@@ -34,7 +34,7 @@ class SSHEndpoint(Endpoint):
         self.ssh_sudo = ssh_sudo
         if self.source:
             self.source = os.path.normpath(self.source)
-            if not self.path.startswith("/"):
+            if self.path is not None and not self.path.startswith("/"):
                 self.path = os.path.join(self.source, self.path)
         self.path = os.path.normpath(self.path)
         self.sshfs = None

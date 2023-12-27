@@ -111,6 +111,7 @@ def sync_snapshots(
     due to retention policy.
     """
 
+    global SNAPSHOT
     logging.info(util.log_heading(f"  To {destination_endpoint} ..."))
 
     source_snapshots = source_endpoint.list_snapshots()
@@ -119,12 +120,12 @@ def sync_snapshots(
 
     # delete corrupt snapshots from destination
     to_remove = []
-    for snapshot in source_snapshots:
-        if snapshot in destination_snapshots and destination_id in snapshot.locks:
+    for SNAPSHOT in source_snapshots:
+        if SNAPSHOT in destination_snapshots and destination_id in SNAPSHOT.locks:
             # seems to have failed previously and is present at
             # destination; delete corrupt snapshot there
             destination_snapshot = destination_snapshots[
-                destination_snapshots.index(snapshot)
+                destination_snapshots.index(SNAPSHOT)
             ]
             logging.info(
                 "Potentially corrupt snapshot %s found at %s",
@@ -138,11 +139,11 @@ def sync_snapshots(
         # disappear
         destination_snapshots = destination_endpoint.list_snapshots()
     # now that deletion worked, remove all locks for this destination
-    for snapshot in source_snapshots:
-        if destination_id in snapshot.locks:
-            source_endpoint.set_lock(snapshot, destination_id, False)
-        if destination_id in snapshot.parent_locks:
-            source_endpoint.set_lock(snapshot, destination_id, False, parent=True)
+    for SNAPSHOT in source_snapshots:
+        if destination_id in SNAPSHOT.locks:
+            source_endpoint.set_lock(SNAPSHOT, destination_id, False)
+        if destination_id in SNAPSHOT.parent_locks:
+            source_endpoint.set_lock(SNAPSHOT, destination_id, False, parent=True)
 
     logging.debug("Planning transmissions ...")
     to_consider = source_snapshots
@@ -151,7 +152,7 @@ def sync_snapshots(
         # afterward anyway
         to_consider = to_consider[-keep_num_backups:]
     to_transfer = [
-        snapshot for snapshot in to_consider if snapshot not in destination_snapshots
+        SNAPSHOT for SNAPSHOT in to_consider if SNAPSHOT not in destination_snapshots
     ]
 
     if not to_transfer:
@@ -160,7 +161,7 @@ def sync_snapshots(
 
     logging.info("Going to transfer %d snapshot(s):", len(to_transfer))
     for _ in to_transfer:
-        logging.info("  %s", snapshot)
+        logging.info("  %s", SNAPSHOT)
 
     while to_transfer:
         if no_incremental:
@@ -172,10 +173,10 @@ def sync_snapshots(
             # pick the snapshots common among source and destination,
             # exclude those that had a failed transfer before
             present_snapshots = [
-                snapshot
-                for snapshot in source_snapshots
-                if snapshot in destination_snapshots
-                   and destination_id not in snapshot.locks
+                SNAPSHOT
+                for SNAPSHOT in source_snapshots
+                if SNAPSHOT in destination_snapshots
+                   and destination_id not in SNAPSHOT.locks
             ]
 
             # choose snapshot with the smallest distance to its parent

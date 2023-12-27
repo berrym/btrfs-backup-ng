@@ -357,7 +357,7 @@ class Endpoint:
     def _get_lock_file_path(self):
         """Is used by the default ``_read/write_locks`` methods and should
         return the file in which the locks are stored."""
-        return os.path.join(self.path, self.lock_file_name)
+        return os.path.join(str(self.path), str(self.lock_file_name))
 
     @require_source
     def _read_locks(self):

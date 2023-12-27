@@ -211,7 +211,8 @@ class MyArgumentParser(argparse.ArgumentParser):
             # for regular arguments, just add them back into the list
             if (
                 not arg_string
-                or arg_string[0] not in self.fromfile_prefix_chars
+                or self.fromfile_prefix_chars is not None
+                and arg_string[0] not in self.fromfile_prefix_chars
             ):
                 new_arg_strings.append(arg_string)
             # replace arguments referencing files with the file content
