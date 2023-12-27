@@ -29,7 +29,7 @@ base has been tagged with `legacy`. If, for any reason, you want to
 continue using it and miss the new features, you can check that out.
 
 Latest release  
-v0.4.0
+v0.5.0
 
 Downloads  
 <http://pypi.python.org/pypi/btrfs_backup_ng>
@@ -97,7 +97,7 @@ Alternatively, clone this git repository
 
     $ git clone https://github.com/berrym/btrfs-backup-ng
     $ cd btrfs-backup-ng
-    $ git checkout tags/v0.4.0  # optionally checkout a specific version
+    $ git checkout tags/v0.5.0  # optionally checkout a specific version
     $ sudo ./setup.py install
 
 ## Sample usage
