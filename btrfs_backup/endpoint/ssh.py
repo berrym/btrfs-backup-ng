@@ -1,17 +1,30 @@
+"""btrfs-backup-ng: btrfs-backup/ssh.py
+Create commands with ssh endpoints.
+"""
+
 import copy
 import logging
 import os
 import subprocess
 import tempfile
 
-from .. import util
 from .common import Endpoint
+from .. import util
 
 
 class SSHEndpoint(Endpoint):
-    def __init__(self, hostname, port=None, username=None, ssh_opts=None,
-                 ssh_sudo=False, **kwargs):
-        super(SSHEndpoint, self).__init__(**kwargs)
+    """Commands for creating an ssh endpoint."""
+
+    def __init__(
+        self,
+        hostname,
+        port=None,
+        username=None,
+        ssh_opts=None,
+        ssh_sudo=False,
+        **kwargs,
+    ):
+        super().__init__(**kwargs)
         self.hostname = hostname
         self.port = port
         self.username = username
@@ -27,37 +40,37 @@ class SSHEndpoint(Endpoint):
         self.sshfs = None
 
     def __repr__(self):
-        return "(SSH) {}{}".format(
-            self._build_connect_string(with_port=True), self.path)
+        return f"(SSH) {self._build_connect_string(with_port=True)}{self.path}"
 
     def get_id(self):
         s = self.hostname
         if self.username:
-            s = "{}@{}".format(self.username, s)
+            s = f"{self.username}@{s}"
         if self.port:
-            s = "{}:{}".format(s, self.port)
-        return "ssh://{}{}".format(s, self.path)
+            s = f"{s}:{self.port}"
+        return f"ssh://{s}{self.path}"
 
     def _prepare(self):
         # check whether ssh is available
         logging.debug("Checking for ssh ...")
         cmd = ["ssh"]
         try:
-            util.exec_subprocess(cmd, method="call", stdout=subprocess.DEVNULL,
-                                 stderr=subprocess.DEVNULL)
+            util.exec_subprocess(
+                cmd, method="call", stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+            )
         except FileNotFoundError as e:
-            logging.debug("  -> got exception: {}".format(e))
+            logging.debug("  -> got exception: %s", e)
             logging.info("ssh command is not available")
             raise util.AbortError()
-        else:
-            logging.debug("  -> ssh is available")
+
+        logging.debug("  -> ssh is available")
 
         # sshfs is useful for listing directories and reading/writing locks
         tempdir = tempfile.mkdtemp()
-        logging.debug("Created tempdir: {}".format(tempdir))
-        mountpoint = os.path.join(tempdir, "mnt")
-        os.makedirs(mountpoint)
-        logging.debug("Created directory: {}".format(mountpoint))
+        logging.debug("Created tempdir: %s", tempdir)
+        mount_point = os.path.join(tempdir, "mnt")
+        os.makedirs(mount_point)
+        logging.debug("Created directory: %s", mount_point)
         logging.debug("Mounting sshfs ...")
 
         cmd = ["sshfs"]
@@ -65,19 +78,20 @@ class SSHEndpoint(Endpoint):
             cmd += ["-p", str(self.port)]
         for opt in self.sshfs_opts:
             cmd += ["-o", opt]
-        cmd += ["{}:/".format(self._build_connect_string()), mountpoint]
+        cmd += [f"{self._build_connect_string()}:/", mount_point]
         try:
-            util.exec_subprocess(cmd, method="check_call",
-                                 stdout=subprocess.DEVNULL)
+            util.exec_subprocess(cmd, method="check_call", stdout=subprocess.DEVNULL)
         except FileNotFoundError as e:
-            logging.debug("  -> got exception: {}".format(e))
+            logging.debug("  -> got exception: %s", e)
             if self.source:
                 # we need that for the locks
-                logging.info("  The sshfs command is not available but it is "
-                             "mandatory for sourcing from SSH.")
+                logging.info(
+                    "  The sshfs command is not available but it is "
+                    "mandatory for sourcing from SSH."
+                )
                 raise util.AbortError()
         else:
-            self.sshfs = mountpoint
+            self.sshfs = mount_point
             logging.debug("  -> sshfs is available")
 
         # create directories, if needed
@@ -87,13 +101,12 @@ class SSHEndpoint(Endpoint):
         dirs.append(self.path)
         if self.sshfs:
             for d in dirs:
-                if not os.path.isdir(self._path2sshfs(d)):
-                    logging.info("Creating directory: {}".format(d))
+                if not os.path.isdir(self._path_to_sshfs(d)):
+                    logging.info("Creating directory: %s", d)
                     try:
-                        os.makedirs(self._path2sshfs(d))
+                        os.makedirs(self._path_to_sshfs(d))
                     except OSError as e:
-                        logging.error("Error creating new location {}: "
-                                      "{}".format(d, e))
+                        logging.error("Error creating new location %s: %s", d, e)
                         raise util.AbortError()
         else:
             cmd = ["mkdir", "-p"] + dirs
@@ -111,26 +124,26 @@ class SSHEndpoint(Endpoint):
 
         return [collapsed]
 
-    def _exec_cmd(self, orig_cmd, **kwargs):
+    def _exec_cmd(self, cmd, **kwargs):
         """Executes the command at the remote host."""
 
-        cmd = ["ssh"]
+        new_cmd = ["ssh"]
         if self.port:
-            cmd += ["-p", str(self.port)]
+            new_cmd += ["-p", str(self.port)]
         for opt in self.ssh_opts:
-            cmd += ["-o", opt]
-        cmd += [self._build_connect_string()]
+            new_cmd += ["-o", opt]
+        new_cmd += [self._build_connect_string()]
         if self.ssh_sudo:
-            cmd += ["sudo"]
-        cmd.extend(orig_cmd)
+            new_cmd += ["sudo"]
+        new_cmd.extend(cmd)
 
-        return util.exec_subprocess(cmd, **kwargs)
+        return util.exec_subprocess(new_cmd, **kwargs)
 
     def _listdir(self, location):
         """Operates remotely via 'ls -1A'."""
 
         if self.sshfs:
-            items = os.listdir(self._path2sshfs(location))
+            items = os.listdir(self._path_to_sshfs(location))
         else:
             cmd = ["ls", "-1A", location]
             output = self._exec_cmd(cmd, universal_newlines=True)
@@ -138,23 +151,22 @@ class SSHEndpoint(Endpoint):
         return items
 
     def _get_lock_file_path(self):
-        return self._path2sshfs(super(SSHEndpoint, self)._get_lock_file_path())
+        return self._path_to_sshfs(super()._get_lock_file_path())
 
-
-    ########## Custom methods
+    # Custom methods
 
     def _build_connect_string(self, with_port=False):
         s = self.hostname
         if self.username:
-            s = "{}@{}".format(self.username, s)
+            s = f"{self.username}@{s}"
         if with_port and self.port:
-            s = "{}:{}".format(s, self.port)
+            s = f"{s}:{self.port}"
         return s
 
-    def _path2sshfs(self, path):
-        """Joins the given ``path`` with the sshfs mountpoint."""
+    def _path_to_sshfs(self, path):
+        """Joins the given ``path`` with the sshfs mount_point."""
         if not self.sshfs:
             raise ValueError("sshfs not mounted")
         if path.startswith("/"):
             path = path[1:]
-        return os.path.join(self.sshfs, path)
+        return str(os.path.join(self.sshfs, path))

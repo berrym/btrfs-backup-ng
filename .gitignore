@@ -41,3 +41,6 @@ nosetests.xml
 # stdeb
 deb_dist
 btrfs_backup-*.tar.gz
+
+# ide
+.idea

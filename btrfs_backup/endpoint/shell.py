@@ -1,18 +1,24 @@
+"""btrfs-backup-ng: btrfs-backup/shell.py
+Create destinations with shell command endpoints.
+"""
+
 from .common import Endpoint
 
 
 class ShellEndpoint(Endpoint):
+    """Create a shell command endpoint."""
+
     def __init__(self, cmd, **kwargs):
-        super(ShellEndpoint, self).__init__(**kwargs)
+        super().__init__(**kwargs)
         if self.source:
             raise ValueError("Shell can't be used as source.")
         self.cmd = cmd
 
     def __repr__(self):
-        return "(Shell) " + self.cmd
+        return f"(Shell) {self.cmd}"
 
     def get_id(self):
-        return "shell://{}".format(self.cmd)
+        return f"shell://{self.cmd}"
 
-    def _build_receive_cmd(self, dest):
+    def _build_receive_cmd(self, destination):
         return ["sh", "-c", self.cmd]

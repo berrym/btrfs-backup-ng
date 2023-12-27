@@ -1,26 +1,27 @@
+"""btrfs-backup-ng: btrfs-backup/endpoint/__init__.py"""
+
 import os
 import urllib.parse
 
 from .local import LocalEndpoint
-from .ssh import SSHEndpoint
 from .shell import ShellEndpoint
+from .ssh import SSHEndpoint
 
 
-def choose_endpoint(spec, common_kwargs=None, source=False,
-                    excluded_types=()):
+def choose_endpoint(spec, common_kwargs=None, source=False, excluded_types=()):
     """Chooses a suitable endpoint based on the specification given.
-       If ``common_kwargs`` is given, it should be a dictionary with
-       keyword arguments that all endpoint types should be initialized
-       with.
-       If ``source`` is set, this is considered as a source endpoint,
-       meaning that parsed path is passed as ``source`` parameter and not
-       as ``path`` at endpoint initialization. The value for ``path``
-       should be present in ``common_kwargs`` in this case.
-       The endpoint classes specified in ``excluded_types`` are excluded
-       from the consideration.
-       It will return an instance of the proper ``Endpoint`` sub-class.
-       If no endpoint can be determined for the given specification,
-       a ``ValueError`` is raised."""
+    If ``common_kwargs`` is given, it should be a dictionary with
+    keyword arguments that all endpoint types should be initialized
+    with.
+    If ``source`` is set, this is considered as a source endpoint,
+    meaning that parsed path is passed as ``source`` parameter and not
+    as ``path`` at endpoint initialization. The value for ``path``
+    should be present in ``common_kwargs`` in this case.
+    The endpoint classes specified in ``excluded_types`` are excluded
+    from the consideration.
+    It will return an instance of the proper ``Endpoint`` subclass.
+    If no endpoint can be determined for the given specification,
+    a ``ValueError`` is raised."""
 
     kwargs = {}
     if common_kwargs:
@@ -35,7 +36,7 @@ def choose_endpoint(spec, common_kwargs=None, source=False,
         c = SSHEndpoint
         parsed = urllib.parse.urlparse(spec)
         if not parsed.hostname:
-            raise ValueError("No hostname for SSh specified.")
+            raise ValueError("No hostname for SSH specified.")
         try:
             kwargs["port"] = parsed.port
         except ValueError:
@@ -59,7 +60,8 @@ def choose_endpoint(spec, common_kwargs=None, source=False,
         else:
             kwargs["path"] = spec
     else:
-        raise ValueError("No endpoint could be generated for this "
-                         "specification: {}".format(spec))
+        raise ValueError(
+            f"No endpoint could be generated for this specification: {spec}"
+        )
 
     return c(**kwargs)

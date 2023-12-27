@@ -1,13 +1,19 @@
-import os
-import logging
+"""btrfs-backup-ng: btrfs-backup/local.py
+Create commands with local endpoints.
+"""
 
-from .. import util
+import logging
+import os
+
 from .common import Endpoint
+from .. import util
 
 
 class LocalEndpoint(Endpoint):
+    """Create a local command endpoint."""
+
     def __init__(self, **kwargs):
-        super(LocalEndpoint, self).__init__(**kwargs)
+        super().__init__(**kwargs)
         if self.source:
             self.source = os.path.realpath(self.source)
             if not os.path.isabs(self.path):
@@ -26,20 +32,20 @@ class LocalEndpoint(Endpoint):
         dirs.append(self.path)
         for d in dirs:
             if not os.path.isdir(d):
-                logging.info("Creating directory: {}".format(d))
+                logging.info("Creating directory: %s", d)
                 try:
                     os.makedirs(d)
                 except OSError as e:
-                    logging.error("Error creating new location {}: "
-                                  "{}".format(d, e))
+                    logging.error("Error creating new location %s: %s", d, e)
                     raise util.AbortError()
 
-        if self.source is not None and self.fs_checks and \
-           not util.is_subvolume(self.source):
-            logging.error("{} does not seem to be a btrfs "
-                          "subvolume".format(self.source))
+        if (
+            self.source is not None
+            and self.fs_checks
+            and not util.is_subvolume(self.source)
+        ):
+            logging.error("%s does not seem to be a btrfs subvolume", self.source)
             raise util.AbortError()
         if self.fs_checks and not util.is_btrfs(self.path):
-            logging.error("{} does not seem to be on a btrfs "
-                          "filesystem".format(self.path))
+            logging.error("%s does not seem to be on a btrfs filesystem", self.path)
             raise util.AbortError()
