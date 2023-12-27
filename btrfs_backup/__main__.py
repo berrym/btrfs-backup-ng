@@ -176,7 +176,7 @@ def sync_snapshots(
                 SNAPSHOT
                 for SNAPSHOT in source_snapshots
                 if SNAPSHOT in destination_snapshots
-                   and destination_id not in SNAPSHOT.locks
+                and destination_id not in SNAPSHOT.locks
             ]
 
             # choose snapshot with the smallest distance to its parent

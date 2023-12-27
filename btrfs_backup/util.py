@@ -125,16 +125,14 @@ def is_btrfs(path):
         try:
             mount_point, fs_type = line.split(" ")[1:3]
         except ValueError as e:
-            logging.debug(
-                "  Couldn't split line, skipping: %s\nCaught: %s", line, e
-            )
+            logging.debug("  Couldn't split line, skipping: %s\nCaught: %s", line, e)
             continue
         mount_point_prefix = mount_point
         if not mount_point_prefix.endswith(os.sep):
             mount_point_prefix += os.sep
-        if (
-            path == mount_point or path.startswith(mount_point_prefix)
-        ) and len(mount_point) > len(best_match):
+        if (path == mount_point or path.startswith(mount_point_prefix)) and len(
+            mount_point
+        ) > len(best_match):
             best_match = mount_point
             best_match_fs_type = fs_type
             logging.debug(
@@ -225,9 +223,7 @@ class MyArgumentParser(argparse.ArgumentParser):
                                 # make nested includes relative to their parent
                                 if (
                                     self.fromfile_prefix_chars is not None
-                                    and arg.startswith(
-                                        self.fromfile_prefix_chars
-                                    )
+                                    and arg.startswith(self.fromfile_prefix_chars)
                                 ):
                                     dir_name = os.path.dirname(arg_string[1:])
                                     path = os.path.join(dir_name, arg[1:])
@@ -269,7 +265,5 @@ class MyHelpFormatter(argparse.HelpFormatter):
         lines = []
         for line in _lines:
             # this is the RawTextHelpFormatter._split_lines
-            lines.extend(
-                argparse.HelpFormatter._split_lines(self, line, width)
-            )
+            lines.extend(argparse.HelpFormatter._split_lines(self, line, width))
         return lines
