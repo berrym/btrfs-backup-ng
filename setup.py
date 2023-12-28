@@ -5,13 +5,13 @@ from setuptools import setup
 
 from btrfs_backup import __version__
 
-# read the contents of EADME file
+# read the contents of README file
 from pathlib import Path
-this_directory = Path(__file__).parent
-long_description = (this_directory / "README.md").read_text()
+project_directory = Path(__file__).parent
+long_description = (project_directory / "README.md").read_text()
 
 setup(
-    name="btrfs_backup-ng",
+    name="btrfs-backup-ng",
     version=__version__,
     description="Intelligent, feature-rich backups for btrfs",
     long_description=long_description,
