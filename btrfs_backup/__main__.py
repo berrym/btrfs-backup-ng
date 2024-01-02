@@ -1,9 +1,9 @@
 """btrfs-backup-ng: btrfs-backup/__main__.py
 
 Backup a btrfs volume to another, incrementally
-Requires Python >= 3.3, btrfs-progs >= 3.12 most likely.
+Requires Python >= 3.6, btrfs-progs >= 3.12 most likely.
 
-Copyright (c) 2023 Michael Berry <trismegustis@gmail.com>
+Copyright (c) 2024 Michael Berry <trismegustis@gmail.com>
 Copyright (c) 2017 Robert Schindler <r.schindler@efficiosoft.com>
 Copyright (c) 2014 Chris Lawrence <lawrencc@debian.org>
 
@@ -28,6 +28,7 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 """
 
+import concurrent.futures
 import logging
 import os
 import subprocess
@@ -39,11 +40,8 @@ from . import endpoint
 from . import util
 
 
-SNAPSHOT = None
-
-
 def send_snapshot(
-    snap, destination_endpoint, parent=None, clones=None, no_progress=False
+    snapshot, destination_endpoint, parent=None, clones=None, no_progress=False
 ):
     """
     Sends snapshot to destination endpoint, using given parent and clones.
@@ -52,13 +50,13 @@ def send_snapshot(
     """
 
     # Now we need to send the snapshot (incrementally, if possible)
-    logging.info("Sending %s ...", snap)
+    logging.info("Sending %s ...", snapshot)
     if parent:
         logging.info("  Using parent: %s", parent)
     else:
         logging.info("  No parent snapshot available, sending in full mode.")
     if clones:
-        logging.info("  Using clones: %s", clones)
+        logging.info("  Using clones: %r", clones)
 
     pv = False
     if not no_progress:
@@ -75,7 +73,7 @@ def send_snapshot(
             logging.debug("  -> pv is available")
             pv = True
 
-    pipes = [snap.endpoint.send(snap, parent=parent, clones=clones)]
+    pipes = [snapshot.endpoint.send(snapshot, parent=parent, clones=clones)]
 
     if pv:
         cmd = ["pv"]
@@ -111,7 +109,8 @@ def sync_snapshots(
     due to retention policy.
     """
 
-    global SNAPSHOT
+    # global snapshot
+    snapshot = None
     logging.info(util.log_heading(f"  To {destination_endpoint} ..."))
 
     source_snapshots = source_endpoint.list_snapshots()
@@ -120,12 +119,12 @@ def sync_snapshots(
 
     # delete corrupt snapshots from destination
     to_remove = []
-    for SNAPSHOT in source_snapshots:
-        if SNAPSHOT in destination_snapshots and destination_id in SNAPSHOT.locks:
+    for snapshot in source_snapshots:
+        if snapshot in destination_snapshots and destination_id in snapshot.locks:
             # seems to have failed previously and is present at
             # destination; delete corrupt snapshot there
             destination_snapshot = destination_snapshots[
-                destination_snapshots.index(SNAPSHOT)
+                destination_snapshots.index(snapshot)
             ]
             logging.info(
                 "Potentially corrupt snapshot %s found at %s",
@@ -139,11 +138,11 @@ def sync_snapshots(
         # disappear
         destination_snapshots = destination_endpoint.list_snapshots()
     # now that deletion worked, remove all locks for this destination
-    for SNAPSHOT in source_snapshots:
-        if destination_id in SNAPSHOT.locks:
-            source_endpoint.set_lock(SNAPSHOT, destination_id, False)
-        if destination_id in SNAPSHOT.parent_locks:
-            source_endpoint.set_lock(SNAPSHOT, destination_id, False, parent=True)
+    for snapshot in source_snapshots:
+        if destination_id in snapshot.locks:
+            source_endpoint.set_lock(snapshot, destination_id, False)
+        if destination_id in snapshot.parent_locks:
+            source_endpoint.set_lock(snapshot, destination_id, False, parent=True)
 
     logging.debug("Planning transmissions ...")
     to_consider = source_snapshots
@@ -152,7 +151,7 @@ def sync_snapshots(
         # afterward anyway
         to_consider = to_consider[-keep_num_backups:]
     to_transfer = [
-        SNAPSHOT for SNAPSHOT in to_consider if SNAPSHOT not in destination_snapshots
+        snapshot for snapshot in to_consider if snapshot not in destination_snapshots
     ]
 
     if not to_transfer:
@@ -161,7 +160,7 @@ def sync_snapshots(
 
     logging.info("Going to transfer %d snapshot(s):", len(to_transfer))
     for _ in to_transfer:
-        logging.info("  %s", SNAPSHOT)
+        logging.info("  %s", snapshot)
 
     while to_transfer:
         if no_incremental:
@@ -173,10 +172,10 @@ def sync_snapshots(
             # pick the snapshots common among source and destination,
             # exclude those that had a failed transfer before
             present_snapshots = [
-                SNAPSHOT
-                for SNAPSHOT in source_snapshots
-                if SNAPSHOT in destination_snapshots
-                and destination_id not in SNAPSHOT.locks
+                snapshot
+                for snapshot in source_snapshots
+                if snapshot in destination_snapshots
+                and destination_id not in snapshot.locks
             ]
 
             # choose snapshot with the smallest distance to its parent
@@ -219,7 +218,7 @@ def sync_snapshots(
     logging.info(util.log_heading(f"Transfers to {destination_endpoint} complete!"))
 
 
-def run(argv):
+def parse_options(argv):
     """Run the program. Items in ``argv`` are treated as command line
     arguments."""
 
@@ -415,96 +414,106 @@ files is allowed as well."""
         "Specifying a source is mandatory.",
     )
     group.add_argument(
-        "destination",
+        "destinations",
         nargs="*",
-        default=[],
         help="N|Destination to send backups to.\n"
         "The following schemes are possible:\n"
         " - /path/to/backups\n"
         " - ssh://[user@]host[:port]/path/to/backups\n"
         " - 'shell://cat > some-file'\n"
-        "You may use this argument multiple times to transfer backups to multiple locations."
-        " You may even omit it "
+        "You may use this argument multiple times to transfer backups to multiple locations. "
+        "You may even omit it "
         "completely in what case no snapshot is transferred at all. That allows, for instance, "
         "for well-organized local snapshotting without backing up.",
     )
 
+    # parse args then convert to dict format
+    options = {}
     try:
         args = parser.parse_args(argv)
+        for k, v in vars(args).items():
+            if v is not None:
+                options[k] = v
     except RecursionError as e:
         print(
             "Recursion error while parsing arguments.\n"
-            "Maybe you produced a loop in argument files? "
+            "Maybe you produced a loop in argument files?\n"
             f"Caught: ({e})",
             file=sys.stderr,
         )
         raise util.AbortError()
 
-    # applying shortcuts
-    if args.quiet:
-        args.no_progress = True
-        args.verbosity = "warning"
-    if args.latest_only:
-        args.num_snapshots = 1
+    return options
 
+
+def run_task(task):
+    """Create a list of tasks to run."""
+    options = parse_options(task)
     logging.basicConfig(
         format="%(asctime)s  [%(levelname)-5s]  %(message)s",
         datefmt="%H:%M:%S",
-        level=getattr(logging, args.verbosity.upper()),
+        level=options["verbosity"].upper(),
     )
+
+    # applying shortcuts
+    if "quiet" in options:
+        options["no_progress"] = True
+        options["verbosity"] = "warning"
+    if "latest_only" in options:
+        options["num_snapshots"] = 1
 
     logging.info(util.log_heading(f"Started at {time.ctime()}"))
 
     logging.debug(util.log_heading("Settings"))
-    if args.snapshot_folder:
-        snap_dir = args.snapshot_folder
+    if "snapshot_folder" in options:
+        snapshot_directory = options["snapshot_folder"]
     else:
-        snap_dir = ".snapshots"
+        snapshot_directory = ".snapshots"
 
-    if args.snapshot_prefix:
-        snap_prefix = args.snapshot_prefix
+    if "snapshot_prefix" in options:
+        snapshot_prefix = options["snapshot_prefix"]
     else:
-        snap_prefix = str("")
+        snapshot_prefix = str()
 
-    logging.debug("Enable btrfs debugging: %r", args.btrfs_debug)
-    logging.debug("Don't display progress: %r", args.no_progress)
-    logging.debug("Don't take a new snapshot: %r", args.no_snapshot)
-    logging.debug("Number of snapshots to keep: %d", {args.num_snapshots})
+    logging.debug("Enable btrfs debugging: %r", options["btrfs_debug"])
+    logging.debug("Don't display progress: %r", options["no_progress"])
+    logging.debug("Don't take a new snapshot: %r", options["no_snapshot"])
+    logging.debug("Number of snapshots to keep: %d", options["num_snapshots"])
     logging.debug(
         "Number of backups to keep: %s",
-        (args.num_backups if args.num_backups > 0 else "Any"),
+        (str(options["num_backups"]) if options["num_backups"] > 0 else "Any"),
     )
-    logging.debug("Snapshot folder: %s", snap_dir)
-    logging.debug("Snapshot prefix: %s", snap_prefix if snap_prefix else None)
-    logging.debug("Don't transfer snapshots: %r", args.no_transfer)
-    logging.debug("Don't send incrementally: %r", args.no_incremental)
-    logging.debug("Extra SSH config options: %s", args.ssh_opt)
-    logging.debug("Use sudo at SSH remote host: %r", args.ssh_sudo)
-    logging.debug("Run 'btrfs subvolume sync' afterwards: %r", args.sync)
+    logging.debug("Snapshot folder: %s", snapshot_directory)
+    logging.debug("Snapshot prefix: %s", snapshot_prefix if snapshot_prefix else None)
+    logging.debug("Don't transfer snapshots: %r", options["no_transfer"])
+    logging.debug("Don't send incrementally: %r", options["no_incremental"])
+    logging.debug("Extra SSH config options: %s", options["ssh_opt"])
+    logging.debug("Use sudo at SSH remote host: %r", options["ssh_sudo"])
+    logging.debug("Run 'btrfs subvolume sync' afterwards: %r", options["sync"])
     logging.debug(
-        "Convert subvolumes to read-write before deletion: %r", args.convert_rw
+        "Convert subvolumes to read-write before deletion: %r", options["convert_rw"]
     )
-    logging.debug("Remove locks for given destinations: %r", args.remove_locks)
-    logging.debug("Skip filesystem checks: %r", args.skip_fs_checks)
-    logging.debug("Auto add locked destinations: %r", args.locked_destinations)
+    logging.debug("Remove locks for given destinations: %r", options["remove_locks"])
+    logging.debug("Skip filesystem checks: %r", options["skip_fs_checks"])
+    logging.debug("Auto add locked destinations: %r", options["locked_destinations"])
 
     # kwargs that are common between all endpoints
     endpoint_kwargs = {
-        "snap_prefix": snap_prefix,
-        "convert_rw": args.convert_rw,
-        "subvolume_sync": args.sync,
-        "btrfs_debug": args.btrfs_debug,
-        "fs_checks": not args.skip_fs_checks,
-        "ssh_opts": args.ssh_opt,
-        "ssh_sudo": args.ssh_sudo,
+        "snap_prefix": snapshot_prefix,
+        "convert_rw": options["convert_rw"],
+        "subvolume_sync": options["sync"],
+        "btrfs_debug": options["btrfs_debug"],
+        "fs_checks": not options["skip_fs_checks"],
+        "ssh_opts": options["ssh_opt"],
+        "ssh_sudo": options["ssh_sudo"],
     }
 
-    logging.debug("Source: %s", args.source)
+    logging.debug("Source: %s", options["source"])
     source_endpoint_kwargs = dict(endpoint_kwargs)
-    source_endpoint_kwargs["path"] = snap_dir
+    source_endpoint_kwargs["path"] = snapshot_directory
     try:
         source_endpoint = endpoint.choose_endpoint(
-            args.source, source_endpoint_kwargs, source=True
+            options["source"], source_endpoint_kwargs, source=True
         )
     except ValueError as e:
         logging.error("Couldn't parse source specification: %s", e)
@@ -513,16 +522,16 @@ files is allowed as well."""
     source_endpoint.prepare()
 
     # add endpoint creation strings for locked destinations, if desired
-    if args.locked_destinations:
+    if options["locked_destinations"]:
         for snap in source_endpoint.list_snapshots():
             for lock in snap.locks:
-                if lock not in args.destination:
-                    args.destination.append(lock)
+                if lock not in options["destinations"]:
+                    options["destinations"].append(lock)
 
-    if args.remove_locks:
+    if "remove_locks" in options.keys():
         logging.info("Removing locks (--remove-locks) ...")
         for snap in source_endpoint.list_snapshots():
-            for destination in args.destination:
+            for destination in options["destinations"]:
                 if destination in snap.locks:
                     logging.info("  %s (%s)", snap, destination)
                     source_endpoint.set_lock(snap, destination, False)
@@ -532,13 +541,13 @@ files is allowed as well."""
 
     destination_endpoints = []
     # only create destination endpoints if they are needed
-    if args.no_transfer and args.num_backups <= 0:
+    if options["no_transfer"] and options["num_backups"] <= 0:
         logging.debug(
             "Don't create destination endpoints because they won't be needed "
             "(--no-transfer and no --num-backups)."
         )
     else:
-        for destination in args.destination:
+        for destination in options["destinations"]:
             logging.debug("Destination: %s", destination)
             try:
                 destination_endpoint = endpoint.choose_endpoint(
@@ -551,14 +560,14 @@ files is allowed as well."""
             logging.debug("Destination endpoint: %s", destination_endpoint)
             destination_endpoint.prepare()
 
-    if args.no_snapshot:
+    if options["no_snapshot"]:
         logging.info("Taking no snapshot (--no-snapshot).")
     else:
         # First we need to create a new snapshot on the source disk
         logging.info(util.log_heading("Snapshotting ..."))
         source_endpoint.snapshot()
 
-    if args.no_transfer:
+    if options["no_transfer"]:
         logging.info(util.log_heading("Not transferring (--no-transfer)."))
     else:
         logging.info(util.log_heading("Transferring ..."))
@@ -567,9 +576,9 @@ files is allowed as well."""
                 sync_snapshots(
                     source_endpoint,
                     destination_endpoint,
-                    keep_num_backups=args.num_backups,
-                    no_incremental=args.no_incremental,
-                    no_progress=args.no_progress,
+                    keep_num_backups=options["num_backups"],
+                    no_incremental=options["no_incremental"],
+                    no_progress=options["no_progress"],
                 )
             except util.AbortError as e:
                 logging.error(
@@ -582,34 +591,62 @@ files is allowed as well."""
 
     logging.info(util.log_heading("Cleaning up..."))
     # cleanup snapshots > num_snapshots in snap_dir
-    if args.num_snapshots > 0:
+    if options["num_snapshots"] > 0:
         try:
-            source_endpoint.delete_old_snapshots(args.num_snapshots)
+            source_endpoint.delete_old_snapshots(options["num_snapshots"])
         except util.AbortError as e:
             logging.debug(
-                "Got AbortError while deleting source snapshots at %s", source_endpoint
+                "Got AbortError while deleting source snapshots at %s\n" "Caught: %s",
+                source_endpoint,
+                e,
             )
     # cleanup backups > num_backups in backup target
-    if args.num_backups > 0:
+    if options["num_backups"] > 0:
         for destination_endpoint in destination_endpoints:
             try:
-                destination_endpoint.delete_old_snapshots(args.num_backups)
+                destination_endpoint.delete_old_snapshots(options["num_backups"])
             except util.AbortError as e:
                 logging.debug(
-                    "Got AbortError while deleting backups at %s", destination_endpoint
+                    "Got AbortError while deleting backups at %s\n" "Caught: %s",
+                    destination_endpoint,
+                    e,
                 )
 
     logging.info(util.log_heading(f"Finished at {time.ctime()}"))
 
+    return "Success"
+
+
+def elevate_privileges():
+    """Re-run the program using sudo if privileges are needed."""
+    if os.getuid() != 0:
+        command = ("sudo", sys.executable, *sys.argv)
+        os.execvp("sudo", command)
+
 
 def main():
     """Main function."""
+    elevate_privileges()
+    command_line = str()
+    for arg in sys.argv[1:]:  # skip sys.argv[0] since the question didn't ask for it
+        command_line += f"{arg}  "  # Assume no space => no quotes
+
+    tasks = [task.split() for task in command_line.split(":")]
+
+    futures = {}
     try:
-        run(sys.argv[1:])
+        with concurrent.futures.ProcessPoolExecutor() as executor:
+            # for task in tasks:
+            futures = {executor.submit(run_task, task): task for task in tasks}
+
+            for future in concurrent.futures.as_completed(futures):
+                task = futures[future]
+                result = future.result()
+                print(f"{task}\nResult: {result}")
     except (util.AbortError, KeyboardInterrupt):
         sys.exit(1)
 
 
 # Program entry point
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

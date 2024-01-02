@@ -76,17 +76,17 @@ class Snapshot:
         return None
 
 
-def exec_subprocess(cmd, method="check_output", **kwargs):
+def exec_subprocess(command, method="check_output", **kwargs):
     """Executes ``getattr(subprocess, method)(cmd, **kwargs)`` and takes
     care of proper logging and error handling. ``AbortError`` is raised
     in case of a ``subprocess.CalledProcessError``."""
-    logging.debug("Executing: %s", cmd)
+    logging.debug("Executing: %s", command)
     m = getattr(subprocess, method)
     try:
-        return m(cmd, **kwargs)
-    except subprocess.CalledProcessError:
-        logging.error("Error on command: %s", cmd)
-        raise AbortError()
+        return m(command, **kwargs)
+    except subprocess.CalledProcessError as e:
+        logging.error("Error on command: %s\nCaught: %s", command, e)
+        raise AbortError() from e
 
 
 def log_heading(caption):
@@ -165,7 +165,6 @@ def read_locks(s):
     """Reads locks from lock file content given as string.
     Returns ``{'snap_name': {'locks': ['lock', ...], ...}, 'parent_locks': ['lock', ...]}``.
     If format is invalid, ``ValueError`` is raised."""
-
     s = s.strip()
     if not s:
         return {}
@@ -185,7 +184,7 @@ def read_locks(s):
                 snapshot_entry[lock_type] = list(set(locks))
     except (AssertionError, json.JSONDecodeError) as e:
         logging.error("Lock file couldn't be parsed: %s", e)
-        raise ValueError("invalid lock file format")
+        raise ValueError("invalid lock file format") from e
 
     return content
 

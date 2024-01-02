@@ -29,7 +29,7 @@ base has been tagged with `legacy`. If, for any reason, you want to
 continue using it and miss the new features, you can check that out.
 
 Latest release  
-v0.5.2
+v0.5.3
 
 Downloads  
 <http://pypi.python.org/pypi/btrfs_backup_ng>
@@ -62,6 +62,7 @@ backup, btrfs, snapshot, send, receive, ssh
 -   Creation of backups without root privileges, if some special
     conditions are met
 -   Detailed logging output with configurable log level
+-   Concurrent process execution of tasks
 
 ## Installation
 
@@ -97,7 +98,7 @@ Alternatively, clone this git repository
 
     $ git clone https://github.com/berrym/btrfs-backup-ng
     $ cd btrfs-backup-ng
-    $ git checkout tags/v0.5.2  # optionally checkout a specific version
+    $ git checkout tags/v0.5.3  # optionally checkout a specific version
     $ sudo ./setup.py install
 
 ## Sample usage
@@ -111,7 +112,7 @@ different sample usages to get started as quick as possible.
 For reference, a copy of the output of `btrfs-backup-ng --help` is attached
 below.
 
-As root:
+As root (if not root btrfs-backup-ng will try and re-run itself with sudo):
 
     $ btrfs-backup-ng /home /backup
 
@@ -185,6 +186,17 @@ before + an extra sending to your local `/mnt/backups` folder. Please
 note that btrfs-backup-ng is not smart enough to prevent the same data from
 being pulled from `source_server` twice. But that wouldn't be easy to
 implement with the current design.
+
+
+### Concurrent tasks
+
+Multiple btrfs-backup-ng tasks can be run in concurrent processes by
+separating the desired tasks with a ':'
+
+    $ btrfs-backup-ng /home /mnt/backups/home:/opt /mnt/backups/opt
+
+or a similarly chained command. Each task will have its own set of options.
+
 
 ## Help text
 

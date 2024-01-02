@@ -20,5 +20,5 @@ class ShellEndpoint(Endpoint):
     def get_id(self):
         return f"shell://{self.cmd}"
 
-    def _build_receive_cmd(self, destination):
+    def _build_receive_command(self, destination):
         return ["sh", "-c", self.cmd]

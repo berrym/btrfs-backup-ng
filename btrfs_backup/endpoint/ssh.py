@@ -110,21 +110,21 @@ class SSHEndpoint(Endpoint):
                         raise util.AbortError()
         else:
             cmd = ["mkdir", "-p"] + dirs
-            self._exec_cmd(cmd)
+            self._exec_command(cmd)
 
-    def _collapse_cmds(self, cmds, abort_on_failure=True):
+    def _collapse_commands(self, commands, abort_on_failure=True):
         """Concatenates all given commands, ';' is inserted as separator."""
 
         collapsed = []
-        for i, cmd in enumerate(cmds):
+        for i, cmd in enumerate(commands):
             if isinstance(cmd, (list, tuple)):
                 collapsed.extend(cmd)
-                if len(cmds) > i + 1:
+                if len(commands) > i + 1:
                     collapsed.append("&&" if abort_on_failure else ";")
 
         return [collapsed]
 
-    def _exec_cmd(self, cmd, **kwargs):
+    def _exec_command(self, command, **kwargs):
         """Executes the command at the remote host."""
 
         new_cmd = ["ssh"]
@@ -135,7 +135,7 @@ class SSHEndpoint(Endpoint):
         new_cmd += [self._build_connect_string()]
         if self.ssh_sudo:
             new_cmd += ["sudo"]
-        new_cmd.extend(cmd)
+        new_cmd.extend(command)
 
         return util.exec_subprocess(new_cmd, **kwargs)
 
@@ -146,7 +146,7 @@ class SSHEndpoint(Endpoint):
             items = os.listdir(self._path_to_sshfs(location))
         else:
             cmd = ["ls", "-1A", location]
-            output = self._exec_cmd(cmd, universal_newlines=True)
+            output = self._exec_command(cmd, universal_newlines=True)
             items = output.splitlines()
         return items
 

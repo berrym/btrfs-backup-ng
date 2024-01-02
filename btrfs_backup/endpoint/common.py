@@ -60,14 +60,16 @@ class Endpoint:
         snapshot_path = snapshot.get_path()
         logging.info("%s -> %s", self.source, snapshot_path)
 
-        cmds = [self._build_snapshot_cmd(self.source, snapshot_path, readonly=readonly)]
+        commands = [
+            self._build_snapshot_cmd(self.source, snapshot_path, readonly=readonly)
+        ]
 
         # sync disks
         if sync:
-            cmds.append(self._build_sync_cmd())
+            commands.append(self._build_sync_command())
 
-        for cmd in self._collapse_cmds(cmds, abort_on_failure=True):
-            self._exec_cmd(cmd)
+        for cmd in self._collapse_commands(commands, abort_on_failure=True):
+            self._exec_command(cmd)
 
         self.add_snapshot(snapshot)
         return snapshot
@@ -77,18 +79,18 @@ class Endpoint:
         """Calls 'btrfs send' for the given snapshot and returns its
         Popen object."""
 
-        cmd = self._build_send_cmd(snapshot, parent=parent, clones=clones)
-        return self._exec_cmd(cmd, method="Popen", stdout=subprocess.PIPE)
+        cmd = self._build_send_command(snapshot, parent=parent, clones=clones)
+        return self._exec_command(cmd, method="Popen", stdout=subprocess.PIPE)
 
     def receive(self, stdin):
         """Calls 'btrfs receive', setting the given pipe as its stdin.
         The receiving process's Popen object is returned."""
 
-        cmd = self._build_receive_cmd(self.path)
+        cmd = self._build_receive_command(self.path)
         # from WARNING level onwards, hide stdout
         loglevel = logging.getLogger().getEffectiveLevel()
         stdout = subprocess.DEVNULL if loglevel >= logging.WARNING else None
-        return self._exec_cmd(cmd, method="Popen", stdin=stdin, stdout=stdout)
+        return self._exec_command(cmd, method="Popen", stdin=stdin, stdout=stdout)
 
     def list_snapshots(self, flush_cache=False):
         """Returns a list with all snapshots found at ``self.path``.
@@ -212,10 +214,10 @@ class Endpoint:
 
         if to_remove:
             # finally delete them
-            cmds = self._build_deletion_cmds(to_remove, **kwargs)
-            cmds = self._collapse_cmds(cmds, abort_on_failure=True)
+            cmds = self._build_deletion_commands(to_remove, **kwargs)
+            cmds = self._collapse_commands(cmds, abort_on_failure=True)
             for cmd in cmds:
-                self._exec_cmd(cmd)
+                self._exec_command(cmd)
 
             if self.__cached_snapshots is not None:
                 for snapshot in to_remove:
@@ -263,18 +265,18 @@ class Endpoint:
         return cmd
 
     @staticmethod
-    def _build_sync_cmd():
+    def _build_sync_command():
         """Should return the 'sync' command."""
         return ["sync"]
 
-    def _build_send_cmd(self, snapshot, parent=None, clones=None):
+    def _build_send_command(self, snapshot, parent=None, clones=None):
         """Should return a command which, when executed, writes the send
         stream of given ``snapshot`` to stdout. ``parent`` and ``clones``
         may be used as well."""
         cmd = ["btrfs", "send"] + self.btrfs_flags
         # from WARNING level onwards, pass --quiet
-        loglevel = logging.getLogger().getEffectiveLevel()
-        if loglevel >= logging.WARNING:
+        log_level = logging.getLogger().getEffectiveLevel()
+        if log_level >= logging.WARNING:
             cmd += ["--quiet"]
         if parent:
             cmd += ["-p", parent.get_path()]
@@ -284,12 +286,12 @@ class Endpoint:
         cmd += [snapshot.get_path()]
         return cmd
 
-    def _build_receive_cmd(self, destination):
+    def _build_receive_command(self, destination):
         """Should return a command to receive a snapshot to ``dest``.
         The stream is piped into stdin when the command is running."""
         return ["btrfs", "receive"] + self.btrfs_flags + [destination]
 
-    def _build_deletion_cmds(self, snapshots, convert_rw=None, subvolume_sync=None):
+    def _build_deletion_commands(self, snapshots, convert_rw=None, subvolume_sync=None):
         """Should return a list of commands that, when executed in order,
         delete the given ``snapshots``. ``convert_rw`` and
         ``subvolume_sync`` should be regarded as well."""
@@ -299,11 +301,11 @@ class Endpoint:
         if subvolume_sync is None:
             subvolume_sync = self.subvolume_sync
 
-        cmds = []
+        commands = []
 
         if convert_rw:
             for snapshot in snapshots:
-                cmds.append(
+                commands.append(
                     [
                         "btrfs",
                         "property",
@@ -317,14 +319,14 @@ class Endpoint:
 
         cmd = ["btrfs", "subvolume", "delete"]
         cmd.extend([snapshot.get_path() for snapshot in snapshots])
-        cmds.append(cmd)
+        commands.append(cmd)
 
         if subvolume_sync:
-            cmds.append(["btrfs", "subvolume", "sync", self.path])
+            commands.append(["btrfs", "subvolume", "sync", self.path])
 
-        return cmds
+        return commands
 
-    def _collapse_cmds(self, cmds, abort_on_failure=True):
+    def _collapse_commands(self, commands, abort_on_failure=True):
         """This might be re-implemented to group commands together wherever
         possible. The default implementation simply returns the given command
         list unchanged.
@@ -334,14 +336,14 @@ class Endpoint:
         unset, the opposite behaviour is expected (subsequent commands have
         to be run even in case a previous one fails)."""
 
-        return cmds
+        return commands
 
-    def _exec_cmd(self, cmd, **kwargs):
+    def _exec_command(self, command, **kwargs):
         """Finally, the command should be executed via
         ``util.exec_subprocess``, which should get all given keyword
         arguments. This could be re-implemented to execute via SSH,
         for instance."""
-        return util.exec_subprocess(cmd, **kwargs)
+        return util.exec_subprocess(command, **kwargs)
 
     def _listdir(self, location):
         """Should return all items present at the given ``location``."""
