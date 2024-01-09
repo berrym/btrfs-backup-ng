@@ -448,6 +448,7 @@ files is allowed as well."""
 
 def run_task(task):
     """Create a list of tasks to run."""
+
     options = parse_options(task)
     logging.basicConfig(
         format="%(asctime)s  [%(levelname)-5s]  %(message)s",
@@ -628,7 +629,7 @@ def main():
     """Main function."""
     elevate_privileges()
     command_line = str()
-    for arg in sys.argv[1:]:  # skip sys.argv[0] since the question didn't ask for it
+    for arg in sys.argv[1:]:
         command_line += f"{arg}  "  # Assume no space => no quotes
 
     tasks = [task.split() for task in command_line.split(":")]
@@ -636,7 +637,6 @@ def main():
     futures = {}
     try:
         with concurrent.futures.ProcessPoolExecutor() as executor:
-            # for task in tasks:
             futures = {executor.submit(run_task, task): task for task in tasks}
 
             for future in concurrent.futures.as_completed(futures):
