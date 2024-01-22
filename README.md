@@ -29,7 +29,7 @@ base has been tagged with `legacy`. If, for any reason, you want to
 continue using it and miss the new features, you can check that out.
 
 Latest release  
-v0.5.5
+v0.5.6
 
 Downloads  
 <http://pypi.python.org/pypi/btrfs_backup_ng>
@@ -396,3 +396,4 @@ Copyright © 2014 Chris Lawrence <lawrencc@debian.org>
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Code style: black](https://img.shields.io/badge/code%20style-black-000000.svg)](https://github.com/psf/black)
+[![build result](https://build.opensuse.org/projects/home:berrym/packages/btrfs-backup-ng/badge.svg?type=default)](https://build.opensuse.org/package/show/home:berrym/btrfs-backup-ng)
