@@ -2,9 +2,12 @@
 requires = ["setuptools>=61.0"]
 build-backend = "setuptools.build_meta"
 
+[tool.setuptools.packages.find]
+where = ["src"]
+
 [project]
 name = "btrfs-backup-ng"
-version = "0.5.5"
+version = "0.5.6"
 description = "Intelligent, feature-rich backups for btrfs"
 authors = [
     {name = "Michael Berry", email = "trismegustis@gmail.com"},
@@ -23,4 +26,4 @@ readme = "README.md"
 Homepage = "https://github.com/berrym/btrfs-backup-ng"
 
 [project.scripts]
-btrfs-backup-ng = "btrfs_backup.__main__:main"
+btrfs-backup-ng = "btrfs_backup_ng.__main__:main"

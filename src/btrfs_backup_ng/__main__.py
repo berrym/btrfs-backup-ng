@@ -474,7 +474,7 @@ def run_task(task):
     if "snapshot_prefix" in options:
         snapshot_prefix = options["snapshot_prefix"]
     else:
-        snapshot_prefix = str()
+        snapshot_prefix = ""
 
     logging.debug("Enable btrfs debugging: %r", options["btrfs_debug"])
     logging.debug("Don't display progress: %r", options["no_progress"])
@@ -621,6 +621,7 @@ def run_task(task):
 def elevate_privileges():
     """Re-run the program using sudo if privileges are needed."""
     if os.getuid() != 0:
+        print("btrfs-backup-ng needs root privileges, will attempt to elevate with sudo")
         command = ("sudo", sys.executable, *sys.argv)
         os.execvp("sudo", command)
 
@@ -628,13 +629,12 @@ def elevate_privileges():
 def main():
     """Main function."""
     elevate_privileges()
-    command_line = str()
+    command_line = ""
     for arg in sys.argv[1:]:
         command_line += f"{arg}  "  # Assume no space => no quotes
 
     tasks = [task.split() for task in command_line.split(":")]
 
-    futures = {}
     try:
         with concurrent.futures.ProcessPoolExecutor() as executor:
             futures = {executor.submit(run_task, task): task for task in tasks}
@@ -645,8 +645,3 @@ def main():
                 print(f"{task}\nResult: {result}")
     except (util.AbortError, KeyboardInterrupt):
         sys.exit(1)
-
-
-# Program entry point
-if __name__ == "__main__":
-    sys.exit(main())
