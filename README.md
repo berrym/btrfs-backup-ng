@@ -397,4 +397,4 @@ Copyright © 2014 Chris Lawrence <lawrencc@debian.org>
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Code style: black](https://img.shields.io/badge/code%20style-black-000000.svg)](https://github.com/psf/black)
 [![build result](https://build.opensuse.org/projects/home:berrym/packages/btrfs-backup-ng/badge.svg?type=default)](https://build.opensuse.org/package/show/home:berrym/btrfs-backup-ng)
-[![build result](https://copr.fedorainfracloud.org/coprs/mberry/btrfs-backup-ng/package/btrfs-backup-ng/status_image/last_build.png)](https://copr.fedorainfracloud.org/coprs/mberry/btrfs-backup-ng/builds)
+[![Copr build status](https://copr.fedorainfracloud.org/coprs/mberry/btrfs-backup-ng/package/btrfs-backup-ng/status_image/last_build.png)](https://copr.fedorainfracloud.org/coprs/mberry/btrfs-backup-ng/package/btrfs-backup-ng/)
