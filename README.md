@@ -29,7 +29,7 @@ base has been tagged with `legacy`. If, for any reason, you want to
 continue using it and miss the new features, you can check that out.
 
 Latest release  
-v0.5.6
+v0.5.7
 
 Downloads  
 <http://pypi.python.org/pypi/btrfs_backup_ng>
@@ -90,7 +90,18 @@ Then, you can fetch the latest version of btrfs-backup-ng:
 
 ### Pre-built packages
 
-There are currently no pre-built packages available.
+There are currently pre-built packages available for Fedora and OpenSUSE Tumbleweed:
+
+Fedora 38, Fedora 39, Fedora Rawhide
+
+    $ dnf copr enable mberry/btrfs-backup-ng
+    $ dnf install btrfs-backup-ng --refresh
+
+OpenSUSE Tumbleweed
+
+    $ sudo zypper addrepo https://download.opensuse.org/repositories/home:berrym/openSUSE_Tumbleweed/home:berrym.repo
+    $ sudo zypper refresh
+    $ zypper install btrfs-backup-ng
 
 ### Manual installation
 
@@ -101,7 +112,7 @@ Clone this git repository
 
     $ git clone https://github.com/berrym/btrfs-backup-ng.git
     $ cd btrfs-backup-ng
-    $ git checkout tags/v0.5.5  # optionally checkout a specific version
+    $ git checkout tags/v0.5.7  # optionally checkout a specific version
     $ python3 -m venv /path/to/btrfs-backup-ng/venv # optionally use venv
     $ sh /path/to/btrfs-backup-ng/venv/bin/activate # using venv
     $ python3 -m build

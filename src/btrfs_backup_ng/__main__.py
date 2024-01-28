@@ -621,19 +621,27 @@ def run_task(task):
 def elevate_privileges():
     """Re-run the program using sudo if privileges are needed."""
     if os.getuid() != 0:
-        print("btrfs-backup-ng needs root privileges, will attempt to elevate with sudo")
+        print(
+            "btrfs-backup-ng needs root privileges, will attempt to elevate with sudo"
+        )
         command = ("sudo", sys.executable, *sys.argv)
         os.execvp("sudo", command)
 
 
 def main():
     """Main function."""
-    elevate_privileges()
     command_line = ""
     for arg in sys.argv[1:]:
         command_line += f"{arg}  "  # Assume no space => no quotes
 
     tasks = [task.split() for task in command_line.split(":")]
+
+    # make sure we have at least one valid task to complete
+    if len(tasks) == 1:
+        _ = parse_options(tasks[0])
+
+    # make sure we have root privileges
+    elevate_privileges()
 
     try:
         with concurrent.futures.ProcessPoolExecutor() as executor:
