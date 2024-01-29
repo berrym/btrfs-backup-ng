@@ -30,11 +30,13 @@ SOFTWARE.
 
 import concurrent.futures
 import logging
+import multiprocessing
 import os
-import subprocess
 import sys
 import time
 from math import inf
+
+from rich import progress
 
 from . import endpoint
 from . import util
@@ -58,29 +60,7 @@ def send_snapshot(
     if clones:
         logging.info("  Using clones: %r", clones)
 
-    pv = False
-    if not no_progress:
-        # check whether pv is available
-        logging.debug("Checking for pv ...")
-        cmd = ["pv", "--help"]
-        logging.debug("Executing: %s", cmd)
-        try:
-            subprocess.call(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        except FileNotFoundError as e:
-            logging.debug("  -> got exception: %s", e)
-            logging.debug("  -> pv is not available")
-        else:
-            logging.debug("  -> pv is available")
-            pv = True
-
     pipes = [snapshot.endpoint.send(snapshot, parent=parent, clones=clones)]
-
-    if pv:
-        cmd = ["pv"]
-        logging.debug("Executing: %s", cmd)
-        pipes.append(
-            subprocess.Popen(cmd, stdin=pipes[-1].stdout, stdout=subprocess.PIPE)
-        )
 
     pipes.append(destination_endpoint.receive(pipes[-1].stdout))
 
@@ -267,19 +247,13 @@ files is allowed as well."""
         "-q",
         "--quiet",
         action="store_true",
-        help="Shortcut for '--no-progress --verbosity " "warning'.",
+        help="Shortcut for '--verbosity " "warning'.",
     )
     group.add_argument(
         "-d",
         "--btrfs-debug",
         action="store_true",
         help="Enable debugging on btrfs send / receive.",
-    )
-    group.add_argument(
-        "-P",
-        "--no-progress",
-        action="store_true",
-        help="Don't display progress and stats during backup.",
     )
 
     group = parser.add_argument_group(
@@ -644,12 +618,53 @@ def main():
     elevate_privileges()
 
     try:
-        with concurrent.futures.ProcessPoolExecutor() as executor:
-            futures = {executor.submit(run_task, task): task for task in tasks}
+        with progress.Progress(
+            "[progress.description]{task.description}",
+            progress.BarColumn(),
+            "[progress.percentage]{task.percentage:>3.0f}%",
+            progress.TimeRemainingColumn(),
+            progress.TimeElapsedColumn(),
+            refresh_per_second=1,  # bit slower updates
+        ) as progress_bars:
+            futures = []  # keep track of the jobs
+            with multiprocessing.Manager() as manager:
+                # this is the key - we share some state between our
+                # main process and our worker functions
+                _progress = manager.dict()
+                overall_progress_task = progress_bars.add_task(
+                    "[green]All jobs progress:"
+                )
 
-            for future in concurrent.futures.as_completed(futures):
-                task = futures[future]
-                result = future.result()
-                print(f"{task}\nResult: {result}")
+                with concurrent.futures.ProcessPoolExecutor() as executor:
+                    futures = {executor.submit(run_task, task): task for task in tasks}
+
+                    for n in range(len(tasks)):  # iterate over the tasks we need to run
+                        # set visible false, so we don't have a lot of bars all at once:
+                        task_id = progress_bars.add_task(f"task {n}", total=None)
+
+                    # monitor the progress:
+                    while (
+                        tasks_completed := sum([future.done() for future in futures])
+                    ) < len(futures):
+                        progress_bars.update(
+                            overall_progress_task,
+                            completed=tasks_completed,
+                            total=len(futures),
+                        )
+                        for task_id, update_data in _progress.items():
+                            latest = update_data["progress"]
+                            total = update_data["total"]
+                            # update the progress bar for this task:
+                            progress_bars.update(
+                                task_id,
+                                completed=latest,
+                                total=total,
+                                visible=latest < total,
+                            )
+
+                    for future in concurrent.futures.as_completed(futures):
+                        task = futures[future]
+                        result = future.result()
+                        print(f"{task}\nResult: {result}")
     except (util.AbortError, KeyboardInterrupt):
         sys.exit(1)

@@ -7,19 +7,19 @@ where = ["src"]
 
 [project]
 name = "btrfs-backup-ng"
-version = "0.5.7"
+version = "0.5.8"
 description = "Intelligent, feature-rich backups for btrfs"
 authors = [
     {name = "Michael Berry", email = "trismegustis@gmail.com"},
 ]
 license = {text = "MIT"}
-dependencies = []
+dependencies = ["rich"]
 classifiers = [
     "Programming Language :: Python :: 3",
     "License :: OSI Approved :: MIT License",
     "Operating System :: POSIX :: Linux",
 ]
-requires-python = ">=3.6"
+requires-python = ">=3.8"
 readme = "README.md"
 
 [project.urls]
