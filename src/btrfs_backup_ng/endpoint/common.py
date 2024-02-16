@@ -61,7 +61,9 @@ class Endpoint:
         logging.info("%s -> %s", self.source, snapshot_path)
 
         commands = [
-            self._build_snapshot_cmd(self.source, snapshot_path, readonly=readonly)
+            self._build_snapshot_cmd(
+                self.source, snapshot_path, readonly=readonly
+            )
         ]
 
         # sync disks
@@ -90,7 +92,9 @@ class Endpoint:
         # from WARNING level onwards, hide stdout
         loglevel = logging.getLogger().getEffectiveLevel()
         stdout = subprocess.DEVNULL if loglevel >= logging.WARNING else None
-        return self._exec_command(cmd, method="Popen", stdin=stdin, stdout=stdout)
+        return self._exec_command(
+            cmd, method="Popen", stdin=stdin, stdout=stdout
+        )
 
     def list_snapshots(self, flush_cache=False):
         """Returns a list with all snapshots found at ``self.path``.
@@ -291,7 +295,9 @@ class Endpoint:
         The stream is piped into stdin when the command is running."""
         return ["btrfs", "receive"] + self.btrfs_flags + [destination]
 
-    def _build_deletion_commands(self, snapshots, convert_rw=None, subvolume_sync=None):
+    def _build_deletion_commands(
+        self, snapshots, convert_rw=None, subvolume_sync=None
+    ):
         """Should return a list of commands that, when executed in order,
         delete the given ``snapshots``. ``convert_rw`` and
         ``subvolume_sync`` should be regarded as well."""

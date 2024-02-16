@@ -68,7 +68,9 @@ def send_snapshot(
     while pids:
         pid, return_code = os.wait()
         if pid in pids:
-            logging.debug("  -> PID %d exited with return code %d", pid, return_code)
+            logging.debug(
+                "  -> PID %d exited with return code %d", pid, return_code
+            )
             pids.remove(pid)
         if return_code != 0:
             logging.error("Error during btrfs send / receive")
@@ -100,7 +102,10 @@ def sync_snapshots(
     # delete corrupt snapshots from destination
     to_remove = []
     for snapshot in source_snapshots:
-        if snapshot in destination_snapshots and destination_id in snapshot.locks:
+        if (
+            snapshot in destination_snapshots
+            and destination_id in snapshot.locks
+        ):
             # seems to have failed previously and is present at
             # destination; delete corrupt snapshot there
             destination_snapshot = destination_snapshots[
@@ -122,7 +127,9 @@ def sync_snapshots(
         if destination_id in snapshot.locks:
             source_endpoint.set_lock(snapshot, destination_id, False)
         if destination_id in snapshot.parent_locks:
-            source_endpoint.set_lock(snapshot, destination_id, False, parent=True)
+            source_endpoint.set_lock(
+                snapshot, destination_id, False, parent=True
+            )
 
     logging.debug("Planning transmissions ...")
     to_consider = source_snapshots
@@ -131,7 +138,9 @@ def sync_snapshots(
         # afterward anyway
         to_consider = to_consider[-keep_num_backups:]
     to_transfer = [
-        snapshot for snapshot in to_consider if snapshot not in destination_snapshots
+        snapshot
+        for snapshot in to_consider
+        if snapshot not in destination_snapshots
     ]
 
     if not to_transfer:
@@ -185,17 +194,22 @@ def sync_snapshots(
             )
         except util.SnapshotTransferError:
             logging.info(
-                "Keeping %s locked to prevent it from getting removed.", best_snapshot
+                "Keeping %s locked to prevent it from getting removed.",
+                best_snapshot,
             )
         else:
             source_endpoint.set_lock(best_snapshot, destination_id, False)
             if parent:
-                source_endpoint.set_lock(parent, destination_id, False, parent=True)
+                source_endpoint.set_lock(
+                    parent, destination_id, False, parent=True
+                )
             destination_endpoint.add_snapshot(best_snapshot)
             destination_snapshots = destination_endpoint.list_snapshots()
         to_transfer.remove(best_snapshot)
 
-    logging.info(util.log_heading(f"Transfers to {destination_endpoint} complete!"))
+    logging.info(
+        util.log_heading(f"Transfers to {destination_endpoint} complete!")
+    )
 
 
 def parse_options(argv):
@@ -459,18 +473,25 @@ def run_task(task):
         (str(options["num_backups"]) if options["num_backups"] > 0 else "Any"),
     )
     logging.debug("Snapshot folder: %s", snapshot_directory)
-    logging.debug("Snapshot prefix: %s", snapshot_prefix if snapshot_prefix else None)
+    logging.debug(
+        "Snapshot prefix: %s", snapshot_prefix if snapshot_prefix else None
+    )
     logging.debug("Don't transfer snapshots: %r", options["no_transfer"])
     logging.debug("Don't send incrementally: %r", options["no_incremental"])
     logging.debug("Extra SSH config options: %s", options["ssh_opt"])
     logging.debug("Use sudo at SSH remote host: %r", options["ssh_sudo"])
     logging.debug("Run 'btrfs subvolume sync' afterwards: %r", options["sync"])
     logging.debug(
-        "Convert subvolumes to read-write before deletion: %r", options["convert_rw"]
+        "Convert subvolumes to read-write before deletion: %r",
+        options["convert_rw"],
     )
-    logging.debug("Remove locks for given destinations: %r", options["remove_locks"])
+    logging.debug(
+        "Remove locks for given destinations: %r", options["remove_locks"]
+    )
     logging.debug("Skip filesystem checks: %r", options["skip_fs_checks"])
-    logging.debug("Auto add locked destinations: %r", options["locked_destinations"])
+    logging.debug(
+        "Auto add locked destinations: %r", options["locked_destinations"]
+    )
 
     # kwargs that are common between all endpoints
     endpoint_kwargs = {
@@ -512,7 +533,9 @@ def run_task(task):
                     source_endpoint.set_lock(snap, destination, False)
                 if destination in snap.parent_locks:
                     logging.info("  %s (%s) [parent]", snap, destination)
-                    source_endpoint.set_lock(snap, destination, False, parent=True)
+                    source_endpoint.set_lock(
+                        snap, destination, False, parent=True
+                    )
 
     destination_endpoints = []
     # only create destination endpoints if they are needed
@@ -529,7 +552,9 @@ def run_task(task):
                     destination, endpoint_kwargs, source=False
                 )
             except ValueError as e:
-                logging.error("Couldn't parse destination specification: %s", e)
+                logging.error(
+                    "Couldn't parse destination specification: %s", e
+                )
                 raise util.AbortError()
             destination_endpoints.append(destination_endpoint)
             logging.debug("Destination endpoint: %s", destination_endpoint)
@@ -571,7 +596,8 @@ def run_task(task):
             source_endpoint.delete_old_snapshots(options["num_snapshots"])
         except util.AbortError as e:
             logging.debug(
-                "Got AbortError while deleting source snapshots at %s\n" "Caught: %s",
+                "Got AbortError while deleting source snapshots at %s\n"
+                "Caught: %s",
                 source_endpoint,
                 e,
             )
@@ -579,10 +605,13 @@ def run_task(task):
     if options["num_backups"] > 0:
         for destination_endpoint in destination_endpoints:
             try:
-                destination_endpoint.delete_old_snapshots(options["num_backups"])
+                destination_endpoint.delete_old_snapshots(
+                    options["num_backups"]
+                )
             except util.AbortError as e:
                 logging.debug(
-                    "Got AbortError while deleting backups at %s\n" "Caught: %s",
+                    "Got AbortError while deleting backups at %s\n"
+                    "Caught: %s",
                     destination_endpoint,
                     e,
                 )
@@ -636,15 +665,23 @@ def main():
                 )
 
                 with concurrent.futures.ProcessPoolExecutor() as executor:
-                    futures = {executor.submit(run_task, task): task for task in tasks}
+                    futures = {
+                        executor.submit(run_task, task): task for task in tasks
+                    }
 
-                    for n in range(len(tasks)):  # iterate over the tasks we need to run
+                    for n in range(
+                        len(tasks)
+                    ):  # iterate over the tasks we need to run
                         # set visible false, so we don't have a lot of bars all at once:
-                        task_id = progress_bars.add_task(f"task {n}", total=None)
+                        task_id = progress_bars.add_task(
+                            f"task {n}", total=None
+                        )
 
                     # monitor the progress:
                     while (
-                        tasks_completed := sum([future.done() for future in futures])
+                        tasks_completed := sum(
+                            [future.done() for future in futures]
+                        )
                     ) < len(futures):
                         progress_bars.update(
                             overall_progress_task,
