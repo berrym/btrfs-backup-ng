@@ -30,16 +30,23 @@ SOFTWARE.
 
 import concurrent.futures
 import logging
-import multiprocessing
+
 import os
 import sys
 import time
 from math import inf
 
-from rich import progress
+from rich.console import Console, Group
+from rich.live import Live
+from rich.logging import RichHandler
+from rich.panel import Panel
+from rich.progress import BarColumn, Progress, SpinnerColumn, TimeElapsedColumn
 
 from . import endpoint
 from . import util
+
+
+console = Console()
 
 
 def send_snapshot(snapshot, destination_endpoint, parent=None, clones=None):
@@ -65,9 +72,7 @@ def send_snapshot(snapshot, destination_endpoint, parent=None, clones=None):
     while pids:
         pid, return_code = os.wait()
         if pid in pids:
-            logging.debug(
-                "  -> PID %d exited with return code %d", pid, return_code
-            )
+            logging.debug("  -> PID %d exited with return code %d", pid, return_code)
             pids.remove(pid)
         if return_code != 0:
             logging.error("Error during btrfs send / receive")
@@ -99,10 +104,7 @@ def sync_snapshots(
     # delete corrupt snapshots from destination
     to_remove = []
     for snapshot in source_snapshots:
-        if (
-            snapshot in destination_snapshots
-            and destination_id in snapshot.locks
-        ):
+        if snapshot in destination_snapshots and destination_id in snapshot.locks:
             # seems to have failed previously and is present at
             # destination; delete corrupt snapshot there
             destination_snapshot = destination_snapshots[
@@ -124,9 +126,7 @@ def sync_snapshots(
         if destination_id in snapshot.locks:
             source_endpoint.set_lock(snapshot, destination_id, False)
         if destination_id in snapshot.parent_locks:
-            source_endpoint.set_lock(
-                snapshot, destination_id, False, parent=True
-            )
+            source_endpoint.set_lock(snapshot, destination_id, False, parent=True)
 
     logging.debug("Planning transmissions ...")
     to_consider = source_snapshots
@@ -135,9 +135,7 @@ def sync_snapshots(
         # afterward anyway
         to_consider = to_consider[-keep_num_backups:]
     to_transfer = [
-        snapshot
-        for snapshot in to_consider
-        if snapshot not in destination_snapshots
+        snapshot for snapshot in to_consider if snapshot not in destination_snapshots
     ]
 
     if not to_transfer:
@@ -197,16 +195,12 @@ def sync_snapshots(
         else:
             source_endpoint.set_lock(best_snapshot, destination_id, False)
             if parent:
-                source_endpoint.set_lock(
-                    parent, destination_id, False, parent=True
-                )
+                source_endpoint.set_lock(parent, destination_id, False, parent=True)
             destination_endpoint.add_snapshot(best_snapshot)
             destination_snapshots = destination_endpoint.list_snapshots()
         to_transfer.remove(best_snapshot)
 
-    logging.info(
-        util.log_heading(f"Transfers to {destination_endpoint} complete!")
-    )
+    logging.info(util.log_heading(f"Transfers to {destination_endpoint} complete!"))
 
 
 def parse_options(argv):
@@ -431,14 +425,14 @@ files is allowed as well."""
     return options
 
 
-def run_task(task):
+def run_task(options):
     """Create a list of tasks to run."""
 
-    options = parse_options(task)
     logging.basicConfig(
-        format="%(asctime)s  [%(levelname)-5s]  %(message)s",
+        format="%(message)s",
         datefmt="%H:%M:%S",
         level=options["verbosity"].upper(),
+        handlers=[RichHandler(console=console)],
     )
 
     # applying shortcuts
@@ -468,9 +462,7 @@ def run_task(task):
         (str(options["num_backups"]) if options["num_backups"] > 0 else "Any"),
     )
     logging.debug("Snapshot folder: %s", snapshot_directory)
-    logging.debug(
-        "Snapshot prefix: %s", snapshot_prefix if snapshot_prefix else None
-    )
+    logging.debug("Snapshot prefix: %s", snapshot_prefix if snapshot_prefix else None)
     logging.debug("Don't transfer snapshots: %r", options["no_transfer"])
     logging.debug("Don't send incrementally: %r", options["no_incremental"])
     logging.debug("Extra SSH config options: %s", options["ssh_opt"])
@@ -480,13 +472,9 @@ def run_task(task):
         "Convert subvolumes to read-write before deletion: %r",
         options["convert_rw"],
     )
-    logging.debug(
-        "Remove locks for given destinations: %r", options["remove_locks"]
-    )
+    logging.debug("Remove locks for given destinations: %r", options["remove_locks"])
     logging.debug("Skip filesystem checks: %r", options["skip_fs_checks"])
-    logging.debug(
-        "Auto add locked destinations: %r", options["locked_destinations"]
-    )
+    logging.debug("Auto add locked destinations: %r", options["locked_destinations"])
 
     # kwargs that are common between all endpoints
     endpoint_kwargs = {
@@ -528,9 +516,7 @@ def run_task(task):
                     source_endpoint.set_lock(snap, destination, False)
                 if destination in snap.parent_locks:
                     logging.info("  %s (%s) [parent]", snap, destination)
-                    source_endpoint.set_lock(
-                        snap, destination, False, parent=True
-                    )
+                    source_endpoint.set_lock(snap, destination, False, parent=True)
 
     destination_endpoints = []
     # only create destination endpoints if they are needed
@@ -547,9 +533,7 @@ def run_task(task):
                     destination, endpoint_kwargs, source=False
                 )
             except ValueError as e:
-                logging.error(
-                    "Couldn't parse destination specification: %s", e
-                )
+                logging.error("Couldn't parse destination specification: %s", e)
                 raise util.AbortError()
             destination_endpoints.append(destination_endpoint)
             logging.debug("Destination endpoint: %s", destination_endpoint)
@@ -590,8 +574,7 @@ def run_task(task):
             source_endpoint.delete_old_snapshots(options["num_snapshots"])
         except util.AbortError as e:
             logging.debug(
-                "Got AbortError while deleting source snapshots at %s\n"
-                "Caught: %s",
+                "Got AbortError while deleting source snapshots at %s\n" "Caught: %s",
                 source_endpoint,
                 e,
             )
@@ -599,13 +582,10 @@ def run_task(task):
     if options["num_backups"] > 0:
         for destination_endpoint in destination_endpoints:
             try:
-                destination_endpoint.delete_old_snapshots(
-                    options["num_backups"]
-                )
+                destination_endpoint.delete_old_snapshots(options["num_backups"])
             except util.AbortError as e:
                 logging.debug(
-                    "Got AbortError while deleting backups at %s\n"
-                    "Caught: %s",
+                    "Got AbortError while deleting backups at %s\n" "Caught: %s",
                     destination_endpoint,
                     e,
                 )
@@ -633,69 +613,86 @@ def main():
 
     tasks = [task.split() for task in command_line.split(":")]
 
+    task_options = []
+
     # make sure we have at least one valid task to complete
-    if len(tasks) == 1:
-        _ = parse_options(tasks[0])
+    for task in tasks:
+        task_options.append(parse_options(task))
 
     # make sure we have root privileges
     elevate_privileges()
 
+    overall_progress = Progress(
+        "[progress.description]{task.description}",
+        BarColumn(),
+        "[progress.percentage]{task.percentage:>3.0f}%",
+        SpinnerColumn(),
+        TimeElapsedColumn(),
+        refresh_per_second=4,
+    )
+
+    tasks_progress = Progress(
+        "{task.description}",
+        BarColumn(),
+        SpinnerColumn(),
+        TimeElapsedColumn(),
+        refresh_per_second=4,
+    )
+
+    progress_group = Group(Panel(tasks_progress), Panel(overall_progress))
+
     try:
-        with progress.Progress(
-            "[progress.description]{task.description}",
-            progress.BarColumn(),
-            "[progress.percentage]{task.percentage:>3.0f}%",
-            progress.TimeRemainingColumn(),
-            progress.TimeElapsedColumn(),
-            refresh_per_second=1,  # bit slower updates
-        ) as progress_bars:
-            futures = []  # keep track of the jobs
-            with multiprocessing.Manager() as manager:
-                # this is the key - we share some state between our
-                # main process and our worker functions
-                _progress = manager.dict()
-                overall_progress_task = progress_bars.add_task(
-                    "[green]All jobs progress:"
+        with Live(progress_group, console=console, refresh_per_second=4):
+            futures = []  # keep track of the concurrent futures
+            task_numbers = []
+            futures_id_map = {}
+
+            with concurrent.futures.ProcessPoolExecutor(max_workers=8) as executor:
+                for n, _ in enumerate(tasks):
+                    futures.append(executor.submit(run_task, task_options[n]))
+
+                    task_id = tasks_progress.add_task(
+                        f"[red]task {n}: [cyan]{task_options[n]['source']} -> {task_options[n]['destinations']}",
+                        total=None,
+                        visible=True,
+                    )
+                    task_numbers.append(task_id)
+                    futures_id_map[futures[n]] = task_id
+
+                # Total count of completed tasks
+                total_tasks = len(task_numbers)
+                # tasks_completed = 0
+
+                overall_task_id = overall_progress.add_task(
+                    "[green]All jobs progress:",
+                    total=total_tasks,
+                    visible=True,
                 )
 
-                with concurrent.futures.ProcessPoolExecutor() as executor:
-                    futures = {
-                        executor.submit(run_task, task): task for task in tasks
-                    }
+                # monitor the progress
+                for future in concurrent.futures.as_completed(futures):
+                    result = future.result()
+                    task_id = futures_id_map[future]
+                    logging.info(
+                        "Task %d has completed, result: %s",
+                        task_id,
+                        result,
+                    )
+                    tasks_progress.update(
+                        task_id,
+                        description=f"[red]Task {task_id}: [bold yellow]Completed!",
+                        total=1,
+                        completed=1,
+                    )
+                    overall_progress.update(
+                        overall_task_id,
+                        advance=1,
+                    )
 
-                    for n in range(
-                        len(tasks)
-                    ):  # iterate over the tasks we need to run
-                        # set visible false, so we don't have a lot of bars all at once:
-                        task_id = progress_bars.add_task(
-                            f"task {n}", total=None
-                        )
-
-                    # monitor the progress:
-                    while (
-                        tasks_completed := sum(
-                            [future.done() for future in futures]
-                        )
-                    ) < len(futures):
-                        progress_bars.update(
-                            overall_progress_task,
-                            completed=tasks_completed,
-                            total=len(futures),
-                        )
-                        for task_id, update_data in _progress.items():
-                            latest = update_data["progress"]
-                            total = update_data["total"]
-                            # update the progress bar for this task:
-                            progress_bars.update(
-                                task_id,
-                                completed=latest,
-                                total=total,
-                                visible=latest < total,
-                            )
-
-                    for future in concurrent.futures.as_completed(futures):
-                        task = futures[future]
-                        result = future.result()
-                        print(f"{task}\nResult: {result}")
+            overall_progress.update(
+                overall_task_id,
+                description="[bold yellow]All tasks have finished!",
+                completed=total_tasks,
+            )
     except (util.AbortError, KeyboardInterrupt):
         sys.exit(1)
