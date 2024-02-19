@@ -111,7 +111,7 @@ Clone this git repository
 
     $ git clone https://github.com/berrym/btrfs-backup-ng.git
     $ cd btrfs-backup-ng
-    $ git checkout tags/v0.5.9  # optionally checkout a specific version
+    $ git checkout tags/v0.5.10  # optionally checkout a specific version
     $ python3 -m venv /path/to/btrfs-backup-ng/venv # optionally use venv
     $ sh /path/to/btrfs-backup-ng/venv/bin/activate # using venv
     $ python3 -m build
