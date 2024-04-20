@@ -44,3 +44,5 @@ btrfs_backup-*.tar.gz
 
 # ide
 .idea
+.vscode
+venv

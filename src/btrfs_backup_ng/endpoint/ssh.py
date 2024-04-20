@@ -83,9 +83,7 @@ class SSHEndpoint(Endpoint):
             cmd += ["-o", opt]
         cmd += [f"{self._build_connect_string()}:/", mount_point]
         try:
-            util.exec_subprocess(
-                cmd, method="check_call", stdout=subprocess.DEVNULL
-            )
+            util.exec_subprocess(cmd, method="check_call", stdout=subprocess.DEVNULL)
         except FileNotFoundError as e:
             logging.debug("  -> got exception: %s", e)
             if self.source:
@@ -111,9 +109,7 @@ class SSHEndpoint(Endpoint):
                     try:
                         os.makedirs(self._path_to_sshfs(d))
                     except OSError as e:
-                        logging.error(
-                            "Error creating new location %s: %s", d, e
-                        )
+                        logging.error("Error creating new location %s: %s", d, e)
                         raise util.AbortError()
         else:
             cmd = ["mkdir", "-p"] + dirs

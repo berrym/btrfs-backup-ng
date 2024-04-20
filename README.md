@@ -29,7 +29,7 @@ base has been tagged with `legacy`. If, for any reason, you want to
 continue using it and miss the new features, you can check that out.
 
 Latest release  
-v0.5.9
+v0.5.11
 
 Downloads  
 <http://pypi.python.org/pypi/btrfs_backup_ng>
@@ -85,7 +85,7 @@ distribution, simply install it via:
 
 Then, you can fetch the latest version of btrfs-backup-ng:
 
-    $ sudo pip3 install btrfs-backup-ng
+    $ pip3 install btrfs-backup-ng
 
 ### Pre-built packages
 
@@ -111,7 +111,7 @@ Clone this git repository
 
     $ git clone https://github.com/berrym/btrfs-backup-ng.git
     $ cd btrfs-backup-ng
-    $ git checkout tags/v0.5.10  # optionally checkout a specific version
+    $ git checkout tags/v0.5.11  # optionally checkout a specific version
     $ python3 -m venv /path/to/btrfs-backup-ng/venv # optionally use venv
     $ sh /path/to/btrfs-backup-ng/venv/bin/activate # using venv
     $ python3 -m build

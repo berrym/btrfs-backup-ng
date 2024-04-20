@@ -44,12 +44,8 @@ class LocalEndpoint(Endpoint):
             and self.fs_checks
             and not util.is_subvolume(self.source)
         ):
-            logging.error(
-                "%s does not seem to be a btrfs subvolume", self.source
-            )
+            logging.error("%s does not seem to be a btrfs subvolume", self.source)
             raise util.AbortError()
         if self.fs_checks and not util.is_btrfs(self.path):
-            logging.error(
-                "%s does not seem to be on a btrfs filesystem", self.path
-            )
+            logging.error("%s does not seem to be on a btrfs filesystem", self.path)
             raise util.AbortError()
