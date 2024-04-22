@@ -1,11 +1,11 @@
-"""btrfs-backup-ng: btrfs-backup/local.py
+"""btrfs-backup-ng: btrfs_backup_ng/endpoint/local.py
 Create commands with local endpoints.
 """
 
-import logging
 import os
 
 from .common import Endpoint
+from ..rich_logger import logger
 from .. import util
 
 
@@ -32,11 +32,11 @@ class LocalEndpoint(Endpoint):
         dirs.append(self.path)
         for d in dirs:
             if not os.path.isdir(d):
-                logging.info("Creating directory: %s", d)
+                logger.info("Creating directory: %s", d)
                 try:
                     os.makedirs(d)
                 except OSError as e:
-                    logging.error("Error creating new location %s: %s", d, e)
+                    logger.error("Error creating new location %s: %s", d, e)
                     raise util.AbortError()
 
         if (
@@ -44,8 +44,8 @@ class LocalEndpoint(Endpoint):
             and self.fs_checks
             and not util.is_subvolume(self.source)
         ):
-            logging.error("%s does not seem to be a btrfs subvolume", self.source)
+            logger.error("%s does not seem to be a btrfs subvolume", self.source)
             raise util.AbortError()
         if self.fs_checks and not util.is_btrfs(self.path):
-            logging.error("%s does not seem to be on a btrfs filesystem", self.path)
+            logger.error("%s does not seem to be on a btrfs filesystem", self.path)
             raise util.AbortError()

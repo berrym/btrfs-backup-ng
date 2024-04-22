@@ -1,4 +1,4 @@
-"""btrfs-backup-ng: btrfs-backup/endpoint/common.py
+"""btrfs-backup-ng: btrfs_backup_ng/endpoint/common.py
 Common functionality among modules.
 """
 
@@ -6,6 +6,7 @@ import logging
 import os
 import subprocess
 
+from ..rich_logger import logger
 from .. import util
 
 
@@ -49,7 +50,7 @@ class Endpoint:
 
     def prepare(self):
         """Public access to _prepare, which is called after creating an endpoint.XS"""
-        logging.info("Preparing endpoint %r ...", self)
+        logger.info("Preparing endpoint %r ...", self)
         return self._prepare()
 
     @require_source
@@ -58,7 +59,7 @@ class Endpoint:
 
         snapshot = util.Snapshot(self.path, self.snap_prefix, self)
         snapshot_path = snapshot.get_path()
-        logging.info("%s -> %s", self.source, snapshot_path)
+        logger.info("%s -> %s", self.source, snapshot_path)
 
         commands = [
             self._build_snapshot_cmd(self.source, snapshot_path, readonly=readonly)
@@ -98,14 +99,14 @@ class Endpoint:
         if available."""
 
         if self.__cached_snapshots is not None and not flush_cache:
-            logging.debug(
+            logger.debug(
                 "Returning %d cached snapshots for %r.",
                 len(self.__cached_snapshots),
                 self,
             )
             return list(self.__cached_snapshots)
 
-        logging.debug("Building snapshot cache of %r ...", self)
+        logger.debug("Building snapshot cache of %r ...", self)
         snapshots = []
         listdir = self._listdir(self.path)
         for item in listdir:
@@ -135,7 +136,7 @@ class Endpoint:
 
         # populate cache
         self.__cached_snapshots = snapshots
-        logging.debug(
+        logger.debug(
             "Populated snapshot cache of %r with %d items.",
             self,
             len(snapshots),
@@ -167,7 +168,7 @@ class Endpoint:
             if snap_entry:
                 lock_dict[_snapshot.get_name()] = snap_entry
         self._write_locks(lock_dict)
-        logging.debug(
+        logger.debug(
             "Lock state for %s and lock_id %s changed to %s (parent = %s)",
             snapshot,
             lock_id,
@@ -205,12 +206,12 @@ class Endpoint:
             if not snapshot.locks and not snapshot.parent_locks:
                 to_remove.append(snapshot)
 
-        logging.info("Removing %d snapshot(s) from %r:", len(to_remove), self)
+        logger.info("Removing %d snapshot(s) from %r:", len(to_remove), self)
         for snapshot in snapshots:
             if snapshot in to_remove:
-                logging.info("  %s", snapshot)
+                logger.info("  %s", snapshot)
             else:
-                logging.info("  %s - is locked, keeping it", snapshot)
+                logger.info("  %s - is locked, keeping it", snapshot)
 
         if to_remove:
             # finally delete them
@@ -366,7 +367,7 @@ class Endpoint:
             with open(path, "r", encoding="utf-8") as f:
                 return util.read_locks(f.read())
         except (OSError, ValueError) as e:
-            logging.error("Error on reading lock file %s: %s", path, e)
+            logger.error("Error on reading lock file %s: %s", path, e)
             raise util.AbortError()
 
     @require_source
@@ -375,9 +376,9 @@ class Endpoint:
         ``util.read_locks`` returns it."""
         path = self._get_lock_file_path()
         try:
-            logging.debug("Writing lock file: %s", path)
+            logger.debug("Writing lock file: %s", path)
             with open(path, "w", encoding="utf-8") as f:
                 f.write(util.write_locks(lock_dict))
         except OSError as e:
-            logging.error("Error on writing lock file %s: %s", path, e)
+            logger.error("Error on writing lock file %s: %s", path, e)
             raise util.AbortError()

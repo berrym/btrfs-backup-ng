@@ -1,14 +1,14 @@
-"""btrfs-backup-ng: btrfs-backup/ssh.py
+"""btrfs-backup-ng: btrfs_backup_ng/endpoint/ssh.py
 Create commands with ssh endpoints.
 """
 
 import copy
-import logging
 import os
 import subprocess
 import tempfile
 
 from .common import Endpoint
+from ..rich_logger import logger
 from .. import util
 
 
@@ -52,7 +52,7 @@ class SSHEndpoint(Endpoint):
 
     def _prepare(self):
         # check whether ssh is available
-        logging.debug("Checking for ssh ...")
+        logger.debug("Checking for ssh ...")
         cmd = ["ssh"]
         try:
             util.exec_subprocess(
@@ -62,19 +62,19 @@ class SSHEndpoint(Endpoint):
                 stderr=subprocess.DEVNULL,
             )
         except FileNotFoundError as e:
-            logging.debug("  -> got exception: %s", e)
-            logging.info("ssh command is not available")
+            logger.debug("  -> got exception: %s", e)
+            logger.info("ssh command is not available")
             raise util.AbortError()
 
-        logging.debug("  -> ssh is available")
+        logger.debug("  -> ssh is available")
 
         # sshfs is useful for listing directories and reading/writing locks
         tempdir = tempfile.mkdtemp()
-        logging.debug("Created tempdir: %s", tempdir)
+        logger.debug("Created tempdir: %s", tempdir)
         mount_point = os.path.join(tempdir, "mnt")
         os.makedirs(mount_point)
-        logging.debug("Created directory: %s", mount_point)
-        logging.debug("Mounting sshfs ...")
+        logger.debug("Created directory: %s", mount_point)
+        logger.debug("Mounting sshfs ...")
 
         cmd = ["sshfs"]
         if self.port:
@@ -85,17 +85,17 @@ class SSHEndpoint(Endpoint):
         try:
             util.exec_subprocess(cmd, method="check_call", stdout=subprocess.DEVNULL)
         except FileNotFoundError as e:
-            logging.debug("  -> got exception: %s", e)
+            logger.debug("  -> got exception: %s", e)
             if self.source:
                 # we need that for the locks
-                logging.info(
+                logger.info(
                     "  The sshfs command is not available but it is "
                     "mandatory for sourcing from SSH."
                 )
                 raise util.AbortError()
         else:
             self.sshfs = mount_point
-            logging.debug("  -> sshfs is available")
+            logger.debug("  -> sshfs is available")
 
         # create directories, if needed
         dirs = []
@@ -105,11 +105,11 @@ class SSHEndpoint(Endpoint):
         if self.sshfs:
             for d in dirs:
                 if not os.path.isdir(self._path_to_sshfs(d)):
-                    logging.info("Creating directory: %s", d)
+                    logger.info("Creating directory: %s", d)
                     try:
                         os.makedirs(self._path_to_sshfs(d))
                     except OSError as e:
-                        logging.error("Error creating new location %s: %s", d, e)
+                        logger.error("Error creating new location %s: %s", d, e)
                         raise util.AbortError()
         else:
             cmd = ["mkdir", "-p"] + dirs

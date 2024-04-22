@@ -29,27 +29,22 @@ SOFTWARE.
 """
 
 import concurrent.futures
-import logging
-
 import os
 import sys
 import time
+
 from math import inf
 
 from rich.align import Align
-from rich.console import Group
 from rich.layout import Layout
 from rich.live import Live
-from rich.logging import RichHandler
 from rich.panel import Panel
 from rich.progress import BarColumn, Progress, SpinnerColumn, TimeElapsedColumn
 from rich.text import Text
 
 from . import endpoint
+from .rich_logger import RichLogger, logger
 from . import util
-
-
-layout = Layout(name="root")
 
 
 def send_snapshot(snapshot, destination_endpoint, parent=None, clones=None):
@@ -59,13 +54,13 @@ def send_snapshot(snapshot, destination_endpoint, parent=None, clones=None):
     """
 
     # Now we need to send the snapshot (incrementally, if possible)
-    logging.info("Sending %s ...", snapshot)
+    logger.info("Sending %s ...", snapshot)
     if parent:
-        logging.info("  Using parent: %s", parent)
+        logger.info("  Using parent: %s", parent)
     else:
-        logging.info("  No parent snapshot available, sending in full mode.")
+        logger.info("  No parent snapshot available, sending in full mode.")
     if clones:
-        logging.info("  Using clones: %r", clones)
+        logger.info("  Using clones: %r", clones)
 
     pipes = [snapshot.endpoint.send(snapshot, parent=parent, clones=clones)]
 
@@ -75,10 +70,10 @@ def send_snapshot(snapshot, destination_endpoint, parent=None, clones=None):
     while pids:
         pid, return_code = os.wait()
         if pid in pids:
-            logging.debug("  -> PID %d exited with return code %d", pid, return_code)
+            logger.debug("  -> PID %d exited with return code %d", pid, return_code)
             pids.remove(pid)
         if return_code != 0:
-            logging.error("Error during btrfs send / receive")
+            logger.error("Error during btrfs send / receive")
             raise util.SnapshotTransferError()
 
 
@@ -98,7 +93,7 @@ def sync_snapshots(
 
     # global snapshot
     snapshot = None
-    logging.info(util.log_heading(f"  To {destination_endpoint} ..."))
+    logger.info(util.log_heading(f"  To {destination_endpoint} ..."))
 
     source_snapshots = source_endpoint.list_snapshots()
     destination_snapshots = destination_endpoint.list_snapshots()
@@ -113,7 +108,7 @@ def sync_snapshots(
             destination_snapshot = destination_snapshots[
                 destination_snapshots.index(snapshot)
             ]
-            logging.info(
+            logger.info(
                 "Potentially corrupt snapshot %s found at %s",
                 destination_snapshot,
                 destination_endpoint,
@@ -131,7 +126,7 @@ def sync_snapshots(
         if destination_id in snapshot.parent_locks:
             source_endpoint.set_lock(snapshot, destination_id, False, parent=True)
 
-    logging.debug("Planning transmissions ...")
+    logger.debug("Planning transmissions ...")
     to_consider = source_snapshots
     if keep_num_backups > 0:
         # it wouldn't make sense to transfer snapshots that would be deleted
@@ -142,12 +137,12 @@ def sync_snapshots(
     ]
 
     if not to_transfer:
-        logging.info("No snapshots need to be transferred.")
+        logger.info("No snapshots need to be transferred.")
         return
 
-    logging.info("Going to transfer %d snapshot(s):", len(to_transfer))
+    logger.info("Going to transfer %d snapshot(s):", len(to_transfer))
     for _ in to_transfer:
-        logging.info("  %s", snapshot)
+        logger.info("  %s", snapshot)
 
     while to_transfer:
         if no_incremental:
@@ -191,7 +186,7 @@ def sync_snapshots(
                 **kwargs,
             )
         except util.SnapshotTransferError:
-            logging.info(
+            logger.info(
                 "Keeping %s locked to prevent it from getting removed.",
                 best_snapshot,
             )
@@ -203,7 +198,7 @@ def sync_snapshots(
             destination_snapshots = destination_endpoint.list_snapshots()
         to_transfer.remove(best_snapshot)
 
-    logging.info(util.log_heading(f"Transfers to {destination_endpoint} complete!"))
+    logger.info(util.log_heading(f"Transfers to {destination_endpoint} complete!"))
 
 
 def parse_options(argv):
@@ -431,12 +426,7 @@ files is allowed as well."""
 def run_task(options):
     """Create a list of tasks to run."""
 
-    logging.basicConfig(
-        format="%(message)s",
-        datefmt="%H:%M:%S",
-        level=options["verbosity"].upper(),
-        handlers=[RichHandler()],
-    )
+    logger.setLevel(options["verbosity"].upper())
 
     # applying shortcuts
     if "quiet" in options:
@@ -444,9 +434,9 @@ def run_task(options):
     if "latest_only" in options:
         options["num_snapshots"] = 1
 
-    logging.info(util.log_heading(f"Started at {time.ctime()}"))
+    logger.info(util.log_heading(f"Started at {time.ctime()}"))
 
-    logging.debug(util.log_heading("Settings"))
+    logger.debug(util.log_heading("Settings"))
     if "snapshot_folder" in options:
         snapshot_directory = options["snapshot_folder"]
     else:
@@ -457,27 +447,27 @@ def run_task(options):
     else:
         snapshot_prefix = f"{os.uname()[1]}-"
 
-    logging.debug("Enable btrfs debugging: %r", options["btrfs_debug"])
-    logging.debug("Don't take a new snapshot: %r", options["no_snapshot"])
-    logging.debug("Number of snapshots to keep: %d", options["num_snapshots"])
-    logging.debug(
+    logger.debug("Enable btrfs debugging: %r", options["btrfs_debug"])
+    logger.debug("Don't take a new snapshot: %r", options["no_snapshot"])
+    logger.debug("Number of snapshots to keep: %d", options["num_snapshots"])
+    logger.debug(
         "Number of backups to keep: %s",
         (str(options["num_backups"]) if options["num_backups"] > 0 else "Any"),
     )
-    logging.debug("Snapshot folder: %s", snapshot_directory)
-    logging.debug("Snapshot prefix: %s", snapshot_prefix if snapshot_prefix else None)
-    logging.debug("Don't transfer snapshots: %r", options["no_transfer"])
-    logging.debug("Don't send incrementally: %r", options["no_incremental"])
-    logging.debug("Extra SSH config options: %s", options["ssh_opt"])
-    logging.debug("Use sudo at SSH remote host: %r", options["ssh_sudo"])
-    logging.debug("Run 'btrfs subvolume sync' afterwards: %r", options["sync"])
-    logging.debug(
+    logger.debug("Snapshot folder: %s", snapshot_directory)
+    logger.debug("Snapshot prefix: %s", snapshot_prefix if snapshot_prefix else None)
+    logger.debug("Don't transfer snapshots: %r", options["no_transfer"])
+    logger.debug("Don't send incrementally: %r", options["no_incremental"])
+    logger.debug("Extra SSH config options: %s", options["ssh_opt"])
+    logger.debug("Use sudo at SSH remote host: %r", options["ssh_sudo"])
+    logger.debug("Run 'btrfs subvolume sync' afterwards: %r", options["sync"])
+    logger.debug(
         "Convert subvolumes to read-write before deletion: %r",
         options["convert_rw"],
     )
-    logging.debug("Remove locks for given destinations: %r", options["remove_locks"])
-    logging.debug("Skip filesystem checks: %r", options["skip_fs_checks"])
-    logging.debug("Auto add locked destinations: %r", options["locked_destinations"])
+    logger.debug("Remove locks for given destinations: %r", options["remove_locks"])
+    logger.debug("Skip filesystem checks: %r", options["skip_fs_checks"])
+    logger.debug("Auto add locked destinations: %r", options["locked_destinations"])
 
     # kwargs that are common between all endpoints
     endpoint_kwargs = {
@@ -490,7 +480,7 @@ def run_task(options):
         "ssh_sudo": options["ssh_sudo"],
     }
 
-    logging.debug("Source: %s", options["source"])
+    logger.debug("Source: %s", options["source"])
     source_endpoint_kwargs = dict(endpoint_kwargs)
     source_endpoint_kwargs["path"] = snapshot_directory
     try:
@@ -498,9 +488,9 @@ def run_task(options):
             options["source"], source_endpoint_kwargs, source=True
         )
     except ValueError as e:
-        logging.error("Couldn't parse source specification: %s", e)
+        logger.error("Couldn't parse source specification: %s", e)
         raise util.AbortError()
-    logging.debug("Source endpoint: %s", source_endpoint)
+    logger.debug("Source endpoint: %s", source_endpoint)
     source_endpoint.prepare()
 
     # add endpoint creation strings for locked destinations, if desired
@@ -511,48 +501,48 @@ def run_task(options):
                     options["destinations"].append(lock)
 
     if "remove_locks" in options.keys():
-        logging.info("Removing locks (--remove-locks) ...")
+        logger.info("Removing locks (--remove-locks) ...")
         for snap in source_endpoint.list_snapshots():
             for destination in options["destinations"]:
                 if destination in snap.locks:
-                    logging.info("  %s (%s)", snap, destination)
+                    logger.info("  %s (%s)", snap, destination)
                     source_endpoint.set_lock(snap, destination, False)
                 if destination in snap.parent_locks:
-                    logging.info("  %s (%s) [parent]", snap, destination)
+                    logger.info("  %s (%s) [parent]", snap, destination)
                     source_endpoint.set_lock(snap, destination, False, parent=True)
 
     destination_endpoints = []
     # only create destination endpoints if they are needed
     if options["no_transfer"] and options["num_backups"] <= 0:
-        logging.debug(
+        logger.debug(
             "Don't create destination endpoints because they won't be needed "
             "(--no-transfer and no --num-backups)."
         )
     else:
         for destination in options["destinations"]:
-            logging.debug("Destination: %s", destination)
+            logger.debug("Destination: %s", destination)
             try:
                 destination_endpoint = endpoint.choose_endpoint(
                     destination, endpoint_kwargs, source=False
                 )
             except ValueError as e:
-                logging.error("Couldn't parse destination specification: %s", e)
+                logger.error("Couldn't parse destination specification: %s", e)
                 raise util.AbortError()
             destination_endpoints.append(destination_endpoint)
-            logging.debug("Destination endpoint: %s", destination_endpoint)
+            logger.debug("Destination endpoint: %s", destination_endpoint)
             destination_endpoint.prepare()
 
     if options["no_snapshot"]:
-        logging.info("Taking no snapshot (--no-snapshot).")
+        logger.info("Taking no snapshot (--no-snapshot).")
     else:
         # First we need to create a new snapshot on the source disk
-        logging.info(util.log_heading("Snapshotting ..."))
+        logger.info(util.log_heading("Snapshotting ..."))
         source_endpoint.snapshot()
 
     if options["no_transfer"]:
-        logging.info(util.log_heading("Not transferring (--no-transfer)."))
+        logger.info(util.log_heading("Not transferring (--no-transfer)."))
     else:
-        logging.info(util.log_heading("Transferring ..."))
+        logger.info(util.log_heading("Transferring ..."))
         for destination_endpoint in destination_endpoints:
             try:
                 sync_snapshots(
@@ -562,21 +552,21 @@ def run_task(options):
                     no_incremental=options["no_incremental"],
                 )
             except util.AbortError as e:
-                logging.error(
+                logger.error(
                     "Aborting snapshot transfer to %s due to exception.",
                     destination_endpoint,
                 )
-                logging.debug("Exception was: %s", e)
+                logger.debug("Exception was: %s", e)
         if not destination_endpoints:
-            logging.info("No destination configured, don't sending anything.")
+            logger.info("No destination configured, don't sending anything.")
 
-    logging.info(util.log_heading("Cleaning up..."))
+    logger.info(util.log_heading("Cleaning up..."))
     # cleanup snapshots > num_snapshots in snap_dir
     if options["num_snapshots"] > 0:
         try:
             source_endpoint.delete_old_snapshots(options["num_snapshots"])
         except util.AbortError as e:
-            logging.debug(
+            logger.debug(
                 "Got AbortError while deleting source snapshots at %s\n" "Caught: %s",
                 source_endpoint,
                 e,
@@ -587,13 +577,13 @@ def run_task(options):
             try:
                 destination_endpoint.delete_old_snapshots(options["num_backups"])
             except util.AbortError as e:
-                logging.debug(
+                logger.debug(
                     "Got AbortError while deleting backups at %s\n" "Caught: %s",
                     destination_endpoint,
                     e,
                 )
 
-    logging.info(util.log_heading(f"Finished at {time.ctime()}"))
+    logger.info(util.log_heading(f"Finished at {time.ctime()}"))
 
     return "Success"
 
@@ -640,55 +630,66 @@ def main():
         TimeElapsedColumn(),
     )
 
-    progress_group = Group(Panel(tasks_progress), Panel(overall_progress))
+    layout = Layout(name="root")
 
     layout.split(
-        Layout(name="header"),
+        Layout(name="header", size=5),
         Layout(name="main"),
+        Layout(name="footer", size=3),
+    )
+
+    layout["main"].split_row(
+        Layout(name="tasks"), Layout(name="logs", ratio=2, minimum_size=80)
     )
 
     layout["header"].update(
         Panel(
             Align.center(
                 Text(
-                    """btrfs-backup-ng\n\nIncremental atomic backups for the btrfs filesystem.""",
+                    """btrfs-backup-ng\n\nIncremental backups for the btrfs filesystem.""",
                     justify="center",
                 ),
                 vertical="middle",
             )
-        )
+        ),
     )
 
-    layout["main"].update(progress_group)
+    total_tasks = len(tasks)
+    overall_task_id = overall_progress.add_task(
+        "[green]All jobs progress:",
+        total=total_tasks,
+    )
+
+    layout["tasks"].update(Panel(tasks_progress))
+
+    log = RichLogger()
+    layout["logs"].update(Panel(Text("\n".join(log.messages))))
+
+    layout["footer"].update(Panel(overall_progress))
 
     futures = []  # keep track of the concurrent futures
     futures_id_map = {}  # associate a task_id with futures
 
     try:
-        with concurrent.futures.ProcessPoolExecutor(max_workers=8) as executor:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
             for n in range(len(tasks)):
                 futures.append(executor.submit(run_task, task_options[n]))
                 task_id = tasks_progress.add_task(
-                    f"[red]task {n}: [cyan]{task_options[n]['source']} -> {task_options[n]['destinations']}",
+                    f"[red]task: [cyan]{task_options[n]['source']}",
                     total=None,
-                    visible=True,
                 )
                 futures_id_map[futures[n]] = task_id
+                layout["logs"].update(Panel(Text("\n".join(log.messages))))
 
-            total_tasks = len(tasks)
-            overall_task_id = overall_progress.add_task(
-                "[green]All jobs progress:",
-                total=total_tasks,
-                visible=True,
-            )
-
-            with Live(layout):
+            with Live(layout, refresh_per_second=10):
                 while not overall_progress.finished:
-                    for future in concurrent.futures.as_completed(futures):
+                    layout["logs"].update(Panel(Text("\n".join(log.messages))))
+                    done, _ = concurrent.futures.wait(futures, timeout=1)
+                    for future in done:
+                        layout["logs"].update(Panel(Text("\n".join(log.messages))))
                         task_id = futures_id_map[future]
                         tasks_progress.update(
                             task_id,
-                            description=f"[red]Task {task_id}: [bold yellow]Completed!",
                             total=1,
                             completed=1,
                         )
@@ -696,9 +697,9 @@ def main():
                             overall_task_id,
                             advance=1,
                         )
+                        futures.remove(future)
                 overall_progress.update(
                     overall_task_id,
-                    description="[bold yellow]All tasks have completed!",
                     completed=total_tasks,
                 )
     except (util.AbortError, KeyboardInterrupt):

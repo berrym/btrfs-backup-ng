@@ -1,15 +1,17 @@
-"""btrfs-backup-ng: btrfs-backup/util.py
+"""btrfs-backup-ng: btrfs_backup_ng/util.py
 Common utility code shared between modules.
 """
 
 import argparse
 import functools
 import json
-import logging
 import os
 import subprocess
 import sys
 import time
+
+from .rich_logger import logger
+
 
 DATE_FORMAT = "%Y%m%d-%H%M%S"
 MOUNTS_FILE = "/proc/mounts"
@@ -80,12 +82,12 @@ def exec_subprocess(command, method="check_output", **kwargs):
     """Executes ``getattr(subprocess, method)(cmd, **kwargs)`` and takes
     care of proper logging and error handling. ``AbortError`` is raised
     in case of a ``subprocess.CalledProcessError``."""
-    logging.debug("Executing: %s", command)
+    logger.debug("Executing: %s", command)
     m = getattr(subprocess, method)
     try:
         return m(command, **kwargs)
     except subprocess.CalledProcessError as e:
-        logging.error("Error on command: %s\nCaught: %s", command, e)
+        logger.error("Error on command: %s\nCaught: %s", command, e)
         raise AbortError() from e
 
 
@@ -117,15 +119,15 @@ def str_to_date(time_string=None, fmt=None):
 def is_btrfs(path):
     """Checks whether path is inside a btrfs file system"""
     path = os.path.normpath(os.path.abspath(path))
-    logging.debug("Checking for btrfs filesystem: %s", path)
+    logger.debug("Checking for btrfs filesystem: %s", path)
     best_match = ""
     best_match_fs_type = ""
-    logging.debug("  Reading mounts file: %s", MOUNTS_FILE)
+    logger.debug("  Reading mounts file: %s", MOUNTS_FILE)
     for line in open(MOUNTS_FILE, encoding="utf-8"):
         try:
             mount_point, fs_type = line.split(" ")[1:3]
         except ValueError as e:
-            logging.debug("  Couldn't split line, skipping: %s\nCaught: %s", line, e)
+            logger.debug("  Couldn't split line, skipping: %s\nCaught: %s", line, e)
             continue
         mount_point_prefix = mount_point
         if not mount_point_prefix.endswith(os.sep):
@@ -135,13 +137,13 @@ def is_btrfs(path):
         ) > len(best_match):
             best_match = mount_point
             best_match_fs_type = fs_type
-            logging.debug(
+            logger.debug(
                 "  New best_match with filesystem type %s: %s",
                 best_match_fs_type,
                 best_match,
             )
     result = best_match_fs_type == "btrfs"
-    logging.debug(
+    logger.debug(
         "  -> best_match_fs_type is %s, result is %r",
         best_match_fs_type,
         result,
@@ -153,11 +155,11 @@ def is_subvolume(path):
     """Checks whether the given path is a btrfs subvolume."""
     if not is_btrfs(path):
         return False
-    logging.debug("Checking for btrfs subvolume: %s", path)
+    logger.debug("Checking for btrfs subvolume: %s", path)
     # subvolumes always have inode 256
     st = os.stat(path)
     result = st.st_ino == 256
-    logging.debug("  -> Inode is %d, result is %r", st.st_ino, result)
+    logger.debug("  -> Inode is %d, result is %r", st.st_ino, result)
     return result
 
 
@@ -183,7 +185,7 @@ def read_locks(s):
                 # eliminate multiple occurrences of locks
                 snapshot_entry[lock_type] = list(set(locks))
     except (AssertionError, json.JSONDecodeError) as e:
-        logging.error("Lock file couldn't be parsed: %s", e)
+        logger.error("Lock file couldn't be parsed: %s", e)
         raise ValueError("invalid lock file format") from e
 
     return content

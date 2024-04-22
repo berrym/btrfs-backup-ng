@@ -1,4 +1,4 @@
-"""btrfs-backup-ng: btrfs-backup/endpoint/__init__.py"""
+"""btrfs-backup-ng: btrfs_backup_ng/endpoint/__init__.py"""
 
 import os
 import urllib.parse
