@@ -29,8 +29,12 @@ SOFTWARE.
 """
 
 import concurrent.futures
+import logging
+import logging.handlers
+import multiprocessing
 import os
 import sys
+import threading
 import time
 
 from math import inf
@@ -43,8 +47,8 @@ from rich.progress import BarColumn, Progress, SpinnerColumn, TimeElapsedColumn
 from rich.text import Text
 
 from . import endpoint
-from .rich_logger import RichLogger, logger
 from . import util
+from .rich_logger import RichLogger, create_logger, cons, logger
 
 
 def send_snapshot(snapshot, destination_endpoint, parent=None, clones=None):
@@ -91,7 +95,6 @@ def sync_snapshots(
     due to retention policy.
     """
 
-    # global snapshot
     snapshot = None
     logger.info(util.log_heading(f"  To {destination_endpoint} ..."))
 
@@ -201,7 +204,7 @@ def sync_snapshots(
     logger.info(util.log_heading(f"Transfers to {destination_endpoint} complete!"))
 
 
-def parse_options(argv):
+def parse_options(global_parser, argv):
     """Run the program. Items in ``argv`` are treated as command line
     arguments."""
 
@@ -233,32 +236,11 @@ files is allowed as well."""
         add_help=False,
         fromfile_prefix_chars="@",
         formatter_class=util.MyHelpFormatter,
+        parents=global_parser,
     )
-
-    group = parser.add_argument_group("Display settings")
-    group.add_argument(
+    parser.add_argument(
         "-h", "--help", action="help", help="Show this help message and exit."
     )
-    group.add_argument(
-        "-v",
-        "--verbosity",
-        default="info",
-        choices=["debug", "info", "warning", "error"],
-        help="Set verbosity level. Default is 'info'.",
-    )
-    group.add_argument(
-        "-q",
-        "--quiet",
-        action="store_true",
-        help="Shortcut for '--verbosity " "warning'.",
-    )
-    group.add_argument(
-        "-d",
-        "--btrfs-debug",
-        action="store_true",
-        help="Enable debugging on btrfs send / receive.",
-    )
-
     group = parser.add_argument_group(
         "Retention settings",
         description="By default, snapshots are "
@@ -294,12 +276,12 @@ files is allowed as well."""
         "-f",
         "--snapshot-folder",
         help="Snapshot folder in source filesystem; either relative to source or absolute."
-        " Default is '.snapshots'.",
+        " Default is '.btrfs-backup-ng/snapshots'.",
     )
     group.add_argument(
         "-p",
         "--snapshot-prefix",
-        help="Prefix for snapshot names. Default is ''.",
+        help="Prefix for snapshot names. Default is system hostname.",
     )
 
     group = parser.add_argument_group("Transfer related options")
@@ -423,7 +405,7 @@ files is allowed as well."""
     return options
 
 
-def run_task(options):
+def run_task(options, queue):
     """Create a list of tasks to run."""
 
     logger.setLevel(options["verbosity"].upper())
@@ -598,109 +580,168 @@ def elevate_privileges():
         os.execvp("sudo", command)
 
 
+def serve_logger_thread(queue):
+    """Run the logger from a thread in main to talk to all children."""
+    while True:
+        record = queue.get()
+        if record is None:
+            break
+        logger = logging.getLogger(record.name)
+        logger.handle(record)
+
+
 def main():
     """Main function."""
+    global_parser = util.MyArgumentParser(add_help=False)
+    group = global_parser.add_argument_group("Global Display settings")
+    group.add_argument(
+        "-l",
+        "--live-layout",
+        default=False,
+        action="store_true",
+        help="Display a Live layout interface.",
+    )
+    group.add_argument(
+        "-v",
+        "--verbosity",
+        default="info",
+        choices=["debug", "info", "warning", "error"],
+        help="Set verbosity level. Default is 'info'.",
+    )
+    group.add_argument(
+        "-q",
+        "--quiet",
+        default=False,
+        action="store_true",
+        help="Shortcut for --verbosity 'warning'.",
+    )
+    group.add_argument(
+        "-d",
+        "--btrfs-debug",
+        default=False,
+        action="store_true",
+        help="Enable debugging on btrfs send / receive.",
+    )
+
     command_line = ""
     for arg in sys.argv[1:]:
         command_line += f"{arg}  "  # Assume no space => no quotes
 
     tasks = [task.split() for task in command_line.split(":")]
-
     task_options = []
 
-    # make sure we have at least one valid task to complete
     for task in tasks:
-        task_options.append(parse_options(task))
+        task_options.append(parse_options([global_parser], task))
+    total_tasks = len(tasks)
 
-    # make sure we have root privileges
+    # Determine if we're using a live layout
+    live_layout = False
+    for options in task_options:
+        if "live_layout" in options:
+            if options["live_layout"]:
+                live_layout = True
+                break
+
+    # Create a shared logger for all child processes
+    create_logger(live_layout)
+    queue = multiprocessing.Manager().Queue(-1)
+    logger_thread = threading.Thread(target=serve_logger_thread, args=(queue,))
+    logger_thread.start()
+
+    # Make sure we have root privileges
     elevate_privileges()
 
-    overall_progress = Progress(
-        "[progress.description]{task.description}",
-        BarColumn(),
-        "[progress.percentage]{task.percentage:>3.0f}%",
-        SpinnerColumn(),
-        TimeElapsedColumn(),
-    )
+    if live_layout:
+        layout = Layout(name="root")
 
-    tasks_progress = Progress(
-        "{task.description}",
-        BarColumn(),
-        SpinnerColumn(),
-        TimeElapsedColumn(),
-    )
+        layout.split(
+            Layout(name="header", size=5),
+            Layout(name="main"),
+            Layout(name="footer", size=3),
+        )
 
-    layout = Layout(name="root")
+        layout["main"].split_row(
+            Layout(name="tasks"), Layout(name="logs", ratio=2, minimum_size=80)
+        )
 
-    layout.split(
-        Layout(name="header", size=5),
-        Layout(name="main"),
-        Layout(name="footer", size=3),
-    )
+        layout["header"].update(
+            Panel(
+                Align.center(
+                    Text(
+                        """btrfs-backup-ng\n\nIncremental backups for the btrfs filesystem.""",
+                        justify="center",
+                    ),
+                    vertical="middle",
+                )
+            ),
+        )
 
-    layout["main"].split_row(
-        Layout(name="tasks"), Layout(name="logs", ratio=2, minimum_size=80)
-    )
+        overall_progress = Progress(
+            "[progress.description]{task.description}",
+            BarColumn(),
+            "[progress.percentage]{task.percentage:>3.0f}%",
+            SpinnerColumn(),
+            TimeElapsedColumn(),
+        )
 
-    layout["header"].update(
-        Panel(
-            Align.center(
-                Text(
-                    """btrfs-backup-ng\n\nIncremental backups for the btrfs filesystem.""",
-                    justify="center",
-                ),
-                vertical="middle",
-            )
-        ),
-    )
+        tasks_progress = Progress(
+            "{task.description}",
+            BarColumn(),
+            SpinnerColumn(),
+            TimeElapsedColumn(),
+        )
 
-    total_tasks = len(tasks)
-    overall_task_id = overall_progress.add_task(
-        "[green]All jobs progress:",
-        total=total_tasks,
-    )
+        overall_task_id = overall_progress.add_task(
+            "[green]All jobs progress:",
+            total=total_tasks,
+        )
 
-    layout["tasks"].update(Panel(tasks_progress))
+        log = RichLogger()
 
-    log = RichLogger()
-    layout["logs"].update(Panel(Text("\n".join(log.messages))))
-
-    layout["footer"].update(Panel(overall_progress))
+        layout["tasks"].update(Panel(tasks_progress))
+        layout["logs"].update(Panel(Text("\n".join(log.messages))))
+        layout["footer"].update(Panel(overall_progress))
 
     futures = []  # keep track of the concurrent futures
     futures_id_map = {}  # associate a task_id with futures
 
     try:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+        with concurrent.futures.ProcessPoolExecutor(
+            max_workers=8
+        ) as executor:  # , thread_name_prefix="Task") as executor:
             for n in range(len(tasks)):
-                futures.append(executor.submit(run_task, task_options[n]))
-                task_id = tasks_progress.add_task(
-                    f"[red]task: [cyan]{task_options[n]['source']}",
-                    total=None,
-                )
-                futures_id_map[futures[n]] = task_id
-                layout["logs"].update(Panel(Text("\n".join(log.messages))))
+                futures.append(executor.submit(run_task, task_options[n], queue))
+                if live_layout:
+                    task_id = tasks_progress.add_task(
+                        f"[red]task: [cyan]{task_options[n]['source']}",
+                        total=None,
+                    )
+                    futures_id_map[futures[n]] = task_id
 
-            with Live(layout, refresh_per_second=10):
-                while not overall_progress.finished:
-                    layout["logs"].update(Panel(Text("\n".join(log.messages))))
-                    done, _ = concurrent.futures.wait(futures, timeout=1)
-                    for future in done:
+            if live_layout:
+                with Live(layout, console=cons):
+                    while not overall_progress.finished:
                         layout["logs"].update(Panel(Text("\n".join(log.messages))))
-                        task_id = futures_id_map[future]
-                        tasks_progress.update(
-                            task_id,
-                            total=1,
-                            completed=1,
-                        )
-                        overall_progress.update(
-                            overall_task_id,
-                            advance=1,
-                        )
-                        futures.remove(future)
-                overall_progress.update(
-                    overall_task_id,
-                    completed=total_tasks,
-                )
+                        done, _ = concurrent.futures.wait(futures, timeout=1)
+                        for future in done:
+                            layout["logs"].update(Panel(Text("\n".join(log.messages))))
+                            task_id = futures_id_map[future]
+                            tasks_progress.update(
+                                task_id,
+                                total=1,
+                                completed=1,
+                            )
+                            overall_progress.update(
+                                overall_task_id,
+                                advance=1,
+                            )
+                            futures.remove(future)
+                    overall_progress.update(
+                        overall_task_id,
+                        completed=total_tasks,
+                    )
+                    layout["logs"].update(Panel(Text("\n".join(log.messages))))
+        queue.put_nowait(None)
+        logger_thread.join()
     except (util.AbortError, KeyboardInterrupt):
         sys.exit(1)

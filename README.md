@@ -17,19 +17,19 @@ subvolumes.
 btrfs-backup-ng has almost no dependencies and hence is well suited for
 many kinds of setups with only minimal maintenance effort.
 
-This project is a fork of btrfs-backup written by Chris Lawrence,
-and since then maintained by Robert Schindler, this codebase is
-written and maintained by Michael Berry.
-
-Originally, it started as a fork of a project with the same name,
+Originally, it started as a fork of a project btrfs-backup,
 written by Chris Lawrence. Since then, most of the code has been
 refactored and many new features were added before this repository has
 been transferred to Robert Schindler. Many thanks to Chris for his work. The old code
 base has been tagged with `legacy`. If, for any reason, you want to
 continue using it and miss the new features, you can check that out.
 
+This project is a fork of btrfs-backup written by Chris Lawrence,
+and since then maintained by Robert Schindler, this codebase is
+written and maintained by Michael Berry.
+
 Latest release  
-v0.6.0
+v0.6.1
 
 Downloads  
 <http://pypi.python.org/pypi/btrfs_backup_ng>
@@ -38,7 +38,7 @@ Source
 <https://github.com/berrym/btrfs-backup-ng>
 
 Platforms  
-Linux >= 3.12, Python >= 3.6
+Linux >= 3.12, Python >= 3.8
 
 Keywords  
 backup, btrfs, snapshot, send, receive, ssh
@@ -91,12 +91,12 @@ Then, you can fetch the latest version of btrfs-backup-ng:
 
 There are currently pre-built packages available for Fedora and OpenSUSE Tumbleweed:
 
-Fedora 38, Fedora 39, Fedora 40, Fedora Rawhide
+Fedora 39, Fedora 40, Fedora Rawhide
 
     $ dnf copr enable mberry/btrfs-backup-ng
     $ dnf install btrfs-backup-ng --refresh
 
-OpenSUSE Tumbleweed
+OpenSUSE Tumbleweed (Packages currently outdated)
 
     $ sudo zypper addrepo https://download.opensuse.org/repositories/home:berrym/openSUSE_Tumbleweed/home:berrym.repo
     $ sudo zypper refresh
@@ -111,7 +111,7 @@ Clone this git repository
 
     $ git clone https://github.com/berrym/btrfs-backup-ng.git
     $ cd btrfs-backup-ng
-    $ git checkout tags/v0.6.0  # optionally checkout a specific version
+    $ git checkout tags/v0.6.1  # optionally checkout a specific version
     $ python3 -m venv /path/to/btrfs-backup-ng/venv # optionally use venv
     $ sh /path/to/btrfs-backup-ng/venv/bin/activate # using venv
     $ python3 -m build
@@ -129,15 +129,15 @@ However, there are some sections about the general concepts and
 different sample usages to get started as quick as possible.
 
 For reference, a copy of the output of `btrfs-backup-ng --help` is attached
-below.
+below. (Not Finished).
 
 As root (if not root btrfs-backup-ng will try and re-run itself with sudo):
 
     $ btrfs-backup-ng /home /backup
 
 This will create a read-only snapshot of `/home` in
-`/home/.snapshots/YYMMDD-HHMMSS`, and then send it to
-`/backup/YYMMDD-HHMMSS`. On future runs, it will take a new read-only
+`/home/.btrfs-backup-ng/snapshots/$(hostname)-YYMMDD-HHMMSS`, and then send it to
+`/backup/$(hostname)-YYMMDD-HHMMSS`. On future runs, it will take a new read-only
 snapshot and send the difference between the previous snapshot and the
 new one.
 
@@ -215,6 +215,8 @@ separating the desired tasks with a ':'
     $ btrfs-backup-ng /home /mnt/backups/home:/opt /mnt/backups/opt
 
 or a similarly chained command. Each task will have its own set of options.
+Theres a set of Global Display Options that are inherited by all tasks.
+See `btrfs-backup-ng --help` for details.
 
 
 ## Help text
@@ -353,13 +355,13 @@ scripts.
 
 If necessary, you can restore a whole snapshot by using e.g.
 
-    $ mkdir /home/.snapshots
-    $ btrfs send /backup/YYMMDD-HHMMSS | btrfs receive /home/.snapshots
+    $ mkdir /home/.btrfs-backup-ng/snapshots
+    $ btrfs send /backup/$(hostname)-YYMMDD-HHMMSS | btrfs receive /home/.btrfs-backup-ng/snapshots
 
 Then you need to take the read-only snapshot and turn it back into a
 root filesystem:
 
-    $ cp -aR --reflink /home/.snapshots/YYMMDD-HHMMSS /home
+    $ cp -aR --reflink /home/.snapshots/$(hostname)-YYMMDD-HHMMSS /home
 
 You might instead have some luck taking the restored snapshot and
 turning it into a read-write snapshot, and then re-pivoting your mounted
@@ -374,15 +376,15 @@ An alternative structure is to keep all subvolumes in the root directory
     /active/root
     /active/home
     /inactive
-    /.snapshots/root/YYMMDD-HHMMSS
-    /.snapshots/home/YYMMDD-HHMMSS
+    /.btrfs-backup-ng/snapshots/root/$(hostname)-YYMMDD-HHMMSS
+    /.btrfs-backup-ng/snapshots/home/$(hostname)-YYMMDD-HHMMSS
 
 and have corresponding entries in `/etc/fstab` to mount the subvolumes
 from `/active/*`. One benefit of this approach is that restoring a
 snapshot can be done entirely with btrfs tools:
 
-    $ btrfs send /backup/root/YYMMDD-HHMMSS | btrfs receive /.snapshots/root
-    $ btrfs send /backup/home/YYMMDD-HHMMSS | btrfs receive /.snapshots/home
+    $ btrfs send /backup/root/$(hostname)-YYMMDD-HHMMSS | btrfs receive /.btrfs-backup-ng/snapshots/root
+    $ btrfs send /backup/home/$(hostname)-YYMMDD-HHMMSS | btrfs receive /.btrfs-backup-ng/snapshots/home
     $ mv /active/root /inactive
     $ mv /active/home /inactive
     $ btrfs subvolume snapshot /.snapshots/root/YYMMDD-HHMMSS /active/root
@@ -400,7 +402,7 @@ problem. Thank you!
 
 ## Copyright
 
-Copyright © 2023 Michael Berry <trismegustis@gmail.com>\
+Copyright © 2024 Michael Berry <trismegustis@gmail.com>\
 Copyright © 2017 Robert Schindler <r.schindler@efficiosoft.com>\
 Copyright © 2014 Chris Lawrence <lawrencc@debian.org>
 

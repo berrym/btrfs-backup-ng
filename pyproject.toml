@@ -7,7 +7,7 @@ where = ["src"]
 
 [project]
 name = "btrfs-backup-ng"
-version = "0.6.0"
+version = "0.6.1"
 description = "Intelligent, feature-rich backups for btrfs"
 authors = [{ name = "Michael Berry", email = "trismegustis@gmail.com" }]
 license = { text = "MIT" }
