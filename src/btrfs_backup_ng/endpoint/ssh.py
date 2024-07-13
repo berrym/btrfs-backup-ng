@@ -8,8 +8,8 @@ import subprocess
 import tempfile
 
 from .common import Endpoint
-from ..rich_logger import logger
-from .. import util
+from ..__logger__ import logger
+from .. import __util__
 
 
 class SSHEndpoint(Endpoint):
@@ -55,7 +55,7 @@ class SSHEndpoint(Endpoint):
         logger.debug("Checking for ssh ...")
         cmd = ["ssh"]
         try:
-            util.exec_subprocess(
+            __util__.exec_subprocess(
                 cmd,
                 method="call",
                 stdout=subprocess.DEVNULL,
@@ -64,7 +64,7 @@ class SSHEndpoint(Endpoint):
         except FileNotFoundError as e:
             logger.debug("  -> got exception: %s", e)
             logger.info("ssh command is not available")
-            raise util.AbortError()
+            raise __util__.AbortError()
 
         logger.debug("  -> ssh is available")
 
@@ -83,7 +83,9 @@ class SSHEndpoint(Endpoint):
             cmd += ["-o", opt]
         cmd += [f"{self._build_connect_string()}:/", mount_point]
         try:
-            util.exec_subprocess(cmd, method="check_call", stdout=subprocess.DEVNULL)
+            __util__.exec_subprocess(
+                cmd, method="check_call", stdout=subprocess.DEVNULL
+            )
         except FileNotFoundError as e:
             logger.debug("  -> got exception: %s", e)
             if self.source:
@@ -92,7 +94,7 @@ class SSHEndpoint(Endpoint):
                     "  The sshfs command is not available but it is "
                     "mandatory for sourcing from SSH."
                 )
-                raise util.AbortError()
+                raise __util__.AbortError()
         else:
             self.sshfs = mount_point
             logger.debug("  -> sshfs is available")
@@ -110,7 +112,7 @@ class SSHEndpoint(Endpoint):
                         os.makedirs(self._path_to_sshfs(d))
                     except OSError as e:
                         logger.error("Error creating new location %s: %s", d, e)
-                        raise util.AbortError()
+                        raise __util__.AbortError()
         else:
             cmd = ["mkdir", "-p"] + dirs
             self._exec_command(cmd)
@@ -140,7 +142,7 @@ class SSHEndpoint(Endpoint):
             new_cmd += ["sudo"]
         new_cmd.extend(command)
 
-        return util.exec_subprocess(new_cmd, **kwargs)
+        return __util__.exec_subprocess(new_cmd, **kwargs)
 
     def _listdir(self, location):
         """Operates remotely via 'ls -1A'."""

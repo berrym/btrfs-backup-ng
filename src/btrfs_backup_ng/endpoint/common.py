@@ -6,8 +6,8 @@ import logging
 import os
 import subprocess
 
-from ..rich_logger import logger
-from .. import util
+from ..__logger__ import logger
+from .. import __util__
 
 
 def require_source(method):
@@ -57,7 +57,7 @@ class Endpoint:
     def snapshot(self, readonly=True, sync=True):
         """Takes a snapshot and returns the created object."""
 
-        snapshot = util.Snapshot(self.path, self.snap_prefix, self)
+        snapshot = __util__.Snapshot(self.path, self.snap_prefix, self)
         snapshot_path = snapshot.get_path()
         logger.info("%s -> %s", self.source, snapshot_path)
 
@@ -113,12 +113,12 @@ class Endpoint:
             if item.startswith(self.snap_prefix):
                 time_str = item[len(self.snap_prefix) :]
                 try:
-                    time_obj = util.str_to_date(time_str)
+                    time_obj = __util__.str_to_date(time_str)
                 except ValueError:
                     # no valid name for current prefix + time string
                     continue
                 else:
-                    snapshot = util.Snapshot(
+                    snapshot = __util__.Snapshot(
                         self.path, self.snap_prefix, self, time_obj=time_obj
                     )
                     snapshots.append(snapshot)
@@ -178,7 +178,7 @@ class Endpoint:
 
     def add_snapshot(self, snapshot, rewrite=True):
         """Adds a snapshot to the cache. If ``rewrite`` is set, a new
-        ``util.Snapshot`` object is created with the original ``prefix``
+        ``__util__.Snapshot`` object is created with the original ``prefix``
         and ``time_obj``. However, ``path`` and ``endpoint`` are set to
         belong to this endpoint. The original snapshot object is
         dropped in that case."""
@@ -187,7 +187,7 @@ class Endpoint:
             return None
 
         if rewrite:
-            snapshot = util.Snapshot(
+            snapshot = __util__.Snapshot(
                 self.path, snapshot.prefix, self, time_obj=snapshot.time_obj
             )
 
@@ -341,10 +341,10 @@ class Endpoint:
 
     def _exec_command(self, command, **kwargs):
         """Finally, the command should be executed via
-        ``util.exec_subprocess``, which should get all given keyword
+        ``__util__.exec_subprocess``, which should get all given keyword
         arguments. This could be re-implemented to execute via SSH,
         for instance."""
-        return util.exec_subprocess(command, **kwargs)
+        return __util__.exec_subprocess(command, **kwargs)
 
     def _listdir(self, location):
         """Should return all items present at the given ``location``."""
@@ -359,26 +359,26 @@ class Endpoint:
     @require_source
     def _read_locks(self):
         """Should read the locks and return a dict like
-        ``util.read_locks`` returns it."""
+        ``__util__.read_locks`` returns it."""
         path = self._get_lock_file_path()
         try:
             if not os.path.isfile(path):
                 return {}
             with open(path, "r", encoding="utf-8") as f:
-                return util.read_locks(f.read())
+                return __util__.read_locks(f.read())
         except (OSError, ValueError) as e:
             logger.error("Error on reading lock file %s: %s", path, e)
-            raise util.AbortError()
+            raise __util__.AbortError()
 
     @require_source
     def _write_locks(self, lock_dict):
         """Should write the locks given as ``lock_dict`` like
-        ``util.read_locks`` returns it."""
+        ``__util__.read_locks`` returns it."""
         path = self._get_lock_file_path()
         try:
             logger.debug("Writing lock file: %s", path)
             with open(path, "w", encoding="utf-8") as f:
-                f.write(util.write_locks(lock_dict))
+                f.write(__util__.write_locks(lock_dict))
         except OSError as e:
             logger.error("Error on writing lock file %s: %s", path, e)
-            raise util.AbortError()
+            raise __util__.AbortError()

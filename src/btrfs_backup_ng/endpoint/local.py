@@ -5,8 +5,8 @@ Create commands with local endpoints.
 import os
 
 from .common import Endpoint
-from ..rich_logger import logger
-from .. import util
+from ..__logger__ import logger
+from .. import __util__
 
 
 class LocalEndpoint(Endpoint):
@@ -37,15 +37,15 @@ class LocalEndpoint(Endpoint):
                     os.makedirs(d)
                 except OSError as e:
                     logger.error("Error creating new location %s: %s", d, e)
-                    raise util.AbortError()
+                    raise __util__.AbortError()
 
         if (
             self.source is not None
             and self.fs_checks
-            and not util.is_subvolume(self.source)
+            and not __util__.is_subvolume(self.source)
         ):
             logger.error("%s does not seem to be a btrfs subvolume", self.source)
-            raise util.AbortError()
-        if self.fs_checks and not util.is_btrfs(self.path):
+            raise __util__.AbortError()
+        if self.fs_checks and not __util__.is_btrfs(self.path):
             logger.error("%s does not seem to be on a btrfs filesystem", self.path)
-            raise util.AbortError()
+            raise __util__.AbortError()

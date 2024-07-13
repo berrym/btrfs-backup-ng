@@ -28,19 +28,19 @@ This project is a fork of btrfs-backup written by Chris Lawrence,
 and since then maintained by Robert Schindler, this codebase is
 written and maintained by Michael Berry.
 
-Latest release  
-v0.6.1
+Latest release
+v0.6.2
 
-Downloads  
+Downloads
 <http://pypi.python.org/pypi/btrfs_backup_ng>
 
-Source  
+Source
 <https://github.com/berrym/btrfs-backup-ng>
 
-Platforms  
+Platforms
 Linux >= 3.12, Python >= 3.8
 
-Keywords  
+Keywords
 backup, btrfs, snapshot, send, receive, ssh
 
 ## Features
@@ -83,6 +83,10 @@ distribution, simply install it via:
 
     $ sudo apt-get install python3-pip python3-wheel
 
+For Fedora
+
+    $ sudo dnf install python3-pip python3-wheel
+
 Then, you can fetch the latest version of btrfs-backup-ng:
 
     $ pip3 install btrfs-backup-ng
@@ -111,13 +115,13 @@ Clone this git repository
 
     $ git clone https://github.com/berrym/btrfs-backup-ng.git
     $ cd btrfs-backup-ng
-    $ git checkout tags/v0.6.1  # optionally checkout a specific version
+    $ git checkout tags/v0.6.2  # optionally checkout a specific version
     $ python3 -m venv /path/to/btrfs-backup-ng/venv # optionally use venv
     $ sh /path/to/btrfs-backup-ng/venv/bin/activate # using venv
     $ python3 -m build
     # using venv
     $ python3 -m pip install .
-    # or 
+    # or
     $ sudo python3 -m pip install .
 
 ## Sample usage

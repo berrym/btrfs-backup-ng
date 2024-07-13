@@ -47,8 +47,8 @@ from rich.progress import BarColumn, Progress, SpinnerColumn, TimeElapsedColumn
 from rich.text import Text
 
 from . import endpoint
-from . import util
-from .rich_logger import RichLogger, create_logger, cons, logger
+from . import __util__
+from .__logger__ import RichLogger, create_logger, cons, logger
 
 
 def send_snapshot(snapshot, destination_endpoint, parent=None, clones=None):
@@ -78,7 +78,7 @@ def send_snapshot(snapshot, destination_endpoint, parent=None, clones=None):
             pids.remove(pid)
         if return_code != 0:
             logger.error("Error during btrfs send / receive")
-            raise util.SnapshotTransferError()
+            raise __util__.SnapshotTransferError()
 
 
 def sync_snapshots(
@@ -96,7 +96,7 @@ def sync_snapshots(
     """
 
     snapshot = None
-    logger.info(util.log_heading(f"  To {destination_endpoint} ..."))
+    logger.info(__util__.log_heading(f"  To {destination_endpoint} ..."))
 
     source_snapshots = source_endpoint.list_snapshots()
     destination_snapshots = destination_endpoint.list_snapshots()
@@ -188,7 +188,7 @@ def sync_snapshots(
                 clones=clones,
                 **kwargs,
             )
-        except util.SnapshotTransferError:
+        except __util__.SnapshotTransferError:
             logger.info(
                 "Keeping %s locked to prevent it from getting removed.",
                 best_snapshot,
@@ -201,7 +201,7 @@ def sync_snapshots(
             destination_snapshots = destination_endpoint.list_snapshots()
         to_transfer.remove(best_snapshot)
 
-    logger.info(util.log_heading(f"Transfers to {destination_endpoint} complete!"))
+    logger.info(__util__.log_heading(f"Transfers to {destination_endpoint} complete!"))
 
 
 def parse_options(global_parser, argv):
@@ -230,12 +230,12 @@ loops by including files mutually. Mixing of direct arguments and argument
 files is allowed as well."""
 
     # Parse command line arguments
-    parser = util.MyArgumentParser(
+    parser = __util__.MyArgumentParser(
         description=description,
         epilog=epilog,
         add_help=False,
         fromfile_prefix_chars="@",
-        formatter_class=util.MyHelpFormatter,
+        formatter_class=__util__.MyHelpFormatter,
         parents=global_parser,
     )
     parser.add_argument(
@@ -400,7 +400,7 @@ files is allowed as well."""
             f"Caught: ({e})",
             file=sys.stderr,
         )
-        raise util.AbortError()
+        raise __util__.AbortError()
 
     return options
 
@@ -408,6 +408,9 @@ files is allowed as well."""
 def run_task(options, queue):
     """Create a list of tasks to run."""
 
+    qh = logging.handlers.QueueHandler(queue)  # Just the one handler needed
+    logger = logging.getLogger()
+    logger.addHandler(qh)
     logger.setLevel(options["verbosity"].upper())
 
     # applying shortcuts
@@ -416,9 +419,9 @@ def run_task(options, queue):
     if "latest_only" in options:
         options["num_snapshots"] = 1
 
-    logger.info(util.log_heading(f"Started at {time.ctime()}"))
+    logger.info(__util__.log_heading(f"Started at {time.ctime()}"))
 
-    logger.debug(util.log_heading("Settings"))
+    logger.debug(__util__.log_heading("Settings"))
     if "snapshot_folder" in options:
         snapshot_directory = options["snapshot_folder"]
     else:
@@ -471,7 +474,7 @@ def run_task(options, queue):
         )
     except ValueError as e:
         logger.error("Couldn't parse source specification: %s", e)
-        raise util.AbortError()
+        raise __util__.AbortError()
     logger.debug("Source endpoint: %s", source_endpoint)
     source_endpoint.prepare()
 
@@ -509,7 +512,7 @@ def run_task(options, queue):
                 )
             except ValueError as e:
                 logger.error("Couldn't parse destination specification: %s", e)
-                raise util.AbortError()
+                raise __util__.AbortError()
             destination_endpoints.append(destination_endpoint)
             logger.debug("Destination endpoint: %s", destination_endpoint)
             destination_endpoint.prepare()
@@ -518,13 +521,13 @@ def run_task(options, queue):
         logger.info("Taking no snapshot (--no-snapshot).")
     else:
         # First we need to create a new snapshot on the source disk
-        logger.info(util.log_heading("Snapshotting ..."))
+        logger.info(__util__.log_heading("Snapshotting ..."))
         source_endpoint.snapshot()
 
     if options["no_transfer"]:
-        logger.info(util.log_heading("Not transferring (--no-transfer)."))
+        logger.info(__util__.log_heading("Not transferring (--no-transfer)."))
     else:
-        logger.info(util.log_heading("Transferring ..."))
+        logger.info(__util__.log_heading("Transferring ..."))
         for destination_endpoint in destination_endpoints:
             try:
                 sync_snapshots(
@@ -533,7 +536,7 @@ def run_task(options, queue):
                     keep_num_backups=options["num_backups"],
                     no_incremental=options["no_incremental"],
                 )
-            except util.AbortError as e:
+            except __util__.AbortError as e:
                 logger.error(
                     "Aborting snapshot transfer to %s due to exception.",
                     destination_endpoint,
@@ -542,12 +545,12 @@ def run_task(options, queue):
         if not destination_endpoints:
             logger.info("No destination configured, don't sending anything.")
 
-    logger.info(util.log_heading("Cleaning up..."))
+    logger.info(__util__.log_heading("Cleaning up..."))
     # cleanup snapshots > num_snapshots in snap_dir
     if options["num_snapshots"] > 0:
         try:
             source_endpoint.delete_old_snapshots(options["num_snapshots"])
-        except util.AbortError as e:
+        except __util__.AbortError as e:
             logger.debug(
                 "Got AbortError while deleting source snapshots at %s\n" "Caught: %s",
                 source_endpoint,
@@ -558,14 +561,14 @@ def run_task(options, queue):
         for destination_endpoint in destination_endpoints:
             try:
                 destination_endpoint.delete_old_snapshots(options["num_backups"])
-            except util.AbortError as e:
+            except __util__.AbortError as e:
                 logger.debug(
                     "Got AbortError while deleting backups at %s\n" "Caught: %s",
                     destination_endpoint,
                     e,
                 )
 
-    logger.info(util.log_heading(f"Finished at {time.ctime()}"))
+    logger.info(__util__.log_heading(f"Finished at {time.ctime()}"))
 
     return "Success"
 
@@ -592,7 +595,7 @@ def serve_logger_thread(queue):
 
 def main():
     """Main function."""
-    global_parser = util.MyArgumentParser(add_help=False)
+    global_parser = __util__.MyArgumentParser(add_help=False)
     group = global_parser.add_argument_group("Global Display settings")
     group.add_argument(
         "-l",
@@ -743,5 +746,5 @@ def main():
                     layout["logs"].update(Panel(Text("\n".join(log.messages))))
         queue.put_nowait(None)
         logger_thread.join()
-    except (util.AbortError, KeyboardInterrupt):
+    except (__util__.AbortError, KeyboardInterrupt):
         sys.exit(1)

@@ -1,5 +1,5 @@
-"""btrfs-backup-ng: btrfs_backup_ng/util.py
-Common utility code shared between modules.
+"""btrfs-backup-ng: btrfs_backup_ng/__util__.py
+Common __util__ity code shared between modules.
 """
 
 import argparse
@@ -10,7 +10,7 @@ import subprocess
 import sys
 import time
 
-from .rich_logger import logger
+from .__logger__ import logger
 
 
 DATE_FORMAT = "%Y%m%d-%H%M%S"
