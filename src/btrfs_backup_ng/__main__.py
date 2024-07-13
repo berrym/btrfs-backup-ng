@@ -46,6 +46,7 @@ from rich.panel import Panel
 from rich.progress import BarColumn, Progress, SpinnerColumn, TimeElapsedColumn
 from rich.text import Text
 
+from . import __version__
 from . import endpoint
 from . import __util__
 from .__logger__ import RichLogger, create_logger, cons, logger
@@ -214,10 +215,11 @@ used for taking regular backups of any btrfs subvolume and syncing them
 with local and/or remote locations. Multiple targets are supported as
 well as retention settings for both source snapshots and backups. If
 a snapshot transfer fails for any reason (e.g. due to network outage),
-btrfs-backup will notice it and prevent the snapshot from being deleted
+btrfs-backup-ng will notice it and prevent the snapshot from being deleted
 until it finally makes it over to its destination."""
 
     epilog = """\
+Copyright (c) 2024 Michael Berry
 You may also pass one or more file names prefixed with '@' at the
 command line. Arguments are then read from these files, treating each
 line as a flag or '--arg value'-style pair you would normally
@@ -231,6 +233,7 @@ files is allowed as well."""
 
     # Parse command line arguments
     parser = __util__.MyArgumentParser(
+        prog="btrfs-backup-ng",
         description=description,
         epilog=epilog,
         add_help=False,
@@ -241,6 +244,7 @@ files is allowed as well."""
     parser.add_argument(
         "-h", "--help", action="help", help="Show this help message and exit."
     )
+    parser.add_argument("-V", "--version", action="version", version=f"{__version__}")
     group = parser.add_argument_group(
         "Retention settings",
         description="By default, snapshots are "
