@@ -75,7 +75,7 @@ backup, btrfs, snapshot, send, receive, ssh
     pulling and pushing via SSH
 -   (optional) `sshfs` - only needed for pulling via SSH
 
-### Install via PIP
+### Install via PIP or PIPX
 
 The easiest way to get up and running with the latest stable version is
 via PIP. If `pip3` is missing on your system, and you run a Debian-based
@@ -86,19 +86,25 @@ distribution, simply install it via:
 For Fedora
 
     $ sudo dnf install python3-pip python3-wheel
+    # or possibly better solution
+    $ sudo dnf install pipx
 
 Then, you can fetch the latest version of btrfs-backup-ng:
 
     $ pip3 install btrfs-backup-ng
+    # or if using pipx (recommended)
+    $ pipx install btrfs-backup-ng # installs into an isolated environment
 
 ### Pre-built packages
 
 There are currently pre-built packages available for Fedora and OpenSUSE Tumbleweed:
 
-Fedora 39, Fedora 40, Fedora Rawhide
+Fedora 39, Fedora 40, Fedora 41 branched, Fedora Rawhide
 
     $ dnf copr enable mberry/btrfs-backup-ng
     $ dnf install btrfs-backup-ng --refresh
+
+**Note:** `btrfs-backup-ng` has been accepted into Fedora officially. It will be available soon.
 
 OpenSUSE Tumbleweed (Packages currently outdated)
 
@@ -336,10 +342,12 @@ which can take several minutes, hours or even days on a filesystem with
 lots of files), you might end up with a new backup starting while an old
 one is still in progress.
 
+### Using anacron
+
 You can work around the lack of locking using the `flock(1)` command, as
 suggested at <https://github.com/efficiosoft/btrfs-backup/issues/4>.
 
-With anacron on Debian, you could simply add a file
+On systems with anacron like Debian or Fedora, you could simply add a file
 `/etc/cron.daily/local-backup`:
 
 ``` sh
@@ -354,6 +362,44 @@ a backup is already running.
 
 More or less frequent backups could be made using other `cron.*`
 scripts.
+
+### Using systemd
+
+On systems with systemd like Fedora you could also create a service
+`/etc/systemd/system/btrfs-backup-ng.service`:
+
+```sh
+[Unit]
+Description="Backup btrfs subvolumes"
+
+[Service]
+ExecStart=btrfs-backup-ng --quiet / /backup/root:/home /backup/home
+```
+
+Then create a timer
+`/etc/systemd/system/btrfs-backup-ng.timer`:
+
+```sh
+[Unit]
+Description="Run btrfs-backup-ng.service daily at 2 AM"
+
+[Timer]
+OnCalendar=Sun..Sat *-*-* 02:00:*
+Unit=btrfs-backup-ng.service
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Verify that the files you created contain no errors.
+
+    $ systemd-analyze verify /etc/systemd/system/btrfs-backup-ng.*
+
+If the command returns no output, the files have passed the verification successfully.
+
+Enable and start the timer.
+
+    $ sudo systemctl enable btrfs-backup-ng.timer --now
 
 ## Restoring a snapshot
 
