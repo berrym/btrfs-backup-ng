@@ -413,7 +413,6 @@ def run_task(options, queue):
     """Create a list of tasks to run."""
 
     qh = logging.handlers.QueueHandler(queue)  # Just the one handler needed
-    logger = logging.getLogger()
     logger.addHandler(qh)
     logger.setLevel(options["verbosity"].upper())
 

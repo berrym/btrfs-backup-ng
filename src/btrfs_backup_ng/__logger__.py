@@ -13,7 +13,7 @@ from rich.logging import RichHandler
 
 cons = Console()
 rich_handler = RichHandler()
-logger = logging.getLogger()
+logger = logging.Logger(__name__)
 
 
 # class Borg:
@@ -103,6 +103,8 @@ def create_logger(live_layout):
     else:
         cons = Console()
         rich_handler = RichHandler(console=cons, show_path=False)
+    logger.handlers.clear()
+    logger.propagate = False
     logging.basicConfig(
         format="(%(processName)s) %(message)s",
         datefmt="%H:%M:%S",
@@ -110,4 +112,3 @@ def create_logger(live_layout):
         handlers=[rich_handler],
         force=True,
     )
-    logger = logging.getLogger("rich")
