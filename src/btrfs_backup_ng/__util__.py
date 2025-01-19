@@ -1,3 +1,5 @@
+# pyright: standard
+
 """btrfs-backup-ng: btrfs_backup_ng/__util__.py
 Common __util__ity code shared between modules.
 """

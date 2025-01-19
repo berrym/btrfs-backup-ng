@@ -1,3 +1,5 @@
+# pyright: standard
+
 """btrfs-backup-ng: btrfs-backup/__main__.py
 
 Backup a btrfs volume to another, incrementally
@@ -29,7 +31,6 @@ SOFTWARE.
 """
 
 import concurrent.futures
-import logging
 import logging.handlers
 import multiprocessing
 import os
@@ -219,7 +220,6 @@ btrfs-backup-ng will notice it and prevent the snapshot from being deleted
 until it finally makes it over to its destination."""
 
     epilog = """\
-Copyright (c) 2024 Michael Berry
 You may also pass one or more file names prefixed with '@' at the
 command line. Arguments are then read from these files, treating each
 line as a flag or '--arg value'-style pair you would normally
@@ -555,7 +555,7 @@ def run_task(options, queue):
             source_endpoint.delete_old_snapshots(options["num_snapshots"])
         except __util__.AbortError as e:
             logger.debug(
-                "Got AbortError while deleting source snapshots at %s\n" "Caught: %s",
+                "Got AbortError while deleting source snapshots at %s\nCaught: %s",
                 source_endpoint,
                 e,
             )
@@ -566,14 +566,12 @@ def run_task(options, queue):
                 destination_endpoint.delete_old_snapshots(options["num_backups"])
             except __util__.AbortError as e:
                 logger.debug(
-                    "Got AbortError while deleting backups at %s\n" "Caught: %s",
+                    "Got AbortError while deleting backups at %s\nCaught: %s",
                     destination_endpoint,
                     e,
                 )
 
     logger.info(__util__.log_heading(f"Finished at {time.ctime()}"))
-
-    return "Success"
 
 
 def elevate_privileges():
@@ -592,8 +590,8 @@ def serve_logger_thread(queue):
         record = queue.get()
         if record is None:
             break
-        logger = logging.getLogger(record.name)
-        logger.handle(record)
+        log = logger.getChild(record.name)  # logging.getLogger(record.name)
+        log.handle(record)
 
 
 def main():
@@ -631,14 +629,13 @@ def main():
 
     command_line = ""
     for arg in sys.argv[1:]:
-        command_line += f"{arg}  "  # Assume no space => no quotes
+        command_line += f"{arg} "  # Assume no space => no quotes
 
     tasks = [task.split() for task in command_line.split(":")]
     task_options = []
 
     for task in tasks:
         task_options.append(parse_options([global_parser], task))
-    total_tasks = len(tasks)
 
     # Determine if we're using a live layout
     live_layout = False
@@ -658,55 +655,78 @@ def main():
     elevate_privileges()
 
     if live_layout:
-        layout = Layout(name="root")
+        do_live_layout(tasks, task_options, queue)
+    else:
+        do_logging(tasks, task_options, queue)
 
-        layout.split(
-            Layout(name="header", size=5),
-            Layout(name="main"),
-            Layout(name="footer", size=3),
-        )
+    logger_thread.join()
 
-        layout["main"].split_row(
-            Layout(name="tasks"), Layout(name="logs", ratio=2, minimum_size=80)
-        )
 
-        layout["header"].update(
-            Panel(
-                Align.center(
-                    Text(
-                        """btrfs-backup-ng\n\nIncremental backups for the btrfs filesystem.""",
-                        justify="center",
-                    ),
-                    vertical="middle",
-                )
-            ),
-        )
+def do_logging(tasks, task_options, queue):
+    """Execute tasks output only logging."""
+    futures = []  # keep track of the concurrent futures
+    try:
+        with concurrent.futures.ProcessPoolExecutor(
+            max_workers=8
+        ) as executor:  # , thread_name_prefix="Task") as executor:
+            for n in range(len(tasks)):
+                futures.append(executor.submit(run_task, task_options[n], queue))
+        queue.put_nowait(None)
+    except (__util__.AbortError, KeyboardInterrupt):
+        sys.exit(1)
 
-        overall_progress = Progress(
-            "[progress.description]{task.description}",
-            BarColumn(),
-            "[progress.percentage]{task.percentage:>3.0f}%",
-            SpinnerColumn(),
-            TimeElapsedColumn(),
-        )
 
-        tasks_progress = Progress(
-            "{task.description}",
-            BarColumn(),
-            SpinnerColumn(),
-            TimeElapsedColumn(),
-        )
+def do_live_layout(tasks, task_options, queue):
+    """Execute tasks using rich live layout."""
+    layout = Layout(name="root")
 
-        overall_task_id = overall_progress.add_task(
-            "[green]All jobs progress:",
-            total=total_tasks,
-        )
+    layout.split(
+        Layout(name="header", size=5),
+        Layout(name="main"),
+        Layout(name="footer", size=3),
+    )
 
-        log = RichLogger()
+    layout["main"].split_row(
+        Layout(name="tasks"), Layout(name="logs", ratio=2, minimum_size=80)
+    )
 
-        layout["tasks"].update(Panel(tasks_progress))
-        layout["logs"].update(Panel(Text("\n".join(log.messages))))
-        layout["footer"].update(Panel(overall_progress))
+    layout["header"].update(
+        Panel(
+            Align.center(
+                Text(
+                    """btrfs-backup-ng\n\nIncremental backups for the btrfs filesystem.""",
+                    justify="center",
+                ),
+                vertical="middle",
+            )
+        ),
+    )
+
+    overall_progress = Progress(
+        "[progress.description]{task.description}",
+        BarColumn(),
+        "[progress.percentage]{task.percentage:>3.0f}%",
+        SpinnerColumn(),
+        TimeElapsedColumn(),
+    )
+
+    tasks_progress = Progress(
+        "{task.description}",
+        BarColumn(),
+        SpinnerColumn(),
+        TimeElapsedColumn(),
+    )
+
+    overall_task_id = overall_progress.add_task(
+        "[green]All jobs progress:",
+        total=len(tasks),
+    )
+
+    log = RichLogger()
+
+    layout["tasks"].update(Panel(tasks_progress))
+    layout["logs"].update(Panel(Text("\n".join(log.messages))))
+    layout["footer"].update(Panel(overall_progress))
 
     futures = []  # keep track of the concurrent futures
     futures_id_map = {}  # associate a task_id with futures
@@ -717,37 +737,36 @@ def main():
         ) as executor:  # , thread_name_prefix="Task") as executor:
             for n in range(len(tasks)):
                 futures.append(executor.submit(run_task, task_options[n], queue))
-                if live_layout:
-                    task_id = tasks_progress.add_task(
-                        f"[red]task: [cyan]{task_options[n]['source']}",
-                        total=None,
-                    )
-                    futures_id_map[futures[n]] = task_id
+                task_id = tasks_progress.add_task(
+                    f"[red]task: [cyan]{task_options[n]['source']}",
+                    total=None,
+                )
+                futures_id_map[futures[n]] = task_id
 
-            if live_layout:
-                with Live(layout, console=cons):
-                    while not overall_progress.finished:
-                        layout["logs"].update(Panel(Text("\n".join(log.messages))))
-                        done, _ = concurrent.futures.wait(futures, timeout=1)
-                        for future in done:
-                            layout["logs"].update(Panel(Text("\n".join(log.messages))))
-                            task_id = futures_id_map[future]
-                            tasks_progress.update(
-                                task_id,
-                                total=1,
-                                completed=1,
-                            )
-                            overall_progress.update(
-                                overall_task_id,
-                                advance=1,
-                            )
-                            futures.remove(future)
-                    overall_progress.update(
-                        overall_task_id,
-                        completed=total_tasks,
-                    )
+            with Live(layout, console=cons):
+                while not overall_progress.finished:
                     layout["logs"].update(Panel(Text("\n".join(log.messages))))
+                    done, _ = concurrent.futures.wait(futures, timeout=1)
+                    for future in done:
+                        layout["logs"].update(Panel(Text("\n".join(log.messages))))
+                        task_id = futures_id_map[future]
+                        tasks_progress.update(
+                            task_id,
+                            total=1,
+                            completed=1,
+                        )
+                        overall_progress.update(
+                            overall_task_id,
+                            advance=1,
+                        )
+                        futures.remove(future)
+                        time.sleep(1)
+                overall_progress.update(
+                    overall_task_id,
+                    completed=len(tasks),
+                )
+                time.sleep(1)
+                layout["logs"].update(Panel(Text("\n".join(log.messages))))
         queue.put_nowait(None)
-        logger_thread.join()
     except (__util__.AbortError, KeyboardInterrupt):
         sys.exit(1)
