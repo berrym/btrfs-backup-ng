@@ -97,8 +97,7 @@ class RichLogger(IO[str]):
 
 def create_logger(live_layout):
     """Helper function to setup logging depending on visual display options."""
-    global cons
-    global rich_handler
+    global cons, rich_handler
     if live_layout:
         cons = Console(file=RichLogger(), width=150)
         rich_handler = RichHandler(console=cons, show_time=False, show_path=False)

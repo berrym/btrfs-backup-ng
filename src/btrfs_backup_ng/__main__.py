@@ -437,7 +437,7 @@ def run_task(options, queue):
         (str(options["num_backups"]) if options["num_backups"] > 0 else "Any"),
     )
     logger.debug("Snapshot folder: %s", snapshot_directory)
-    logger.debug("Snapshot prefix: %s", snapshot_prefix if snapshot_prefix else None)
+    logger.debug("Snapshot prefix: %s", snapshot_prefix or None)
     logger.debug("Don't transfer snapshots: %r", options["no_transfer"])
     logger.debug("Don't send incrementally: %r", options["no_incremental"])
     logger.debug("Extra SSH config options: %s", options["ssh_opt"])
