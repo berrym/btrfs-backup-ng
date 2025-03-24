@@ -90,7 +90,6 @@ def sync_snapshots(
     It never transfers snapshots that would anyway be deleted afterward
     due to retention policy.
     """
-    snapshot = None
     logger.info(__util__.log_heading(f"  To {destination_endpoint} ..."))
 
     source_snapshots = source_endpoint.list_snapshots()
@@ -139,7 +138,7 @@ def sync_snapshots(
         return
 
     logger.info("Going to transfer %d snapshot(s):", len(to_transfer))
-    for _ in to_transfer:
+    for snapshot in to_transfer:
         logger.info("  %s", snapshot)
 
     while to_transfer:
