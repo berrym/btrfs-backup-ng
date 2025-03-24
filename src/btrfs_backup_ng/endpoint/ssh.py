@@ -175,6 +175,5 @@ class SSHEndpoint(Endpoint):
         if not self.sshfs:
             msg = "sshfs not mounted"
             raise ValueError(msg)
-        if path.startswith("/"):
-            path = path[1:]
+        path = path.removeprefix("/")
         return str(os.path.join(self.sshfs, path))
