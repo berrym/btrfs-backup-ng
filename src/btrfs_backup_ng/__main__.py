@@ -392,8 +392,8 @@ files is allowed as well."""
         for k, v in vars(args).items():
             if v is not None:
                 options[k] = v
-    except RecursionError:
-        raise __util__.AbortError
+    except RecursionError as e:
+        raise __util__.AbortError from e
 
     return options
 
