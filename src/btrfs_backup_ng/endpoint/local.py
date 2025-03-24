@@ -6,9 +6,9 @@ Create commands with local endpoints.
 
 import os
 
-from .common import Endpoint
-from ..__logger__ import logger
 from .. import __util__
+from ..__logger__ import logger
+from .common import Endpoint
 
 
 class LocalEndpoint(Endpoint):

@@ -46,3 +46,6 @@ btrfs_backup-*.tar.gz
 .idea
 .vscode
 venv
+
+# uv
+uv.lock

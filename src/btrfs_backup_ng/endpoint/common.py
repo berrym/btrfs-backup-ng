@@ -8,8 +8,8 @@ import logging
 import os
 import subprocess
 
-from ..__logger__ import logger
 from .. import __util__
+from ..__logger__ import logger
 
 
 def require_source(method):
@@ -29,7 +29,7 @@ class Endpoint:
     def __init__(
         self,
         path=None,
-        snap_prefix=str(""),
+        snap_prefix="",
         convert_rw=False,
         subvolume_sync=False,
         btrfs_debug=False,
@@ -58,13 +58,12 @@ class Endpoint:
     @require_source
     def snapshot(self, readonly=True, sync=True):
         """Takes a snapshot and returns the created object."""
-
         snapshot = __util__.Snapshot(self.path, self.snap_prefix, self)
         snapshot_path = snapshot.get_path()
         logger.info("%s -> %s", self.source, snapshot_path)
 
         commands = [
-            self._build_snapshot_cmd(self.source, snapshot_path, readonly=readonly)
+            self._build_snapshot_cmd(self.source, snapshot_path, readonly=readonly),
         ]
 
         # sync disks
@@ -80,15 +79,15 @@ class Endpoint:
     @require_source
     def send(self, snapshot, parent=None, clones=None):
         """Calls 'btrfs send' for the given snapshot and returns its
-        Popen object."""
-
+        Popen object.
+        """
         cmd = self._build_send_command(snapshot, parent=parent, clones=clones)
         return self._exec_command(cmd, method="Popen", stdout=subprocess.PIPE)
 
     def receive(self, stdin):
         """Calls 'btrfs receive', setting the given pipe as its stdin.
-        The receiving process's Popen object is returned."""
-
+        The receiving process's Popen object is returned.
+        """
         cmd = self._build_receive_command(self.path)
         # from WARNING level onwards, hide stdout
         loglevel = logging.getLogger().getEffectiveLevel()
@@ -98,8 +97,8 @@ class Endpoint:
     def list_snapshots(self, flush_cache=False):
         """Returns a list with all snapshots found at ``self.path``.
         If ``flush_cache`` is not set, cached results will be used
-        if available."""
-
+        if available.
+        """
         if self.__cached_snapshots is not None and not flush_cache:
             logger.debug(
                 "Returning %d cached snapshots for %r.",
@@ -121,7 +120,10 @@ class Endpoint:
                     continue
                 else:
                     snapshot = __util__.Snapshot(
-                        self.path, self.snap_prefix, self, time_obj=time_obj
+                        self.path,
+                        self.snap_prefix,
+                        self,
+                        time_obj=time_obj,
                     )
                     snapshots.append(snapshot)
 
@@ -149,17 +151,17 @@ class Endpoint:
     @require_source
     def set_lock(self, snapshot, lock_id, lock_state, parent=False):
         """Adds/removes the given lock from ``snapshot`` and calls
-        ``_write_locks`` with the updated locks."""
+        ``_write_locks`` with the updated locks.
+        """
         if lock_state:
             if parent:
                 snapshot.parent_locks.add(lock_id)
             else:
                 snapshot.locks.add(lock_id)
+        elif parent:
+            snapshot.parent_locks.discard(lock_id)
         else:
-            if parent:
-                snapshot.parent_locks.discard(lock_id)
-            else:
-                snapshot.locks.discard(lock_id)
+            snapshot.locks.discard(lock_id)
         lock_dict = {}
         for _snapshot in self.list_snapshots():
             snap_entry = {}
@@ -183,25 +185,28 @@ class Endpoint:
         ``__util__.Snapshot`` object is created with the original ``prefix``
         and ``time_obj``. However, ``path`` and ``endpoint`` are set to
         belong to this endpoint. The original snapshot object is
-        dropped in that case."""
-
+        dropped in that case.
+        """
         if self.__cached_snapshots is None:
-            return None
+            return
 
         if rewrite:
             snapshot = __util__.Snapshot(
-                self.path, snapshot.prefix, self, time_obj=snapshot.time_obj
+                self.path,
+                snapshot.prefix,
+                self,
+                time_obj=snapshot.time_obj,
             )
 
         self.__cached_snapshots.append(snapshot)
         self.__cached_snapshots.sort()
 
-        return None
+        return
 
     def delete_snapshots(self, snapshots, **kwargs):
         """Deletes the given snapshots, passing all keyword arguments to
-        ``_build_deletion_cmds``."""
-
+        ``_build_deletion_cmds``.
+        """
         # only remove snapshots that have no lock remaining
         to_remove = []
         for snapshot in snapshots:
@@ -254,13 +259,15 @@ class Endpoint:
 
     def _prepare(self):
         """Is called after endpoint creation. Various endpoint-related
-        checks may be implemented here."""
+        checks may be implemented here.
+        """
 
     @staticmethod
     def _build_snapshot_cmd(source, destination, readonly=True):
         """Should return a command which, when executed, creates a
         snapshot of ``source`` at ``destination``. If ``readonly`` is set,
-        the snapshot should be read only."""
+        the snapshot should be read only.
+        """
         cmd = ["btrfs", "subvolume", "snapshot"]
         if readonly:
             cmd += ["-r"]
@@ -275,7 +282,8 @@ class Endpoint:
     def _build_send_command(self, snapshot, parent=None, clones=None):
         """Should return a command which, when executed, writes the send
         stream of given ``snapshot`` to stdout. ``parent`` and ``clones``
-        may be used as well."""
+        may be used as well.
+        """
         cmd = ["btrfs", "send"] + self.btrfs_flags
         # from WARNING level onwards, pass --quiet
         log_level = logging.getLogger().getEffectiveLevel()
@@ -291,14 +299,15 @@ class Endpoint:
 
     def _build_receive_command(self, destination):
         """Should return a command to receive a snapshot to ``dest``.
-        The stream is piped into stdin when the command is running."""
+        The stream is piped into stdin when the command is running.
+        """
         return ["btrfs", "receive"] + self.btrfs_flags + [destination]
 
     def _build_deletion_commands(self, snapshots, convert_rw=None, subvolume_sync=None):
         """Should return a list of commands that, when executed in order,
         delete the given ``snapshots``. ``convert_rw`` and
-        ``subvolume_sync`` should be regarded as well."""
-
+        ``subvolume_sync`` should be regarded as well.
+        """
         if convert_rw is None:
             convert_rw = self.convert_rw
         if subvolume_sync is None:
@@ -317,7 +326,7 @@ class Endpoint:
                         snapshot.get_path(),
                         "ro",
                         "false",
-                    ]
+                    ],
                 )
 
         cmd = ["btrfs", "subvolume", "delete"]
@@ -337,15 +346,16 @@ class Endpoint:
         every collapsed command in the returned list aborts immediately
         after one of the original commands included in it fail. If it is
         unset, the opposite behaviour is expected (subsequent commands have
-        to be run even in case a previous one fails)."""
-
+        to be run even in case a previous one fails).
+        """
         return commands
 
     def _exec_command(self, command, **kwargs):
         """Finally, the command should be executed via
         ``__util__.exec_subprocess``, which should get all given keyword
         arguments. This could be re-implemented to execute via SSH,
-        for instance."""
+        for instance.
+        """
         return __util__.exec_subprocess(command, **kwargs)
 
     def _listdir(self, location):
@@ -355,18 +365,20 @@ class Endpoint:
     @require_source
     def _get_lock_file_path(self):
         """Is used by the default ``_read/write_locks`` methods and should
-        return the file in which the locks are stored."""
+        return the file in which the locks are stored.
+        """
         return os.path.join(str(self.path), str(self.lock_file_name))
 
     @require_source
     def _read_locks(self):
         """Should read the locks and return a dict like
-        ``__util__.read_locks`` returns it."""
+        ``__util__.read_locks`` returns it.
+        """
         path = self._get_lock_file_path()
         try:
             if not os.path.isfile(path):
                 return {}
-            with open(path, "r", encoding="utf-8") as f:
+            with open(path, encoding="utf-8") as f:
                 return __util__.read_locks(f.read())
         except (OSError, ValueError) as e:
             logger.error("Error on reading lock file %s: %s", path, e)
@@ -375,7 +387,8 @@ class Endpoint:
     @require_source
     def _write_locks(self, lock_dict):
         """Should write the locks given as ``lock_dict`` like
-        ``__util__.read_locks`` returns it."""
+        ``__util__.read_locks`` returns it.
+        """
         path = self._get_lock_file_path()
         try:
             logger.debug("Writing lock file: %s", path)

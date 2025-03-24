@@ -23,8 +23,8 @@ def choose_endpoint(spec, common_kwargs=None, source=False, excluded_types=()):
     from the consideration.
     It will return an instance of the proper ``Endpoint`` subclass.
     If no endpoint can be determined for the given specification,
-    a ``ValueError`` is raised."""
-
+    a ``ValueError`` is raised.
+    """
     kwargs = {}
     if common_kwargs:
         kwargs.update(common_kwargs)
@@ -63,7 +63,7 @@ def choose_endpoint(spec, common_kwargs=None, source=False, excluded_types=()):
             kwargs["path"] = spec
     else:
         raise ValueError(
-            f"No endpoint could be generated for this specification: {spec}"
+            f"No endpoint could be generated for this specification: {spec}",
         )
 
     return c(**kwargs)

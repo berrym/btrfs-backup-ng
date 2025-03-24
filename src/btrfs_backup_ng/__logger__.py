@@ -6,13 +6,11 @@ A common logger for displaying in a rich layout.
 
 import logging
 import threading
-
 from collections import deque
 from typing import IO, override
 
 from rich.console import Console
 from rich.logging import RichHandler
-
 
 cons = Console()
 rich_handler = RichHandler()

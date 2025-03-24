@@ -9,9 +9,9 @@ import os
 import subprocess
 import tempfile
 
-from .common import Endpoint
-from ..__logger__ import logger
 from .. import __util__
+from ..__logger__ import logger
+from .common import Endpoint
 
 
 class SSHEndpoint(Endpoint):
@@ -86,7 +86,9 @@ class SSHEndpoint(Endpoint):
         cmd += [f"{self._build_connect_string()}:/", mount_point]
         try:
             __util__.exec_subprocess(
-                cmd, method="check_call", stdout=subprocess.DEVNULL
+                cmd,
+                method="check_call",
+                stdout=subprocess.DEVNULL,
             )
         except FileNotFoundError as e:
             logger.debug("  -> got exception: %s", e)
@@ -94,7 +96,7 @@ class SSHEndpoint(Endpoint):
                 # we need that for the locks
                 logger.info(
                     "  The sshfs command is not available but it is "
-                    "mandatory for sourcing from SSH."
+                    "mandatory for sourcing from SSH.",
                 )
                 raise __util__.AbortError()
         else:
@@ -121,7 +123,6 @@ class SSHEndpoint(Endpoint):
 
     def _collapse_commands(self, commands, abort_on_failure=True):
         """Concatenates all given commands, ';' is inserted as separator."""
-
         collapsed = []
         for i, cmd in enumerate(commands):
             if isinstance(cmd, (list, tuple)):
@@ -133,7 +134,6 @@ class SSHEndpoint(Endpoint):
 
     def _exec_command(self, command, **kwargs):
         """Executes the command at the remote host."""
-
         new_cmd = ["ssh"]
         if self.port:
             new_cmd += ["-p", str(self.port)]
@@ -148,7 +148,6 @@ class SSHEndpoint(Endpoint):
 
     def _listdir(self, location):
         """Operates remotely via 'ls -1A'."""
-
         if self.sshfs:
             items = os.listdir(self._path_to_sshfs(location))
         else:

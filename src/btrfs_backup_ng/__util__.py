@@ -14,7 +14,6 @@ import time
 
 from .__logger__ import logger
 
-
 DATE_FORMAT = "%Y%m%d-%H%M%S"
 MOUNTS_FILE = "/proc/mounts"
 
@@ -47,7 +46,7 @@ class Snapshot:
     def __lt__(self, other):
         if self.prefix != other.prefix:
             raise NotImplementedError(
-                f"prefixes don't match: {self.prefix} vs {other.prefix}"
+                f"prefixes don't match: {self.prefix} vs {other.prefix}",
             )
         return self.time_obj < other.time_obj
 
@@ -65,7 +64,8 @@ class Snapshot:
     def find_parent(self, present_snapshots):
         """Returns object from ``present_snapshot`` most suitable for being
         used as a parent for transferring this one or ``None``,
-        if none found."""
+        if none found.
+        """
         if self in present_snapshots:
             # snapshot already transferred
             return None
@@ -83,14 +83,15 @@ class Snapshot:
 def exec_subprocess(command, method="check_output", **kwargs):
     """Executes ``getattr(subprocess, method)(cmd, **kwargs)`` and takes
     care of proper logging and error handling. ``AbortError`` is raised
-    in case of a ``subprocess.CalledProcessError``."""
+    in case of a ``subprocess.CalledProcessError``.
+    """
     logger.debug("Executing: %s", command)
     m = getattr(subprocess, method)
     try:
         return m(command, **kwargs)
     except subprocess.CalledProcessError as e:
         logger.error("Error on command: %s\nCaught: %s", command, e)
-        raise AbortError() from e
+        raise AbortError from e
 
 
 def log_heading(caption):
@@ -135,7 +136,7 @@ def is_btrfs(path):
         if not mount_point_prefix.endswith(os.sep):
             mount_point_prefix += os.sep
         if (path == mount_point or path.startswith(mount_point_prefix)) and len(
-            mount_point
+            mount_point,
         ) > len(best_match):
             best_match = mount_point
             best_match_fs_type = fs_type
@@ -168,7 +169,8 @@ def is_subvolume(path):
 def read_locks(s):
     """Reads locks from lock file content given as string.
     Returns ``{'snap_name': {'locks': ['lock', ...], ...}, 'parent_locks': ['lock', ...]}``.
-    If format is invalid, ``ValueError`` is raised."""
+    If format is invalid, ``ValueError`` is raised.
+    """
     s = s.strip()
     if not s:
         return {}
@@ -210,9 +212,8 @@ class MyArgumentParser(argparse.ArgumentParser):
         new_arg_strings = []
         for arg_string in arg_strings:
             # for regular arguments, just add them back into the list
-            if (
-                not arg_string
-                or self.fromfile_prefix_chars is not None
+            if not arg_string or (
+                self.fromfile_prefix_chars is not None
                 and arg_string[0] not in self.fromfile_prefix_chars
             ):
                 new_arg_strings.append(arg_string)
@@ -258,7 +259,8 @@ class MyArgumentParser(argparse.ArgumentParser):
 
 class MyHelpFormatter(argparse.HelpFormatter):
     """Custom formatter that keeps explicit line breaks in help texts
-    if the text starts with 'N|'. That special prefix is removed anyway."""
+    if the text starts with 'N|'. That special prefix is removed anyway.
+    """
 
     def _split_lines(self, text, width):
         if text.startswith("N|"):

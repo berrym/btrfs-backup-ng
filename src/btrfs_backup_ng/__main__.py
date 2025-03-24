@@ -37,7 +37,6 @@ import os
 import sys
 import threading
 import time
-
 from math import inf
 
 from rich.align import Align
@@ -47,18 +46,14 @@ from rich.panel import Panel
 from rich.progress import BarColumn, Progress, SpinnerColumn, TimeElapsedColumn
 from rich.text import Text
 
-from . import __version__
-from . import endpoint
-from . import __util__
-from .__logger__ import RichLogger, create_logger, cons, logger
+from . import __util__, __version__, endpoint
+from .__logger__ import RichLogger, cons, create_logger, logger
 
 
 def send_snapshot(snapshot, destination_endpoint, parent=None, clones=None):
-    """
-    Sends snapshot to destination endpoint, using given parent and clones.
+    """Sends snapshot to destination endpoint, using given parent and clones.
     It connects the pipes of source and destination together.
     """
-
     # Now we need to send the snapshot (incrementally, if possible)
     logger.info("Sending %s ...", snapshot)
     if parent:
@@ -90,13 +85,11 @@ def sync_snapshots(
     no_incremental=False,
     **kwargs,
 ):
-    """
-    Synchronizes snapshots from source to destination. Takes care
+    """Synchronizes snapshots from source to destination. Takes care
     about locking and deletion of corrupt snapshots from failed transfers.
     It never transfers snapshots that would anyway be deleted afterward
     due to retention policy.
     """
-
     snapshot = None
     logger.info(__util__.log_heading(f"  To {destination_endpoint} ..."))
 
@@ -208,8 +201,8 @@ def sync_snapshots(
 
 def parse_options(global_parser, argv):
     """Run the program. Items in ``argv`` are treated as command line
-    arguments."""
-
+    arguments.
+    """
     description = """\
 This provides incremental backups for btrfs filesystems. It can be
 used for taking regular backups of any btrfs subvolume and syncing them
@@ -242,7 +235,10 @@ files is allowed as well."""
         parents=global_parser,
     )
     parser.add_argument(
-        "-h", "--help", action="help", help="Show this help message and exit."
+        "-h",
+        "--help",
+        action="help",
+        help="Show this help message and exit.",
     )
     parser.add_argument("-V", "--version", action="version", version=f"{__version__}")
     group = parser.add_argument_group(
@@ -411,7 +407,6 @@ files is allowed as well."""
 
 def run_task(options, queue):
     """Create a list of tasks to run."""
-
     qh = logging.handlers.QueueHandler(queue)  # Just the one handler needed
     logger.addHandler(qh)
     logger.setLevel(options["verbosity"].upper())
@@ -473,7 +468,9 @@ def run_task(options, queue):
     source_endpoint_kwargs["path"] = snapshot_directory
     try:
         source_endpoint = endpoint.choose_endpoint(
-            options["source"], source_endpoint_kwargs, source=True
+            options["source"],
+            source_endpoint_kwargs,
+            source=True,
         )
     except ValueError as e:
         logger.error("Couldn't parse source specification: %s", e)
@@ -504,14 +501,16 @@ def run_task(options, queue):
     if options["no_transfer"] and options["num_backups"] <= 0:
         logger.debug(
             "Don't create destination endpoints because they won't be needed "
-            "(--no-transfer and no --num-backups)."
+            "(--no-transfer and no --num-backups).",
         )
     else:
         for destination in options["destinations"]:
             logger.debug("Destination: %s", destination)
             try:
                 destination_endpoint = endpoint.choose_endpoint(
-                    destination, endpoint_kwargs, source=False
+                    destination,
+                    endpoint_kwargs,
+                    source=False,
                 )
             except ValueError as e:
                 logger.error("Couldn't parse destination specification: %s", e)
@@ -578,7 +577,7 @@ def elevate_privileges():
     """Re-run the program using sudo if privileges are needed."""
     if os.getuid() != 0:
         print(
-            "btrfs-backup-ng needs root privileges, will attempt to elevate with sudo"
+            "btrfs-backup-ng needs root privileges, will attempt to elevate with sudo",
         )
         command = ("sudo", sys.executable, *sys.argv)
         os.execvp("sudo", command)
@@ -667,7 +666,7 @@ def do_logging(tasks, task_options, queue):
     futures = []  # keep track of the concurrent futures
     try:
         with concurrent.futures.ProcessPoolExecutor(
-            max_workers=8
+            max_workers=8,
         ) as executor:  # , thread_name_prefix="Task") as executor:
             for n in range(len(tasks)):
                 futures.append(executor.submit(run_task, task_options[n], queue))
@@ -687,7 +686,8 @@ def do_live_layout(tasks, task_options, queue):
     )
 
     layout["main"].split_row(
-        Layout(name="tasks"), Layout(name="logs", ratio=2, minimum_size=80)
+        Layout(name="tasks"),
+        Layout(name="logs", ratio=2, minimum_size=80),
     )
 
     layout["header"].update(
@@ -698,7 +698,7 @@ def do_live_layout(tasks, task_options, queue):
                     justify="center",
                 ),
                 vertical="middle",
-            )
+            ),
         ),
     )
 
@@ -733,7 +733,7 @@ def do_live_layout(tasks, task_options, queue):
 
     try:
         with concurrent.futures.ProcessPoolExecutor(
-            max_workers=8
+            max_workers=8,
         ) as executor:  # , thread_name_prefix="Task") as executor:
             for n in range(len(tasks)):
                 futures.append(executor.submit(run_task, task_options[n], queue))
