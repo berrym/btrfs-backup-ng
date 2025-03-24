@@ -30,7 +30,7 @@ class SnapshotTransferError(AbortError):
 class Snapshot:
     """Represents a snapshot with comparison by prefix and time_obj."""
 
-    def __init__(self, location, prefix, endpoint, time_obj=None):
+    def __init__(self, location, prefix, endpoint, time_obj=None) -> None:
         self.location = location
         self.prefix = prefix
         self.endpoint = endpoint
@@ -45,12 +45,13 @@ class Snapshot:
 
     def __lt__(self, other):
         if self.prefix != other.prefix:
+            msg = f"prefixes don't match: {self.prefix} vs {other.prefix}"
             raise NotImplementedError(
-                f"prefixes don't match: {self.prefix} vs {other.prefix}",
+                msg,
             )
         return self.time_obj < other.time_obj
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         return self.get_name()
 
     def get_name(self):
@@ -94,7 +95,7 @@ def exec_subprocess(command, method="check_output", **kwargs):
         raise AbortError from e
 
 
-def log_heading(caption):
+def log_heading(caption) -> str:
     """Formatted heading for logging output sections."""
     return f"{f'--[ {caption} ]':-<50}"
 
@@ -120,37 +121,38 @@ def str_to_date(time_string=None, fmt=None):
 
 
 def is_btrfs(path):
-    """Checks whether path is inside a btrfs file system"""
+    """Checks whether path is inside a btrfs file system."""
     path = os.path.normpath(os.path.abspath(path))
     logger.debug("Checking for btrfs filesystem: %s", path)
     best_match = ""
     best_match_fs_type = ""
     logger.debug("  Reading mounts file: %s", MOUNTS_FILE)
-    for line in open(MOUNTS_FILE, encoding="utf-8"):
-        try:
-            mount_point, fs_type = line.split(" ")[1:3]
-        except ValueError as e:
-            logger.debug("  Couldn't split line, skipping: %s\nCaught: %s", line, e)
-            continue
-        mount_point_prefix = mount_point
-        if not mount_point_prefix.endswith(os.sep):
-            mount_point_prefix += os.sep
-        if (path == mount_point or path.startswith(mount_point_prefix)) and len(
-            mount_point,
-        ) > len(best_match):
-            best_match = mount_point
-            best_match_fs_type = fs_type
-            logger.debug(
-                "  New best_match with filesystem type %s: %s",
-                best_match_fs_type,
-                best_match,
-            )
-    result = best_match_fs_type == "btrfs"
-    logger.debug(
-        "  -> best_match_fs_type is %s, result is %r",
-        best_match_fs_type,
-        result,
-    )
+    with open(MOUNTS_FILE, encoding="utf-8") as f:
+        for line in f:
+            try:
+                mount_point, fs_type = line.split(" ")[1:3]
+            except ValueError as e:
+                logger.debug("  Couldn't split line, skipping: %s\nCaught: %s", line, e)
+                continue
+            mount_point_prefix = mount_point
+            if not mount_point_prefix.endswith(os.sep):
+                mount_point_prefix += os.sep
+            if (path == mount_point or path.startswith(mount_point_prefix)) and len(
+                mount_point,
+            ) > len(best_match):
+                best_match = mount_point
+                best_match_fs_type = fs_type
+                logger.debug(
+                    "  New best_match with filesystem type %s: %s",
+                    best_match_fs_type,
+                    best_match,
+                )
+        result = best_match_fs_type == "btrfs"
+        logger.debug(
+            "  -> best_match_fs_type is %s, result is %r",
+            best_match_fs_type,
+            result,
+        )
     return result
 
 
@@ -182,7 +184,7 @@ def read_locks(s):
             assert isinstance(snapshot_name, str)
             assert isinstance(snapshot_entry, dict)
             for lock_type, locks in dict(snapshot_entry).items():
-                assert lock_type in ("locks", "parent_locks")
+                assert lock_type in {"locks", "parent_locks"}
                 assert isinstance(locks, list)
                 for lock in locks:
                     assert isinstance(lock, str)
@@ -190,7 +192,8 @@ def read_locks(s):
                 snapshot_entry[lock_type] = list(set(locks))
     except (AssertionError, json.JSONDecodeError) as e:
         logger.error("Lock file couldn't be parsed: %s", e)
-        raise ValueError("invalid lock file format") from e
+        msg = "invalid lock file format"
+        raise ValueError(msg) from e
 
     return content
 
@@ -263,12 +266,9 @@ class MyHelpFormatter(argparse.HelpFormatter):
     """
 
     def _split_lines(self, text, width):
-        if text.startswith("N|"):
-            _lines = text[2:].splitlines()
-        else:
-            _lines = [text]
+        lines_ = text[2:].splitlines() if text.startswith("N|") else [text]
         lines = []
-        for line in _lines:
+        for line in lines_:
             # this is the RawTextHelpFormatter._split_lines
             lines.extend(argparse.HelpFormatter._split_lines(self, line, width))
         return lines

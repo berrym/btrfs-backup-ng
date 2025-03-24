@@ -9,8 +9,9 @@ import os
 import subprocess
 import tempfile
 
-from .. import __util__
-from ..__logger__ import logger
+from btrfs_backup_ng import __util__
+from btrfs_backup_ng.__logger__ import logger
+
 from .common import Endpoint
 
 
@@ -25,7 +26,7 @@ class SSHEndpoint(Endpoint):
         ssh_opts=None,
         ssh_sudo=False,
         **kwargs,
-    ):
+    ) -> None:
         super().__init__(**kwargs)
         self.hostname = hostname
         self.port = port
@@ -41,10 +42,10 @@ class SSHEndpoint(Endpoint):
         self.path = os.path.normpath(self.path)
         self.sshfs = None
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         return f"(SSH) {self._build_connect_string(with_port=True)}{self.path}"
 
-    def get_id(self):
+    def get_id(self) -> str:
         s = self.hostname
         if self.username:
             s = f"{self.username}@{s}"
@@ -52,7 +53,7 @@ class SSHEndpoint(Endpoint):
             s = f"{s}:{self.port}"
         return f"ssh://{s}{self.path}"
 
-    def _prepare(self):
+    def _prepare(self) -> None:
         # check whether ssh is available
         logger.debug("Checking for ssh ...")
         cmd = ["ssh"]
@@ -66,7 +67,7 @@ class SSHEndpoint(Endpoint):
         except FileNotFoundError as e:
             logger.debug("  -> got exception: %s", e)
             logger.info("ssh command is not available")
-            raise __util__.AbortError()
+            raise __util__.AbortError
 
         logger.debug("  -> ssh is available")
 
@@ -98,7 +99,7 @@ class SSHEndpoint(Endpoint):
                     "  The sshfs command is not available but it is "
                     "mandatory for sourcing from SSH.",
                 )
-                raise __util__.AbortError()
+                raise __util__.AbortError
         else:
             self.sshfs = mount_point
             logger.debug("  -> sshfs is available")
@@ -116,9 +117,9 @@ class SSHEndpoint(Endpoint):
                         os.makedirs(self._path_to_sshfs(d))
                     except OSError as e:
                         logger.error("Error creating new location %s: %s", d, e)
-                        raise __util__.AbortError()
+                        raise __util__.AbortError
         else:
-            cmd = ["mkdir", "-p"] + dirs
+            cmd = ["mkdir", "-p", *dirs]
             self._exec_command(cmd)
 
     def _collapse_commands(self, commands, abort_on_failure=True):
@@ -172,7 +173,8 @@ class SSHEndpoint(Endpoint):
     def _path_to_sshfs(self, path):
         """Joins the given ``path`` with the sshfs mount_point."""
         if not self.sshfs:
-            raise ValueError("sshfs not mounted")
+            msg = "sshfs not mounted"
+            raise ValueError(msg)
         if path.startswith("/"):
             path = path[1:]
         return str(os.path.join(self.sshfs, path))

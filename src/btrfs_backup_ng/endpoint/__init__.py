@@ -1,6 +1,6 @@
 # pyright: standard
 
-"""btrfs-backup-ng: btrfs_backup_ng/endpoint/__init__.py"""
+"""btrfs-backup-ng: btrfs_backup_ng/endpoint/__init__.py."""
 
 import os
 import urllib.parse
@@ -38,7 +38,8 @@ def choose_endpoint(spec, common_kwargs=None, source=False, excluded_types=()):
         c = SSHEndpoint
         parsed = urllib.parse.urlparse(spec)
         if not parsed.hostname:
-            raise ValueError("No hostname for SSH specified.")
+            msg = "No hostname for SSH specified."
+            raise ValueError(msg)
         try:
             kwargs["port"] = parsed.port
         except ValueError:
@@ -62,8 +63,9 @@ def choose_endpoint(spec, common_kwargs=None, source=False, excluded_types=()):
         else:
             kwargs["path"] = spec
     else:
+        msg = f"No endpoint could be generated for this specification: {spec}"
         raise ValueError(
-            f"No endpoint could be generated for this specification: {spec}",
+            msg,
         )
 
     return c(**kwargs)

@@ -29,7 +29,7 @@ and since then maintained by Robert Schindler, this codebase is
 written and maintained by Michael Berry.
 
 Latest release
-v0.6.3
+v0.6.5
 
 Downloads
 <http://pypi.python.org/pypi/btrfs_backup_ng>
@@ -38,7 +38,7 @@ Source
 <https://github.com/berrym/btrfs-backup-ng>
 
 Platforms
-Linux >= 3.12, Python >= 3.8
+Linux >= 3.12, Python >= 3.12
 
 Keywords
 backup, btrfs, snapshot, send, receive, ssh
@@ -68,7 +68,7 @@ backup, btrfs, snapshot, send, receive, ssh
 
 ### Requirements
 
--   Python 3.8 or later
+-   Python 3.12 or later
 -   Appropriate btrfs-progs; typically you'll want **at least** 3.12
     with Linux 3.12/3.13
 -   (optional) OpenSSH's `ssh` command - needed for remote backup
@@ -99,9 +99,8 @@ Then, you can fetch the latest version of btrfs-backup-ng:
 
 There are currently pre-built packages available for Fedora and OpenSUSE Tumbleweed:
 
-Fedora 39, Fedora 40, Fedora 41 branched, Fedora Rawhide
+Fedora 38+
 
-    $ dnf copr enable mberry/btrfs-backup-ng
     $ dnf install btrfs-backup-ng --refresh
 
 **Note:** `btrfs-backup-ng` has been accepted into Fedora officially. It will be available soon.
@@ -121,7 +120,7 @@ Clone this git repository
 
     $ git clone https://github.com/berrym/btrfs-backup-ng.git
     $ cd btrfs-backup-ng
-    $ git checkout tags/v0.6.3  # optionally checkout a specific version
+    $ git checkout tags/v0.6.5  # optionally checkout a specific version
     $ python3 -m venv /path/to/btrfs-backup-ng/venv # optionally use venv
     $ sh /path/to/btrfs-backup-ng/venv/bin/activate # using venv
     $ python3 -m build

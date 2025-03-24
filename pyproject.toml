@@ -17,7 +17,7 @@ classifiers = [
     "License :: OSI Approved :: MIT License",
     "Operating System :: POSIX :: Linux",
 ]
-requires-python = ">=3.8"
+requires-python = ">=3.12"
 readme = "README.md"
 
 [project.urls]

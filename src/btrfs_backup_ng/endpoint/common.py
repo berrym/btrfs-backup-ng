@@ -4,12 +4,13 @@
 Common functionality among modules.
 """
 
+import contextlib
 import logging
 import os
 import subprocess
 
-from .. import __util__
-from ..__logger__ import logger
+from btrfs_backup_ng import __util__
+from btrfs_backup_ng.__logger__ import logger
 
 
 def require_source(method):
@@ -17,7 +18,8 @@ def require_source(method):
 
     def wrapped(self, *args, **kwargs):
         if self.source is None:
-            raise ValueError("source hasn't been set")
+            msg = "source hasn't been set"
+            raise ValueError(msg)
         return method(self, *args, **kwargs)
 
     return wrapped
@@ -36,7 +38,7 @@ class Endpoint:
         source=None,
         fs_checks=True,
         **kwargs,
-    ):
+    ) -> None:
         self.path = path
         self.snap_prefix = snap_prefix
         self.convert_rw = convert_rw
@@ -51,7 +53,7 @@ class Endpoint:
         self.__cached_snapshots = None
 
     def prepare(self):
-        """Public access to _prepare, which is called after creating an endpoint.XS"""
+        """Public access to _prepare, which is called after creating an endpoint."""
         logger.info("Preparing endpoint %r ...", self)
         return self._prepare()
 
@@ -149,7 +151,7 @@ class Endpoint:
         return list(snapshots)
 
     @require_source
-    def set_lock(self, snapshot, lock_id, lock_state, parent=False):
+    def set_lock(self, snapshot, lock_id, lock_state, parent=False) -> None:
         """Adds/removes the given lock from ``snapshot`` and calls
         ``_write_locks`` with the updated locks.
         """
@@ -180,7 +182,7 @@ class Endpoint:
             parent,
         )
 
-    def add_snapshot(self, snapshot, rewrite=True):
+    def add_snapshot(self, snapshot, rewrite=True) -> None:
         """Adds a snapshot to the cache. If ``rewrite`` is set, a new
         ``__util__.Snapshot`` object is created with the original ``prefix``
         and ``time_obj``. However, ``path`` and ``endpoint`` are set to
@@ -203,15 +205,16 @@ class Endpoint:
 
         return
 
-    def delete_snapshots(self, snapshots, **kwargs):
+    def delete_snapshots(self, snapshots, **kwargs) -> None:
         """Deletes the given snapshots, passing all keyword arguments to
         ``_build_deletion_cmds``.
         """
         # only remove snapshots that have no lock remaining
-        to_remove = []
-        for snapshot in snapshots:
-            if not snapshot.locks and not snapshot.parent_locks:
-                to_remove.append(snapshot)
+        to_remove = [
+            snapshot
+            for snapshot in snapshots
+            if not snapshot.locks and not snapshot.parent_locks
+        ]
 
         logger.info("Removing %d snapshot(s) from %r:", len(to_remove), self)
         for snapshot in snapshots:
@@ -229,16 +232,14 @@ class Endpoint:
 
             if self.__cached_snapshots is not None:
                 for snapshot in to_remove:
-                    try:
+                    with contextlib.suppress(ValueError):
                         self.__cached_snapshots.remove(snapshot)
-                    except ValueError:
-                        pass
 
-    def delete_snapshot(self, snapshot, **kwargs):
+    def delete_snapshot(self, snapshot, **kwargs) -> None:
         """Delete a snapshot."""
         self.delete_snapshots([snapshot], **kwargs)
 
-    def delete_old_snapshots(self, keep_num, **kwargs):
+    def delete_old_snapshots(self, keep_num, **kwargs) -> None:
         """Delete all but the value in keep_num newest snapshots at endpoints."""
         snapshots = self.list_snapshots()
 
@@ -250,14 +251,14 @@ class Endpoint:
     # The following methods may be implemented by endpoints unless the
     # default behaviour is wanted.
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         return f"{self.path}"
 
-    def get_id(self):
+    def get_id(self) -> str:
         """Return an id string to identify this endpoint over multiple runs."""
         return f"unknown://{self.path}"
 
-    def _prepare(self):
+    def _prepare(self) -> None:
         """Is called after endpoint creation. Various endpoint-related
         checks may be implemented here.
         """
@@ -284,7 +285,7 @@ class Endpoint:
         stream of given ``snapshot`` to stdout. ``parent`` and ``clones``
         may be used as well.
         """
-        cmd = ["btrfs", "send"] + self.btrfs_flags
+        cmd = ["btrfs", "send", *self.btrfs_flags]
         # from WARNING level onwards, pass --quiet
         log_level = logging.getLogger().getEffectiveLevel()
         if log_level >= logging.WARNING:
@@ -301,7 +302,7 @@ class Endpoint:
         """Should return a command to receive a snapshot to ``dest``.
         The stream is piped into stdin when the command is running.
         """
-        return ["btrfs", "receive"] + self.btrfs_flags + [destination]
+        return ["btrfs", "receive", *self.btrfs_flags, destination]
 
     def _build_deletion_commands(self, snapshots, convert_rw=None, subvolume_sync=None):
         """Should return a list of commands that, when executed in order,
@@ -316,18 +317,18 @@ class Endpoint:
         commands = []
 
         if convert_rw:
-            for snapshot in snapshots:
-                commands.append(
-                    [
-                        "btrfs",
-                        "property",
-                        "set",
-                        "-ts",
-                        snapshot.get_path(),
-                        "ro",
-                        "false",
-                    ],
-                )
+            commands.extend(
+                [
+                    "btrfs",
+                    "property",
+                    "set",
+                    "-ts",
+                    snapshot.get_path(),
+                    "ro",
+                    "false",
+                ]
+                for snapshot in snapshots
+            )
 
         cmd = ["btrfs", "subvolume", "delete"]
         cmd.extend([snapshot.get_path() for snapshot in snapshots])
@@ -382,10 +383,10 @@ class Endpoint:
                 return __util__.read_locks(f.read())
         except (OSError, ValueError) as e:
             logger.error("Error on reading lock file %s: %s", path, e)
-            raise __util__.AbortError()
+            raise __util__.AbortError
 
     @require_source
-    def _write_locks(self, lock_dict):
+    def _write_locks(self, lock_dict) -> None:
         """Should write the locks given as ``lock_dict`` like
         ``__util__.read_locks`` returns it.
         """
@@ -396,4 +397,4 @@ class Endpoint:
                 f.write(__util__.write_locks(lock_dict))
         except OSError as e:
             logger.error("Error on writing lock file %s: %s", path, e)
-            raise __util__.AbortError()
+            raise __util__.AbortError

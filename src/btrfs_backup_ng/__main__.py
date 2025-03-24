@@ -1,6 +1,6 @@
 # pyright: standard
 
-"""btrfs-backup-ng: btrfs-backup/__main__.py
+"""btrfs-backup-ng: btrfs-backup/__main__.py.
 
 Backup a btrfs volume to another, incrementally
 Requires Python >= 3.6, btrfs-progs >= 3.12 most likely.
@@ -50,7 +50,7 @@ from . import __util__, __version__, endpoint
 from .__logger__ import RichLogger, cons, create_logger, logger
 
 
-def send_snapshot(snapshot, destination_endpoint, parent=None, clones=None):
+def send_snapshot(snapshot, destination_endpoint, parent=None, clones=None) -> None:
     """Sends snapshot to destination endpoint, using given parent and clones.
     It connects the pipes of source and destination together.
     """
@@ -75,7 +75,7 @@ def send_snapshot(snapshot, destination_endpoint, parent=None, clones=None):
             pids.remove(pid)
         if return_code != 0:
             logger.error("Error during btrfs send / receive")
-            raise __util__.SnapshotTransferError()
+            raise __util__.SnapshotTransferError
 
 
 def sync_snapshots(
@@ -84,7 +84,7 @@ def sync_snapshots(
     keep_num_backups=0,
     no_incremental=False,
     **kwargs,
-):
+) -> None:
     """Synchronizes snapshots from source to destination. Takes care
     about locking and deletion of corrupt snapshots from failed transfers.
     It never transfers snapshots that would anyway be deleted afterward
@@ -392,19 +392,13 @@ files is allowed as well."""
         for k, v in vars(args).items():
             if v is not None:
                 options[k] = v
-    except RecursionError as e:
-        print(
-            "Recursion error while parsing arguments.\n"
-            "Maybe you produced a loop in argument files?\n"
-            f"Caught: ({e})",
-            file=sys.stderr,
-        )
-        raise __util__.AbortError()
+    except RecursionError:
+        raise __util__.AbortError
 
     return options
 
 
-def run_task(options, queue):
+def run_task(options, queue) -> None:
     """Create a list of tasks to run."""
     qh = logging.handlers.QueueHandler(queue)  # Just the one handler needed
     logger.addHandler(qh)
@@ -473,7 +467,7 @@ def run_task(options, queue):
         )
     except ValueError as e:
         logger.error("Couldn't parse source specification: %s", e)
-        raise __util__.AbortError()
+        raise __util__.AbortError
     logger.debug("Source endpoint: %s", source_endpoint)
     source_endpoint.prepare()
 
@@ -484,7 +478,7 @@ def run_task(options, queue):
                 if lock not in options["destinations"]:
                     options["destinations"].append(lock)
 
-    if "remove_locks" in options.keys():
+    if "remove_locks" in options:
         logger.info("Removing locks (--remove-locks) ...")
         for snap in source_endpoint.list_snapshots():
             for destination in options["destinations"]:
@@ -513,7 +507,7 @@ def run_task(options, queue):
                 )
             except ValueError as e:
                 logger.error("Couldn't parse destination specification: %s", e)
-                raise __util__.AbortError()
+                raise __util__.AbortError
             destination_endpoints.append(destination_endpoint)
             logger.debug("Destination endpoint: %s", destination_endpoint)
             destination_endpoint.prepare()
@@ -572,17 +566,14 @@ def run_task(options, queue):
     logger.info(__util__.log_heading(f"Finished at {time.ctime()}"))
 
 
-def elevate_privileges():
+def elevate_privileges() -> None:
     """Re-run the program using sudo if privileges are needed."""
     if os.getuid() != 0:
-        print(
-            "btrfs-backup-ng needs root privileges, will attempt to elevate with sudo",
-        )
         command = ("sudo", sys.executable, *sys.argv)
         os.execvp("sudo", command)
 
 
-def serve_logger_thread(queue):
+def serve_logger_thread(queue) -> None:
     """Run the logger from a thread in main to talk to all children."""
     while True:
         record = queue.get()
@@ -592,7 +583,7 @@ def serve_logger_thread(queue):
         log.handle(record)
 
 
-def main():
+def main() -> None:
     """Main function."""
     global_parser = __util__.MyArgumentParser(add_help=False)
     group = global_parser.add_argument_group("Global Display settings")
@@ -630,18 +621,15 @@ def main():
         command_line += f"{arg} "  # Assume no space => no quotes
 
     tasks = [task.split() for task in command_line.split(":")]
-    task_options = []
 
-    for task in tasks:
-        task_options.append(parse_options([global_parser], task))
+    task_options = [parse_options([global_parser], task) for task in tasks]
 
     # Determine if we're using a live layout
     live_layout = False
     for options in task_options:
-        if "live_layout" in options:
-            if options["live_layout"]:
-                live_layout = True
-                break
+        if options.get("live_layout"):
+            live_layout = True
+            break
 
     # Create a shared logger for all child processes
     create_logger(live_layout)
@@ -660,21 +648,23 @@ def main():
     logger_thread.join()
 
 
-def do_logging(tasks, task_options, queue):
+def do_logging(tasks, task_options, queue) -> None:
     """Execute tasks output only logging."""
     futures = []  # keep track of the concurrent futures
     try:
         with concurrent.futures.ProcessPoolExecutor(
             max_workers=8,
-        ) as executor:  # , thread_name_prefix="Task") as executor:
-            for n in range(len(tasks)):
-                futures.append(executor.submit(run_task, task_options[n], queue))
+        ) as executor:
+            futures.extend(
+                executor.submit(run_task, task_options[n], queue)
+                for n in range(len(tasks))
+            )
         queue.put_nowait(None)
     except (__util__.AbortError, KeyboardInterrupt):
         sys.exit(1)
 
 
-def do_live_layout(tasks, task_options, queue):
+def do_live_layout(tasks, task_options, queue) -> None:
     """Execute tasks using rich live layout."""
     layout = Layout(name="root")
 

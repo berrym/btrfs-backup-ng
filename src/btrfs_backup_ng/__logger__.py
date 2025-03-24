@@ -72,12 +72,12 @@ class RichLogger(IO[str]):
     __instance = None
     __lock = threading.Lock()
 
-    def __init__(self):
-        """Init"""
+    def __init__(self) -> None:
+        """Init."""
         self.messages = deque(["btrfs-backup-ng -- logger"], maxlen=20)
 
     def __new__(cls, *args, **kwargs):
-        """Singleton"""
+        """Singleton."""
         if not isinstance(cls.__instance, cls):
             with cls.__lock:
                 if not isinstance(cls.__instance, cls):
@@ -85,17 +85,17 @@ class RichLogger(IO[str]):
         return cls.__instance
 
     @override
-    def write(self, message):
-        """Write log message"""
+    def write(self, message) -> int:
+        """Write log message."""
         self.messages.extend(message.splitlines())
         return 0
 
     @override
-    def flush(self):
-        """Place holder"""
+    def flush(self) -> None:
+        """Place holder."""
 
 
-def create_logger(live_layout):
+def create_logger(live_layout) -> None:
     """Helper function to setup logging depending on visual display options."""
     global cons, rich_handler
     if live_layout:
