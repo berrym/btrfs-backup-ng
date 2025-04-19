@@ -49,3 +49,4 @@ venv
 
 # uv
 uv.lock
+.python-version

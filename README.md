@@ -14,7 +14,7 @@ just a few minutes without detailed knowledge on how btrfs send/receive
 works. However, you should have a basic understanding of snapshots and
 subvolumes.
 
-btrfs-backup-ng has almost no dependencies and hence is well suited for
+btrfs-backup-ng has very few dependencies and hence is well suited for
 many kinds of setups with only minimal maintenance effort.
 
 Originally, it started as a fork of a project btrfs-backup,
@@ -29,7 +29,7 @@ and since then maintained by Robert Schindler, this codebase is
 written and maintained by Michael Berry.
 
 Latest release
-v0.6.5
+v0.6.6
 
 Downloads
 <http://pypi.python.org/pypi/btrfs_backup_ng>
@@ -38,7 +38,7 @@ Source
 <https://github.com/berrym/btrfs-backup-ng>
 
 Platforms
-Linux >= 3.12, Python >= 3.12
+Linux >= 3.12, Python >= 3.6
 
 Keywords
 backup, btrfs, snapshot, send, receive, ssh
@@ -103,9 +103,7 @@ Fedora 38+
 
     $ dnf install btrfs-backup-ng --refresh
 
-**Note:** `btrfs-backup-ng` has been accepted into Fedora officially. It will be available soon.
-
-OpenSUSE Tumbleweed (Packages currently outdated)
+OpenSUSE Tumbleweed (Packages currently outdated), use a method described above.
 
     $ sudo zypper addrepo https://download.opensuse.org/repositories/home:berrym/openSUSE_Tumbleweed/home:berrym.repo
     $ sudo zypper refresh

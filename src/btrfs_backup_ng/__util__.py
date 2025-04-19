@@ -4,12 +4,10 @@
 Common __util__ity code shared between modules.
 """
 
-import argparse
 import functools
 import json
 import os
 import subprocess
-import sys
 import time
 
 from .__logger__ import logger
@@ -201,75 +199,3 @@ def read_locks(s):
 def write_locks(lock_dict):
     """Converts ``lock_dict`` back to the string readable by ``read_locks``."""
     return json.dumps(lock_dict, indent=4)
-
-
-# argparse related classes
-
-
-class MyArgumentParser(argparse.ArgumentParser):
-    """Custom parser that allows for comments in argument files."""
-
-    def _read_args_from_files(self, arg_strings):
-        """Overloaded to make nested imports relative to their parents."""
-        # expand arguments referencing files
-        new_arg_strings = []
-        for arg_string in arg_strings:
-            # for regular arguments, just add them back into the list
-            if not arg_string or (
-                self.fromfile_prefix_chars is not None
-                and arg_string[0] not in self.fromfile_prefix_chars
-            ):
-                new_arg_strings.append(arg_string)
-            # replace arguments referencing files with the file content
-            else:
-                arg_strings = []
-                try:
-                    with open(arg_string[1:], encoding="utf-8") as args_file:
-                        for arg_line in args_file.read().splitlines():
-                            for arg in self.convert_arg_line_to_args(arg_line):
-                                # make nested includes relative to their parent
-                                if (
-                                    self.fromfile_prefix_chars is not None
-                                    and arg.startswith(self.fromfile_prefix_chars)
-                                ):
-                                    dir_name = os.path.dirname(arg_string[1:])
-                                    path = os.path.join(dir_name, arg[1:])
-                                    # eliminate ../foo/../foo constructs
-                                    path = os.path.normpath(path)
-                                    arg = arg[0] + path
-                                arg_strings.append(arg)
-                except OSError:
-                    err = sys.exc_info()[1]
-                    self.error(str(err))
-                arg_strings = self._read_args_from_files(arg_strings)
-                new_arg_strings.extend(arg_strings)
-
-        # return the modified argument list
-        return new_arg_strings
-
-    def convert_arg_line_to_args(self, arg_line):
-        stripped = arg_line.strip()
-        # ignore blank lines and comments
-        if not stripped or stripped.startswith("#"):
-            return []
-        if stripped.startswith(tuple(self.prefix_chars)):
-            # split at first whitespace/tab, empty strings are removed
-            # e.g. "-a    b c" -> ["-a", "b c"]
-            return stripped.split(None, 1)
-        # must be a positional argument which shouldn't be split
-        return [stripped]
-
-
-class MyHelpFormatter(argparse.HelpFormatter):
-    """Custom formatter that keeps explicit line breaks in help texts
-    if the text starts with 'N|'. That special prefix is removed anyway.
-    """
-
-    # pylint: disable=protected-access
-    def _split_lines(self, text, width):
-        lines_ = text[2:].splitlines() if text.startswith("N|") else [text]
-        lines = []
-        for line in lines_:
-            # this is the RawTextHelpFormatter._split_lines
-            lines.extend(argparse.HelpFormatter._split_lines(self, line, width))
-        return lines

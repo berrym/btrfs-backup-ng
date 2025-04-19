@@ -7,7 +7,7 @@ A common logger for displaying in a rich layout.
 import logging
 import threading
 from collections import deque
-from typing import IO, override
+from typing import IO  # , override (reuires python 3.12)
 
 from rich.console import Console
 from rich.logging import RichHandler
@@ -84,13 +84,13 @@ class RichLogger(IO[str]):
                     cls.__instance = super().__new__(cls, *args, **kwargs)
         return cls.__instance
 
-    @override
+    # @override
     def write(self, message) -> int:
         """Write log message."""
         self.messages.extend(message.splitlines())
         return 0
 
-    @override
+    # @override
     def flush(self) -> None:
         """Place holder."""
 

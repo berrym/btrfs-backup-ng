@@ -30,6 +30,7 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 """
 
+import argparse
 import concurrent.futures
 import logging.handlers
 import multiprocessing
@@ -248,13 +249,13 @@ loops by including files mutually. Mixing of direct arguments and argument
 files is allowed as well."""
 
     # Parse command line arguments
-    parser = __util__.MyArgumentParser(
+    parser = argparse.ArgumentParser(
         prog="btrfs-backup-ng",
         description=description,
         epilog=epilog,
         add_help=False,
         fromfile_prefix_chars="@",
-        formatter_class=__util__.MyHelpFormatter,
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
         parents=global_parser,
     )
     parser.add_argument(
@@ -327,8 +328,8 @@ files is allowed as well."""
         "--ssh-opt",
         action="append",
         default=[],
-        help="N|Pass extra ssh_config options to ssh(1).\n"
-        "Example: '--ssh-opt Cipher=aes256-ctr --ssh-opt IdentityFile=/root/id_rsa'\n"
+        help="Pass extra ssh_config options to ssh(1). "
+        "Example: '--ssh-opt Cipher=aes256-ctr --ssh-opt IdentityFile=/root/id_rsa' "
         "would result in 'ssh -o Cipher=aes256-ctr -o IdentityFile=/root/id_rsa'.",
     )
     group.add_argument(
@@ -389,20 +390,20 @@ files is allowed as well."""
     )
     group.add_argument(
         "source",
-        help="N|Subvolume to backup.\n"
-        "The following schemes are possible:\n"
-        " - /path/to/subvolume\n"
-        " - ssh://[user@]host[:port]/path/to/subvolume\n"
+        help="Subvolume to backup. "
+        "The following schemes are possible:"
+        " - /path/to/subvolume "
+        " - ssh://[user@]host[:port]/path/to/subvolume "
         "Specifying a source is mandatory.",
     )
     group.add_argument(
         "destinations",
         nargs="*",
-        help="N|Destination to send backups to.\n"
-        "The following schemes are possible:\n"
-        " - /path/to/backups\n"
-        " - ssh://[user@]host[:port]/path/to/backups\n"
-        " - 'shell://cat > some-file'\n"
+        help="Destination to send backups to. "
+        "The following schemes are possible:"
+        " - /path/to/backups"
+        " - ssh://[user@]host[:port]/path/to/backups"
+        " - 'shell://cat > some-file' "
         "You may use this argument multiple times to transfer backups to multiple locations. "
         "You may even omit it "
         "completely in what case no snapshot is transferred at all. That allows, for instance, "
@@ -611,14 +612,14 @@ def serve_logger_thread(queue) -> None:
 
 def main() -> None:
     """Main function."""
-    global_parser = __util__.MyArgumentParser(add_help=False)
+    global_parser = argparse.ArgumentParser(add_help=False)
     group = global_parser.add_argument_group("Global Display settings")
     group.add_argument(
         "-l",
         "--live-layout",
         default=False,
         action="store_true",
-        help="Display a Live layout interface.",
+        help="EXPERIMENTAL - Display a Live layout interface.",
     )
     group.add_argument(
         "-v",
