@@ -90,6 +90,7 @@ def sync_snapshots(
     It never transfers snapshots that would anyway be deleted afterward
     due to retention policy.
     """
+
     logger.info(__util__.log_heading(f"  To {destination_endpoint} ..."))
 
     source_snapshots = source_endpoint.list_snapshots()
@@ -129,6 +130,7 @@ def sync_snapshots(
         # it wouldn't make sense to transfer snapshots that would be deleted
         # afterward anyway
         to_consider = to_consider[-keep_num_backups:]
+
     to_transfer = [
         snapshot for snapshot in to_consider if snapshot not in destination_snapshots
     ]
@@ -138,15 +140,36 @@ def sync_snapshots(
         return
 
     logger.info("Going to transfer %d snapshot(s):", len(to_transfer))
+    transfer_objs = {
+        "source_endpoint": source_endpoint,
+        "destination_endpoint": destination_endpoint,
+        "source_snapshots": source_snapshots,
+        "destination_snapshots": destination_snapshots,
+        "to_transfer": to_transfer,
+        "no_incremental": no_incremental,
+    }
     for snapshot in to_transfer:
         logger.info("  %s", snapshot)
+        do_sync_transfer(transfer_objs, **kwargs)
+
+
+def do_sync_transfer(transfer_objs, **kwargs):
+    """Handle the data transfer part of snapshot syncing."""
+
+    source_endpoint = transfer_objs["source_endpoint"]
+    destination_endpoint = transfer_objs["destination_endpoint"]
+    source_snapshots = transfer_objs["source_snapshots"]
+    destination_snapshots = transfer_objs["destination_snapshots"]
+    destination_id = destination_endpoint.get_id()
+    to_transfer = transfer_objs["to_transfer"]
+    no_incremental = transfer_objs["no_incremental"]
 
     while to_transfer:
         if no_incremental:
             # simply choose the last one
             best_snapshot = to_transfer[-1]
             parent = None
-            clones = []
+            # clones = []
         else:
             # pick the snapshots common among source and destination,
             # exclude those that had a failed transfer before
@@ -154,7 +177,7 @@ def sync_snapshots(
                 snapshot
                 for snapshot in source_snapshots
                 if snapshot in destination_snapshots
-                and destination_id not in snapshot.locks
+                and snapshot.get_id() not in snapshot.locks
             ]
 
             # choose snapshot with the smallest distance to its parent
@@ -170,16 +193,16 @@ def sync_snapshots(
             # we don't use clones at the moment, because they don't seem
             # to speed things up
             # clones = present_snapshots
-            clones = []
+            # clones = []
         source_endpoint.set_lock(best_snapshot, destination_id, True)
         if parent:
             source_endpoint.set_lock(parent, destination_id, True, parent=True)
         try:
             send_snapshot(
                 best_snapshot,
-                destination_endpoint,
+                transfer_objs["destination_endpoint"],
                 parent=parent,
-                clones=clones,
+                #  clones=clones,
                 **kwargs,
             )
         except __util__.SnapshotTransferError:
@@ -192,7 +215,8 @@ def sync_snapshots(
             if parent:
                 source_endpoint.set_lock(parent, destination_id, False, parent=True)
             destination_endpoint.add_snapshot(best_snapshot)
-            destination_snapshots = destination_endpoint.list_snapshots()
+            destination_endpoint.list_snapshots()
+
         to_transfer.remove(best_snapshot)
 
     logger.info(__util__.log_heading(f"Transfers to {destination_endpoint} complete!"))
