@@ -28,6 +28,7 @@ def require_source(method):
 class Endpoint:
     """Generic structure of a command endpoint."""
 
+    # pylint: disable=too-many-instance-attributes
     def __init__(
         self,
         path=None,
@@ -39,6 +40,8 @@ class Endpoint:
         fs_checks=True,
         **kwargs,
     ) -> None:
+        # pylint: disable=too-many-arguments
+        # pylint: disable=too-many-positional-arguments
         self.path = path
         self.snap_prefix = snap_prefix
         self.convert_rw = convert_rw
@@ -51,6 +54,7 @@ class Endpoint:
         self.fs_checks = fs_checks
         self.lock_file_name = ".outstanding_transfers"
         self.__cached_snapshots = None
+        kwargs = kwargs if kwargs else {}
 
     def prepare(self):
         """Public access to _prepare, which is called after creating an endpoint."""
@@ -339,6 +343,7 @@ class Endpoint:
 
         return commands
 
+    # pylint: disable=unused-argument
     def _collapse_commands(self, commands, abort_on_failure=True):
         """This might be re-implemented to group commands together wherever
         possible. The default implementation simply returns the given command

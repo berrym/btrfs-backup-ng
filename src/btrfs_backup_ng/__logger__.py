@@ -97,6 +97,7 @@ class RichLogger(IO[str]):
 
 def create_logger(live_layout) -> None:
     """Helper function to setup logging depending on visual display options."""
+    # pylint: disable=global-statement
     global cons, rich_handler
     if live_layout:
         cons = Console(file=RichLogger(), width=150)

@@ -265,6 +265,7 @@ class MyHelpFormatter(argparse.HelpFormatter):
     if the text starts with 'N|'. That special prefix is removed anyway.
     """
 
+    # pylint: disable=protected-access
     def _split_lines(self, text, width):
         lines_ = text[2:].splitlines() if text.startswith("N|") else [text]
         lines = []

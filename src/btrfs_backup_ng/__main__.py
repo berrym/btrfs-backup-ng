@@ -422,6 +422,8 @@ files is allowed as well."""
     return options
 
 
+# pylint: disable=too-many-branches
+# pylint: disable=too-many-statements
 def run_task(options, queue) -> None:
     """Create a list of tasks to run."""
     qh = logging.handlers.QueueHandler(queue)  # Just the one handler needed
@@ -640,6 +642,7 @@ def main() -> None:
         help="Enable debugging on btrfs send / receive.",
     )
 
+    # pylint: disable=consider-using-join
     command_line = ""
     for arg in sys.argv[1:]:
         command_line += f"{arg} "  # Assume no space => no quotes

@@ -18,6 +18,7 @@ from .common import Endpoint
 class SSHEndpoint(Endpoint):
     """Commands for creating an ssh endpoint."""
 
+    # pylint: disable=too-many-instance-attributes
     def __init__(
         self,
         hostname,
@@ -27,7 +28,9 @@ class SSHEndpoint(Endpoint):
         ssh_sudo=False,
         **kwargs,
     ) -> None:
-        super().__init__(**kwargs)
+        # pylint: disable=too-many-arguments
+        # pylint: disable=too-many-positional-arguments
+        super().__init__(**kwargs if kwargs else {})
         self.hostname = hostname
         self.port = port
         self.username = username
