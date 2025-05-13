@@ -80,31 +80,14 @@ def send_snapshot(snapshot, destination_endpoint, parent=None, clones=None) -> N
             raise __util__.SnapshotTransferError
 
 
-def sync_snapshots(
-    source_endpoint,
-    destination_endpoint,
-    keep_num_backups=0,
-    no_incremental=False,
-    **kwargs,
-) -> None:
-    """Synchronizes snapshots from source to destination. Takes care
-    about locking and deletion of corrupt snapshots from failed transfers.
-    It never transfers snapshots that would anyway be deleted afterward
-    due to retention policy.
-    """
-
-    logger.info(__util__.log_heading(f"  To {destination_endpoint} ..."))
-
-    source_snapshots = source_endpoint.list_snapshots()
-    destination_snapshots = destination_endpoint.list_snapshots()
-    destination_id = destination_endpoint.get_id()
-
-    # delete corrupt snapshots from destination
+def delete_corrupt_snapshots(
+    destination_endpoint, source_snapshots, destination_snapshots
+):
+    """Deletes corrupt snapshots from the destination."""
     to_remove = []
+    destination_id = destination_endpoint.get_id()
     for snapshot in source_snapshots:
         if snapshot in destination_snapshots and destination_id in snapshot.locks:
-            # seems to have failed previously and is present at
-            # destination; delete corrupt snapshot there
             destination_snapshot = destination_snapshots[
                 destination_snapshots.index(snapshot)
             ]
@@ -116,26 +99,54 @@ def sync_snapshots(
             to_remove.append(destination_snapshot)
     if to_remove:
         destination_endpoint.delete_snapshots(to_remove)
-        # refresh list of snapshots at destination to have deleted ones
-        # disappear
-        destination_snapshots = destination_endpoint.list_snapshots()
-    # now that deletion worked, remove all locks for this destination
+        destination_snapshots = (
+            destination_endpoint.list_snapshots()
+        )  # Refresh after deletion
+    return destination_snapshots
+
+
+def clear_locks(source_endpoint, source_snapshots, destination_id):
+    """Clears locks for the given destination from source snapshots."""
     for snapshot in source_snapshots:
         if destination_id in snapshot.locks:
             source_endpoint.set_lock(snapshot, destination_id, False)
         if destination_id in snapshot.parent_locks:
             source_endpoint.set_lock(snapshot, destination_id, False, parent=True)
 
-    logger.debug("Planning transmissions ...")
-    to_consider = source_snapshots
-    if keep_num_backups > 0:
-        # it wouldn't make sense to transfer snapshots that would be deleted
-        # afterward anyway
-        to_consider = to_consider[-keep_num_backups:]
 
+def plan_transfers(source_snapshots, destination_snapshots, keep_num_backups):
+    """Plans which snapshots need to be transferred."""
+    to_consider = (
+        source_snapshots[-keep_num_backups:]
+        if keep_num_backups > 0
+        else source_snapshots
+    )
     to_transfer = [
         snapshot for snapshot in to_consider if snapshot not in destination_snapshots
     ]
+    return to_transfer
+
+
+def sync_snapshots(
+    source_endpoint,
+    destination_endpoint,
+    keep_num_backups=0,
+    no_incremental=False,
+    **kwargs,
+) -> None:
+    """Synchronizes snapshots from source to destination."""
+    logger.info(__util__.log_heading(f"  To {destination_endpoint} ..."))
+
+    source_snapshots = source_endpoint.list_snapshots()
+    destination_snapshots = destination_endpoint.list_snapshots()
+    destination_snapshots = delete_corrupt_snapshots(
+        destination_endpoint, source_snapshots, destination_snapshots
+    )
+    clear_locks(source_endpoint, source_snapshots, destination_endpoint.get_id())
+
+    to_transfer = plan_transfers(
+        source_snapshots, destination_snapshots, keep_num_backups
+    )
 
     if not to_transfer:
         logger.info("No snapshots need to be transferred.")
@@ -486,7 +497,7 @@ def run_task(options, queue) -> None:
 
     logger.debug("Source: %s", options["source"])
     source_endpoint_kwargs = dict(endpoint_kwargs)
-    source_endpoint_kwargs["path"] = Path(snapshot_directory) # Use pathlib.Path here
+    source_endpoint_kwargs["path"] = Path(snapshot_directory)  # Use pathlib.Path here
     try:
         source_endpoint = endpoint.choose_endpoint(
             options["source"],

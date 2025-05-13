@@ -29,7 +29,7 @@ and since then maintained by Robert Schindler, this codebase is
 written and maintained by Michael Berry.
 
 Latest release
-v0.6.6
+v0.6.7
 
 Downloads
 <http://pypi.python.org/pypi/btrfs_backup_ng>
@@ -38,7 +38,7 @@ Source
 <https://github.com/berrym/btrfs-backup-ng>
 
 Platforms
-Linux >= 3.12, Python >= 3.6
+Linux >= 3.12, Python >= 3.9
 
 Keywords
 backup, btrfs, snapshot, send, receive, ssh
@@ -68,7 +68,7 @@ backup, btrfs, snapshot, send, receive, ssh
 
 ### Requirements
 
--   Python 3.12 or later
+-   Python 3.9 or later
 -   Appropriate btrfs-progs; typically you'll want **at least** 3.12
     with Linux 3.12/3.13
 -   (optional) OpenSSH's `ssh` command - needed for remote backup
@@ -217,9 +217,9 @@ implement with the current design.
 ### Concurrent tasks
 
 Multiple btrfs-backup-ng tasks can be run in concurrent processes by
-separating the desired tasks with a ':'
+separating the desired tasks with a double colon '::'
 
-    $ btrfs-backup-ng /home /mnt/backups/home:/opt /mnt/backups/opt
+    $ btrfs-backup-ng /home /mnt/backups/home :: /opt /mnt/backups/opt
 
 or a similarly chained command. Each task will have its own set of options.
 Theres a set of Global Display Options that are inherited by all tasks.
