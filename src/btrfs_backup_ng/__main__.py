@@ -3,7 +3,7 @@
 """btrfs-backup-ng: btrfs-backup/__main__.py.
 
 Backup a btrfs volume to another, incrementally
-Requires Python >= 3.6, btrfs-progs >= 3.12 most likely.
+Requires Python >= 3.9, btrfs-progs >= 3.12 most likely.
 
 Copyright (c) 2024 Michael Berry <trismegustis@gmail.com>
 Copyright (c) 2017 Robert Schindler <r.schindler@efficiosoft.com>
@@ -435,69 +435,80 @@ files is allowed as well."""
     return options
 
 
-# pylint: disable=too-many-branches
-# pylint: disable=too-many-statements
 def run_task(options, queue) -> None:
     """Create a list of tasks to run."""
-    qh = logging.handlers.QueueHandler(queue)  # Just the one handler needed
+    setup_logger(queue, options)
+    apply_shortcuts(options)
+    log_initial_settings(options)
+
+    source_endpoint = prepare_source_endpoint(options)
+    destination_endpoints = prepare_destination_endpoints(options, source_endpoint)
+
+    if options["remove_locks"]:
+        remove_locks(source_endpoint, options)
+
+    if not options["no_snapshot"]:
+        take_snapshot(source_endpoint)
+
+    if not options["no_transfer"]:
+        transfer_snapshots(source_endpoint, destination_endpoints, options)
+
+    cleanup_snapshots(source_endpoint, destination_endpoints, options)
+
+    logger.info(__util__.log_heading(f"Finished at {time.ctime()}"))
+
+
+def setup_logger(queue, options):
+    """Set up the logger with the appropriate verbosity."""
+    qh = logging.handlers.QueueHandler(queue)
     logger.addHandler(qh)
     logger.setLevel(options["verbosity"].upper())
 
-    # applying shortcuts
+
+def apply_shortcuts(options):
+    """Apply shortcuts for verbosity and snapshot settings."""
     if "quiet" in options:
         options["verbosity"] = "warning"
     if "latest_only" in options:
         options["num_snapshots"] = 1
 
+
+def log_initial_settings(options):
+    """Log the initial settings for the task."""
     logger.info(__util__.log_heading(f"Started at {time.ctime()}"))
-
     logger.debug(__util__.log_heading("Settings"))
-    if "snapshot_folder" in options:
-        snapshot_directory = options["snapshot_folder"]
-    else:
-        snapshot_directory = ".btrfs-backup-ng/snapshots"
-
-    if "snapshot_prefix" in options:
-        snapshot_prefix = options["snapshot_prefix"]
-    else:
-        snapshot_prefix = f"{os.uname()[1]}-"
-
     logger.debug("Enable btrfs debugging: %r", options["btrfs_debug"])
     logger.debug("Don't take a new snapshot: %r", options["no_snapshot"])
     logger.debug("Number of snapshots to keep: %d", options["num_snapshots"])
+    logger.debug("Number of backups to keep: %s", options["num_backups"])
     logger.debug(
-        "Number of backups to keep: %s",
-        (str(options["num_backups"]) if options["num_backups"] > 0 else "Any"),
+        "Snapshot folder: %s",
+        options.get("snapshot_folder", ".btrfs-backup-ng/snapshots"),
     )
-    logger.debug("Snapshot folder: %s", snapshot_directory)
-    logger.debug("Snapshot prefix: %s", snapshot_prefix or None)
+    logger.debug(
+        "Snapshot prefix: %s", options.get("snapshot_prefix", f"{os.uname()[1]}-")
+    )
     logger.debug("Don't transfer snapshots: %r", options["no_transfer"])
     logger.debug("Don't send incrementally: %r", options["no_incremental"])
     logger.debug("Extra SSH config options: %s", options["ssh_opt"])
     logger.debug("Use sudo at SSH remote host: %r", options["ssh_sudo"])
     logger.debug("Run 'btrfs subvolume sync' afterwards: %r", options["sync"])
     logger.debug(
-        "Convert subvolumes to read-write before deletion: %r",
-        options["convert_rw"],
+        "Convert subvolumes to read-write before deletion: %r", options["convert_rw"]
     )
     logger.debug("Remove locks for given destinations: %r", options["remove_locks"])
     logger.debug("Skip filesystem checks: %r", options["skip_fs_checks"])
     logger.debug("Auto add locked destinations: %r", options["locked_destinations"])
 
-    # kwargs that are common between all endpoints
-    endpoint_kwargs = {
-        "snap_prefix": snapshot_prefix,
-        "convert_rw": options["convert_rw"],
-        "subvolume_sync": options["sync"],
-        "btrfs_debug": options["btrfs_debug"],
-        "fs_checks": not options["skip_fs_checks"],
-        "ssh_opts": options["ssh_opt"],
-        "ssh_sudo": options["ssh_sudo"],
-    }
 
+def prepare_source_endpoint(options):
+    """Prepare the source endpoint."""
     logger.debug("Source: %s", options["source"])
+    endpoint_kwargs = build_endpoint_kwargs(options)
     source_endpoint_kwargs = dict(endpoint_kwargs)
-    source_endpoint_kwargs["path"] = Path(snapshot_directory)  # Use pathlib.Path here
+    source_endpoint_kwargs["path"] = Path(
+        options.get("snapshot_folder", ".btrfs-backup-ng/snapshots")
+    )
     try:
         source_endpoint = endpoint.choose_endpoint(
             options["source"],
@@ -509,100 +520,111 @@ def run_task(options, queue) -> None:
         raise __util__.AbortError
     logger.debug("Source endpoint: %s", source_endpoint)
     source_endpoint.prepare()
+    return source_endpoint
 
-    # add endpoint creation strings for locked destinations, if desired
+
+def prepare_destination_endpoints(options, source_endpoint):
+    """Prepare the destination endpoints."""
     if options["locked_destinations"]:
-        for snap in source_endpoint.list_snapshots():
-            for lock in snap.locks:
-                if lock not in options["destinations"]:
-                    options["destinations"].append(lock)
+        add_locked_destinations(source_endpoint, options)
 
-    if "remove_locks" in options:
-        logger.info("Removing locks (--remove-locks) ...")
-        for snap in source_endpoint.list_snapshots():
-            for destination in options["destinations"]:
-                if destination in snap.locks:
-                    logger.info("  %s (%s)", snap, destination)
-                    source_endpoint.set_lock(snap, destination, False)
-                if destination in snap.parent_locks:
-                    logger.info("  %s (%s) [parent]", snap, destination)
-                    source_endpoint.set_lock(snap, destination, False, parent=True)
+    if options["no_transfer"] and options["num_backups"] <= 0:
+        logger.debug("Skipping destination endpoint creation.")
+        return []
 
     destination_endpoints = []
-    # only create destination endpoints if they are needed
-    if options["no_transfer"] and options["num_backups"] <= 0:
-        logger.debug(
-            "Don't create destination endpoints because they won't be needed "
-            "(--no-transfer and no --num-backups).",
-        )
-    else:
+    endpoint_kwargs = build_endpoint_kwargs(options)
+    for destination in options["destinations"]:
+        logger.debug("Destination: %s", destination)
+        try:
+            destination_endpoint = endpoint.choose_endpoint(
+                destination,
+                endpoint_kwargs,
+                source=False,
+            )
+        except ValueError as e:
+            logger.error("Couldn't parse destination specification: %s", e)
+            raise __util__.AbortError
+        destination_endpoints.append(destination_endpoint)
+        logger.debug("Destination endpoint: %s", destination_endpoint)
+        destination_endpoint.prepare()
+    return destination_endpoints
+
+
+def build_endpoint_kwargs(options):
+    """Build common kwargs for endpoints."""
+    return {
+        "snap_prefix": options.get("snapshot_prefix", f"{os.uname()[1]}-"),
+        "convert_rw": options["convert_rw"],
+        "subvolume_sync": options["sync"],
+        "btrfs_debug": options["btrfs_debug"],
+        "fs_checks": not options["skip_fs_checks"],
+        "ssh_opts": options["ssh_opt"],
+        "ssh_sudo": options["ssh_sudo"],
+    }
+
+
+def add_locked_destinations(source_endpoint, options):
+    """Add locked destinations to the options."""
+    for snap in source_endpoint.list_snapshots():
+        for lock in snap.locks:
+            if lock not in options["destinations"]:
+                options["destinations"].append(lock)
+
+
+def remove_locks(source_endpoint, options):
+    """Remove locks from the source endpoint."""
+    logger.info("Removing locks (--remove-locks) ...")
+    for snap in source_endpoint.list_snapshots():
         for destination in options["destinations"]:
-            logger.debug("Destination: %s", destination)
-            try:
-                destination_endpoint = endpoint.choose_endpoint(
-                    destination,
-                    endpoint_kwargs,
-                    source=False,
-                )
-            except ValueError as e:
-                logger.error("Couldn't parse destination specification: %s", e)
-                raise __util__.AbortError
-            destination_endpoints.append(destination_endpoint)
-            logger.debug("Destination endpoint: %s", destination_endpoint)
-            destination_endpoint.prepare()
+            if destination in snap.locks:
+                logger.info("  %s (%s)", snap, destination)
+                source_endpoint.set_lock(snap, destination, False)
+            if destination in snap.parent_locks:
+                logger.info("  %s (%s) [parent]", snap, destination)
+                source_endpoint.set_lock(snap, destination, False, parent=True)
 
-    if options["no_snapshot"]:
-        logger.info("Taking no snapshot (--no-snapshot).")
-    else:
-        # First we need to create a new snapshot on the source disk
-        logger.info(__util__.log_heading("Snapshotting ..."))
-        source_endpoint.snapshot()
 
-    if options["no_transfer"]:
-        logger.info(__util__.log_heading("Not transferring (--no-transfer)."))
-    else:
-        logger.info(__util__.log_heading("Transferring ..."))
-        for destination_endpoint in destination_endpoints:
-            try:
-                sync_snapshots(
-                    source_endpoint,
-                    destination_endpoint,
-                    keep_num_backups=options["num_backups"],
-                    no_incremental=options["no_incremental"],
-                )
-            except __util__.AbortError as e:
-                logger.error(
-                    "Aborting snapshot transfer to %s due to exception.",
-                    destination_endpoint,
-                )
-                logger.debug("Exception was: %s", e)
-        if not destination_endpoints:
-            logger.info("No destination configured, don't sending anything.")
+def take_snapshot(source_endpoint):
+    """Take a snapshot on the source endpoint."""
+    logger.info(__util__.log_heading("Snapshotting ..."))
+    source_endpoint.snapshot()
 
+
+def transfer_snapshots(source_endpoint, destination_endpoints, options):
+    """Transfer snapshots to the destination endpoints."""
+    logger.info(__util__.log_heading("Transferring ..."))
+    for destination_endpoint in destination_endpoints:
+        try:
+            sync_snapshots(
+                source_endpoint,
+                destination_endpoint,
+                keep_num_backups=options["num_backups"],
+                no_incremental=options["no_incremental"],
+            )
+        except __util__.AbortError as e:
+            logger.error(
+                "Aborting snapshot transfer to %s due to exception.",
+                destination_endpoint,
+            )
+            logger.debug("Exception was: %s", e)
+
+
+def cleanup_snapshots(source_endpoint, destination_endpoints, options):
+    """Clean up old snapshots."""
     logger.info(__util__.log_heading("Cleaning up..."))
-    # cleanup snapshots > num_snapshots in snap_dir
     if options["num_snapshots"] > 0:
         try:
             source_endpoint.delete_old_snapshots(options["num_snapshots"])
         except __util__.AbortError as e:
-            logger.debug(
-                "Got AbortError while deleting source snapshots at %s\nCaught: %s",
-                source_endpoint,
-                e,
-            )
-    # cleanup backups > num_backups in backup target
+            logger.debug("Error while deleting source snapshots: %s", e)
+
     if options["num_backups"] > 0:
         for destination_endpoint in destination_endpoints:
             try:
                 destination_endpoint.delete_old_snapshots(options["num_backups"])
             except __util__.AbortError as e:
-                logger.debug(
-                    "Got AbortError while deleting backups at %s\nCaught: %s",
-                    destination_endpoint,
-                    e,
-                )
-
-    logger.info(__util__.log_heading(f"Finished at {time.ctime()}"))
+                logger.debug("Error while deleting backups: %s", e)
 
 
 def elevate_privileges() -> None:

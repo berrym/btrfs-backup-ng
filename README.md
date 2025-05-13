@@ -29,7 +29,7 @@ and since then maintained by Robert Schindler, this codebase is
 written and maintained by Michael Berry.
 
 Latest release
-v0.6.7
+v0.6.8
 
 Downloads
 <http://pypi.python.org/pypi/btrfs_backup_ng>
