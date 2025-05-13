@@ -2,8 +2,8 @@
 
 """btrfs-backup-ng: btrfs_backup_ng/endpoint/__init__.py."""
 
-import os
 import urllib.parse
+from pathlib import Path
 
 from .local import LocalEndpoint
 from .shell import ShellEndpoint
@@ -45,11 +45,10 @@ def choose_endpoint(spec, common_kwargs=None, source=False, excluded_types=()):
         except ValueError:
             # invalid literal for int ...
             kwargs["port"] = None
-        path = parsed.path.strip() or "/"
+        path = Path(parsed.path.strip() or "/")
         # This is no URL, so an eventual query part must be appended to path
         if parsed.query:
-            path += "?" + parsed.query
-        path = os.path.normpath(path)
+            path /= "?" + parsed.query
         if source:
             kwargs["source"] = path
         else:
@@ -59,9 +58,9 @@ def choose_endpoint(spec, common_kwargs=None, source=False, excluded_types=()):
     elif LocalEndpoint not in excluded_types:
         c = LocalEndpoint
         if source:
-            kwargs["source"] = spec
+            kwargs["source"] = Path(spec)
         else:
-            kwargs["path"] = spec
+            kwargs["path"] = Path(spec)
     else:
         msg = f"No endpoint could be generated for this specification: {spec}"
         raise ValueError(

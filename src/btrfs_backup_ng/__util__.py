@@ -1,14 +1,14 @@
 # pyright: standard
 
 """btrfs-backup-ng: btrfs_backup_ng/__util__.py
-Common __util__ity code shared between modules.
+Common utility code shared between modules.
 """
 
 import functools
 import json
-import os
 import subprocess
 import time
+from pathlib import Path
 
 from .__logger__ import logger
 
@@ -29,7 +29,7 @@ class Snapshot:
     """Represents a snapshot with comparison by prefix and time_obj."""
 
     def __init__(self, location, prefix, endpoint, time_obj=None) -> None:
-        self.location = location
+        self.location = Path(location)
         self.prefix = prefix
         self.endpoint = endpoint
         if time_obj is None:
@@ -58,7 +58,7 @@ class Snapshot:
 
     def get_path(self):
         """Return full path to a snapshot."""
-        return os.path.join(self.location, self.get_name())
+        return self.location / self.get_name()
 
     def find_parent(self, present_snapshots):
         """Returns object from ``present_snapshot`` most suitable for being
@@ -120,7 +120,7 @@ def str_to_date(time_string=None, fmt=None):
 
 def is_btrfs(path):
     """Checks whether path is inside a btrfs file system."""
-    path = os.path.normpath(os.path.abspath(path))
+    path = Path(path).resolve()
     logger.debug("Checking for btrfs filesystem: %s", path)
     best_match = ""
     best_match_fs_type = ""
@@ -132,19 +132,16 @@ def is_btrfs(path):
             except ValueError as e:
                 logger.debug("  Couldn't split line, skipping: %s\nCaught: %s", line, e)
                 continue
-            mount_point_prefix = mount_point
-            if not mount_point_prefix.endswith(os.sep):
-                mount_point_prefix += os.sep
-            if (path == mount_point or path.startswith(mount_point_prefix)) and len(
-                mount_point,
-            ) > len(best_match):
-                best_match = mount_point
-                best_match_fs_type = fs_type
-                logger.debug(
-                    "  New best_match with filesystem type %s: %s",
-                    best_match_fs_type,
-                    best_match,
-                )
+            mount_point_prefix = Path(mount_point)
+            if path == mount_point_prefix or path.is_relative_to(mount_point_prefix):
+                if len(str(mount_point)) > len(best_match):
+                    best_match = mount_point
+                    best_match_fs_type = fs_type
+                    logger.debug(
+                        "  New best_match with filesystem type %s: %s",
+                        best_match_fs_type,
+                        best_match,
+                    )
         result = best_match_fs_type == "btrfs"
         logger.debug(
             "  -> best_match_fs_type is %s, result is %r",
@@ -160,7 +157,8 @@ def is_subvolume(path):
         return False
     logger.debug("Checking for btrfs subvolume: %s", path)
     # subvolumes always have inode 256
-    st = os.stat(path)
+    path = Path(path).resolve()
+    st = path.stat()
     result = st.st_ino == 256
     logger.debug("  -> Inode is %d, result is %r", st.st_ino, result)
     return result

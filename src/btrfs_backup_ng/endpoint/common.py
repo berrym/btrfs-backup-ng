@@ -6,8 +6,8 @@ Common functionality among modules.
 
 import contextlib
 import logging
-import os
 import subprocess
+from pathlib import Path
 
 from btrfs_backup_ng import __util__
 from btrfs_backup_ng.__logger__ import logger
@@ -42,7 +42,7 @@ class Endpoint:
     ) -> None:
         # pylint: disable=too-many-arguments
         # pylint: disable=too-many-positional-arguments
-        self.path = path
+        self.path = Path(path) if path else None
         self.snap_prefix = snap_prefix
         self.convert_rw = convert_rw
         self.subvolume_sync = subvolume_sync
@@ -50,7 +50,7 @@ class Endpoint:
         self.btrfs_flags = []
         if self.btrfs_debug:
             self.btrfs_flags += ["-vv"]
-        self.source = source
+        self.source = Path(source) if source else None
         self.fs_checks = fs_checks
         self.lock_file_name = ".outstanding_transfers"
         self.__cached_snapshots = None
@@ -276,7 +276,7 @@ class Endpoint:
         cmd = ["btrfs", "subvolume", "snapshot"]
         if readonly:
             cmd += ["-r"]
-        cmd += [source, destination]
+        cmd += [str(source), str(destination)]
         return cmd
 
     @staticmethod
@@ -295,18 +295,18 @@ class Endpoint:
         if log_level >= logging.WARNING:
             cmd += ["--quiet"]
         if parent:
-            cmd += ["-p", parent.get_path()]
+            cmd += ["-p", str(parent.get_path())]
         if clones:
             for clone in clones:
-                cmd += ["-c", clone.get_path()]
-        cmd += [snapshot.get_path()]
+                cmd += [str(clone.get_path())]
+        cmd += [str(snapshot.get_path())]
         return cmd
 
     def _build_receive_command(self, destination):
         """Should return a command to receive a snapshot to ``dest``.
         The stream is piped into stdin when the command is running.
         """
-        return ["btrfs", "receive", *self.btrfs_flags, destination]
+        return ["btrfs", "receive", *self.btrfs_flags, str(destination)]
 
     def _build_deletion_commands(self, snapshots, convert_rw=None, subvolume_sync=None):
         """Should return a list of commands that, when executed in order,
@@ -327,7 +327,7 @@ class Endpoint:
                     "property",
                     "set",
                     "-ts",
-                    snapshot.get_path(),
+                    str(snapshot.get_path()),
                     "ro",
                     "false",
                 ]
@@ -335,11 +335,11 @@ class Endpoint:
             )
 
         cmd = ["btrfs", "subvolume", "delete"]
-        cmd.extend([snapshot.get_path() for snapshot in snapshots])
+        cmd.extend([str(snapshot.get_path()) for snapshot in snapshots])
         commands.append(cmd)
 
         if subvolume_sync:
-            commands.append(["btrfs", "subvolume", "sync", self.path])
+            commands.append(["btrfs", "subvolume", "sync", str(self.path)])
 
         return commands
 
@@ -366,14 +366,16 @@ class Endpoint:
 
     def _listdir(self, location):
         """Should return all items present at the given ``location``."""
-        return os.listdir(location)
+        return [str(item) for item in location.iterdir()]
 
     @require_source
     def _get_lock_file_path(self):
         """Is used by the default ``_read/write_locks`` methods and should
         return the file in which the locks are stored.
         """
-        return os.path.join(str(self.path), str(self.lock_file_name))
+        if self.path is None:
+            raise ValueError
+        return self.path / self.lock_file_name
 
     @require_source
     def _read_locks(self):
@@ -382,7 +384,7 @@ class Endpoint:
         """
         path = self._get_lock_file_path()
         try:
-            if not os.path.isfile(path):
+            if not path.is_file():
                 return {}
             with open(path, encoding="utf-8") as f:
                 return __util__.read_locks(f.read())

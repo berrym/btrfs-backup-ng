@@ -5,9 +5,9 @@ Create commands with ssh endpoints.
 """
 
 import copy
-import os
 import subprocess
 import tempfile
+from pathlib import Path
 
 from btrfs_backup_ng import __util__
 from btrfs_backup_ng.__logger__ import logger
@@ -39,10 +39,10 @@ class SSHEndpoint(Endpoint):
         self.sshfs_opts += ["auto_unmount", "reconnect", "cache=no"]
         self.ssh_sudo = ssh_sudo
         if self.source:
-            self.source = os.path.normpath(self.source)
-            if self.path is not None and not self.path.startswith("/"):
-                self.path = os.path.join(self.source, self.path)
-        self.path = os.path.normpath(self.path)
+            self.source = Path(self.source).resolve()
+            if self.path is not None and not str(self.path).startswith("/"):
+                self.path = self.source / self.path
+        self.path = Path(self.path).resolve()
         self.sshfs = None
 
     def __repr__(self) -> str:
@@ -77,8 +77,8 @@ class SSHEndpoint(Endpoint):
         # sshfs is useful for listing directories and reading/writing locks
         tempdir = tempfile.mkdtemp()
         logger.debug("Created tempdir: %s", tempdir)
-        mount_point = os.path.join(tempdir, "mnt")
-        os.makedirs(mount_point)
+        mount_point = Path(tempdir) / "mnt"
+        mount_point.mkdir()
         logger.debug("Created directory: %s", mount_point)
         logger.debug("Mounting sshfs ...")
 
@@ -87,7 +87,7 @@ class SSHEndpoint(Endpoint):
             cmd += ["-p", str(self.port)]
         for opt in self.sshfs_opts:
             cmd += ["-o", opt]
-        cmd += [f"{self._build_connect_string()}:/", mount_point]
+        cmd += [f"{self._build_connect_string()}:/", str(mount_point)]
         try:
             __util__.exec_subprocess(
                 cmd,
@@ -114,15 +114,16 @@ class SSHEndpoint(Endpoint):
         dirs.append(self.path)
         if self.sshfs:
             for d in dirs:
-                if not os.path.isdir(self._path_to_sshfs(d)):
+                sshfs_path = self._path_to_sshfs(d)
+                if not sshfs_path.is_dir():
                     logger.info("Creating directory: %s", d)
                     try:
-                        os.makedirs(self._path_to_sshfs(d))
+                        sshfs_path.mkdir(parents=True, exist_ok=True)
                     except OSError as e:
                         logger.error("Error creating new location %s: %s", d, e)
                         raise __util__.AbortError
         else:
-            cmd = ["mkdir", "-p", *dirs]
+            cmd = ["mkdir", "-p", *[str(d) for d in dirs]]
             self._exec_command(cmd)
 
     def _collapse_commands(self, commands, abort_on_failure=True):
@@ -153,9 +154,10 @@ class SSHEndpoint(Endpoint):
     def _listdir(self, location):
         """Operates remotely via 'ls -1A'."""
         if self.sshfs:
-            items = os.listdir(self._path_to_sshfs(location))
+            items = [str(item) for item in self._path_to_sshfs(location).iterdir()]
+
         else:
-            cmd = ["ls", "-1A", location]
+            cmd = ["ls", "-1A", str(location)]
             output = self._exec_command(cmd, universal_newlines=True)
             items = output.splitlines()
         return items
@@ -178,5 +180,5 @@ class SSHEndpoint(Endpoint):
         if not self.sshfs:
             msg = "sshfs not mounted"
             raise ValueError(msg)
-        path = path.removeprefix("/")
-        return str(os.path.join(self.sshfs, path))
+        path = Path(path)
+        return self.sshfs / path.relative_to("/")

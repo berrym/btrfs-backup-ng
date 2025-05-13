@@ -39,6 +39,7 @@ import sys
 import threading
 import time
 from math import inf
+from pathlib import Path
 
 from rich.align import Align
 from rich.layout import Layout
@@ -485,7 +486,7 @@ def run_task(options, queue) -> None:
 
     logger.debug("Source: %s", options["source"])
     source_endpoint_kwargs = dict(endpoint_kwargs)
-    source_endpoint_kwargs["path"] = snapshot_directory
+    source_endpoint_kwargs["path"] = Path(snapshot_directory) # Use pathlib.Path here
     try:
         source_endpoint = endpoint.choose_endpoint(
             options["source"],
@@ -648,7 +649,7 @@ def main() -> None:
     for arg in sys.argv[1:]:
         command_line += f"{arg} "  # Assume no space => no quotes
 
-    tasks = [task.split() for task in command_line.split(":")]
+    tasks = [task.split() for task in command_line.split("::")]
 
     task_options = [parse_options([global_parser], task) for task in tasks]
 
