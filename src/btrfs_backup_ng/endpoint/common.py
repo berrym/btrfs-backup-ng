@@ -114,35 +114,6 @@ class Endpoint:
                 self.add_snapshot(snapshot)
         return snapshot
 
-    # @require_source
-    # def snapshot(self, readonly=True, sync=True):
-    #     """Takes a snapshot and returns the created object."""
-    #     snapshot_dir = Path(self.config.get("snapshot_dir", "snapshot"))
-    #     snapshot_path_base = self.config["path"] / snapshot_dir
-    #     # Ensure the snapshot directory exists with correct permissions
-    #     snapshot_path_base.mkdir(parents=True, exist_ok=True, mode=0o700)
-
-    #     snapshot = __util__.Snapshot(
-    #         snapshot_path_base, self.config["snap_prefix"], self
-    #     )
-    #     snapshot_path = snapshot.get_path()
-    #     logger.info("%s -> %s", self.config["source"], snapshot_path)
-
-    #     # Lock file in the snapshot folder
-    #     lock_path = self.config["path"] / ".btrfs-backup-ng.snapshot.lock"
-    #     with FileLock(lock_path):
-    #         self._remount(self.config["source"], read_write=True)
-    #         commands = [
-    #             self._build_snapshot_cmd(
-    #                 self.config["source"], snapshot_path, readonly=readonly
-    #             ),
-    #         ]
-    #         if sync:
-    #             commands.append(self._build_sync_command())
-    #         for cmd in self._collapse_commands(commands, abort_on_failure=True):
-    #             self._exec_command({"command": cmd})
-    #         self.add_snapshot(snapshot)
-    #     return snapshot
 
     @require_source
     def send(self, snapshot, parent=None, clones=None):
@@ -271,32 +242,17 @@ class Endpoint:
         return
 
     def delete_snapshots(self, snapshots, **kwargs) -> None:
-        """Deletes the given snapshots, passing all keyword arguments to
-        ``_build_deletion_commands``. Actually deletes the snapshot subvolumes.
-        """
-        # Only remove snapshots that have no lock remaining
-        to_remove = [
-            snapshot
-            for snapshot in snapshots
-            if not snapshot.locks and not snapshot.parent_locks
-        ]
-
-        logger.info("Removing %d snapshot(s) from %r:", len(to_remove), self)
+        """Deletes the given snapshots, actually deletes the snapshot subvolumes."""
         for snapshot in snapshots:
-            if snapshot in to_remove:
-                logger.info("  %s", snapshot)
-            else:
-                logger.info("  %s - is locked, keeping it", snapshot)
-
-        for snapshot in to_remove:
-            # Actually delete the subvolume using btrfs subvolume delete
+            if snapshot.locks or snapshot.parent_locks:
+                logger.info("Skipping locked snapshot: %s", snapshot)
+                continue
             cmd = ["btrfs", "subvolume", "delete", str(snapshot.get_path())]
             try:
                 self._exec_command({"command": cmd})
                 logger.info("Deleted snapshot subvolume: %s", snapshot.get_path())
             except Exception as e:
                 logger.error("Failed to delete snapshot %s: %s", snapshot.get_path(), e)
-
             # Remove from cache if present
             if self.__cached_snapshots is not None:
                 with contextlib.suppress(ValueError):
@@ -308,15 +264,18 @@ class Endpoint:
 
     def delete_old_snapshots(self, keep):
         """
-        Delete old snapshots, keeping only the most recent `keep` snapshots.
+        Delete old snapshots, keeping only the most recent `keep` unlocked snapshots.
         """
-        # List all snapshots (assume self.list_snapshots() returns sorted by creation time, oldest first)
+        # List all snapshots, sorted oldest to newest
         snapshots = self.list_snapshots()
-        if keep <= 0 or len(snapshots) <= keep:
-            return  # Nothing to delete
+        # Only consider unlocked snapshots for deletion
+        unlocked = [s for s in snapshots if not s.locks and not s.parent_locks]
+        if keep <= 0 or len(unlocked) <= keep:
+            logger.debug("No unlocked snapshots to delete (keep=%d, unlocked=%d)", keep, len(unlocked))
+            return
 
-        # Determine which snapshots to delete
-        to_delete = snapshots[:-keep]
+        # Determine which unlocked snapshots to delete (oldest first)
+        to_delete = unlocked[:-keep]
         for snap in to_delete:
             logger.info("Deleting old snapshot: %s", snap)
             self.delete_snapshots([snap])

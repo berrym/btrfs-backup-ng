@@ -442,8 +442,17 @@ files is allowed as well."""
     except RecursionError as e:
         raise __util__.AbortError from e
 
-    print("Command-line destinations:", options["destinations"])
+    # Ensure retention options are always integers
+    try:
+        options["num_snapshots"] = int(options.get("num_snapshots", 0))
+    except Exception:
+        options["num_snapshots"] = 0
+    try:
+        options["num_backups"] = int(options.get("num_backups", 0))
+    except Exception:
+        options["num_backups"] = 0
 
+    print("Command-line destinations:", options["destinations"])
     return options
 
 
@@ -457,7 +466,7 @@ def run_task(options, queue):
     destination_endpoints = prepare_destination_endpoints(options, source_endpoint)
 
     if not options["no_snapshot"]:
-        snapshot = take_snapshot(source_endpoint)
+        snapshot = take_snapshot(source_endpoint, options)
     else:
         snapshot = None
 
@@ -494,7 +503,10 @@ def apply_shortcuts(options):
     """Apply shortcuts for verbosity and snapshot settings."""
     if "quiet" in options:
         options["verbosity"] = "warning"
-    if "latest_only" in options:
+    # Only override if user did NOT supply --num-snapshots
+    if "latest_only" in options and (
+        "num_snapshots" not in options or options["num_snapshots"] == 0
+    ):
         options["num_snapshots"] = 1
 
 
@@ -630,10 +642,17 @@ def remove_locks(source_endpoint, options):
                 source_endpoint.set_lock(snap, destination, False, parent=True)
 
 
-def take_snapshot(source_endpoint):
-    """Take a snapshot on the source endpoint."""
+def take_snapshot(source_endpoint, options):
+    """Take a snapshot on the source endpoint and enforce retention."""
     logger.info(__util__.log_heading("Transferring ..."))
-    return source_endpoint.snapshot()
+    snapshot = source_endpoint.snapshot()
+    # Enforce retention immediately after snapshot creation
+    if options.get("num_snapshots", 0) > 0:
+        try:
+            source_endpoint.delete_old_snapshots(options["num_snapshots"])
+        except Exception as e:
+            logger.debug("Error while deleting source snapshots: %s", e)
+    return snapshot
 
 
 def transfer_snapshots(source_endpoint, destination_endpoints, options):
@@ -641,7 +660,7 @@ def transfer_snapshots(source_endpoint, destination_endpoints, options):
     logger.info(__util__.log_heading("Transferring ..."))
 
     if not options["no_snapshot"]:
-        snapshot = take_snapshot(source_endpoint)
+        snapshot = take_snapshot(source_endpoint, options=options)
     else:
         snapshot = None
 
