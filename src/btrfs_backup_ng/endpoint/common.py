@@ -136,7 +136,10 @@ class Endpoint:
         )
 
     def list_snapshots(self, flush_cache=False):
-        """Returns a list with all snapshots found directly in self.config['path'] using $snap_prefix."""
+        """
+        Returns a list with all snapshots found directly in self.config['path'] using $snap_prefix.
+        Populates a cache for efficient repeated access and removable snapshot checks.
+        """
         # Use the normalized absolute path for both source and destination
         snapshot_dir = Path(self.config["path"]).resolve()
         snap_prefix = self.config.get("snap_prefix", "")
@@ -145,6 +148,11 @@ class Endpoint:
 
         logger.debug("Listing snapshots in: %s", snapshot_dir)
         logger.debug("Snapshot prefix: %s", snap_prefix)
+
+        # Use or refresh the cache
+        if self.__cached_snapshots is not None and not flush_cache:
+            logger.debug("Returning %d cached snapshots for %r.", len(self.__cached_snapshots), self)
+            return list(self.__cached_snapshots)
 
         snapshots = []
         listdir = self._listdir(snapshot_dir)
@@ -172,12 +180,13 @@ class Endpoint:
                     )
                     snapshots.append(snapshot)
         snapshots.sort()
+        self.__cached_snapshots = snapshots  # Populate the cache
         logger.debug(
-            "Found %d snapshots in %r.",
-            len(snapshots),
+            "Populated snapshot cache of %r with %d items.",
             self,
+            len(snapshots),
         )
-        return snapshots
+        return list(snapshots)
 
     @require_source
     def set_lock(self, snapshot, lock_id, lock_state, parent=False) -> None:
