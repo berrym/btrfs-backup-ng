@@ -89,12 +89,15 @@ class Endpoint:
     @require_source
     def snapshot(self, readonly=True, sync=True):
         """Takes a snapshot and returns the created object."""
-        source_path = Path(self.config["source"])
-        snapshot_dir = source_path / ".btrfs-backup-ng" / "snapshots"
-        # Ensure the snapshot directory exists with correct permissions
+        base_path = Path(self.config["source"]).resolve()
+        snapshot_folder = self.config.get("snapshot_folder", ".btrfs-backup-ng/snapshots")
+        snap_prefix = self.config.get("snap_prefix", "")
+        snapshot_dir = (base_path / snapshot_folder).resolve()
+        self.config["path"] = snapshot_dir
+
         snapshot_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
 
-        snapshot = __util__.Snapshot(snapshot_dir, self.config["snap_prefix"], self)
+        snapshot = __util__.Snapshot(snapshot_dir, snap_prefix, self)
         snapshot_path = snapshot.get_path()
         logger.info("%s -> %s", self.config["source"], snapshot_path)
 
@@ -133,58 +136,48 @@ class Endpoint:
         )
 
     def list_snapshots(self, flush_cache=False):
-        """Returns a list with all snapshots found at ``self.path``."""
-        logger.debug("Listing snapshots in: %s", self.config["path"])
-        logger.debug("Snapshot prefix: %s", self.config["snap_prefix"])
+        """Returns a list with all snapshots found directly in self.config['path'] using $snap_prefix."""
+        # Use the normalized absolute path for both source and destination
+        snapshot_dir = Path(self.config["path"]).resolve()
+        snap_prefix = self.config.get("snap_prefix", "")
 
-        if self.__cached_snapshots is not None and not flush_cache:
-            logger.debug(
-                "Returning %d cached snapshots for %r.",
-                len(self.__cached_snapshots),
-                self,
-            )
-            return list(self.__cached_snapshots)
+        snapshot_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
 
-        logger.debug("Building snapshot cache of %r ...", self)
+        logger.debug("Listing snapshots in: %s", snapshot_dir)
+        logger.debug("Snapshot prefix: %s", snap_prefix)
+
         snapshots = []
-        listdir = self._listdir(self.config["path"])
+        listdir = self._listdir(snapshot_dir)
         logger.debug("Directory contents: %r", listdir)
         for item in listdir:
-            if item.startswith(self.config["snap_prefix"]):
-                time_str = item[len(self.config["snap_prefix"]) :]
+            item_path = Path(item)
+            # Only consider items that are direct children of snapshot_dir and match the prefix
+            if (
+                item_path.parent.resolve() == snapshot_dir
+                and item_path.name.startswith(snap_prefix)
+            ):
+                date_part = item_path.name[len(snap_prefix):]
+                logger.debug("Parsing date from: %r", date_part)
                 try:
-                    time_obj = __util__.str_to_date(time_str)
-                except ValueError:
+                    time_obj = __util__.str_to_date(date_part)
+                except Exception as e:
+                    logger.warning("Could not parse date from: %r (%s)", item_path.name, e)
                     continue
                 else:
                     snapshot = __util__.Snapshot(
-                        self.config["path"],
-                        self.config["snap_prefix"],
+                        snapshot_dir,
+                        snap_prefix,
                         self,
                         time_obj=time_obj,
                     )
                     snapshots.append(snapshot)
-
-        # Apply locks
-        if self.config["source"]:
-            lock_dict = self._read_locks()
-            for snapshot in snapshots:
-                snap_entry = lock_dict.get(snapshot.get_name(), {})
-                for lock_type, locks in snap_entry.items():
-                    getattr(snapshot, lock_type).update(locks)
-
-        # Sort by date, then time
         snapshots.sort()
-
-        # Populate cache
-        self.__cached_snapshots = snapshots
         logger.debug(
-            "Populated snapshot cache of %r with %d items.",
-            self,
+            "Found %d snapshots in %r.",
             len(snapshots),
+            self,
         )
-
-        return list(snapshots)
+        return snapshots
 
     @require_source
     def set_lock(self, snapshot, lock_id, lock_state, parent=False) -> None:
