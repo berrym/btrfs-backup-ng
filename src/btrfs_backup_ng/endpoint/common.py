@@ -50,8 +50,12 @@ class Endpoint:
         self.config["subvolume_sync"] = config.get("subvolume_sync", False)
         self.config["btrfs_debug"] = config.get("btrfs_debug", False)
         self.config["fs_checks"] = config.get("fs_checks", False)
-        self.config["lock_file_name"] = config.get("lock_file_name", ".btrfs-backup-ng.locks")
-        self.config["snapshot_folder"] = config.get("snapshot_folder", ".btrfs-backup-ng/snapshots")
+        self.config["lock_file_name"] = config.get(
+            "lock_file_name", ".btrfs-backup-ng.locks"
+        )
+        self.config["snapshot_folder"] = config.get(
+            "snapshot_folder", ".btrfs-backup-ng/snapshots"
+        )
 
         self.btrfs_flags = ["-vv"] if self.config["btrfs_debug"] else []
         self.__cached_snapshots = None
@@ -87,7 +91,9 @@ class Endpoint:
         with FileLock(lock_path):
             self._remount(self.config["source"], read_write=True)
             commands = [
-                self._build_snapshot_cmd(self.config["source"], snapshot_path, readonly=readonly)
+                self._build_snapshot_cmd(
+                    self.config["source"], snapshot_path, readonly=readonly
+                )
             ]
             if sync:
                 commands.append(self._build_sync_command())
@@ -96,19 +102,22 @@ class Endpoint:
                 self.add_snapshot(snapshot)
         return snapshot
 
-
     @require_source
     def send(self, snapshot, parent=None, clones=None):
         """Call 'btrfs send' for the given snapshot and return its Popen object."""
         cmd = self._build_send_command(snapshot, parent=parent, clones=clones)
-        return self._exec_command({"command": cmd}, method="Popen", stdout=subprocess.PIPE)
+        return self._exec_command(
+            {"command": cmd}, method="Popen", stdout=subprocess.PIPE
+        )
 
     def receive(self, stdin):
         """Call 'btrfs receive', setting the given pipe as its stdin."""
         cmd = self._build_receive_command(self.config["path"])
         loglevel = logging.getLogger().getEffectiveLevel()
         stdout = subprocess.DEVNULL if loglevel >= logging.WARNING else None
-        return self._exec_command({"command": cmd}, method="Popen", stdin=stdin, stdout=stdout)
+        return self._exec_command(
+            {"command": cmd}, method="Popen", stdin=stdin, stdout=stdout
+        )
 
     def list_snapshots(self, flush_cache=False):
         """
@@ -124,26 +133,38 @@ class Endpoint:
 
         # Use or refresh the cache
         if self.__cached_snapshots is not None and not flush_cache:
-            logger.debug("Returning %d cached snapshots for %r.", len(self.__cached_snapshots), self)
+            logger.debug(
+                "Returning %d cached snapshots for %r.",
+                len(self.__cached_snapshots),
+                self,
+            )
             return list(self.__cached_snapshots)
 
         snapshots = []
         for item in self._listdir(snapshot_dir):
             item_path = Path(item)
             # Only consider items that are direct children of snapshot_dir and match the prefix
-            if item_path.parent.resolve() == snapshot_dir and item_path.name.startswith(snap_prefix):
-                date_part = item_path.name[len(snap_prefix):]
+            if item_path.parent.resolve() == snapshot_dir and item_path.name.startswith(
+                snap_prefix
+            ):
+                date_part = item_path.name[len(snap_prefix) :]
                 logger.debug("Parsing date from: %r", date_part)
                 try:
                     time_obj = __util__.str_to_date(date_part)
                 except Exception as e:
-                    logger.warning("Could not parse date from: %r (%s)", item_path.name, e)
+                    logger.warning(
+                        "Could not parse date from: %r (%s)", item_path.name, e
+                    )
                     continue
-                snapshot = __util__.Snapshot(snapshot_dir, snap_prefix, self, time_obj=time_obj)
+                snapshot = __util__.Snapshot(
+                    snapshot_dir, snap_prefix, self, time_obj=time_obj
+                )
                 snapshots.append(snapshot)
         snapshots.sort()
         self.__cached_snapshots = snapshots
-        logger.debug("Populated snapshot cache of %r with %d items.", self, len(snapshots))
+        logger.debug(
+            "Populated snapshot cache of %r with %d items.", self, len(snapshots)
+        )
         return list(snapshots)
 
     @require_source
@@ -163,14 +184,22 @@ class Endpoint:
             if snap_entry:
                 lock_dict[_snapshot.get_name()] = snap_entry
         self._write_locks(lock_dict)
-        logger.debug("Lock state for %s and lock_id %s changed to %s (parent = %s)", snapshot, lock_id, lock_state, parent)
+        logger.debug(
+            "Lock state for %s and lock_id %s changed to %s (parent = %s)",
+            snapshot,
+            lock_id,
+            lock_state,
+            parent,
+        )
 
     def add_snapshot(self, snapshot, rewrite=True) -> None:
         """Add a snapshot to the cache."""
         if self.__cached_snapshots is None:
             return
         if rewrite:
-            snapshot = __util__.Snapshot(self.config["path"], snapshot.prefix, self, time_obj=snapshot.time_obj)
+            snapshot = __util__.Snapshot(
+                self.config["path"], snapshot.prefix, self, time_obj=snapshot.time_obj
+            )
         self.__cached_snapshots.append(snapshot)
         self.__cached_snapshots.sort()
 
@@ -201,7 +230,11 @@ class Endpoint:
         snapshots = self.list_snapshots()
         unlocked = [s for s in snapshots if not s.locks and not s.parent_locks]
         if keep <= 0 or len(unlocked) <= keep:
-            logger.debug("No unlocked snapshots to delete (keep=%d, unlocked=%d)", keep, len(unlocked))
+            logger.debug(
+                "No unlocked snapshots to delete (keep=%d, unlocked=%d)",
+                keep,
+                len(unlocked),
+            )
             return
         to_delete = unlocked[:-keep]
         for snap in to_delete:
@@ -252,16 +285,31 @@ class Endpoint:
         return ["btrfs", "receive", *self.btrfs_flags, str(destination)]
 
     def _build_deletion_commands(self, snapshots, convert_rw=None, subvolume_sync=None):
-        convert_rw = self.config.get("convert_rw", False) if convert_rw is None else convert_rw
-        subvolume_sync = self.config.get("subvolume_sync", False) if subvolume_sync is None else subvolume_sync
+        convert_rw = (
+            self.config.get("convert_rw", False) if convert_rw is None else convert_rw
+        )
+        subvolume_sync = (
+            self.config.get("subvolume_sync", False)
+            if subvolume_sync is None
+            else subvolume_sync
+        )
         commands = []
         if convert_rw:
             commands.extend(
                 [
-                    "btrfs", "property", "set", "-ts", str(snapshot.get_path()), "ro", "false"
-                ] for snapshot in snapshots
+                    "btrfs",
+                    "property",
+                    "set",
+                    "-ts",
+                    str(snapshot.get_path()),
+                    "ro",
+                    "false",
+                ]
+                for snapshot in snapshots
             )
-        cmd = ["btrfs", "subvolume", "delete"] + [str(snapshot.get_path()) for snapshot in snapshots]
+        cmd = ["btrfs", "subvolume", "delete"] + [
+            str(snapshot.get_path()) for snapshot in snapshots
+        ]
         commands.append(cmd)
         if subvolume_sync:
             commands.append(["btrfs", "subvolume", "sync", str(self.config["path"])])
@@ -309,7 +357,14 @@ class Endpoint:
             env = os.environ.copy()
             subprocess.check_call(cmd, env=env)
         except subprocess.CalledProcessError as e:
-            logger.error("Failed to remount %s as %s: %r %r %r", path, mode, e.returncode, e.stderr, e.stdout)
+            logger.error(
+                "Failed to remount %s as %s: %r %r %r",
+                path,
+                mode,
+                e.returncode,
+                e.stderr,
+                e.stdout,
+            )
             raise __util__.AbortError from e
 
     @require_source
