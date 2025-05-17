@@ -10,18 +10,28 @@ from .common import Endpoint
 class ShellEndpoint(Endpoint):
     """Create a shell command endpoint."""
 
-    def __init__(self, cmd, **kwargs) -> None:
-        super().__init__(**kwargs)
-        if self.source:
+    def __init__(self, cmd, config=None, **kwargs) -> None:
+        """
+        Initialize the ShellEndpoint with a shell command and configuration.
+
+        Args:
+            cmd (str): The shell command to execute.
+            config (dict): Configuration dictionary containing endpoint settings.
+            kwargs: Additional keyword arguments for backward compatibility.
+        """
+        super().__init__(config=config, **kwargs)
+        if self.config.get("source"):
             msg = "Shell can't be used as source."
             raise ValueError(msg)
-        self.cmd = cmd
+        self.config["cmd"] = cmd
 
     def __repr__(self) -> str:
-        return f"(Shell) {self.cmd}"
+        return f"(Shell) {self.config['cmd']}"
 
     def get_id(self) -> str:
-        return f"shell://{self.cmd}"
+        """Return a unique identifier for this shell endpoint."""
+        return f"shell://{self.config['cmd']}"
 
     def _build_receive_command(self, destination):
-        return ["sh", "-c", self.cmd]
+        """Build the shell command for receiving data."""
+        return ["sh", "-c", self.config["cmd"]]

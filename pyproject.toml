@@ -7,11 +7,11 @@ where = ["src"]
 
 [project]
 name = "btrfs-backup-ng"
-version = "0.6.8"
+version = "0.7.0"
 description = "Swiss army knife cli tool for atomic, incremental, intelligent, feature-rich backups for btrfs"
 authors = [{ name = "Michael Berry", email = "trismegustis@gmail.com" }]
 license = { text = "MIT" }
-dependencies = ["rich"]
+dependencies = ["filelock", "rich"]
 classifiers = [
     "Programming Language :: Python :: 3",
     "License :: OSI Approved :: MIT License",

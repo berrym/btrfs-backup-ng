@@ -16,48 +16,53 @@ from .common import Endpoint
 
 
 class SSHEndpoint(Endpoint):
-    """Commands for creating an ssh endpoint."""
+    """Commands for creating an SSH endpoint."""
 
-    # pylint: disable=too-many-instance-attributes
-    def __init__(
-        self,
-        hostname,
-        port=None,
-        username=None,
-        ssh_opts=None,
-        ssh_sudo=False,
-        **kwargs,
-    ) -> None:
-        # pylint: disable=too-many-arguments
-        # pylint: disable=too-many-positional-arguments
-        super().__init__(**kwargs if kwargs else {})
-        self.hostname = hostname
-        self.port = port
-        self.username = username
-        self.ssh_opts = ssh_opts or []
-        self.sshfs_opts = copy.deepcopy(self.ssh_opts)
-        self.sshfs_opts += ["auto_unmount", "reconnect", "cache=no"]
-        self.ssh_sudo = ssh_sudo
-        if self.source:
-            self.source = Path(self.source).resolve()
-            if self.path is not None and not str(self.path).startswith("/"):
-                self.path = self.source / self.path
-        self.path = Path(self.path).resolve()
+    def __init__(self, hostname, config=None, **kwargs) -> None:
+        """
+        Initialize the SSHEndpoint with a hostname and configuration.
+
+        Args:
+            hostname (str): The SSH hostname.
+            config (dict): Configuration dictionary containing endpoint settings.
+            kwargs: Additional keyword arguments for backward compatibility.
+        """
+        super().__init__(config=config, **kwargs)
+        self.config["hostname"] = hostname
+        self.config["port"] = self.config.get("port")
+        self.config["username"] = self.config.get("username")
+        self.config["ssh_opts"] = self.config.get("ssh_opts", [])
+        self.config["ssh_sudo"] = self.config.get("ssh_sudo", False)
+
+        # SSHFS options
+        self.config["sshfs_opts"] = copy.deepcopy(self.config["ssh_opts"])
+        self.config["sshfs_opts"] += ["auto_unmount", "reconnect", "cache=no"]
+
+        # Resolve paths
+        if self.config.get("source"):
+            self.config["source"] = Path(self.config["source"]).resolve()
+            if self.config["path"] and not str(self.config["path"]).startswith("/"):
+                self.config["path"] = self.config["source"] / self.config["path"]
+        self.config["path"] = Path(self.config["path"]).resolve()
         self.sshfs = None
 
     def __repr__(self) -> str:
-        return f"(SSH) {self._build_connect_string(with_port=True)}{self.path}"
+        return (
+            f"(SSH) {self._build_connect_string(with_port=True)}{self.config['path']}"
+        )
 
     def get_id(self) -> str:
-        s = self.hostname
-        if self.username:
-            s = f"{self.username}@{s}"
-        if self.port:
-            s = f"{s}:{self.port}"
-        return f"ssh://{s}{self.path}"
+        """Return a unique identifier for this SSH endpoint."""
+        s = self.config["hostname"]
+        if self.config["username"]:
+            s = f"{self.config['username']}@{s}"
+        if self.config["port"]:
+            s = f"{s}:{self.config['port']}"
+        return f"ssh://{s}{self.config['path']}"
 
     def _prepare(self) -> None:
-        # check whether ssh is available
+        """Prepare the SSH endpoint by checking SSH availability and mounting SSHFS."""
+        # Check whether SSH is available
         logger.debug("Checking for ssh ...")
         cmd = ["ssh"]
         try:
@@ -74,7 +79,7 @@ class SSHEndpoint(Endpoint):
 
         logger.debug("  -> ssh is available")
 
-        # sshfs is useful for listing directories and reading/writing locks
+        # SSHFS is useful for listing directories and reading/writing locks
         tempdir = tempfile.mkdtemp()
         logger.debug("Created tempdir: %s", tempdir)
         mount_point = Path(tempdir) / "mnt"
@@ -83,9 +88,9 @@ class SSHEndpoint(Endpoint):
         logger.debug("Mounting sshfs ...")
 
         cmd = ["sshfs"]
-        if self.port:
-            cmd += ["-p", str(self.port)]
-        for opt in self.sshfs_opts:
+        if self.config["port"]:
+            cmd += ["-p", str(self.config["port"])]
+        for opt in self.config["sshfs_opts"]:
             cmd += ["-o", opt]
         cmd += [f"{self._build_connect_string()}:/", str(mount_point)]
         try:
@@ -96,8 +101,8 @@ class SSHEndpoint(Endpoint):
             )
         except FileNotFoundError as e:
             logger.debug("  -> got exception: %s", e)
-            if self.source:
-                # we need that for the locks
+            if self.config.get("source"):
+                # SSHFS is mandatory for sourcing from SSH
                 logger.info(
                     "  The sshfs command is not available but it is "
                     "mandatory for sourcing from SSH.",
@@ -107,11 +112,11 @@ class SSHEndpoint(Endpoint):
             self.sshfs = mount_point
             logger.debug("  -> sshfs is available")
 
-        # create directories, if needed
+        # Create directories, if needed
         dirs = []
-        if self.source is not None:
-            dirs.append(self.source)
-        dirs.append(self.path)
+        if self.config.get("source"):
+            dirs.append(self.config["source"])
+        dirs.append(self.config["path"])
         if self.sshfs:
             for d in dirs:
                 sshfs_path = self._path_to_sshfs(d)
@@ -127,7 +132,7 @@ class SSHEndpoint(Endpoint):
             self._exec_command(cmd)
 
     def _collapse_commands(self, commands, abort_on_failure=True):
-        """Concatenates all given commands, ';' is inserted as separator."""
+        """Concatenate all given commands, using ';' as a separator."""
         collapsed = []
         for i, cmd in enumerate(commands):
             if isinstance(cmd, (list, tuple)):
@@ -137,25 +142,24 @@ class SSHEndpoint(Endpoint):
 
         return [collapsed]
 
-    def _exec_command(self, command, **kwargs):
-        """Executes the command at the remote host."""
+    def _exec_command(self, options, **kwargs):
+        """Execute the command on the remote host."""
         new_cmd = ["ssh"]
-        if self.port:
-            new_cmd += ["-p", str(self.port)]
-        for opt in self.ssh_opts:
+        if self.config["port"]:
+            new_cmd += ["-p", str(self.config["port"])]
+        for opt in self.config["ssh_opts"]:
             new_cmd += ["-o", opt]
         new_cmd += [self._build_connect_string()]
-        if self.ssh_sudo:
+        if self.config["ssh_sudo"]:
             new_cmd += ["sudo"]
-        new_cmd.extend(command)
+        new_cmd.extend(options)
 
         return __util__.exec_subprocess(new_cmd, **kwargs)
 
     def _listdir(self, location):
-        """Operates remotely via 'ls -1A'."""
+        """List directory contents remotely via 'ls -1A'."""
         if self.sshfs:
             items = [str(item) for item in self._path_to_sshfs(location).iterdir()]
-
         else:
             cmd = ["ls", "-1A", str(location)]
             output = self._exec_command(cmd, universal_newlines=True)
@@ -163,20 +167,22 @@ class SSHEndpoint(Endpoint):
         return items
 
     def _get_lock_file_path(self):
+        """Get the lock file path, adjusted for SSHFS."""
         return self._path_to_sshfs(super()._get_lock_file_path())
 
     # Custom methods
 
     def _build_connect_string(self, with_port=False):
-        s = self.hostname
-        if self.username:
-            s = f"{self.username}@{s}"
-        if with_port and self.port:
-            s = f"{s}:{self.port}"
+        """Build the SSH connection string."""
+        s = self.config["hostname"]
+        if self.config["username"]:
+            s = f"{self.config['username']}@{s}"
+        if with_port and self.config["port"]:
+            s = f"{s}:{self.config['port']}"
         return s
 
     def _path_to_sshfs(self, path):
-        """Joins the given ``path`` with the sshfs mount_point."""
+        """Join the given path with the SSHFS mount point."""
         if not self.sshfs:
             msg = "sshfs not mounted"
             raise ValueError(msg)

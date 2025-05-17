@@ -35,10 +35,10 @@ import concurrent.futures
 import logging.handlers
 import multiprocessing
 import os
+import subprocess
 import sys
 import threading
 import time
-from math import inf
 from pathlib import Path
 
 from rich.align import Align
@@ -53,31 +53,40 @@ from .__logger__ import RichLogger, cons, create_logger, logger
 
 
 def send_snapshot(snapshot, destination_endpoint, parent=None, clones=None) -> None:
-    """Sends snapshot to destination endpoint, using given parent and clones.
-    It connects the pipes of source and destination together.
-    """
-    # Now we need to send the snapshot (incrementally, if possible)
+    """Sends snapshot to destination endpoint, using given parent and clones."""
     logger.info("Sending %s ...", snapshot)
-    if parent:
-        logger.info("  Using parent: %s", parent)
-    else:
-        logger.info("  No parent snapshot available, sending in full mode.")
-    if clones:
-        logger.info("  Using clones: %r", clones)
+    log_msg = (
+        f"  Using parent: {parent}"
+        if parent
+        else "  No parent snapshot available, sending in full mode."
+    )
+    logger.info(log_msg)
+    logger.info(f"  Using clones: {clones!r}" if clones else "")
 
-    pipes = [snapshot.endpoint.send(snapshot, parent=parent, clones=clones)]
+    send_process = None
+    receive_process = None
+    try:
+        send_process = snapshot.endpoint.send(snapshot, parent=parent, clones=clones)
+        receive_process = destination_endpoint.receive(send_process.stdout)
 
-    pipes.append(destination_endpoint.receive(pipes[-1].stdout))
+        return_codes = [p.wait() for p in [send_process, receive_process]]
 
-    pids = [pipe.pid for pipe in pipes]
-    while pids:
-        pid, return_code = os.wait()
-        if pid in pids:
-            logger.debug("  -> PID %d exited with return code %d", pid, return_code)
-            pids.remove(pid)
-        if return_code != 0:
-            logger.error("Error during btrfs send / receive")
-            raise __util__.SnapshotTransferError
+        if any(rc != 0 for rc in return_codes):
+            error_message = "btrfs send/receive failed"
+            logger.error(error_message)
+            raise __util__.SnapshotTransferError(error_message)
+
+    except (OSError, subprocess.CalledProcessError) as e:
+        logger.error("Error during snapshot transfer: %r", e)
+        raise __util__.SnapshotTransferError(f"Exception during transfer: {e}") from e
+    finally:
+        for pipe in [send_process, receive_process]:
+            if pipe:
+                try:
+                    pipe.stdout.close()
+                    pipe.stdin.close()
+                except (AttributeError, IOError):
+                    pass
 
 
 def delete_corrupt_snapshots(
@@ -132,16 +141,21 @@ def sync_snapshots(
     destination_endpoint,
     keep_num_backups=0,
     no_incremental=False,
+    snapshot=None,
     **kwargs,
 ) -> None:
     """Synchronizes snapshots from source to destination."""
     logger.info(__util__.log_heading(f"  To {destination_endpoint} ..."))
 
-    source_snapshots = source_endpoint.list_snapshots()
+    if snapshot is None:
+        source_snapshots = source_endpoint.list_snapshots()
+    else:
+        source_snapshots = [snapshot]
+
     destination_snapshots = destination_endpoint.list_snapshots()
-    destination_snapshots = delete_corrupt_snapshots(
-        destination_endpoint, source_snapshots, destination_snapshots
-    )
+    # destination_snapshots = delete_corrupt_snapshots(  # REMOVE THIS LINE
+    #     destination_endpoint, source_snapshots, destination_snapshots
+    # )
     clear_locks(source_endpoint, source_snapshots, destination_endpoint.get_id())
 
     to_transfer = plan_transfers(
@@ -161,8 +175,8 @@ def sync_snapshots(
         "to_transfer": to_transfer,
         "no_incremental": no_incremental,
     }
-    for snapshot in to_transfer:
-        logger.info("  %s", snapshot)
+    for snap in to_transfer:
+        logger.info("  %s", snap)
         do_sync_transfer(transfer_objs, **kwargs)
 
 
@@ -177,15 +191,13 @@ def do_sync_transfer(transfer_objs, **kwargs):
     to_transfer = transfer_objs["to_transfer"]
     no_incremental = transfer_objs["no_incremental"]
 
+    logger.debug("to_transfer: %r", to_transfer)
+
     while to_transfer:
         if no_incremental:
-            # simply choose the last one
             best_snapshot = to_transfer[-1]
             parent = None
-            # clones = []
         else:
-            # pick the snapshots common among source and destination,
-            # exclude those that had a failed transfer before
             present_snapshots = [
                 snapshot
                 for snapshot in source_snapshots
@@ -193,20 +205,16 @@ def do_sync_transfer(transfer_objs, **kwargs):
                 and snapshot.get_id() not in snapshot.locks
             ]
 
-            # choose snapshot with the smallest distance to its parent
             def key(s):
                 p = s.find_parent(present_snapshots)
                 if p is None:
-                    return inf
+                    return float("inf")  # Use float('inf') for infinity
                 d = source_snapshots.index(s) - source_snapshots.index(p)
                 return -d if d < 0 else d
 
             best_snapshot = min(to_transfer, key=key)
             parent = best_snapshot.find_parent(present_snapshots)
-            # we don't use clones at the moment, because they don't seem
-            # to speed things up
-            # clones = present_snapshots
-            # clones = []
+
         source_endpoint.set_lock(best_snapshot, destination_id, True)
         if parent:
             source_endpoint.set_lock(parent, destination_id, True, parent=True)
@@ -215,10 +223,12 @@ def do_sync_transfer(transfer_objs, **kwargs):
                 best_snapshot,
                 transfer_objs["destination_endpoint"],
                 parent=parent,
-                #  clones=clones,
                 **kwargs,
             )
-        except __util__.SnapshotTransferError:
+        except __util__.SnapshotTransferError as e:
+            logger.error(
+                "Snapshot transfer failed for %s: %s", best_snapshot, e
+            )  # Log the error details
             logger.info(
                 "Keeping %s locked to prevent it from getting removed.",
                 best_snapshot,
@@ -432,10 +442,12 @@ files is allowed as well."""
     except RecursionError as e:
         raise __util__.AbortError from e
 
+    print("Command-line destinations:", options["destinations"])
+
     return options
 
 
-def run_task(options, queue) -> None:
+def run_task(options, queue):
     """Create a list of tasks to run."""
     setup_logger(queue, options)
     apply_shortcuts(options)
@@ -444,15 +456,28 @@ def run_task(options, queue) -> None:
     source_endpoint = prepare_source_endpoint(options)
     destination_endpoints = prepare_destination_endpoints(options, source_endpoint)
 
-    if options["remove_locks"]:
-        remove_locks(source_endpoint, options)
-
     if not options["no_snapshot"]:
-        take_snapshot(source_endpoint)
+        snapshot = take_snapshot(source_endpoint)
+    else:
+        snapshot = None
 
-    if not options["no_transfer"]:
-        transfer_snapshots(source_endpoint, destination_endpoints, options)
+    for destination_endpoint in destination_endpoints:
+        try:
+            sync_snapshots(
+                source_endpoint,
+                destination_endpoint,
+                keep_num_backups=options["num_backups"],
+                no_incremental=options["no_incremental"],
+                snapshot=snapshot,
+            )
+        except __util__.AbortError as e:
+            logger.error(
+                "Aborting snapshot transfer to %s due to exception.",
+                destination_endpoint,
+            )
+            logger.debug("Exception was: %s", e)
 
+    # Enforce retention for source and destination endpoints only once, at the end
     cleanup_snapshots(source_endpoint, destination_endpoints, options)
 
     logger.info(__util__.log_heading(f"Finished at {time.ctime()}"))
@@ -506,12 +531,28 @@ def prepare_source_endpoint(options):
     logger.debug("Source: %s", options["source"])
     endpoint_kwargs = build_endpoint_kwargs(options)
     source_endpoint_kwargs = dict(endpoint_kwargs)
-    source_endpoint_kwargs["path"] = Path(
-        options.get("snapshot_folder", ".btrfs-backup-ng/snapshots")
-    )
+
+    # Always resolve to absolute, normalized path
+    source_abs = Path(options["source"]).expanduser().resolve(strict=False)
+    snapshot_folder = options.get("snapshot_folder", ".btrfs-backup-ng/snapshots")
+    snapshot_root = Path(snapshot_folder).expanduser()
+    if not snapshot_root.is_absolute():
+        # Make relative to the source subvolume
+        snapshot_root = source_abs.parent / snapshot_root
+    snapshot_root = snapshot_root.resolve(strict=False)
+
+    # Recreate the full directory structure of the source under snapshot_root
+    relative_source = str(source_abs).lstrip(os.sep)
+    snapshot_dir = snapshot_root.joinpath(*relative_source.split(os.sep))
+
+    # Ensure the snapshot directory exists with correct permissions (e.g., 0o700)
+    snapshot_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+
+    source_endpoint_kwargs["path"] = snapshot_dir
+
     try:
         source_endpoint = endpoint.choose_endpoint(
-            options["source"],
+            str(source_abs),  # Always pass the normalized absolute path
             source_endpoint_kwargs,
             source=True,
         )
@@ -525,7 +566,8 @@ def prepare_source_endpoint(options):
 
 def prepare_destination_endpoints(options, source_endpoint):
     """Prepare the destination endpoints."""
-    if options["locked_destinations"]:
+    # Only add locked destinations if the option is set
+    if options.get("locked_destinations"):
         add_locked_destinations(source_endpoint, options)
 
     if options["no_transfer"] and options["num_backups"] <= 0:
@@ -534,6 +576,8 @@ def prepare_destination_endpoints(options, source_endpoint):
 
     destination_endpoints = []
     endpoint_kwargs = build_endpoint_kwargs(options)
+    # Ensure 'path' is NOT in endpoint_kwargs
+    endpoint_kwargs.pop("path", None)
     for destination in options["destinations"]:
         logger.debug("Destination: %s", destination)
         try:
@@ -561,11 +605,12 @@ def build_endpoint_kwargs(options):
         "fs_checks": not options["skip_fs_checks"],
         "ssh_opts": options["ssh_opt"],
         "ssh_sudo": options["ssh_sudo"],
+        # DO NOT include 'path' here!
     }
 
 
 def add_locked_destinations(source_endpoint, options):
-    """Add locked destinations to the options."""
+    """Add locked destinations to the options if not already present."""
     for snap in source_endpoint.list_snapshots():
         for lock in snap.locks:
             if lock not in options["destinations"]:
@@ -587,13 +632,19 @@ def remove_locks(source_endpoint, options):
 
 def take_snapshot(source_endpoint):
     """Take a snapshot on the source endpoint."""
-    logger.info(__util__.log_heading("Snapshotting ..."))
-    source_endpoint.snapshot()
+    logger.info(__util__.log_heading("Transferring ..."))
+    return source_endpoint.snapshot()
 
 
 def transfer_snapshots(source_endpoint, destination_endpoints, options):
     """Transfer snapshots to the destination endpoints."""
     logger.info(__util__.log_heading("Transferring ..."))
+
+    if not options["no_snapshot"]:
+        snapshot = take_snapshot(source_endpoint)
+    else:
+        snapshot = None
+
     for destination_endpoint in destination_endpoints:
         try:
             sync_snapshots(
@@ -601,6 +652,7 @@ def transfer_snapshots(source_endpoint, destination_endpoints, options):
                 destination_endpoint,
                 keep_num_backups=options["num_backups"],
                 no_incremental=options["no_incremental"],
+                snapshot=snapshot,
             )
         except __util__.AbortError as e:
             logger.error(
@@ -613,25 +665,18 @@ def transfer_snapshots(source_endpoint, destination_endpoints, options):
 def cleanup_snapshots(source_endpoint, destination_endpoints, options):
     """Clean up old snapshots."""
     logger.info(__util__.log_heading("Cleaning up..."))
-    if options["num_snapshots"] > 0:
+    if options.get("num_snapshots", 0) > 0:
         try:
             source_endpoint.delete_old_snapshots(options["num_snapshots"])
         except __util__.AbortError as e:
             logger.debug("Error while deleting source snapshots: %s", e)
 
-    if options["num_backups"] > 0:
+    if options.get("num_backups", 0) > 0:
         for destination_endpoint in destination_endpoints:
             try:
                 destination_endpoint.delete_old_snapshots(options["num_backups"])
             except __util__.AbortError as e:
                 logger.debug("Error while deleting backups: %s", e)
-
-
-def elevate_privileges() -> None:
-    """Re-run the program using sudo if privileges are needed."""
-    if os.getuid() != 0:
-        command = ("sudo", sys.executable, *sys.argv)
-        os.execvp("sudo", command)
 
 
 def serve_logger_thread(queue) -> None:
@@ -677,6 +722,9 @@ def main() -> None:
         help="Enable debugging on btrfs send / receive.",
     )
 
+    # Set up the logger early so debug/info logs are visible
+    create_logger(live_layout=False)  # or True if you want live layout by default
+
     # pylint: disable=consider-using-join
     command_line = ""
     for arg in sys.argv[1:]:
@@ -698,9 +746,6 @@ def main() -> None:
     queue = multiprocessing.Manager().Queue(-1)
     logger_thread = threading.Thread(target=serve_logger_thread, args=(queue,))
     logger_thread.start()
-
-    # Make sure we have root privileges
-    elevate_privileges()
 
     if live_layout:
         do_live_layout(tasks, task_options, queue)

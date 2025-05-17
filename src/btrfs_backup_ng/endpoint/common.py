@@ -5,9 +5,13 @@ Common functionality among modules.
 """
 
 import contextlib
+import getpass
 import logging
+import os
 import subprocess
 from pathlib import Path
+
+from filelock import FileLock
 
 from btrfs_backup_ng import __util__
 from btrfs_backup_ng.__logger__ import logger
@@ -17,7 +21,7 @@ def require_source(method):
     """Decorator that ensures source is set on the object the called method belongs to."""
 
     def wrapped(self, *args, **kwargs):
-        if self.source is None:
+        if self.config["source"] is None:
             msg = "source hasn't been set"
             raise ValueError(msg)
         return method(self, *args, **kwargs)
@@ -28,33 +32,54 @@ def require_source(method):
 class Endpoint:
     """Generic structure of a command endpoint."""
 
-    # pylint: disable=too-many-instance-attributes
-    def __init__(
-        self,
-        path=None,
-        snap_prefix="",
-        convert_rw=False,
-        subvolume_sync=False,
-        btrfs_debug=False,
-        source=None,
-        fs_checks=True,
-        **kwargs,
-    ) -> None:
-        # pylint: disable=too-many-arguments
-        # pylint: disable=too-many-positional-arguments
-        self.path = Path(path) if path else None
-        self.snap_prefix = snap_prefix
-        self.convert_rw = convert_rw
-        self.subvolume_sync = subvolume_sync
-        self.btrfs_debug = btrfs_debug
-        self.btrfs_flags = []
-        if self.btrfs_debug:
-            self.btrfs_flags += ["-vv"]
-        self.source = Path(source) if source else None
-        self.fs_checks = fs_checks
-        self.lock_file_name = ".outstanding_transfers"
+    def __init__(self, config=None, **kwargs) -> None:
+        """
+        Initialize the Endpoint with a configuration dictionary.
+
+        Args:
+            config (dict): Configuration dictionary containing endpoint settings.
+            kwargs: Additional keyword arguments for backward compatibility.
+        """
+        config = config or {}
+        self.config = {}
+
+        # Always resolve source to absolute path
+        val = config.get("source")
+        if val is not None:
+            path = Path(val).expanduser()
+            if not path.is_absolute():
+                path = Path.cwd() / path
+            self.config["source"] = path.resolve()
+        else:
+            self.config["source"] = None
+
+        # For path (destination), only expanduser, do not resolve unless absolute
+        val = config.get("path")
+        if val is not None:
+            path = Path(val).expanduser()
+            if not path.is_absolute():
+                path = path.resolve()
+            self.config["path"] = path
+        else:
+            self.config["path"] = None
+
+        # Copy other config keys as before
+        for key in [
+            "snap_prefix",
+            "convert_rw",
+            "subvolume_sync",
+            "btrfs_debug",
+            "fs_checks",
+            "lock_file_name",
+        ]:
+            self.config[key] = config.get(key, self.config.get(key))
+
+        self.btrfs_flags = ["-vv"] if self.config["btrfs_debug"] else []
         self.__cached_snapshots = None
-        kwargs = kwargs if kwargs else {}
+
+        for key, value in kwargs.items():
+            self.config[key] = value
+        self._lock = None  # Initialize lock
 
     def prepare(self):
         """Public access to _prepare, which is called after creating an endpoint."""
@@ -64,47 +89,83 @@ class Endpoint:
     @require_source
     def snapshot(self, readonly=True, sync=True):
         """Takes a snapshot and returns the created object."""
-        snapshot = __util__.Snapshot(self.path, self.snap_prefix, self)
+        source_path = Path(self.config["source"])
+        snapshot_dir = source_path / ".btrfs-backup-ng" / "snapshots"
+        # Ensure the snapshot directory exists with correct permissions
+        snapshot_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+
+        snapshot = __util__.Snapshot(snapshot_dir, self.config["snap_prefix"], self)
         snapshot_path = snapshot.get_path()
-        logger.info("%s -> %s", self.source, snapshot_path)
+        logger.info("%s -> %s", self.config["source"], snapshot_path)
 
-        commands = [
-            self._build_snapshot_cmd(self.source, snapshot_path, readonly=readonly),
-        ]
-
-        # sync disks
-        if sync:
-            commands.append(self._build_sync_command())
-
-        for cmd in self._collapse_commands(commands, abort_on_failure=True):
-            self._exec_command(cmd)
-
-        self.add_snapshot(snapshot)
+        # Lock file in the snapshot folder
+        lock_path = snapshot_dir / ".btrfs-backup-ng.snapshot.lock"
+        with FileLock(lock_path):
+            self._remount(self.config["source"], read_write=True)
+            commands = [
+                self._build_snapshot_cmd(
+                    self.config["source"], snapshot_path, readonly=readonly
+                ),
+            ]
+            if sync:
+                commands.append(self._build_sync_command())
+            for cmd in self._collapse_commands(commands, abort_on_failure=True):
+                self._exec_command({"command": cmd})
+                self.add_snapshot(snapshot)
         return snapshot
+
+    # @require_source
+    # def snapshot(self, readonly=True, sync=True):
+    #     """Takes a snapshot and returns the created object."""
+    #     snapshot_dir = Path(self.config.get("snapshot_dir", "snapshot"))
+    #     snapshot_path_base = self.config["path"] / snapshot_dir
+    #     # Ensure the snapshot directory exists with correct permissions
+    #     snapshot_path_base.mkdir(parents=True, exist_ok=True, mode=0o700)
+
+    #     snapshot = __util__.Snapshot(
+    #         snapshot_path_base, self.config["snap_prefix"], self
+    #     )
+    #     snapshot_path = snapshot.get_path()
+    #     logger.info("%s -> %s", self.config["source"], snapshot_path)
+
+    #     # Lock file in the snapshot folder
+    #     lock_path = self.config["path"] / ".btrfs-backup-ng.snapshot.lock"
+    #     with FileLock(lock_path):
+    #         self._remount(self.config["source"], read_write=True)
+    #         commands = [
+    #             self._build_snapshot_cmd(
+    #                 self.config["source"], snapshot_path, readonly=readonly
+    #             ),
+    #         ]
+    #         if sync:
+    #             commands.append(self._build_sync_command())
+    #         for cmd in self._collapse_commands(commands, abort_on_failure=True):
+    #             self._exec_command({"command": cmd})
+    #         self.add_snapshot(snapshot)
+    #     return snapshot
 
     @require_source
     def send(self, snapshot, parent=None, clones=None):
-        """Calls 'btrfs send' for the given snapshot and returns its
-        Popen object.
-        """
+        """Calls 'btrfs send' for the given snapshot and returns its Popen object."""
         cmd = self._build_send_command(snapshot, parent=parent, clones=clones)
-        return self._exec_command(cmd, method="Popen", stdout=subprocess.PIPE)
+        return self._exec_command(
+            {"command": cmd}, method="Popen", stdout=subprocess.PIPE
+        )
 
     def receive(self, stdin):
-        """Calls 'btrfs receive', setting the given pipe as its stdin.
-        The receiving process's Popen object is returned.
-        """
-        cmd = self._build_receive_command(self.path)
-        # from WARNING level onwards, hide stdout
+        """Calls 'btrfs receive', setting the given pipe as its stdin."""
+        cmd = self._build_receive_command(self.config["path"])
         loglevel = logging.getLogger().getEffectiveLevel()
         stdout = subprocess.DEVNULL if loglevel >= logging.WARNING else None
-        return self._exec_command(cmd, method="Popen", stdin=stdin, stdout=stdout)
+        return self._exec_command(
+            {"command": cmd}, method="Popen", stdin=stdin, stdout=stdout
+        )
 
     def list_snapshots(self, flush_cache=False):
-        """Returns a list with all snapshots found at ``self.path``.
-        If ``flush_cache`` is not set, cached results will be used
-        if available.
-        """
+        """Returns a list with all snapshots found at ``self.path``."""
+        logger.debug("Listing snapshots in: %s", self.config["path"])
+        logger.debug("Snapshot prefix: %s", self.config["snap_prefix"])
+
         if self.__cached_snapshots is not None and not flush_cache:
             logger.debug(
                 "Returning %d cached snapshots for %r.",
@@ -115,36 +176,36 @@ class Endpoint:
 
         logger.debug("Building snapshot cache of %r ...", self)
         snapshots = []
-        listdir = self._listdir(self.path)
+        listdir = self._listdir(self.config["path"])
+        logger.debug("Directory contents: %r", listdir)
         for item in listdir:
-            if item.startswith(self.snap_prefix):
-                time_str = item[len(self.snap_prefix) :]
+            if item.startswith(self.config["snap_prefix"]):
+                time_str = item[len(self.config["snap_prefix"]) :]
                 try:
                     time_obj = __util__.str_to_date(time_str)
                 except ValueError:
-                    # no valid name for current prefix + time string
                     continue
                 else:
                     snapshot = __util__.Snapshot(
-                        self.path,
-                        self.snap_prefix,
+                        self.config["path"],
+                        self.config["snap_prefix"],
                         self,
                         time_obj=time_obj,
                     )
                     snapshots.append(snapshot)
 
-        # apply locks
-        if self.source:
+        # Apply locks
+        if self.config["source"]:
             lock_dict = self._read_locks()
             for snapshot in snapshots:
                 snap_entry = lock_dict.get(snapshot.get_name(), {})
                 for lock_type, locks in snap_entry.items():
                     getattr(snapshot, lock_type).update(locks)
 
-        # sort by date, then time;
+        # Sort by date, then time
         snapshots.sort()
 
-        # populate cache
+        # Populate cache
         self.__cached_snapshots = snapshots
         logger.debug(
             "Populated snapshot cache of %r with %d items.",
@@ -198,7 +259,7 @@ class Endpoint:
 
         if rewrite:
             snapshot = __util__.Snapshot(
-                self.path,
+                self.config["path"],
                 snapshot.prefix,
                 self,
                 time_obj=snapshot.time_obj,
@@ -211,9 +272,9 @@ class Endpoint:
 
     def delete_snapshots(self, snapshots, **kwargs) -> None:
         """Deletes the given snapshots, passing all keyword arguments to
-        ``_build_deletion_cmds``.
+        ``_build_deletion_commands``. Actually deletes the snapshot subvolumes.
         """
-        # only remove snapshots that have no lock remaining
+        # Only remove snapshots that have no lock remaining
         to_remove = [
             snapshot
             for snapshot in snapshots
@@ -227,40 +288,48 @@ class Endpoint:
             else:
                 logger.info("  %s - is locked, keeping it", snapshot)
 
-        if to_remove:
-            # finally delete them
-            cmds = self._build_deletion_commands(to_remove, **kwargs)
-            cmds = self._collapse_commands(cmds, abort_on_failure=True)
-            for cmd in cmds:
-                self._exec_command(cmd)
+        for snapshot in to_remove:
+            # Actually delete the subvolume using btrfs subvolume delete
+            cmd = ["btrfs", "subvolume", "delete", str(snapshot.get_path())]
+            try:
+                self._exec_command({"command": cmd})
+                logger.info("Deleted snapshot subvolume: %s", snapshot.get_path())
+            except Exception as e:
+                logger.error("Failed to delete snapshot %s: %s", snapshot.get_path(), e)
 
+            # Remove from cache if present
             if self.__cached_snapshots is not None:
-                for snapshot in to_remove:
-                    with contextlib.suppress(ValueError):
-                        self.__cached_snapshots.remove(snapshot)
+                with contextlib.suppress(ValueError):
+                    self.__cached_snapshots.remove(snapshot)
 
     def delete_snapshot(self, snapshot, **kwargs) -> None:
         """Delete a snapshot."""
         self.delete_snapshots([snapshot], **kwargs)
 
-    def delete_old_snapshots(self, keep_num, **kwargs) -> None:
-        """Delete all but the value in keep_num newest snapshots at endpoints."""
+    def delete_old_snapshots(self, keep):
+        """
+        Delete old snapshots, keeping only the most recent `keep` snapshots.
+        """
+        # List all snapshots (assume self.list_snapshots() returns sorted by creation time, oldest first)
         snapshots = self.list_snapshots()
+        if keep <= 0 or len(snapshots) <= keep:
+            return  # Nothing to delete
 
-        if len(snapshots) > keep_num:
-            # delete oldest snapshots
-            to_remove = snapshots[:-keep_num]
-            self.delete_snapshots(to_remove, **kwargs)
+        # Determine which snapshots to delete
+        to_delete = snapshots[:-keep]
+        for snap in to_delete:
+            logger.info("Deleting old snapshot: %s", snap)
+            self.delete_snapshots([snap])
 
     # The following methods may be implemented by endpoints unless the
     # default behaviour is wanted.
 
     def __repr__(self) -> str:
-        return f"{self.path}"
+        return f"{self.config['path']}"
 
     def get_id(self) -> str:
         """Return an id string to identify this endpoint over multiple runs."""
-        return f"unknown://{self.path}"
+        return f"unknown://{self.config['path']}"
 
     def _prepare(self) -> None:
         """Is called after endpoint creation. Various endpoint-related
@@ -277,6 +346,7 @@ class Endpoint:
         if readonly:
             cmd += ["-r"]
         cmd += [str(source), str(destination)]
+        logger.debug("Snapshot command: %s", cmd)
         return cmd
 
     @staticmethod
@@ -314,9 +384,9 @@ class Endpoint:
         ``subvolume_sync`` should be regarded as well.
         """
         if convert_rw is None:
-            convert_rw = self.convert_rw
+            convert_rw = self.config["convert_rw"]
         if subvolume_sync is None:
-            subvolume_sync = self.subvolume_sync
+            subvolume_sync = self.config["subvolume_sync"]
 
         commands = []
 
@@ -339,7 +409,7 @@ class Endpoint:
         commands.append(cmd)
 
         if subvolume_sync:
-            commands.append(["btrfs", "subvolume", "sync", str(self.path)])
+            commands.append(["btrfs", "subvolume", "sync", str(self.config["path"])])
 
         return commands
 
@@ -356,26 +426,77 @@ class Endpoint:
         """
         return commands
 
-    def _exec_command(self, command, **kwargs):
-        """Finally, the command should be executed via
-        ``__util__.exec_subprocess``, which should get all given keyword
-        arguments. This could be re-implemented to execute via SSH,
-        for instance.
+    def _exec_command(self, options, **kwargs):
         """
-        return __util__.exec_subprocess(command, **kwargs)
+        Execute a command using __util__.exec_subprocess, with options dict.
+        options must contain at least 'command': a list of command arguments.
+        """
+        command = options.get("command")
+        if not command:
+            raise ValueError("No command specified in options for _exec_command")
+
+        lock_path = Path("/tmp") / f".btrfs-backup-ng.{getpass.getuser()}.lock"
+        lock = FileLock(lock_path)
+        with lock:
+            if os.geteuid() != 0 and command and command[0] == "btrfs":
+                if options.get("no_password_sudo"):
+                    command = ["sudo", "-n"] + command
+                else:
+                    command = ["sudo"] + command
+            return __util__.exec_subprocess(command, **kwargs)
 
     def _listdir(self, location):
-        """Should return all items present at the given ``location``."""
+        location = Path(location).resolve()
+        if not location.exists():
+            return []
         return [str(item) for item in location.iterdir()]
+
+    def _remount(self, path, read_write=True):
+        """Remounts the given path as read-write or read-only."""
+        logger.debug("Remounting %s as read-write: %r", path, read_write)
+        if read_write:
+            mode = "rw"
+        else:
+            mode = "ro"
+
+        # Check if already mounted with the desired mode
+        try:
+            output = subprocess.check_output(["mount"], text=True).splitlines()
+            for line in output:
+                if str(path) in line and f"(flags:{mode})" in line:
+                    logger.debug("%s already mounted as %s", path, mode)
+                    return  # Already mounted with the correct mode
+        except subprocess.CalledProcessError as e:
+            logger.error("Failed to check mount status %r", e)
+            raise __util__.AbortError from e
+
+        cmd = ["mount", "-o", f"remount,{mode}", str(path)]
+        if os.geteuid() != 0:
+            cmd = ["sudo"] + cmd
+        logger.debug("Executing remount command: %s", cmd)
+        try:
+            env = os.environ.copy()
+            logger.debug("Environment variables: %s", env)
+            subprocess.check_call(cmd, env=env)
+        except subprocess.CalledProcessError as e:
+            logger.error(
+                "Failed to remount %s as %s: %r %r %r",
+                path,
+                mode,
+                e.returncode,
+                e.stderr,
+                e.stdout,
+            )
+            raise __util__.AbortError from e
 
     @require_source
     def _get_lock_file_path(self):
         """Is used by the default ``_read/write_locks`` methods and should
         return the file in which the locks are stored.
         """
-        if self.path is None:
+        if self.config["path"] is None:
             raise ValueError
-        return self.path / self.lock_file_name
+        return self.config["path"] / str(self.config["lock_file_name"])
 
     @require_source
     def _read_locks(self):
