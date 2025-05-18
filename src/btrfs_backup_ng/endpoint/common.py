@@ -67,6 +67,10 @@ class Endpoint:
         if val is None:
             return None
         path = Path(val).expanduser()
+        # Only resolve paths that are local (not for remote endpoints)
+        # This preserves remote paths without trying to resolve them locally
+        if hasattr(self, "_is_remote") and getattr(self, "_is_remote", False):
+            return path
         return path.resolve() if not path.is_absolute() else path
 
     def prepare(self):
@@ -85,10 +89,14 @@ class Endpoint:
         snapshot_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
         snapshot = __util__.Snapshot(snapshot_dir, snap_prefix, self)
         snapshot_path = snapshot.get_path()
-        logger.info("%s -> %s", self.config["source"], snapshot_path)
+        logger.info("Creating snapshot from source: %s to destination: %s", self.config["source"], snapshot_path)
+        logger.debug("Snapshot directory: %s", snapshot_dir)
+        logger.debug("Snapshot prefix: %s", snap_prefix)
 
         lock_path = snapshot_dir / ".btrfs-backup-ng.snapshot.lock"
+        logger.debug("Acquiring snapshot lock: %s", lock_path)
         with FileLock(lock_path):
+            logger.debug("Snapshot lock acquired: %s", lock_path)
             self._remount(self.config["source"], read_write=True)
             commands = [
                 self._build_snapshot_cmd(
@@ -98,7 +106,9 @@ class Endpoint:
             if sync:
                 commands.append(self._build_sync_command())
             for cmd in self._collapse_commands(commands):
+                logger.debug("Executing snapshot command: %s", cmd)
                 self._exec_command({"command": cmd})
+                logger.debug("Snapshot command executed successfully: %s", cmd)
                 self.add_snapshot(snapshot)
         return snapshot
 
@@ -112,7 +122,10 @@ class Endpoint:
 
     def receive(self, stdin):
         """Call 'btrfs receive', setting the given pipe as its stdin."""
-        cmd = self._build_receive_command(self.config["path"])
+        # Make sure we use the raw path without local resolution
+        path = self.config["path"]
+        logger.debug("Receive path: %s (type: %s)", path, type(path).__name__)
+        cmd = self._build_receive_command(path)
         loglevel = logging.getLogger().getEffectiveLevel()
         stdout = subprocess.DEVNULL if loglevel >= logging.WARNING else None
         return self._exec_command(
@@ -282,7 +295,11 @@ class Endpoint:
         return cmd
 
     def _build_receive_command(self, destination):
-        return ["btrfs", "receive", *self.btrfs_flags, str(destination)]
+        # Ensure destination is properly formatted as a string without resolving
+        # This avoids path resolution that could break remote paths
+        dest_str = str(destination)
+        logger.debug("Building receive command with destination: %s", dest_str)
+        return ["btrfs", "receive", *self.btrfs_flags, dest_str]
 
     def _build_deletion_commands(self, snapshots, convert_rw=None, subvolume_sync=None):
         convert_rw = (
