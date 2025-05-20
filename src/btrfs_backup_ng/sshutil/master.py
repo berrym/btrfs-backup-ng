@@ -138,7 +138,7 @@ class SSHMasterManager:
         self._master_started = False
 
     def _ssh_base_cmd(self, force_tty=False):
-        """Build the base SSH command.
+        # Build the base SSH command.
         
         Args:
             force_tty: If True, add -t to force TTY allocation (needed for sudo)
@@ -161,12 +161,23 @@ class SSHMasterManager:
             "ConnectTimeout=10",
             "-o",
             "ConnectionAttempts=3",
+            "-o",
+            "TCPKeepAlive=yes",
+            "-o",
+            "StrictHostKeyChecking=accept-new",
+            "-o",
+            "ExitOnForwardFailure=yes",
+            "-o",
+            "IPQoS=throughput",
+            "-o", 
+            "PreferredAuthentications=publickey,password",
         ]
         
         # Handle TTY allocation if requested
         if force_tty:
             # Force TTY allocation (for interactive sudo)
             cmd.append("-t")
+            logger.debug("Forcing TTY allocation for SSH command")
 
         # When running as root via sudo, explicitly use the regular user's SSH config
         if self.running_as_sudo and self.sudo_user:
@@ -290,8 +301,6 @@ class SSHMasterManager:
                     test_cmd = self._ssh_base_cmd() + [
                         "-o",
                         "ControlMaster=no",
-                        "-o",
-                        "PasswordAuthentication=no",
                         "true",
                     ]
 
@@ -307,6 +316,8 @@ class SSHMasterManager:
                         # Use the actual home directory of the sudo user instead of assuming /home
                         env["HOME"] = pwd.getpwnam(self.sudo_user).pw_dir
                         env["USER"] = self.sudo_user
+                        # Ensure we don't try to use askpass programs when running non-interactively
+                        env["SSH_ASKPASS_REQUIRE"] = "never"
                         # Also tell SSH to allocate a TTY if we're going to use sudo
                         if "sudo" in " ".join(test_cmd):
                             logger.debug("Sudo command detected in test, will try to allocate TTY")
@@ -369,15 +380,23 @@ class SSHMasterManager:
                     else:
                         # For non-sudo or btrfs commands, use regular SSH
                         cmd_to_use = cmd
-                        
-                    proc = subprocess.run(
-                        cmd_to_use,
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.PIPE,
-                        timeout=timeout,
-                        check=False,
-                        env=env,
-                    )
+                
+                        # Add -o PasswordAuthentication=yes to ensure password auth is allowed during master setup
+                        if "-o" in cmd_to_use and "PasswordAuthentication=no" in " ".join(cmd_to_use):
+                            logger.debug("Ensuring password authentication is enabled for master setup")
+                            # Find and replace PasswordAuthentication=no with PasswordAuthentication=yes
+                            for i, arg in enumerate(cmd_to_use):
+                                if arg == "PasswordAuthentication=no":
+                                    cmd_to_use[i] = "PasswordAuthentication=yes"
+                
+                        proc = subprocess.run(
+                            cmd_to_use,
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.PIPE,
+                            timeout=timeout,
+                            check=False,
+                            env=env,
+                        )
                     if proc.returncode != 0:
                         logger.error(
                             f"Failed to start SSH master (attempt {attempt}): {proc.stderr.decode().strip()}"
@@ -395,18 +414,33 @@ class SSHMasterManager:
                         continue
                     return False
 
-                # Wait for socket to appear
+                # Wait for socket to appear and verify it's working properly
                 start_time = time.time()
                 while time.time() - start_time < timeout:
                     if self.is_master_alive():
-                        self._master_started = True
-                        if self.debug:
-                            logger.debug(f"SSH master started at {self.control_path}")
-                            # Log the effective SSH configuration
-                            logger.debug(f"SSH connection established with: user={self.username}, host={self.hostname}")
-                            if self.identity_file:
-                                logger.debug(f"Used identity file: {self.identity_file}")
-                        return True
+                        # Extra verification - run a simple command to ensure connection is truly ready
+                        try:
+                            test_cmd = self._ssh_base_cmd() + ["echo", "Connection verified"]
+                            test_proc = subprocess.run(
+                                test_cmd,
+                                stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE,
+                                timeout=5,
+                                check=False,
+                            )
+                            if test_proc.returncode == 0:
+                                self._master_started = True
+                                if self.debug:
+                                    logger.debug(f"SSH master started and verified at {self.control_path}")
+                                    # Log the effective SSH configuration
+                                    logger.debug(f"SSH connection established with: user={self.username}, host={self.hostname}")
+                                    if self.identity_file:
+                                        logger.debug(f"Used identity file: {self.identity_file}")
+                                return True
+                            else:
+                                logger.warning("SSH master started but command test failed, will retry")
+                        except Exception as e:
+                            logger.warning(f"SSH master started but verification failed: {e}")
                     time.sleep(0.1)
 
                 if self.debug:
@@ -415,18 +449,24 @@ class SSHMasterManager:
                     )
                     if self.running_as_sudo:
                         logger.debug(
-                            "SSH issues might be related to sudo. Check if SSH keys are accessible to root."
-                        )
-                        logger.debug(f"Consider these troubleshooting steps:")
-                        logger.debug(
-                            f"1. Ensure {self.ssh_config_dir}/id_rsa exists and has correct permissions"
-                        )
-                        logger.debug(
-                            f"2. Run 'ssh-add' as your regular user before using sudo"
-                        )
-                        logger.debug(
-                            f"3. Consider using ssh-agent forwarding with sudo"
-                        )
+                            # SSH issues might be related to sudo. Check if SSH keys are accessible to root."
+                            )
+                            logger.debug(f"Consider these troubleshooting steps:")
+                            logger.debug(
+                                f"1. Ensure {self.ssh_config_dir}/id_rsa exists and has correct permissions"
+                            )
+                            logger.debug(
+                                f"2. Run 'ssh-add' as your regular user before using sudo"
+                            )
+                            logger.debug(
+                                f"3. Consider using ssh-agent forwarding with sudo"
+                            )
+                            logger.debug(
+                                f"4. Make sure sudo on the remote host is configured to allow passwordless sudo for btrfs commands"
+                            )
+                            logger.debug(
+                                f"5. Try manually running: ssh {self.username}@{self.hostname} 'sudo -S btrfs receive /path/to/dest'"
+                            )
 
                 if attempt < retries:
                     self.cleanup_socket()
@@ -515,9 +555,12 @@ class SSHMasterManager:
             return success
 
     def is_master_alive(self) -> bool:
-        """Check if the SSH master connection is alive."""
+        """Check if the SSH master connection is alive and usable."""
         if not self.control_path.exists():
+            logger.debug(f"SSH master control path does not exist: {self.control_path}")
             return False
+            
+        # First do a control check
         cmd = [
             "ssh",
             "-O",
@@ -528,7 +571,9 @@ class SSHMasterManager:
         ]
         if self.port:
             cmd += ["-p", str(self.port)]
+            
         try:
+            logger.debug(f"Checking SSH master connection: {' '.join(cmd)}")
             proc = subprocess.run(
                 cmd,
                 stdout=subprocess.PIPE,
@@ -536,28 +581,52 @@ class SSHMasterManager:
                 timeout=5,  # Give a bit more time for check
                 check=False,
             )
+            
             if proc.returncode == 0:
-                # Also try a simple command to be doubly sure the connection works
+                logger.debug("SSH control socket check passed")
+                
+                # Now do a real command test to ensure the connection is truly functional
                 test_cmd = self._ssh_base_cmd() + ["true"]
+                logger.debug(f"Running secondary SSH check: {' '.join(test_cmd)}")
+                
                 test_proc = subprocess.run(
                     test_cmd,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
                     timeout=5,
                     check=False,
                 )
+                
                 if test_proc.returncode == 0:
                     # Both checks passed
+                    logger.debug("SSH connection is fully functional")
                     return True
-                if self.debug:
-                    logger.debug("SSH master secondary check failed")
-
-            if self.debug:
-                logger.debug(f"SSH master check failed: {proc.stderr.decode().strip()}")
+                else:
+                    # Control socket exists but can't run commands
+                    stderr = test_proc.stderr.decode(errors='replace').strip()
+                    logger.warning(f"SSH control socket exists but command test failed: {stderr}")
+                    
+                    # The socket might be stale or broken
+                    logger.info("SSH socket appears to be stale or broken, will remove it")
+                    self.cleanup_socket()
+                    return False
+            else:
+                stderr = proc.stderr.decode(errors='replace').strip()
+                logger.warning(f"SSH master socket check failed: {stderr}")
+                
+                # Socket exists but check failed, try to clean it up
+                if "No such file or directory" in stderr:
+                    logger.info("Control socket file not found even though path exists, cleaning up")
+                    self.cleanup_socket()
+                return False
+                
+        except subprocess.TimeoutExpired:
+            logger.warning("SSH master connection check timed out after 5 seconds")
+            # This is a sign the socket may be stale
+            self.cleanup_socket()
             return False
         except Exception as e:
-            if self.debug:
-                logger.debug(f"SSH master check exception: {e}")
+            logger.warning(f"SSH master check exception: {e}")
             return False
 
     def cleanup_socket(self):

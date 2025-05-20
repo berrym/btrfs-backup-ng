@@ -4,17 +4,24 @@
 
 This module provides the SSHEndpoint class, which integrates with SSHMasterManager
 to handle SSH-based operations robustly, including btrfs send/receive commands.
+
+Environment variables that affect behavior:
+- BTRFS_BACKUP_PASSWORDLESS_ONLY: If set to 1/true/yes, disables the use of sudo
+  -S flag and will only attempt passwordless sudo (-n flag), failing if a password
+  would be required.
 """
 
 import copy
 import os
 import pwd
+import select
 import subprocess
+import time
 import uuid
 import logging
 from pathlib import Path
 from threading import Lock
-from typing import Optional, List, Union
+from typing import Optional, List, Union, Dict, Any, Tuple
 
 from btrfs_backup_ng.__logger__ import logger
 from btrfs_backup_ng.sshutil.master import SSHMasterManager
@@ -51,6 +58,12 @@ class SSHEndpoint(Endpoint):
         self.config["path"] = self.config.get("path", "/")
         self.config["ssh_sudo"] = self.config.get("ssh_sudo", False)
         self.config["passwordless"] = self.config.get("passwordless", False)
+        
+        # Log important settings for troubleshooting
+        logger.info("SSH endpoint configuration: hostname=%s, sudo=%s, passwordless=%s", 
+                   self.hostname, 
+                   self.config.get("ssh_sudo", False),
+                   self.config.get("passwordless", False))
         
         # Username handling with clear precedence:
         # 1. Explicitly provided username (from command line via --ssh-username)
@@ -164,10 +177,27 @@ class SSHEndpoint(Endpoint):
             logger.debug("Using sudo for remote command: %s", cmd_str)
             
             # Special handling for btrfs receive which needs to be root
-            if command[0] == "btrfs":
-                # Use -n to avoid password prompt, but allow passing through TTY if available
-                # Add -E to preserve environment variables if needed
-                logger.debug("Using sudo for btrfs command")
+            if command[0] == "btrfs" and command[1] == "receive":
+                # For btrfs receive, we want to ensure sudo works even if it requires a password
+                # Add -E to preserve environment variables
+                # Add -P to preserve PATH which is important for finding the btrfs binary
+                
+                # Check if we should force passwordless mode
+                passwordless_only = os.environ.get("BTRFS_BACKUP_PASSWORDLESS_ONLY", "0").lower() in ("1", "true", "yes")
+                
+                if passwordless_only:
+                    # Use -n flag to fail rather than prompt for password
+                    logger.debug("Using sudo with -n flag (passwordless only mode)")
+                    return ["sudo", "-n", "-E", "-P"] + command
+                else:
+                    # Use -S to read password from stdin if needed (stdin will be connected to our pipe)
+                    logger.debug("Using sudo for btrfs receive command with password support")
+                    logger.warning("Note: If the remote host requires a sudo password, transfer may fail")
+                    logger.warning("Consider setting up passwordless sudo for btrfs commands on remote host")
+                    return ["sudo", "-S", "-E", "-P"] + command
+            elif command[0] == "btrfs":
+                # For other btrfs commands, use -n which will fail rather than prompt for password
+                logger.debug("Using sudo for regular btrfs command")
                 return ["sudo", "-n", "-E"] + command
             else:
                 # Use -n to avoid password prompt for other commands
@@ -182,7 +212,15 @@ class SSHEndpoint(Endpoint):
             for arg in command
         ]
         remote_cmd = self._build_remote_command(string_command)
-        ssh_cmd = self.ssh_manager._ssh_base_cmd() + ["--"] + remote_cmd
+        # Build the SSH command - if using sudo for this command, consider forcing TTY allocation
+        needs_tty = False
+        if self.config.get("ssh_sudo", False) and not self.config.get("passwordless", False):
+            # Check if this is a command that might need TTY for sudo password
+            cmd_str = " ".join(remote_cmd)
+            if "sudo" in cmd_str and "-n" not in cmd_str:
+                needs_tty = True
+            
+        ssh_cmd = self.ssh_manager._ssh_base_cmd(force_tty=needs_tty) + ["--"] + remote_cmd
 
         # Always capture stderr if not explicitly provided
         if "stderr" not in kwargs:
@@ -303,27 +341,140 @@ class SSHEndpoint(Endpoint):
         receive_cmd = ["btrfs", "receive", destination]
         logger.debug("Preparing btrfs receive command: %s", receive_cmd)
         
+        # If we're testing in this run, we'll disable sudo password prompt
+        passwordless_only = os.environ.get("BTRFS_BACKUP_PASSWORDLESS_ONLY", "0").lower() in ("1", "true", "yes")
+        if passwordless_only:
+            logger.warning("Running in passwordless-only mode - will not prompt for sudo password")
+        
+        # First ensure the destination directory exists and is writable
+        destination_dir = os.path.dirname(destination)
+        if destination_dir:
+            try:
+                logger.debug(f"Ensuring destination directory exists: {destination_dir}")
+                mkdir_cmd = ["mkdir", "-p", destination_dir]
+                result = self._exec_remote_command(mkdir_cmd, check=False)
+                if result.returncode != 0:
+                    logger.warning(f"Could not create destination directory: {destination_dir}")
+            except Exception as e:
+                logger.warning(f"Error creating destination directory: {e}")
+        
+        # Test if remote destination directory is writeable without sudo first
+        dest_dir = os.path.dirname(destination)
+        if dest_dir:
+            try:
+                logger.debug(f"Testing if destination directory is directly writeable without sudo: {dest_dir}")
+                test_cmd = ["touch", f"{dest_dir}/.test_write_access"]
+                rm_cmd = ["rm", "-f", f"{dest_dir}/.test_write_access"]
+                result = self._exec_remote_command(test_cmd, check=False)
+                if result.returncode == 0:
+                    logger.info("Destination directory is directly writeable without sudo!")
+                    # Clean up test file
+                    self._exec_remote_command(rm_cmd, check=False)
+                    # Also check if btrfs command is available without sudo
+                    btrfs_cmd = ["btrfs", "--version"]
+                    btrfs_result = self._exec_remote_command(btrfs_cmd, check=False)
+                    if btrfs_result.returncode == 0:
+                        logger.info("btrfs command is available without sudo - will try direct receive")
+                        logger.debug("Using direct btrfs receive without sudo")
+                        return receive_cmd
+                    else:
+                        logger.debug("btrfs command requires sudo even though directory is writeable")
+                else:
+                    logger.debug("Destination directory requires sudo for writing")
+            except Exception as e:
+                logger.debug(f"Error testing direct write access: {e}")
+        
         # Build the remote command with optional sudo
         receive_cmd = self._build_remote_command(receive_cmd)
         
-        # Build the SSH command
-        ssh_cmd = self.ssh_manager._ssh_base_cmd() + ["--"] + receive_cmd
-        logger.debug("Full SSH btrfs receive command: %s", " ".join(ssh_cmd))
+        # Determine if we need a TTY for this command (needed if sudo might prompt for password)
+        needs_tty = False
+        if self.config.get("ssh_sudo", False) and not self.config.get("passwordless", False):
+            # If using sudo without passwordless, we might need a TTY
+            logger.debug("Sudo configuration detected that may require TTY")
+            needs_tty = True
+        
+        # Build the SSH command with appropriate TTY settings
+        ssh_base_cmd = self.ssh_manager._ssh_base_cmd(force_tty=needs_tty)
+        
+        # Add options to make SSH more resilient to network issues
+        # ServerAliveInterval sends a keep-alive packet every N seconds
+        # ServerAliveCountMax defines how many missed responses before disconnect
+        ssh_options = [
+            "-o", "ServerAliveInterval=5", 
+            "-o", "ServerAliveCountMax=3",
+            "-o", "TCPKeepAlive=yes",
+            "-o", "ConnectTimeout=10"
+        ]
+        
+        # If we need TTY, ensure related SSH options are set correctly
+        if needs_tty:
+            ssh_options.extend([
+                "-o", "RequestTTY=yes",
+                "-o", "BatchMode=no"  # Allow password prompts if necessary
+            ])
+            logger.debug("Adding TTY-related SSH options for sudo authentication")
+        
+        # Insert options after the SSH command but before any other arguments
+        for i, opt in enumerate(ssh_options):
+            ssh_base_cmd.insert(i + 1, opt)
+        
+        ssh_cmd = ssh_base_cmd + ["--"] + receive_cmd
+        
+        # Log the full command for debugging
+        logger.debug("Full SSH btrfs receive command: %s", " ".join(map(str, ssh_cmd)))
         
         try:
             # Start the btrfs receive process
             logger.debug("Starting btrfs receive process")
+                
+            # Set up the environment for better handling of SSH processes
+            env = os.environ.copy()
+            
+            # Environment setup for SSH authentication
+            if needs_tty:
+                # If we're using TTY for sudo, try to make session interactive
+                if "SSH_ASKPASS" in env:
+                    env["SSH_ASKPASS_REQUIRE"] = "force"  # Force using askpass if available
+                if "DISPLAY" not in env and os.environ.get("SUDO_USER"):
+                    # Try to get DISPLAY from original user's environment
+                    try:
+                        sudo_user = os.environ.get("SUDO_USER")
+                        proc = subprocess.run(
+                            ["sudo", "-u", sudo_user, "printenv", "DISPLAY"],
+                            capture_output=True,
+                            text=True,
+                            check=False
+                        )
+                        if proc.returncode == 0 and proc.stdout.strip():
+                            env["DISPLAY"] = proc.stdout.strip()
+                            logger.debug(f"Set DISPLAY={env['DISPLAY']} from sudo user")
+                    except Exception as e:
+                        logger.debug(f"Could not get DISPLAY from sudo user: {e}")
+            else:
+                # Not using TTY, ensure non-interactive mode
+                env["SSH_ASKPASS_REQUIRE"] = "never"
+            
+            # Create named FIFO pipes for better stream handling if necessary
             receive_process = subprocess.Popen(
                 ssh_cmd,
                 stdin=stdin_pipe,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
+                bufsize=0,  # Use unbuffered mode for better streaming
+                env=env,
+                text=False,  # Use binary mode for streams
             )
             
             logger.debug("btrfs receive process started with PID: %d", receive_process.pid)
             return receive_process
         except Exception as e:
             logger.error("Failed to start btrfs receive process: %s", e)
+            # Check if this is a connection-related error
+            if isinstance(e, (BrokenPipeError, ConnectionError, ConnectionResetError)):
+                logger.error("SSH connection error detected. The connection might be broken.")
+                # Re-raise as a more specific exception for better retry handling
+                raise ConnectionError(f"SSH connection error: {e}")
             raise
 
     def _listdir(self, location):
@@ -375,8 +526,8 @@ class SSHEndpoint(Endpoint):
             )
             return []
 
-    def send_receive(self, source: str, destination: str) -> None:
-        """Perform btrfs send/receive operation."""
+    def send_receive(self, source: str, destination: str, max_retries: int = 3) -> None:
+        """Perform btrfs send/receive operation with retry capability."""
         logger.info(
             "Starting btrfs send/receive operation from %s to %s", source, destination
         )
@@ -385,6 +536,7 @@ class SSHEndpoint(Endpoint):
         
         # Test if destination already exists
         try:
+            # First check if the destination exists
             test_cmd = ["test", "-e", destination]
             result = self._exec_remote_command(test_cmd, check=False)
             if result.returncode == 0:
@@ -392,71 +544,371 @@ class SSHEndpoint(Endpoint):
                     "Destination path already exists: %s - this might cause btrfs receive to fail", 
                     destination
                 )
+                
+                # Also check what type of file it is
+                file_type_cmd = ["stat", "-c", "%F", destination]
+                type_result = self._exec_remote_command(file_type_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+                if type_result.returncode == 0:
+                    file_type = type_result.stdout.decode(errors="replace").strip()
+                    logger.warning("Existing destination is of type: %s", file_type)
+                    if "directory" in file_type.lower():
+                        logger.error("Destination is a directory - btrfs receive cannot write to a directory!")
+                        logger.error("Make sure the destination path points to a subvolume, not a directory")
         except Exception as e:
             logger.warning("Could not check if destination exists: %s", e)
         
-        # Establish SSH connection with context manager
-        with self.ssh_manager:
-            try:
-                # Start the send process
-                send_proc = subprocess.Popen(
-                    ["btrfs", "send", source],
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                )
+        retry_count = 0
+        last_exception = None
+        
+        while retry_count <= max_retries:
+            # If this is a retry, log it and wait before trying again
+            if retry_count > 0:
+                logger.info(f"Retry attempt {retry_count}/{max_retries} for send/receive operation")
+                time.sleep(5)  # Wait 5 seconds between retries
                 
-                # Start the receive process
-                recv_proc = self._btrfs_receive(destination, send_proc.stdout)
-
-                # Close stdout after passing to receive process to allow proper SIGPIPE
-                logger.debug(
-                    "Closing send_proc stdout to allow SIGPIPE if recv_proc exits"
-                )
-                send_proc.stdout.close()
-
-                # Wait for processes to complete
-                logger.debug("Waiting for btrfs send process to complete...")
-                send_returncode = send_proc.wait()
-                logger.debug("btrfs send process completed with return code: %d", send_returncode)
-
-                logger.debug("Waiting for btrfs receive process to complete...")
-                recv_returncode = recv_proc.wait()
-                logger.debug("btrfs receive process completed with return code: %d", recv_returncode)
-
-                # Check for errors and log output
-                if send_returncode != 0:
-                    send_stderr = send_proc.stderr.read().decode(errors="replace")
-                    logger.error("btrfs send failed with return code %d", send_returncode)
-                    logger.error("btrfs send stderr: %s", send_stderr)
-                    raise RuntimeError(f"btrfs send failed: {send_stderr}")
-
-                if recv_returncode != 0:
-                    recv_stderr = recv_proc.stderr.read().decode(errors="replace")
-                    logger.error("btrfs receive failed with return code %d", recv_returncode)
-                    logger.error("btrfs receive stderr: %s", recv_stderr)
-                    raise RuntimeError(f"btrfs receive failed: {recv_stderr}")
+                # Re-establish SSH connection if needed
+                if not self.ssh_manager.is_master_alive():
+                    logger.info("SSH connection lost, attempting to re-establish...")
+                    if not self.ssh_manager.start_master():
+                        logger.error("Failed to re-establish SSH connection")
+                        raise RuntimeError("Failed to re-establish SSH connection after disconnect")
+                    logger.info("SSH connection re-established successfully")
+            
+            send_proc = None
+            recv_proc = None
                 
-                # Verify transfer completion
-                logger.debug("Verifying transfer completion on remote host...")
-                verify_cmd = self._build_remote_command(["ls", "-l", destination])
-                verify_proc = self._exec_remote_command(verify_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                if verify_proc.returncode != 0:
-                    logger.error("Verification failed: %s", verify_proc.stderr.decode(errors="replace"))
-                    raise RuntimeError("Failed to verify transfer on remote host")
-                logger.debug("Transfer verified successfully on remote host.")
-                
-            finally:
-                # Ensure proper cleanup of processes
-                if 'send_proc' in locals():
-                    if hasattr(send_proc, "stderr") and send_proc.stderr:
-                        send_proc.stderr.close()
-                
-                if 'recv_proc' in locals():
-                    if hasattr(recv_proc, "stdout") and recv_proc.stdout:
-                        recv_proc.stdout.close()
-                    if hasattr(recv_proc, "stderr") and recv_proc.stderr:
-                        recv_proc.stderr.close()
+            # Establish SSH connection with context manager
+            with self.ssh_manager:
+                try:
+                    # Start the send process
+                    logger.debug("Starting local btrfs send process for %s", source)
+                    send_cmd = ["btrfs", "send", source]
+                    logger.info("Running local command: %s", " ".join(send_cmd))
+                    send_proc = subprocess.Popen(
+                        send_cmd,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        bufsize=0,  # Use unbuffered mode for better streaming
+                    )
+                    
+                    # Start the receive process
+                    logger.debug("Starting btrfs receive process on remote host")
+                    
+                    # Check if we're in passwordless-only mode
+                    passwordless_only = os.environ.get("BTRFS_BACKUP_PASSWORDLESS_ONLY", "0").lower() in ("1", "true", "yes")
+                    if passwordless_only:
+                        logger.warning("Running in passwordless-only mode - any sudo password prompt will cause failure")
+                    
+                    # Check for sudo requirements on remote host
+                    if self.config.get("ssh_sudo", False):
+                        logger.info("Verifying sudo access on remote host...")
+                        try:
+                            # First verify sudo access in general
+                            sudo_test = self._exec_remote_command(
+                                ["sudo", "-n", "-v"], 
+                                check=False, 
+                                timeout=10
+                            )
+                                
+                            if sudo_test.returncode != 0:
+                                logger.warning("Passwordless sudo is not available on remote host.")
+                                logger.warning("This will likely cause the transfer to fail if sudo is required.")
+                            else:
+                                logger.info("Passwordless sudo is available on the remote host")
+                                
+                            # Then specifically test btrfs receive with sudo
+                            btrfs_test = self._exec_remote_command(
+                                ["sudo", "-n", "btrfs", "--version"],
+                                check=False,
+                                timeout=10,
+                                stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE
+                            )
+                                
+                            if btrfs_test.returncode != 0:
+                                logger.warning("Cannot run btrfs commands with passwordless sudo on remote host.")
+                                logger.warning("Transfer will fail if sudo password is required for btrfs commands.")
+                                logger.warning("Add the following to sudoers on remote host to fix this:")
+                                logger.warning("    %sudo ALL=(ALL) NOPASSWD: /usr/bin/btrfs")
+                                # Log the error output to help diagnose the issue
+                                stderr = btrfs_test.stderr.decode(errors="replace").strip()
+                                if stderr:
+                                    logger.warning("Remote sudo error: %s", stderr)
+                            else:
+                                btrfs_version = btrfs_test.stdout.decode(errors="replace").strip()
+                                logger.info("Passwordless sudo for btrfs verified on remote host: %s", btrfs_version)
+                                
+                            # Also check direct write access to destination directory
+                            dest_dir = os.path.dirname(destination)
+                            if dest_dir:
+                                write_test = self._exec_remote_command(
+                                    ["touch", f"{dest_dir}/.test_write_access"],
+                                    check=False,
+                                    timeout=10,
+                                    stderr=subprocess.PIPE
+                                )
+                                if write_test.returncode == 0:
+                                    logger.info("Destination directory is directly writeable without sudo")
+                                    self._exec_remote_command(
+                                        ["rm", "-f", f"{dest_dir}/.test_write_access"],
+                                        check=False
+                                    )
+                                else:
+                                    stderr = write_test.stderr.decode(errors="replace").strip()
+                                    logger.info("Destination directory requires sudo for writing: %s", stderr)
+                            
+                                    # Test if it's writable with sudo
+                                    sudo_write_test = self._exec_remote_command(
+                                        ["sudo", "-n", "touch", f"{dest_dir}/.test_write_access_sudo"],
+                                        check=False,
+                                        timeout=10
+                                    )
+                                    if sudo_write_test.returncode == 0:
+                                        logger.info("Destination directory is writeable with sudo")
+                                        self._exec_remote_command(
+                                            ["sudo", "-n", "rm", "-f", f"{dest_dir}/.test_write_access_sudo"],
+                                            check=False
+                                        )
+                                    else:
+                                        logger.warning("Destination directory is not writeable even with sudo!")
+                            else:
+                                logger.warning("Cannot determine destination directory for write testing")
+                                
+                        except Exception as e:
+                            logger.warning(f"Could not verify sudo access: {e}")
+                        
+                    recv_proc = self._btrfs_receive(destination, send_proc.stdout)
 
+                    # Close stdout after passing to receive process to allow proper SIGPIPE
+                    logger.debug(
+                        "Closing send_proc stdout to allow SIGPIPE if recv_proc exits"
+                    )
+                    send_proc.stdout.close()
+                    
+                    # If sudo requires a password and we're using -S flag, 
+                    # it will be read from stdin (which is connected to our pipe)
+                    logger.debug("btrfs receive process started with PID: %d", recv_proc.pid)
+                    
+                    # Log additional debug info about the receive process
+                    logger.debug("Process information: stdin=%s, stdout=%s, stderr=%s", 
+                                recv_proc.stdin, recv_proc.stdout, recv_proc.stderr)
+
+                    # Use select to wait for processes with timeout to detect stalled connections
+                    def wait_with_timeout(proc, timeout=30):
+                        """Wait for process with timeout to detect stalled connections."""
+                        end_time = time.time() + timeout
+                        
+                        # Setup file descriptors to monitor for activity
+                        fds_to_watch: Dict[int, Tuple[Any, str]] = {}
+                        if hasattr(proc, 'stderr') and proc.stderr:
+                            fds_to_watch[proc.stderr.fileno()] = (proc.stderr, 'stderr')
+                        
+                        while proc.poll() is None and time.time() < end_time:
+                            if fds_to_watch:
+                                # Wait for activity on file descriptors or timeout
+                                try:
+                                    ready, _, _ = select.select(fds_to_watch.keys(), [], [], 0.5)
+                                    for fd in ready:
+                                        fd_obj, fd_name = fds_to_watch[fd]
+                                        data = fd_obj.read(1024)
+                                        if not data:  # EOF
+                                            del fds_to_watch[fd]
+                                        else:
+                                            logger.debug(f"Activity on {fd_name}: {data.decode(errors='replace').strip()}")
+                                except (select.error, ValueError, IOError) as e:
+                                    # Handle select errors (including closed file descriptors)
+                                    logger.debug(f"Select error: {e}")
+                                    break
+                            else:
+                                time.sleep(0.1)
+                                
+                        return proc.poll() is not None
+
+                    # Wait for processes to complete with monitoring
+                    logger.debug("Waiting for btrfs send process to complete...")
+                    if not wait_with_timeout(send_proc, timeout=60):  # Increased timeout
+                        logger.warning("btrfs send process appears stalled, checking SSH connection")
+                        if not self.ssh_manager.is_master_alive():
+                            logger.error("SSH connection appears to be broken")
+                            # Try to kill the stuck process before raising error
+                            try:
+                                logger.warning("Terminating stuck send process...")
+                                send_proc.terminate()
+                                time.sleep(0.5)
+                                if send_proc.poll() is None:
+                                    logger.warning("Forcefully killing stuck send process...")
+                                    send_proc.kill()
+                            except Exception as e:
+                                logger.error(f"Error cleaning up send process: {e}")
+                            raise ConnectionError("SSH connection broken during transfer")
+                        else:
+                            logger.warning("SSH connection is alive but transfer appears stalled - continuing to wait")
+                    send_returncode = send_proc.wait()
+                    logger.debug("btrfs send process completed with return code: %d", send_returncode)
+
+                    logger.debug("Waiting for btrfs receive process to complete...")
+                    if not wait_with_timeout(recv_proc, timeout=60):  # Increased timeout
+                        logger.warning("btrfs receive process appears stalled, checking SSH connection")
+                        if not self.ssh_manager.is_master_alive():
+                            logger.error("SSH connection appears to be broken")
+                            # Try to kill the stuck process before raising error
+                            try:
+                                logger.warning("Terminating stuck receive process...")
+                                recv_proc.terminate()
+                                time.sleep(0.5)
+                                if recv_proc.poll() is None:
+                                    logger.warning("Forcefully killing stuck receive process...")
+                                    recv_proc.kill()
+                            except Exception as e:
+                                logger.error(f"Error cleaning up receive process: {e}")
+                            raise ConnectionError("SSH connection broken during receive operation")
+                        else:
+                            logger.warning("SSH connection is alive but receive process appears stalled - continuing to wait")
+                    recv_returncode = recv_proc.wait()
+                    logger.debug("btrfs receive process completed with return code: %d", recv_returncode)
+
+                    # Check for errors and log output
+                    if send_returncode != 0:
+                        send_stderr = send_proc.stderr.read().decode(errors="replace")
+                        logger.error("btrfs send failed with return code %d", send_returncode)
+                        logger.error("btrfs send stderr: %s", send_stderr)
+                        
+                        # Detect specific error conditions
+                        if "Broken pipe" in send_stderr or "Connection reset" in send_stderr:
+                            raise ConnectionError(f"btrfs send failed due to connection issue: {send_stderr}")
+                        elif "not a btrfs subvolume" in send_stderr.lower():
+                            raise ValueError(f"Source path is not a btrfs subvolume: {source}")
+                        elif "failed to open" in send_stderr.lower():
+                            raise FileNotFoundError(f"Failed to open source subvolume: {source}")
+                        else:
+                            raise RuntimeError(f"btrfs send failed: {send_stderr}")
+
+                    if recv_returncode != 0:
+                        recv_stderr = recv_proc.stderr.read().decode(errors="replace")
+                        logger.error("btrfs receive failed with return code %d", recv_returncode)
+                        logger.error("btrfs receive stderr: %s", recv_stderr)
+                        
+                        # Detect specific error conditions
+                        if "Connection closed" in recv_stderr or "broken pipe" in recv_stderr.lower():
+                            raise ConnectionError(f"btrfs receive failed due to connection issue: {recv_stderr}")
+                        elif "sudo" in recv_stderr.lower() and "password" in recv_stderr.lower():
+                            logger.error("=============================================================")
+                            logger.error("SUDO PASSWORD REQUIRED ON REMOTE HOST")
+                            logger.error("This transfer cannot complete because sudo requires a password")
+                            logger.error("To fix this, run the following on the remote host as root:")
+                            logger.error("echo '%sudo ALL=(ALL) NOPASSWD: /usr/bin/btrfs' >> /etc/sudoers.d/btrfs")
+                            logger.error("=============================================================")
+                            raise PermissionError(f"Sudo password required but not provided: {recv_stderr}")
+                        elif "permission denied" in recv_stderr.lower():
+                            logger.error("=============================================================")
+                            logger.error("PERMISSION DENIED ON REMOTE HOST")
+                            logger.error("Make sure the destination path is writable by your SSH user")
+                            logger.error("=============================================================")
+                            raise PermissionError(f"Permission denied on remote host: {recv_stderr}")
+                        elif "not a btrfs" in recv_stderr.lower():
+                            raise ValueError(f"Destination is not on a btrfs filesystem: {destination}")
+                        elif "no space left" in recv_stderr.lower():
+                            raise OSError(f"No space left on remote device: {recv_stderr}")
+                        elif "askpass" in recv_stderr.lower():
+                            logger.error("=============================================================")
+                            logger.error("SUDO ASKPASS PROBLEM DETECTED")
+                            logger.error("This may be related to sudo requiring a password prompt")
+                            logger.error("Try setting up passwordless sudo for btrfs on the remote host")
+                            logger.error("=============================================================")
+                            raise PermissionError(f"Sudo askpass problem: {recv_stderr}")
+                        else:
+                            raise RuntimeError(f"btrfs receive failed: {recv_stderr}")
+                    
+                    # Verify transfer completion
+                    logger.debug("Verifying transfer completion on remote host...")
+                    verify_cmd = self._build_remote_command(["ls", "-l", destination])
+                    verify_proc = self._exec_remote_command(verify_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                    if verify_proc.returncode != 0:
+                        logger.error("Verification failed: %s", verify_proc.stderr.decode(errors="replace"))
+                        raise RuntimeError("Failed to verify transfer on remote host")
+                    logger.debug("Transfer verified successfully on remote host.")
+                    
+                    # If we get here without exceptions, the transfer was successful
+                    logger.info("btrfs send/receive completed successfully")
+                    return
+                    
+                except (ConnectionError, ConnectionResetError, BrokenPipeError, OSError) as e:
+                    # These are network-related errors we can retry
+                    last_exception = e
+                    logger.warning(f"Network error during transfer (attempt {retry_count+1}/{max_retries+1}): {e}")
+                    retry_count += 1
+                    
+                    # Clean up any potentially stuck processes
+                    if send_proc and send_proc.poll() is None:
+                        try:
+                            logger.warning("Terminating stuck send process during retry...")
+                            send_proc.terminate()
+                            time.sleep(0.5)
+                            if send_proc.poll() is None:
+                                logger.warning("Forcefully killing stuck send process during retry...")
+                                send_proc.kill()
+                        except Exception as e:
+                            logger.error(f"Error cleaning up send process during retry: {e}")
+                    
+                    if recv_proc and recv_proc.poll() is None:
+                        try:
+                            logger.warning("Terminating stuck receive process during retry...")
+                            recv_proc.terminate()
+                            time.sleep(0.5)
+                            if recv_proc.poll() is None:
+                                logger.warning("Forcefully killing stuck receive process during retry...")
+                                recv_proc.kill()
+                        except Exception as e:
+                            logger.error(f"Error cleaning up receive process during retry: {e}")
+                    
+                    # Force cleanup of SSH connection to ensure clean slate for retry
+                    self.ssh_manager.stop_master()
+                    continue
+                    
+                except Exception as e:
+                    # Log other exceptions that we won't retry
+                    logger.error(f"Error during transfer: {e}")
+                    raise
+                    
+                finally:
+                    # Ensure proper cleanup of processes
+                    if send_proc:
+                        # Ensure process is terminated before cleaning up
+                        if send_proc.poll() is None:
+                            try:
+                                send_proc.terminate()
+                                time.sleep(0.5)
+                                if send_proc.poll() is None:
+                                    send_proc.kill()
+                            except Exception as e:
+                                logger.debug(f"Error terminating send process: {e}")
+                                
+                        # Close file descriptors
+                        if hasattr(send_proc, "stderr") and send_proc.stderr:
+                            send_proc.stderr.close()
+                    
+                    if recv_proc:
+                        # Ensure process is terminated before cleaning up
+                        if recv_proc.poll() is None:
+                            try:
+                                recv_proc.terminate()
+                                time.sleep(0.5)
+                                if recv_proc.poll() is None:
+                                    recv_proc.kill()
+                            except Exception as e:
+                                logger.debug(f"Error terminating receive process: {e}")
+                                
+                        # Close file descriptors
+                        if hasattr(recv_proc, "stdout") and recv_proc.stdout:
+                            recv_proc.stdout.close()
+                        if hasattr(recv_proc, "stderr") and recv_proc.stderr:
+                            recv_proc.stderr.close()
+        
+        # If we've exhausted all retries, raise the last exception
+        if last_exception:
+            logger.error(f"Failed to complete transfer after {max_retries+1} attempts")
+            raise last_exception
+        
         logger.info("btrfs send/receive completed successfully")
 
     def _prepare(self) -> None:
