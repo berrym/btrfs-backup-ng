@@ -10,7 +10,6 @@ import copy
 import os
 import subprocess
 import uuid
-from pathlib import Path
 from threading import Lock
 from typing import Optional
 
@@ -27,12 +26,12 @@ class SSHEndpoint(Endpoint):
 
     def __init__(self, hostname: str, config: Optional[dict] = None, **kwargs) -> None:
         # Deep copy config to avoid shared references in multiprocessing
-        logger.debug("SSHEndpoint initialized with hostname: %s, Here be Dragons!", self.hostname)
         if config is not None:
             config = copy.deepcopy(config)
         super().__init__(config=config, **kwargs)
 
         self.hostname = hostname
+        logger.debug("SSHEndpoint initialized with hostname: %s", self.hostname)
         self.config["username"] = self.config.get("username")
         self.config["port"] = self.config.get("port")
         self.config["ssh_opts"] = self.config.get("ssh_opts", [])
@@ -69,7 +68,7 @@ class SSHEndpoint(Endpoint):
         """Execute a command on the remote host."""
         remote_cmd = self._build_remote_command(command)
         ssh_cmd = self.ssh_manager._ssh_base_cmd() + ["--"] + remote_cmd
-        logger.debug("Executing remote command: %s", ssh_cmd)
+        logger.debug("Executing remote command: %s", " ".join(map(str, ssh_cmd)))
         return subprocess.run(ssh_cmd, **kwargs)
 
     def _btrfs_send(self, source: str, stdout_pipe) -> subprocess.Popen:
@@ -89,7 +88,7 @@ class SSHEndpoint(Endpoint):
         command = ["btrfs", "receive", destination]
         remote_cmd = self._build_remote_command(command)
         ssh_cmd = self.ssh_manager._ssh_base_cmd() + ["--"] + remote_cmd
-        logger.debug("Preparing to execute btrfs receive: %s", ssh_cmd)
+        logger.debug("Preparing to execute btrfs receive: %s", " ".join(map(str, ssh_cmd)))
         try:
             process = subprocess.Popen(ssh_cmd, stdin=stdin_pipe, stderr=subprocess.PIPE)
             logger.debug("btrfs receive process started successfully: %s", ssh_cmd)

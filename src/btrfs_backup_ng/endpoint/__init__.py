@@ -2,8 +2,11 @@
 
 """btrfs-backup-ng: btrfs_backup_ng/endpoint/__init__.py."""
 
+import getpass
 import urllib.parse
 from pathlib import Path
+
+from ..__logger__ import logger
 
 from .local import LocalEndpoint
 from .shell import ShellEndpoint
@@ -40,9 +43,6 @@ def choose_endpoint(spec, common_config=None, source=False, excluded_types=()):
             raise ValueError("No hostname for SSH specified.")
 
         # Parse URL components and log them
-        from btrfs_backup_ng.__logger__ import logger
-
-        logger.debug("SSHEndpoint initialized with hostname: %s, Here be Dragons!", self.hostname)
         logger.debug("Parsed SSH URL: %s", spec)
         logger.debug("Username from URL: %s", parsed.username)
         logger.debug("Hostname from URL: %s", parsed.hostname)
@@ -82,7 +82,6 @@ def choose_endpoint(spec, common_config=None, source=False, excluded_types=()):
     if endpoint_class == SSHEndpoint:
         # Initialize with passwordless=False by default
         config.setdefault("passwordless", False)
-        from btrfs_backup_ng.__logger__ import logger
 
         logger.debug("Final SSH config: %s", config)
         logger.debug("Final SSH username: %s", config.get("username"))
@@ -94,11 +93,11 @@ def choose_endpoint(spec, common_config=None, source=False, excluded_types=()):
         return endpoint_class(
             config=config,
             cmd=config.get("cmd", None),
-            hostname=config.get("hostname", None),
+            hostname=config.get("hostname", ""),
         )
     else:
         return endpoint_class(
             config=config,
             cmd=config.get("cmd", None),
-            hostname=config.get("hostname", None),
+            hostname=config.get("hostname", ""),
         )

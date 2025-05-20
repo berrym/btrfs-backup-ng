@@ -5,65 +5,19 @@ A common logger for displaying in a rich layout.
 """
 
 import logging
+import logging.handlers
 import threading
 from collections import deque
-from typing import IO  # , override (reuires python 3.12)
+from typing import IO  # , override (requires python 3.12)
 
 from rich.console import Console
 from rich.logging import RichHandler
 
+# Initialize basic console and handler
 cons = Console()
-rich_handler = RichHandler()
-logger = logging.Logger(__name__)
-
-
-# class Borg:
-#     """Basic Borg pattern class."""
-
-#     __monostate = {}
-
-#     def __init__(self):
-#         """Initialize the shared internal state."""
-#         self.__dict__ = self.__monostate
-
-
-# class RichLogger(Borg):
-#     """A Borg subclass to share internal state of the rich logger."""
-
-#     def __init__(self):
-#         """Initialize the Borg and the logger."""
-#         Borg.__init__(self)
-#         self.messages = deque(["btrfs-backup-ng -- logger"], maxlen=20)
-
-#     def write(self, message):
-#         """Write log message"""
-#         self.messages.extend(message.splitlines())
-
-#     def flush(self):
-#         """Place holder"""
-#         pass
-
-
-# class RichLogger:
-#     """Borg pattern class to share internal state of the rich logger."""
-
-#     __monostate = None
-
-#     def __init__(self):
-#         """Initialize the logger state."""
-#         if RichLogger.__monostate is None:
-#             RichLogger.__monostate = self.__dict__
-#             self.messages = deque(["btrfs-backup-ng -- logger"], maxlen=20)
-#         else:
-#             self.__dict__ = RichLogger.__monostate
-
-#     def write(self, message):
-#         """Add log message"""
-#         self.messages.extend(message.splitlines())
-
-#     def flush(self):
-#         """Place holder."""
-#         pass
+rich_handler = RichHandler(console=cons, show_path=False)
+# Create a logger directly
+logger = logging.Logger("btrfs-backup-ng", logging.INFO)
 
 
 class RichLogger(IO[str]):
@@ -98,15 +52,20 @@ class RichLogger(IO[str]):
 def create_logger(live_layout) -> None:
     """Helper function to setup logging depending on visual display options."""
     # pylint: disable=global-statement
-    global cons, rich_handler
+    global cons, rich_handler, logger
+    
+    # Create new handlers
     if live_layout:
         cons = Console(file=RichLogger(), width=150)
         rich_handler = RichHandler(console=cons, show_time=False, show_path=False)
     else:
         cons = Console()
         rich_handler = RichHandler(console=cons, show_path=False)
+    
     logger.handlers.clear()
     logger.propagate = False
+    logger.addHandler(rich_handler)
+    
     logging.basicConfig(
         format="(%(processName)s) %(message)s",
         datefmt="%H:%M:%S",
@@ -114,3 +73,4 @@ def create_logger(live_layout) -> None:
         handlers=[rich_handler],
         force=True,
     )
+

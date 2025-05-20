@@ -32,6 +32,7 @@ SOFTWARE.
 
 import argparse
 import concurrent.futures
+import logging
 import logging.handlers
 import multiprocessing
 import os
@@ -39,6 +40,7 @@ import subprocess
 import sys
 import threading
 import time
+import traceback
 from pathlib import Path
 
 from rich.align import Align
@@ -452,13 +454,21 @@ files is allowed as well."""
     except Exception:
         options["num_backups"] = 0
 
-    print("Command-line destinations:", options["destinations"])
     return options
 
 
-def run_task(options, queue):
+def run_task(options, queue=None):
     """Create a list of tasks to run."""
-    setup_logger(queue, options)
+    # Set up process-specific logger if queue is provided
+    if queue is not None:
+        try:
+            verbosity = options.get("verbosity", "INFO").upper()
+            log = setup_logger(queue, verbosity)
+            log.debug(f"Process {os.getpid()} logger initialized with queue")
+        except Exception as e:
+            print(f"Error setting up logger in process {os.getpid()}: {e}")
+            traceback.print_exc()
+    
     apply_shortcuts(options)
     log_initial_settings(options)
 
@@ -489,14 +499,26 @@ def run_task(options, queue):
     # Enforce retention for source and destination endpoints only once, at the end
     cleanup_snapshots(source_endpoint, destination_endpoints, options)
 
-    logger.info(__util__.log_heading(f"Finished at {time.ctime()}"))
 
-
-def setup_logger(queue, options):
+def setup_logger(queue, level):
     """Set up the logger with the appropriate verbosity."""
+    # Simple QueueHandler setup - works reliably with multiprocessing
     qh = logging.handlers.QueueHandler(queue)
-    logger.addHandler(qh)
-    logger.setLevel(options["verbosity"].upper())
+    # Get the logger instance
+    log = logging.getLogger("btrfs-backup-ng")
+    # Reset handlers
+    log.handlers.clear()
+    log.propagate = False
+    # Add queue handler and set level
+    log.addHandler(qh)
+    try:
+        log.setLevel(level)
+    except (ValueError, TypeError):
+        # Fallback to INFO if level is invalid
+        print(f"Invalid log level: {level}, using INFO")
+        log.setLevel(logging.INFO)
+    # Return for confirmation
+    return log
 
 
 def apply_shortcuts(options):
@@ -536,6 +558,24 @@ def log_initial_settings(options):
     logger.debug("Remove locks for given destinations: %r", options["remove_locks"])
     logger.debug("Skip filesystem checks: %r", options["skip_fs_checks"])
     logger.debug("Auto add locked destinations: %r", options["locked_destinations"])
+
+
+def cleanup_snapshots(source_endpoint, destination_endpoints, options):
+    """Clean up old snapshots."""
+    logger.info(__util__.log_heading("Cleaning up..."))
+    if options.get("num_snapshots", 0) > 0:
+        try:
+            source_endpoint.delete_old_snapshots(options["num_snapshots"])
+        except __util__.AbortError as e:
+            logger.debug("Error while deleting source snapshots: %s", e)
+
+    if options.get("num_backups", 0) > 0:
+        for destination_endpoint in destination_endpoints:
+            try:
+                destination_endpoint.delete_old_snapshots(options["num_backups"])
+            except __util__.AbortError as e:
+                logger.debug("Error while deleting backups: %s", e)
+    logger.info(__util__.log_heading(f"Finished at {time.ctime()}"))
 
 
 def prepare_source_endpoint(options):
@@ -681,31 +721,21 @@ def transfer_snapshots(source_endpoint, destination_endpoints, options):
             logger.debug("Exception was: %s", e)
 
 
-def cleanup_snapshots(source_endpoint, destination_endpoints, options):
-    """Clean up old snapshots."""
-    logger.info(__util__.log_heading("Cleaning up..."))
-    if options.get("num_snapshots", 0) > 0:
-        try:
-            source_endpoint.delete_old_snapshots(options["num_snapshots"])
-        except __util__.AbortError as e:
-            logger.debug("Error while deleting source snapshots: %s", e)
-
-    if options.get("num_backups", 0) > 0:
-        for destination_endpoint in destination_endpoints:
-            try:
-                destination_endpoint.delete_old_snapshots(options["num_backups"])
-            except __util__.AbortError as e:
-                logger.debug("Error while deleting backups: %s", e)
-
-
 def serve_logger_thread(queue) -> None:
     """Run the logger from a thread in main to talk to all children."""
+    print("Logger thread started")
     while True:
-        record = queue.get()
-        if record is None:
+        try:
+            record = queue.get()
+            if record is None:
+                print("Logger thread received shutdown signal")
+                break
+            logger.handle(record)
+        except Exception as e:
+            print(f"Error in logger thread: {e}")
+            traceback.print_exc()
             break
-        log = logger.getChild(record.name)  # logging.getLogger(record.name)
-        log.handle(record)
+    print("Logger thread shutting down")
 
 
 def main() -> None:
@@ -741,9 +771,6 @@ def main() -> None:
         help="Enable debugging on btrfs send / receive.",
     )
 
-    # Set up the logger early so debug/info logs are visible
-    create_logger(live_layout=False)  # or True if you want live layout by default
-
     # pylint: disable=consider-using-join
     command_line = ""
     for arg in sys.argv[1:]:
@@ -762,16 +789,29 @@ def main() -> None:
 
     # Create a shared logger for all child processes
     create_logger(live_layout)
+    # Setup queue for cross-process logging
     queue = multiprocessing.Manager().Queue(-1)
+    # Create and start logger thread
     logger_thread = threading.Thread(target=serve_logger_thread, args=(queue,))
+    logger_thread.daemon = True  # Make thread daemon so it doesn't block program exit
     logger_thread.start()
+    # Configure main process logger
+    level = task_options[0].get("verbosity", "INFO").upper()
+    setup_logger(queue, level)
+    logger.debug("Main process logger initialized")
 
-    if live_layout:
-        do_live_layout(tasks, task_options, queue)
-    else:
-        do_logging(tasks, task_options, queue)
-
-    logger_thread.join()
+    try:
+        if live_layout:
+            do_live_layout(tasks, task_options, queue)
+        else:
+            do_logging(tasks, task_options, queue)
+    finally:
+        # Ensure logger thread gets shutdown signal
+        logger.info("All tasks completed, shutting down logger")
+        queue.put_nowait(None)
+        # Wait for logger thread to finish processing all messages
+        logger_thread.join(timeout=5.0)
+        print("Logger thread joined")
 
 
 def do_logging(tasks, task_options, queue) -> None:
@@ -779,19 +819,25 @@ def do_logging(tasks, task_options, queue) -> None:
     futures = []  # keep track of the concurrent futures
     try:
         with concurrent.futures.ProcessPoolExecutor(
-            max_workers=8,
+            max_workers=min(8, len(tasks))
         ) as executor:
-            futures.extend(
-                executor.submit(run_task, task_options[n], queue)
-                for n in range(len(tasks))
-            )
-        queue.put_nowait(None)
+            # Submit all tasks, passing queue to each
+            for n in range(len(tasks)):
+                logger.debug(f"Submitting task {n+1}/{len(tasks)}")
+                futures.append(executor.submit(run_task, task_options[n], queue))
+            
+            # Wait for all futures to complete
+            logger.info(f"Waiting for {len(futures)} tasks to complete")
+            concurrent.futures.wait(futures)
+            logger.info("All tasks completed")
     except (__util__.AbortError, KeyboardInterrupt):
+        logger.error("Process aborted by user or error")
         sys.exit(1)
 
 
 def do_live_layout(tasks, task_options, queue) -> None:
     """Execute tasks using rich live layout."""
+    logger.debug("Starting live layout with queue")
     layout = Layout(name="root")
 
     layout.split(
@@ -848,9 +894,10 @@ def do_live_layout(tasks, task_options, queue) -> None:
 
     try:
         with concurrent.futures.ProcessPoolExecutor(
-            max_workers=8,
-        ) as executor:  # , thread_name_prefix="Task") as executor:
+            max_workers=min(8, len(tasks))
+        ) as executor:
             for n in range(len(tasks)):
+                logger.debug(f"Submitting live layout task {n+1}/{len(tasks)}")
                 futures.append(executor.submit(run_task, task_options[n], queue))
                 task_id = tasks_progress.add_task(
                     f"[red]task: [cyan]{task_options[n]['source']}",
@@ -882,6 +929,8 @@ def do_live_layout(tasks, task_options, queue) -> None:
                 )
                 time.sleep(1)
                 layout["logs"].update(Panel(Text("\n".join(log.messages))))
-        queue.put_nowait(None)
+                logger.debug("Live layout completed all tasks")
+        # Signal is sent in main() after this function returns
     except (__util__.AbortError, KeyboardInterrupt):
+        logger.error("Live layout aborted by user or error")
         sys.exit(1)
