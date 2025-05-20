@@ -48,6 +48,8 @@ backup, btrfs, snapshot, send, receive, ssh
 -   Initial creation of full backups
 -   Incremental backups on subsequent runs
 -   Different backup storage engines:
+    -   Local btrfs filesystem
+    -   Remote SSH with optional username specified via `--ssh-username` or in the URI (`ssh://user@host/path`)
     -   Local storage
     -   Remote storage via SSH
     -   Custom storage: Alternatively, the output of `btrfs send` may be
@@ -442,12 +444,26 @@ the `--snapshot-folder` option.
 
 ## Recent Updates
 
-### Bug Fixes (July 2023)
+### Bug Fixes (May 2025)
 
 - Fixed syntax error in the SSH endpoint implementation that was causing "unexpected indent" errors
 - Improved error handling in SSH operations with proper try/except blocks
 - Enhanced cleanup of resources in SSH operations to prevent potential leaks
 - Better error reporting for remote operations
+- Fixed identity file handling when running with sudo to properly expand paths
+
+### Running with sudo (May 2025)
+
+When running btrfs-backup-ng with sudo, you need to make sure your SSH settings are correctly preserved. Here's the recommended approach:
+
+```
+sudo SSH_AUTH_SOCK=$SSH_AUTH_SOCK btrfs-backup-ng --ssh-identity-file=/absolute/path/to/id_ed25519 --ssh-username=your_user send local:/mnt/data remote:/mnt/backup
+```
+
+Key points when using sudo:
+- Use `SSH_AUTH_SOCK=$SSH_AUTH_SOCK` to preserve SSH agent forwarding
+- Specify `--ssh-identity-file` with an absolute path (not ~)
+- Use `--ssh-username` to explicitly set your SSH username
 
 ## Issues and Contribution
 
@@ -455,6 +471,16 @@ As in every piece of software, there likely are bugs. When you find one,
 please open an issue on GitHub. If you do so, please include the output
 with debug log level (`-v debug`) and provide steps to reproduce the
 problem. Thank you!
+
+### Common SSH Issues
+
+If you're having SSH connection issues, especially when running with sudo:
+
+1. Make sure you're using absolute paths for identity files when running with sudo
+2. Use `SSH_AUTH_SOCK=$SSH_AUTH_SOCK` to preserve SSH agent forwarding
+3. Check that the identity file has proper permissions (chmod 600)
+4. Explicitly specify your SSH username with `--ssh-username=your_user`
+5. Add verbose debugging: `-v debug`
 
 ## Copyright
 

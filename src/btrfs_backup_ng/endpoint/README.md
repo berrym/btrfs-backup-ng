@@ -11,7 +11,7 @@ This directory contains the endpoint implementations for btrfs-backup-ng. Endpoi
 
 ## Recent Fixes
 
-### SSH Endpoint (2023-07-18)
+### SSH Endpoint (May 2025)
 
 The SSH endpoint implementation has been fixed to address several issues:
 
