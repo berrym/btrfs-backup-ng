@@ -138,7 +138,7 @@ class SSHMasterManager:
         self._master_started = False
 
     def _ssh_base_cmd(self, force_tty=False):
-        # Build the base SSH command.
+        """Build the base SSH command.
         
         Args:
             force_tty: If True, add -t to force TTY allocation (needed for sudo)
@@ -375,21 +375,22 @@ class SSHMasterManager:
                     # If we're using sudo, we might need TTY allocation
                     if "sudo" in " ".join(cmd) and not any(x in " ".join(cmd) for x in ["btrfs send", "btrfs receive"]):
                         # Regular sudo commands may need TTY
+                        # Set proper indent
                         cmd_to_use = self._ssh_base_cmd(force_tty=True) + cmd[1:]
                         logger.debug("Using TTY-enabled command for sudo: %s", " ".join(cmd_to_use))
                     else:
                         # For non-sudo or btrfs commands, use regular SSH
                         cmd_to_use = cmd
-                
-                        # Add -o PasswordAuthentication=yes to ensure password auth is allowed during master setup
-                        if "-o" in cmd_to_use and "PasswordAuthentication=no" in " ".join(cmd_to_use):
-                            logger.debug("Ensuring password authentication is enabled for master setup")
-                            # Find and replace PasswordAuthentication=no with PasswordAuthentication=yes
-                            for i, arg in enumerate(cmd_to_use):
-                                if arg == "PasswordAuthentication=no":
-                                    cmd_to_use[i] = "PasswordAuthentication=yes"
-                
-                        proc = subprocess.run(
+                    
+                    # Add -o PasswordAuthentication=yes to ensure password auth is allowed during master setup
+                    if "-o" in cmd_to_use and "PasswordAuthentication=no" in " ".join(cmd_to_use):
+                        logger.debug("Ensuring password authentication is enabled for master setup")
+                        # Find and replace PasswordAuthentication=no with PasswordAuthentication=yes
+                        for i, arg in enumerate(cmd_to_use):
+                            if arg == "PasswordAuthentication=no":
+                                cmd_to_use[i] = "PasswordAuthentication=yes"
+            
+                    proc = subprocess.run(
                             cmd_to_use,
                             stdout=subprocess.DEVNULL,
                             stderr=subprocess.PIPE,
@@ -449,24 +450,24 @@ class SSHMasterManager:
                     )
                     if self.running_as_sudo:
                         logger.debug(
-                            # SSH issues might be related to sudo. Check if SSH keys are accessible to root."
-                            )
-                            logger.debug(f"Consider these troubleshooting steps:")
-                            logger.debug(
-                                f"1. Ensure {self.ssh_config_dir}/id_rsa exists and has correct permissions"
-                            )
-                            logger.debug(
-                                f"2. Run 'ssh-add' as your regular user before using sudo"
-                            )
-                            logger.debug(
-                                f"3. Consider using ssh-agent forwarding with sudo"
-                            )
-                            logger.debug(
-                                f"4. Make sure sudo on the remote host is configured to allow passwordless sudo for btrfs commands"
-                            )
-                            logger.debug(
-                                f"5. Try manually running: ssh {self.username}@{self.hostname} 'sudo -S btrfs receive /path/to/dest'"
-                            )
+                            "SSH issues might be related to sudo. Check if SSH keys are accessible to root."
+                        )
+                        logger.debug(f"Consider these troubleshooting steps:")
+                        logger.debug(
+                            f"1. Ensure {self.ssh_config_dir}/id_rsa exists and has correct permissions"
+                        )
+                        logger.debug(
+                            f"2. Run 'ssh-add' as your regular user before using sudo"
+                        )
+                        logger.debug(
+                            f"3. Consider using ssh-agent forwarding with sudo"
+                        )
+                        logger.debug(
+                            f"4. Make sure sudo on the remote host is configured to allow passwordless sudo for btrfs commands"
+                        )
+                        logger.debug(
+                            f"5. Try manually running: ssh {self.username}@{self.hostname} 'sudo -S btrfs receive /path/to/dest'"
+                        )
 
                 if attempt < retries:
                     self.cleanup_socket()
