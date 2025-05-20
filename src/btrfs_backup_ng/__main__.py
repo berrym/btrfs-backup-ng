@@ -558,6 +558,11 @@ files is allowed as well."""
         help="Explicitly specify the SSH identity (private key) file to use. "
         "Useful when running btrfs-backup-ng with sudo where your regular user's SSH keys aren't accessible.",
     )
+    group.add_argument(
+        "--ssh-username",
+        help="Explicitly specify the SSH username to use when connecting to remote hosts. "
+        "Overrides usernames specified in SSH URLs.",
+    )
 
     group = parser.add_argument_group("Miscellaneous options")
     group.add_argument(
@@ -981,6 +986,11 @@ def build_endpoint_kwargs(options):
         "ssh_sudo": options["ssh_sudo"],
         # DO NOT include 'path' here!
     }
+    
+    # Include SSH username if specified
+    if "ssh_username" in options and options["ssh_username"]:
+        kwargs["username"] = options["ssh_username"]
+        logger.info("Using explicitly configured SSH username: %s", options["ssh_username"])
 
     # Include SSH identity file if specified
     if "ssh_identity_file" in options and options["ssh_identity_file"]:

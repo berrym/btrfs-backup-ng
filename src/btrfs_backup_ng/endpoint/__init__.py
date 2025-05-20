@@ -42,26 +42,27 @@ def choose_endpoint(spec, common_config=None, source=False, excluded_types=()):
         if not parsed.hostname:
             raise ValueError("No hostname for SSH specified.")
 
-            # Parse URL components and log them
-            try:
-                logger.debug("Parsed SSH URL: %s", spec)
-                logger.debug("Username from URL: %s", parsed.username)
-                logger.debug("Hostname from URL: %s", parsed.hostname)
-                logger.debug("Port from URL: %s", parsed.port)
-                logger.debug("Path from URL: %s", parsed.path)
-                logger.debug("Is source endpoint: %s", source)
-            except Exception as e:
-                logger.error("Error logging SSH URL components: %s", e)
+        try:
+            logger.debug("Parsed SSH URL: %s", spec)
+            logger.debug("Username from URL: %s", parsed.username)
+            logger.debug("Hostname from URL: %s", parsed.hostname)
+            logger.debug("Port from URL: %s", parsed.port)
+            logger.debug("Path from URL: %s", parsed.path)
+            logger.debug("Is source endpoint: %s", source)
+        except Exception as e:
+            logger.error("Error logging SSH URL components: %s", e)
 
         config["hostname"] = parsed.hostname
         config["port"] = parsed.port
-        # Ensure the username from the URL is set correctly
-        if parsed.username:
-            config["username"] = parsed.username
-        else:
-            config["username"] = (
-                getpass.getuser()
-            )  # Default to the current user if not specified
+        
+        # Username handling:
+        # 1. Keep username from common_config (from command line) if present
+        # 2. Otherwise use username from URL if present
+        # 3. Otherwise the default will be set in the SSHEndpoint class
+        if "username" not in config:
+            if parsed.username:
+                config["username"] = parsed.username
+                logger.debug("Using username from URL: %s", parsed.username)
 
         # Path handling - don't convert to Path object yet to avoid resolution
         path = parsed.path.strip() or "/"
@@ -93,9 +94,17 @@ def choose_endpoint(spec, common_config=None, source=False, excluded_types=()):
     if endpoint_class == SSHEndpoint:
         # Initialize with passwordless=False by default
         config.setdefault("passwordless", False)
+        
+        # Username will be fully resolved in the SSHEndpoint class
+        # but we ensure it's documented in debug logs
+        username_source = "command_line" if "username" in common_config else "url" if parsed.username else "will use default"
+        logger.debug("Username source: %s", username_source)
 
         logger.debug("Final SSH config: %s", config)
-        logger.debug("Final SSH username: %s", config.get("username"))
+        if "username" in config:
+            logger.debug("Passing username to endpoint: %s", config.get("username"))
+        else:
+            logger.debug("No username set in config, endpoint will use default")
         logger.debug("Final SSH hostname: %s", config.get("hostname"))
         logger.debug("SSH source value: %s", config.get("source"))
         logger.debug("SSH path value: %s", config.get("path"))

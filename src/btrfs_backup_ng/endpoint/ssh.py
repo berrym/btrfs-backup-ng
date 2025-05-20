@@ -11,6 +11,7 @@ import os
 import pwd
 import subprocess
 import uuid
+import logging
 from pathlib import Path
 from threading import Lock
 from typing import Optional, List, Union
@@ -21,7 +22,16 @@ from .common import Endpoint
 
 
 class SSHEndpoint(Endpoint):
-    """SSH-based endpoint for remote operations."""
+    """SSH-based endpoint for remote operations.
+    
+    This endpoint type handles connections to remote hosts via SSH.
+    SSH username can be specified in three ways, in order of precedence:
+    1. Via --ssh-username command line argument (highest priority)
+    2. In the URI (e.g., ssh://user@host:/path)
+    3. Current local user (fallback)
+    
+    When running as root with sudo, SSH identity files and usernames need special handling.
+    """
 
     _is_remote = True
     _supports_multiprocessing = True
@@ -34,18 +44,89 @@ class SSHEndpoint(Endpoint):
 
         self.hostname = hostname
         logger.debug("SSHEndpoint initialized with hostname: %s", self.hostname)
-        self.config["username"] = self.config.get("username")
+        
+        # Set default values for config parameters
         self.config["port"] = self.config.get("port")
         self.config["ssh_opts"] = self.config.get("ssh_opts", [])
         self.config["path"] = self.config.get("path", "/")
         self.config["ssh_sudo"] = self.config.get("ssh_sudo", False)
         self.config["passwordless"] = self.config.get("passwordless", False)
-        self.config["ssh_identity_file"] = self.config.get("ssh_identity_file")
         
-        # Log the final path configuration
+        # Username handling with clear precedence:
+        # 1. Explicitly provided username (from command line via --ssh-username)
+        # 2. Username from the URL (ssh://user@host/path)
+        # 3. SUDO_USER environment variable if running as root with sudo
+        # 4. Current user as fallback
+        if not self.config.get("username"):
+            # No username provided in config, check sudo environment
+            if os.geteuid() == 0 and os.environ.get("SUDO_USER"):
+                self.config["username"] = os.environ.get("SUDO_USER")
+                logger.debug("Using sudo original user as username: %s", self.config["username"])
+            else:
+                # Default to current user if nothing else specified
+                import getpass
+                self.config["username"] = getpass.getuser()
+                logger.debug("Using current user as username: %s", self.config["username"])
+        else:
+            # Username explicitly provided in config
+            logger.debug("Using explicitly configured username: %s", self.config["username"])
+        
+        # Handle SSH identity file path, especially when running under sudo
+        identity_file = self.config.get("ssh_identity_file")
+        if identity_file:
+            # Check if running as root via sudo
+            running_as_sudo = os.geteuid() == 0 and os.environ.get("SUDO_USER")
+            if running_as_sudo:
+                sudo_user = os.environ.get("SUDO_USER")
+                try:
+                    # Get the sudo user's home directory
+                    sudo_user_home = pwd.getpwnam(sudo_user).pw_dir
+                    
+                    # Expand ~ to sudo user's home directory
+                    if identity_file.startswith("~"):
+                        identity_file = identity_file.replace("~", sudo_user_home, 1)
+                        logger.debug("Expanded ~ in identity file path: %s", identity_file)
+                    
+                    # If path is relative, make it absolute using sudo user's home
+                    if not os.path.isabs(identity_file):
+                        identity_file = os.path.join(sudo_user_home, identity_file)
+                        logger.debug("Converted relative path to absolute: %s", identity_file)
+                    
+                    # Store the expanded path
+                    self.config["ssh_identity_file"] = identity_file
+                    logger.debug("Final identity file path: %s", identity_file)
+                    
+                    # Verify the file exists and is readable
+                    id_file = Path(identity_file).absolute()
+                    if not id_file.exists():
+                        logger.warning("SSH identity file does not exist: %s", id_file)
+                        logger.warning("When running with sudo, ensure the identity file path is absolute and accessible")
+                    elif not os.access(str(id_file), os.R_OK):
+                        logger.warning("SSH identity file is not readable: %s", id_file)
+                        logger.warning("Check file permissions: chmod 600 %s", id_file)
+                    else:
+                        logger.info("Using SSH identity file: %s (verified)", id_file)
+                except Exception as e:
+                    logger.warning("Error processing identity file path: %s", e)
+                    # Keep the original path as a fallback
+                    self.config["ssh_identity_file"] = identity_file
+            else:
+                # Not running as sudo, just log the path
+                logger.debug("Using SSH identity file: %s", identity_file)
+        
+        # Log the final configuration
         logger.debug("SSH path: %s", self.config["path"])
-        if self.config.get("ssh_identity_file"):
-            logger.debug("Using SSH identity file: %s", self.config["ssh_identity_file"])
+        logger.debug("SSH username: %s", self.config["username"])
+        logger.debug("SSH hostname: %s", self.hostname)
+        logger.debug("SSH port: %s", self.config["port"])
+        logger.debug("SSH sudo: %s", self.config["ssh_sudo"])
+        
+        # Add SSH agent forwarding if available when running as sudo
+        if os.geteuid() == 0 and os.environ.get("SUDO_USER") and "SSH_AUTH_SOCK" in os.environ:
+            logger.debug("Adding SSH agent forwarding for sudo user")
+            ssh_opts = self.config.get("ssh_opts", []).copy()
+            ssh_opts.append(f"IdentityAgent={os.environ['SSH_AUTH_SOCK']}")
+            self.config["ssh_opts"] = ssh_opts
 
         self.ssh_manager = SSHMasterManager(
             hostname=self.hostname,
@@ -61,11 +142,14 @@ class SSHEndpoint(Endpoint):
         self._instance_id = f"{os.getpid()}_{uuid.uuid4().hex[:8]}"
 
     def __repr__(self) -> str:
-        return f"(SSH) {self.hostname}:{self.config['path']}"
+        username = self.config.get('username', '')
+        return f"(SSH) {username}@{self.hostname}:{self.config['path']}"
 
     def get_id(self) -> str:
         """Return a unique identifier for this SSH endpoint."""
-        return f"ssh://{self.hostname}:{self.config['path']}"
+        username = self.config.get('username', '')
+        username_part = f"{username}@" if username else ""
+        return f"ssh://{username_part}{self.hostname}:{self.config['path']}"
 
     def _build_remote_command(self, command: List[str]) -> List[str]:
         """Prepare a remote command with optional sudo."""
@@ -163,6 +247,25 @@ class SSHEndpoint(Endpoint):
         # not convert them to Path objects or resolve them locally
         if isinstance(path, Path):
             return str(path)
+            
+        # If it's a string with a tilde, we need special handling
+        if isinstance(path, str) and "~" in path:
+            # Check if running as root via sudo
+            if os.geteuid() == 0 and os.environ.get("SUDO_USER"):
+                sudo_user = os.environ.get("SUDO_USER")
+                try:
+                    # Get the sudo user's home directory
+                    sudo_user_home = pwd.getpwnam(sudo_user).pw_dir
+                    # Replace ~ with sudo user's home
+                    if path.startswith("~"):
+                        path = path.replace("~", sudo_user_home, 1)
+                        logger.debug("Expanded ~ in path to sudo user's home: %s", path)
+                except Exception as e:
+                    logger.debug("Error expanding ~ in path: %s", e)
+            else:
+                # Normal user, let Path handle it
+                path = os.path.expanduser(path)
+                
         return str(path) if path is not None else None
         
     def _verify_btrfs_availability(self, use_sudo=False):
@@ -363,23 +466,90 @@ class SSHEndpoint(Endpoint):
         path = self._normalize_path(self.config["path"])
         logger.debug("Preparing remote directory: %s", path)
         
+        # Log detailed SSH connection settings for debugging
+        logger.debug("SSH connection settings:")
+        logger.debug("  Hostname: %s", self.hostname)
+        logger.debug("  Username: %s", self.config.get("username"))
+        logger.debug("  Port: %s", self.config.get("port"))
+        logger.debug("  SSH options: %s", self.config.get("ssh_opts", []))
+        logger.debug("  Identity file: %s", self.config.get("ssh_identity_file"))
+        
+        # Check if running as root via sudo
+        if os.geteuid() == 0 and os.environ.get("SUDO_USER"):
+            sudo_user = os.environ.get("SUDO_USER")
+            logger.debug("Running as root via sudo from user: %s", sudo_user)
+            logger.debug("Effective UID: %s", os.geteuid())
+            logger.debug("Real UID: %s", os.getuid())
+            
+            # Check SSH agent forwarding
+            if "SSH_AUTH_SOCK" in os.environ:
+                logger.debug("SSH_AUTH_SOCK is set: %s", os.environ.get("SSH_AUTH_SOCK"))
+            else:
+                logger.warning("SSH_AUTH_SOCK is not set, agent forwarding won't work")
+                logger.warning("Consider: sudo SSH_AUTH_SOCK=$SSH_AUTH_SOCK btrfs-backup-ng ...")
+        
         if not self.ssh_manager.start_master(timeout=30.0, retries=3):
             logger.error("Failed to establish SSH connection to %s", self.hostname)
-            raise RuntimeError(f"Cannot establish SSH connection to {self.hostname}")
+            
+            # Provide detailed error information
+            error_msg = f"Cannot establish SSH connection to {self.hostname}"
+            
+            # Check for common issues
+            identity_file = self.config.get("ssh_identity_file")
+            if identity_file:
+                id_path = Path(identity_file)
+                if not id_path.exists():
+                    error_msg += f"\n- Identity file does not exist: {id_path}"
+                elif not os.access(str(id_path), os.R_OK):
+                    error_msg += f"\n- Identity file is not readable: {id_path}"
+                else:
+                    error_msg += f"\n- Using identity file: {id_path}"
+            else:
+                error_msg += "\n- No identity file specified"
+            
+            if os.geteuid() == 0 and os.environ.get("SUDO_USER"):
+                sudo_user = os.environ.get("SUDO_USER")
+                error_msg += f"\n- Running as root via sudo from user {sudo_user}"
+                if not "SSH_AUTH_SOCK" in os.environ:
+                    error_msg += "\n- SSH_AUTH_SOCK is not set, agent forwarding won't work"
+                    error_msg += f"\n  Try: sudo SSH_AUTH_SOCK=$SSH_AUTH_SOCK btrfs-backup-ng ..."
+            
+            raise RuntimeError(error_msg)
         
         # If we're using sudo, verify sudo works
         if self.config.get("ssh_sudo", False):
             logger.debug("Testing sudo access on remote host")
             try:
                 test_cmd = ["sudo", "-n", "echo", "sudo test successful"]
+                logger.debug("Testing sudo access with command: %s", test_cmd)
                 result = self._exec_remote_command(test_cmd, check=False)
                 if result.returncode != 0:
-                    logger.warning("Remote sudo test failed. The remote user may not have passwordless sudo permissions.")
+                    stderr = result.stderr.decode("utf-8", errors="replace") if hasattr(result, "stderr") and result.stderr else ""
+                    logger.warning("Remote sudo test failed. Error: %s", stderr)
+                    logger.warning("The remote user may not have passwordless sudo permissions.")
                     logger.warning("You may need to configure /etc/sudoers on the remote system to allow passwordless sudo for btrfs commands.")
-                    logger.warning("Add this line to /etc/sudoers: username ALL=(ALL) NOPASSWD: /usr/bin/btrfs")
+                    logger.warning("Add this line to /etc/sudoers: %s ALL=(ALL) NOPASSWD: /usr/bin/btrfs", 
+                                  self.config.get("username", "username"))
+                    
+                    # Check for common sudo issues
+                    if "tty" in stderr.lower() or "terminal" in stderr.lower():
+                        logger.warning("Sudo is requiring a terminal. You may need to add 'Defaults:%s !requiretty' to sudoers", 
+                                      self.config.get("username", "username"))
+                    
                     # Don't fail here as sudo might still work interactively or for specific commands
                 else:
                     logger.debug("Remote sudo test successful")
+                    
+                # Also test btrfs with sudo specifically
+                btrfs_test_cmd = ["sudo", "-n", "btrfs", "--version"]
+                logger.debug("Testing btrfs with sudo: %s", btrfs_test_cmd)
+                btrfs_result = self._exec_remote_command(btrfs_test_cmd, check=False)
+                if btrfs_result.returncode == 0:
+                    btrfs_version = btrfs_result.stdout.decode("utf-8", errors="replace") if hasattr(btrfs_result, "stdout") and btrfs_result.stdout else ""
+                    logger.debug("Sudo access for btrfs commands verified: %s", btrfs_version.strip())
+                else:
+                    btrfs_stderr = btrfs_result.stderr.decode("utf-8", errors="replace") if hasattr(btrfs_result, "stderr") and btrfs_result.stderr else ""
+                    logger.warning("Sudo access for btrfs failed: %s", btrfs_stderr)
             except Exception as e:
                 logger.warning("Error testing sudo: %s", e)
             
@@ -388,7 +558,9 @@ class SSHEndpoint(Endpoint):
             # First check if the path exists
             logger.debug("Checking if remote path exists: %s", path)
             check_cmd = ["test", "-d", path]
+            logger.debug("Executing remote command: %s", check_cmd)
             result = self._exec_remote_command(check_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+            logger.debug("Remote path check returned: %d", result.returncode)
             
             if result.returncode != 0:
                 logger.debug("Remote directory %s does not exist, creating it", path)
