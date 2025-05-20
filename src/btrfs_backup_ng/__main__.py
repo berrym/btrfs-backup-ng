@@ -36,12 +36,13 @@ import logging
 import logging.handlers
 import multiprocessing
 import os
+import pwd
 import subprocess
 import sys
 import threading
 import time
 import traceback
-from pathlib import Path
+from pathlib import Path  # Required for path handling
 
 from rich.align import Align
 from rich.layout import Layout
@@ -57,6 +58,53 @@ from .__logger__ import RichLogger, cons, create_logger, logger
 def send_snapshot(snapshot, destination_endpoint, parent=None, clones=None) -> None:
     """Sends snapshot to destination endpoint, using given parent and clones."""
     logger.info("Sending %s ...", snapshot)
+    logger.debug("Source endpoint type: %s", type(snapshot.endpoint).__name__)
+    logger.debug("Destination endpoint type: %s", type(destination_endpoint).__name__)
+    logger.debug("Source snapshot path: %s", snapshot.get_path())
+    logger.debug("Destination path: %s", destination_endpoint.config["path"])
+
+    # Verify destination path is accessible
+    logger.debug("Verifying destination path is accessible...")
+    try:
+        # For SSH endpoints, ensure directory exists before transfer
+        if (
+            hasattr(destination_endpoint, "_is_remote")
+            and destination_endpoint._is_remote
+        ):
+            if hasattr(destination_endpoint, "_exec_remote_command"):
+                path = destination_endpoint._normalize_path(
+                    destination_endpoint.config["path"]
+                )
+                logger.debug("Ensuring remote destination path exists: %s", path)
+                try:
+                    cmd = ["test", "-d", path]
+                    result = destination_endpoint._exec_remote_command(cmd, check=False)
+                    if result.returncode != 0:
+                        # Path doesn't exist, create it
+                        logger.warning(
+                            "Destination path doesn't exist, creating it: %s", path
+                        )
+                        mkdir_cmd = ["mkdir", "-p", path]
+                        mkdir_result = destination_endpoint._exec_remote_command(
+                            mkdir_cmd, check=False
+                        )
+                        if mkdir_result.returncode != 0:
+                            stderr = mkdir_result.stderr.decode(
+                                "utf-8", errors="replace"
+                            )
+                            logger.error(
+                                "Failed to create destination directory: %s", stderr
+                            )
+                            raise __util__.SnapshotTransferError(
+                                f"Cannot create destination directory: {stderr}"
+                            )
+                except Exception as e:
+                    logger.error("Error verifying/creating destination: %s", e)
+    except Exception as e:
+        logger.warning(
+            "Error during destination verification (will try transfer anyway): %s", e
+        )
+
     log_msg = (
         f"  Using parent: {parent}"
         if parent
@@ -68,27 +116,97 @@ def send_snapshot(snapshot, destination_endpoint, parent=None, clones=None) -> N
     send_process = None
     receive_process = None
     try:
+        logger.debug("Starting send process from %s", snapshot.endpoint)
         send_process = snapshot.endpoint.send(snapshot, parent=parent, clones=clones)
-        receive_process = destination_endpoint.receive(send_process.stdout)
+        if send_process is None:
+            logger.error("Failed to start send process - send_process is None")
+            raise __util__.SnapshotTransferError("Send process failed to start")
 
+        logger.debug("Starting receive process on %s", destination_endpoint)
+        # Check if using SSH destination without sudo
+        is_ssh_endpoint = (
+            hasattr(destination_endpoint, "_is_remote")
+            and destination_endpoint._is_remote
+        )
+        is_using_sudo = is_ssh_endpoint and destination_endpoint.config.get(
+            "ssh_sudo", False
+        )
+
+        if is_ssh_endpoint and not is_using_sudo:
+            logger.warning(
+                "Using SSH destination without --ssh-sudo. This may fail if the remote user doesn't have permissions for btrfs commands."
+            )
+
+        receive_process = destination_endpoint.receive(send_process.stdout)
+        if receive_process is None:
+            logger.error("Failed to start receive process - receive_process is None")
+            if is_ssh_endpoint and not is_using_sudo:
+                logger.error(
+                    "For SSH destinations, try using --ssh-sudo if the remote user needs elevated permissions"
+                )
+            raise __util__.SnapshotTransferError("Receive process failed to start")
+
+        logger.debug("Waiting for processes to complete...")
         return_codes = [p.wait() for p in [send_process, receive_process]]
+        logger.debug(
+            "Process return codes: send=%d, receive=%d",
+            return_codes[0],
+            return_codes[1],
+        )
 
         if any(rc != 0 for rc in return_codes):
-            error_message = "btrfs send/receive failed"
+            error_message = (
+                f"btrfs send/receive failed with return codes: {return_codes}"
+            )
             logger.error(error_message)
+            # Try to get stderr from processes
+            if hasattr(send_process, "stderr") and send_process.stderr:
+                send_err = send_process.stderr.read().decode("utf-8", errors="replace")
+                logger.error("Send process stderr: %s", send_err)
+            if hasattr(receive_process, "stderr") and receive_process.stderr:
+                recv_err = receive_process.stderr.read().decode(
+                    "utf-8", errors="replace"
+                )
+                logger.error("Receive process stderr: %s", recv_err)
             raise __util__.SnapshotTransferError(error_message)
+
+        logger.info("Transfer completed successfully")
 
     except (OSError, subprocess.CalledProcessError) as e:
         logger.error("Error during snapshot transfer: %r", e)
+        if hasattr(e, "stderr") and e.stderr:
+            stderr = e.stderr.decode("utf-8", errors="replace")
+            logger.error("Process stderr: %s", stderr)
+            # Check for common SSH/sudo permission issues
+            if (
+                "permission denied" in stderr.lower() or "sudo" in stderr.lower()
+            ) and hasattr(destination_endpoint, "_is_remote"):
+                logger.error(
+                    "This appears to be a permission issue with the remote btrfs command"
+                )
+                logger.error(
+                    "For SSH destinations, use --ssh-sudo and ensure the remote user has passwordless sudo rights"
+                )
+                logger.error(
+                    "Add this to remote /etc/sudoers: username ALL=(ALL) NOPASSWD: /usr/bin/btrfs"
+                )
+        if hasattr(e, "stdout") and e.stdout:
+            logger.error(
+                "Process stdout: %s", e.stdout.decode("utf-8", errors="replace")
+            )
         raise __util__.SnapshotTransferError(f"Exception during transfer: {e}") from e
     finally:
         for pipe in [send_process, receive_process]:
             if pipe:
                 try:
-                    pipe.stdout.close()
-                    pipe.stdin.close()
-                except (AttributeError, IOError):
-                    pass
+                    if hasattr(pipe, "stdout") and pipe.stdout:
+                        pipe.stdout.close()
+                    if hasattr(pipe, "stdin") and pipe.stdin:
+                        pipe.stdin.close()
+                    if hasattr(pipe, "stderr") and pipe.stderr:
+                        pipe.stderr.close()
+                except (AttributeError, IOError) as e:
+                    logger.warning("Error closing pipe: %s", e)
 
 
 def delete_corrupt_snapshots(
@@ -194,11 +312,41 @@ def do_sync_transfer(transfer_objs, **kwargs):
     no_incremental = transfer_objs["no_incremental"]
 
     logger.debug("to_transfer: %r", to_transfer)
+    logger.debug(
+        "Destination endpoint: %s (type: %s)",
+        destination_endpoint,
+        type(destination_endpoint).__name__,
+    )
+    logger.debug(
+        "Source endpoint: %s (type: %s)",
+        source_endpoint,
+        type(source_endpoint).__name__,
+    )
+
+    # Before starting transfers, verify the destination path again
+    try:
+        destination_path = destination_endpoint.config.get("path")
+        logger.debug("Verifying destination path before transfer: %s", destination_path)
+
+        # For remote endpoints, ensure path is accessible
+        if (
+            hasattr(destination_endpoint, "_is_remote")
+            and destination_endpoint._is_remote
+        ):
+            logger.debug("Destination is remote, ensuring directory exists")
+            # This will be handled in each send_snapshot call
+    except Exception as e:
+        logger.warning(
+            "Pre-transfer destination check failed (continuing anyway): %s", e
+        )
 
     while to_transfer:
         if no_incremental:
             best_snapshot = to_transfer[-1]
             parent = None
+            logger.debug(
+                "Using non-incremental transfer for snapshot: %s", best_snapshot
+            )
         else:
             present_snapshots = [
                 snapshot
@@ -206,6 +354,10 @@ def do_sync_transfer(transfer_objs, **kwargs):
                 if snapshot in destination_snapshots
                 and snapshot.get_id() not in snapshot.locks
             ]
+            logger.debug(
+                "Found %d present snapshots for incremental transfer",
+                len(present_snapshots),
+            )
 
             def key(s):
                 p = s.find_parent(present_snapshots)
@@ -216,33 +368,73 @@ def do_sync_transfer(transfer_objs, **kwargs):
 
             best_snapshot = min(to_transfer, key=key)
             parent = best_snapshot.find_parent(present_snapshots)
+            logger.debug("Selected snapshot %s with parent %s", best_snapshot, parent)
 
+        # Set locks to prevent snapshots from being deleted during transfer
+        logger.debug(
+            "Setting lock on %s for destination %s", best_snapshot, destination_id
+        )
         source_endpoint.set_lock(best_snapshot, destination_id, True)
         if parent:
+            logger.debug(
+                "Setting parent lock on %s for destination %s", parent, destination_id
+            )
             source_endpoint.set_lock(parent, destination_id, True, parent=True)
+
+        # Attempt the transfer
         try:
+            logger.info(
+                "Starting transfer of snapshot %s to %s",
+                best_snapshot,
+                destination_endpoint,
+            )
             send_snapshot(
                 best_snapshot,
                 transfer_objs["destination_endpoint"],
                 parent=parent,
                 **kwargs,
             )
+            logger.info("Transfer of %s completed successfully", best_snapshot)
+
+            # Release locks and update destination
+            source_endpoint.set_lock(best_snapshot, destination_id, False)
+            if parent:
+                source_endpoint.set_lock(parent, destination_id, False, parent=True)
+
+            # Update destination snapshot list
+            logger.debug("Adding snapshot %s to destination", best_snapshot)
+            destination_endpoint.add_snapshot(best_snapshot)
+            # Refresh snapshot list
+            destination_endpoint.list_snapshots()
+
         except __util__.SnapshotTransferError as e:
-            logger.error(
-                "Snapshot transfer failed for %s: %s", best_snapshot, e
-            )  # Log the error details
+            logger.error("Snapshot transfer failed for %s: %s", best_snapshot, e)
             logger.info(
                 "Keeping %s locked to prevent it from getting removed.",
                 best_snapshot,
             )
-        else:
-            source_endpoint.set_lock(best_snapshot, destination_id, False)
-            if parent:
-                source_endpoint.set_lock(parent, destination_id, False, parent=True)
-            destination_endpoint.add_snapshot(best_snapshot)
-            destination_endpoint.list_snapshots()
+            # Try to get more diagnostic info about the destination
+            try:
+                if hasattr(destination_endpoint, "_exec_remote_command"):
+                    path = destination_endpoint.config.get("path")
+                    logger.debug(
+                        "Checking destination path after failed transfer: %s", path
+                    )
+                    ls_cmd = ["ls", "-la", path]
+                    result = destination_endpoint._exec_remote_command(
+                        ls_cmd, check=False
+                    )
+                    if result.returncode == 0 and hasattr(result, "stdout"):
+                        logger.debug(
+                            "Destination directory contents: %s",
+                            result.stdout.decode("utf-8", errors="replace"),
+                        )
+            except Exception as e_diagnostic:
+                logger.debug("Diagnostic check failed: %s", e_diagnostic)
 
+        # Move to next snapshot
         to_transfer.remove(best_snapshot)
+        logger.debug("%d snapshots left to transfer", len(to_transfer))
 
     logger.info(__util__.log_heading(f"Transfers to {destination_endpoint} complete!"))
 
@@ -359,7 +551,12 @@ files is allowed as well."""
     group.add_argument(
         "--ssh-sudo",
         action="store_true",
-        help="Execute commands with sudo on the remote host.",
+        help="Execute commands with sudo on the remote host. REQUIRED for btrfs operations if the remote user doesn't have direct permissions to run btrfs commands. Remote user must have passwordless sudo access configured for btrfs commands.",
+    )
+    group.add_argument(
+        "--ssh-identity-file",
+        help="Explicitly specify the SSH identity (private key) file to use. "
+        "Useful when running btrfs-backup-ng with sudo where your regular user's SSH keys aren't accessible.",
     )
 
     group = parser.add_argument_group("Miscellaneous options")
@@ -454,6 +651,48 @@ files is allowed as well."""
     except Exception:
         options["num_backups"] = 0
 
+    # Process SSH identity file if provided
+    if "ssh_identity_file" in options and options["ssh_identity_file"]:
+        identity_file = options["ssh_identity_file"]
+        
+        # Special handling when running as root via sudo
+        running_as_sudo = os.geteuid() == 0 and os.environ.get("SUDO_USER")
+        if running_as_sudo:
+            sudo_user = os.environ.get("SUDO_USER")
+            sudo_user_home = pwd.getpwnam(sudo_user).pw_dir
+            logger.debug("Running as sudo from user: %s (home: %s)", sudo_user, sudo_user_home)
+            
+            # Handle ~ expansion for sudo
+            if identity_file.startswith("~"):
+                # Replace ~ with the sudo user's home
+                identity_file = identity_file.replace("~", sudo_user_home, 1)
+                logger.debug("Expanded identity file path for sudo user: %s", identity_file)
+            
+            # For relative paths that don't start with ~, still ensure they're under the user's home
+            elif not os.path.isabs(identity_file):
+                identity_file = os.path.join(sudo_user_home, identity_file)
+                logger.debug("Converted relative path to absolute: %s", identity_file)
+        else:
+            # Normal expansion for regular user
+            identity_file = os.path.expanduser(identity_file)
+            
+        # Convert to absolute path and store
+        identity_path = Path(identity_file).absolute()
+        options["ssh_identity_file"] = str(identity_path)
+        
+        # Validate the identity file
+        if not identity_path.exists():
+            logger.warning("SSH identity file does not exist: %s", identity_path)
+            if running_as_sudo:
+                logger.warning("When running with sudo, ensure the path is correct and accessible to root")
+                logger.warning("Try using absolute path: /home/%s/.ssh/your_key", sudo_user)
+        elif not os.access(identity_path, os.R_OK):
+            logger.warning("SSH identity file is not readable: %s", identity_path)
+            if running_as_sudo:
+                logger.warning("Check file permissions: chmod 644 %s", identity_path)
+        else:
+            logger.info("Using SSH identity file: %s", identity_path)
+
     return options
 
 
@@ -468,7 +707,7 @@ def run_task(options, queue=None):
         except Exception as e:
             print(f"Error setting up logger in process {os.getpid()}: {e}")
             traceback.print_exc()
-    
+
     apply_shortcuts(options)
     log_initial_settings(options)
 
@@ -495,6 +734,20 @@ def run_task(options, queue=None):
                 destination_endpoint,
             )
             logger.debug("Exception was: %s", e)
+            if (
+                hasattr(destination_endpoint, "_is_remote")
+                and destination_endpoint._is_remote
+            ):
+                if not options.get("ssh_sudo", False):
+                    logger.error(
+                        "For SSH destinations, try using --ssh-sudo if you're encountering permission issues"
+                    )
+                    logger.error(
+                        "Remote user needs passwordless sudo rights for btrfs commands"
+                    )
+                    logger.error(
+                        "Add this to remote /etc/sudoers: username ALL=(ALL) NOPASSWD: /usr/bin/btrfs"
+                    )
 
     # Enforce retention for source and destination endpoints only once, at the end
     cleanup_snapshots(source_endpoint, destination_endpoints, options)
@@ -551,6 +804,15 @@ def log_initial_settings(options):
     logger.debug("Don't send incrementally: %r", options["no_incremental"])
     logger.debug("Extra SSH config options: %s", options["ssh_opt"])
     logger.debug("Use sudo at SSH remote host: %r", options["ssh_sudo"])
+    if options["ssh_sudo"]:
+        logger.info(
+            "Using sudo for btrfs commands on remote hosts - ensure passwordless sudo is configured"
+        )
+    elif any(dest.startswith("ssh://") for dest in options.get("destinations", [])):
+        logger.warning(
+            "Using SSH destination without --ssh-sudo. This may fail if the remote user doesn't have permissions."
+        )
+        logger.warning("Consider adding --ssh-sudo if you encounter permission errors")
     logger.debug("Run 'btrfs subvolume sync' afterwards: %r", options["sync"])
     logger.debug(
         "Convert subvolumes to read-write before deletion: %r", options["convert_rw"]
@@ -630,26 +892,86 @@ def prepare_destination_endpoints(options, source_endpoint):
     endpoint_kwargs = build_endpoint_kwargs(options)
     # Ensure 'path' is NOT in endpoint_kwargs
     endpoint_kwargs.pop("path", None)
+
+    logger.info("Preparing destination endpoints...")
     for destination in options["destinations"]:
-        logger.debug("Destination: %s", destination)
+        logger.info("Setting up destination: %s", destination)
         try:
-            destination_endpoint = endpoint.choose_endpoint(
-                destination,
-                endpoint_kwargs,
-                source=False,
-            )
+            # Create the destination endpoint
+            logger.debug("Creating destination endpoint object for: %s", destination)
+            try:
+                destination_endpoint = endpoint.choose_endpoint(
+                    destination,
+                    endpoint_kwargs,
+                    source=False,
+                )
+
+                # Log endpoint details for debugging
+                logger.debug("Created destination endpoint: %s", destination_endpoint)
+                logger.debug("Endpoint type: %s", type(destination_endpoint).__name__)
+                logger.debug(
+                    "Endpoint path: %s", destination_endpoint.config.get("path")
+                )
+            except NameError as e:
+                logger.error("NameError in choose_endpoint: %s", e)
+                logger.error("Missing import? %s", str(e))
+                raise __util__.AbortError(f"NameError in endpoint setup: {str(e)}")
+
+            # Prepare the endpoint (creates directories, etc.)
+            logger.debug("Preparing endpoint...")
+            try:
+                destination_endpoint.prepare()
+                logger.debug("Endpoint preparation successful")
+            except Exception as e:
+                logger.error("Failed to prepare destination endpoint: %s", e)
+                logger.error(
+                    "Destination endpoint preparation error details: %s",
+                    traceback.format_exc(),
+                )
+                raise __util__.AbortError(f"Failed to prepare destination: {str(e)}")
+
+            destination_endpoints.append(destination_endpoint)
+            logger.info("Destination endpoint ready: %s", destination_endpoint)
+
         except ValueError as e:
             logger.error("Couldn't parse destination specification: %s", e)
             raise __util__.AbortError
-        destination_endpoints.append(destination_endpoint)
-        logger.debug("Destination endpoint: %s", destination_endpoint)
-        destination_endpoint.prepare()
+        except NameError as e:
+            logger.error("Import error setting up destination %s: %s", destination, e)
+            logger.error("This is likely a missing import in one of the modules")
+            logger.error("Error details: %s", traceback.format_exc())
+            raise __util__.AbortError(
+                f"Import error for destination {destination}: {str(e)}"
+            )
+        except Exception as e:
+            logger.error(
+                "Unexpected error setting up destination %s: %s", destination, e
+            )
+            logger.error("Error details: %s", traceback.format_exc())
+            if "permission denied" in str(e).lower() and "ssh://" in destination:
+                logger.error(
+                    "For SSH destinations with permission issues, use --ssh-sudo to run commands as root on the remote host"
+                )
+                logger.error(
+                    "Ensure the remote user has passwordless sudo rights for btrfs commands"
+                )
+                if os.geteuid() == 0 and os.environ.get("SUDO_USER"):
+                    logger.error(
+                        "You are running with sudo, which may be causing SSH key access issues."
+                    )
+                    logger.error(
+                        "Try using --ssh-identity-file to specify your SSH key explicitly"
+                    )
+            raise __util__.AbortError(
+                f"Failed to set up destination {destination}: {str(e)}"
+            )
+
     return destination_endpoints
 
 
 def build_endpoint_kwargs(options):
     """Build common kwargs for endpoints."""
-    return {
+    kwargs = {
         "snap_prefix": options.get("snapshot_prefix", f"{os.uname()[1]}-"),
         "convert_rw": options["convert_rw"],
         "subvolume_sync": options["sync"],
@@ -659,6 +981,36 @@ def build_endpoint_kwargs(options):
         "ssh_sudo": options["ssh_sudo"],
         # DO NOT include 'path' here!
     }
+
+    # Include SSH identity file if specified
+    if "ssh_identity_file" in options and options["ssh_identity_file"]:
+        identity_file = options["ssh_identity_file"]
+        kwargs["ssh_identity_file"] = identity_file
+        logger.info("SSH identity file configured: %s", identity_file)
+        
+        # When running as sudo, add special options to help with auth
+        if os.geteuid() == 0 and os.environ.get("SUDO_USER"):
+            # Preserve SSH agent forwarding if available
+            ssh_auth_sock = os.environ.get("SSH_AUTH_SOCK")
+            if ssh_auth_sock:
+                logger.debug("SSH agent socket found: %s", ssh_auth_sock)
+                kwargs.setdefault("ssh_opts", []).append(f"IdentityAgent={ssh_auth_sock}")
+            
+            # Add debug flag for more verbose SSH output
+            if options.get("debug", False):
+                kwargs.setdefault("ssh_opts", []).append("LogLevel=DEBUG")
+
+    logger.debug("Built endpoint kwargs: %s", kwargs)
+    # Log SSH-specific options for better debugging
+    if options["ssh_opt"]:
+        logger.debug("SSH options: %s", options["ssh_opt"])
+    if options["ssh_sudo"]:
+        logger.debug("SSH sudo enabled: %s", options["ssh_sudo"])
+        logger.info(
+            "Using sudo for remote commands - ensure remote user has passwordless sudo rights for btrfs commands"
+        )
+
+    return kwargs
 
 
 def add_locked_destinations(source_endpoint, options):
@@ -740,6 +1092,31 @@ def serve_logger_thread(queue) -> None:
 
 def main() -> None:
     """Main function."""
+    # Check if we're running with sudo and provide guidance
+    if os.geteuid() == 0 and os.environ.get("SUDO_USER"):
+        sudo_user = os.environ.get("SUDO_USER")
+        print(f"Running as root (via sudo from user {sudo_user}).")
+        print(
+            "NOTE: When running with sudo, your regular SSH keys may not be accessible."
+        )
+        print("If connecting to SSH destinations fails, try one of these approaches:")
+        print("  1. Use --ssh-identity-file to specify your SSH private key explicitly")
+        print("  2. Run without sudo and configure appropriate permissions")
+        print("  3. Use ssh-agent forwarding with sudo")
+        print("")
+
+    # Check for SSH destinations in argv and add a recommendation
+    if any("ssh://" in arg for arg in sys.argv):
+        print("NOTE: SSH destination detected. For btrfs operations on remote systems:")
+        print(
+            "  - Use --ssh-sudo if the remote user doesn't have direct btrfs permissions"
+        )
+        print(
+            "  - Ensure the remote user has passwordless sudo rights for btrfs commands"
+        )
+        print("  - Example sudoers entry: username ALL=(ALL) NOPASSWD: /usr/bin/btrfs")
+        print("")
+
     global_parser = argparse.ArgumentParser(add_help=False)
     group = global_parser.add_argument_group("Global Display settings")
     group.add_argument(
@@ -825,7 +1202,7 @@ def do_logging(tasks, task_options, queue) -> None:
             for n in range(len(tasks)):
                 logger.debug(f"Submitting task {n+1}/{len(tasks)}")
                 futures.append(executor.submit(run_task, task_options[n], queue))
-            
+
             # Wait for all futures to complete
             logger.info(f"Waiting for {len(futures)} tasks to complete")
             concurrent.futures.wait(futures)

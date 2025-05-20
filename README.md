@@ -440,6 +440,15 @@ snapshot can be done entirely with btrfs tools:
 The snapshots from btrfs-backup-ng may be placed in `/.snapshots` by using
 the `--snapshot-folder` option.
 
+## Recent Updates
+
+### Bug Fixes (July 2023)
+
+- Fixed syntax error in the SSH endpoint implementation that was causing "unexpected indent" errors
+- Improved error handling in SSH operations with proper try/except blocks
+- Enhanced cleanup of resources in SSH operations to prevent potential leaks
+- Better error reporting for remote operations
+
 ## Issues and Contribution
 
 As in every piece of software, there likely are bugs. When you find one,

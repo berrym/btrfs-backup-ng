@@ -53,7 +53,7 @@ def create_logger(live_layout) -> None:
     """Helper function to setup logging depending on visual display options."""
     # pylint: disable=global-statement
     global cons, rich_handler, logger
-    
+
     # Create new handlers
     if live_layout:
         cons = Console(file=RichLogger(), width=150)
@@ -61,11 +61,11 @@ def create_logger(live_layout) -> None:
     else:
         cons = Console()
         rich_handler = RichHandler(console=cons, show_path=False)
-    
+
     logger.handlers.clear()
     logger.propagate = False
     logger.addHandler(rich_handler)
-    
+
     logging.basicConfig(
         format="(%(processName)s) %(message)s",
         datefmt="%H:%M:%S",
@@ -73,4 +73,3 @@ def create_logger(live_layout) -> None:
         handlers=[rich_handler],
         force=True,
     )
-

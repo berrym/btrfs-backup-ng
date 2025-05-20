@@ -66,12 +66,26 @@ class Endpoint:
     def _normalize_path(self, val):
         if val is None:
             return None
-        path = Path(val).expanduser()
-        # Only resolve paths that are local (not for remote endpoints)
-        # This preserves remote paths without trying to resolve them locally
-        if hasattr(self, "_is_remote") and getattr(self, "_is_remote", False):
-            return path
-        return path.resolve() if not path.is_absolute() else path
+
+        # Handle string paths
+        if isinstance(val, str):
+            # Just expanduser for remote paths to avoid resolving them locally
+            if hasattr(self, "_is_remote") and getattr(self, "_is_remote", False):
+                return str(Path(val).expanduser())
+            # For local paths, fully resolve
+            path = Path(val).expanduser()
+            return path.resolve() if not path.is_absolute() else path
+
+        # If it's already a Path object
+        if isinstance(val, Path):
+            # For remote paths, convert to string to avoid resolution issues
+            if hasattr(self, "_is_remote") and getattr(self, "_is_remote", False):
+                return str(val)
+            # For local paths, ensure it's fully resolved
+            return val.resolve() if not val.is_absolute() else val
+
+        # For other types, just convert to string
+        return str(val)
 
     def prepare(self):
         """Public access to _prepare, which is called after creating an endpoint."""
@@ -89,7 +103,11 @@ class Endpoint:
         snapshot_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
         snapshot = __util__.Snapshot(snapshot_dir, snap_prefix, self)
         snapshot_path = snapshot.get_path()
-        logger.info("Creating snapshot from source: %s to destination: %s", self.config["source"], snapshot_path)
+        logger.info(
+            "Creating snapshot from source: %s to destination: %s",
+            self.config["source"],
+            snapshot_path,
+        )
         logger.debug("Snapshot directory: %s", snapshot_dir)
         logger.debug("Snapshot prefix: %s", snap_prefix)
 
@@ -124,10 +142,23 @@ class Endpoint:
         """Call 'btrfs receive', setting the given pipe as its stdin."""
         # Make sure we use the raw path without local resolution
         path = self.config["path"]
-        logger.debug("Receive path: %s (type: %s)", path, type(path).__name__)
-        cmd = self._build_receive_command(path)
+        # Ensure path is properly normalized for this endpoint type
+        normalized_path = self._normalize_path(path)
+        logger.debug(
+            "Receive path: %s (type: %s)",
+            normalized_path,
+            type(normalized_path).__name__,
+        )
+
+        # Log more details for debugging
+        logger.debug("Receive endpoint type: %s", type(self).__name__)
+        logger.debug("Is remote endpoint: %s", getattr(self, "_is_remote", False))
+
+        cmd = self._build_receive_command(normalized_path)
         loglevel = logging.getLogger().getEffectiveLevel()
         stdout = subprocess.DEVNULL if loglevel >= logging.WARNING else None
+
+        logger.debug("Running receive command: %s", cmd)
         return self._exec_command(
             {"command": cmd}, method="Popen", stdin=stdin, stdout=stdout
         )
@@ -262,7 +293,9 @@ class Endpoint:
 
     def get_id(self) -> str:
         """Return an id string to identify this endpoint over multiple runs."""
-        return f"unknown://{self.config['path']}"
+        # Ensure path is normalized to string for consistent IDs
+        path = self._normalize_path(self.config["path"])
+        return f"unknown://{path}"
 
     def _prepare(self) -> None:
         """Called after endpoint creation for additional checks."""
@@ -299,7 +332,14 @@ class Endpoint:
         # This avoids path resolution that could break remote paths
         dest_str = str(destination)
         logger.debug("Building receive command with destination: %s", dest_str)
-        return ["btrfs", "receive", *self.btrfs_flags, dest_str]
+
+        # Add more debug info about destination
+        if isinstance(destination, Path):
+            logger.debug("Destination is a Path object, converting to string")
+
+        cmd = ["btrfs", "receive", *self.btrfs_flags, dest_str]
+        logger.debug("Receive command: %s", cmd)
+        return cmd
 
     def _build_deletion_commands(self, snapshots, convert_rw=None, subvolume_sync=None):
         convert_rw = (
@@ -339,19 +379,42 @@ class Endpoint:
         command = options.get("command")
         if not command:
             raise ValueError("No command specified in options for _exec_command")
+
+        # Ensure all path elements in the command are properly formatted as strings
+        command = [
+            self._normalize_path(arg) if isinstance(arg, (str, Path)) else arg
+            for arg in command
+        ]
+
+        logger.debug("Executing command: %s", command)
         lock_path = Path("/tmp") / f".btrfs-backup-ng.{getpass.getuser()}.lock"
+
         with FileLock(lock_path):
             if os.geteuid() != 0 and command and command[0] == "btrfs":
                 if options.get("no_password_sudo"):
                     command = ["sudo", "-n"] + command
                 else:
                     command = ["sudo"] + command
+
+            logger.debug("Final command after sudo adjustment: %s", command)
             return __util__.exec_subprocess(command, **kwargs)
 
     def _listdir(self, location):
-        location = Path(location).resolve()
+        # For remote endpoints, don't try to resolve the path locally
+        if hasattr(self, "_is_remote") and getattr(self, "_is_remote", False):
+            # Remote endpoints should implement their own _listdir
+            logger.debug(
+                "Using default _listdir implementation on remote path: %s", location
+            )
+            location = Path(location)
+        else:
+            location = Path(location).resolve()
+
         if not location.exists():
+            logger.debug("Path does not exist for _listdir: %s", location)
             return []
+
+        logger.debug("Listing directory contents: %s", location)
         return [str(item) for item in location.iterdir()]
 
     def _remount(self, path, read_write=True):
