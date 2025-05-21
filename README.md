@@ -186,18 +186,31 @@ Backing up to a remote server via SSH is as easy as:
     $ btrfs-backup-ng /home ssh://server/mnt/backups
 
 btrfs-backup-ng doesn't need to be installed on the remote side for this to
-work. It is recommended to set up public key authentication to eliminate
-the need for entering passwords. A full description of how to customize
-the `ssh` call can be found in the help text.
+work. However, the following requirements must be met on the remote server:
+- BTRFS filesystem at the destination path
+- `btrfs` command available (usually in the `btrfs-progs` package)
+- Proper permissions to run BTRFS commands (may require sudo)
 
-Pulling backups from a remote side is now supported as well! Simply use
-the `ssh://` scheme as source.
+For the best SSH backup experience, use these options:
+
+    $ sudo SSH_AUTH_SOCK=$SSH_AUTH_SOCK btrfs-backup-ng \
+           --ssh-identity-file ~/.ssh/id_ed25519 \
+           --ssh-sudo \
+           -v debug \
+           /path/to/subvolume \
+           ssh://user@host:/path/to/backups
+
+The `--ssh-sudo` option enables running BTRFS commands with sudo on the remote host, which is typically required. Make sure the remote user has passwordless sudo rights for BTRFS commands.
+
+Pulling backups from a remote side is supported as well! Simply use the `ssh://` scheme as source:
+
+    $ btrfs-backup-ng ssh://source_server/home /mnt/local-backups
 
 You could even do something like:
 
     $ btrfs-backup-ng ssh://source_server/home ssh://destination_server/mnt/backups
 
-to pull backups from `source_server` and store them at `destinstation_server`.
+to pull backups from `source_server` and store them at `destination_server`.
 This might be used if you can't install btrfs-backup-ng on either remote
 host for any reason. But keep in mind that this procedure will generate
 double traffic (from `source_server` to you and from you to
@@ -214,6 +227,16 @@ before + an extra sending to your local `/mnt/backups` folder. Please
 note that btrfs-backup-ng is not smart enough to prevent the same data from
 being pulled from `source_server` twice. But that wouldn't be easy to
 implement with the current design.
+
+#### SSH Transfer Progress Display
+
+When transferring large snapshots over SSH, btrfs-backup-ng provides a visual progress display showing:
+- Progress bar
+- Transfer rate (MB/s)
+- Elapsed time
+- Estimated time remaining (ETA)
+
+This feature requires the `pv` command on your local system.
 
 
 ### Concurrent tasks
@@ -444,6 +467,18 @@ the `--snapshot-folder` option.
 
 ## Recent Updates
 
+### Enhanced SSH Transfer (May 2025)
+
+- Added reliable SSH transfer with progress display showing:
+  - Progress bar with percentage
+  - Transfer rate (MB/s)
+  - Elapsed time
+  - Estimated time remaining (ETA)
+- Created standalone `btrfs-ssh-send` script for direct snapshot transfers
+- Added comprehensive verification of successful transfers
+- Implemented buffer support with mbuffer/pv for more reliable large transfers
+- Fixed path handling issues when running as root
+
 ### Bug Fixes (May 2025)
 
 - Fixed syntax error in the SSH endpoint implementation that was causing "unexpected indent" errors
@@ -481,6 +516,33 @@ If you're having SSH connection issues, especially when running with sudo:
 3. Check that the identity file has proper permissions (chmod 600)
 4. Explicitly specify your SSH username with `--ssh-username=your_user`
 5. Add verbose debugging: `-v debug`
+6. Always use `--ssh-sudo` if your remote user needs sudo to run BTRFS commands
+7. Verify the remote filesystem is actually BTRFS (use `df -T` on remote host)
+8. Ensure remote user has passwordless sudo rights for BTRFS commands:
+   ```
+   # Add to /etc/sudoers on remote host:
+   yourusername ALL=(ALL) NOPASSWD: /usr/bin/btrfs, /usr/sbin/btrfs
+   ```
+9. Use the standalone transfer script for direct testing:
+   ```
+   sudo SSH_AUTH_SOCK=$SSH_AUTH_SOCK ./btrfs-ssh-send -i ~/.ssh/id_ed25519 /path/to/snapshot user@host:/path/to/backup
+   ```
+
+#### Standalone SSH Transfer Script
+
+btrfs-backup-ng includes a standalone script `btrfs-ssh-send` that can be used to directly transfer snapshots without going through the full backup process. This can be useful for testing SSH connectivity or manual transfers:
+
+```
+sudo SSH_AUTH_SOCK=$SSH_AUTH_SOCK ./btrfs-ssh-send [options] <snapshot_path> <user@host:/destination_path>
+```
+
+Options:
+- `-i, --identity <file>`: SSH identity file
+- `-v, --verbose`: Enable verbose output
+- `-s, --buffer-size <size>`: Buffer size (default: 128M)
+- `--sudo`: Use sudo on remote host (recommended)
+
+The script provides detailed progress information and verification that the transfer succeeded.
 
 ## Copyright
 

@@ -17,6 +17,14 @@ This directory contains the source code for the BTRFS Backup NG project.
   - `sshutil/`: SSH utilities
     - `master.py`: SSH master connection manager
 
+### Standalone Scripts
+
+- `btrfs-ssh-send`: Standalone script for SSH transfers with progress display
+  - Handles btrfs snapshot transfers over SSH with visual progress feedback
+  - Implements transfer buffering with pv/mbuffer for improved reliability
+  - Provides verification of successful transfers
+  - Can be used independently of the main package
+
 ## Development
 
 ### Setting up a development environment
@@ -32,9 +40,31 @@ This directory contains the source code for the BTRFS Backup NG project.
    pip install -e .
    ```
 
-3. Run the application:
+3. Install optional dependencies for improved SSH transfers:
+   ```
+   # For progress display during transfers
+   sudo apt install pv       # Debian/Ubuntu
+   sudo dnf install pv       # Fedora/RHEL
+   brew install pv           # macOS with Homebrew
+   
+   # For buffered transfers (optional)
+   sudo apt install mbuffer  # Debian/Ubuntu
+   sudo dnf install mbuffer  # Fedora/RHEL
+   brew install mbuffer      # macOS with Homebrew
+   ```
+
+4. Run the application:
    ```
    python -m btrfs_backup_ng --help
+   ```
+
+5. For SSH transfers, ensure proper setup:
+   ```
+   # Make the standalone transfer script executable
+   chmod +x btrfs-ssh-send
+   
+   # Run SSH transfers with agent forwarding when using sudo
+   sudo SSH_AUTH_SOCK=$SSH_AUTH_SOCK ./btrfs-ssh-send [options] source destination
    ```
 
 ### Running tests
@@ -62,6 +92,34 @@ This will create both source and wheel distributions in the `dist/` directory.
 ## Documentation
 
 The code is self-documented with docstrings. You can generate documentation using Sphinx.
+
+## Technical Implementation Details
+
+### SSH Transfer Process
+
+The SSH transfer functionality works through multiple components:
+
+1. **SSHEndpoint Class**: Handles SSH connections and command execution
+   - Manages SSH identity files and authentication
+   - Implements the BTRFS send/receive protocol over SSH
+
+2. **Master Connection Manager**: Optimizes SSH connections using control sockets
+   - Maintains persistent SSH connections for improved performance
+   - Handles connection cleanup and error recovery
+
+3. **Standalone Transfer Script**: Provides a direct interface for transfers
+   - Implements progress display using pv or mbuffer
+   - Performs pre-transfer verification of remote filesystem type
+   - Implements post-transfer verification to ensure snapshot creation
+   - Uses fallback mechanisms for maximum compatibility
+
+### BTRFS Command Handling
+
+The application carefully manages BTRFS commands:
+- Properly handles path differences between user and root environments
+- Automatically elevates privileges when needed
+- Uses direct command path resolution to avoid PATH issues
+- Implements comprehensive error handling for BTRFS operations
 
 ## Contributions
 
