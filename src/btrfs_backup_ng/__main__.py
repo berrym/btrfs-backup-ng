@@ -100,6 +100,18 @@ def send_snapshot(snapshot, destination_endpoint, parent=None, clones=None) -> N
                             )
                 except Exception as e:
                     logger.error("Error verifying/creating destination: %s", e)
+        # For local endpoints, ensure directory exists
+        elif hasattr(destination_endpoint, "config") and "path" in destination_endpoint.config:
+            path = destination_endpoint.config["path"]
+            logger.debug("Ensuring local destination path exists: %s", path)
+            try:
+                path_obj = Path(path)
+                if not path_obj.exists():
+                    logger.warning("Local destination path doesn't exist, creating it: %s", path)
+                    path_obj.mkdir(parents=True, exist_ok=True)
+            except Exception as e:
+                logger.error("Error creating local destination directory: %s", e)
+                raise __util__.SnapshotTransferError(f"Cannot create local destination directory: {e}")
     except Exception as e:
         logger.warning(
             "Error during destination verification (will try transfer anyway): %s", e
@@ -137,14 +149,18 @@ def send_snapshot(snapshot, destination_endpoint, parent=None, clones=None) -> N
                 "Using SSH destination without --ssh-sudo. This may fail if the remote user doesn't have permissions for btrfs commands."
             )
 
-        receive_process = destination_endpoint.receive(send_process.stdout)
-        if receive_process is None:
-            logger.error("Failed to start receive process - receive_process is None")
-            if is_ssh_endpoint and not is_using_sudo:
-                logger.error(
-                    "For SSH destinations, try using --ssh-sudo if the remote user needs elevated permissions"
-                )
-            raise __util__.SnapshotTransferError("Receive process failed to start")
+        try:
+            receive_process = destination_endpoint.receive(send_process.stdout)
+            if receive_process is None:
+                logger.error("Failed to start receive process - receive_process is None")
+                if is_ssh_endpoint and not is_using_sudo:
+                    logger.error(
+                        "For SSH destinations, try using --ssh-sudo if the remote user needs elevated permissions"
+                    )
+                raise __util__.SnapshotTransferError("Receive process failed to start")
+        except Exception as e:
+            logger.error("Failed to start receive process: %s", e)
+            raise __util__.SnapshotTransferError(f"Receive process failed to start: {e}")
 
         logger.debug("Waiting for processes to complete...")
         return_codes = [p.wait() for p in [send_process, receive_process]]
@@ -335,6 +351,17 @@ def do_sync_transfer(transfer_objs, **kwargs):
         ):
             logger.debug("Destination is remote, ensuring directory exists")
             # This will be handled in each send_snapshot call
+        # For local endpoints, ensure path exists and is writable
+        else:
+            logger.debug("Destination is local, ensuring directory exists")
+            if destination_path:
+                path_obj = Path(destination_path)
+                if not path_obj.exists():
+                    logger.warning("Creating local destination directory: %s", destination_path)
+                    path_obj.mkdir(parents=True, exist_ok=True)
+                elif not path_obj.is_dir():
+                    logger.error("Destination exists but is not a directory: %s", destination_path)
+                    raise __util__.AbortError("Destination is not a directory")
     except Exception as e:
         logger.warning(
             "Pre-transfer destination check failed (continuing anyway): %s", e
@@ -388,6 +415,11 @@ def do_sync_transfer(transfer_objs, **kwargs):
                 best_snapshot,
                 destination_endpoint,
             )
+            # Ensure destination_endpoint is properly initialized
+            if transfer_objs["destination_endpoint"] is None:
+                logger.error("Destination endpoint is None, cannot proceed with transfer")
+                raise __util__.AbortError("Invalid destination endpoint for transfer")
+                
             send_snapshot(
                 best_snapshot,
                 transfer_objs["destination_endpoint"],
@@ -712,6 +744,19 @@ def run_task(options, queue=None):
         except Exception as e:
             print(f"Error setting up logger in process {os.getpid()}: {e}")
             traceback.print_exc()
+
+    try:
+        # Ensure options dict has all required keys with defaults
+        if "source" not in options or not options["source"]:
+            raise __util__.AbortError("No source specified")
+        
+        # Ensure destination path exists
+        options.setdefault("destinations", [])
+        
+    except Exception as e:
+        print(f"Error initializing task options: {e}")
+        traceback.print_exc()
+        raise __util__.AbortError(f"Failed to initialize task: {e}")
 
     apply_shortcuts(options)
     log_initial_settings(options)

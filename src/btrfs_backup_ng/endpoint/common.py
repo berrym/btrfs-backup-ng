@@ -67,22 +67,50 @@ class Endpoint:
         if val is None:
             return None
 
+        # Import logger here to avoid circular imports
+        from btrfs_backup_ng.__logger__ import logger
+
         # Handle string paths
         if isinstance(val, str):
             # Just expanduser for remote paths to avoid resolving them locally
             if hasattr(self, "_is_remote") and getattr(self, "_is_remote", False):
                 return str(Path(val).expanduser())
-            # For local paths, fully resolve
-            path = Path(val).expanduser()
-            return path.resolve() if not path.is_absolute() else path
+            
+            # For local paths, handle carefully
+            try:
+                path = Path(val).expanduser()
+                # If path is absolute, no need to resolve
+                if path.is_absolute():
+                    return path
+                
+                # Safely resolve relative path
+                try:
+                    return path.resolve()
+                except (FileNotFoundError, PermissionError) as e:
+                    # If resolving fails, manually make it absolute with cwd
+                    logger.warning(f"Path resolution failed for {path}: {e}")
+                    return Path(os.getcwd()) / path
+            except Exception as e:
+                logger.error(f"Path handling error: {e}")
+                # Return original string if all else fails
+                return val
 
         # If it's already a Path object
         if isinstance(val, Path):
             # For remote paths, convert to string to avoid resolution issues
             if hasattr(self, "_is_remote") and getattr(self, "_is_remote", False):
                 return str(val)
-            # For local paths, ensure it's fully resolved
-            return val.resolve() if not val.is_absolute() else val
+            
+            # For local paths, handle safely
+            if val.is_absolute():
+                return val
+            
+            try:
+                return val.resolve()
+            except (FileNotFoundError, PermissionError) as e:
+                # If resolving fails, manually make it absolute
+                logger.warning(f"Path resolution failed for {val}: {e}")
+                return Path(os.getcwd()) / val
 
         # For other types, just convert to string
         return str(val)
@@ -154,14 +182,28 @@ class Endpoint:
         logger.debug("Receive endpoint type: %s", type(self).__name__)
         logger.debug("Is remote endpoint: %s", getattr(self, "_is_remote", False))
 
+        # Verify path exists or create it
+        try:
+            if isinstance(normalized_path, (str, Path)) and not getattr(self, "_is_remote", False):
+                path_obj = Path(normalized_path) if isinstance(normalized_path, str) else normalized_path
+                if not path_obj.exists():
+                    logger.warning("Destination path doesn't exist, creating it: %s", path_obj)
+                    path_obj.mkdir(parents=True, exist_ok=True)
+        except Exception as e:
+            logger.warning("Error verifying or creating path %s: %s", normalized_path, e)
+
         cmd = self._build_receive_command(normalized_path)
         loglevel = logging.getLogger().getEffectiveLevel()
         stdout = subprocess.DEVNULL if loglevel >= logging.WARNING else None
 
         logger.debug("Running receive command: %s", cmd)
-        return self._exec_command(
-            {"command": cmd}, method="Popen", stdin=stdin, stdout=stdout
-        )
+        try:
+            return self._exec_command(
+                {"command": cmd}, method="Popen", stdin=stdin, stdout=stdout
+            )
+        except Exception as e:
+            logger.error("Error executing receive command: %s", e)
+            raise
 
     def list_snapshots(self, flush_cache=False):
         """
@@ -303,28 +345,35 @@ class Endpoint:
 
     @staticmethod
     def _build_snapshot_cmd(source, destination, readonly=True):
-        cmd = ["btrfs", "subvolume", "snapshot"]
+        # Use tuples to mark command arguments that shouldn't be normalized as paths
+        cmd = [("btrfs", False), ("subvolume", False), ("snapshot", False)]
         if readonly:
-            cmd += ["-r"]
-        cmd += [str(source), str(destination)]
-        logger.debug("Snapshot command: %s", cmd)
+            cmd += [("-r", False)]
+        cmd += [(str(source), True), (str(destination), True)]
+        logger.debug("Snapshot command: %s", [arg for arg, _ in cmd])
         return cmd
 
     @staticmethod
     def _build_sync_command():
-        return ["sync"]
+        return [("sync", False)]
 
     def _build_send_command(self, snapshot, parent=None, clones=None):
-        cmd = ["btrfs", "send", *self.btrfs_flags]
+        # Use tuples to mark command arguments that shouldn't be normalized as paths
+        cmd = [("btrfs", False), ("send", False)]
+        # Add btrfs flags
+        for flag in self.btrfs_flags:
+            cmd.append((flag, False))
+            
         log_level = logging.getLogger().getEffectiveLevel()
         if log_level >= logging.WARNING:
-            cmd += ["--quiet"]
+            cmd.append(("--quiet", False))
         if parent:
-            cmd += ["-p", str(parent.get_path())]
+            cmd.append(("-p", False))
+            cmd.append((str(parent.get_path()), True))
         if clones:
             for clone in clones:
-                cmd += [str(clone.get_path())]
-        cmd += [str(snapshot.get_path())]
+                cmd.append((str(clone.get_path()), True))
+        cmd.append((str(snapshot.get_path()), True))
         return cmd
 
     def _build_receive_command(self, destination):
@@ -337,8 +386,12 @@ class Endpoint:
         if isinstance(destination, Path):
             logger.debug("Destination is a Path object, converting to string")
 
-        cmd = ["btrfs", "receive", *self.btrfs_flags, dest_str]
-        logger.debug("Receive command: %s", cmd)
+        # Use tuples to mark command arguments that shouldn't be normalized as paths
+        cmd = [("btrfs", False), ("receive", False)]
+        for flag in self.btrfs_flags:
+            cmd.append((flag, False))
+        cmd.append((dest_str, True))
+        logger.debug("Receive command: %s", [arg for arg, _ in cmd])
         return cmd
 
     def _build_deletion_commands(self, snapshots, convert_rw=None, subvolume_sync=None):
@@ -352,24 +405,31 @@ class Endpoint:
         )
         commands = []
         if convert_rw:
-            commands.extend(
-                [
-                    "btrfs",
-                    "property",
-                    "set",
-                    "-ts",
-                    str(snapshot.get_path()),
-                    "ro",
-                    "false",
-                ]
-                for snapshot in snapshots
-            )
-        cmd = ["btrfs", "subvolume", "delete"] + [
-            str(snapshot.get_path()) for snapshot in snapshots
-        ]
-        commands.append(cmd)
+            for snapshot in snapshots:
+                # Use tuples to mark command arguments that shouldn't be normalized as paths
+                commands.append([
+                    ("btrfs", False),
+                    ("property", False),
+                    ("set", False),
+                    ("-ts", False),
+                    (snapshot.get_path(), True),
+                    ("ro", False),
+                    ("false", False),
+                ])
+        for snapshot in snapshots:
+            commands.append([
+                ("btrfs", False),
+                ("subvolume", False),
+                ("delete", False),
+                (snapshot.get_path(), True),
+            ])
         if subvolume_sync:
-            commands.append(["btrfs", "subvolume", "sync", str(self.config["path"])])
+            commands.append([
+                ("btrfs", False),
+                ("subvolume", False),
+                ("sync", False),
+                (self.config["path"], True),
+            ])
         return commands
 
     def _collapse_commands(self, commands, abort_on_failure=True):
@@ -380,24 +440,83 @@ class Endpoint:
         if not command:
             raise ValueError("No command specified in options for _exec_command")
 
-        # Ensure all path elements in the command are properly formatted as strings
-        command = [
-            self._normalize_path(arg) if isinstance(arg, (str, Path)) else arg
-            for arg in command
-        ]
-
+        # Process command based on whether arguments are marked as paths or not
+        try:
+            normalized_command = []
+            
+            # Check if command is using the tuple format (arg, is_path)
+            if command and isinstance(command[0], tuple) and len(command[0]) == 2:
+                # New format with (arg, is_path) tuples
+                for arg, is_path in command:
+                    if is_path and isinstance(arg, (str, Path)):
+                        try:
+                            normalized_arg = self._normalize_path(arg)
+                            normalized_command.append(normalized_arg)
+                        except Exception as e:
+                            logger.warning("Path normalization failed for %s: %s", arg, e)
+                            # Use original argument if normalization fails
+                            normalized_command.append(arg)
+                    else:
+                        # Not a path, just append as-is
+                        normalized_command.append(arg)
+                logger.debug("Processed marked command arguments")
+            else:
+                # Legacy format - attempt to guess which args are paths
+                for i, arg in enumerate(command):
+                    if isinstance(arg, (str, Path)):
+                        # First argument is a command - don't normalize it as a path
+                        if i == 0 or (isinstance(arg, str) and arg.startswith("-")):
+                            normalized_command.append(arg)
+                            logger.debug("Not normalizing argument: %s", arg)
+                        else:
+                            try:
+                                normalized_arg = self._normalize_path(arg)
+                                normalized_command.append(normalized_arg)
+                            except Exception as e:
+                                logger.warning("Path normalization failed for %s: %s", arg, e)
+                                # Use original argument if normalization fails
+                                normalized_command.append(arg)
+                    else:
+                        normalized_command.append(arg)
+                logger.debug("Processed legacy command format")
+            
+            command = normalized_command
+        except Exception as e:
+            logger.error("Error normalizing command arguments: %s", e)
+            # Continue with original command if normalization completely fails
+            logger.warning("Using original command without normalization")
+        
+        # Convert all command arguments to strings for subprocess
+        command = [str(arg) for arg in command]
         logger.debug("Executing command: %s", command)
         lock_path = Path("/tmp") / f".btrfs-backup-ng.{getpass.getuser()}.lock"
 
-        with FileLock(lock_path):
-            if os.geteuid() != 0 and command and command[0] == "btrfs":
-                if options.get("no_password_sudo"):
-                    command = ["sudo", "-n"] + command
-                else:
-                    command = ["sudo"] + command
+        try:
+            with FileLock(lock_path):
+                # Convert command to string for proper detection
+                first_cmd = str(command[0]) if command else ""
+                
+                if os.geteuid() != 0 and command and first_cmd == "btrfs":
+                    # Find the full path to btrfs command if needed
+                    if first_cmd == "btrfs" and "/" not in first_cmd:
+                        # This preserves just using "btrfs" which will use PATH
+                        pass
+                        
+                    if options.get("no_password_sudo"):
+                        command = ["sudo", "-n"] + command
+                    else:
+                        command = ["sudo"] + command
 
-            logger.debug("Final command after sudo adjustment: %s", command)
-            return __util__.exec_subprocess(command, **kwargs)
+                # Ensure all command elements are strings
+                command = [str(arg) for arg in command]
+                logger.debug("Final command after sudo adjustment: %s", command)
+                # Make sure the environment includes the PATH
+                env = kwargs.get("env", os.environ.copy())
+                kwargs["env"] = env
+                return __util__.exec_subprocess(command, **kwargs)
+        except Exception as e:
+            logger.error("Error in _exec_command: %s", e)
+            raise
 
     def _listdir(self, location):
         # For remote endpoints, don't try to resolve the path locally
