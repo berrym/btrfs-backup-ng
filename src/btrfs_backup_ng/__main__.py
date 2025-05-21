@@ -162,30 +162,67 @@ def send_snapshot(snapshot, destination_endpoint, parent=None, clones=None) -> N
                     "Using SSH destination without --ssh-sudo. This may fail if the remote user doesn't have permissions for btrfs commands."
                 )
 
-        # Check if we need to use direct SSH pipe for reliability
-        use_direct_pipe = is_ssh_endpoint and hasattr(destination_endpoint, 'send_receive')
-        logger.debug("Using direct SSH pipe: %s", use_direct_pipe)
+        # For SSH endpoints, we'll always force the use of a direct pipe for reliability
+        use_direct_pipe = is_ssh_endpoint
+        logger.debug("Using direct SSH pipe for SSH endpoint: %s", use_direct_pipe)
         
         if use_direct_pipe:
             try:
-                # Use the specialized SSH direct pipe method
-                logger.debug("Using SSH direct pipe transfer method for better reliability")
-                success = destination_endpoint.send_receive(
-                    snapshot, 
-                    parent=parent, 
-                    clones=clones,
-                    timeout=3600  # 1 hour timeout for large transfers
-                )
-                if not success:
-                    raise __util__.SnapshotTransferError("SSH direct pipe transfer failed")
+                # Use a direct pipe approach instead of the regular send/receive
+                logger.debug("Using direct SSH pipe transfer - this bypasses the normal btrfs send/receive")
+                
+                # Get the snapshot path
+                snapshot_path = str(snapshot.get_path())
+                destination_path = destination_endpoint.config["path"]
+                logger.info(f"SSH direct transfer from {snapshot_path} to {destination_endpoint}")
+                
+                # Use a simpler, more direct approach - build a direct SSH pipe command
+                source_path = snapshot_path
+                dest_host = destination_endpoint.hostname
+                dest_path = destination_endpoint.config["path"]
+                dest_user = destination_endpoint.config.get("username", os.getenv("USER"))
+                sudo_flag = "sudo" if destination_endpoint.config.get("ssh_sudo", False) else ""
+                identity_file = destination_endpoint.config.get("ssh_identity_file", "")
+                identity_arg = f"-i {identity_file}" if identity_file else ""
+                
+                # Build a direct command that pipes data between btrfs send and ssh btrfs receive
+                if parent:
+                    parent_path = str(parent.get_path())
+                    logger.debug(f"Using parent for incremental transfer: {parent_path}")
+                    direct_cmd = f"sudo btrfs send -p {parent_path} {source_path} | ssh {identity_arg} {dest_user}@{dest_host} '{sudo_flag} btrfs receive {dest_path}'"
+                else:
+                    direct_cmd = f"sudo btrfs send {source_path} | ssh {identity_arg} {dest_user}@{dest_host} '{sudo_flag} btrfs receive {dest_path}'"
+                
+                logger.debug(f"Executing direct SSH pipe command: {direct_cmd}")
+                
+                # Run the command directly
+                result = subprocess.run(direct_cmd, shell=True, capture_output=True, text=True)
+                if result.returncode != 0:
+                    logger.error(f"Direct SSH pipe failed with exit code {result.returncode}")
+                    logger.error(f"Error output: {result.stderr}")
+                    raise __util__.SnapshotTransferError(f"Direct SSH pipe failed: {result.stderr}")
+                
+                logger.info("Direct SSH pipe transfer completed successfully")
+                # Verify transfer by checking if snapshot exists on remote host
+                logger.info("Verifying snapshot was created on remote host...")
+                verify_cmd = f"ssh {identity_arg} {dest_user}@{dest_host} '{sudo_flag} btrfs subvolume list {dest_path}'"
+                verify_result = subprocess.run(verify_cmd, shell=True, capture_output=True, text=True)
+                
+                if snapshot.get_name() in verify_result.stdout:
+                    logger.info("VERIFICATION SUCCESSFUL: Snapshot exists on remote host")
+                else:
+                    logger.error("VERIFICATION FAILED: Snapshot was NOT created on remote host")
+                    logger.error("This likely means the remote filesystem isn't btrfs or permissions are wrong")
+                    logger.error(f"Remote output: {verify_result.stdout}")
+                    raise __util__.SnapshotTransferError("Snapshot verification failed - transfer incomplete")
                 
                 # For direct pipe, we fake the return codes as successful
                 return_codes = [0, 0]
             except Exception as e:
                 logger.error("Error during SSH direct pipe transfer: %s", e)
-                # Try to get log from endpoint
-                if hasattr(destination_endpoint, "_last_receive_log"):
-                    logger.error("Check remote log file: %s", destination_endpoint._last_receive_log)
+                logger.error("SSH transfer failed. Check remote host permissions and filesystem type.")
+                logger.error("The remote filesystem MUST be btrfs and user MUST have sudo rights for btrfs commands")
+                logger.error(f"Direct command was: {direct_cmd}")
                 raise __util__.SnapshotTransferError(f"SSH direct pipe transfer failed: {e}")
         else:
             # Traditional send/receive process approach
@@ -655,7 +692,13 @@ files is allowed as well."""
         "--direct-ssh-pipe",
         action="store_true",
         default=True,
-        help="Use direct SSH pipe method for better transfer reliability. This is now on by default.",
+        help="Use direct SSH pipe method for better transfer reliability. This is now on by default and always used for SSH endpoints.",
+    )
+    group.add_argument(
+        "--verify-transfer",
+        action="store_true",
+        default=True,
+        help="Verify that snapshots were successfully created after transfer. This is now on by default.",
     )
     group.add_argument(
         "--ssh-identity-file",
@@ -875,13 +918,40 @@ def run_task(options, queue=None):
     logger.debug("Waiting briefly for any pending operations to complete...")
     time.sleep(1)
     
-    # Verify snapshots transferred successfully
-    if options.get("verify_transfer", True):
-        logger.debug("Verifying transfers completed successfully...")
-        for destination_endpoint in destination_endpoints:
-            if hasattr(destination_endpoint, "verify_snapshot_transfer") and hasattr(destination_endpoint, "_last_transfer_snapshot"):
-                logger.debug("Endpoint supports transfer verification: %s", destination_endpoint)
-                # We would call verify_snapshot_transfer here, but it's already handled in the send_receive method
+    # For SSH endpoints, do a final verification that snapshots were created
+    logger.debug("Performing final verification for SSH endpoints...")
+    for destination_endpoint in destination_endpoints:
+        if (hasattr(destination_endpoint, "_is_remote") and 
+            getattr(destination_endpoint, "_is_remote", False)):
+            logger.info(f"Verifying SSH endpoint: {destination_endpoint}")
+            
+            # Get the destination path and connection details
+            dest_host = destination_endpoint.hostname
+            dest_path = destination_endpoint.config["path"]
+            dest_user = destination_endpoint.config.get("username", os.getenv("USER"))
+            sudo_cmd = "sudo " if destination_endpoint.config.get("ssh_sudo", False) else ""
+            identity_file = destination_endpoint.config.get("ssh_identity_file", "")
+            identity_arg = f"-i {identity_file}" if identity_file else ""
+            
+            # Build a command to list subvolumes on the remote host
+            verify_cmd = f"ssh {identity_arg} {dest_user}@{dest_host} '{sudo_cmd}btrfs subvolume list -o {dest_path}'"
+            logger.debug(f"Running verification command: {verify_cmd}")
+            
+            # Run the verification command
+            try:
+                verify_result = subprocess.run(verify_cmd, shell=True, capture_output=True, text=True)
+                if verify_result.returncode == 0:
+                    if len(verify_result.stdout.strip()) > 0:
+                        logger.info(f"VERIFICATION SUCCESSFUL: Subvolumes found on remote host")
+                        logger.info(f"Remote subvolumes: {verify_result.stdout.strip()}")
+                    else:
+                        logger.error("VERIFICATION FAILED: No subvolumes found on remote host")
+                        logger.error("This indicates the transfer didn't work or the filesystem isn't btrfs")
+                else:
+                    logger.error(f"VERIFICATION FAILED: Command returned non-zero exit code {verify_result.returncode}")
+                    logger.error(f"Error output: {verify_result.stderr}")
+            except Exception as e:
+                logger.error(f"Error during verification: {e}")
 
     # Enforce retention for source and destination endpoints only once, at the end
     cleanup_snapshots(source_endpoint, destination_endpoints, options)
@@ -1035,12 +1105,14 @@ def prepare_destination_endpoints(options, source_endpoint):
         # Force enable in options too, in case it was set in another way
         options["ssh_sudo"] = True
     
-    # Handle direct SSH pipe option
-    direct_ssh_pipe = options.get("direct_ssh_pipe", True)  # Default to True for better reliability
-    endpoint_kwargs["direct_ssh_pipe"] = direct_ssh_pipe
+    # For SSH transfers, we always force direct pipe and verification on
+    endpoint_kwargs["direct_ssh_pipe"] = True
+    endpoint_kwargs["verify_transfer"] = True
+    options["direct_ssh_pipe"] = True
+    options["verify_transfer"] = True
     
     logger.debug("SSH sudo in endpoint kwargs: %s", endpoint_kwargs.get("ssh_sudo", False))
-    logger.debug("Direct SSH pipe in endpoint kwargs: %s", endpoint_kwargs.get("direct_ssh_pipe", True))
+    logger.debug("Direct SSH pipe and verification now forced on for better reliability")
 
     logger.info("Preparing destination endpoints...")
     for destination in options["destinations"]:
