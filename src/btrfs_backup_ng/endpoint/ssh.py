@@ -365,9 +365,9 @@ class SSHEndpoint(Endpoint):
                 path = os.path.expanduser(path)
                 logger.debug("Expanded user path: %s -> %s", original_path, path)
                 
-    result = str(path) if path is not None else None
-    logger.debug("Final normalized path result: %s", result)
-    return result
+        result = str(path) if path is not None else None
+        logger.debug("Final normalized path result: %s", result)
+        return result
         
     def _verify_btrfs_availability(self, use_sudo=False):
         """Verify that btrfs command is available on the remote host."""
