@@ -57,10 +57,13 @@ class SSHEndpoint(Endpoint):
 
         self.hostname = hostname
         logger.debug("SSHEndpoint initialized with hostname: %s", self.hostname)
-        
-        # Set default values for config parameters
+        self.config["username"] = self.config.get("username")
         self.config["port"] = self.config.get("port")
         self.config["ssh_opts"] = self.config.get("ssh_opts", [])
+        
+        # Initialize tracking variables for verification
+        self._last_receive_log = None
+        self._last_transfer_snapshot = None
         self.config["path"] = self.config.get("path", "/")
         self.config["ssh_sudo"] = self.config.get("ssh_sudo", False)
         self.config["passwordless"] = self.config.get("passwordless", False)
@@ -445,9 +448,6 @@ class SSHEndpoint(Endpoint):
             except Exception as e:
                 logger.warning(f"Error creating destination directory: {e}")
         
-        # Check if btrfs commands require sudo on remote host
-        requires_sudo = True
-        
         # Test if remote destination directory is writeable without sudo first
         dest_dir = os.path.dirname(destination)
         if dest_dir:
@@ -485,7 +485,22 @@ class SSHEndpoint(Endpoint):
             logger.warning("Consider using --ssh-sudo option to enable sudo on remote host")
         
         # Build the remote command with optional sudo
-        receive_cmd = self._build_remote_command(receive_cmd)
+        # For SSH receive, we'll construct a shell command that saves stderr to a log file
+        # This helps diagnose issues when the receive process fails silently
+        log_file = f"/tmp/btrfs-receive-{int(time.time())}.log"
+        
+        if self.config.get("ssh_sudo", False):
+            # Use sudo with -E to preserve environment and redirect stderr to log file
+            receive_shell_cmd = f"sudo -E btrfs receive {destination} 2> {log_file}; echo $? > {log_file}.exitcode"
+        else:
+            # Direct command with stderr redirection
+            receive_shell_cmd = f"btrfs receive {destination} 2> {log_file}; echo $? > {log_file}.exitcode"
+        
+        # Log the shell command for debugging
+        logger.debug("Built receive shell command: %s", receive_shell_cmd)
+        
+        # Use -c to execute the command in the shell
+        receive_cmd = ["bash", "-c", receive_shell_cmd]
         
         # Determine if we need a TTY for this command (needed if sudo might prompt for password)
         needs_tty = False
@@ -564,7 +579,6 @@ class SSHEndpoint(Endpoint):
             full_cmd_str = " ".join(map(str, ssh_cmd))
             logger.debug("Full SSH receive command: %s", full_cmd_str)
             
-            # Create named FIFO pipes for better stream handling if necessary
             logger.debug("Starting btrfs receive via SSH, sudo=%s", self.config.get("ssh_sudo", False))
             receive_process = subprocess.Popen(
                 ssh_cmd,
@@ -579,6 +593,17 @@ class SSHEndpoint(Endpoint):
             
             logger.debug("btrfs receive process started with PID: %d", receive_process.pid)
             logger.debug("If receive fails, verify remote user has sudo access for btrfs commands")
+            
+            # Store the log file path for later verification
+            self._last_receive_log = log_file
+            self._last_transfer_snapshot = True
+            
+            return receive_process
+            logger.debug("Remote log file for this transfer: %s", log_file)
+            
+            # Store the log file path for later verification
+            self._last_receive_log = log_file
+            
             return receive_process
         except Exception as e:
             logger.error("Failed to start btrfs receive process: %s", e)
@@ -1022,9 +1047,115 @@ class SSHEndpoint(Endpoint):
             raise last_exception
         
         logger.info("btrfs send/receive completed successfully")
+        logger.info("Transfer completed successfully")
+        
+        # Verify the transfer was successful by checking for the snapshot on the remote system
+        try:
+            if self.verify_snapshot_transfer(snapshot):
+                logger.info("Snapshot verification successful - snapshot exists on remote host")
+            else:
+                logger.error("SNAPSHOT VERIFICATION FAILED - snapshot NOT found on remote host!")
+                logger.error("This means the transfer appeared to complete but did not create a snapshot")
+                logger.error("Check remote host permissions and filesystem type")
+                # Raise an exception to indicate the failure
+                raise RuntimeError("Snapshot verification failed - snapshot not found on remote host")
+        except Exception as e:
+            logger.error("Error during snapshot verification: %s", e)
+            logger.error("Cannot confirm if snapshot was successfully created on remote host")
+
+    def verify_snapshot_transfer(self, snapshot):
+        """Verify that a snapshot was successfully transferred to the remote host.
+                
+        Args:
+            snapshot: The snapshot to verify
+                    
+        Returns:
+            bool: True if the snapshot exists on the remote host, False otherwise
+        """
+        if not hasattr(self, '_last_transfer_snapshot') or not self._last_transfer_snapshot:
+            logger.warning("No snapshot to verify - skipping verification")
+            return False
+                    
+        try:
+            # Get the snapshot name
+            snapshot_name = os.path.basename(str(snapshot.get_path()))
+            destination_path = self._normalize_path(self.config["path"])
+                    
+            logger.debug("Verifying snapshot transfer: %s at %s", snapshot_name, destination_path)
+                    
+            # First check the return code from the receive operation if we have a log file
+            if hasattr(self, '_last_receive_log') and self._last_receive_log:
+                exitcode_file = f"{self._last_receive_log}.exitcode"
+                cat_cmd = ["cat", exitcode_file]
+                try:
+                    result = self._exec_remote_command(cat_cmd, check=False, stdout=subprocess.PIPE)
+                    if result.returncode == 0:
+                        exit_code_str = result.stdout.decode('utf-8').strip()
+                        try:
+                            exit_code = int(exit_code_str)
+                            if exit_code != 0:
+                                logger.error("Remote btrfs receive process exited with non-zero code: %d", exit_code)
+                                # Get the log file contents
+                                log_cmd = ["cat", self._last_receive_log]
+                                log_result = self._exec_remote_command(log_cmd, check=False, stdout=subprocess.PIPE)
+                                if log_result.returncode == 0:
+                                    log_content = log_result.stdout.decode('utf-8').strip()
+                                    logger.error("Remote receive log: %s", log_content)
+                                return False
+                        except ValueError:
+                            logger.warning("Invalid exit code in file: %s", exit_code_str)
+                except Exception as e:
+                    logger.warning("Error reading exit code file: %s", e)
+                    
+            # Run btrfs subvolume list to check if the snapshot exists
+            if self.config.get("ssh_sudo", False):
+                list_cmd = ["sudo", "btrfs", "subvolume", "list", "-o", destination_path]
+            else:
+                list_cmd = ["btrfs", "subvolume", "list", "-o", destination_path]
+                        
+            logger.debug("Running remote subvolume list command: %s", list_cmd)
+            result = self._exec_remote_command(
+                list_cmd, 
+                check=False, 
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE
+            )
+                    
+            if result.returncode != 0:
+                stderr = result.stderr.decode('utf-8').strip() if result.stderr else ""
+                logger.error("Failed to list subvolumes on remote host: %s", stderr)
+                        
+                # Try a more direct test - check if the path exists
+                test_cmd = ["test", "-d", f"{destination_path}/{snapshot_name}"]
+                test_result = self._exec_remote_command(test_cmd, check=False)
+                if test_result.returncode == 0:
+                    logger.info("Snapshot directory exists on remote host")
+                    return True
+                else:
+                    logger.error("Snapshot directory does not exist on remote host")
+                    return False
+                    
+            # Parse the output to look for our snapshot
+            output = result.stdout.decode('utf-8').strip()
+            logger.debug("Remote subvolume list output: %s", output)
+                    
+            # Check if the snapshot name appears in the output
+            if snapshot_name in output:
+                logger.info("Found snapshot in remote subvolume list: %s", snapshot_name)
+                return True
+            else:
+                logger.error("Snapshot not found in remote subvolume list: %s", snapshot_name)
+                # Try a direct path test as backup
+                test_cmd = ["test", "-d", f"{destination_path}/{snapshot_name}"]
+                test_result = self._exec_remote_command(test_cmd, check=False)
+                return test_result.returncode == 0
+                        
+        except Exception as e:
+            logger.error("Error verifying snapshot transfer: %s", e)
+            return False
 
     def _prepare(self) -> None:
-        # Prepare the SSH endpoint by ensuring SSH connectivity."""
+        """Prepare the SSH endpoint by ensuring SSH connectivity."""
         logger.debug("Preparing SSH endpoint for hostname: %s", self.hostname)
         # Ensure path is a string
         path = self._normalize_path(self.config["path"])

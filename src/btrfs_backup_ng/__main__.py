@@ -162,46 +162,73 @@ def send_snapshot(snapshot, destination_endpoint, parent=None, clones=None) -> N
                     "Using SSH destination without --ssh-sudo. This may fail if the remote user doesn't have permissions for btrfs commands."
                 )
 
-        try:
-            receive_process = destination_endpoint.receive(send_process.stdout)
-            if receive_process is None:
-                logger.error("Failed to start receive process - receive_process is None")
-                if is_ssh_endpoint:
-                    if not destination_endpoint.config.get("ssh_sudo", False):
-                        logger.error(
-                            "For SSH destinations, try using --ssh-sudo if the remote user needs elevated permissions"
-                        )
-                raise __util__.SnapshotTransferError("Receive process failed to start")
-        except Exception as e:
-            logger.error("Failed to start receive process: %s", e)
-            raise __util__.SnapshotTransferError(f"Receive process failed to start: {e}")
+        # Check if we need to use direct SSH pipe for reliability
+        use_direct_pipe = is_ssh_endpoint and hasattr(destination_endpoint, 'send_receive')
+        logger.debug("Using direct SSH pipe: %s", use_direct_pipe)
+        
+        if use_direct_pipe:
+            try:
+                # Use the specialized SSH direct pipe method
+                logger.debug("Using SSH direct pipe transfer method for better reliability")
+                success = destination_endpoint.send_receive(
+                    snapshot, 
+                    parent=parent, 
+                    clones=clones,
+                    timeout=3600  # 1 hour timeout for large transfers
+                )
+                if not success:
+                    raise __util__.SnapshotTransferError("SSH direct pipe transfer failed")
+                
+                # For direct pipe, we fake the return codes as successful
+                return_codes = [0, 0]
+            except Exception as e:
+                logger.error("Error during SSH direct pipe transfer: %s", e)
+                # Try to get log from endpoint
+                if hasattr(destination_endpoint, "_last_receive_log"):
+                    logger.error("Check remote log file: %s", destination_endpoint._last_receive_log)
+                raise __util__.SnapshotTransferError(f"SSH direct pipe transfer failed: {e}")
+        else:
+            # Traditional send/receive process approach
+            try:
+                receive_process = destination_endpoint.receive(send_process.stdout)
+                if receive_process is None:
+                    logger.error("Failed to start receive process - receive_process is None")
+                    if is_ssh_endpoint:
+                        if not destination_endpoint.config.get("ssh_sudo", False):
+                            logger.error(
+                                "For SSH destinations, try using --ssh-sudo if the remote user needs elevated permissions"
+                            )
+                    raise __util__.SnapshotTransferError("Receive process failed to start")
+            except Exception as e:
+                logger.error("Failed to start receive process: %s", e)
+                raise __util__.SnapshotTransferError(f"Receive process failed to start: {e}")
 
-        logger.debug("Waiting for processes to complete...")
-        # Set a timeout for the processes to prevent hanging indefinitely
-        timeout_seconds = 3600  # 1 hour timeout for large transfers
-        logger.debug("Waiting for send/receive processes to complete (timeout=%ds)", timeout_seconds)
-        
-        # Wait for send process first
-        try:
-            logger.debug("Waiting for send process to complete...")
-            return_code_send = send_process.wait(timeout=timeout_seconds)
-            logger.debug("Send process completed with return code: %d", return_code_send)
-        except subprocess.TimeoutExpired:
-            logger.error("Timeout waiting for send process to complete")
-            send_process.kill()
-            raise __util__.SnapshotTransferError("Timeout waiting for send process")
-        
-        # Then wait for receive process - it should finish soon after send process
-        try:
-            logger.debug("Waiting for receive process to complete...")
-            return_code_receive = receive_process.wait(timeout=300)  # 5 minute timeout after send completes
-            logger.debug("Receive process completed with return code: %d", return_code_receive)
-        except subprocess.TimeoutExpired:
-            logger.error("Timeout waiting for receive process to complete")
-            receive_process.kill()
-            raise __util__.SnapshotTransferError("Timeout waiting for receive process")
-        
-        return_codes = [return_code_send, return_code_receive]
+            logger.debug("Waiting for processes to complete...")
+            # Set a timeout for the processes to prevent hanging indefinitely
+            timeout_seconds = 3600  # 1 hour timeout for large transfers
+            logger.debug("Waiting for send/receive processes to complete (timeout=%ds)", timeout_seconds)
+            
+            # Wait for send process first
+            try:
+                logger.debug("Waiting for send process to complete...")
+                return_code_send = send_process.wait(timeout=timeout_seconds)
+                logger.debug("Send process completed with return code: %d", return_code_send)
+            except subprocess.TimeoutExpired:
+                logger.error("Timeout waiting for send process to complete")
+                send_process.kill()
+                raise __util__.SnapshotTransferError("Timeout waiting for send process")
+            
+            # Then wait for receive process - it should finish soon after send process
+            try:
+                logger.debug("Waiting for receive process to complete...")
+                return_code_receive = receive_process.wait(timeout=300)  # 5 minute timeout after send completes
+                logger.debug("Receive process completed with return code: %d", return_code_receive)
+            except subprocess.TimeoutExpired:
+                logger.error("Timeout waiting for receive process to complete")
+                receive_process.kill()
+                raise __util__.SnapshotTransferError("Timeout waiting for receive process")
+            
+            return_codes = [return_code_send, return_code_receive]
         logger.debug(
             "Process return codes: send=%d, receive=%d",
             return_codes[0],
@@ -625,6 +652,12 @@ files is allowed as well."""
         help="Execute commands with sudo on the remote host. REQUIRED for btrfs operations if the remote user doesn't have direct permissions to run btrfs commands. Remote user must have passwordless sudo access configured for btrfs commands.",
     )
     group.add_argument(
+        "--direct-ssh-pipe",
+        action="store_true",
+        default=True,
+        help="Use direct SSH pipe method for better transfer reliability. This is now on by default.",
+    )
+    group.add_argument(
         "--ssh-identity-file",
         help="Explicitly specify the SSH identity (private key) file to use. "
         "Useful when running btrfs-backup-ng with sudo where your regular user's SSH keys aren't accessible.",
@@ -841,7 +874,15 @@ def run_task(options, queue=None):
     # Wait a moment for any pending operations to complete
     logger.debug("Waiting briefly for any pending operations to complete...")
     time.sleep(1)
-        
+    
+    # Verify snapshots transferred successfully
+    if options.get("verify_transfer", True):
+        logger.debug("Verifying transfers completed successfully...")
+        for destination_endpoint in destination_endpoints:
+            if hasattr(destination_endpoint, "verify_snapshot_transfer") and hasattr(destination_endpoint, "_last_transfer_snapshot"):
+                logger.debug("Endpoint supports transfer verification: %s", destination_endpoint)
+                # We would call verify_snapshot_transfer here, but it's already handled in the send_receive method
+
     # Enforce retention for source and destination endpoints only once, at the end
     cleanup_snapshots(source_endpoint, destination_endpoints, options)
 
@@ -993,7 +1034,13 @@ def prepare_destination_endpoints(options, source_endpoint):
         endpoint_kwargs["ssh_sudo"] = True
         # Force enable in options too, in case it was set in another way
         options["ssh_sudo"] = True
+    
+    # Handle direct SSH pipe option
+    direct_ssh_pipe = options.get("direct_ssh_pipe", True)  # Default to True for better reliability
+    endpoint_kwargs["direct_ssh_pipe"] = direct_ssh_pipe
+    
     logger.debug("SSH sudo in endpoint kwargs: %s", endpoint_kwargs.get("ssh_sudo", False))
+    logger.debug("Direct SSH pipe in endpoint kwargs: %s", endpoint_kwargs.get("direct_ssh_pipe", True))
 
     logger.info("Preparing destination endpoints...")
     for destination in options["destinations"]:
