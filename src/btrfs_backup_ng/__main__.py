@@ -186,19 +186,25 @@ def send_snapshot(snapshot, destination_endpoint, parent=None, clones=None) -> N
                 ssh_destination = f"{dest_user}@{dest_host}:{dest_path}"
                 logger.info(f"Using dedicated SSH transfer script from {snapshot_path} to {ssh_destination}")
                 
-                # Build the command line for our transfer script
-                script_path = os.path.join("/usr/bin", "btrfs-ssh-transfer")
-                # If script doesn't exist in system path, try to find it relative to this file
-                if not os.path.exists(script_path):
-                    script_path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "bin", "btrfs-ssh-transfer")
-                    if not os.path.exists(script_path):
-                        # Last attempt - try current directory
-                        script_path = os.path.join(os.getcwd(), "bin", "btrfs-ssh-transfer")
+                # Find our btrfs-ssh-send script (search in multiple locations)
+                script_name = "btrfs-ssh-send"
+                script_paths = [
+                    os.path.join("/usr/bin", script_name),
+                    os.path.join("/usr/local/bin", script_name),
+                    os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), script_name),
+                    os.path.join(os.getcwd(), script_name),
+                ]
+                
+                script_path = None
+                for path in script_paths:
+                    if os.path.exists(path) and os.access(path, os.X_OK):
+                        script_path = path
+                        break
                         
                 logger.debug(f"Using SSH transfer script at: {script_path}")
-                if not os.path.exists(script_path):
-                    logger.error(f"SSH transfer script not found at: {script_path}")
-                    logger.error("Please ensure btrfs-ssh-transfer script is installed")
+                if not script_path:
+                    logger.error(f"SSH transfer script '{script_name}' not found")
+                    logger.error(f"Searched in: {', '.join(script_paths)}")
                     raise __util__.SnapshotTransferError("SSH transfer script not found")
                 
                 cmd = [script_path]
@@ -206,26 +212,22 @@ def send_snapshot(snapshot, destination_endpoint, parent=None, clones=None) -> N
                 # Add options
                 if use_sudo:
                     cmd.append("--sudo")
+                else:
+                    cmd.append("--no-sudo")
                 if identity_file:
                     cmd.extend(["--identity", identity_file])
                 if parent_path:
                     cmd.extend(["--parent", parent_path])
                 cmd.append("--verbose")
                 
-                # Add source and destination - ensure quotes for paths with spaces
-                cmd.append(snapshot_path.replace(" ", "\\ "))
-                cmd.append(ssh_destination.replace(" ", "\\ "))
+                # Add source and destination
+                cmd.append(snapshot_path)
+                cmd.append(ssh_destination)
                 
                 logger.debug(f"Running SSH transfer script: {' '.join(cmd)}")
                 
-                # Execute the transfer script with proper environment
-                env = os.environ.copy()
-                # Ensure PATH includes the directory with our script
-                script_dir = os.path.dirname(script_path)
-                env["PATH"] = f"{script_dir}:{env.get('PATH', '')}"
-                
-                logger.debug(f"Running SSH transfer command: {' '.join(cmd)}")
-                result = subprocess.run(cmd, capture_output=True, text=True, env=env)
+                # Execute the transfer script
+                result = subprocess.run(cmd, capture_output=True, text=True)
                 
                 if result.returncode == 0:
                     logger.info("SSH transfer completed successfully")
@@ -948,7 +950,7 @@ def run_task(options, queue=None):
     
     # For SSH endpoints, we skip final verification since our standalone script 
     # already handles comprehensive verification
-    logger.debug("Skipping final verification as standalone SSH script handles this")
+    logger.debug("Skipping final verification as btrfs-ssh-send script handles this")
 
     # Enforce retention for source and destination endpoints only once, at the end
     cleanup_snapshots(source_endpoint, destination_endpoints, options)

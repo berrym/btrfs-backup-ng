@@ -1,0 +1,366 @@
+#!/bin/bash
+#
+# btrfs-ssh-send - Transfer BTRFS snapshots over SSH
+#
+# This script reliably transfers BTRFS snapshots to a remote host using SSH.
+# It handles various edge cases like different btrfs command locations,
+# sudo elevation, SSH authentication, and proper verification.
+#
+# Usage: btrfs-ssh-send [options] <snapshot_path> <user@host:/destination_path>
+#
+# Author: OpenAI Assistant, 2025
+
+set -eo pipefail
+
+# Colors for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+BLUE='\033[0;34m'
+NC='\033[0m' # No Color
+
+# Default values
+USE_SUDO=true
+VERBOSE=false
+IDENTITY_FILE=""
+TEST_MODE=false
+
+# Find the btrfs command path
+find_btrfs_cmd() {
+    for path in "/usr/sbin/btrfs" "/usr/bin/btrfs" "/sbin/btrfs" "/bin/btrfs"; do
+        if [ -x "$path" ]; then
+            echo "$path"
+            return 0
+        fi
+    done
+    
+    # Try using which as fallback
+    if command -v which >/dev/null 2>&1; then
+        local which_result=$(which btrfs 2>/dev/null)
+        if [ -n "$which_result" ] && [ -x "$which_result" ]; then
+            echo "$which_result"
+            return 0
+        fi
+    fi
+    
+    # Not found
+    return 1
+}
+
+# Find path to ssh command
+find_ssh_cmd() {
+    for path in "/usr/bin/ssh" "/bin/ssh" "/usr/local/bin/ssh"; do
+        if [ -x "$path" ]; then
+            echo "$path"
+            return 0
+        fi
+    done
+    
+    # Not found
+    return 1
+}
+
+# Print usage information
+print_usage() {
+    echo "Usage: $(basename $0) [options] <snapshot_path> <user@host:/destination_path>"
+    echo
+    echo "Options:"
+    echo "  -i, --identity <file>    SSH identity file"
+    echo "  -n, --no-sudo            Don't use sudo on remote host"
+    echo "  -v, --verbose            Enable verbose output"
+    echo "  -t, --test               Test mode - verify only"
+    echo "  -h, --help               Show this help message"
+    echo
+    echo "Examples:"
+    echo "  $(basename $0) /path/to/snapshot user@host:/path/to/destination"
+    echo "  $(basename $0) -i ~/.ssh/id_ed25519 /path/to/snapshot user@host:/path/to/destination"
+}
+
+log_info() {
+    echo -e "[${BLUE}INFO${NC}] $1"
+}
+
+log_success() {
+    echo -e "[${GREEN}SUCCESS${NC}] $1"
+}
+
+log_warning() {
+    echo -e "[${YELLOW}WARNING${NC}] $1"
+}
+
+log_error() {
+    echo -e "[${RED}ERROR${NC}] $1" >&2
+}
+
+log_verbose() {
+    if $VERBOSE; then
+        echo -e "[${BLUE}DEBUG${NC}] $1"
+    fi
+}
+
+# Parse command line arguments
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -i|--identity)
+            IDENTITY_FILE="$2"
+            shift 2
+            ;;
+        -n|--no-sudo)
+            USE_SUDO=false
+            shift
+            ;;
+        -v|--verbose)
+            VERBOSE=true
+            shift
+            ;;
+        -t|--test)
+            TEST_MODE=true
+            shift
+            ;;
+        -h|--help)
+            print_usage
+            exit 0
+            ;;
+        -*)
+            log_error "Unknown option: $1"
+            print_usage
+            exit 1
+            ;;
+        *)
+            if [ -z "$SOURCE_PATH" ]; then
+                SOURCE_PATH="$1"
+                shift
+            elif [ -z "$DESTINATION" ]; then
+                DESTINATION="$1"
+                shift
+            else
+                log_error "Unexpected argument: $1"
+                print_usage
+                exit 1
+            fi
+            ;;
+    esac
+done
+
+# Check required arguments
+if [ -z "$SOURCE_PATH" ] || [ -z "$DESTINATION" ]; then
+    log_error "Missing required arguments"
+    print_usage
+    exit 1
+fi
+
+# Parse destination
+if [[ ! "$DESTINATION" =~ .*:.* ]]; then
+    log_error "Destination must be in format user@host:/path or host:/path"
+    print_usage
+    exit 1
+fi
+
+HOST_PART="${DESTINATION%%:*}"
+DEST_PATH="${DESTINATION#*:}"
+
+if [[ "$HOST_PART" =~ .*@.* ]]; then
+    DEST_USER="${HOST_PART%%@*}"
+    DEST_HOST="${HOST_PART#*@}"
+else
+    DEST_USER="$USER"
+    DEST_HOST="$HOST_PART"
+fi
+
+log_verbose "Source path: $SOURCE_PATH"
+log_verbose "Destination user: $DEST_USER"
+log_verbose "Destination host: $DEST_HOST"
+log_verbose "Destination path: $DEST_PATH"
+
+# Find the btrfs command
+BTRFS_CMD=$(find_btrfs_cmd)
+if [ -z "$BTRFS_CMD" ]; then
+    log_error "btrfs command not found. Please install btrfs-progs package."
+    exit 1
+fi
+log_verbose "Using btrfs command: $BTRFS_CMD"
+
+# Find the ssh command
+SSH_CMD=$(find_ssh_cmd)
+if [ -z "$SSH_CMD" ]; then
+    log_error "ssh command not found. Please install OpenSSH client."
+    exit 1
+fi
+log_verbose "Using ssh command: $SSH_CMD"
+
+# Set up SSH options
+SSH_OPTS="-o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10"
+if [ -n "$IDENTITY_FILE" ]; then
+    if [ ! -f "$IDENTITY_FILE" ]; then
+        log_error "SSH identity file not found: $IDENTITY_FILE"
+        exit 1
+    fi
+    SSH_OPTS="$SSH_OPTS -i $IDENTITY_FILE"
+    log_verbose "Using SSH identity file: $IDENTITY_FILE"
+fi
+
+# Check if running as root and fix SSH_AUTH_SOCK
+if [ "$EUID" -eq 0 ] && [ -z "$SSH_AUTH_SOCK" ] && [ -n "$SUDO_USER" ]; then
+    log_warning "Running as root without SSH_AUTH_SOCK - attempting to fix"
+    
+    # Try to get SSH_AUTH_SOCK from the original user
+    if command -v sudo >/dev/null 2>&1; then
+        USER_SSH_AUTH_SOCK=$(sudo -u "$SUDO_USER" printenv SSH_AUTH_SOCK 2>/dev/null)
+        if [ -n "$USER_SSH_AUTH_SOCK" ] && [ -e "$USER_SSH_AUTH_SOCK" ]; then
+            export SSH_AUTH_SOCK="$USER_SSH_AUTH_SOCK"
+            log_success "Fixed SSH_AUTH_SOCK: $SSH_AUTH_SOCK"
+        fi
+    fi
+    
+    if [ -z "$SSH_AUTH_SOCK" ] || [ ! -e "$SSH_AUTH_SOCK" ]; then
+        log_warning "Could not fix SSH_AUTH_SOCK - authentication may fail"
+    fi
+fi
+
+# Check if source path exists
+if [ ! -e "$SOURCE_PATH" ]; then
+    log_error "Source path does not exist: $SOURCE_PATH"
+    exit 1
+fi
+
+# Check if source is a BTRFS subvolume
+if ! "$BTRFS_CMD" subvolume show "$SOURCE_PATH" >/dev/null 2>&1; then
+    log_error "Source path is not a BTRFS subvolume: $SOURCE_PATH"
+    exit 1
+fi
+
+log_info "Verified source is a valid BTRFS subvolume: $SOURCE_PATH"
+
+# Test SSH connectivity
+log_info "Testing SSH connectivity to $DEST_HOST..."
+if ! "$SSH_CMD" $SSH_OPTS "$DEST_USER@$DEST_HOST" "echo SSH connection successful" >/dev/null 2>&1; then
+    log_error "SSH connection test failed. Please check your SSH configuration."
+    log_error "Make sure you can connect with: ssh $SSH_OPTS $DEST_USER@$DEST_HOST"
+    exit 1
+fi
+log_success "SSH connectivity test passed"
+
+# Create destination directory on remote host
+log_info "Creating destination directory on remote host..."
+MKDIR_CMD="mkdir -p $DEST_PATH"
+if $USE_SUDO; then
+    MKDIR_CMD="sudo $MKDIR_CMD"
+fi
+if ! "$SSH_CMD" $SSH_OPTS "$DEST_USER@$DEST_HOST" "$MKDIR_CMD" >/dev/null 2>&1; then
+    log_error "Failed to create destination directory on remote host"
+    exit 1
+fi
+log_success "Destination directory created"
+
+# Test if remote filesystem is BTRFS
+log_info "Verifying remote filesystem is BTRFS..."
+FS_TEST_CMD="stat -f -c %T $DEST_PATH"
+if $USE_SUDO; then
+    FS_TEST_CMD="sudo $FS_TEST_CMD"
+fi
+
+REMOTE_FS=$("$SSH_CMD" $SSH_OPTS "$DEST_USER@$DEST_HOST" "$FS_TEST_CMD" 2>/dev/null || echo "unknown")
+if [ "$REMOTE_FS" = "btrfs" ]; then
+    log_success "Remote filesystem is BTRFS"
+else
+    log_warning "Remote filesystem might not be BTRFS (found: $REMOTE_FS)"
+    
+    # Try alternative detection
+    DF_CMD="df -T $DEST_PATH"
+    if $USE_SUDO; then
+        DF_CMD="sudo $DF_CMD"
+    fi
+    
+    if "$SSH_CMD" $SSH_OPTS "$DEST_USER@$DEST_HOST" "$DF_CMD" 2>/dev/null | grep -q "btrfs"; then
+        log_success "Remote filesystem is BTRFS (confirmed with df)"
+    else
+        # Try one more test - see if btrfs commands work
+        BTRFS_TEST_CMD="btrfs filesystem usage $DEST_PATH"
+        if $USE_SUDO; then
+            BTRFS_TEST_CMD="sudo $BTRFS_TEST_CMD"
+        fi
+        
+        if "$SSH_CMD" $SSH_OPTS "$DEST_USER@$DEST_HOST" "$BTRFS_TEST_CMD" >/dev/null 2>&1; then
+            log_success "Remote filesystem is BTRFS (confirmed with btrfs commands)"
+        else
+            log_error "Remote filesystem is not BTRFS. Transfer will likely fail."
+            log_error "Please ensure destination path is on a BTRFS filesystem."
+            
+            if $TEST_MODE; then
+                exit 1
+            else
+                log_warning "Continuing anyway as requested..."
+            fi
+        fi
+    fi
+fi
+
+# Exit if in test mode
+if $TEST_MODE; then
+    log_success "Test mode completed successfully. All checks passed."
+    exit 0
+fi
+
+# Get snapshot name for verification
+SNAPSHOT_NAME=$(basename "$SOURCE_PATH")
+
+# Start the transfer
+log_info "Starting BTRFS snapshot transfer..."
+log_info "Source: $SOURCE_PATH"
+log_info "Destination: $DESTINATION"
+
+# Build the command
+RECEIVE_CMD="btrfs receive $DEST_PATH"
+if $USE_SUDO; then
+    RECEIVE_CMD="sudo $RECEIVE_CMD"
+fi
+
+# Set up pipe command
+TRANSFER_CMD="\"$BTRFS_CMD\" send \"$SOURCE_PATH\" | \"$SSH_CMD\" $SSH_OPTS \"$DEST_USER@$DEST_HOST\" \"$RECEIVE_CMD\""
+log_verbose "Transfer command: $TRANSFER_CMD"
+
+# Start a timer
+START_TIME=$(date +%s)
+
+# Execute the transfer
+log_info "Transferring snapshot, this may take a while..."
+eval "$TRANSFER_CMD"
+TRANSFER_STATUS=$?
+
+END_TIME=$(date +%s)
+ELAPSED=$((END_TIME - START_TIME))
+
+if [ $TRANSFER_STATUS -eq 0 ]; then
+    log_success "Transfer completed successfully in $ELAPSED seconds"
+else
+    log_error "Transfer failed with status $TRANSFER_STATUS"
+    exit 1
+fi
+
+# Verify transfer success
+log_info "Verifying snapshot was transferred successfully..."
+VERIFY_CMD="test -d \"$DEST_PATH/$SNAPSHOT_NAME\""
+if $USE_SUDO; then
+    VERIFY_CMD="sudo $VERIFY_CMD"
+fi
+
+if "$SSH_CMD" $SSH_OPTS "$DEST_USER@$DEST_HOST" "$VERIFY_CMD"; then
+    log_success "Snapshot verified on remote host: $DEST_PATH/$SNAPSHOT_NAME"
+else
+    log_error "Failed to verify snapshot on remote host"
+    log_error "This may indicate the transfer appeared to succeed but actually failed"
+    exit 1
+fi
+
+# Print additional subvolume info if verbose
+if $VERBOSE; then
+    log_verbose "Remote subvolume information:"
+    SUBVOL_CMD="btrfs subvolume list -o $DEST_PATH"
+    if $USE_SUDO; then
+        SUBVOL_CMD="sudo $SUBVOL_CMD"
+    fi
+    "$SSH_CMD" $SSH_OPTS "$DEST_USER@$DEST_HOST" "$SUBVOL_CMD" | grep -i "$SNAPSHOT_NAME" || true
+fi
+
+log_success "BTRFS snapshot transferred successfully to remote host"
+exit 0
