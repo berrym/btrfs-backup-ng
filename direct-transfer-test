@@ -14,6 +14,15 @@ YELLOW='\033[0;33m'
 BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
+# Function to run command with sudo only if not already root
+run_elevated() {
+    if [[ $EUID -eq 0 ]]; then
+        "$@"
+    else
+        sudo "$@"
+    fi
+}
+
 # Default values
 SOURCE_PATH="/var/log"
 DESTINATION="mberry@192.168.5.79:/home/mberry/backups/var-log"
@@ -41,7 +50,7 @@ function log_error() {
 
 function cleanup() {
     log_info "Cleaning up..."
-    sudo btrfs subvolume delete "$FULL_SNAPSHOT_PATH" 2>/dev/null || true
+    run_elevated btrfs subvolume delete "$FULL_SNAPSHOT_PATH" 2>/dev/null || true
 }
 
 # Register cleanup on exit
@@ -81,12 +90,12 @@ fi
 # Create snapshot directory if it doesn't exist
 if [[ ! -d "$SNAPSHOT_DIR" ]]; then
     log_info "Creating snapshot directory..."
-    sudo mkdir -p "$SNAPSHOT_DIR"
+    run_elevated mkdir -p "$SNAPSHOT_DIR"
 fi
 
 # Create a temporary snapshot
 log_info "Creating temporary snapshot..."
-sudo btrfs subvolume snapshot -r "$SOURCE_PATH" "$FULL_SNAPSHOT_PATH"
+run_elevated btrfs subvolume snapshot -r "$SOURCE_PATH" "$FULL_SNAPSHOT_PATH"
 log_success "Created snapshot: $FULL_SNAPSHOT_PATH"
 
 # Verify the remote filesystem is BTRFS
@@ -128,8 +137,8 @@ ssh -i "$IDENTITY_FILE" "$USER@$HOST" "sudo mkdir -p $PATH"
 
 # Try method 1: Direct SSH pipe with sudo
 log_info "Method 1: Direct SSH pipe with sudo"
-echo "$ sudo btrfs send $FULL_SNAPSHOT_PATH | ssh -i $IDENTITY_FILE $USER@$HOST 'sudo btrfs receive $PATH'"
-if sudo btrfs send "$FULL_SNAPSHOT_PATH" | ssh -i "$IDENTITY_FILE" "$USER@$HOST" "sudo btrfs receive $PATH"; then
+echo "$ btrfs send $FULL_SNAPSHOT_PATH | ssh -i $IDENTITY_FILE $USER@$HOST 'sudo btrfs receive $PATH'"
+if run_elevated btrfs send "$FULL_SNAPSHOT_PATH" | ssh -i "$IDENTITY_FILE" "$USER@$HOST" "sudo btrfs receive $PATH"; then
     log_success "Method 1 succeeded!"
     
     # Verify snapshot was received
@@ -153,8 +162,8 @@ fi
 command -v mbuffer >/dev/null 2>&1 && HAS_MBUFFER=true || HAS_MBUFFER=false
 if $HAS_MBUFFER; then
     log_info "Method 2: Direct SSH pipe with mbuffer"
-    echo "$ sudo btrfs send $FULL_SNAPSHOT_PATH | mbuffer -q -s 64M | ssh -i $IDENTITY_FILE $USER@$HOST 'sudo btrfs receive $PATH'"
-    if sudo btrfs send "$FULL_SNAPSHOT_PATH" | mbuffer -q -s 64M | ssh -i "$IDENTITY_FILE" "$USER@$HOST" "sudo btrfs receive $PATH"; then
+    echo "$ btrfs send $FULL_SNAPSHOT_PATH | mbuffer -q -s 64M | ssh -i $IDENTITY_FILE $USER@$HOST 'sudo btrfs receive $PATH'"
+    if run_elevated btrfs send "$FULL_SNAPSHOT_PATH" | mbuffer -q -s 64M | ssh -i "$IDENTITY_FILE" "$USER@$HOST" "sudo btrfs receive $PATH"; then
         log_success "Method 2 succeeded!"
     else
         log_error "Method 2 failed!"
@@ -166,8 +175,8 @@ fi
 # Try method 3: Direct SSH pipe with netcat
 log_info "Method 3: Using netcat for transfer"
 NC_PORT=12345
-echo "$ sudo nc -l $NC_PORT | sudo btrfs receive $PATH (remote)"
-echo "$ sudo btrfs send $FULL_SNAPSHOT_PATH | nc $HOST $NC_PORT (local)"
+echo "$ nc -l $NC_PORT | sudo btrfs receive $PATH (remote)"
+echo "$ btrfs send $FULL_SNAPSHOT_PATH | nc $HOST $NC_PORT (local)"
 
 # Start receiver on remote host in background
 ssh -i "$IDENTITY_FILE" "$USER@$HOST" "sudo nc -l $NC_PORT | sudo btrfs receive $PATH" &
@@ -177,7 +186,7 @@ NC_PID=$!
 sleep 2
 
 # Send snapshot
-if sudo btrfs send "$FULL_SNAPSHOT_PATH" | nc "$HOST" "$NC_PORT"; then
+if run_elevated btrfs send "$FULL_SNAPSHOT_PATH" | nc "$HOST" "$NC_PORT"; then
     log_success "Method 3 succeeded!"
 else
     log_error "Method 3 failed!"

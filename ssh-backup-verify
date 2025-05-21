@@ -8,6 +8,15 @@
 
 set -e
 
+# Function to run command with sudo only if not already root
+run_elevated() {
+    if [[ $EUID -eq 0 ]]; then
+        "$@"
+    else
+        sudo "$@"
+    fi
+}
+
 # Default values
 IDENTITY_FILE=""
 VERBOSE=false
@@ -118,13 +127,23 @@ fi
 # Check if we're root and fix SSH_AUTH_SOCK if needed
 if [[ $EUID -eq 0 && -z "$SSH_AUTH_SOCK" && -n "$SUDO_USER" ]]; then
     log_warning "Running as root without SSH_AUTH_SOCK - attempting to fix"
-    USER_SSH_AUTH_SOCK=$(sudo -u "$SUDO_USER" printenv SSH_AUTH_SOCK 2>/dev/null)
+    USER_SSH_AUTH_SOCK=$(run_elevated -u "$SUDO_USER" printenv SSH_AUTH_SOCK 2>/dev/null)
     if [[ -n "$USER_SSH_AUTH_SOCK" ]]; then
         export SSH_AUTH_SOCK="$USER_SSH_AUTH_SOCK"
         log_success "Fixed SSH_AUTH_SOCK: $SSH_AUTH_SOCK"
     else
         log_error "Cannot get SSH_AUTH_SOCK from original user - SSH authentication will likely fail"
         log_error "Please run with: sudo SSH_AUTH_SOCK=\$SSH_AUTH_SOCK $(basename $0) ..."
+    fi
+fi
+
+# Fix identity file path if needed
+if [[ -n "$IDENTITY_FILE" && ! -f "$IDENTITY_FILE" && $EUID -eq 0 && -n "$SUDO_USER" ]]; then
+    # The identity file might be in the user's home directory
+    USER_HOME=$(getent passwd "$SUDO_USER" | cut -d: -f6)
+    if [[ -f "${USER_HOME}/${IDENTITY_FILE#$HOME/}" ]]; then
+        IDENTITY_FILE="${USER_HOME}/${IDENTITY_FILE#$HOME/}"
+        log_success "Using identity file: $IDENTITY_FILE"
     fi
 fi
 
@@ -149,7 +168,7 @@ if [[ ! -d "$SNAPSHOT_DIR" ]]; then
     sudo mkdir -p "$SNAPSHOT_DIR"
 fi
 
-sudo btrfs subvolume snapshot -r "$SOURCE" "$FULL_SNAPSHOT_PATH"
+run_elevated btrfs subvolume snapshot -r "$SOURCE" "$FULL_SNAPSHOT_PATH"
 log_success "Created verification snapshot: $FULL_SNAPSHOT_PATH"
 
 # Build command for transfer script
@@ -168,7 +187,7 @@ fi
 CMD+=("$FULL_SNAPSHOT_PATH" "$DESTINATION")
 
 log_info "Executing transfer command: ${CMD[*]}"
-if sudo "${CMD[@]}"; then
+if run_elevated "${CMD[@]}"; then
     log_success "SSH backup verification successful!"
     log_success "Your SSH backup configuration is working correctly."
 else
@@ -180,7 +199,7 @@ fi
 
 # Clean up temporary snapshot
 log_info "Cleaning up temporary snapshot..."
-sudo btrfs subvolume delete "$FULL_SNAPSHOT_PATH"
+run_elevated btrfs subvolume delete "$FULL_SNAPSHOT_PATH"
 log_success "Temporary snapshot removed"
 
 log_info "Verification complete - SSH backups are working properly!"
