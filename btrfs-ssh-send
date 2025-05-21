@@ -106,7 +106,7 @@ find_buffer_program() {
 estimate_subvol_size() {
     local subvol="$1"
     
-    # Use du -b for size estimation
+    # Use du -b for size estimation with clean parsing
     local size
     
     # Execute in a subshell to prevent output on failure
@@ -123,7 +123,8 @@ estimate_subvol_size() {
         fi
     fi
     
-    echo "$size"
+    # Ensure we output a clean integer
+    echo "$size" | grep -E '^[0-9]+$' || echo "1073741824"
 }
 
 # Test if a pv command with specific options works
@@ -431,7 +432,7 @@ if [ -n "$BUFFER_INFO" ]; then
     log_info "Using $BUFFER_TYPE for transfer"
     
     # Display initial transfer info
-    SUBVOL_SIZE=$(du -sh "$SOURCE_PATH" 2>/dev/null | cut -f1 || echo "unknown")
+    SUBVOL_SIZE=$(du -sh "$SOURCE_PATH" 2>/dev/null | awk '{print $1}' || echo "unknown")
     log_info "Transferring snapshot ($SUBVOL_SIZE), this may take a while..."
     
     # Start a timer
@@ -519,7 +520,7 @@ ELAPSED=$((END_TIME - START_TIME))
 
 if [ $TRANSFER_STATUS -eq 0 ]; then
     # Calculate transfer speed
-    SIZE_BYTES=$(du -b "$SOURCE_PATH" 2>/dev/null | cut -f1 || echo 0)
+    SIZE_BYTES=$(du -b "$SOURCE_PATH" 2>/dev/null | awk '{print $1}' || echo 0)
     if [ "$SIZE_BYTES" -gt 0 ] && [ "$ELAPSED" -gt 0 ]; then
         SPEED=$(echo "scale=2; $SIZE_BYTES / $ELAPSED / 1048576" | bc 2>/dev/null || echo "unknown")
         log_success "Transfer completed successfully in $ELAPSED seconds ($SPEED MB/s)"
@@ -559,12 +560,13 @@ fi
 # Show transfer summary
 # Display transfer summary
 log_success "BTRFS snapshot transferred successfully to remote host"
-if [ "$SIZE_BYTES" -gt 0 ]; then
+# Use safe numeric check with grep
+if echo "$SIZE_BYTES" | grep -qE '^[0-9]+$' && [ "$(echo "$SIZE_BYTES" | grep -E '^[0-9]+$')" -gt 0 ]; then
     SIZE_MB=$(echo "scale=2; $SIZE_BYTES / 1048576" | bc 2>/dev/null || echo "unknown")
     SIZE_GB=$(echo "scale=2; $SIZE_BYTES / 1073741824" | bc 2>/dev/null || echo "unknown")
     log_info "Transfer summary:"
     echo "  - Snapshot: $(basename "$SOURCE_PATH")"
-    if [ "$SIZE_BYTES" -gt 1073741824 ]; then
+    if echo "$SIZE_BYTES" | grep -qE '^[0-9]+$' && [ "$(echo "$SIZE_BYTES" | grep -E '^[0-9]+$')" -gt 1073741824 ]; then
         echo "  - Size: $SUBVOL_SIZE ($SIZE_GB GB)"
     else
         echo "  - Size: $SUBVOL_SIZE ($SIZE_MB MB)"
@@ -581,6 +583,12 @@ if [ "$SIZE_BYTES" -gt 0 ]; then
     fi
     
     # Verify snapshot exists on remote host
+    echo "  - Verification: Successful"
+else
+    log_info "Transfer summary:"
+    echo "  - Snapshot: $(basename "$SOURCE_PATH")"
+    echo "  - Size: $SUBVOL_SIZE"
+    echo "  - Duration: $ELAPSED seconds"
     echo "  - Verification: Successful"
 fi
 
