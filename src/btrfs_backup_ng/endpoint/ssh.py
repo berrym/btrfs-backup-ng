@@ -172,12 +172,13 @@ class SSHEndpoint(Endpoint):
         # Ensure all elements are strings
         command = [str(c) for c in command]
         
+        # Check if the ssh_sudo flag is set
         if self.config.get("ssh_sudo", False):
             cmd_str = " ".join(command)
             logger.debug("Using sudo for remote command: %s", cmd_str)
             
             # Special handling for btrfs receive which needs to be root
-            if command[0] == "btrfs" and command[1] == "receive":
+            if len(command) > 1 and command[0] == "btrfs" and command[1] == "receive":
                 # For btrfs receive, we want to ensure sudo works even if it requires a password
                 # Add -E to preserve environment variables
                 # Add -P to preserve PATH which is important for finding the btrfs binary
@@ -202,6 +203,8 @@ class SSHEndpoint(Endpoint):
             else:
                 # Use -n to avoid password prompt for other commands
                 return ["sudo", "-n"] + command
+        else:
+            logger.debug("Not using sudo for remote command (ssh_sudo=False): %s", command)
         return command
 
     def _exec_remote_command(self, command, **kwargs) -> subprocess.CompletedProcess:
@@ -421,6 +424,9 @@ class SSHEndpoint(Endpoint):
             except Exception as e:
                 logger.warning(f"Error creating destination directory: {e}")
         
+        # Check if btrfs commands require sudo on remote host
+        requires_sudo = True
+        
         # Test if remote destination directory is writeable without sudo first
         dest_dir = os.path.dirname(destination)
         if dest_dir:
@@ -439,7 +445,7 @@ class SSHEndpoint(Endpoint):
                     if btrfs_result.returncode == 0:
                         logger.info("btrfs command is available without sudo - will try direct receive")
                         logger.debug("Using direct btrfs receive without sudo")
-                        return receive_cmd
+                        requires_sudo = False
                     else:
                         logger.debug("btrfs command requires sudo even though directory is writeable")
                 else:
@@ -447,12 +453,26 @@ class SSHEndpoint(Endpoint):
             except Exception as e:
                 logger.debug(f"Error testing direct write access: {e}")
         
+        # Force using sudo if ssh_sudo option is enabled, regardless of write access
+        if self.config.get("ssh_sudo", False):
+            logger.debug("ssh_sudo option is enabled, forcing use of sudo for receive command")
+            requires_sudo = True
+        
+        # Modify the receive command with sudo if needed
+        if requires_sudo and not self.config.get("ssh_sudo", False):
+            logger.warning("btrfs commands require sudo on remote host but --ssh-sudo not specified")
+            logger.warning("Consider using --ssh-sudo option to enable sudo on remote host")
+        
         # Build the remote command with optional sudo
         receive_cmd = self._build_remote_command(receive_cmd)
         
         # Determine if we need a TTY for this command (needed if sudo might prompt for password)
         needs_tty = False
-        if self.config.get("ssh_sudo", False) and not self.config.get("passwordless", False):
+        # Always set needs_tty to True if ssh_sudo is enabled, regardless of passwordless setting
+        if self.config.get("ssh_sudo", False):
+            logger.debug("SSH sudo enabled - forcing TTY allocation for sudo authentication")
+            needs_tty = True
+        elif not self.config.get("passwordless", False):
             # If using sudo without passwordless, we might need a TTY
             logger.debug("Sudo configuration detected that may require TTY")
             needs_tty = True
@@ -518,6 +538,10 @@ class SSHEndpoint(Endpoint):
                 # Not using TTY, ensure non-interactive mode
                 env["SSH_ASKPASS_REQUIRE"] = "never"
             
+            # Log the complete command for debugging
+            full_cmd_str = " ".join(map(str, ssh_cmd))
+            logger.debug("Full SSH receive command: %s", full_cmd_str)
+            
             # Create named FIFO pipes for better stream handling if necessary
             receive_process = subprocess.Popen(
                 ssh_cmd,
@@ -530,6 +554,7 @@ class SSHEndpoint(Endpoint):
             )
             
             logger.debug("btrfs receive process started with PID: %d", receive_process.pid)
+            logger.debug("If receive fails, verify remote user has sudo access for btrfs commands")
             return receive_process
         except Exception as e:
             logger.error("Failed to start btrfs receive process: %s", e)

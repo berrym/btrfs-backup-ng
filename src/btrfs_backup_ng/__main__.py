@@ -140,23 +140,35 @@ def send_snapshot(snapshot, destination_endpoint, parent=None, clones=None) -> N
             hasattr(destination_endpoint, "_is_remote")
             and destination_endpoint._is_remote
         )
-        is_using_sudo = is_ssh_endpoint and destination_endpoint.config.get(
-            "ssh_sudo", False
-        )
+        is_using_sudo = False
+            
+        if is_ssh_endpoint:
+            # Ensure the ssh_sudo flag is propagated to the endpoint config
+            if options.get("ssh_sudo", False):
+                destination_endpoint.config["ssh_sudo"] = True
+                is_using_sudo = True
+            else:
+                is_using_sudo = destination_endpoint.config.get("ssh_sudo", False)
 
         if is_ssh_endpoint and not is_using_sudo:
             logger.warning(
                 "Using SSH destination without --ssh-sudo. This may fail if the remote user doesn't have permissions for btrfs commands."
             )
+            # Check if we should force ssh_sudo based on command-line options
+            if options.get("ssh_sudo", False):
+                logger.info("Enabling SSH sudo based on command-line option")
+                destination_endpoint.config["ssh_sudo"] = True
+                is_using_sudo = True
 
         try:
             receive_process = destination_endpoint.receive(send_process.stdout)
             if receive_process is None:
                 logger.error("Failed to start receive process - receive_process is None")
-                if is_ssh_endpoint and not is_using_sudo:
-                    logger.error(
-                        "For SSH destinations, try using --ssh-sudo if the remote user needs elevated permissions"
-                    )
+                if is_ssh_endpoint:
+                    if not destination_endpoint.config.get("ssh_sudo", False):
+                        logger.error(
+                            "For SSH destinations, try using --ssh-sudo if the remote user needs elevated permissions"
+                        )
                 raise __util__.SnapshotTransferError("Receive process failed to start")
         except Exception as e:
             logger.error("Failed to start receive process: %s", e)
@@ -942,6 +954,11 @@ def prepare_destination_endpoints(options, source_endpoint):
     endpoint_kwargs = build_endpoint_kwargs(options)
     # Ensure 'path' is NOT in endpoint_kwargs
     endpoint_kwargs.pop("path", None)
+    
+    # Ensure SSH sudo flag is propagated
+    if options.get("ssh_sudo", False):
+        logger.debug("SSH sudo enabled in options, propagating to endpoint kwargs")
+        endpoint_kwargs["ssh_sudo"] = True
 
     logger.info("Preparing destination endpoints...")
     for destination in options["destinations"]:
@@ -962,6 +979,13 @@ def prepare_destination_endpoints(options, source_endpoint):
                 logger.debug(
                     "Endpoint path: %s", destination_endpoint.config.get("path")
                 )
+                
+                # Verify SSH sudo config if this is an SSH endpoint
+                if hasattr(destination_endpoint, "_is_remote") and destination_endpoint._is_remote:
+                    logger.debug("SSH sudo setting: %s", destination_endpoint.config.get("ssh_sudo", False))
+                    if options.get("ssh_sudo", False) and not destination_endpoint.config.get("ssh_sudo", False):
+                        logger.warning("SSH sudo flag not properly propagated, fixing...")
+                        destination_endpoint.config["ssh_sudo"] = True
             except NameError as e:
                 logger.error("NameError in choose_endpoint: %s", e)
                 logger.error("Missing import? %s", str(e))
