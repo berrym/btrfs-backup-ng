@@ -141,10 +141,23 @@ else
     DEST_HOST="$HOST_PART"
 fi
 
-# Set up SSH command
-SSH_OPTS="-o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10"
+# Set up SSH command with better options for reliability
+SSH_OPTS="-o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 -o ServerAliveInterval=5 -o ServerAliveCountMax=3"
 if [[ -n "$IDENTITY_FILE" ]]; then
     SSH_OPTS="$SSH_OPTS -i $IDENTITY_FILE"
+fi
+
+# Handle SSH_AUTH_SOCK if running with sudo
+if [[ "$EUID" -eq 0 && -n "$SSH_AUTH_SOCK" ]]; then
+    verbose "Using SSH_AUTH_SOCK for authentication: $SSH_AUTH_SOCK"
+    # SSH_AUTH_SOCK is already set, we're good
+elif [[ "$EUID" -eq 0 && -n "$SUDO_USER" && -z "$SSH_AUTH_SOCK" ]]; then
+    # Try to get SSH_AUTH_SOCK from the original user if running as root
+    ORIGINAL_USER_SSH_AUTH_SOCK=$(sudo -u "$SUDO_USER" printenv SSH_AUTH_SOCK 2>/dev/null)
+    if [[ -n "$ORIGINAL_USER_SSH_AUTH_SOCK" ]]; then
+        export SSH_AUTH_SOCK="$ORIGINAL_USER_SSH_AUTH_SOCK"
+        verbose "Set SSH_AUTH_SOCK from original user: $SSH_AUTH_SOCK"
+    fi
 fi
 
 # Check for buffer programs
@@ -173,9 +186,34 @@ fi
 SNAPSHOT_NAME=$(basename "$SOURCE_PATH")
 verbose "Snapshot name: $SNAPSHOT_NAME"
 
+# Handle wildcards in source path
+if [[ "$SOURCE_PATH" == *"*"* ]]; then
+    # When a wildcard is used, find the most recent matching snapshot
+    log_info "Wildcard detected in source path, finding most recent matching snapshot..."
+    EXPANDED_PATHS=()
+    
+    # Use sudo if needed because snapshot directory might not be readable by current user
+    if [[ -n "$(which sudo 2>/dev/null)" && "$SOURCE_PATH" == /var/* ]]; then
+        EXPANDED_PATHS=($(sudo ls -d $SOURCE_PATH 2>/dev/null | sort -r))
+    else
+        EXPANDED_PATHS=($(ls -d $SOURCE_PATH 2>/dev/null | sort -r))
+    fi
+    
+    if [[ ${#EXPANDED_PATHS[@]} -eq 0 ]]; then
+        log_error "No snapshots match the pattern: $SOURCE_PATH"
+        exit 1
+    fi
+    
+    # Use the most recent snapshot (first in reverse-sorted list)
+    SOURCE_PATH="${EXPANDED_PATHS[0]}"
+    log_info "Selected most recent snapshot: $SOURCE_PATH"
+    SNAPSHOT_NAME=$(basename "$SOURCE_PATH")
+fi
+
 # Verify source path exists
 if [[ ! -d "$SOURCE_PATH" ]]; then
     log_error "Source snapshot does not exist: $SOURCE_PATH"
+    log_error "Please specify a valid btrfs snapshot path"
     exit 1
 fi
 
@@ -218,15 +256,41 @@ function test_remote_filesystem {
         sudo_cmd="sudo"
     fi
     
-    local fs_type=$(ssh $SSH_OPTS "$DEST_USER@$DEST_HOST" "$sudo_cmd stat -f -c %T $DEST_PATH" 2>/dev/null)
+    # First try using stat (most reliable)
+    local stat_cmd="$sudo_cmd stat -f -c %T $DEST_PATH"
+    verbose "Running remote filesystem check: $stat_cmd"
+    
+    local fs_type=$(ssh $SSH_OPTS "$DEST_USER@$DEST_HOST" "$stat_cmd" 2>/dev/null)
     
     if [[ "$fs_type" == "btrfs" ]]; then
         log_success "Remote filesystem is BTRFS"
         return 0
     else
-        log_error "Remote filesystem is not BTRFS (found: $fs_type)"
-        log_error "The destination must be on a BTRFS filesystem"
-        return 1
+        # Fall back to df -T
+        local df_cmd="$sudo_cmd df -T $DEST_PATH"
+        verbose "Trying alternate filesystem check: $df_cmd"
+        
+        local df_output=$(ssh $SSH_OPTS "$DEST_USER@$DEST_HOST" "$df_cmd" 2>/dev/null)
+        
+        if [[ "$df_output" == *"btrfs"* ]]; then
+            log_success "Remote filesystem is BTRFS (detected via df)"
+            return 0
+        else
+            # Try one last method - check if btrfs subvolume list works
+            local btrfs_cmd="$sudo_cmd btrfs subvolume list $DEST_PATH"
+            verbose "Final filesystem check: $btrfs_cmd"
+            
+            if ssh $SSH_OPTS "$DEST_USER@$DEST_HOST" "$btrfs_cmd" &>/dev/null; then
+                log_success "Remote filesystem is BTRFS (can run btrfs commands)"
+                return 0
+            else
+                log_error "Remote filesystem is not BTRFS (found: ${fs_type:-unknown})"
+                log_error "The destination must be on a BTRFS filesystem"
+                log_error "Remote filesystem details:"
+                ssh $SSH_OPTS "$DEST_USER@$DEST_HOST" "$sudo_cmd df -T $DEST_PATH" 2>/dev/null | head -2
+                return 1
+            fi
+        fi
     fi
 }
 
@@ -241,21 +305,47 @@ function verify_snapshot_exists {
     log_info "Verifying snapshot exists on remote host..."
     
     # Try using btrfs subvolume list first
-    local subvol_output=$(ssh $SSH_OPTS "$DEST_USER@$DEST_HOST" "$sudo_cmd btrfs subvolume list -o $DEST_PATH" 2>/dev/null)
+    local subvol_cmd="$sudo_cmd btrfs subvolume list -o $DEST_PATH"
+    verbose "Running remote command: $subvol_cmd"
     
-    if [[ $? -eq 0 ]]; then
+    local subvol_output=$(ssh $SSH_OPTS "$DEST_USER@$DEST_HOST" "$subvol_cmd" 2>/dev/null)
+    local exit_code=$?
+    
+    # Log the output for debugging
+    verbose "Remote subvolume list exit code: $exit_code"
+    verbose "Remote subvolume list output: $subvol_output"
+    
+    if [[ $exit_code -eq 0 ]]; then
         if [[ "$subvol_output" == *"$snapshot_name"* ]]; then
             log_success "Snapshot found on remote host: $snapshot_name"
+            # Show other subvolumes for reference
+            echo "Other subvolumes on remote host:"
+            echo "$subvol_output" | grep -v "$snapshot_name" | head -5
             return 0
         fi
     fi
     
+    # Check for any subvolumes (not just our specific one)
+    if [[ -n "$subvol_output" ]]; then
+        log_warning "No matching snapshot found, but other subvolumes exist on remote host:"
+        echo "$subvol_output" | head -5
+    fi
+    
     # Fall back to checking if the directory exists
-    if ssh $SSH_OPTS "$DEST_USER@$DEST_HOST" "$sudo_cmd test -d $DEST_PATH/$snapshot_name" 2>/dev/null; then
-        log_success "Snapshot directory exists on remote host"
+    local test_cmd="$sudo_cmd test -d $DEST_PATH/$snapshot_name"
+    verbose "Running remote directory test: $test_cmd"
+    
+    if ssh $SSH_OPTS "$DEST_USER@$DEST_HOST" "$test_cmd" 2>/dev/null; then
+        log_success "Snapshot directory exists on remote host at: $DEST_PATH/$snapshot_name"
         return 0
     else
         log_error "Snapshot not found on remote host: $snapshot_name"
+        log_error "Path checked: $DEST_PATH/$snapshot_name"
+        
+        # Try to determine filesystem type
+        log_error "Remote filesystem information (should be btrfs):"
+        ssh $SSH_OPTS "$DEST_USER@$DEST_HOST" "$sudo_cmd df -T $DEST_PATH" 2>/dev/null | head -2
+        
         return 1
     fi
 }
@@ -284,6 +374,9 @@ function perform_transfer {
     # Build receive command
     local receive_cmd="$sudo_cmd btrfs receive $DEST_PATH"
     
+    # Log remote filesystem type for verification
+    ssh $SSH_OPTS "$DEST_USER@$DEST_HOST" "$sudo_cmd df -T $DEST_PATH" 2>/dev/null | grep -v "Filesystem" | head -1
+    
     # Build full command with pipe
     local full_cmd=""
     if [[ -n "$BUFFER_CMD" ]]; then
@@ -294,16 +387,39 @@ function perform_transfer {
     
     verbose "Executing transfer command: $full_cmd"
     
-    # Execute the transfer
+    # Create a log file for the transfer
+    local log_file="/tmp/btrfs-transfer-$$.log"
+    
+    # Execute the transfer with logging
     local start_time=$(date +%s)
-    if eval "$full_cmd"; then
+    {
+        eval "$full_cmd" 2>&1 
+        echo "EXIT_CODE=$?" > "$log_file.status"
+    } | tee "$log_file" 
+    
+    # Get exit code from status file
+    local exit_code=1
+    if [[ -f "$log_file.status" ]]; then
+        source "$log_file.status"
+    fi
+    
+    if [[ $exit_code -eq 0 ]]; then
         local end_time=$(date +%s)
         local elapsed=$((end_time - start_time))
         log_success "Transfer completed in $elapsed seconds"
         return 0
     else
-        local exit_code=$?
         log_error "Transfer failed with exit code $exit_code"
+        log_error "Transfer log available at: $log_file"
+        
+        # Extract the last few lines of the log for error context
+        if [[ -f "$log_file" ]]; then
+            echo "----------------------------------------"
+            echo "Last 10 lines of transfer log:"
+            tail -10 "$log_file"
+            echo "----------------------------------------"
+        fi
+        
         return $exit_code
     fi
 }

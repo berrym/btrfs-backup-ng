@@ -187,7 +187,19 @@ def send_snapshot(snapshot, destination_endpoint, parent=None, clones=None) -> N
                 logger.info(f"Using dedicated SSH transfer script from {snapshot_path} to {ssh_destination}")
                 
                 # Build the command line for our transfer script
-                script_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "bin", "btrfs-ssh-transfer")
+                script_path = os.path.join("/usr/bin", "btrfs-ssh-transfer")
+                # If script doesn't exist in system path, try to find it relative to this file
+                if not os.path.exists(script_path):
+                    script_path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "bin", "btrfs-ssh-transfer")
+                    if not os.path.exists(script_path):
+                        # Last attempt - try current directory
+                        script_path = os.path.join(os.getcwd(), "bin", "btrfs-ssh-transfer")
+                        
+                logger.debug(f"Using SSH transfer script at: {script_path}")
+                if not os.path.exists(script_path):
+                    logger.error(f"SSH transfer script not found at: {script_path}")
+                    logger.error("Please ensure btrfs-ssh-transfer script is installed")
+                    raise __util__.SnapshotTransferError("SSH transfer script not found")
                 
                 cmd = [script_path]
                 
@@ -200,14 +212,20 @@ def send_snapshot(snapshot, destination_endpoint, parent=None, clones=None) -> N
                     cmd.extend(["--parent", parent_path])
                 cmd.append("--verbose")
                 
-                # Add source and destination
-                cmd.append(snapshot_path)
-                cmd.append(ssh_destination)
+                # Add source and destination - ensure quotes for paths with spaces
+                cmd.append(snapshot_path.replace(" ", "\\ "))
+                cmd.append(ssh_destination.replace(" ", "\\ "))
                 
                 logger.debug(f"Running SSH transfer script: {' '.join(cmd)}")
                 
-                # Execute the transfer script
-                result = subprocess.run(cmd, capture_output=True, text=True)
+                # Execute the transfer script with proper environment
+                env = os.environ.copy()
+                # Ensure PATH includes the directory with our script
+                script_dir = os.path.dirname(script_path)
+                env["PATH"] = f"{script_dir}:{env.get('PATH', '')}"
+                
+                logger.debug(f"Running SSH transfer command: {' '.join(cmd)}")
+                result = subprocess.run(cmd, capture_output=True, text=True, env=env)
                 
                 if result.returncode == 0:
                     logger.info("SSH transfer completed successfully")
