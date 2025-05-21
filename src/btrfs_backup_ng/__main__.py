@@ -207,6 +207,9 @@ def send_snapshot(snapshot, destination_endpoint, parent=None, clones=None) -> N
                     os.path.join(os.path.dirname(os.getcwd()), script_name),
                     # Absolute path from current directory
                     os.path.abspath(script_name),
+                    # Additional project-related paths
+                    os.path.join(os.path.dirname(project_root), script_name),
+                    os.path.join(project_root, "bin", script_name),
                 ]
                 
                 # Deduplicate paths
@@ -226,24 +229,49 @@ def send_snapshot(snapshot, destination_endpoint, parent=None, clones=None) -> N
                             break
                         else:
                             logger.debug(f"Found {path} but it's not executable")
+                            # Try to make it executable
+                            try:
+                                os.chmod(path, 0o755)
+                                logger.debug(f"Made {path} executable")
+                                script_path = path
+                                break
+                            except Exception as e:
+                                logger.debug(f"Failed to make {path} executable: {e}")
                 
                 # Check if script was found
                 if script_path:
                     logger.debug(f"Using SSH transfer script at: {script_path}")
                 else:
-                    # Last resort - try copying our script to /tmp and make it executable
+                    # Last resort - create a temporary copy of the embedded script
                     logger.warning(f"SSH transfer script '{script_name}' not found in standard locations")
-                    for path in script_paths:
-                        if os.path.exists(path) and not os.access(path, os.X_OK):
-                            logger.info(f"Found non-executable script at {path}, trying to make it executable")
-                            try:
-                                os.chmod(path, 0o755)
-                                script_path = path
-                                break
-                            except Exception as e:
-                                logger.warning(f"Failed to make {path} executable: {e}")
-                    
-                    if not script_path:
+                    try:
+                        # Check if we have the script embedded as a resource
+                        embedded_script_path = os.path.join(os.path.dirname(__file__), "resources", script_name)
+                        if os.path.exists(embedded_script_path):
+                            # Copy to /tmp and make executable
+                            tmp_script_path = os.path.join("/tmp", script_name)
+                            with open(embedded_script_path, "r") as src, open(tmp_script_path, "w") as dst:
+                                dst.write(src.read())
+                            os.chmod(tmp_script_path, 0o755)
+                            script_path = tmp_script_path
+                            logger.info(f"Created temporary script at {tmp_script_path}")
+                        else:
+                            # Try to create a basic version of the script
+                            logger.warning("Embedded script not found, creating a basic version")
+                            basic_script = """#!/bin/bash
+# Basic SSH transfer script for btrfs-backup-ng
+set -e
+echo "Transferring $1 to $2..."
+btrfs send "$1" | ssh $3 "sudo btrfs receive $(echo $2 | cut -d: -f2)"
+"""
+                            tmp_script_path = os.path.join("/tmp", script_name)
+                            with open(tmp_script_path, "w") as f:
+                                f.write(basic_script)
+                            os.chmod(tmp_script_path, 0o755)
+                            script_path = tmp_script_path
+                            logger.info(f"Created basic script at {tmp_script_path}")
+                    except Exception as e:
+                        logger.error(f"Failed to create temporary script: {e}")
                         logger.error(f"SSH transfer script '{script_name}' not found")
                         logger.error(f"Searched in: {', '.join(script_paths)}")
                         raise __util__.SnapshotTransferError("SSH transfer script not found")
@@ -259,8 +287,17 @@ def send_snapshot(snapshot, destination_endpoint, parent=None, clones=None) -> N
                     cmd.extend(["--identity", identity_file])
                 if parent_path:
                     cmd.extend(["--parent", parent_path])
-                cmd.append("--verbose")
+                    # Also pass parent path as an alternate option for compatibility
+                    cmd.extend(["-p", parent_path])
                 
+                # Add verbose flag if requested
+                if options.get("verbosity", "").upper() in ("DEBUG", "TRACE"):
+                    cmd.append("--verbose")
+                
+                # Benefit from btrfs-backup-ng's incremental transfer knowledge
+                if parent:
+                    logger.debug(f"Using incremental transfer with parent snapshot: {parent}")
+                    
                 # Add source and destination
                 cmd.append(snapshot_path)
                 cmd.append(ssh_destination)
@@ -276,43 +313,75 @@ def send_snapshot(snapshot, destination_endpoint, parent=None, clones=None) -> N
                     env["PATH"] = f"{script_dir}:{env.get('PATH', '')}"
                     logger.debug(f"Added {script_dir} to PATH")
                 
+                # Ensure SSH_AUTH_SOCK is preserved if present
+                if "SSH_AUTH_SOCK" in os.environ and "SSH_AUTH_SOCK" not in env:
+                    env["SSH_AUTH_SOCK"] = os.environ["SSH_AUTH_SOCK"]
+                    logger.debug(f"Preserved SSH_AUTH_SOCK: {env['SSH_AUTH_SOCK']}")
+                
                 # Execute the transfer script with expanded environment
                 try:
-                    logger.debug(f"Executing {script_path} with PATH: {env.get('PATH')}")
+                    logger.info(f"Transferring snapshot using external SSH script")
+                    logger.debug(f"Executing: {' '.join(cmd)}")
                     result = subprocess.run(cmd, capture_output=True, text=True, env=env)
                 except Exception as e:
                     logger.error(f"Failed to execute SSH transfer script: {e}")
                     logger.error(f"Script path: {script_path}")
                     logger.error(f"Command: {' '.join(cmd)}")
+                    if "SSH_AUTH_SOCK" not in env:
+                        logger.error("SSH_AUTH_SOCK not found in environment - authentication may fail")
+                        logger.error("Try running with: sudo SSH_AUTH_SOCK=$SSH_AUTH_SOCK btrfs-backup-ng ...")
                     raise __util__.SnapshotTransferError(f"SSH transfer script execution failed: {e}")
                 
                 if result.returncode == 0:
                     logger.info("SSH transfer completed successfully")
+                    # Process stdout for important information
                     for line in result.stdout.splitlines():
                         if line.strip():
-                            logger.info(f"Transfer output: {line}")
+                            # Log important lines from script output
+                            if any(marker in line for marker in ["SUCCESS", "INFO", "snapshot verified", "Transfer completed"]):
+                                logger.info(f"Transfer: {line}")
+                            elif "WARNING" in line:
+                                logger.warning(f"Transfer: {line}")
+                            elif "ERROR" in line:
+                                logger.error(f"Transfer: {line}")
+                            elif "DEBUG" in line and options.get("verbosity", "").upper() == "DEBUG":
+                                logger.debug(f"Transfer: {line}")
                     
-                    # Verify the transfer manually as backup
-                    logger.debug("Performing additional verification of successful transfer")
+                    # Perform additional verification to ensure transfer worked
+                    logger.debug("Performing verification of successful transfer")
                     verify_cmd = ["ssh"]
                     if identity_file:
                         verify_cmd.extend(["-i", identity_file])
-                    verify_cmd.extend([f"{dest_user}@{dest_host}", f"ls -la {dest_path}/{os.path.basename(snapshot_path)}"])
+                    verify_cmd.extend([f"{dest_user}@{dest_host}", f"test -d {dest_path}/{os.path.basename(snapshot_path)} && echo 'VERIFIED' || echo 'NOT_FOUND'"])
                     
                     try:
                         verify_result = subprocess.run(verify_cmd, capture_output=True, text=True)
-                        if verify_result.returncode == 0:
-                            logger.info("Additional verification confirmed snapshot exists on remote host")
+                        if verify_result.returncode == 0 and "VERIFIED" in verify_result.stdout:
+                            logger.info("Snapshot successfully verified on remote host")
+                            # Register snapshot in destination endpoint's cache
+                            try:
+                                destination_endpoint.add_snapshot(snapshot)
+                                logger.debug(f"Added snapshot {snapshot} to destination endpoint cache")
+                            except Exception as e:
+                                logger.debug(f"Could not add snapshot to destination cache: {e}")
                         else:
-                            logger.warning("Additional verification could not confirm snapshot - transfer may have failed silently")
+                            logger.warning("Verification could not confirm snapshot exists - transfer may have failed")
+                            logger.warning("This could mean either an SSH connectivity issue or the transfer did not complete")
                     except Exception as e:
-                        logger.warning(f"Could not perform additional verification: {e}")
+                        logger.warning(f"Could not perform verification: {e}")
                 else:
                     logger.error(f"SSH transfer failed with exit code {result.returncode}")
                     for line in result.stderr.splitlines():
                         if line.strip():
                             logger.error(f"Transfer error: {line}")
-                    logger.error(f"Full stdout: {result.stdout}")
+                    
+                    # Show stdout for debugging even on failure
+                    if options.get("verbosity", "").upper() == "DEBUG":
+                        logger.debug("Transfer output:")
+                        for line in result.stdout.splitlines():
+                            if line.strip():
+                                logger.debug(f"  {line}")
+                    
                     raise __util__.SnapshotTransferError("SSH transfer script failed - see logs for details")
                 
                 # For direct SSH transfer, we fake the return codes as successful
@@ -1022,9 +1091,32 @@ def run_task(options, queue=None):
     logger.debug("Waiting briefly for any pending operations to complete...")
     time.sleep(1)
     
-    # For SSH endpoints, we skip final verification since our standalone script 
-    # already handles comprehensive verification
-    logger.debug("Skipping final verification as btrfs-ssh-send script handles this")
+    # For SSH endpoints, perform one final comprehensive verification
+    logger.debug("Performing final verification for SSH endpoints")
+    for destination_endpoint in destination_endpoints:
+        if (hasattr(destination_endpoint, "_is_remote") and 
+            getattr(destination_endpoint, "_is_remote", False)):
+            try:
+                logger.debug(f"Verifying SSH endpoint: {destination_endpoint}")
+                source_snapshots = source_endpoint.list_snapshots()
+                logger.debug(f"Found {len(source_snapshots)} source snapshots")
+                
+                # Check for snapshots on destination
+                dest_snapshots = destination_endpoint.list_snapshots(flush_cache=True)
+                logger.debug(f"Found {len(dest_snapshots)} destination snapshots")
+                
+                # Calculate successful transfer rate
+                if source_snapshots and dest_snapshots:
+                    transferred = [s for s in source_snapshots if any(d.get_name() == s.get_name() for d in dest_snapshots)]
+                    percent = len(transferred) / len(source_snapshots) * 100 if source_snapshots else 0
+                    logger.info(f"SSH backups: {len(transferred)}/{len(source_snapshots)} snapshots transferred ({percent:.1f}%)")
+                
+                # If no snapshots found on destination, log a warning
+                if not dest_snapshots:
+                    logger.warning(f"No snapshots found on SSH destination: {destination_endpoint}")
+                    logger.warning("SSH transfers may not be working correctly")
+            except Exception as e:
+                logger.warning(f"Error during final verification: {e}")
 
     # Enforce retention for source and destination endpoints only once, at the end
     cleanup_snapshots(source_endpoint, destination_endpoints, options)
