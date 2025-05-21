@@ -44,6 +44,8 @@ import time
 import traceback
 from pathlib import Path  # Required for path handling
 
+from . import ssh_transfer
+
 from rich.align import Align
 from rich.layout import Layout
 from rich.live import Live
@@ -162,68 +164,48 @@ def send_snapshot(snapshot, destination_endpoint, parent=None, clones=None) -> N
                     "Using SSH destination without --ssh-sudo. This may fail if the remote user doesn't have permissions for btrfs commands."
                 )
 
-        # For SSH endpoints, we'll always force the use of a direct pipe for reliability
-        use_direct_pipe = is_ssh_endpoint
-        logger.debug("Using direct SSH pipe for SSH endpoint: %s", use_direct_pipe)
+        # For SSH endpoints, use our dedicated SSH transfer module
+        use_ssh_transfer = is_ssh_endpoint
+        logger.debug("Using dedicated SSH transfer module: %s", use_ssh_transfer)
         
-        if use_direct_pipe:
+        if use_ssh_transfer:
             try:
-                # Use a direct pipe approach instead of the regular send/receive
-                logger.debug("Using direct SSH pipe transfer - this bypasses the normal btrfs send/receive")
-                
-                # Get the snapshot path
+                # Get the snapshot and config details
                 snapshot_path = str(snapshot.get_path())
-                destination_path = destination_endpoint.config["path"]
-                logger.info(f"SSH direct transfer from {snapshot_path} to {destination_endpoint}")
-                
-                # Use a simpler, more direct approach - build a direct SSH pipe command
-                source_path = snapshot_path
+                snapshot_name = snapshot.get_name()
                 dest_host = destination_endpoint.hostname
                 dest_path = destination_endpoint.config["path"]
                 dest_user = destination_endpoint.config.get("username", os.getenv("USER"))
-                sudo_flag = "sudo" if destination_endpoint.config.get("ssh_sudo", False) else ""
+                use_sudo = destination_endpoint.config.get("ssh_sudo", False)
                 identity_file = destination_endpoint.config.get("ssh_identity_file", "")
-                identity_arg = f"-i {identity_file}" if identity_file else ""
                 
-                # Build a direct command that pipes data between btrfs send and ssh btrfs receive
-                if parent:
-                    parent_path = str(parent.get_path())
-                    logger.debug(f"Using parent for incremental transfer: {parent_path}")
-                    direct_cmd = f"sudo btrfs send -p {parent_path} {source_path} | ssh {identity_arg} {dest_user}@{dest_host} '{sudo_flag} btrfs receive {dest_path}'"
-                else:
-                    direct_cmd = f"sudo btrfs send {source_path} | ssh {identity_arg} {dest_user}@{dest_host} '{sudo_flag} btrfs receive {dest_path}'"
+                # Parent for incremental transfers
+                parent_path = str(parent.get_path()) if parent else None
                 
-                logger.debug(f"Executing direct SSH pipe command: {direct_cmd}")
+                logger.info(f"Using dedicated SSH transfer from {snapshot_path} to {dest_host}:{dest_path}")
                 
-                # Run the command directly
-                result = subprocess.run(direct_cmd, shell=True, capture_output=True, text=True)
-                if result.returncode != 0:
-                    logger.error(f"Direct SSH pipe failed with exit code {result.returncode}")
-                    logger.error(f"Error output: {result.stderr}")
-                    raise __util__.SnapshotTransferError(f"Direct SSH pipe failed: {result.stderr}")
+                # Use our specialized transfer function
+                success = ssh_transfer.direct_ssh_transfer(
+                    source_path=snapshot_path,
+                    host=dest_host,
+                    dest_path=dest_path,
+                    snapshot_name=snapshot_name,
+                    parent_path=parent_path,
+                    user=dest_user,
+                    identity_file=identity_file,
+                    use_sudo=use_sudo
+                )
                 
-                logger.info("Direct SSH pipe transfer completed successfully")
-                # Verify transfer by checking if snapshot exists on remote host
-                logger.info("Verifying snapshot was created on remote host...")
-                verify_cmd = f"ssh {identity_arg} {dest_user}@{dest_host} '{sudo_flag} btrfs subvolume list {dest_path}'"
-                verify_result = subprocess.run(verify_cmd, shell=True, capture_output=True, text=True)
+                if not success:
+                    raise __util__.SnapshotTransferError("SSH transfer failed - see logs for details")
                 
-                if snapshot.get_name() in verify_result.stdout:
-                    logger.info("VERIFICATION SUCCESSFUL: Snapshot exists on remote host")
-                else:
-                    logger.error("VERIFICATION FAILED: Snapshot was NOT created on remote host")
-                    logger.error("This likely means the remote filesystem isn't btrfs or permissions are wrong")
-                    logger.error(f"Remote output: {verify_result.stdout}")
-                    raise __util__.SnapshotTransferError("Snapshot verification failed - transfer incomplete")
-                
-                # For direct pipe, we fake the return codes as successful
+                # For direct SSH transfer, we fake the return codes as successful
                 return_codes = [0, 0]
             except Exception as e:
-                logger.error("Error during SSH direct pipe transfer: %s", e)
+                logger.error("Error during SSH transfer: %s", e)
                 logger.error("SSH transfer failed. Check remote host permissions and filesystem type.")
                 logger.error("The remote filesystem MUST be btrfs and user MUST have sudo rights for btrfs commands")
-                logger.error(f"Direct command was: {direct_cmd}")
-                raise __util__.SnapshotTransferError(f"SSH direct pipe transfer failed: {e}")
+                raise __util__.SnapshotTransferError(f"SSH transfer failed: {e}")
         else:
             # Traditional send/receive process approach
             try:
@@ -689,16 +671,22 @@ files is allowed as well."""
         help="Execute commands with sudo on the remote host. REQUIRED for btrfs operations if the remote user doesn't have direct permissions to run btrfs commands. Remote user must have passwordless sudo access configured for btrfs commands.",
     )
     group.add_argument(
-        "--direct-ssh-pipe",
+        "--use-mbuffer",
         action="store_true",
         default=True,
-        help="Use direct SSH pipe method for better transfer reliability. This is now on by default and always used for SSH endpoints.",
+        help="Use mbuffer if available for more reliable SSH transfers. Enabled by default.",
     )
     group.add_argument(
         "--verify-transfer",
         action="store_true",
         default=True,
         help="Verify that snapshots were successfully created after transfer. This is now on by default.",
+    )
+    group.add_argument(
+        "--test-remote-filesystem",
+        action="store_true",
+        default=True,
+        help="Test remote filesystem is BTRFS before transfer. Enabled by default.",
     )
     group.add_argument(
         "--ssh-identity-file",
@@ -919,6 +907,8 @@ def run_task(options, queue=None):
     time.sleep(1)
     
     # For SSH endpoints, do a final verification that snapshots were created
+    # (This is now redundant since our ssh_transfer module handles verification,
+    # but we keep it for extra safety and logging)
     logger.debug("Performing final verification for SSH endpoints...")
     for destination_endpoint in destination_endpoints:
         if (hasattr(destination_endpoint, "_is_remote") and 
@@ -929,27 +919,37 @@ def run_task(options, queue=None):
             dest_host = destination_endpoint.hostname
             dest_path = destination_endpoint.config["path"]
             dest_user = destination_endpoint.config.get("username", os.getenv("USER"))
-            sudo_cmd = "sudo " if destination_endpoint.config.get("ssh_sudo", False) else ""
+            use_sudo = destination_endpoint.config.get("ssh_sudo", False)
             identity_file = destination_endpoint.config.get("ssh_identity_file", "")
-            identity_arg = f"-i {identity_file}" if identity_file else ""
             
-            # Build a command to list subvolumes on the remote host
-            verify_cmd = f"ssh {identity_arg} {dest_user}@{dest_host} '{sudo_cmd}btrfs subvolume list -o {dest_path}'"
-            logger.debug(f"Running verification command: {verify_cmd}")
-            
-            # Run the verification command
             try:
-                verify_result = subprocess.run(verify_cmd, shell=True, capture_output=True, text=True)
-                if verify_result.returncode == 0:
-                    if len(verify_result.stdout.strip()) > 0:
-                        logger.info(f"VERIFICATION SUCCESSFUL: Subvolumes found on remote host")
-                        logger.info(f"Remote subvolumes: {verify_result.stdout.strip()}")
-                    else:
-                        logger.error("VERIFICATION FAILED: No subvolumes found on remote host")
-                        logger.error("This indicates the transfer didn't work or the filesystem isn't btrfs")
+                # Use the verification function from our SSH transfer module
+                if ssh_transfer.test_remote_filesystem(
+                    host=dest_host,
+                    path=dest_path,
+                    user=dest_user,
+                    identity_file=identity_file,
+                    use_sudo=use_sudo
+                ):
+                    logger.info("Remote filesystem verified as BTRFS")
                 else:
-                    logger.error(f"VERIFICATION FAILED: Command returned non-zero exit code {verify_result.returncode}")
-                    logger.error(f"Error output: {verify_result.stderr}")
+                    logger.error("Remote filesystem verification failed - is it BTRFS?")
+                    
+                # Check for any BTRFS subvolumes
+                subvols_exist = ssh_transfer.verify_snapshot_exists(
+                    host=dest_host,
+                    path=dest_path,
+                    snapshot_name="",  # Empty to just check if any subvolumes exist
+                    user=dest_user,
+                    identity_file=identity_file,
+                    use_sudo=use_sudo
+                )
+                
+                if subvols_exist:
+                    logger.info("VERIFICATION SUCCESSFUL: Subvolumes found on remote host")
+                else:
+                    logger.error("VERIFICATION FAILED: No subvolumes found on remote host")
+                    logger.error("This indicates the transfer didn't work or the filesystem isn't btrfs")
             except Exception as e:
                 logger.error(f"Error during verification: {e}")
 
