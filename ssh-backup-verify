@@ -8,12 +8,53 @@
 
 set -e
 
+# Find the full path to btrfs command
+find_btrfs_cmd() {
+    for path in "/usr/bin/btrfs" "/usr/sbin/btrfs" "/bin/btrfs" "/sbin/btrfs"; do
+        if [[ -x "$path" ]]; then
+            echo "$path"
+            return 0
+        fi
+    done
+    
+    # Try using which command
+    local which_result=$(which btrfs 2>/dev/null)
+    if [[ -x "$which_result" ]]; then
+        echo "$which_result"
+        return 0
+    fi
+    
+    # If we get here, btrfs command not found
+    echo ""
+    return 1
+}
+
+# Get the btrfs command path
+BTRFS_CMD=$(find_btrfs_cmd)
+if [[ -z "$BTRFS_CMD" ]]; then
+    echo -e "${RED}ERROR: btrfs command not found in PATH${NC}"
+    echo "Please install btrfs-progs package"
+    exit 1
+fi
+
 # Function to run command with sudo only if not already root
 run_elevated() {
     if [[ $EUID -eq 0 ]]; then
-        "$@"
+        if [[ "$1" == "btrfs" ]]; then
+            # Use full path for btrfs command
+            shift
+            "$BTRFS_CMD" "$@"
+        else
+            "$@"
+        fi
     else
-        sudo "$@"
+        if [[ "$1" == "btrfs" ]]; then
+            # Use full path for btrfs command
+            shift
+            sudo "$BTRFS_CMD" "$@"
+        else
+            sudo "$@"
+        fi
     fi
 }
 
@@ -169,6 +210,7 @@ if [[ ! -d "$SNAPSHOT_DIR" ]]; then
 fi
 
 run_elevated btrfs subvolume snapshot -r "$SOURCE" "$FULL_SNAPSHOT_PATH"
+echo "Created snapshot: $($BTRFS_CMD subvolume show "$FULL_SNAPSHOT_PATH" | head -1)"
 log_success "Created verification snapshot: $FULL_SNAPSHOT_PATH"
 
 # Build command for transfer script
@@ -199,7 +241,7 @@ fi
 
 # Clean up temporary snapshot
 log_info "Cleaning up temporary snapshot..."
-run_elevated btrfs subvolume delete "$FULL_SNAPSHOT_PATH"
+"$BTRFS_CMD" subvolume delete "$FULL_SNAPSHOT_PATH"
 log_success "Temporary snapshot removed"
 
 log_info "Verification complete - SSH backups are working properly!"

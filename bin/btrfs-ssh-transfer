@@ -11,6 +11,35 @@
 
 set -eo pipefail
 
+# Find the full path to btrfs command
+find_btrfs_cmd() {
+    for path in "/usr/bin/btrfs" "/usr/sbin/btrfs" "/bin/btrfs" "/sbin/btrfs"; do
+        if [[ -x "$path" ]]; then
+            echo "$path"
+            return 0
+        fi
+    done
+    
+    # Try using which command
+    local which_result=$(which btrfs 2>/dev/null)
+    if [[ -x "$which_result" ]]; then
+        echo "$which_result"
+        return 0
+    fi
+    
+    # If we get here, btrfs command not found
+    echo ""
+    return 1
+}
+
+# Get the btrfs command path
+BTRFS_CMD=$(find_btrfs_cmd)
+if [[ -z "$BTRFS_CMD" ]]; then
+    echo -e "${RED}ERROR: btrfs command not found in PATH${NC}"
+    echo "Please install btrfs-progs package"
+    exit 1
+fi
+
 # Default values
 USE_BUFFER=true
 USE_SUDO=false
@@ -223,6 +252,13 @@ if [[ ! -d "$SOURCE_PATH" ]]; then
     exit 1
 fi
 
+# Verify source is a btrfs subvolume
+if ! "$BTRFS_CMD" subvolume show "$SOURCE_PATH" &>/dev/null; then
+    log_error "Source path is not a btrfs subvolume: $SOURCE_PATH"
+    log_error "Please specify a valid btrfs snapshot path"
+    exit 1
+fi
+
 # Test SSH connectivity
 function test_ssh_connectivity {
     local test_file="/tmp/btrfs-backup-test-$$"
@@ -393,7 +429,7 @@ function verify_snapshot_exists {
 function perform_transfer {
     log_info "Starting BTRFS snapshot transfer..."
     
-    local send_cmd="sudo btrfs send"
+    local send_cmd="$BTRFS_CMD send"
     local sudo_cmd=""
     if $USE_SUDO; then
         sudo_cmd="sudo"
@@ -422,6 +458,9 @@ function perform_transfer {
             log_error "btrfs command not found on remote host - please install btrfs-progs package"
             return 1
         fi
+        
+        # Log which btrfs command we're using locally
+        log_info "Using local btrfs command: $BTRFS_CMD"
     
         # Test the receive command with a dry run
         log_info "Testing btrfs receive command on remote host..."
@@ -459,10 +498,10 @@ function perform_transfer {
     fi
     
     # Check if the source path is actually a subvolume
-    if ! sudo btrfs subvolume show "$SOURCE_PATH" &>/dev/null; then
+    if ! "$BTRFS_CMD" subvolume show "$SOURCE_PATH" &>/dev/null; then
         log_error "Source path is not a btrfs subvolume: $SOURCE_PATH"
         echo "----------------------------------------"
-        sudo btrfs subvolume show "$SOURCE_PATH" 2>&1 || echo "Failed to get subvolume info"
+        "$BTRFS_CMD" subvolume show "$SOURCE_PATH" 2>&1 || echo "Failed to get subvolume info"
         echo "----------------------------------------"
         return 1
     fi
