@@ -1,0 +1,346 @@
+#!/bin/bash
+#
+# btrfs-ssh-transfer - A robust script for reliable BTRFS snapshot transfers over SSH
+#
+# This script provides a direct and reliable way to transfer BTRFS snapshots between
+# hosts using SSH. It includes verification steps, error handling, and progress
+# reporting to ensure transfers complete successfully.
+#
+# Usage: btrfs-ssh-transfer [options] <source_path> <user@host:/destination_path>
+#
+
+set -eo pipefail
+
+# Default values
+USE_BUFFER=true
+USE_SUDO=false
+VERBOSE=false
+PARENT_SNAPSHOT=""
+IDENTITY_FILE=""
+MAX_RETRIES=3
+CURRENT_RETRY=0
+
+# Colors for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+BLUE='\033[0;34m'
+NC='\033[0m' # No Color
+
+# Print usage information
+function show_usage {
+    echo "Usage: $(basename $0) [options] <source_path> <user@host:/destination_path>"
+    echo
+    echo "Options:"
+    echo "  -p, --parent <path>        Parent snapshot for incremental transfer"
+    echo "  -i, --identity <file>      SSH identity file"
+    echo "  -s, --sudo                 Use sudo on remote host"
+    echo "  -b, --no-buffer            Don't use mbuffer/pv even if available"
+    echo "  -r, --retries <num>        Number of retry attempts (default: 3)"
+    echo "  -v, --verbose              Enable verbose output"
+    echo "  -h, --help                 Show this help message"
+    echo
+    echo "Examples:"
+    echo "  $(basename $0) /path/to/snapshot user@remote:/path/to/destination"
+    echo "  $(basename $0) -s -i ~/.ssh/id_ed25519 /path/to/snapshot user@remote:/path/to/destination"
+    echo
+}
+
+function log_info {
+    echo -e "[${BLUE}INFO${NC}] $1"
+}
+
+function log_success {
+    echo -e "[${GREEN}SUCCESS${NC}] $1"
+}
+
+function log_warning {
+    echo -e "[${YELLOW}WARNING${NC}] $1"
+}
+
+function log_error {
+    echo -e "[${RED}ERROR${NC}] $1" >&2
+}
+
+function verbose {
+    if $VERBOSE; then
+        echo -e "[${BLUE}DEBUG${NC}] $1"
+    fi
+}
+
+# Parse command line arguments
+while [[ $# -gt 0 ]]; do
+    key="$1"
+    case $key in
+        -p|--parent)
+            PARENT_SNAPSHOT="$2"
+            shift 2
+            ;;
+        -i|--identity)
+            IDENTITY_FILE="$2"
+            shift 2
+            ;;
+        -s|--sudo)
+            USE_SUDO=true
+            shift
+            ;;
+        -b|--no-buffer)
+            USE_BUFFER=false
+            shift
+            ;;
+        -r|--retries)
+            MAX_RETRIES="$2"
+            shift 2
+            ;;
+        -v|--verbose)
+            VERBOSE=true
+            shift
+            ;;
+        -h|--help)
+            show_usage
+            exit 0
+            ;;
+        *)
+            if [[ -z "$SOURCE_PATH" ]]; then
+                SOURCE_PATH="$1"
+                shift
+            elif [[ -z "$DESTINATION" ]]; then
+                DESTINATION="$1"
+                shift
+            else
+                log_error "Unexpected argument: $1"
+                show_usage
+                exit 1
+            fi
+            ;;
+    esac
+done
+
+# Check for required arguments
+if [[ -z "$SOURCE_PATH" || -z "$DESTINATION" ]]; then
+    log_error "Missing required arguments"
+    show_usage
+    exit 1
+fi
+
+# Parse destination into components
+if [[ ! "$DESTINATION" =~ .*:.* ]]; then
+    log_error "Destination must be in format user@host:/path or host:/path"
+    show_usage
+    exit 1
+fi
+
+HOST_PART="${DESTINATION%%:*}"
+DEST_PATH="${DESTINATION#*:}"
+
+if [[ "$HOST_PART" =~ .*@.* ]]; then
+    DEST_USER="${HOST_PART%%@*}"
+    DEST_HOST="${HOST_PART#*@}"
+else
+    DEST_USER="$USER"
+    DEST_HOST="$HOST_PART"
+fi
+
+# Set up SSH command
+SSH_OPTS="-o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10"
+if [[ -n "$IDENTITY_FILE" ]]; then
+    SSH_OPTS="$SSH_OPTS -i $IDENTITY_FILE"
+fi
+
+# Check for buffer programs
+function find_buffer {
+    if $USE_BUFFER; then
+        if command -v mbuffer >/dev/null 2>&1; then
+            echo "mbuffer -q -s 128M"
+            return 0
+        elif command -v pv >/dev/null 2>&1; then
+            echo "pv -q"
+            return 0
+        fi
+    fi
+    echo ""
+    return 1
+}
+
+BUFFER_CMD=$(find_buffer)
+if [[ -n "$BUFFER_CMD" ]]; then
+    verbose "Using buffer command: $BUFFER_CMD"
+else
+    verbose "No buffer command available or disabled"
+fi
+
+# Get snapshot name for verification
+SNAPSHOT_NAME=$(basename "$SOURCE_PATH")
+verbose "Snapshot name: $SNAPSHOT_NAME"
+
+# Verify source path exists
+if [[ ! -d "$SOURCE_PATH" ]]; then
+    log_error "Source snapshot does not exist: $SOURCE_PATH"
+    exit 1
+fi
+
+# Test SSH connectivity
+function test_ssh_connectivity {
+    local test_file="/tmp/btrfs-backup-test-$$"
+    log_info "Testing SSH connectivity to $DEST_HOST..."
+    
+    # Create a test file
+    echo "BTRFS backup test file $(date)" > "$test_file"
+    
+    # Copy the test file to the remote host
+    if ! scp $SSH_OPTS "$test_file" "$DEST_USER@$DEST_HOST:$test_file" >/dev/null 2>&1; then
+        log_error "Failed to copy test file to remote host"
+        rm -f "$test_file"
+        return 1
+    fi
+    
+    # Verify the test file on the remote host
+    if ! ssh $SSH_OPTS "$DEST_USER@$DEST_HOST" "cat $test_file" >/dev/null 2>&1; then
+        log_error "Failed to verify test file on remote host"
+        rm -f "$test_file"
+        return 1
+    fi
+    
+    # Clean up
+    ssh $SSH_OPTS "$DEST_USER@$DEST_HOST" "rm -f $test_file" >/dev/null 2>&1
+    rm -f "$test_file"
+    
+    log_success "SSH connectivity test passed"
+    return 0
+}
+
+# Test if remote filesystem is BTRFS
+function test_remote_filesystem {
+    log_info "Testing if remote filesystem is BTRFS..."
+    
+    local sudo_cmd=""
+    if $USE_SUDO; then
+        sudo_cmd="sudo"
+    fi
+    
+    local fs_type=$(ssh $SSH_OPTS "$DEST_USER@$DEST_HOST" "$sudo_cmd stat -f -c %T $DEST_PATH" 2>/dev/null)
+    
+    if [[ "$fs_type" == "btrfs" ]]; then
+        log_success "Remote filesystem is BTRFS"
+        return 0
+    else
+        log_error "Remote filesystem is not BTRFS (found: $fs_type)"
+        log_error "The destination must be on a BTRFS filesystem"
+        return 1
+    fi
+}
+
+# Verify a snapshot exists on the remote host
+function verify_snapshot_exists {
+    local snapshot_name="$1"
+    local sudo_cmd=""
+    if $USE_SUDO; then
+        sudo_cmd="sudo"
+    fi
+    
+    log_info "Verifying snapshot exists on remote host..."
+    
+    # Try using btrfs subvolume list first
+    local subvol_output=$(ssh $SSH_OPTS "$DEST_USER@$DEST_HOST" "$sudo_cmd btrfs subvolume list -o $DEST_PATH" 2>/dev/null)
+    
+    if [[ $? -eq 0 ]]; then
+        if [[ "$subvol_output" == *"$snapshot_name"* ]]; then
+            log_success "Snapshot found on remote host: $snapshot_name"
+            return 0
+        fi
+    fi
+    
+    # Fall back to checking if the directory exists
+    if ssh $SSH_OPTS "$DEST_USER@$DEST_HOST" "$sudo_cmd test -d $DEST_PATH/$snapshot_name" 2>/dev/null; then
+        log_success "Snapshot directory exists on remote host"
+        return 0
+    else
+        log_error "Snapshot not found on remote host: $snapshot_name"
+        return 1
+    fi
+}
+
+# Perform the BTRFS transfer
+function perform_transfer {
+    log_info "Starting BTRFS snapshot transfer..."
+    
+    local send_cmd="sudo btrfs send"
+    local sudo_cmd=""
+    if $USE_SUDO; then
+        sudo_cmd="sudo"
+    fi
+    
+    # Add parent for incremental transfer
+    if [[ -n "$PARENT_SNAPSHOT" && -d "$PARENT_SNAPSHOT" ]]; then
+        log_info "Using incremental transfer with parent: $PARENT_SNAPSHOT"
+        send_cmd="$send_cmd -p $PARENT_SNAPSHOT"
+    else
+        log_info "Using full transfer (no parent)"
+    fi
+    
+    # Add source path
+    send_cmd="$send_cmd $SOURCE_PATH"
+    
+    # Build receive command
+    local receive_cmd="$sudo_cmd btrfs receive $DEST_PATH"
+    
+    # Build full command with pipe
+    local full_cmd=""
+    if [[ -n "$BUFFER_CMD" ]]; then
+        full_cmd="$send_cmd | $BUFFER_CMD | ssh $SSH_OPTS $DEST_USER@$DEST_HOST '$receive_cmd'"
+    else
+        full_cmd="$send_cmd | ssh $SSH_OPTS $DEST_USER@$DEST_HOST '$receive_cmd'"
+    fi
+    
+    verbose "Executing transfer command: $full_cmd"
+    
+    # Execute the transfer
+    local start_time=$(date +%s)
+    if eval "$full_cmd"; then
+        local end_time=$(date +%s)
+        local elapsed=$((end_time - start_time))
+        log_success "Transfer completed in $elapsed seconds"
+        return 0
+    else
+        local exit_code=$?
+        log_error "Transfer failed with exit code $exit_code"
+        return $exit_code
+    fi
+}
+
+# Main transfer function with retry logic
+function transfer_with_retry {
+    CURRENT_RETRY=0
+    
+    while [[ $CURRENT_RETRY -lt $MAX_RETRIES ]]; do
+        if [[ $CURRENT_RETRY -gt 0 ]]; then
+            log_warning "Retry attempt $CURRENT_RETRY of $MAX_RETRIES"
+            sleep 3
+        fi
+        
+        if test_ssh_connectivity && test_remote_filesystem; then
+            if perform_transfer; then
+                if verify_snapshot_exists "$SNAPSHOT_NAME"; then
+                    log_success "BTRFS snapshot transfer completed successfully"
+                    return 0
+                else
+                    log_error "Transfer appeared to succeed but snapshot verification failed"
+                fi
+            fi
+        fi
+        
+        CURRENT_RETRY=$((CURRENT_RETRY + 1))
+    done
+    
+    log_error "Transfer failed after $MAX_RETRIES attempts"
+    return 1
+}
+
+# Execute the transfer
+if transfer_with_retry; then
+    log_success "BTRFS snapshot transfer to $DEST_HOST:$DEST_PATH completed successfully"
+    exit 0
+else
+    log_error "BTRFS snapshot transfer failed"
+    exit 1
+fi
