@@ -13,7 +13,6 @@ Environment variables that affect behavior:
 
 import copy
 import os
-import pwd
 import select
 import subprocess
 import time
@@ -26,6 +25,13 @@ from typing import Optional, List, Union, Dict, Any, Tuple
 from btrfs_backup_ng.__logger__ import logger
 from btrfs_backup_ng.sshutil.master import SSHMasterManager
 from .common import Endpoint
+
+# Import pwd module safely with fallback
+try:
+    import pwd
+    PWD_MODULE_AVAILABLE = True
+except ImportError:
+    PWD_MODULE_AVAILABLE = False
 
 
 class SSHEndpoint(Endpoint):
@@ -186,16 +192,19 @@ class SSHEndpoint(Endpoint):
                 # Check if we should force passwordless mode
                 passwordless_only = os.environ.get("BTRFS_BACKUP_PASSWORDLESS_ONLY", "0").lower() in ("1", "true", "yes")
                 
+                # Always add -p flag to keep terminal-based stdin functioning properly for btrfs receive
+                # This helps ensure the stream is properly passed through
                 if passwordless_only:
                     # Use -n flag to fail rather than prompt for password
                     logger.debug("Using sudo with -n flag (passwordless only mode)")
-                    return ["sudo", "-n", "-E", "-P"] + command
+                    return ["sudo", "-n", "-E", "-P", "-p", ""] + command
                 else:
                     # Use -S to read password from stdin if needed (stdin will be connected to our pipe)
+                    # Use empty password prompt to avoid interfering with btrfs receive stream
                     logger.debug("Using sudo for btrfs receive command with password support")
                     logger.warning("Note: If the remote host requires a sudo password, transfer may fail")
                     logger.warning("Consider setting up passwordless sudo for btrfs commands on remote host")
-                    return ["sudo", "-S", "-E", "-P"] + command
+                    return ["sudo", "-S", "-E", "-P", "-p", ""] + command
             elif command[0] == "btrfs":
                 # For other btrfs commands, use -n which will fail rather than prompt for password
                 logger.debug("Using sudo for regular btrfs command")
@@ -353,13 +362,25 @@ class SSHEndpoint(Endpoint):
                 logger.debug("Running as root via sudo user: %s", sudo_user)
                 try:
                     # Get the sudo user's home directory
-                    sudo_user_home = pwd.getpwnam(sudo_user).pw_dir
-                    logger.debug("Found sudo user home: %s", sudo_user_home)
-                    # Replace ~ with sudo user's home
-                    if path.startswith("~"):
-                        original_path = path
-                        path = path.replace("~", sudo_user_home, 1)
-                        logger.debug("Expanded ~ in path: %s -> %s", original_path, path)
+                    if PWD_MODULE_AVAILABLE:
+                        sudo_user_home = pwd.getpwnam(sudo_user).pw_dir
+                        logger.debug("Found sudo user home: %s", sudo_user_home)
+                        # Replace ~ with sudo user's home
+                        if path.startswith("~"):
+                            original_path = path
+                            path = path.replace("~", sudo_user_home, 1)
+                            logger.debug("Expanded ~ in path: %s -> %s", original_path, path)
+                    else:
+                        # Fallback if pwd module is not available
+                        logger.warning("pwd module not available, using fallback for home directory")
+                        if sudo_user == "root":
+                            sudo_user_home = "/root"
+                        else:
+                            sudo_user_home = f"/home/{sudo_user}"
+                        if path.startswith("~"):
+                            original_path = path
+                            path = path.replace("~", sudo_user_home, 1)
+                            logger.debug("Expanded ~ in path (fallback): %s -> %s", original_path, path)
                 except Exception as e:
                     logger.error("Error expanding ~ in path: %s", e)
             else:
@@ -487,7 +508,8 @@ class SSHEndpoint(Endpoint):
             "-o", "ServerAliveInterval=5", 
             "-o", "ServerAliveCountMax=3",
             "-o", "TCPKeepAlive=yes",
-            "-o", "ConnectTimeout=10"
+            "-o", "ConnectTimeout=10",
+            "-o", "ExitOnForwardFailure=yes"
         ]
         
         # If we need TTY, ensure related SSH options are set correctly
@@ -543,6 +565,7 @@ class SSHEndpoint(Endpoint):
             logger.debug("Full SSH receive command: %s", full_cmd_str)
             
             # Create named FIFO pipes for better stream handling if necessary
+            logger.debug("Starting btrfs receive via SSH, sudo=%s", self.config.get("ssh_sudo", False))
             receive_process = subprocess.Popen(
                 ssh_cmd,
                 stdin=stdin_pipe,
@@ -551,6 +574,7 @@ class SSHEndpoint(Endpoint):
                 bufsize=0,  # Use unbuffered mode for better streaming
                 env=env,
                 text=False,  # Use binary mode for streams
+                start_new_session=True  # Avoid signal propagation issues
             )
             
             logger.debug("btrfs receive process started with PID: %d", receive_process.pid)
@@ -1000,7 +1024,7 @@ class SSHEndpoint(Endpoint):
         logger.info("btrfs send/receive completed successfully")
 
     def _prepare(self) -> None:
-        """Prepare the SSH endpoint by ensuring SSH connectivity."""
+        # Prepare the SSH endpoint by ensuring SSH connectivity."""
         logger.debug("Preparing SSH endpoint for hostname: %s", self.hostname)
         # Ensure path is a string
         path = self._normalize_path(self.config["path"])
@@ -1013,6 +1037,7 @@ class SSHEndpoint(Endpoint):
         logger.debug("  Port: %s", self.config.get("port"))
         logger.debug("  SSH options: %s", self.config.get("ssh_opts", []))
         logger.debug("  Identity file: %s", self.config.get("ssh_identity_file"))
+        logger.debug("  SSH sudo enabled: %s", self.config.get("ssh_sudo", False))
         
         # Check if running as root via sudo
         if os.geteuid() == 0 and os.environ.get("SUDO_USER"):

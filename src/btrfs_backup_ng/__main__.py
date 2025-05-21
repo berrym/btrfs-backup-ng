@@ -150,15 +150,17 @@ def send_snapshot(snapshot, destination_endpoint, parent=None, clones=None) -> N
             else:
                 is_using_sudo = destination_endpoint.config.get("ssh_sudo", False)
 
-        if is_ssh_endpoint and not is_using_sudo:
-            logger.warning(
-                "Using SSH destination without --ssh-sudo. This may fail if the remote user doesn't have permissions for btrfs commands."
-            )
-            # Check if we should force ssh_sudo based on command-line options
+        # Always force ssh_sudo if specified in options
+        if is_ssh_endpoint:
             if options.get("ssh_sudo", False):
-                logger.info("Enabling SSH sudo based on command-line option")
+                logger.info("Forcing SSH sudo based on command-line option")
                 destination_endpoint.config["ssh_sudo"] = True
                 is_using_sudo = True
+            
+            if not is_using_sudo:
+                logger.warning(
+                    "Using SSH destination without --ssh-sudo. This may fail if the remote user doesn't have permissions for btrfs commands."
+                )
 
         try:
             receive_process = destination_endpoint.receive(send_process.stdout)
@@ -175,7 +177,31 @@ def send_snapshot(snapshot, destination_endpoint, parent=None, clones=None) -> N
             raise __util__.SnapshotTransferError(f"Receive process failed to start: {e}")
 
         logger.debug("Waiting for processes to complete...")
-        return_codes = [p.wait() for p in [send_process, receive_process]]
+        # Set a timeout for the processes to prevent hanging indefinitely
+        timeout_seconds = 3600  # 1 hour timeout for large transfers
+        logger.debug("Waiting for send/receive processes to complete (timeout=%ds)", timeout_seconds)
+        
+        # Wait for send process first
+        try:
+            logger.debug("Waiting for send process to complete...")
+            return_code_send = send_process.wait(timeout=timeout_seconds)
+            logger.debug("Send process completed with return code: %d", return_code_send)
+        except subprocess.TimeoutExpired:
+            logger.error("Timeout waiting for send process to complete")
+            send_process.kill()
+            raise __util__.SnapshotTransferError("Timeout waiting for send process")
+        
+        # Then wait for receive process - it should finish soon after send process
+        try:
+            logger.debug("Waiting for receive process to complete...")
+            return_code_receive = receive_process.wait(timeout=300)  # 5 minute timeout after send completes
+            logger.debug("Receive process completed with return code: %d", return_code_receive)
+        except subprocess.TimeoutExpired:
+            logger.error("Timeout waiting for receive process to complete")
+            receive_process.kill()
+            raise __util__.SnapshotTransferError("Timeout waiting for receive process")
+        
+        return_codes = [return_code_send, return_code_receive]
         logger.debug(
             "Process return codes: send=%d, receive=%d",
             return_codes[0],
@@ -595,6 +621,7 @@ files is allowed as well."""
     group.add_argument(
         "--ssh-sudo",
         action="store_true",
+        default=False,
         help="Execute commands with sudo on the remote host. REQUIRED for btrfs operations if the remote user doesn't have direct permissions to run btrfs commands. Remote user must have passwordless sudo access configured for btrfs commands.",
     )
     group.add_argument(
@@ -811,6 +838,10 @@ def run_task(options, queue=None):
                         "Add this to remote /etc/sudoers: username ALL=(ALL) NOPASSWD: /usr/bin/btrfs"
                     )
 
+    # Wait a moment for any pending operations to complete
+    logger.debug("Waiting briefly for any pending operations to complete...")
+    time.sleep(1)
+        
     # Enforce retention for source and destination endpoints only once, at the end
     cleanup_snapshots(source_endpoint, destination_endpoints, options)
 
@@ -955,10 +986,14 @@ def prepare_destination_endpoints(options, source_endpoint):
     # Ensure 'path' is NOT in endpoint_kwargs
     endpoint_kwargs.pop("path", None)
     
-    # Ensure SSH sudo flag is propagated
-    if options.get("ssh_sudo", False):
+    # Ensure SSH sudo flag is propagated - force it to True if specified
+    ssh_sudo = options.get("ssh_sudo", False)
+    if ssh_sudo:
         logger.debug("SSH sudo enabled in options, propagating to endpoint kwargs")
         endpoint_kwargs["ssh_sudo"] = True
+        # Force enable in options too, in case it was set in another way
+        options["ssh_sudo"] = True
+    logger.debug("SSH sudo in endpoint kwargs: %s", endpoint_kwargs.get("ssh_sudo", False))
 
     logger.info("Preparing destination endpoints...")
     for destination in options["destinations"]:
@@ -980,12 +1015,23 @@ def prepare_destination_endpoints(options, source_endpoint):
                     "Endpoint path: %s", destination_endpoint.config.get("path")
                 )
                 
-                # Verify SSH sudo config if this is an SSH endpoint
+                # Verify and force SSH sudo config if this is an SSH endpoint and --ssh-sudo was specified
                 if hasattr(destination_endpoint, "_is_remote") and destination_endpoint._is_remote:
-                    logger.debug("SSH sudo setting: %s", destination_endpoint.config.get("ssh_sudo", False))
-                    if options.get("ssh_sudo", False) and not destination_endpoint.config.get("ssh_sudo", False):
-                        logger.warning("SSH sudo flag not properly propagated, fixing...")
-                        destination_endpoint.config["ssh_sudo"] = True
+                    # Check if we need to force ssh_sudo based on command line options
+                    if options.get("ssh_sudo", False):
+                        current_ssh_sudo = destination_endpoint.config.get("ssh_sudo", False)
+                        logger.debug("SSH sudo setting before: %s", current_ssh_sudo)
+                        if not current_ssh_sudo:
+                            logger.warning("SSH sudo flag not properly propagated, forcing to True")
+                            destination_endpoint.config["ssh_sudo"] = True
+                        # Double check it's actually set now
+                        if not destination_endpoint.config.get("ssh_sudo", False):
+                            destination_endpoint.config["ssh_sudo"] = True
+                            logger.warning("Forcing SSH sudo flag to True for this endpoint")
+                        logger.debug("SSH sudo setting after: %s", destination_endpoint.config.get("ssh_sudo", False))
+                    else:
+                        logger.debug("SSH sudo not enabled in options, current setting: %s",
+                                    destination_endpoint.config.get("ssh_sudo", False))
             except NameError as e:
                 logger.error("NameError in choose_endpoint: %s", e)
                 logger.error("Missing import? %s", str(e))
