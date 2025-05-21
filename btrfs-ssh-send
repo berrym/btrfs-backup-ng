@@ -67,14 +67,9 @@ find_buffer_program() {
     # Try pv first (more compatible and simpler)
     for path in "/usr/bin/pv" "/usr/local/bin/pv" "/bin/pv" "/sbin/pv"; do
         if [ -x "$path" ]; then
-            # Check pv version and capabilities
-            PV_VERSION=$("$path" --version 2>&1 | head -1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' || echo "unknown")
-            # Check if advanced flags are supported
-            if "$path" --help 2>&1 | grep -q -- "--name"; then
-                echo "pv:$path:$PV_VERSION:advanced"
-            else
-                echo "pv:$path:$PV_VERSION:basic"
-            fi
+            # Get basic version info but don't worry about capabilities
+            PV_VERSION=$("$path" --version 2>&1 | head -1 || echo "unknown")
+            echo "pv:$path:$PV_VERSION"
             return 0
         fi
     done
@@ -82,15 +77,8 @@ find_buffer_program() {
     # Try mbuffer as secondary option
     for path in "/usr/bin/mbuffer" "/usr/local/bin/mbuffer" "/bin/mbuffer" "/sbin/mbuffer"; do
         if [ -x "$path" ]; then
-            # Test if mbuffer works with minimal options
-            if "$path" -q -s 1k -m 1M -h >/dev/null 2>&1; then
-                echo "mbuffer:$path:compatible"
-                return 0
-            else
-                # mbuffer exists but may have compatibility issues
-                echo "mbuffer:$path:problematic"
-                return 0
-            fi
+            echo "mbuffer:$path:unknown"
+            return 0
         fi
     done
     
@@ -102,24 +90,14 @@ find_buffer_program() {
 # Function to estimate BTRFS subvolume size more accurately
 estimate_subvol_size() {
     local subvol="$1"
-    local size=0
     
-    # Try direct du first (faster but less accurate)
-    size=$(du -b "$subvol" 2>/dev/null | cut -f1 || echo 0)
+    # Just use du -b for size estimation - most reliable across systems
+    # du returns size in bytes which is perfect for pv
+    local size=$(du -bs "$subvol" 2>/dev/null | cut -f1 || echo 0)
     
-    # If size is very small or failed, try btrfs qgroup show (more accurate)
-    if [ "$size" -lt 1000000 ]; then
-        if command -v btrfs >/dev/null 2>&1; then
-            # Get subvolume ID
-            local subvol_id=$("$BTRFS_CMD" subvolume show "$subvol" 2>/dev/null | grep "Subvolume ID" | awk '{print $3}' || echo "")
-            if [ -n "$subvol_id" ]; then
-                # Get exclusive size from qgroup if available
-                local qsize=$("$BTRFS_CMD" qgroup show -re "$subvol_id" "$subvol" 2>/dev/null | grep "$subvol_id" | awk '{print $2}' || echo "")
-                if [ -n "$qsize" ] && [ "$qsize" -gt 0 ]; then
-                    size="$qsize"
-                fi
-            fi
-        fi
+    # Ensure we have a valid numeric value
+    if ! [[ "$size" =~ ^[0-9]+$ ]]; then
+        size=0
     fi
     
     echo "$size"
@@ -257,12 +235,8 @@ if [ -z "$BTRFS_CMD" ]; then
 fi
 log_verbose "Using btrfs command: $BTRFS_CMD"
 
-# Set terminal width for better progress display
-if command -v tput >/dev/null 2>&1; then
-    export COLUMNS=$(tput cols 2>/dev/null || echo 80)
-    export LINES=$(tput lines 2>/dev/null || echo 24)
-    log_verbose "Terminal size: ${COLUMNS}x${LINES}"
-fi
+# Setting terminal variables can cause issues in some environments, so we'll skip it
+log_verbose "Using standard terminal configuration"
 
 # Find the ssh command
 SSH_CMD=$(find_ssh_cmd)
@@ -436,33 +410,15 @@ if [ -n "$BUFFER_INFO" ]; then
         PV_CAPABILITIES="${BUFFER_VERSION#*:}"
         PV_VERSION="${BUFFER_VERSION%%:*}"
         
-        # Get accurate size estimate for transfer
-        log_info "Estimating transfer size for progress display..."
-        ESTIMATED_SIZE=$(estimate_subvol_size "$SOURCE_PATH")
-        
         # Format snapshot name for display
         SNAPSHOT_NAME=$(basename "$SOURCE_PATH")
         
-        if [ "$PV_CAPABILITIES" = "advanced" ]; then
-            # Enhanced pv with full-featured progress display
-            log_info "Using pv ($PV_VERSION) with enhanced progress display"
-            "$BTRFS_CMD" send "$SOURCE_PATH" | \
-                "$BUFFER_PATH" \
-                    --name "$SNAPSHOT_NAME" \
-                    --size "$ESTIMATED_SIZE" \
-                    --rate --bytes --timer --eta --wait \
-                    --cursor --line-mode \
-                    --progress --force \
-                | "$SSH_CMD" $SSH_OPTS "$DEST_USER@$DEST_HOST" "$RECEIVE_CMD"
-            TRANSFER_STATUS=$?
-        else
-            # Basic pv with simpler progress display
-            log_info "Using pv ($PV_VERSION) with basic progress display"
-            "$BTRFS_CMD" send "$SOURCE_PATH" | \
-                "$BUFFER_PATH" -pterb -s "$ESTIMATED_SIZE" | \
-                "$SSH_CMD" $SSH_OPTS "$DEST_USER@$DEST_HOST" "$RECEIVE_CMD"
-            TRANSFER_STATUS=$?
-        fi
+        # Simple direct approach with minimal pv options for maximum compatibility
+        log_info "Using pv for transfer with progress display"
+        "$BTRFS_CMD" send "$SOURCE_PATH" | \
+            "$BUFFER_PATH" -p -t -e -r | \
+            "$SSH_CMD" $SSH_OPTS "$DEST_USER@$DEST_HOST" "$RECEIVE_CMD"
+        TRANSFER_STATUS=$?
         
         # If pv fails, fall back to direct transfer
         if [ $TRANSFER_STATUS -ne 0 ]; then
@@ -471,17 +427,17 @@ if [ -n "$BUFFER_INFO" ]; then
             TRANSFER_STATUS=$?
         fi
     elif [ "$BUFFER_TYPE" = "mbuffer" ]; then
-        # Try mbuffer with minimal options
-        log_verbose "Using mbuffer with minimal options"
-        "$BTRFS_CMD" send "$SOURCE_PATH" | "$BUFFER_PATH" -q | "$SSH_CMD" $SSH_OPTS "$DEST_USER@$DEST_HOST" "$RECEIVE_CMD"
-        TRANSFER_STATUS=$?
+        # Use mbuffer with absolute minimum options
+                log_verbose "Using mbuffer with minimal options"
+                "$BTRFS_CMD" send "$SOURCE_PATH" | "$BUFFER_PATH" | "$SSH_CMD" $SSH_OPTS "$DEST_USER@$DEST_HOST" "$RECEIVE_CMD"
+                TRANSFER_STATUS=$?
         
-        # If mbuffer fails, fall back to direct transfer
-        if [ $TRANSFER_STATUS -ne 0 ]; then
-            log_warning "mbuffer failed, falling back to direct transfer"
-            "$BTRFS_CMD" send "$SOURCE_PATH" | "$SSH_CMD" $SSH_OPTS "$DEST_USER@$DEST_HOST" "$RECEIVE_CMD"
-            TRANSFER_STATUS=$?
-        fi
+                # If mbuffer fails, fall back to direct transfer
+                if [ $TRANSFER_STATUS -ne 0 ]; then
+                    log_warning "mbuffer failed, falling back to direct transfer"
+                    "$BTRFS_CMD" send "$SOURCE_PATH" | "$SSH_CMD" $SSH_OPTS "$DEST_USER@$DEST_HOST" "$RECEIVE_CMD"
+                    TRANSFER_STATUS=$?
+                fi
     fi
 else
     # Direct transfer without buffer
@@ -570,7 +526,7 @@ fi
 
 # Print completion message
 echo 
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo "======================================================================"
 echo "Transfer completed successfully at $(date)"
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo "======================================================================"
 exit 0
