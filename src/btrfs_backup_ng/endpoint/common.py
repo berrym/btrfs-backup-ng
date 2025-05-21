@@ -412,7 +412,7 @@ class Endpoint:
                     ("property", False),
                     ("set", False),
                     ("-ts", False),
-                    (snapshot.get_path(), True),
+                    (str(snapshot.get_path()), True),
                     ("ro", False),
                     ("false", False),
                 ])
@@ -421,14 +421,14 @@ class Endpoint:
                 ("btrfs", False),
                 ("subvolume", False),
                 ("delete", False),
-                (snapshot.get_path(), True),
+                (str(snapshot.get_path()), True),
             ])
         if subvolume_sync:
             commands.append([
                 ("btrfs", False),
                 ("subvolume", False),
                 ("sync", False),
-                (self.config["path"], True),
+                (str(self.config["path"]), True),
             ])
         return commands
 
@@ -459,7 +459,7 @@ class Endpoint:
                     else:
                         # Not a path, just append as-is
                         normalized_command.append(arg)
-                logger.debug("Processed marked command arguments")
+                logger.debug("Processed marked command arguments: %s", normalized_command)
             else:
                 # Legacy format - attempt to guess which args are paths
                 for i, arg in enumerate(command):
@@ -478,7 +478,7 @@ class Endpoint:
                                 normalized_command.append(arg)
                     else:
                         normalized_command.append(arg)
-                logger.debug("Processed legacy command format")
+                logger.debug("Processed legacy command format: %s", normalized_command)
             
             command = normalized_command
         except Exception as e:

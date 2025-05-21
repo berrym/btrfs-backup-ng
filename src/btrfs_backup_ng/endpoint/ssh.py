@@ -204,13 +204,29 @@ class SSHEndpoint(Endpoint):
                 return ["sudo", "-n"] + command
         return command
 
-    def _exec_remote_command(self, command: List[str], **kwargs) -> subprocess.CompletedProcess:
+    def _exec_remote_command(self, command, **kwargs) -> subprocess.CompletedProcess:
         """Execute a command on the remote host."""
-        # Convert any Path objects in the command to strings
-        string_command = [
-            self._normalize_path(arg) if isinstance(arg, (str, Path)) else arg
-            for arg in command
-        ]
+        # Process command arguments based on whether they're marked as paths
+        string_command = []
+        
+        # Check if command is using the tuple format (arg, is_path)
+        if command and isinstance(command[0], tuple) and len(command[0]) == 2:
+            # New format with (arg, is_path) tuples
+            for arg, is_path in command:
+                if is_path and isinstance(arg, (str, Path)):
+                    string_command.append(self._normalize_path(arg))
+                else:
+                    # Not a path, just append as-is
+                    string_command.append(arg)
+            logger.debug("Processed marked command arguments for remote execution: %s", string_command)
+        else:
+            # Legacy format - convert any Path objects in the command to strings
+            for arg in command:
+                if isinstance(arg, (str, Path)):
+                    string_command.append(self._normalize_path(arg))
+                else:
+                    string_command.append(arg)
+            logger.debug("Processed legacy command format for remote execution: %s", string_command)
         remote_cmd = self._build_remote_command(string_command)
         # Build the SSH command - if using sudo for this command, consider forcing TTY allocation
         needs_tty = False
@@ -281,6 +297,14 @@ class SSHEndpoint(Endpoint):
         """Override to handle remote paths properly."""
         if path is None:
             return None
+            
+        # If the path is actually a tuple from our new command format, extract just the path part
+        if isinstance(path, tuple) and len(path) == 2:
+            path, is_path = path
+            if not is_path:
+                # If it's not a path, just return as-is
+                return path
+        
         # For SSH paths, we just want to ensure they're strings,
         # not convert them to Path objects or resolve them locally
         if isinstance(path, Path):
