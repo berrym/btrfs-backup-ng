@@ -188,24 +188,65 @@ def send_snapshot(snapshot, destination_endpoint, parent=None, clones=None) -> N
                 
                 # Find our btrfs-ssh-send script (search in multiple locations)
                 script_name = "btrfs-ssh-send"
+                
+                # Get this file's directory to find relative paths
+                current_dir = os.path.dirname(os.path.abspath(__file__))
+                project_root = os.path.dirname(os.path.dirname(os.path.dirname(current_dir)))
+                
+                # Add all possible locations to search
                 script_paths = [
+                    # System paths
                     os.path.join("/usr/bin", script_name),
                     os.path.join("/usr/local/bin", script_name),
-                    os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), script_name),
+                    os.path.join("/usr/sbin", script_name),
+                    os.path.join("/bin", script_name),
+                    os.path.join("/sbin", script_name),
+                    # Project paths
+                    os.path.join(project_root, script_name),
                     os.path.join(os.getcwd(), script_name),
+                    os.path.join(os.path.dirname(os.getcwd()), script_name),
+                    # Absolute path from current directory
+                    os.path.abspath(script_name),
                 ]
                 
+                # Deduplicate paths
+                script_paths = list(set(script_paths))
+                
+                # Debug output of all paths being checked
+                logger.debug(f"Searching for {script_name} in following locations:")
+                for i, path in enumerate(script_paths):
+                    logger.debug(f"  {i+1}. {path}")
+                
+                # Try to find the script
                 script_path = None
                 for path in script_paths:
-                    if os.path.exists(path) and os.access(path, os.X_OK):
-                        script_path = path
-                        break
-                        
-                logger.debug(f"Using SSH transfer script at: {script_path}")
-                if not script_path:
-                    logger.error(f"SSH transfer script '{script_name}' not found")
-                    logger.error(f"Searched in: {', '.join(script_paths)}")
-                    raise __util__.SnapshotTransferError("SSH transfer script not found")
+                    if os.path.exists(path):
+                        if os.access(path, os.X_OK):
+                            script_path = path
+                            break
+                        else:
+                            logger.debug(f"Found {path} but it's not executable")
+                
+                # Check if script was found
+                if script_path:
+                    logger.debug(f"Using SSH transfer script at: {script_path}")
+                else:
+                    # Last resort - try copying our script to /tmp and make it executable
+                    logger.warning(f"SSH transfer script '{script_name}' not found in standard locations")
+                    for path in script_paths:
+                        if os.path.exists(path) and not os.access(path, os.X_OK):
+                            logger.info(f"Found non-executable script at {path}, trying to make it executable")
+                            try:
+                                os.chmod(path, 0o755)
+                                script_path = path
+                                break
+                            except Exception as e:
+                                logger.warning(f"Failed to make {path} executable: {e}")
+                    
+                    if not script_path:
+                        logger.error(f"SSH transfer script '{script_name}' not found")
+                        logger.error(f"Searched in: {', '.join(script_paths)}")
+                        raise __util__.SnapshotTransferError("SSH transfer script not found")
                 
                 cmd = [script_path]
                 
@@ -226,19 +267,52 @@ def send_snapshot(snapshot, destination_endpoint, parent=None, clones=None) -> N
                 
                 logger.debug(f"Running SSH transfer script: {' '.join(cmd)}")
                 
-                # Execute the transfer script
-                result = subprocess.run(cmd, capture_output=True, text=True)
+                # Set up environment for consistent execution
+                env = os.environ.copy()
+                
+                # Ensure script directory is in PATH
+                script_dir = os.path.dirname(script_path)
+                if script_dir not in env.get("PATH", ""):
+                    env["PATH"] = f"{script_dir}:{env.get('PATH', '')}"
+                    logger.debug(f"Added {script_dir} to PATH")
+                
+                # Execute the transfer script with expanded environment
+                try:
+                    logger.debug(f"Executing {script_path} with PATH: {env.get('PATH')}")
+                    result = subprocess.run(cmd, capture_output=True, text=True, env=env)
+                except Exception as e:
+                    logger.error(f"Failed to execute SSH transfer script: {e}")
+                    logger.error(f"Script path: {script_path}")
+                    logger.error(f"Command: {' '.join(cmd)}")
+                    raise __util__.SnapshotTransferError(f"SSH transfer script execution failed: {e}")
                 
                 if result.returncode == 0:
                     logger.info("SSH transfer completed successfully")
                     for line in result.stdout.splitlines():
                         if line.strip():
                             logger.info(f"Transfer output: {line}")
+                    
+                    # Verify the transfer manually as backup
+                    logger.debug("Performing additional verification of successful transfer")
+                    verify_cmd = ["ssh"]
+                    if identity_file:
+                        verify_cmd.extend(["-i", identity_file])
+                    verify_cmd.extend([f"{dest_user}@{dest_host}", f"ls -la {dest_path}/{os.path.basename(snapshot_path)}"])
+                    
+                    try:
+                        verify_result = subprocess.run(verify_cmd, capture_output=True, text=True)
+                        if verify_result.returncode == 0:
+                            logger.info("Additional verification confirmed snapshot exists on remote host")
+                        else:
+                            logger.warning("Additional verification could not confirm snapshot - transfer may have failed silently")
+                    except Exception as e:
+                        logger.warning(f"Could not perform additional verification: {e}")
                 else:
                     logger.error(f"SSH transfer failed with exit code {result.returncode}")
                     for line in result.stderr.splitlines():
                         if line.strip():
                             logger.error(f"Transfer error: {line}")
+                    logger.error(f"Full stdout: {result.stdout}")
                     raise __util__.SnapshotTransferError("SSH transfer script failed - see logs for details")
                 
                 # For direct SSH transfer, we fake the return codes as successful
