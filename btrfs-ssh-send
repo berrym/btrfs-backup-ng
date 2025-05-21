@@ -67,9 +67,24 @@ find_buffer_program() {
     # Try pv first (more compatible and simpler)
     for path in "/usr/bin/pv" "/usr/local/bin/pv" "/bin/pv" "/sbin/pv"; do
         if [ -x "$path" ]; then
-            # Get basic version info but don't worry about capabilities
-            PV_VERSION=$("$path" --version 2>&1 | head -1 || echo "unknown")
-            echo "pv:$path:$PV_VERSION"
+            # Get pv version and test for advanced capabilities
+            PV_VERSION=$("$path" --version 2>&1 | head -1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' || echo "unknown")
+            
+            # Test if --progress flag works (for progress bar)
+            if "$path" --help 2>&1 | grep -q -- "--progress"; then
+                HAS_PROGRESS=true
+            else
+                HAS_PROGRESS=false
+            fi
+            
+            # Test if --eta flag works
+            if "$path" --help 2>&1 | grep -q -- "--eta"; then
+                HAS_ETA=true
+            else
+                HAS_ETA=false
+            fi
+            
+            echo "pv:$path:$PV_VERSION:$HAS_PROGRESS:$HAS_ETA"
             return 0
         fi
     done
@@ -91,16 +106,34 @@ find_buffer_program() {
 estimate_subvol_size() {
     local subvol="$1"
     
-    # Just use du -b for size estimation - most reliable across systems
-    # du returns size in bytes which is perfect for pv
-    local size=$(du -bs "$subvol" 2>/dev/null | cut -f1 || echo 0)
+    # Use du -b for size estimation
+    local size
+    
+    # Execute in a subshell to prevent output on failure
+    size=$(du -bs "$subvol" 2>/dev/null | awk '{print $1}')
     
     # Ensure we have a valid numeric value
     if ! [[ "$size" =~ ^[0-9]+$ ]]; then
-        size=0
+        # Fallback - try different approach
+        size=$(stat -c%s "$subvol" 2>/dev/null || echo 0)
+        
+        # If we still don't have a valid number, use a reasonable default
+        if ! [[ "$size" =~ ^[0-9]+$ ]]; then
+            size=1073741824  # Default to 1GB
+        fi
     fi
     
     echo "$size"
+}
+
+# Test if a pv command with specific options works
+test_pv_options() {
+    local pv_path="$1"
+    local options="$2"
+    
+    # Create a small test with 1KB of data
+    dd if=/dev/zero bs=1k count=1 2>/dev/null | "$pv_path" $options >/dev/null 2>&1
+    return $?
 }
 
 # Print usage information
@@ -413,12 +446,39 @@ if [ -n "$BUFFER_INFO" ]; then
         # Format snapshot name for display
         SNAPSHOT_NAME=$(basename "$SOURCE_PATH")
         
-        # Simple direct approach with minimal pv options for maximum compatibility
-        log_info "Using pv for transfer with progress display"
-        "$BTRFS_CMD" send "$SOURCE_PATH" | \
-            "$BUFFER_PATH" -p -t -e -r | \
-            "$SSH_CMD" $SSH_OPTS "$DEST_USER@$DEST_HOST" "$RECEIVE_CMD"
-        TRANSFER_STATUS=$?
+        # Parse PV capabilities
+        PV_VERSION="${BUFFER_VERSION%%:*}"
+        BUFFER_INFO_TEMP="${BUFFER_VERSION#*:}"
+        HAS_PROGRESS="${BUFFER_INFO_TEMP#*:}"
+        HAS_PROGRESS="${HAS_PROGRESS%%:*}"
+        HAS_ETA="${BUFFER_INFO_TEMP##*:}"
+        
+        # Get size estimate for progress percentage
+        ESTIMATED_SIZE=$(estimate_subvol_size "$SOURCE_PATH")
+        
+        # Try to use advanced options first
+        if test_pv_options "$BUFFER_PATH" "--progress --eta -s $ESTIMATED_SIZE"; then
+            # Best case - all features work
+            log_info "Using pv with full progress bar and ETA display"
+            "$BTRFS_CMD" send "$SOURCE_PATH" | \
+                "$BUFFER_PATH" --progress --eta --rate --timer --bytes -s "$ESTIMATED_SIZE" | \
+                "$SSH_CMD" $SSH_OPTS "$DEST_USER@$DEST_HOST" "$RECEIVE_CMD"
+            TRANSFER_STATUS=$?
+        elif test_pv_options "$BUFFER_PATH" "-p -e -s $ESTIMATED_SIZE"; then
+            # Next best - short options for progress and ETA
+            log_info "Using pv with standard progress bar and ETA"
+            "$BTRFS_CMD" send "$SOURCE_PATH" | \
+                "$BUFFER_PATH" -p -e -t -r -b -s "$ESTIMATED_SIZE" | \
+                "$SSH_CMD" $SSH_OPTS "$DEST_USER@$DEST_HOST" "$RECEIVE_CMD"
+            TRANSFER_STATUS=$?
+        else
+            # Fallback to basic options
+            log_info "Using pv with basic progress display"
+            "$BTRFS_CMD" send "$SOURCE_PATH" | \
+                "$BUFFER_PATH" -p -t -r | \
+                "$SSH_CMD" $SSH_OPTS "$DEST_USER@$DEST_HOST" "$RECEIVE_CMD"
+            TRANSFER_STATUS=$?
+        fi
         
         # If pv fails, fall back to direct transfer
         if [ $TRANSFER_STATUS -ne 0 ]; then
