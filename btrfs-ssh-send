@@ -24,6 +24,8 @@ USE_SUDO=true
 VERBOSE=false
 IDENTITY_FILE=""
 TEST_MODE=false
+USE_BUFFER=true
+BUFFER_SIZE="128M"
 
 # Find the btrfs command path
 find_btrfs_cmd() {
@@ -60,6 +62,29 @@ find_ssh_cmd() {
     return 1
 }
 
+# Find buffer program (mbuffer or pv) for transfer progress
+find_buffer_program() {
+    # Try mbuffer first (preferred)
+    for path in "/usr/bin/mbuffer" "/usr/local/bin/mbuffer" "/bin/mbuffer" "/sbin/mbuffer"; do
+        if [ -x "$path" ]; then
+            echo "mbuffer:$path"
+            return 0
+        fi
+    done
+    
+    # Try pv as fallback
+    for path in "/usr/bin/pv" "/usr/local/bin/pv" "/bin/pv" "/sbin/pv"; do
+        if [ -x "$path" ]; then
+            echo "pv:$path"
+            return 0
+        fi
+    done
+    
+    # No buffer program found
+    echo ""
+    return 1
+}
+
 # Print usage information
 print_usage() {
     echo "Usage: $(basename $0) [options] <snapshot_path> <user@host:/destination_path>"
@@ -69,11 +94,14 @@ print_usage() {
     echo "  -n, --no-sudo            Don't use sudo on remote host"
     echo "  -v, --verbose            Enable verbose output"
     echo "  -t, --test               Test mode - verify only"
+    echo "  -b, --no-buffer          Don't use mbuffer/pv for transfer"
+    echo "  -s, --buffer-size <size> Buffer size (default: 128M)"
     echo "  -h, --help               Show this help message"
     echo
     echo "Examples:"
     echo "  $(basename $0) /path/to/snapshot user@host:/path/to/destination"
     echo "  $(basename $0) -i ~/.ssh/id_ed25519 /path/to/snapshot user@host:/path/to/destination"
+    echo "  $(basename $0) -s 256M /path/to/snapshot user@host:/path/to/destination"
 }
 
 log_info() {
@@ -116,6 +144,14 @@ while [ $# -gt 0 ]; do
         -t|--test)
             TEST_MODE=true
             shift
+            ;;
+        -b|--no-buffer)
+            USE_BUFFER=false
+            shift
+            ;;
+        -s|--buffer-size)
+            BUFFER_SIZE="$2"
+            shift 2
             ;;
         -h|--help)
             print_usage
@@ -315,15 +351,41 @@ if $USE_SUDO; then
     RECEIVE_CMD="sudo $RECEIVE_CMD"
 fi
 
+# Check for buffer program
+BUFFER_INFO=""
+if $USE_BUFFER; then
+    BUFFER_INFO=$(find_buffer_program)
+    if [ -n "$BUFFER_INFO" ]; then
+        BUFFER_TYPE="${BUFFER_INFO%%:*}"
+        BUFFER_PATH="${BUFFER_INFO#*:}"
+        log_info "Using $BUFFER_TYPE for transfer with buffer size $BUFFER_SIZE"
+    else
+        log_warning "No buffer program found (mbuffer or pv) - transfer will proceed without progress display"
+    fi
+fi
+
 # Set up pipe command
-TRANSFER_CMD="\"$BTRFS_CMD\" send \"$SOURCE_PATH\" | \"$SSH_CMD\" $SSH_OPTS \"$DEST_USER@$DEST_HOST\" \"$RECEIVE_CMD\""
+if [ -n "$BUFFER_INFO" ]; then
+    if [ "$BUFFER_TYPE" = "mbuffer" ]; then
+        # mbuffer with progress display
+        BUFFER_CMD="\"$BUFFER_PATH\" -s $BUFFER_SIZE -m $BUFFER_SIZE -q -v -P 90"
+    else
+        # pv with progress display
+        BUFFER_CMD="\"$BUFFER_PATH\" -pterb -s $(stat -c%s \"$SOURCE_PATH\" 2>/dev/null || echo 0)"
+    fi
+    TRANSFER_CMD="\"$BTRFS_CMD\" send \"$SOURCE_PATH\" | $BUFFER_CMD | \"$SSH_CMD\" $SSH_OPTS \"$DEST_USER@$DEST_HOST\" \"$RECEIVE_CMD\""
+else
+    # Direct transfer without buffer
+    TRANSFER_CMD="\"$BTRFS_CMD\" send \"$SOURCE_PATH\" | \"$SSH_CMD\" $SSH_OPTS \"$DEST_USER@$DEST_HOST\" \"$RECEIVE_CMD\""
+fi
 log_verbose "Transfer command: $TRANSFER_CMD"
 
 # Start a timer
 START_TIME=$(date +%s)
 
-# Execute the transfer
-log_info "Transferring snapshot, this may take a while..."
+# Display initial transfer info
+SUBVOL_SIZE=$(du -sh "$SOURCE_PATH" 2>/dev/null | cut -f1 || echo "unknown")
+log_info "Transferring snapshot ($SUBVOL_SIZE), this may take a while..."
 eval "$TRANSFER_CMD"
 TRANSFER_STATUS=$?
 
@@ -331,7 +393,14 @@ END_TIME=$(date +%s)
 ELAPSED=$((END_TIME - START_TIME))
 
 if [ $TRANSFER_STATUS -eq 0 ]; then
-    log_success "Transfer completed successfully in $ELAPSED seconds"
+    # Calculate transfer speed
+    SIZE_BYTES=$(du -b "$SOURCE_PATH" 2>/dev/null | cut -f1 || echo 0)
+    if [ "$SIZE_BYTES" -gt 0 ] && [ "$ELAPSED" -gt 0 ]; then
+        SPEED=$(echo "scale=2; $SIZE_BYTES / $ELAPSED / 1048576" | bc 2>/dev/null || echo "unknown")
+        log_success "Transfer completed successfully in $ELAPSED seconds ($SPEED MB/s)"
+    else
+        log_success "Transfer completed successfully in $ELAPSED seconds"
+    fi
 else
     log_error "Transfer failed with status $TRANSFER_STATUS"
     exit 1
@@ -362,5 +431,16 @@ if $VERBOSE; then
     "$SSH_CMD" $SSH_OPTS "$DEST_USER@$DEST_HOST" "$SUBVOL_CMD" | grep -i "$SNAPSHOT_NAME" || true
 fi
 
+# Show transfer summary
 log_success "BTRFS snapshot transferred successfully to remote host"
+if [ "$SIZE_BYTES" -gt 0 ]; then
+    SIZE_MB=$(echo "scale=2; $SIZE_BYTES / 1048576" | bc 2>/dev/null || echo "unknown")
+    log_info "Transfer summary:"
+    echo "  - Snapshot: $(basename "$SOURCE_PATH")"
+    echo "  - Size: $SUBVOL_SIZE ($SIZE_MB MB)"
+    echo "  - Duration: $ELAPSED seconds"
+    if [ "$ELAPSED" -gt 0 ]; then
+        echo "  - Speed: $SPEED MB/s"
+    fi
+fi
 exit 0
