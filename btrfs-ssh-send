@@ -67,7 +67,9 @@ find_buffer_program() {
     # Try mbuffer first (preferred)
     for path in "/usr/bin/mbuffer" "/usr/local/bin/mbuffer" "/bin/mbuffer" "/sbin/mbuffer"; do
         if [ -x "$path" ]; then
-            echo "mbuffer:$path"
+            # Check mbuffer version for compatibility
+            MBUFFER_VERSION=$("$path" --version 2>&1 | head -1 | cut -d' ' -f2 || echo "unknown")
+            echo "mbuffer:$path:$MBUFFER_VERSION"
             return 0
         fi
     done
@@ -75,7 +77,7 @@ find_buffer_program() {
     # Try pv as fallback
     for path in "/usr/bin/pv" "/usr/local/bin/pv" "/bin/pv" "/sbin/pv"; do
         if [ -x "$path" ]; then
-            echo "pv:$path"
+            echo "pv:$path:unknown"
             return 0
         fi
     done
@@ -357,8 +359,10 @@ if $USE_BUFFER; then
     BUFFER_INFO=$(find_buffer_program)
     if [ -n "$BUFFER_INFO" ]; then
         BUFFER_TYPE="${BUFFER_INFO%%:*}"
-        BUFFER_PATH="${BUFFER_INFO#*:}"
-        log_info "Using $BUFFER_TYPE for transfer with buffer size $BUFFER_SIZE"
+        BUFFER_INFO_TEMP="${BUFFER_INFO#*:}"
+        BUFFER_PATH="${BUFFER_INFO_TEMP%%:*}"
+        BUFFER_VERSION="${BUFFER_INFO_TEMP#*:}"
+        log_info "Using $BUFFER_TYPE (version $BUFFER_VERSION) for transfer with buffer size $BUFFER_SIZE"
     else
         log_warning "No buffer program found (mbuffer or pv) - transfer will proceed without progress display"
     fi
@@ -366,9 +370,21 @@ fi
 
 # Set up pipe command
 if [ -n "$BUFFER_INFO" ]; then
+    BUFFER_TYPE="${BUFFER_INFO%%:*}"
+    BUFFER_INFO_TEMP="${BUFFER_INFO#*:}"
+    BUFFER_PATH="${BUFFER_INFO_TEMP%%:*}"
+    BUFFER_VERSION="${BUFFER_INFO_TEMP#*:}"
+    
     if [ "$BUFFER_TYPE" = "mbuffer" ]; then
-        # mbuffer with progress display
-        BUFFER_CMD="\"$BUFFER_PATH\" -s $BUFFER_SIZE -m $BUFFER_SIZE -q -v -P 90"
+        # mbuffer with progress display - use options compatible with different versions
+        if [ "$VERBOSE" = "true" ]; then
+            # For verbose logging, show more output
+            BUFFER_CMD="\"$BUFFER_PATH\" -s $BUFFER_SIZE -m $BUFFER_SIZE -v"
+        else
+            # For quiet operation
+            BUFFER_CMD="\"$BUFFER_PATH\" -s $BUFFER_SIZE -m $BUFFER_SIZE -q"
+        fi
+        log_verbose "Using mbuffer version: $BUFFER_VERSION"
     else
         # pv with progress display
         BUFFER_CMD="\"$BUFFER_PATH\" -pterb -s $(stat -c%s \"$SOURCE_PATH\" 2>/dev/null || echo 0)"
