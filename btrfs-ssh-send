@@ -64,21 +64,26 @@ find_ssh_cmd() {
 
 # Find buffer program (mbuffer or pv) for transfer progress
 find_buffer_program() {
-    # Try mbuffer first (preferred)
-    for path in "/usr/bin/mbuffer" "/usr/local/bin/mbuffer" "/bin/mbuffer" "/sbin/mbuffer"; do
-        if [ -x "$path" ]; then
-            # Check mbuffer version for compatibility
-            MBUFFER_VERSION=$("$path" --version 2>&1 | head -1 | cut -d' ' -f2 || echo "unknown")
-            echo "mbuffer:$path:$MBUFFER_VERSION"
-            return 0
-        fi
-    done
-    
-    # Try pv as fallback
+    # Try pv first (more compatible and simpler)
     for path in "/usr/bin/pv" "/usr/local/bin/pv" "/bin/pv" "/sbin/pv"; do
         if [ -x "$path" ]; then
             echo "pv:$path:unknown"
             return 0
+        fi
+    done
+    
+    # Try mbuffer as secondary option
+    for path in "/usr/bin/mbuffer" "/usr/local/bin/mbuffer" "/bin/mbuffer" "/sbin/mbuffer"; do
+        if [ -x "$path" ]; then
+            # Test if mbuffer works with minimal options
+            if "$path" -q -s 1k -m 1M -h >/dev/null 2>&1; then
+                echo "mbuffer:$path:compatible"
+                return 0
+            else
+                # mbuffer exists but may have compatibility issues
+                echo "mbuffer:$path:problematic"
+                return 0
+            fi
         fi
     done
     
@@ -368,42 +373,55 @@ if $USE_BUFFER; then
     fi
 fi
 
-# Set up pipe command
+# Set up transfer command with progressive fallbacks
 if [ -n "$BUFFER_INFO" ]; then
     BUFFER_TYPE="${BUFFER_INFO%%:*}"
     BUFFER_INFO_TEMP="${BUFFER_INFO#*:}"
     BUFFER_PATH="${BUFFER_INFO_TEMP%%:*}"
     BUFFER_VERSION="${BUFFER_INFO_TEMP#*:}"
     
-    if [ "$BUFFER_TYPE" = "mbuffer" ]; then
-        # mbuffer with progress display - use options compatible with different versions
-        if [ "$VERBOSE" = "true" ]; then
-            # For verbose logging, show more output
-            BUFFER_CMD="\"$BUFFER_PATH\" -s $BUFFER_SIZE -m $BUFFER_SIZE -v"
-        else
-            # For quiet operation
-            BUFFER_CMD="\"$BUFFER_PATH\" -s $BUFFER_SIZE -m $BUFFER_SIZE -q"
+    log_info "Using $BUFFER_TYPE for transfer"
+    
+    # Display initial transfer info
+    SUBVOL_SIZE=$(du -sh "$SOURCE_PATH" 2>/dev/null | cut -f1 || echo "unknown")
+    log_info "Transferring snapshot ($SUBVOL_SIZE), this may take a while..."
+    
+    # Start a timer
+    START_TIME=$(date +%s)
+    
+    # Try with buffer first
+    if [ "$BUFFER_TYPE" = "pv" ]; then
+        # pv with progress display - simple and reliable
+        log_verbose "Using pv for transfer with progress display"
+        "$BTRFS_CMD" send "$SOURCE_PATH" | "$BUFFER_PATH" -pterb | "$SSH_CMD" $SSH_OPTS "$DEST_USER@$DEST_HOST" "$RECEIVE_CMD"
+        TRANSFER_STATUS=$?
+    elif [ "$BUFFER_TYPE" = "mbuffer" ]; then
+        # Try mbuffer with minimal options
+        log_verbose "Using mbuffer with minimal options"
+        "$BTRFS_CMD" send "$SOURCE_PATH" | "$BUFFER_PATH" -q | "$SSH_CMD" $SSH_OPTS "$DEST_USER@$DEST_HOST" "$RECEIVE_CMD"
+        TRANSFER_STATUS=$?
+        
+        # If mbuffer fails, fall back to direct transfer
+        if [ $TRANSFER_STATUS -ne 0 ]; then
+            log_warning "mbuffer failed, falling back to direct transfer"
+            "$BTRFS_CMD" send "$SOURCE_PATH" | "$SSH_CMD" $SSH_OPTS "$DEST_USER@$DEST_HOST" "$RECEIVE_CMD"
+            TRANSFER_STATUS=$?
         fi
-        log_verbose "Using mbuffer version: $BUFFER_VERSION"
-    else
-        # pv with progress display
-        BUFFER_CMD="\"$BUFFER_PATH\" -pterb -s $(stat -c%s \"$SOURCE_PATH\" 2>/dev/null || echo 0)"
     fi
-    TRANSFER_CMD="\"$BTRFS_CMD\" send \"$SOURCE_PATH\" | $BUFFER_CMD | \"$SSH_CMD\" $SSH_OPTS \"$DEST_USER@$DEST_HOST\" \"$RECEIVE_CMD\""
 else
     # Direct transfer without buffer
-    TRANSFER_CMD="\"$BTRFS_CMD\" send \"$SOURCE_PATH\" | \"$SSH_CMD\" $SSH_OPTS \"$DEST_USER@$DEST_HOST\" \"$RECEIVE_CMD\""
+    log_info "No buffer program available, using direct transfer"
+    
+    # Display initial transfer info
+    SUBVOL_SIZE=$(du -sh "$SOURCE_PATH" 2>/dev/null | cut -f1 || echo "unknown")
+    log_info "Transferring snapshot ($SUBVOL_SIZE), this may take a while..."
+    
+    # Start a timer
+    START_TIME=$(date +%s)
+    
+    "$BTRFS_CMD" send "$SOURCE_PATH" | "$SSH_CMD" $SSH_OPTS "$DEST_USER@$DEST_HOST" "$RECEIVE_CMD"
+    TRANSFER_STATUS=$?
 fi
-log_verbose "Transfer command: $TRANSFER_CMD"
-
-# Start a timer
-START_TIME=$(date +%s)
-
-# Display initial transfer info
-SUBVOL_SIZE=$(du -sh "$SOURCE_PATH" 2>/dev/null | cut -f1 || echo "unknown")
-log_info "Transferring snapshot ($SUBVOL_SIZE), this may take a while..."
-eval "$TRANSFER_CMD"
-TRANSFER_STATUS=$?
 
 END_TIME=$(date +%s)
 ELAPSED=$((END_TIME - START_TIME))
