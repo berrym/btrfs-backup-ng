@@ -209,25 +209,42 @@ class SSHEndpoint(Endpoint):
         # Process command arguments based on whether they're marked as paths
         string_command = []
         
+        logger.debug("Executing remote command, original format: %s", command)
+        logger.debug("Command type: %s, first element type: %s", 
+                    type(command).__name__, 
+                    type(command[0]).__name__ if command else "None")
+        
         # Check if command is using the tuple format (arg, is_path)
         if command and isinstance(command[0], tuple) and len(command[0]) == 2:
             # New format with (arg, is_path) tuples
-            for arg, is_path in command:
+            logger.debug("Detected tuple format command (arg, is_path)")
+            for i, (arg, is_path) in enumerate(command):
+                logger.debug("Processing arg %d: '%s' (is_path=%s, type=%s)", 
+                            i, arg, is_path, type(arg).__name__)
                 if is_path and isinstance(arg, (str, Path)):
-                    string_command.append(self._normalize_path(arg))
+                    normalized = self._normalize_path(arg)
+                    logger.debug("Normalized path arg %d: %s -> %s", i, arg, normalized)
+                    string_command.append(normalized)
                 else:
                     # Not a path, just append as-is
+                    logger.debug("Using non-path arg %d as-is: %s", i, arg)
                     string_command.append(arg)
             logger.debug("Processed marked command arguments for remote execution: %s", string_command)
         else:
             # Legacy format - convert any Path objects in the command to strings
-            for arg in command:
+            logger.debug("Using legacy command format")
+            for i, arg in enumerate(command):
                 if isinstance(arg, (str, Path)):
-                    string_command.append(self._normalize_path(arg))
+                    normalized = self._normalize_path(arg)
+                    logger.debug("Normalized arg %d: %s -> %s", i, arg, normalized)
+                    string_command.append(normalized)
                 else:
+                    logger.debug("Using non-string arg %d as-is: %s", i, arg)
                     string_command.append(arg)
             logger.debug("Processed legacy command format for remote execution: %s", string_command)
+        
         remote_cmd = self._build_remote_command(string_command)
+        logger.debug("Final remote command after build: %s", remote_cmd)
         # Build the SSH command - if using sudo for this command, consider forcing TTY allocation
         needs_tty = False
         if self.config.get("ssh_sudo", False) and not self.config.get("passwordless", False):
@@ -236,18 +253,25 @@ class SSHEndpoint(Endpoint):
             if "sudo" in cmd_str and "-n" not in cmd_str:
                 needs_tty = True
             
-        ssh_cmd = self.ssh_manager._ssh_base_cmd(force_tty=needs_tty) + ["--"] + remote_cmd
+        ssh_base_cmd = self.ssh_manager._ssh_base_cmd(force_tty=needs_tty)
+        logger.debug("SSH base command: %s", ssh_base_cmd)
+        
+        ssh_cmd = ssh_base_cmd + ["--"] + remote_cmd
+        logger.debug("Complete SSH command: %s", ssh_cmd)
 
         # Always capture stderr if not explicitly provided
         if "stderr" not in kwargs:
             kwargs["stderr"] = subprocess.PIPE
+            logger.debug("Added stderr capture to kwargs")
 
         # Default timeout if not specified
         if "timeout" not in kwargs:
             kwargs["timeout"] = 30
+            logger.debug("Set default timeout to 30 seconds")
 
         cmd_str = " ".join(map(str, ssh_cmd))
         logger.debug("Executing remote command: %s", cmd_str)
+        logger.debug("Working directory: %s", os.getcwd())
 
         try:
             result = subprocess.run(ssh_cmd, **kwargs)
@@ -268,15 +292,19 @@ class SSHEndpoint(Endpoint):
             elif exit_code == 0:
                 logger.debug("Command executed successfully: %s", cmd_str)
 
+            logger.debug("Command execution result: exit_code=%d", result.returncode)
             return result
 
         except subprocess.TimeoutExpired as e:
             logger.error("Command timed out after %s seconds: %s", e.timeout, cmd_str)
+            logger.error("Timeout occurred in SSH command execution, command was: %s", ssh_cmd)
             raise
         except Exception as e:
             logger.error(
                 "Failed to execute remote command: %s\nError: %s", cmd_str, str(e)
             )
+            logger.error("Exception type: %s", type(e).__name__)
+            logger.error("Command that failed: %s", ssh_cmd)
             raise
 
     def _btrfs_send(self, source: str, stdout_pipe) -> subprocess.Popen:
@@ -301,34 +329,45 @@ class SSHEndpoint(Endpoint):
         # If the path is actually a tuple from our new command format, extract just the path part
         if isinstance(path, tuple) and len(path) == 2:
             path, is_path = path
+            logger.debug("Tuple format detected in _normalize_path: %s (is_path=%s)", path, is_path)
             if not is_path:
                 # If it's not a path, just return as-is
+                logger.debug("Not a path, returning as-is: %s", path)
                 return path
         
         # For SSH paths, we just want to ensure they're strings,
         # not convert them to Path objects or resolve them locally
         if isinstance(path, Path):
+            logger.debug("Converting Path object to string: %s", path)
             return str(path)
             
         # If it's a string with a tilde, we need special handling
         if isinstance(path, str) and "~" in path:
+            logger.debug("Path contains tilde, handling expansion: %s", path)
             # Check if running as root via sudo
             if os.geteuid() == 0 and os.environ.get("SUDO_USER"):
                 sudo_user = os.environ.get("SUDO_USER")
+                logger.debug("Running as root via sudo user: %s", sudo_user)
                 try:
                     # Get the sudo user's home directory
                     sudo_user_home = pwd.getpwnam(sudo_user).pw_dir
+                    logger.debug("Found sudo user home: %s", sudo_user_home)
                     # Replace ~ with sudo user's home
                     if path.startswith("~"):
+                        original_path = path
                         path = path.replace("~", sudo_user_home, 1)
-                        logger.debug("Expanded ~ in path to sudo user's home: %s", path)
+                        logger.debug("Expanded ~ in path: %s -> %s", original_path, path)
                 except Exception as e:
-                    logger.debug("Error expanding ~ in path: %s", e)
+                    logger.error("Error expanding ~ in path: %s", e)
             else:
                 # Normal user, let Path handle it
+                original_path = path
                 path = os.path.expanduser(path)
+                logger.debug("Expanded user path: %s -> %s", original_path, path)
                 
-        return str(path) if path is not None else None
+    result = str(path) if path is not None else None
+    logger.debug("Final normalized path result: %s", result)
+    return result
         
     def _verify_btrfs_availability(self, use_sudo=False):
         """Verify that btrfs command is available on the remote host."""

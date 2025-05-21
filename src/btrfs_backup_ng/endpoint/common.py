@@ -70,29 +70,40 @@ class Endpoint:
         # Import logger here to avoid circular imports
         from btrfs_backup_ng.__logger__ import logger
 
+        logger.debug("Normalizing path: %s (type: %s)", val, type(val).__name__)
+        
         # Handle string paths
         if isinstance(val, str):
             # Just expanduser for remote paths to avoid resolving them locally
             if hasattr(self, "_is_remote") and getattr(self, "_is_remote", False):
-                return str(Path(val).expanduser())
+                expanded = str(Path(val).expanduser())
+                logger.debug("Remote path expanded: %s -> %s", val, expanded)
+                return expanded
             
             # For local paths, handle carefully
             try:
                 path = Path(val).expanduser()
+                logger.debug("Local path expanded: %s -> %s", val, path)
                 # If path is absolute, no need to resolve
                 if path.is_absolute():
+                    logger.debug("Using absolute path as-is: %s", path)
                     return path
                 
                 # Safely resolve relative path
                 try:
-                    return path.resolve()
+                    resolved = path.resolve()
+                    logger.debug("Resolved relative path: %s -> %s", path, resolved)
+                    return resolved
                 except (FileNotFoundError, PermissionError) as e:
                     # If resolving fails, manually make it absolute with cwd
                     logger.warning(f"Path resolution failed for {path}: {e}")
-                    return Path(os.getcwd()) / path
+                    cwd_path = Path(os.getcwd()) / path
+                    logger.debug("Manually made absolute with cwd: %s -> %s", path, cwd_path)
+                    return cwd_path
             except Exception as e:
                 logger.error(f"Path handling error: {e}")
                 # Return original string if all else fails
+                logger.debug("Returning original string due to error: %s", val)
                 return val
 
         # If it's already a Path object
@@ -295,12 +306,15 @@ class Endpoint:
             if snapshot.locks or snapshot.parent_locks:
                 logger.info("Skipping locked snapshot: %s", snapshot)
                 continue
-            cmd = ["btrfs", "subvolume", "delete", str(snapshot.get_path())]
+            cmd = [("btrfs", False), ("subvolume", False), ("delete", False), (str(snapshot.get_path()), True)]
+            logger.debug("Executing deletion command: %s", [(arg, is_path) for arg, is_path in cmd])
             try:
+                logger.debug("Deleting snapshot with path: %s", snapshot.get_path())
                 self._exec_command({"command": cmd})
                 logger.info("Deleted snapshot subvolume: %s", snapshot.get_path())
             except Exception as e:
                 logger.error("Failed to delete snapshot %s: %s", snapshot.get_path(), e)
+                logger.error("Deletion command was: %s", [(arg, is_path) for arg, is_path in cmd])
             if self.__cached_snapshots is not None:
                 with contextlib.suppress(ValueError):
                     self.__cached_snapshots.remove(snapshot)
@@ -370,10 +384,13 @@ class Endpoint:
         if parent:
             cmd.append(("-p", False))
             cmd.append((str(parent.get_path()), True))
+            logger.debug("Using parent for send: %s", parent.get_path())
         if clones:
             for clone in clones:
                 cmd.append((str(clone.get_path()), True))
+                logger.debug("Added clone for send: %s", clone.get_path())
         cmd.append((str(snapshot.get_path()), True))
+        logger.debug("Built send command: %s", [(a, p) for a, p in cmd])
         return cmd
 
     def _build_receive_command(self, destination):
@@ -443,14 +460,19 @@ class Endpoint:
         # Process command based on whether arguments are marked as paths or not
         try:
             normalized_command = []
+            logger.debug("Original command to normalize: %s", command)
             
             # Check if command is using the tuple format (arg, is_path)
             if command and isinstance(command[0], tuple) and len(command[0]) == 2:
                 # New format with (arg, is_path) tuples
-                for arg, is_path in command:
+                logger.debug("Using tuple format for command normalization")
+                for i, (arg, is_path) in enumerate(command):
+                    logger.debug("Processing arg %d: %s (is_path=%s, type=%s)", 
+                                i, arg, is_path, type(arg).__name__)
                     if is_path and isinstance(arg, (str, Path)):
                         try:
                             normalized_arg = self._normalize_path(arg)
+                            logger.debug("Normalized path arg %s to: %s", arg, normalized_arg)
                             normalized_command.append(normalized_arg)
                         except Exception as e:
                             logger.warning("Path normalization failed for %s: %s", arg, e)
@@ -458,25 +480,29 @@ class Endpoint:
                             normalized_command.append(arg)
                     else:
                         # Not a path, just append as-is
+                        logger.debug("Using non-path arg as-is: %s", arg)
                         normalized_command.append(arg)
                 logger.debug("Processed marked command arguments: %s", normalized_command)
             else:
                 # Legacy format - attempt to guess which args are paths
+                logger.debug("Using legacy format for command normalization")
                 for i, arg in enumerate(command):
                     if isinstance(arg, (str, Path)):
                         # First argument is a command - don't normalize it as a path
                         if i == 0 or (isinstance(arg, str) and arg.startswith("-")):
                             normalized_command.append(arg)
-                            logger.debug("Not normalizing argument: %s", arg)
+                            logger.debug("Not normalizing argument %d: %s", i, arg)
                         else:
                             try:
                                 normalized_arg = self._normalize_path(arg)
+                                logger.debug("Normalized path arg %d %s to: %s", i, arg, normalized_arg)
                                 normalized_command.append(normalized_arg)
                             except Exception as e:
                                 logger.warning("Path normalization failed for %s: %s", arg, e)
                                 # Use original argument if normalization fails
                                 normalized_command.append(arg)
                     else:
+                        logger.debug("Keeping non-string/path arg %d as-is: %s", i, arg)
                         normalized_command.append(arg)
                 logger.debug("Processed legacy command format: %s", normalized_command)
             
@@ -507,11 +533,18 @@ class Endpoint:
                     else:
                         command = ["sudo"] + command
 
-                # Ensure all command elements are strings
+                # Ensure all command arguments are strings
                 command = [str(arg) for arg in command]
                 logger.debug("Final command after sudo adjustment: %s", command)
+                # Log the command with file paths, useful for debugging
+                cwd = os.getcwd()
+                logger.debug("Current working directory: %s", cwd)
+                logger.debug("Executing command with absolute paths:")
+                for i, arg in enumerate(command):
+                    logger.debug("  Arg %d: %s", i, arg)
                 # Make sure the environment includes the PATH
                 env = kwargs.get("env", os.environ.copy())
+                logger.debug("Environment PATH: %s", env.get("PATH", "Not set"))
                 kwargs["env"] = env
                 return __util__.exec_subprocess(command, **kwargs)
         except Exception as e:
