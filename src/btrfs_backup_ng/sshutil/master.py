@@ -180,7 +180,7 @@ class SSHMasterManager:
         # Handle TTY allocation if requested
         if force_tty:
             # Force TTY allocation (for interactive sudo)
-            cmd.append("-t")
+            cmd.append("-tt")
             logger.debug("Forcing TTY allocation for SSH command")
 
         # When running as root via sudo, explicitly use the regular user's SSH config
