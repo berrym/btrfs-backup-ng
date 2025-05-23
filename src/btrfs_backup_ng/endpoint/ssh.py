@@ -590,7 +590,7 @@ class SSHEndpoint(Endpoint):
         logger.info("\nDiagnostic Summary:")
         logger.info("-" * 50)
         for test, result in results.items():
-            status = "✓" if result else "✗"
+            status = "PASS" if result else "FAIL"
             logger.info(f"{test.replace('_', ' ').title():20} {status}")
             logger.debug(f"Test {test}: {'PASSED' if result else 'FAILED'}")
         logger.info("-" * 50)
@@ -1624,7 +1624,7 @@ echo $? >"{receive_log}.exitcode"
                 'buffer': buffer_process
             }
             
-            logger.info("🚀 Using enhanced monitoring system for real-time progress...")
+            logger.info("SYSTEM: Using enhanced monitoring system for real-time progress...")
             transfer_succeeded = self._monitor_transfer_progress(
                 processes=processes,
                 start_time=start_time,
@@ -1638,10 +1638,10 @@ echo $? >"{receive_log}.exitcode"
                 logger.warning("Reached maximum wait time, performing final verification...")
                 try:
                     if self._verify_snapshot_exists(dest_path, snapshot_name):
-                        logger.info("✅ Transfer completed successfully (final check)")
+                        logger.info("SUCCESS: Transfer completed successfully (final check)")
                         transfer_succeeded = True
                     else:
-                        logger.error("❌ Transfer failed - no snapshot found after maximum wait time")
+                        logger.error("FAILED: Transfer failed - no snapshot found after maximum wait time")
                 except Exception as e:
                     logger.error(f"Final verification failed: {e}")
             
@@ -1689,7 +1689,7 @@ echo $? >"{receive_log}.exitcode"
                 logger.info(f"Snapshot existence verification: {verification_result}")
                 
                 if verification_result:
-                    logger.info("✅ TRANSFER ACTUALLY SUCCEEDED - Snapshot exists on remote host")
+                    logger.info("SUCCESS: TRANSFER ACTUALLY SUCCEEDED - Snapshot exists on remote host")
                     transfer_actually_succeeded = True
                 else:
                     # Try alternative verification methods
@@ -1700,7 +1700,7 @@ echo $? >"{receive_log}.exitcode"
                         ls_output = ls_result.stdout.decode(errors="replace")
                         logger.info(f"Directory listing: {ls_output}")
                         if snapshot_name in ls_output:
-                            logger.info("✅ TRANSFER ACTUALLY SUCCEEDED - Snapshot found in directory listing")
+                            logger.info("SUCCESS: TRANSFER ACTUALLY SUCCEEDED - Snapshot found in directory listing")
                             transfer_actually_succeeded = True
                             
             except Exception as e:
@@ -1745,10 +1745,10 @@ echo $? >"{receive_log}.exitcode"
             
             # Final decision based on actual transfer success
             if transfer_actually_succeeded:
-                logger.info("✅ TRANSFER VERIFICATION SUCCESSFUL")
+                logger.info("SUCCESS: TRANSFER VERIFICATION SUCCESSFUL")
                 return True
             else:
-                logger.error("❌ TRANSFER FAILED - No snapshot found on remote host")
+                logger.error("FAILED: TRANSFER FAILED - No snapshot found on remote host")
                 return False
                 
         except Exception as e:
@@ -1854,7 +1854,7 @@ echo $? >"{receive_log}.exitcode"
         Returns:
             bool: True if transfer succeeded, False otherwise
         """
-        logger.info("🚀 Starting advanced transfer monitoring...")
+        logger.info("Starting advanced transfer monitoring...")
         
         send_process = processes['send']
         receive_process = processes['receive'] 
@@ -1877,7 +1877,7 @@ echo $? >"{receive_log}.exitcode"
             
             # Check for critical failures
             if not send_alive and send_process.returncode != 0:
-                logger.error(f"❌ Send process failed (exit code: {send_process.returncode})")
+                logger.error(f"CRITICAL: Send process failed (exit code: {send_process.returncode})")
                 self._log_process_error(send_process, "send")
                 return False
                 
@@ -1888,61 +1888,61 @@ echo $? >"{receive_log}.exitcode"
                 
             # Periodic verification
             if current_time - last_verification_time >= verification_interval:
-                logger.info("🔍 Performing verification check...")
+                logger.info("Performing verification check...")
                 try:
                     if self._verify_snapshot_exists(dest_path, snapshot_name):
-                        logger.info("✅ Transfer verification successful!")
+                        logger.info("SUCCESS: Transfer verification successful!")
                         return True
                     else:
-                        logger.info("🔄 Transfer still in progress...")
+                        logger.info("STATUS: Transfer still in progress...")
                 except Exception as e:
                     logger.debug(f"Verification check failed (normal during transfer): {e}")
                 last_verification_time = current_time
                 
             # Check if all processes finished
             if not send_alive and not receive_alive and not (buffer_process and buffer_alive):
-                logger.info("📋 All processes completed, performing final verification...")
+                logger.info("STATUS: All processes completed, performing final verification...")
                 break
                 
             # Handle receive process warnings (but don't fail immediately)
             if not receive_alive and receive_process.returncode not in [None, 0]:
-                logger.warning(f"⚠️ Receive process exit code: {receive_process.returncode}")
-                logger.info("🔍 Checking if transfer succeeded despite exit code...")
+                logger.warning(f"WARNING: Receive process exit code: {receive_process.returncode}")
+                logger.info("STATUS: Checking if transfer succeeded despite exit code...")
                 
             time.sleep(0.5)  # Short sleep for responsive monitoring
             
         # Final verification
-        logger.info("🏁 Transfer monitoring complete, performing final verification...")
+        logger.info("COMPLETE: Transfer monitoring complete, performing final verification...")
         try:
             transfer_succeeded = self._verify_snapshot_exists(dest_path, snapshot_name)
             if transfer_succeeded:
                 elapsed_final = time.time() - start_time
-                logger.info(f"✅ Transfer completed successfully in {elapsed_final:.1f}s")
+                logger.info(f"SUCCESS: Transfer completed successfully in {elapsed_final:.1f}s")
             else:
-                logger.error("❌ Transfer failed - snapshot not found on remote host")
+                logger.error("FAILED: Transfer failed - snapshot not found on remote host")
         except Exception as e:
-            logger.error(f"❌ Final verification failed: {e}")
+            logger.error(f"ERROR: Final verification failed: {e}")
             
         return transfer_succeeded
         
     def _log_transfer_status(self, elapsed, send_alive, receive_alive, buffer_alive, buffer_process):
-        """Log detailed transfer status with emoji indicators."""
+        """Log detailed transfer status with professional indicators."""
         minutes = elapsed / 60
         
-        logger.info(f"🔄 Transfer Status ({elapsed:.1f}s / {minutes:.1f}m)")
-        logger.info(f"   📤 Send: {'🟢 active' if send_alive else '✅ done'}")
-        logger.info(f"   📥 Receive: {'🟢 active' if receive_alive else '✅ done'}")
+        logger.info(f"STATUS: Transfer Progress ({elapsed:.1f}s / {minutes:.1f}m)")
+        logger.info(f"   Send: {'ACTIVE' if send_alive else 'COMPLETE'}")
+        logger.info(f"   Receive: {'ACTIVE' if receive_alive else 'COMPLETE'}")
         
         if buffer_process:
-            logger.info(f"   🔧 Buffer: {'🟢 active' if buffer_alive else '✅ done'}")
+            logger.info(f"   Buffer: {'ACTIVE' if buffer_alive else 'COMPLETE'}")
             
         # Show activity indicator
         active_count = sum([send_alive, receive_alive, buffer_alive])
         total_count = 2 + (1 if buffer_process else 0)
-        logger.info(f"   📊 Active: {active_count}/{total_count} processes")
+        logger.info(f"   Active Processes: {active_count}/{total_count}")
         
         if elapsed > 60:  # After 1 minute
-            logger.info(f"   ⏱️ Transfer progressing normally...")
+            logger.info(f"   STATUS: Transfer progressing normally...")
             
     def _log_process_error(self, process, process_name):
         """Log detailed error information for a failed process."""

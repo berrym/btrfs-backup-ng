@@ -356,12 +356,12 @@ def main():
     logger.info("\n" + "-" * 50)
     logger.info("DIAGNOSTIC SUMMARY")
     logger.info("-" * 50)
-    logger.info(f"SSH Connection:          {'✓' if ssh_ok else '✗'}")
-    logger.info(f"btrfs Command:           {'✓' if btrfs_ok else '✗'}")
-    logger.info(f"Passwordless Sudo:       {'✓' if sudo_ok else '✗'}")
-    logger.info(f"Sudo btrfs Command:      {'✓' if sudo_btrfs_ok else '✗'}")
-    logger.info(f"Write Permissions:       {'✓' if write_ok else '✗'}")
-    logger.info(f"btrfs Filesystem:        {'✓' if btrfs_fs_ok else '✗'}")
+    logger.info(f"SSH Connection:          {'PASS' if ssh_ok else 'FAIL'}")
+    logger.info(f"btrfs Command:           {'PASS' if btrfs_ok else 'FAIL'}")
+    logger.info(f"Passwordless Sudo:       {'PASS' if sudo_ok else 'FAIL'}")
+    logger.info(f"Sudo btrfs Command:      {'PASS' if sudo_btrfs_ok else 'FAIL'}")
+    logger.info(f"Write Permissions:       {'PASS' if write_ok else 'FAIL'}")
+    logger.info(f"btrfs Filesystem:        {'PASS' if btrfs_fs_ok else 'FAIL'}")
     logger.info("-" * 50)
 
     # Overall assessment
