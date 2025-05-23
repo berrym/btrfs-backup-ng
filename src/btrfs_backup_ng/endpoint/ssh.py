@@ -1050,26 +1050,30 @@ class SSHEndpoint(Endpoint):
                 "Consider using --ssh-sudo option to enable sudo on remote host"
             )
 
-        # Build the remote command with optional sudo and proper logging
+        # Use inline script approach to avoid all shell parsing issues
         receive_log = f"/tmp/btrfs-receive-{int(time.time())}.log"
-
-        # Properly escape the destination path for shell execution
-        escaped_dest = destination.replace("'", "'\"'\"'")
-        escaped_log = receive_log.replace("'", "'\"'\"'")
-
+        
+        # Create an inline script that avoids parsing issues
         if self.config.get("ssh_sudo", False):
-            # Use sudo for btrfs receive with logging
-            receive_shell_cmd = f"sudo -n -E btrfs receive '{escaped_dest}' 2>'{escaped_log}'; echo $? >'{escaped_log}.exitcode'"
+            script_content = f'''#!/bin/bash
+sudo -n -E btrfs receive "{destination}" 2>"{receive_log}"
+echo $? >"{receive_log}.exitcode"
+'''
         else:
-            # Direct command with logging
-            receive_shell_cmd = f"btrfs receive '{escaped_dest}' 2>'{escaped_log}'; echo $? >'{escaped_log}.exitcode'"
+            script_content = f'''#!/bin/bash
+btrfs receive "{destination}" 2>"{receive_log}"
+echo $? >"{receive_log}.exitcode"
+'''
 
-        # Use shell to execute the command with logging
-        receive_cmd = ["sh", "-c", receive_shell_cmd]
+        # Use bash with here-document to execute the script
+        receive_cmd = ["bash", "-c", script_content]
 
         # Log the command for debugging
-        logger.debug("Built receive shell command: %s", receive_shell_cmd)
-        logger.debug("SSH command array: %s", receive_cmd)
+        logger.info("=== SSH COMMAND CONSTRUCTION DEBUG ===")
+        logger.info("Built script content: %s", script_content.strip())
+        logger.info("SSH command array: %s", receive_cmd)
+        logger.info("Destination path: %s", destination)
+        logger.info("Log file path: %s", receive_log)
 
         # Determine if we need a TTY for this command (needed if sudo might prompt for password)
         needs_tty = False
@@ -1122,7 +1126,11 @@ class SSHEndpoint(Endpoint):
         ssh_cmd = ssh_base_cmd + ["--"] + receive_cmd
 
         # Log the full command for debugging
-        logger.debug("Full SSH btrfs receive command: %s", " ".join(map(str, ssh_cmd)))
+        logger.info("=== FINAL SSH COMMAND DEBUG ===")
+        logger.info("SSH base command: %s", ssh_base_cmd)
+        logger.info("Receive command: %s", receive_cmd)
+        logger.info("Full SSH command: %s", ssh_cmd)
+        logger.info("Full SSH command as string: %s", " ".join(map(str, ssh_cmd)))
 
         try:
             # Start the btrfs receive process
@@ -1168,6 +1176,7 @@ class SSHEndpoint(Endpoint):
             logger.debug(
                 "If receive fails, verify remote user has sudo access for btrfs commands"
             )
+            # Set log file path for compatibility with error checking code
             self._last_receive_log = receive_log
             self._last_transfer_snapshot = True
             return receive_process
