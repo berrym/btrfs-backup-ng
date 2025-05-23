@@ -1050,24 +1050,26 @@ class SSHEndpoint(Endpoint):
                 "Consider using --ssh-sudo option to enable sudo on remote host"
             )
 
-        # Build the remote command with optional sudo
-        # For SSH receive, we'll construct a shell command that saves stderr to a log file
-        # This helps diagnose issues when the receive process fails silently
-
+        # Build the remote command with optional sudo and proper logging
         receive_log = f"/tmp/btrfs-receive-{int(time.time())}.log"
 
+        # Properly escape the destination path for shell execution
+        escaped_dest = destination.replace("'", "'\"'\"'")
+        escaped_log = receive_log.replace("'", "'\"'\"'")
+
         if self.config.get("ssh_sudo", False):
-            # Use sudo with -E to preserve environment and redirect stderr to log file
-            receive_shell_cmd = f"sudo -E btrfs receive {destination} 2> {receive_log}; echo $? > {receive_log}.exitcode"
+            # Use sudo for btrfs receive with logging
+            receive_shell_cmd = f"sudo -n -E btrfs receive '{escaped_dest}' 2>'{escaped_log}'; echo $? >'{escaped_log}.exitcode'"
         else:
-            # Direct command with stderr redirection
-            receive_shell_cmd = f"btrfs receive {destination} 2> {receive_log}; echo $? > {receive_log}.exitcode"
+            # Direct command with logging
+            receive_shell_cmd = f"btrfs receive '{escaped_dest}' 2>'{escaped_log}'; echo $? >'{escaped_log}.exitcode'"
 
-        # Log the shell command for debugging
+        # Use shell to execute the command with logging
+        receive_cmd = ["sh", "-c", receive_shell_cmd]
+
+        # Log the command for debugging
         logger.debug("Built receive shell command: %s", receive_shell_cmd)
-
-        # Use -c to execute the command in the shell
-        receive_cmd = ["bash", "-c", receive_shell_cmd]
+        logger.debug("SSH command array: %s", receive_cmd)
 
         # Determine if we need a TTY for this command (needed if sudo might prompt for password)
         needs_tty = False
@@ -1339,10 +1341,10 @@ class SSHEndpoint(Endpoint):
         if self.config.get("ssh_sudo", False):
             list_cmd = ["sudo", "-n"] + list_cmd
 
-        logger.debug(f"Verifying snapshot existence with command: {' '.join(list_cmd)}")
+        logger.info(f"Verifying snapshot existence with command: {' '.join(list_cmd)}")
 
         try:
-            logger.debug("Executing subvolume list command...")
+            logger.info("Executing subvolume list command...")
             list_result = self._exec_remote_command(
                 list_cmd,
                 check=False,
@@ -1350,7 +1352,13 @@ class SSHEndpoint(Endpoint):
                 stderr=subprocess.PIPE,
             )
 
-            logger.debug(f"Subvolume list command exit code: {list_result.returncode}")
+            logger.info(f"Subvolume list command exit code: {list_result.returncode}")
+            if list_result.stdout:
+                stdout_content = list_result.stdout.decode(errors="replace")
+                logger.info(f"Subvolume list output:\n{stdout_content}")
+            if list_result.stderr:
+                stderr_content = list_result.stderr.decode(errors="replace") 
+                logger.info(f"Subvolume list stderr:\n{stderr_content}")
             if list_result.returncode != 0:
                 stderr_text = (
                     list_result.stderr.decode(errors="replace")
@@ -1499,133 +1507,136 @@ class SSHEndpoint(Endpoint):
         # Find buffer program for progress display and reliability
         buffer_name, buffer_cmd = self._find_buffer_program()
 
-        # Build the transfer command
-        if parent_path and os.path.exists(parent_path):
-            logger.info(f"Using incremental transfer with parent: {parent_path}")
-            send_cmd = ["sudo", "btrfs", "send", "-p", parent_path, source_path]
-            logger.debug(f"Incremental send command: {' '.join(send_cmd)}")
-        else:
-            logger.info(f"Using full transfer")
-            send_cmd = ["sudo", "btrfs", "send", source_path]
-            logger.debug(f"Full send command: {' '.join(send_cmd)}")
-
-        receive_cmd = ["btrfs", "receive", dest_path]
-        if self.config.get("ssh_sudo", False):
-            # Add sudo with appropriate flags for receive command
-            passwordless_only = os.environ.get(
-                "BTRFS_BACKUP_PASSWORDLESS_ONLY", "0"
-            ).lower() in ("1", "true", "yes")
-            logger.debug(f"SSH sudo enabled, passwordless_only: {passwordless_only}")
-            if passwordless_only:
-                receive_cmd = ["sudo", "-n", "-E", "-P", "-p", ""] + receive_cmd
+        # Get the source snapshot object to use proper send method
+        from btrfs_backup_ng import __util__
+        
+        # Find the source endpoint (should be passed in or accessible)
+        # For now, we'll create a minimal snapshot object to use the source endpoint's send method
+        try:
+            # Create a snapshot object that represents our source
+            source_endpoint = None
+            # We need to get this from the source path - this is a limitation of the current design
+            # For now, we'll use the traditional approach but with better process management
+            
+            # Determine parent for incremental transfer
+            parent_snapshot = None
+            if parent_path and os.path.exists(parent_path):
+                logger.info(f"Using incremental transfer with parent: {parent_path}")
+                # We'll handle incremental logic in the actual send call
             else:
-                receive_cmd = ["sudo", "-S", "-E", "-P", "-p", ""] + receive_cmd
-            logger.debug(f"Remote receive command: {' '.join(receive_cmd)}")
-        else:
-            logger.debug(f"SSH sudo disabled, receive command: {' '.join(receive_cmd)}")
+                logger.info(f"Using full transfer")
+        except Exception as e:
+            logger.error(f"Error setting up transfer parameters: {e}")
+            return False
 
         try:
-            # Start local send process
+            # Build the proper btrfs send command
             logger.info(f"Starting transfer from {source_path}...")
-            logger.debug(f"Executing local send command: {' '.join(send_cmd)}")
-            send_process = subprocess.Popen(
-                send_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0
-            )
             start_time = time.time()
-            logger.debug(f"Send process started at {start_time}")
-
-            # Pipe through buffer program if available
-            buffer_process = None
+            
+            # Create the btrfs send command
+            send_cmd = ["btrfs", "send"]
+            if parent_path and os.path.exists(parent_path):
+                send_cmd.extend(["-p", parent_path])
+                logger.debug(f"Using incremental send with parent: {parent_path}")
+            send_cmd.append(source_path)
+            
+            logger.debug(f"Local send command: {' '.join(send_cmd)}")
+            
+            # Start the local btrfs send process
+            send_process = subprocess.Popen(
+                send_cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                bufsize=0
+            )
+            
+            # Set up buffering if available
             if buffer_cmd:
                 logger.info(f"Using {buffer_name} to improve transfer reliability")
                 buffer_args = buffer_cmd.split()
-                logger.debug(f"Buffer command: {' '.join(buffer_args)}")
                 buffer_process = subprocess.Popen(
                     buffer_args,
                     stdin=send_process.stdout,
                     stdout=subprocess.PIPE,
-                    bufsize=0,
+                    bufsize=0
                 )
-                if send_process.stdout:
-                    send_process.stdout.close()  # Allow send_process to receive SIGPIPE
-                stdin_pipe = buffer_process.stdout
-                logger.debug("Buffer process started and connected to send process")
+                send_process.stdout.close()  # Allow send_process to receive SIGPIPE
+                pipe_output = buffer_process.stdout
             else:
-                stdin_pipe = send_process.stdout
-                logger.debug("No buffer program available, using direct pipe")
-
-            # Start remote receive process
-            if not stdin_pipe:
-                logger.error("No input pipe available for receive process")
+                pipe_output = send_process.stdout
+                buffer_process = None
+            
+            # Start the remote receive process
+            logger.debug("Starting remote btrfs receive process")
+            receive_process = self._btrfs_receive(dest_path, pipe_output)
+            
+            if not receive_process:
+                logger.error("Failed to start remote receive process")
                 return False
-
-            logger.debug("Starting remote receive process")
-            receive_process = self._btrfs_receive(dest_path, stdin_pipe)
-            logger.debug("Remote receive process started")
-
-            # Wait for processes to complete
-            logger.debug("Waiting for send process to complete...")
+            
+            # Wait for all processes to complete
+            logger.debug("Waiting for all transfer processes to complete...")
+            
+            # Wait for send process
             send_result = send_process.wait()
             logger.debug(f"Send process completed with exit code: {send_result}")
-
+            
+            # Wait for buffer process if used
             if buffer_process:
-                logger.debug("Waiting for buffer process to complete...")
                 buffer_result = buffer_process.wait()
-                logger.debug(
-                    f"Buffer process completed with exit code: {buffer_result}"
-                )
-
-            logger.debug("Waiting for receive process to complete...")
+                logger.debug(f"Buffer process completed with exit code: {buffer_result}")
+            
+            # Wait for receive process
             receive_result = receive_process.wait()
             logger.debug(f"Receive process completed with exit code: {receive_result}")
-
+            
             elapsed_time = time.time() - start_time
-            logger.debug(f"Total transfer time: {elapsed_time:.2f} seconds")
-
-            # Check send process result
-            if send_result != 0:
-                stderr_text = ""
-                if send_process.stderr:
-                    stderr_text = send_process.stderr.read().decode(errors="replace")
-                logger.error(
-                    f"Send process failed with exit code {send_result}: {stderr_text}"
-                )
-                return False
-
-            # Check receive process result
-            if receive_result != 0:
-                stderr_text = ""
-                if receive_process.stderr:
-                    stderr_text = receive_process.stderr.read().decode(errors="replace")
-                logger.error(
-                    f"Receive process failed with exit code {receive_result}: {stderr_text}"
-                )
-                return False
-
             logger.info(f"Transfer completed in {elapsed_time:.2f} seconds")
-
-            # Verify the transfer
-            logger.info("Verifying snapshot was created on remote host...")
-            logger.debug(
-                f"Verifying snapshot '{snapshot_name}' exists in '{dest_path}'"
-            )
+            
+            # Check process results
+            if send_result != 0:
+                stderr_output = send_process.stderr.read().decode(errors="replace") if send_process.stderr else ""
+                logger.error(f"Local send process failed with exit code {send_result}: {stderr_output}")
+                return False
+            
+            if receive_result != 0:
+                logger.error(f"Remote receive process failed with exit code {receive_result}")
+                return False
+            
+            # Check the actual btrfs receive result from log files
+            if hasattr(self, '_last_receive_log'):
+                try:
+                    # Check exit code file first
+                    exitcode_cmd = ["cat", f"{self._last_receive_log}.exitcode"]
+                    exitcode_result = self._exec_remote_command(exitcode_cmd, check=False, stdout=subprocess.PIPE)
+                    if exitcode_result.returncode == 0 and exitcode_result.stdout:
+                        actual_exitcode = exitcode_result.stdout.decode(errors="replace").strip()
+                        logger.debug(f"Actual btrfs receive exit code: {actual_exitcode}")
+                        if actual_exitcode != "0":
+                            # Read the error log
+                            log_cmd = ["cat", self._last_receive_log]
+                            log_result = self._exec_remote_command(log_cmd, check=False, stdout=subprocess.PIPE)
+                            if log_result.returncode == 0 and log_result.stdout:
+                                log_content = log_result.stdout.decode(errors="replace")
+                                logger.error(f"btrfs receive failed with exit code {actual_exitcode}")
+                                logger.error(f"Error details: {log_content}")
+                            return False
+                except Exception as e:
+                    logger.warning(f"Could not check receive log files: {e}")
+            
+            # Verify the transfer was successful
+            logger.debug("Verifying snapshot was created on remote host...")
             if self._verify_snapshot_exists(dest_path, snapshot_name):
                 logger.info("Transfer verification successful")
-                logger.debug(f"Snapshot '{snapshot_name}' confirmed on remote host")
                 return True
             else:
-                logger.error(
-                    "Transfer verification failed - snapshot not found on remote host"
-                )
-                logger.debug(f"Snapshot '{snapshot_name}' not found in '{dest_path}'")
+                logger.error("Transfer verification failed - snapshot not found on remote host")
                 return False
-
+                
         except Exception as e:
             logger.error(f"Error during transfer: {e}")
             logger.debug(f"Full error details: {e}", exc_info=True)
-            if isinstance(e, (BrokenPipeError, ConnectionError, ConnectionResetError)):
-                logger.error("SSH connection error detected")
-                logger.debug("Connection-related error occurred during transfer")
             return False
 
     def send_receive(self, snapshot, parent=None, clones=None, timeout=3600) -> bool:
