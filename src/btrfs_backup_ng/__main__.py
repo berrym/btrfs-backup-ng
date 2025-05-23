@@ -57,8 +57,10 @@ from . import __util__, __version__, endpoint
 from .__logger__ import RichLogger, cons, create_logger, logger
 
 
-def send_snapshot(snapshot, destination_endpoint, parent=None, clones=None) -> None:
+def send_snapshot(snapshot, destination_endpoint, parent=None, clones=None, options=None) -> None:
     """Sends snapshot to destination endpoint, using given parent and clones."""
+    if options is None:
+        options = {}
     logger.info("Sending %s ...", snapshot)
     logger.debug("Source endpoint type: %s", type(snapshot.endpoint).__name__)
     logger.debug("Destination endpoint type: %s", type(destination_endpoint).__name__)
@@ -137,127 +139,160 @@ def send_snapshot(snapshot, destination_endpoint, parent=None, clones=None) -> N
     send_process = None
     receive_process = None
     try:
+        logger.info("=== STARTING SEND PROCESS ===")
         logger.debug("Starting send process from %s", snapshot.endpoint)
+        logger.info("About to call snapshot.endpoint.send()")
         send_process = snapshot.endpoint.send(snapshot, parent=parent, clones=clones)
+        logger.info("Send process call completed, result: %s", send_process)
         if send_process is None:
             logger.error("Failed to start send process - send_process is None")
             raise __util__.SnapshotTransferError("Send process failed to start")
 
-        logger.debug("Starting receive process on %s", destination_endpoint)
-        # Check if using SSH destination without sudo
-        is_ssh_endpoint = (
-            hasattr(destination_endpoint, "_is_remote")
-            and destination_endpoint._is_remote
-        )
-        is_using_sudo = False
+        logger.info("Send process started successfully")
+        
+        try:
+            logger.info("=== CONTINUING WITH TRANSFER LOGIC ===")
+            logger.debug("Starting receive process on %s", destination_endpoint)
+            # Check if using SSH destination without sudo
+            is_ssh_endpoint = (
+                hasattr(destination_endpoint, "_is_remote")
+                and destination_endpoint._is_remote
+            )
+            is_using_sudo = False
 
-        if is_ssh_endpoint:
-            # Ensure the ssh_sudo flag is propagated to the endpoint config
-            if options.get("ssh_sudo", False):
-                destination_endpoint.config["ssh_sudo"] = True
-                is_using_sudo = True
-            else:
-                is_using_sudo = destination_endpoint.config.get("ssh_sudo", False)
+            logger.info("Checking SSH endpoint status...")
+            if is_ssh_endpoint:
+                logger.info("Detected SSH endpoint, configuring sudo settings")
+                # Ensure the ssh_sudo flag is propagated to the endpoint config
+                if options.get("ssh_sudo", False):
+                    destination_endpoint.config["ssh_sudo"] = True
+                    is_using_sudo = True
+                else:
+                    is_using_sudo = destination_endpoint.config.get("ssh_sudo", False)
 
-        # Always force ssh_sudo if specified in options
-        if is_ssh_endpoint:
-            if options.get("ssh_sudo", False):
-                logger.info("Forcing SSH sudo based on command-line option")
-                destination_endpoint.config["ssh_sudo"] = True
-                is_using_sudo = True
+            # Always force ssh_sudo if specified in options
+            if is_ssh_endpoint:
+                if options.get("ssh_sudo", False):
+                    logger.info("Forcing SSH sudo based on command-line option")
+                    destination_endpoint.config["ssh_sudo"] = True
+                    is_using_sudo = True
 
-            if not is_using_sudo:
-                logger.warning(
-                    "Using SSH destination without --ssh-sudo. This may fail if the remote user doesn't have permissions for btrfs commands."
-                )
-
-        # Check if we need to use direct SSH pipe for reliability
-        logger.info("Checking for direct SSH pipe capability...")
-        logger.info("Is SSH endpoint: %s", is_ssh_endpoint)
-        logger.info("Has send_receive method: %s", hasattr(destination_endpoint, 'send_receive'))
-        use_direct_pipe = is_ssh_endpoint and hasattr(destination_endpoint, 'send_receive')
-        logger.info("Using direct SSH pipe: %s", use_direct_pipe)
-
-        if use_direct_pipe:
-            try:
-                # Use the specialized SSH direct pipe method
-                logger.info("=== USING SSH DIRECT PIPE TRANSFER ===")
-                logger.info("Using SSH direct pipe transfer method for better reliability")
-                success = destination_endpoint.send_receive(
-                    snapshot,
-                    parent=parent,
-                    clones=clones,
-                    timeout=3600  # 1 hour timeout for large transfers
-                )
-                if not success:
-                    raise __util__.SnapshotTransferError("SSH direct pipe transfer failed")
-
-                # For direct pipe, we fake the return codes as successful
-                return_codes = [0, 0]
-            except Exception as e:
-                logger.error("Error during SSH direct pipe transfer: %s", e)
-                # Try to get log from endpoint
-                if hasattr(destination_endpoint, "_last_receive_log"):
-                    logger.error("Check remote log file: %s", destination_endpoint._last_receive_log)
-                raise __util__.SnapshotTransferError(f"SSH direct pipe transfer failed: {e}")
-        else:
-            # Traditional send/receive process approach
-            logger.info("=== USING TRADITIONAL SEND/RECEIVE ===")
-            logger.info("Using traditional send/receive process approach")
-            try:
-                receive_process = destination_endpoint.receive(send_process.stdout)
-                if receive_process is None:
-                    logger.error(
-                        "Failed to start receive process - receive_process is None"
+                if not is_using_sudo:
+                    logger.warning(
+                        "Using SSH destination without --ssh-sudo. This may fail if the remote user doesn't have permissions for btrfs commands."
                     )
-                    if is_ssh_endpoint:
-                        if not destination_endpoint.config.get("ssh_sudo", False):
-                            logger.error(
-                                "For SSH destinations, try using --ssh-sudo if the remote user needs elevated permissions"
-                            )
-                    raise __util__.SnapshotTransferError("Receive process failed to start")
-            except Exception as e:
-                logger.error("Failed to start receive process: %s", e)
-                raise __util__.SnapshotTransferError(
-                    f"Receive process failed to start: {e}"
+
+            # Check if we need to use direct SSH pipe for reliability
+            logger.info("=== SSH PIPE CAPABILITY CHECK ===")
+            logger.info("Checking for direct SSH pipe capability...")
+            logger.info("Is SSH endpoint: %s", is_ssh_endpoint)
+            logger.info("Has send_receive method: %s", hasattr(destination_endpoint, 'send_receive'))
+            use_direct_pipe = is_ssh_endpoint and hasattr(destination_endpoint, 'send_receive')
+            logger.info("Using direct SSH pipe: %s", use_direct_pipe)
+
+            if use_direct_pipe:
+                try:
+                    # Use the specialized SSH direct pipe method
+                    logger.info("=== USING SSH DIRECT PIPE TRANSFER ===")
+                    logger.info("Using SSH direct pipe transfer method for better reliability")
+                    
+                    # Close the send process since we'll use direct pipe
+                    logger.info("Terminating local send process for direct pipe method")
+                    if send_process:
+                        send_process.terminate()
+                        send_process.wait()
+                    
+                    success = destination_endpoint.send_receive(
+                        snapshot,
+                        parent=parent,
+                        clones=clones,
+                        timeout=3600  # 1 hour timeout for large transfers
+                    )
+                    if not success:
+                        raise __util__.SnapshotTransferError("SSH direct pipe transfer failed")
+
+                    # For direct pipe, we fake the return codes as successful
+                    return_codes = [0, 0]
+                    logger.info("Direct SSH pipe transfer completed successfully")
+                except Exception as e:
+                    logger.error("Error during SSH direct pipe transfer: %s", e)
+                    logger.error("Exception details:", exc_info=True)
+                    # Try to get log from endpoint
+                    if hasattr(destination_endpoint, "_last_receive_log"):
+                        logger.error("Check remote log file: %s", destination_endpoint._last_receive_log)
+                    raise __util__.SnapshotTransferError(f"SSH direct pipe transfer failed: {e}")
+            else:
+                # Traditional send/receive process approach
+                logger.info("=== USING TRADITIONAL SEND/RECEIVE ===")
+                logger.info("Using traditional send/receive process approach")
+                try:
+                    logger.info("Starting receive process on destination endpoint")
+                    receive_process = destination_endpoint.receive(send_process.stdout)
+                    if receive_process is None:
+                        logger.error(
+                            "Failed to start receive process - receive_process is None"
+                        )
+                        if is_ssh_endpoint:
+                            if not destination_endpoint.config.get("ssh_sudo", False):
+                                logger.error(
+                                    "For SSH destinations, try using --ssh-sudo if the remote user needs elevated permissions"
+                                )
+                        raise __util__.SnapshotTransferError("Receive process failed to start")
+                    
+                    logger.info("Receive process started successfully")
+                except Exception as e:
+                    logger.error("Failed to start receive process: %s", e)
+                    logger.error("Exception details:", exc_info=True)
+                    raise __util__.SnapshotTransferError(
+                        f"Receive process failed to start: {e}"
+                    )
+
+                logger.info("Both send and receive processes started, waiting for completion...")
+                logger.debug("Waiting for processes to complete...")
+                # Set a timeout for the processes to prevent hanging indefinitely
+                timeout_seconds = 3600  # 1 hour timeout for large transfers
+                logger.debug(
+                    "Waiting for send/receive processes to complete (timeout=%ds)",
+                    timeout_seconds,
                 )
 
-        logger.debug("Waiting for processes to complete...")
-        # Set a timeout for the processes to prevent hanging indefinitely
-        timeout_seconds = 3600  # 1 hour timeout for large transfers
-        logger.debug(
-            "Waiting for send/receive processes to complete (timeout=%ds)",
-            timeout_seconds,
-        )
+                # Wait for send process first
+                try:
+                    logger.info("Waiting for send process to complete...")
+                    return_code_send = send_process.wait(timeout=timeout_seconds)
+                    logger.info(
+                        "Send process completed with return code: %d", return_code_send
+                    )
+                except subprocess.TimeoutExpired:
+                    logger.error("Timeout waiting for send process to complete")
+                    send_process.kill()
+                    raise __util__.SnapshotTransferError("Timeout waiting for send process")
 
-        # Wait for send process first
-        try:
-            logger.debug("Waiting for send process to complete...")
-            return_code_send = send_process.wait(timeout=timeout_seconds)
-            logger.debug(
-                "Send process completed with return code: %d", return_code_send
-            )
-        except subprocess.TimeoutExpired:
-            logger.error("Timeout waiting for send process to complete")
-            send_process.kill()
-            raise __util__.SnapshotTransferError("Timeout waiting for send process")
+                # Then wait for receive process - it should finish soon after send process
+                try:
+                    logger.info("Waiting for receive process to complete...")
+                    return_code_receive = receive_process.wait(
+                        timeout=300
+                    )  # 5 minute timeout after send completes
+                    logger.info(
+                        "Receive process completed with return code: %d",
+                        return_code_receive,
+                    )
+                except subprocess.TimeoutExpired:
+                    logger.error("Timeout waiting for receive process to complete")
+                    receive_process.kill()
+                    raise __util__.SnapshotTransferError(
+                        "Timeout waiting for receive process"
+                    )
 
-        # Then wait for receive process - it should finish soon after send process
-        try:
-            logger.debug("Waiting for receive process to complete...")
-            return_code_receive = receive_process.wait(
-                timeout=300
-            )  # 5 minute timeout after send completes
-            logger.debug(
-                "Receive process completed with return code: %d",
-                return_code_receive,
-            )
-        except subprocess.TimeoutExpired:
-            logger.error("Timeout waiting for receive process to complete")
-            receive_process.kill()
-            raise __util__.SnapshotTransferError("Timeout waiting for receive process")
-
-        return_codes = [return_code_send, return_code_receive]
+                return_codes = [return_code_send, return_code_receive]
+                
+        except Exception as e:
+            logger.error("=== CRITICAL ERROR IN TRANSFER LOGIC ===")
+            logger.error("Exception occurred during transfer setup: %s", e)
+            logger.error("Exception type: %s", type(e).__name__)
+            logger.error("Full traceback:", exc_info=True)
+            raise
         logger.debug(
             "Process return codes: send=%d, receive=%d",
             return_codes[0],
@@ -372,6 +407,7 @@ def sync_snapshots(
     keep_num_backups=0,
     no_incremental=False,
     snapshot=None,
+    options=None,
     **kwargs,
 ) -> None:
     """Synchronizes snapshots from source to destination."""
@@ -428,7 +464,7 @@ def sync_snapshots(
     }
     for snap in to_transfer:
         logger.info("  %s", snap)
-        do_sync_transfer(transfer_objs, **kwargs)
+        do_sync_transfer(transfer_objs, options=options, **kwargs)
 
 
 def do_sync_transfer(transfer_objs, **kwargs):
@@ -546,7 +582,7 @@ def do_sync_transfer(transfer_objs, **kwargs):
                 best_snapshot,
                 transfer_objs["destination_endpoint"],
                 parent=parent,
-                **kwargs,
+                options=kwargs.get('options', {}),
             )
             logger.info("Transfer of %s completed successfully", best_snapshot)
 
@@ -926,6 +962,7 @@ def run_task(options, queue=None):
                 keep_num_backups=options["num_backups"],
                 no_incremental=options["no_incremental"],
                 snapshot=snapshot,
+                options=options,
             )
         except __util__.AbortError as e:
             logger.error(
@@ -1008,8 +1045,11 @@ def setup_logger(queue, level):
     # Add queue handler and set level
     log.addHandler(qh)
     try:
+        # Convert string level to logging constant
+        if isinstance(level, str):
+            level = getattr(logging, level.upper())
         log.setLevel(level)
-    except (ValueError, TypeError):
+    except (ValueError, TypeError, AttributeError):
         # Fallback to INFO if level is invalid
         print(f"Invalid log level: {level}, using INFO")
         log.setLevel(logging.INFO)
