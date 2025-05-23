@@ -319,13 +319,33 @@ class SSHEndpoint(Endpoint):
             ):
                 logger.info("Skipping locked snapshot: %s", snapshot)
                 continue
-            remote_path = (
-                str(snapshot.get_path())
-                if hasattr(snapshot, "get_path")
-                else str(snapshot)
-            )
+            
+            # Handle remote path normalization properly
+            if hasattr(snapshot, "get_path"):
+                remote_path = str(snapshot.get_path())
+            else:
+                remote_path = str(snapshot)
+            
+            # Ensure the path is properly normalized for remote execution
+            remote_path = self._normalize_path(remote_path)
+            
+            # Verify the path exists before attempting deletion
+            test_cmd = ["test", "-d", remote_path]
+            try:
+                test_result = self._exec_remote_command(
+                    test_cmd, check=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+                )
+                if test_result.returncode != 0:
+                    logger.warning(f"Snapshot path does not exist for deletion: {remote_path}")
+                    continue
+            except Exception as e:
+                logger.warning(f"Could not verify snapshot path {remote_path}: {e}")
+                continue
+            
+            # Build deletion command with proper sudo handling
             cmd = ["btrfs", "subvolume", "delete", remote_path]
             logger.debug("Executing remote deletion command: %s", cmd)
+            
             try:
                 result = self._exec_remote_command(
                     cmd,
@@ -338,16 +358,21 @@ class SSHEndpoint(Endpoint):
                 else:
                     stderr = (
                         result.stderr.decode(errors="replace").strip()
-                        if hasattr(result.stderr, "decode")
-                        else result.stderr
+                        if hasattr(result, "stderr") and result.stderr
+                        else "Unknown error"
                     )
-                    logger.error(
-                        "Failed to delete remote snapshot %s: %s", remote_path, stderr
-                    )
+                    # Check for common btrfs deletion errors
+                    if "No such file or directory" in stderr:
+                        logger.warning(f"Snapshot already deleted or path not found: {remote_path}")
+                    elif "statfs" in stderr.lower():
+                        logger.error(f"Filesystem access error when deleting {remote_path}: {stderr}")
+                        logger.error("This may indicate the remote path is not accessible or the filesystem is unmounted")
+                    else:
+                        logger.error(f"Failed to delete remote snapshot {remote_path}: {stderr}")
             except Exception as e:
-                logger.error(
-                    "Exception while deleting remote snapshot %s: %s", remote_path, e
-                )
+                logger.error(f"Exception while deleting remote snapshot {remote_path}: {e}")
+                # Log additional diagnostic information
+                logger.debug(f"Deletion exception details: {e}", exc_info=True)
 
     def delete_old_snapshots(self, keep: int) -> None:
         """
@@ -1451,13 +1476,19 @@ echo $? >"{receive_log}.exitcode"
         Returns:
             A tuple of (program_name, command_string) or (None, None) if not found
         """
-        # Check for pv
+        # Check for pv with progress display
         if self._check_command_exists("pv"):
             logger.debug("Found pv - using it for transfer progress")
-            return "pv", "pv -q"
+            # Use pv with progress display (don't use -q for quiet, we want progress)
+            return "pv", "pv -p -t -e -r -b"
+
+        # Check for mbuffer as fallback
+        if self._check_command_exists("mbuffer"):
+            logger.debug("Found mbuffer - using it for transfer buffering")
+            return "mbuffer", "mbuffer -q -s 128k -m 1G"
 
         # No buffer program found
-        logger.debug("No buffer program (pv) found - transfers may be less reliable")
+        logger.debug("No buffer program (pv/mbuffer) found - transfers may be less reliable")
         return None, None
 
     def _check_command_exists(self, command: str) -> bool:
@@ -1484,6 +1515,7 @@ echo $? >"{receive_log}.exitcode"
         dest_path: str,
         snapshot_name: str,
         parent_path: Optional[str] = None,
+        max_wait_time: int = 3600,
         **kwargs: Any,
     ) -> bool:
         """Direct SSH transfer for btrfs-backup-ng, using robust logic and logging."""
@@ -1570,7 +1602,8 @@ echo $? >"{receive_log}.exitcode"
                     stdout=subprocess.PIPE,
                     bufsize=0
                 )
-                send_process.stdout.close()  # Allow send_process to receive SIGPIPE
+                if send_process.stdout:  # Only close if stdout exists
+                    send_process.stdout.close()  # Allow send_process to receive SIGPIPE
                 pipe_output = buffer_process.stdout
             else:
                 pipe_output = send_process.stdout
@@ -1584,42 +1617,21 @@ echo $? >"{receive_log}.exitcode"
                 logger.error("Failed to start remote receive process")
                 return False
             
-            # Simple time-based monitoring with frequent verification
-            logger.info("=== SIMPLE TIME-BASED MONITORING ===")
-            logger.info("Monitoring transfer with periodic verification checks...")
+            # Use the new enhanced monitoring system
+            processes = {
+                'send': send_process,
+                'receive': receive_process,
+                'buffer': buffer_process
+            }
             
-            # Give initial time for processes to start
-            time.sleep(5)
-            logger.info("Initial startup period complete, beginning verification checks...")
-            
-            # Monitor with verification every 15 seconds, up to 5 minutes total
-            max_wait_time = 300  # 5 minutes
-            check_interval = 15  # Check every 15 seconds
-            checks_completed = 0
-            max_checks = max_wait_time // check_interval
-            
-            transfer_succeeded = False
-            
-            while checks_completed < max_checks:
-                checks_completed += 1
-                current_time = checks_completed * check_interval
-                
-                logger.info(f"Verification check {checks_completed}/{max_checks} at {current_time}s...")
-                
-                # Check if transfer succeeded
-                try:
-                    if self._verify_snapshot_exists(dest_path, snapshot_name):
-                        logger.info("✅ Transfer verification successful!")
-                        transfer_succeeded = True
-                        break
-                    else:
-                        logger.info(f"Transfer in progress... ({current_time}s elapsed)")
-                except Exception as e:
-                    logger.debug(f"Verification failed (normal during transfer): {e}")
-                
-                # Wait for next check
-                if checks_completed < max_checks:
-                    time.sleep(check_interval)
+            logger.info("🚀 Using enhanced monitoring system for real-time progress...")
+            transfer_succeeded = self._monitor_transfer_progress(
+                processes=processes,
+                start_time=start_time,
+                dest_path=dest_path,
+                snapshot_name=snapshot_name,
+                max_wait_time=max_wait_time
+            )
             
             # Final verification if we timed out
             if not transfer_succeeded:
@@ -1814,7 +1826,8 @@ echo $? >"{receive_log}.exitcode"
                 source_path=snapshot_path,
                 dest_path=dest_path,
                 snapshot_name=snapshot_name,
-                parent_path=parent_path
+                parent_path=parent_path,
+                max_wait_time=timeout
             )
             
             if success:
@@ -1827,3 +1840,116 @@ echo $? >"{receive_log}.exitcode"
         except Exception as e:
             logger.error("Error during direct SSH pipe transfer: %s", e)
             return False
+
+    def _monitor_transfer_progress(self, processes, start_time, dest_path, snapshot_name, max_wait_time=3600):
+        """Enhanced transfer monitoring with real-time progress feedback.
+        
+        Args:
+            processes: Dict containing 'send', 'receive', and optionally 'buffer' processes
+            start_time: Transfer start time
+            dest_path: Destination path for verification
+            snapshot_name: Name of snapshot being transferred
+            max_wait_time: Maximum time to wait in seconds
+            
+        Returns:
+            bool: True if transfer succeeded, False otherwise
+        """
+        logger.info("🚀 Starting advanced transfer monitoring...")
+        
+        send_process = processes['send']
+        receive_process = processes['receive'] 
+        buffer_process = processes.get('buffer')
+        
+        transfer_succeeded = False
+        last_status_time = start_time
+        last_verification_time = start_time
+        status_interval = 5  # Status updates every 5 seconds
+        verification_interval = 30  # Verify snapshot every 30 seconds
+        
+        while time.time() - start_time < max_wait_time:
+            current_time = time.time()
+            elapsed = current_time - start_time
+            
+            # Check process status
+            send_alive = send_process.poll() is None
+            receive_alive = receive_process.poll() is None
+            buffer_alive = buffer_process.poll() is None if buffer_process else True
+            
+            # Check for critical failures
+            if not send_alive and send_process.returncode != 0:
+                logger.error(f"❌ Send process failed (exit code: {send_process.returncode})")
+                self._log_process_error(send_process, "send")
+                return False
+                
+            # Regular status updates
+            if current_time - last_status_time >= status_interval:
+                self._log_transfer_status(elapsed, send_alive, receive_alive, buffer_alive, buffer_process)
+                last_status_time = current_time
+                
+            # Periodic verification
+            if current_time - last_verification_time >= verification_interval:
+                logger.info("🔍 Performing verification check...")
+                try:
+                    if self._verify_snapshot_exists(dest_path, snapshot_name):
+                        logger.info("✅ Transfer verification successful!")
+                        return True
+                    else:
+                        logger.info("🔄 Transfer still in progress...")
+                except Exception as e:
+                    logger.debug(f"Verification check failed (normal during transfer): {e}")
+                last_verification_time = current_time
+                
+            # Check if all processes finished
+            if not send_alive and not receive_alive and not (buffer_process and buffer_alive):
+                logger.info("📋 All processes completed, performing final verification...")
+                break
+                
+            # Handle receive process warnings (but don't fail immediately)
+            if not receive_alive and receive_process.returncode not in [None, 0]:
+                logger.warning(f"⚠️ Receive process exit code: {receive_process.returncode}")
+                logger.info("🔍 Checking if transfer succeeded despite exit code...")
+                
+            time.sleep(0.5)  # Short sleep for responsive monitoring
+            
+        # Final verification
+        logger.info("🏁 Transfer monitoring complete, performing final verification...")
+        try:
+            transfer_succeeded = self._verify_snapshot_exists(dest_path, snapshot_name)
+            if transfer_succeeded:
+                elapsed_final = time.time() - start_time
+                logger.info(f"✅ Transfer completed successfully in {elapsed_final:.1f}s")
+            else:
+                logger.error("❌ Transfer failed - snapshot not found on remote host")
+        except Exception as e:
+            logger.error(f"❌ Final verification failed: {e}")
+            
+        return transfer_succeeded
+        
+    def _log_transfer_status(self, elapsed, send_alive, receive_alive, buffer_alive, buffer_process):
+        """Log detailed transfer status with emoji indicators."""
+        minutes = elapsed / 60
+        
+        logger.info(f"🔄 Transfer Status ({elapsed:.1f}s / {minutes:.1f}m)")
+        logger.info(f"   📤 Send: {'🟢 active' if send_alive else '✅ done'}")
+        logger.info(f"   📥 Receive: {'🟢 active' if receive_alive else '✅ done'}")
+        
+        if buffer_process:
+            logger.info(f"   🔧 Buffer: {'🟢 active' if buffer_alive else '✅ done'}")
+            
+        # Show activity indicator
+        active_count = sum([send_alive, receive_alive, buffer_alive])
+        total_count = 2 + (1 if buffer_process else 0)
+        logger.info(f"   📊 Active: {active_count}/{total_count} processes")
+        
+        if elapsed > 60:  # After 1 minute
+            logger.info(f"   ⏱️ Transfer progressing normally...")
+            
+    def _log_process_error(self, process, process_name):
+        """Log detailed error information for a failed process."""
+        try:
+            if process.stderr:
+                stderr_data = process.stderr.read().decode('utf-8', errors='replace')
+                if stderr_data.strip():
+                    logger.error(f"{process_name} process stderr: {stderr_data}")
+        except Exception as e:
+            logger.debug(f"Could not read stderr from {process_name} process: {e}")
