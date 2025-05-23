@@ -10,6 +10,7 @@ import logging
 import os
 import subprocess
 from pathlib import Path
+from typing import Any, Optional, List, Dict
 
 from filelock import FileLock
 
@@ -31,7 +32,7 @@ def require_source(method):
 class Endpoint:
     """Generic structure of a command endpoint."""
 
-    def __init__(self, config=None, **kwargs) -> None:
+    def __init__(self, config: Optional[Dict[str, Any]] = None, **kwargs: Any) -> None:
         """
         Initialize the Endpoint with a configuration dictionary.
 
@@ -63,7 +64,7 @@ class Endpoint:
         for key, value in kwargs.items():
             self.config[key] = value
 
-    def _normalize_path(self, val):
+    def _normalize_path(self, val: Any) -> Any:
         if val is None:
             return None
 
@@ -71,7 +72,7 @@ class Endpoint:
         from btrfs_backup_ng.__logger__ import logger
 
         logger.debug("Normalizing path: %s (type: %s)", val, type(val).__name__)
-        
+
         # Handle string paths
         if isinstance(val, str):
             # Just expanduser for remote paths to avoid resolving them locally
@@ -79,7 +80,7 @@ class Endpoint:
                 expanded = str(Path(val).expanduser())
                 logger.debug("Remote path expanded: %s -> %s", val, expanded)
                 return expanded
-            
+
             # For local paths, handle carefully
             try:
                 path = Path(val).expanduser()
@@ -88,7 +89,7 @@ class Endpoint:
                 if path.is_absolute():
                     logger.debug("Using absolute path as-is: %s", path)
                     return path
-                
+
                 # Safely resolve relative path
                 try:
                     resolved = path.resolve()
@@ -98,7 +99,9 @@ class Endpoint:
                     # If resolving fails, manually make it absolute with cwd
                     logger.warning(f"Path resolution failed for {path}: {e}")
                     cwd_path = Path(os.getcwd()) / path
-                    logger.debug("Manually made absolute with cwd: %s -> %s", path, cwd_path)
+                    logger.debug(
+                        "Manually made absolute with cwd: %s -> %s", path, cwd_path
+                    )
                     return cwd_path
             except Exception as e:
                 logger.error(f"Path handling error: {e}")
@@ -111,11 +114,11 @@ class Endpoint:
             # For remote paths, convert to string to avoid resolution issues
             if hasattr(self, "_is_remote") and getattr(self, "_is_remote", False):
                 return str(val)
-            
+
             # For local paths, handle safely
             if val.is_absolute():
                 return val
-            
+
             try:
                 return val.resolve()
             except (FileNotFoundError, PermissionError) as e:
@@ -126,13 +129,13 @@ class Endpoint:
         # For other types, just convert to string
         return str(val)
 
-    def prepare(self):
+    def prepare(self) -> None:
         """Public access to _prepare, which is called after creating an endpoint."""
         logger.info("Preparing endpoint %r ...", self)
         return self._prepare()
 
     @require_source
-    def snapshot(self, readonly=True, sync=True):
+    def snapshot(self, readonly: bool = True, sync: bool = True) -> Any:
         """Take a snapshot and return the created object."""
         base_path = Path(self.config["source"]).resolve()
         snapshot_dir = (base_path / self.config["snapshot_folder"]).resolve()
@@ -170,14 +173,16 @@ class Endpoint:
         return snapshot
 
     @require_source
-    def send(self, snapshot, parent=None, clones=None):
+    def send(
+        self, snapshot: Any, parent: Any = None, clones: Optional[List[Any]] = None
+    ) -> Any:
         """Call 'btrfs send' for the given snapshot and return its Popen object."""
         cmd = self._build_send_command(snapshot, parent=parent, clones=clones)
         return self._exec_command(
             {"command": cmd}, method="Popen", stdout=subprocess.PIPE
         )
 
-    def receive(self, stdin):
+    def receive(self, stdin: Any) -> Any:
         """Call 'btrfs receive', setting the given pipe as its stdin."""
         # Make sure we use the raw path without local resolution
         path = self.config["path"]
@@ -195,13 +200,23 @@ class Endpoint:
 
         # Verify path exists or create it
         try:
-            if isinstance(normalized_path, (str, Path)) and not getattr(self, "_is_remote", False):
-                path_obj = Path(normalized_path) if isinstance(normalized_path, str) else normalized_path
+            if isinstance(normalized_path, (str, Path)) and not getattr(
+                self, "_is_remote", False
+            ):
+                path_obj = (
+                    Path(normalized_path)
+                    if isinstance(normalized_path, str)
+                    else normalized_path
+                )
                 if not path_obj.exists():
-                    logger.warning("Destination path doesn't exist, creating it: %s", path_obj)
+                    logger.warning(
+                        "Destination path doesn't exist, creating it: %s", path_obj
+                    )
                     path_obj.mkdir(parents=True, exist_ok=True)
         except Exception as e:
-            logger.warning("Error verifying or creating path %s: %s", normalized_path, e)
+            logger.warning(
+                "Error verifying or creating path %s: %s", normalized_path, e
+            )
 
         cmd = self._build_receive_command(normalized_path)
         loglevel = logging.getLogger().getEffectiveLevel()
@@ -216,7 +231,7 @@ class Endpoint:
             logger.error("Error executing receive command: %s", e)
             raise
 
-    def list_snapshots(self, flush_cache=False):
+    def list_snapshots(self, flush_cache: bool = False) -> List[Any]:
         """
         Return a list of all snapshots found directly in self.config['path'] using $snap_prefix.
         Populates a cache for efficient repeated access and removable snapshot checks.
@@ -265,7 +280,9 @@ class Endpoint:
         return list(snapshots)
 
     @require_source
-    def set_lock(self, snapshot, lock_id, lock_state, parent=False) -> None:
+    def set_lock(
+        self, snapshot: Any, lock_id: Any, lock_state: bool, parent: bool = False
+    ) -> None:
         """Add or remove the given lock from ``snapshot`` and update the lock file."""
         if lock_state:
             (snapshot.parent_locks if parent else snapshot.locks).add(lock_id)
@@ -289,7 +306,7 @@ class Endpoint:
             parent,
         )
 
-    def add_snapshot(self, snapshot, rewrite=True) -> None:
+    def add_snapshot(self, snapshot: Any, rewrite: bool = True) -> None:
         """Add a snapshot to the cache."""
         if self.__cached_snapshots is None:
             return
@@ -300,30 +317,40 @@ class Endpoint:
         self.__cached_snapshots.append(snapshot)
         self.__cached_snapshots.sort()
 
-    def delete_snapshots(self, snapshots, **kwargs) -> None:
+    def delete_snapshots(self, snapshots: List[Any], **kwargs: Any) -> None:
         """Delete the given snapshots (subvolumes)."""
         for snapshot in snapshots:
             if snapshot.locks or snapshot.parent_locks:
                 logger.info("Skipping locked snapshot: %s", snapshot)
                 continue
-            cmd = [("btrfs", False), ("subvolume", False), ("delete", False), (str(snapshot.get_path()), True)]
-            logger.debug("Executing deletion command: %s", [(arg, is_path) for arg, is_path in cmd])
+            cmd = [
+                ("btrfs", False),
+                ("subvolume", False),
+                ("delete", False),
+                (str(snapshot.get_path()), True),
+            ]
+            logger.debug(
+                "Executing deletion command: %s",
+                [(arg, is_path) for arg, is_path in cmd],
+            )
             try:
                 logger.debug("Deleting snapshot with path: %s", snapshot.get_path())
                 self._exec_command({"command": cmd})
                 logger.info("Deleted snapshot subvolume: %s", snapshot.get_path())
             except Exception as e:
                 logger.error("Failed to delete snapshot %s: %s", snapshot.get_path(), e)
-                logger.error("Deletion command was: %s", [(arg, is_path) for arg, is_path in cmd])
+                logger.error(
+                    "Deletion command was: %s", [(arg, is_path) for arg, is_path in cmd]
+                )
             if self.__cached_snapshots is not None:
                 with contextlib.suppress(ValueError):
                     self.__cached_snapshots.remove(snapshot)
 
-    def delete_snapshot(self, snapshot, **kwargs) -> None:
+    def delete_snapshot(self, snapshot: Any, **kwargs: Any) -> None:
         """Delete a snapshot."""
         self.delete_snapshots([snapshot], **kwargs)
 
-    def delete_old_snapshots(self, keep):
+    def delete_old_snapshots(self, keep: int) -> None:
         """
         Delete old snapshots, keeping only the most recent `keep` unlocked snapshots.
         """
@@ -358,7 +385,9 @@ class Endpoint:
         pass
 
     @staticmethod
-    def _build_snapshot_cmd(source, destination, readonly=True):
+    def _build_snapshot_cmd(
+        source: Any, destination: Any, readonly: bool = True
+    ) -> List[Any]:
         # Use tuples to mark command arguments that shouldn't be normalized as paths
         cmd = [("btrfs", False), ("subvolume", False), ("snapshot", False)]
         if readonly:
@@ -368,16 +397,18 @@ class Endpoint:
         return cmd
 
     @staticmethod
-    def _build_sync_command():
+    def _build_sync_command() -> List[Any]:
         return [("sync", False)]
 
-    def _build_send_command(self, snapshot, parent=None, clones=None):
+    def _build_send_command(
+        self, snapshot: Any, parent: Any = None, clones: Optional[List[Any]] = None
+    ) -> List[Any]:
         # Use tuples to mark command arguments that shouldn't be normalized as paths
         cmd = [("btrfs", False), ("send", False)]
         # Add btrfs flags
         for flag in self.btrfs_flags:
             cmd.append((flag, False))
-            
+
         log_level = logging.getLogger().getEffectiveLevel()
         if log_level >= logging.WARNING:
             cmd.append(("--quiet", False))
@@ -393,7 +424,7 @@ class Endpoint:
         logger.debug("Built send command: %s", [(a, p) for a, p in cmd])
         return cmd
 
-    def _build_receive_command(self, destination):
+    def _build_receive_command(self, destination: Any) -> List[Any]:
         # Ensure destination is properly formatted as a string without resolving
         # This avoids path resolution that could break remote paths
         dest_str = str(destination)
@@ -411,7 +442,12 @@ class Endpoint:
         logger.debug("Receive command: %s", [arg for arg, _ in cmd])
         return cmd
 
-    def _build_deletion_commands(self, snapshots, convert_rw=None, subvolume_sync=None):
+    def _build_deletion_commands(
+        self,
+        snapshots: List[Any],
+        convert_rw: Optional[bool] = None,
+        subvolume_sync: Optional[bool] = None,
+    ) -> List[Any]:
         convert_rw = (
             self.config.get("convert_rw", False) if convert_rw is None else convert_rw
         )
@@ -424,35 +460,43 @@ class Endpoint:
         if convert_rw:
             for snapshot in snapshots:
                 # Use tuples to mark command arguments that shouldn't be normalized as paths
-                commands.append([
-                    ("btrfs", False),
-                    ("property", False),
-                    ("set", False),
-                    ("-ts", False),
-                    (str(snapshot.get_path()), True),
-                    ("ro", False),
-                    ("false", False),
-                ])
+                commands.append(
+                    [
+                        ("btrfs", False),
+                        ("property", False),
+                        ("set", False),
+                        ("-ts", False),
+                        (str(snapshot.get_path()), True),
+                        ("ro", False),
+                        ("false", False),
+                    ]
+                )
         for snapshot in snapshots:
-            commands.append([
-                ("btrfs", False),
-                ("subvolume", False),
-                ("delete", False),
-                (str(snapshot.get_path()), True),
-            ])
+            commands.append(
+                [
+                    ("btrfs", False),
+                    ("subvolume", False),
+                    ("delete", False),
+                    (str(snapshot.get_path()), True),
+                ]
+            )
         if subvolume_sync:
-            commands.append([
-                ("btrfs", False),
-                ("subvolume", False),
-                ("sync", False),
-                (str(self.config["path"]), True),
-            ])
+            commands.append(
+                [
+                    ("btrfs", False),
+                    ("subvolume", False),
+                    ("sync", False),
+                    (str(self.config["path"]), True),
+                ]
+            )
         return commands
 
-    def _collapse_commands(self, commands, abort_on_failure=True):
+    def _collapse_commands(
+        self, commands: List[Any], abort_on_failure: bool = True
+    ) -> List[Any]:
         return commands
 
-    def _exec_command(self, options, **kwargs):
+    def _exec_command(self, options: Dict[str, Any], **kwargs: Any) -> Any:
         command = options.get("command")
         if not command:
             raise ValueError("No command specified in options for _exec_command")
@@ -461,28 +505,39 @@ class Endpoint:
         try:
             normalized_command = []
             logger.debug("Original command to normalize: %s", command)
-            
+
             # Check if command is using the tuple format (arg, is_path)
             if command and isinstance(command[0], tuple) and len(command[0]) == 2:
                 # New format with (arg, is_path) tuples
                 logger.debug("Using tuple format for command normalization")
                 for i, (arg, is_path) in enumerate(command):
-                    logger.debug("Processing arg %d: %s (is_path=%s, type=%s)", 
-                                i, arg, is_path, type(arg).__name__)
+                    logger.debug(
+                        "Processing arg %d: %s (is_path=%s, type=%s)",
+                        i,
+                        arg,
+                        is_path,
+                        type(arg).__name__,
+                    )
                     if is_path and isinstance(arg, (str, Path)):
                         try:
                             normalized_arg = self._normalize_path(arg)
-                            logger.debug("Normalized path arg %s to: %s", arg, normalized_arg)
+                            logger.debug(
+                                "Normalized path arg %s to: %s", arg, normalized_arg
+                            )
                             normalized_command.append(normalized_arg)
                         except Exception as e:
-                            logger.warning("Path normalization failed for %s: %s", arg, e)
+                            logger.warning(
+                                "Path normalization failed for %s: %s", arg, e
+                            )
                             # Use original argument if normalization fails
                             normalized_command.append(arg)
                     else:
                         # Not a path, just append as-is
                         logger.debug("Using non-path arg as-is: %s", arg)
                         normalized_command.append(arg)
-                logger.debug("Processed marked command arguments: %s", normalized_command)
+                logger.debug(
+                    "Processed marked command arguments: %s", normalized_command
+                )
             else:
                 # Legacy format - attempt to guess which args are paths
                 logger.debug("Using legacy format for command normalization")
@@ -495,23 +550,30 @@ class Endpoint:
                         else:
                             try:
                                 normalized_arg = self._normalize_path(arg)
-                                logger.debug("Normalized path arg %d %s to: %s", i, arg, normalized_arg)
+                                logger.debug(
+                                    "Normalized path arg %d %s to: %s",
+                                    i,
+                                    arg,
+                                    normalized_arg,
+                                )
                                 normalized_command.append(normalized_arg)
                             except Exception as e:
-                                logger.warning("Path normalization failed for %s: %s", arg, e)
+                                logger.warning(
+                                    "Path normalization failed for %s: %s", arg, e
+                                )
                                 # Use original argument if normalization fails
                                 normalized_command.append(arg)
                     else:
                         logger.debug("Keeping non-string/path arg %d as-is: %s", i, arg)
                         normalized_command.append(arg)
                 logger.debug("Processed legacy command format: %s", normalized_command)
-            
+
             command = normalized_command
         except Exception as e:
             logger.error("Error normalizing command arguments: %s", e)
             # Continue with original command if normalization completely fails
             logger.warning("Using original command without normalization")
-        
+
         # Convert all command arguments to strings for subprocess
         command = [str(arg) for arg in command]
         logger.debug("Executing command: %s", command)
@@ -521,13 +583,13 @@ class Endpoint:
             with FileLock(lock_path):
                 # Convert command to string for proper detection
                 first_cmd = str(command[0]) if command else ""
-                
+
                 if os.geteuid() != 0 and command and first_cmd == "btrfs":
                     # Find the full path to btrfs command if needed
                     if first_cmd == "btrfs" and "/" not in first_cmd:
                         # This preserves just using "btrfs" which will use PATH
                         pass
-                        
+
                     if options.get("no_password_sudo"):
                         command = ["sudo", "-n"] + command
                     else:
@@ -551,7 +613,7 @@ class Endpoint:
             logger.error("Error in _exec_command: %s", e)
             raise
 
-    def _listdir(self, location):
+    def _listdir(self, location: Any) -> List[str]:
         # For remote endpoints, don't try to resolve the path locally
         if hasattr(self, "_is_remote") and getattr(self, "_is_remote", False):
             # Remote endpoints should implement their own _listdir
@@ -569,7 +631,7 @@ class Endpoint:
         logger.debug("Listing directory contents: %s", location)
         return [str(item) for item in location.iterdir()]
 
-    def _remount(self, path, read_write=True):
+    def _remount(self, path: Any, read_write: bool = True) -> None:
         logger.debug("Remounting %s as read-write: %r", path, read_write)
         mode = "rw" if read_write else "ro"
         try:
@@ -600,13 +662,13 @@ class Endpoint:
             raise __util__.AbortError from e
 
     @require_source
-    def _get_lock_file_path(self):
+    def _get_lock_file_path(self) -> Path:
         if self.config["path"] is None:
             raise ValueError
         return self.config["path"] / str(self.config["lock_file_name"])
 
     @require_source
-    def _read_locks(self):
+    def _read_locks(self) -> Dict[str, Any]:
         path = self._get_lock_file_path()
         try:
             if not path.is_file():
@@ -618,7 +680,7 @@ class Endpoint:
             raise __util__.AbortError
 
     @require_source
-    def _write_locks(self, lock_dict) -> None:
+    def _write_locks(self, lock_dict: Dict[str, Any]) -> None:
         path = self._get_lock_file_path()
         try:
             logger.debug("Writing lock file: %s", path)

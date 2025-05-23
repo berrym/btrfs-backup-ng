@@ -88,14 +88,14 @@ def exec_subprocess(command, method="check_output", **kwargs):
     """
     logger.debug("Executing: %s", command)
     m = getattr(subprocess, method)
-    
+
     # Ensure environment is set up correctly
     if "env" not in kwargs:
         kwargs["env"] = os.environ.copy()
-    
+
     # Ensure all command arguments are strings
     command = [str(arg) for arg in command]
-    
+
     try:
         return m(command, **kwargs)
     except FileNotFoundError as e:
@@ -103,17 +103,14 @@ def exec_subprocess(command, method="check_output", **kwargs):
         logger.error("Command not found: %s", command[0])
         logger.error("PATH: %s", kwargs["env"].get("PATH", "Not set"))
         logger.error("Working directory: %s", os.getcwd())
-        
+
         # Try to locate the command in the system path
         if command and "/" not in command[0]:
             logger.info("Attempting to find command '%s' in PATH", command[0])
             try:
                 # Try to find the executable in PATH with 'which' command
                 which_result = subprocess.run(
-                    ["which", command[0]], 
-                    capture_output=True, 
-                    text=True,
-                    check=False
+                    ["which", command[0]], capture_output=True, text=True, check=False
                 )
                 if which_result.returncode == 0:
                     full_path = which_result.stdout.strip()
@@ -126,7 +123,7 @@ def exec_subprocess(command, method="check_output", **kwargs):
                     logger.error("Command '%s' not found in PATH", command[0])
             except Exception as find_e:
                 logger.error("Error finding command: %s", find_e)
-        
+
         # If all else fails, raise the original error
         logger.error("Cannot execute command: %s", e)
         raise AbortError(f"Command not found: {command[0]}") from e

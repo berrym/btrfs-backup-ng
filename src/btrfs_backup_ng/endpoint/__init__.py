@@ -18,7 +18,7 @@ def choose_endpoint(spec, common_config=None, source=False, excluded_types=()):
     Chooses a suitable endpoint based on the specification given.
 
     Args:
-        spec (str): The endpoint specification (e.g., "ssh://hostname/path").
+        spec (str): The endpoint specification (e.g., "ssh://hostname/path", "user@host:/path").
         common_config (dict): A dictionary with common configuration settings for all endpoints.
         source (bool): If True, this is considered a source endpoint.
         excluded_types (tuple): A tuple of endpoint classes to exclude from consideration.
@@ -31,12 +31,28 @@ def choose_endpoint(spec, common_config=None, source=False, excluded_types=()):
     """
     config = common_config or {}
 
+    # Helper function to detect SSH patterns
+    def _is_ssh_pattern(spec_str):
+        """Detect if a string looks like an SSH destination (user@host:/path or host:/path)."""
+        if spec_str.startswith("ssh://"):
+            return True
+        # Check for patterns like user@host:/path or host:/path
+        if ":" in spec_str and not spec_str.startswith("/"):
+            # Must contain a colon and not start with / (to avoid /path/to/file:backup confusion)
+            host_part = spec_str.split(":", 1)[0]
+            # Check if it looks like a hostname (contains @ or looks like a hostname)
+            if "@" in host_part or ("." in host_part and not host_part.startswith("/")):
+                return True
+        return False
+
     # Parse destination string
     if ShellEndpoint not in excluded_types and spec.startswith("shell://"):
         endpoint_class = ShellEndpoint
         config["cmd"] = spec[8:]
         config["source"] = True
-    elif SSHEndpoint not in excluded_types and spec.startswith("ssh://"):
+    elif SSHEndpoint not in excluded_types and (
+        spec.startswith("ssh://") or _is_ssh_pattern(spec)
+    ):
         endpoint_class = SSHEndpoint
         parsed = urllib.parse.urlparse(spec)
         if not parsed.hostname:
@@ -54,7 +70,7 @@ def choose_endpoint(spec, common_config=None, source=False, excluded_types=()):
 
         config["hostname"] = parsed.hostname
         config["port"] = parsed.port
-        
+
         # Username handling:
         # 1. Keep username from common_config (from command line) if present
         # 2. Otherwise use username from URL if present
@@ -94,10 +110,14 @@ def choose_endpoint(spec, common_config=None, source=False, excluded_types=()):
     if endpoint_class == SSHEndpoint:
         # Initialize with passwordless=False by default
         config.setdefault("passwordless", False)
-        
+
         # Username will be fully resolved in the SSHEndpoint class
         # but we ensure it's documented in debug logs
-        username_source = "command_line" if "username" in common_config else "url" if parsed.username else "will use default"
+        username_source = (
+            "command_line"
+            if "username" in common_config
+            else "url" if parsed.username else "will use default"
+        )
         logger.debug("Username source: %s", username_source)
 
         logger.debug("Final SSH config: %s", config)

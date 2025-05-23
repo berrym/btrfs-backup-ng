@@ -17,7 +17,7 @@ import time
 import tempfile
 import getpass
 from pathlib import Path
-from typing import Optional
+from typing import Optional, List, Type, Any, List
 
 from btrfs_backup_ng.__logger__ import logger
 
@@ -51,7 +51,7 @@ class SSHMasterManager:
             os.environ.get("SUDO_USER") is not None and os.geteuid() == 0
         )
         self.sudo_user = os.environ.get("SUDO_USER")
-        
+
         # Store the sudo user's home directory for proper path expansion
         self.sudo_user_home = None
         if self.running_as_sudo and self.sudo_user:
@@ -62,35 +62,39 @@ class SSHMasterManager:
             except Exception as e:
                 if self.debug:
                     logger.warning(f"Failed to get sudo user home directory: {e}")
-        
+
         # Process identity file path immediately to handle ~ expansion correctly
         if identity_file:
             # Save the original identity file path for debugging
             self.original_identity_file = identity_file
-            
+
             if self.running_as_sudo and self.sudo_user_home:
                 # Convert relative paths to absolute using sudo user's home
                 if identity_file.startswith("~"):
                     identity_file = identity_file.replace("~", self.sudo_user_home, 1)
                     if self.debug:
                         logger.debug(f"Expanded identity file path: {identity_file}")
-                
+
                 # If still not absolute, prefix with sudo user's home
                 if not os.path.isabs(identity_file):
                     identity_file = os.path.join(self.sudo_user_home, identity_file)
                     if self.debug:
-                        logger.debug(f"Made identity file path absolute: {identity_file}")
-                        
+                        logger.debug(
+                            f"Made identity file path absolute: {identity_file}"
+                        )
+
                 # Ensure the file exists and is readable
                 id_path = Path(identity_file)
                 if not id_path.exists():
                     logger.warning(f"Identity file does not exist: {id_path}")
                 elif not os.access(str(id_path), os.R_OK):
                     logger.warning(f"Identity file is not readable: {id_path}")
-                    
+
                 if self.debug:
-                    logger.debug(f"Using identity file (after sudo expansion): {identity_file}")
-                    
+                    logger.debug(
+                        f"Using identity file (after sudo expansion): {identity_file}"
+                    )
+
         # Store identity file path (now properly expanded if needed)
         self.identity_file = identity_file
 
@@ -139,7 +143,7 @@ class SSHMasterManager:
 
     def _ssh_base_cmd(self, force_tty=False):
         """Build the base SSH command.
-        
+
         Args:
             force_tty: If True, add -t to force TTY allocation (needed for sudo)
         """
@@ -169,10 +173,10 @@ class SSHMasterManager:
             "ExitOnForwardFailure=yes",
             "-o",
             "IPQoS=throughput",
-            "-o", 
+            "-o",
             "PreferredAuthentications=publickey,password",
         ]
-        
+
         # Handle TTY allocation if requested
         if force_tty:
             # Force TTY allocation (for interactive sudo)
@@ -184,16 +188,18 @@ class SSHMasterManager:
             # Use the regular user's SSH config
             known_hosts_path = Path(f"{self.ssh_config_dir}/known_hosts")
             ssh_config_path = Path(f"{self.ssh_config_dir}/config")
-            
+
             if known_hosts_path.exists():
                 cmd.extend(["-o", f"UserKnownHostsFile={str(known_hosts_path)}"])
-            
+
             if ssh_config_path.exists():
                 cmd.extend(["-F", f"{str(ssh_config_path)}"])
-            
+
             # Log what we're using
             if self.debug:
-                logger.debug(f"Using sudo user's SSH config directory: {self.ssh_config_dir}")
+                logger.debug(
+                    f"Using sudo user's SSH config directory: {self.ssh_config_dir}"
+                )
                 if known_hosts_path.exists():
                     logger.debug(f"Using known_hosts file: {known_hosts_path}")
                 if ssh_config_path.exists():
@@ -206,26 +212,35 @@ class SSHMasterManager:
                     Path(f"{self.ssh_config_dir}/id_rsa"),
                     Path(f"{self.ssh_config_dir}/id_ed25519"),
                     Path(f"{self.ssh_config_dir}/id_ecdsa"),
-                    Path(f"{self.ssh_config_dir}/id_dsa")
+                    Path(f"{self.ssh_config_dir}/id_dsa"),
                 ]
-                    
+
                 found_id = False
                 for id_path in potential_ids:
                     if id_path.exists() and os.access(str(id_path), os.R_OK):
                         cmd.extend(["-i", str(id_path)])
                         found_id = True
                         if self.debug:
-                            logger.debug(f"Using auto-detected identity file: {id_path}")
-                    
+                            logger.debug(
+                                f"Using auto-detected identity file: {id_path}"
+                            )
+
                 if not found_id and self.debug:
-                    logger.warning(f"No readable identity files found in {self.ssh_config_dir}")
-                    logger.warning("SSH authentication will likely fail without identity files")
-                        
+                    logger.warning(
+                        f"No readable identity files found in {self.ssh_config_dir}"
+                    )
+                    logger.warning(
+                        "SSH authentication will likely fail without identity files"
+                    )
+
                     # Try agent-based authentication as a fallback
                     if "SSH_AUTH_SOCK" in os.environ:
-                        logger.debug("SSH agent socket found: %s", os.environ.get("SSH_AUTH_SOCK"))
+                        logger.debug(
+                            "SSH agent socket found: %s",
+                            os.environ.get("SSH_AUTH_SOCK"),
+                        )
                         logger.debug("Will try using SSH agent authentication")
-            
+
             if self.debug:
                 logger.debug(f"SSH command configured for sudo user {self.sudo_user}")
 
@@ -239,18 +254,26 @@ class SSHMasterManager:
             # Use the identity file path that was properly expanded in __init__
             identity_path = Path(self.identity_file)
             cmd += ["-i", str(identity_path)]
-            
+
             if self.debug:
                 logger.debug(f"Using explicit identity file: {identity_path}")
                 if not identity_path.exists():
                     logger.warning(f"Identity file does not exist: {identity_path}")
                     if self.running_as_sudo:
-                        logger.warning(f"When running with sudo, ensure file permissions allow root to read it")
-                        logger.warning(f"Or try using an absolute path like: /home/{self.sudo_user}/.ssh/id_ed25519")
+                        logger.warning(
+                            f"When running with sudo, ensure file permissions allow root to read it"
+                        )
+                        logger.warning(
+                            f"Or try using an absolute path like: /home/{self.sudo_user}/.ssh/id_ed25519"
+                        )
                 elif not os.access(str(identity_path), os.R_OK):
-                    logger.warning(f"Identity file exists but is not readable: {identity_path}")
+                    logger.warning(
+                        f"Identity file exists but is not readable: {identity_path}"
+                    )
                     if self.running_as_sudo:
-                        logger.warning(f"Check file permissions: chmod 600 {identity_path}")
+                        logger.warning(
+                            f"Check file permissions: chmod 600 {identity_path}"
+                        )
                 else:
                     logger.debug(f"Identity file exists and is readable")
 
@@ -259,6 +282,57 @@ class SSHMasterManager:
 
         if self.debug:
             logger.debug(f"SSH base command: {' '.join(cmd)}")
+
+        return cmd
+
+    def get_ssh_base_cmd(self, force_tty: bool = False) -> List[str]:
+        """Get the base SSH command with control options.
+
+        Args:
+            force_tty: If True, add -t to force TTY allocation (needed for sudo)
+
+        Returns:
+            List of command arguments for SSH
+        """
+        cmd = ["ssh"]
+
+        # Add control path and other connection options
+        cmd.extend(
+            [
+                "-o",
+                f"ControlPath={self.control_path}",
+                "-o",
+                "ControlMaster=auto",
+                "-o",
+                f"ControlPersist={self.persist}",
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                "ServerAliveInterval=5",
+                "-o",
+                "ServerAliveCountMax=3",
+                "-o",
+                "ConnectTimeout=10",
+                "-o",
+                "ExitOnForwardFailure=yes",
+            ]
+        )
+
+        # Add force TTY if requested
+        if force_tty:
+            cmd.append("-t")
+
+        # Add port if specified
+        if self.port:
+            cmd.extend(["-p", str(self.port)])
+
+        # Add SSH options from config
+        if self.ssh_opts:
+            cmd.extend(self.ssh_opts)
+
+        # Add username and host
+        dest = f"{self.username}@{self.hostname}" if self.username else self.hostname
+        cmd.append(dest)
 
         return cmd
 
@@ -282,10 +356,16 @@ class SSHMasterManager:
                 logger.debug(f"Using SSH config: {self.ssh_config_dir}")
                 logger.debug(f"Control path: {self.control_path}")
                 if self.identity_file:
-                    logger.debug(f"Original identity file before sudo adjustment: {self.identity_file}")
+                    logger.debug(
+                        f"Original identity file before sudo adjustment: {self.identity_file}"
+                    )
                     if self.sudo_user_home and self.identity_file.startswith("~"):
-                        adjusted_path = self.identity_file.replace("~", self.sudo_user_home, 1)
-                        logger.debug(f"Adjusted identity file for sudo user: {adjusted_path}")
+                        adjusted_path = self.identity_file.replace(
+                            "~", self.sudo_user_home, 1
+                        )
+                        logger.debug(
+                            f"Adjusted identity file for sudo user: {adjusted_path}"
+                        )
 
             for attempt in range(1, retries + 1):
                 cmd = self._ssh_base_cmd()
@@ -320,31 +400,39 @@ class SSHMasterManager:
                         env["SSH_ASKPASS_REQUIRE"] = "never"
                         # Also tell SSH to allocate a TTY if we're going to use sudo
                         if "sudo" in " ".join(test_cmd):
-                            logger.debug("Sudo command detected in test, will try to allocate TTY")
+                            logger.debug(
+                                "Sudo command detected in test, will try to allocate TTY"
+                            )
                         # Also set SSH_AUTH_SOCK if it exists in the original environment
                         sudo_auth_sock = None
-            
+
                         # Try to find the original user's SSH_AUTH_SOCK
                         try:
                             # Read /proc/pid/environ for the sudo process to find original SSH_AUTH_SOCK
                             sudo_pid = os.environ.get("SUDO_COMMAND", "").split()[0]
                             if sudo_pid and sudo_pid.isdigit():
                                 with open(f"/proc/{sudo_pid}/environ", "rb") as f:
-                                    env_data = f.read().split(b'\0')
+                                    env_data = f.read().split(b"\0")
                                     for var in env_data:
-                                        if var.startswith(b'SSH_AUTH_SOCK='):
-                                            sudo_auth_sock = var.decode('utf-8', errors='ignore').split('=', 1)[1]
+                                        if var.startswith(b"SSH_AUTH_SOCK="):
+                                            sudo_auth_sock = var.decode(
+                                                "utf-8", errors="ignore"
+                                            ).split("=", 1)[1]
                                             break
                         except Exception:
                             pass
-                
+
                         if sudo_auth_sock:
                             env["SSH_AUTH_SOCK"] = sudo_auth_sock
                             if self.debug:
-                                logger.debug(f"Using sudo user's SSH_AUTH_SOCK: {sudo_auth_sock}")
-                    
+                                logger.debug(
+                                    f"Using sudo user's SSH_AUTH_SOCK: {sudo_auth_sock}"
+                                )
+
                         if self.debug:
-                            logger.debug(f"Using modified environment: HOME={env['HOME']}, USER={env['USER']}")
+                            logger.debug(
+                                f"Using modified environment: HOME={env['HOME']}, USER={env['USER']}"
+                            )
 
                     test_proc = subprocess.run(
                         test_cmd,
@@ -373,31 +461,40 @@ class SSHMasterManager:
                         env["USER"] = self.sudo_user
 
                     # If we're using sudo, we might need TTY allocation
-                    if "sudo" in " ".join(cmd) and not any(x in " ".join(cmd) for x in ["btrfs send", "btrfs receive"]):
+                    if "sudo" in " ".join(cmd) and not any(
+                        x in " ".join(cmd) for x in ["btrfs send", "btrfs receive"]
+                    ):
                         # Regular sudo commands may need TTY
                         # Set proper indent
                         cmd_to_use = self._ssh_base_cmd(force_tty=True) + cmd[1:]
-                        logger.debug("Using TTY-enabled command for sudo: %s", " ".join(cmd_to_use))
+                        logger.debug(
+                            "Using TTY-enabled command for sudo: %s",
+                            " ".join(cmd_to_use),
+                        )
                     else:
                         # For non-sudo or btrfs commands, use regular SSH
                         cmd_to_use = cmd
-                    
+
                     # Add -o PasswordAuthentication=yes to ensure password auth is allowed during master setup
-                    if "-o" in cmd_to_use and "PasswordAuthentication=no" in " ".join(cmd_to_use):
-                        logger.debug("Ensuring password authentication is enabled for master setup")
+                    if "-o" in cmd_to_use and "PasswordAuthentication=no" in " ".join(
+                        cmd_to_use
+                    ):
+                        logger.debug(
+                            "Ensuring password authentication is enabled for master setup"
+                        )
                         # Find and replace PasswordAuthentication=no with PasswordAuthentication=yes
                         for i, arg in enumerate(cmd_to_use):
                             if arg == "PasswordAuthentication=no":
                                 cmd_to_use[i] = "PasswordAuthentication=yes"
-            
+
                     proc = subprocess.run(
-                            cmd_to_use,
-                            stdout=subprocess.DEVNULL,
-                            stderr=subprocess.PIPE,
-                            timeout=timeout,
-                            check=False,
-                            env=env,
-                        )
+                        cmd_to_use,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.PIPE,
+                        timeout=timeout,
+                        check=False,
+                        env=env,
+                    )
                     if proc.returncode != 0:
                         logger.error(
                             f"Failed to start SSH master (attempt {attempt}): {proc.stderr.decode().strip()}"
@@ -421,7 +518,10 @@ class SSHMasterManager:
                     if self.is_master_alive():
                         # Extra verification - run a simple command to ensure connection is truly ready
                         try:
-                            test_cmd = self._ssh_base_cmd() + ["echo", "Connection verified"]
+                            test_cmd = self._ssh_base_cmd() + [
+                                "echo",
+                                "Connection verified",
+                            ]
                             test_proc = subprocess.run(
                                 test_cmd,
                                 stdout=subprocess.PIPE,
@@ -432,16 +532,26 @@ class SSHMasterManager:
                             if test_proc.returncode == 0:
                                 self._master_started = True
                                 if self.debug:
-                                    logger.debug(f"SSH master started and verified at {self.control_path}")
+                                    logger.debug(
+                                        f"SSH master started and verified at {self.control_path}"
+                                    )
                                     # Log the effective SSH configuration
-                                    logger.debug(f"SSH connection established with: user={self.username}, host={self.hostname}")
+                                    logger.debug(
+                                        f"SSH connection established with: user={self.username}, host={self.hostname}"
+                                    )
                                     if self.identity_file:
-                                        logger.debug(f"Used identity file: {self.identity_file}")
+                                        logger.debug(
+                                            f"Used identity file: {self.identity_file}"
+                                        )
                                 return True
                             else:
-                                logger.warning("SSH master started but command test failed, will retry")
+                                logger.warning(
+                                    "SSH master started but command test failed, will retry"
+                                )
                         except Exception as e:
-                            logger.warning(f"SSH master started but verification failed: {e}")
+                            logger.warning(
+                                f"SSH master started but verification failed: {e}"
+                            )
                     time.sleep(0.1)
 
                 if self.debug:
@@ -560,7 +670,7 @@ class SSHMasterManager:
         if not self.control_path.exists():
             logger.debug(f"SSH master control path does not exist: {self.control_path}")
             return False
-            
+
         # First do a control check
         cmd = [
             "ssh",
@@ -572,7 +682,7 @@ class SSHMasterManager:
         ]
         if self.port:
             cmd += ["-p", str(self.port)]
-            
+
         try:
             logger.debug(f"Checking SSH master connection: {' '.join(cmd)}")
             proc = subprocess.run(
@@ -582,14 +692,14 @@ class SSHMasterManager:
                 timeout=5,  # Give a bit more time for check
                 check=False,
             )
-            
+
             if proc.returncode == 0:
                 logger.debug("SSH control socket check passed")
-                
+
                 # Now do a real command test to ensure the connection is truly functional
                 test_cmd = self._ssh_base_cmd() + ["true"]
                 logger.debug(f"Running secondary SSH check: {' '.join(test_cmd)}")
-                
+
                 test_proc = subprocess.run(
                     test_cmd,
                     stdout=subprocess.PIPE,
@@ -597,30 +707,36 @@ class SSHMasterManager:
                     timeout=5,
                     check=False,
                 )
-                
+
                 if test_proc.returncode == 0:
                     # Both checks passed
                     logger.debug("SSH connection is fully functional")
                     return True
                 else:
                     # Control socket exists but can't run commands
-                    stderr = test_proc.stderr.decode(errors='replace').strip()
-                    logger.warning(f"SSH control socket exists but command test failed: {stderr}")
-                    
+                    stderr = test_proc.stderr.decode(errors="replace").strip()
+                    logger.warning(
+                        f"SSH control socket exists but command test failed: {stderr}"
+                    )
+
                     # The socket might be stale or broken
-                    logger.info("SSH socket appears to be stale or broken, will remove it")
+                    logger.info(
+                        "SSH socket appears to be stale or broken, will remove it"
+                    )
                     self.cleanup_socket()
                     return False
             else:
-                stderr = proc.stderr.decode(errors='replace').strip()
+                stderr = proc.stderr.decode(errors="replace").strip()
                 logger.warning(f"SSH master socket check failed: {stderr}")
-                
+
                 # Socket exists but check failed, try to clean it up
                 if "No such file or directory" in stderr:
-                    logger.info("Control socket file not found even though path exists, cleaning up")
+                    logger.info(
+                        "Control socket file not found even though path exists, cleaning up"
+                    )
                     self.cleanup_socket()
                 return False
-                
+
         except subprocess.TimeoutExpired:
             logger.warning("SSH master connection check timed out after 5 seconds")
             # This is a sign the socket may be stale

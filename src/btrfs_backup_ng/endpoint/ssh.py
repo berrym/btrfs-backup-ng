@@ -5,6 +5,14 @@
 This module provides the SSHEndpoint class, which integrates with SSHMasterManager
 to handle SSH-based operations robustly, including btrfs send/receive commands.
 
+Key features:
+- Verifies remote filesystem is BTRFS before attempting transfers
+- Tests SSH connectivity with a simple test file
+- Uses mbuffer or pv if available to improve transfer reliability
+- Provides detailed error reporting and verification
+- Implements transfer method fallbacks for maximum reliability
+- Includes direct SSH transfer functionality (previously in ssh_transfer.py)
+
 Environment variables that affect behavior:
 - BTRFS_BACKUP_PASSWORDLESS_ONLY: If set to 1/true/yes, disables the use of sudo
   -S flag and will only attempt passwordless sudo (-n flag), failing if a password
@@ -13,67 +21,126 @@ Environment variables that affect behavior:
 
 import copy
 import os
-import select
 import subprocess
 import time
 import uuid
-import logging
 from pathlib import Path
 from threading import Lock
-from typing import Optional, List, Union, Dict, Any, Tuple
+from typing import Optional, List, Any, Dict, Tuple, cast, TypeVar
+from subprocess import CompletedProcess
+import getpass
+
+try:
+    import pwd
+
+    _pwd = pwd
+    _pwd_available = True
+except ImportError:
+    _pwd = None
+    _pwd_available = False
+
 
 from btrfs_backup_ng.__logger__ import logger
 from btrfs_backup_ng.sshutil.master import SSHMasterManager
 from .common import Endpoint
 
-# Import pwd module safely with fallback
-try:
-    import pwd
-    PWD_MODULE_AVAILABLE = True
-except ImportError:
-    PWD_MODULE_AVAILABLE = False
+# Type variable for self in SSHEndpoint
+_Self = TypeVar("_Self", bound="SSHEndpoint")
 
 
 class SSHEndpoint(Endpoint):
     """SSH-based endpoint for remote operations.
-    
+
     This endpoint type handles connections to remote hosts via SSH.
     SSH username can be specified in three ways, in order of precedence:
     1. Via --ssh-username command line argument (highest priority)
     2. In the URI (e.g., ssh://user@host:/path)
     3. Current local user (fallback)
-    
+
     When running as root with sudo, SSH identity files and usernames need special handling.
+
+    Enhanced with direct SSH transfer capabilities for improved reliability:
+    - Verifies remote filesystem is BTRFS before attempting transfers
+    - Tests SSH connectivity with a simple test file
+    - Uses mbuffer or pv if available to improve transfer reliability
+    - Provides detailed error reporting and verification
+    - Implements transfer method fallbacks for maximum reliability
+
+    Note: This class incorporates the functionality previously provided by
+    the separate ssh_transfer.py module, offering an integrated solution for
+    reliable BTRFS transfers over SSH.
     """
 
     _is_remote = True
     _supports_multiprocessing = True
 
-    def __init__(self, hostname: str, config: Optional[dict] = None, **kwargs) -> None:
+    def __init__(
+        self,
+        hostname: str,
+        config: Optional[Dict[str, Any]] = None,
+        *,
+        ssh_sudo: bool = False,
+        ssh_identity_file: Optional[str] = None,
+        username: Optional[str] = None,
+        port: Optional[int] = None,
+        ssh_opts: Optional[List[str]] = None,
+        agent_forwarding: bool = False,
+        passwordless: bool = False,
+        **kwargs: Any,
+    ) -> None:
+        """Initialize the SSH endpoint.
+
+        Args:
+            hostname: Remote hostname
+            config: Configuration dictionary
+            **kwargs: Additional keyword arguments passed to parent class
+        """
         # Deep copy config to avoid shared references in multiprocessing
         if config is not None:
             config = copy.deepcopy(config)
-        super().__init__(config=config, **kwargs)
+            logger.debug("SSHEndpoint: Using provided config (deep copied)")
+        else:
+            config = {}
+            logger.debug("SSHEndpoint: No config provided, using empty dict")
+
+        # Initialize our config before calling parent init
+        self.config: Dict[str, Any] = config if config is not None else {}
+        self.hostname: str = hostname
+        self._instance_id: str = f"{os.getpid()}_{uuid.uuid4().hex[:8]}"
+        self._lock: Lock = Lock()
+        self._last_receive_log: Optional[str] = None
+        self._last_transfer_snapshot: Optional[bool] = None
+        self.ssh_manager: SSHMasterManager
+        logger.debug(
+            "SSHEndpoint: Config keys before parent init: %s", list(config.keys())
+        )
+
+        # Call parent init with both config and kwargs
+        super().__init__(config=self.config, **kwargs)
 
         self.hostname = hostname
         logger.debug("SSHEndpoint initialized with hostname: %s", self.hostname)
+        logger.debug("SSHEndpoint: kwargs provided: %s", list(kwargs.keys()))
         self.config["username"] = self.config.get("username")
         self.config["port"] = self.config.get("port")
         self.config["ssh_opts"] = self.config.get("ssh_opts", [])
-        
+        self.config["agent_forwarding"] = self.config.get("agent_forwarding", False)
+
         # Initialize tracking variables for verification
         self._last_receive_log = None
         self._last_transfer_snapshot = None
         self.config["path"] = self.config.get("path", "/")
         self.config["ssh_sudo"] = self.config.get("ssh_sudo", False)
         self.config["passwordless"] = self.config.get("passwordless", False)
-        
+
         # Log important settings for troubleshooting
-        logger.info("SSH endpoint configuration: hostname=%s, sudo=%s, passwordless=%s", 
-                   self.hostname, 
-                   self.config.get("ssh_sudo", False),
-                   self.config.get("passwordless", False))
-        
+        logger.info(
+            "SSH endpoint configuration: hostname=%s, sudo=%s, passwordless=%s",
+            self.hostname,
+            self.config.get("ssh_sudo", False),
+            self.config.get("passwordless", False),
+        )
+
         # Username handling with clear precedence:
         # 1. Explicitly provided username (from command line via --ssh-username)
         # 2. Username from the URL (ssh://user@host/path)
@@ -83,46 +150,100 @@ class SSHEndpoint(Endpoint):
             # No username provided in config, check sudo environment
             if os.geteuid() == 0 and os.environ.get("SUDO_USER"):
                 self.config["username"] = os.environ.get("SUDO_USER")
-                logger.debug("Using sudo original user as username: %s", self.config["username"])
+                logger.debug(
+                    "Using sudo original user as username: %s", self.config["username"]
+                )
+                logger.debug(
+                    "Running as root (euid=0) with SUDO_USER=%s",
+                    os.environ.get("SUDO_USER"),
+                )
             else:
-                # Default to current user if nothing else specified
-                import getpass
-                self.config["username"] = getpass.getuser()
-                logger.debug("Using current user as username: %s", self.config["username"])
+                logger.debug("Not running as sudo, getting current user")
+                try:
+                    self.config["username"] = getpass.getuser()
+                    logger.debug(
+                        "Using current user as username: %s", self.config["username"]
+                    )
+                except Exception as e:
+                    # Fallback if getpass.getuser() fails
+                    logger.warning(f"Error getting current username: {e}")
+                    logger.debug(
+                        f"getpass.getuser() failed with exception: {e}", exc_info=True
+                    )
+                    # Try environment variables
+                    username = os.environ.get("USER") or os.environ.get("USERNAME")
+                    logger.debug(
+                        "Trying environment variables: USER=%s, USERNAME=%s",
+                        os.environ.get("USER"),
+                        os.environ.get("USERNAME"),
+                    )
+                    if not username:
+                        # Last resort fallback
+                        username = "btrfs-backup-user"
+                        logger.warning(f"Using default fallback username: {username}")
+                        logger.debug(
+                            "No username found in environment, using hardcoded fallback"
+                        )
+                    self.config["username"] = username
+                    logger.debug(f"Using fallback username: {username}")
         else:
-            # Username explicitly provided in config
-            logger.debug("Using explicitly configured username: %s", self.config["username"])
-        
-        # Handle SSH identity file path, especially when running under sudo
+            logger.debug(
+                "Using explicitly configured username: %s", self.config["username"]
+            )
+
         identity_file = self.config.get("ssh_identity_file")
+        logger.debug("SSH identity file from config: %s", identity_file)
         if identity_file:
-            # Check if running as root via sudo
             running_as_sudo = os.geteuid() == 0 and os.environ.get("SUDO_USER")
+            logger.debug(
+                "Running as sudo check: euid=%d, SUDO_USER=%s, running_as_sudo=%s",
+                os.geteuid(),
+                os.environ.get("SUDO_USER"),
+                running_as_sudo,
+            )
             if running_as_sudo:
                 sudo_user = os.environ.get("SUDO_USER")
+                logger.debug("Processing identity file for sudo user: %s", sudo_user)
+                sudo_user_home = None
+                if sudo_user:
+                    sudo_user_home = None
+                    if _pwd_available and _pwd is not None:
+                        try:
+                            sudo_user_home = _pwd.getpwnam(sudo_user).pw_dir
+                            logger.debug(
+                                f"Found home directory for sudo user: {sudo_user_home}"
+                            )
+                        except Exception as e:
+                            logger.warning(
+                                f"Error getting home directory for sudo user: {e}"
+                            )
+                            logger.debug(f"pwd.getpwnam() failed: {e}", exc_info=True)
+                            # Fall back to default location
+                            sudo_user_home = None
+
+                    # Use fallback if we couldn't get the home directory
+                    if sudo_user_home is None:
+                        sudo_user_home = (
+                            f"/home/{sudo_user}" if sudo_user != "root" else "/root"
+                        )
+                        logger.debug(f"Using fallback home directory: {sudo_user_home}")
+                if sudo_user_home and identity_file.startswith("~"):
+                    identity_file = identity_file.replace("~", sudo_user_home, 1)
+                    logger.debug("Expanded ~ in identity file path: %s", identity_file)
+                if sudo_user_home and not os.path.isabs(identity_file):
+                    identity_file = os.path.join(sudo_user_home, identity_file)
+                    logger.debug(
+                        "Converted relative path to absolute: %s", identity_file
+                    )
+                self.config["ssh_identity_file"] = identity_file
+                logger.debug("Final identity file path: %s", identity_file)
                 try:
-                    # Get the sudo user's home directory
-                    sudo_user_home = pwd.getpwnam(sudo_user).pw_dir
-                    
-                    # Expand ~ to sudo user's home directory
-                    if identity_file.startswith("~"):
-                        identity_file = identity_file.replace("~", sudo_user_home, 1)
-                        logger.debug("Expanded ~ in identity file path: %s", identity_file)
-                    
-                    # If path is relative, make it absolute using sudo user's home
-                    if not os.path.isabs(identity_file):
-                        identity_file = os.path.join(sudo_user_home, identity_file)
-                        logger.debug("Converted relative path to absolute: %s", identity_file)
-                    
-                    # Store the expanded path
-                    self.config["ssh_identity_file"] = identity_file
-                    logger.debug("Final identity file path: %s", identity_file)
-                    
-                    # Verify the file exists and is readable
                     id_file = Path(identity_file).absolute()
                     if not id_file.exists():
                         logger.warning("SSH identity file does not exist: %s", id_file)
-                        logger.warning("When running with sudo, ensure the identity file path is absolute and accessible")
+                        logger.warning(
+                            "When running with sudo, ensure the identity file path is absolute and accessible"
+                        )
                     elif not os.access(str(id_file), os.R_OK):
                         logger.warning("SSH identity file is not readable: %s", id_file)
                         logger.warning("Check file permissions: chmod 600 %s", id_file)
@@ -130,27 +251,28 @@ class SSHEndpoint(Endpoint):
                         logger.info("Using SSH identity file: %s (verified)", id_file)
                 except Exception as e:
                     logger.warning("Error processing identity file path: %s", e)
-                    # Keep the original path as a fallback
                     self.config["ssh_identity_file"] = identity_file
             else:
-                # Not running as sudo, just log the path
                 logger.debug("Using SSH identity file: %s", identity_file)
-        
+
         # Log the final configuration
         logger.debug("SSH path: %s", self.config["path"])
         logger.debug("SSH username: %s", self.config["username"])
         logger.debug("SSH hostname: %s", self.hostname)
         logger.debug("SSH port: %s", self.config["port"])
         logger.debug("SSH sudo: %s", self.config["ssh_sudo"])
-        
-        # Add SSH agent forwarding if available when running as sudo
-        if os.geteuid() == 0 and os.environ.get("SUDO_USER") and "SSH_AUTH_SOCK" in os.environ:
-            logger.debug("Adding SSH agent forwarding for sudo user")
-            ssh_opts = self.config.get("ssh_opts", []).copy()
-            ssh_opts.append(f"IdentityAgent={os.environ['SSH_AUTH_SOCK']}")
-            self.config["ssh_opts"] = ssh_opts
 
-        self.ssh_manager = SSHMasterManager(
+        # Centralized agent forwarding logic
+        logger.debug("Applying agent forwarding configuration")
+        self._apply_agent_forwarding()
+
+        logger.debug(
+            "Creating SSHMasterManager with: hostname=%s, username=%s, port=%s",
+            self.hostname,
+            self.config["username"],
+            self.config["port"],
+        )
+        self.ssh_manager: SSHMasterManager = SSHMasterManager(
             hostname=self.hostname,
             username=self.config["username"],
             port=self.config["port"],
@@ -159,118 +281,488 @@ class SSHEndpoint(Endpoint):
             debug=True,
             identity_file=self.config.get("ssh_identity_file"),
         )
+        logger.debug("SSHMasterManager created successfully")
 
-        self._lock = Lock()
-        self._instance_id = f"{os.getpid()}_{uuid.uuid4().hex[:8]}"
+        self._lock = Lock()  # Already set in type definition
+        self._instance_id = (
+            f"{os.getpid()}_{uuid.uuid4().hex[:8]}"  # Already set in type definition
+        )
+        logger.debug("SSHEndpoint instance ID: %s", self._instance_id)
+
+        # Force ssh_sudo to True if requested in kwargs or config
+        cli_ssh_sudo = kwargs.get("ssh_sudo") or (config and config.get("ssh_sudo"))
+        logger.debug(
+            f"[SSHEndpoint.__init__] Initial ssh_sudo: {self.config.get('ssh_sudo', False)}, CLI/config ssh_sudo: {cli_ssh_sudo}"
+        )
+        logger.debug(
+            "SSH sudo propagation check: kwargs.ssh_sudo=%s, config.ssh_sudo=%s",
+            kwargs.get("ssh_sudo"),
+            config.get("ssh_sudo"),
+        )
+        if cli_ssh_sudo and not self.config.get("ssh_sudo", False):
+            logger.warning("SSH sudo flag not properly propagated, forcing to True")
+            self.config["ssh_sudo"] = True
+        logger.debug(
+            f"[SSHEndpoint.__init__] Final ssh_sudo: {self.config.get('ssh_sudo', False)}"
+        )
+        logger.debug("SSHEndpoint initialization completed")
 
     def __repr__(self) -> str:
-        username = self.config.get('username', '')
+        username: str = self.config.get("username", "")
         return f"(SSH) {username}@{self.hostname}:{self.config['path']}"
+
+    def delete_snapshots(self, snapshots: List[Any], **kwargs: Any) -> None:
+        """Delete the given snapshots (subvolumes) on the remote host via SSH."""
+        for snapshot in snapshots:
+            if hasattr(snapshot, "locks") and (
+                snapshot.locks or getattr(snapshot, "parent_locks", False)
+            ):
+                logger.info("Skipping locked snapshot: %s", snapshot)
+                continue
+            remote_path = (
+                str(snapshot.get_path())
+                if hasattr(snapshot, "get_path")
+                else str(snapshot)
+            )
+            cmd = ["btrfs", "subvolume", "delete", remote_path]
+            logger.debug("Executing remote deletion command: %s", cmd)
+            try:
+                result = self._exec_remote_command(
+                    cmd,
+                    check=False,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                )
+                if result.returncode == 0:
+                    logger.info("Deleted remote snapshot subvolume: %s", remote_path)
+                else:
+                    stderr = (
+                        result.stderr.decode(errors="replace").strip()
+                        if hasattr(result.stderr, "decode")
+                        else result.stderr
+                    )
+                    logger.error(
+                        "Failed to delete remote snapshot %s: %s", remote_path, stderr
+                    )
+            except Exception as e:
+                logger.error(
+                    "Exception while deleting remote snapshot %s: %s", remote_path, e
+                )
+
+    def delete_old_snapshots(self, keep: int) -> None:
+        """
+        Delete old snapshots on the remote host, keeping only the most recent `keep` unlocked snapshots.
+        """
+        snapshots = self.list_snapshots()  # type: ignore
+        unlocked = [  # type: ignore
+            s  # type: ignore
+            for s in snapshots  # type: ignore
+            if not getattr(s, "locks", False) and not getattr(s, "parent_locks", False)  # type: ignore
+        ]
+        if keep <= 0 or len(unlocked) <= keep:  # type: ignore
+            logger.debug(
+                "No unlocked snapshots to delete (keep=%d, unlocked=%d)",
+                keep,
+                len(unlocked),  # type: ignore
+            )
+            return
+        to_delete = unlocked[:-keep]  # type: ignore
+        for snap in to_delete:  # type: ignore
+            logger.info("Deleting old remote snapshot: %s", str(snap))  # type: ignore
+            self.delete_snapshots([snap])
+
+    def _apply_agent_forwarding(self) -> None:
+        """
+        Apply SSH agent forwarding if enabled in config.
+        """
+        agent_forwarding: bool = self.config.get("agent_forwarding", False)
+        ssh_auth_sock: Optional[str] = os.environ.get("SSH_AUTH_SOCK")
+        ssh_opts: List[str] = self.config.get("ssh_opts", []).copy()
+
+        if agent_forwarding:
+            if ssh_auth_sock:
+                logger.info(
+                    "Enabling SSH agent forwarding (IdentityAgent=%s)", ssh_auth_sock
+                )
+                # Avoid duplicate IdentityAgent entries
+                identity_agent_opt = f"IdentityAgent={ssh_auth_sock}"
+                if identity_agent_opt not in ssh_opts:
+                    ssh_opts.append(identity_agent_opt)
+                self.config["ssh_opts"] = ssh_opts
+            else:
+                logger.warning(
+                    "SSH agent forwarding requested but SSH_AUTH_SOCK is not set. Agent forwarding will not work."
+                )
+
+    def _run_diagnostics(self, path: str = "/") -> Dict[str, bool]:
+        """Run SSH and sudo diagnostics to identify potential issues.
+
+        Attempts several tests to verify SSH connectivity, btrfs availability,
+        sudo access, and filesystem type. Updates self.config["passwordless_sudo_available"]
+        based on sudo test results.
+
+        Args:
+            path: Remote path to test for btrfs operations
+
+        Returns:
+            Dictionary with test results (True=passed, False=failed):
+            {
+                'ssh_connection': bool,  # Basic SSH connectivity
+                'btrfs_command': bool,   # btrfs command exists on remote
+                'passwordless_sudo': bool,  # Sudo without password works
+                'sudo_btrfs': bool,      # Can run btrfs with sudo
+                'write_permissions': bool,  # Can write to path
+                'btrfs_filesystem': bool  # Path is on btrfs filesystem
+            }
+        """
+        # Initialize results dictionary
+        results: Dict[str, bool] = {
+            "ssh_connection": False,
+            "btrfs_command": False,
+            "passwordless_sudo": False,
+            "sudo_btrfs": False,
+            "write_permissions": False,
+            "btrfs_filesystem": False,
+        }
+
+        # Test SSH Connection
+        logger.debug("Testing SSH connection...")
+        try:
+            cmd_result: CompletedProcess[Any] = self._exec_remote_command(
+                ["echo", "SSH connection successful"],
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            results["ssh_connection"] = cmd_result.returncode == 0
+            if not results["ssh_connection"]:
+                logger.error("SSH connection test failed")
+                logger.debug(
+                    f"SSH connection stderr: {cmd_result.stderr.decode() if cmd_result.stderr else 'None'}"
+                )
+                return results
+            else:
+                logger.debug("SSH connection test passed")
+        except Exception as e:
+            logger.error(f"SSH connection test failed: {e}")
+            logger.debug(f"SSH connection exception details: {e}", exc_info=True)
+            return results
+
+        # Test btrfs command availability
+        logger.debug("Testing btrfs command availability...")
+        try:
+            result = self._exec_remote_command(["command", "-v", "btrfs"], check=False)
+            results["btrfs_command"] = result.returncode == 0
+            if results["btrfs_command"]:
+                btrfs_path = result.stdout.decode().strip() if result.stdout else ""
+                logger.info(f"btrfs command found: {btrfs_path}")
+                logger.debug(f"btrfs command path: {btrfs_path}")
+            else:
+                logger.error("btrfs command not found on remote host")
+                logger.debug(
+                    f"btrfs command check stderr: {result.stderr.decode() if result.stderr else 'None'}"
+                )
+        except Exception as e:
+            logger.error(f"Error checking btrfs command: {e}")
+            logger.debug(f"btrfs command check exception: {e}", exc_info=True)
+
+        # Test passwordless sudo
+        logger.debug("Testing passwordless sudo...")
+        try:
+            result = self._exec_remote_command(["sudo", "-n", "true"], check=False)
+            results["passwordless_sudo"] = result.returncode == 0
+            if results["passwordless_sudo"]:
+                logger.info("Passwordless sudo is available")
+                logger.debug("Passwordless sudo test passed")
+            else:
+                logger.warning("Passwordless sudo is not available")
+                logger.debug(
+                    f"Passwordless sudo stderr: {result.stderr.decode() if result.stderr else 'None'}"
+                )
+        except Exception as e:
+            logger.error(f"Error checking passwordless sudo: {e}")
+            logger.debug(f"Passwordless sudo exception: {e}", exc_info=True)
+
+        # Test sudo with btrfs
+        logger.debug("Testing sudo with btrfs command...")
+        try:
+            result = self._exec_remote_command(
+                ["sudo", "-n", "btrfs", "--version"], check=False
+            )
+            results["sudo_btrfs"] = result.returncode == 0
+            if results["sudo_btrfs"]:
+                logger.info("Sudo btrfs command works")
+                logger.debug("Sudo btrfs test passed")
+                if result.stdout:
+                    logger.debug(f"btrfs version: {result.stdout.decode().strip()}")
+            else:
+                logger.warning("Cannot run btrfs with passwordless sudo")
+                logger.debug(
+                    f"Sudo btrfs stderr: {result.stderr.decode() if result.stderr else 'None'}"
+                )
+        except Exception as e:
+            logger.error(f"Error checking sudo btrfs: {e}")
+            logger.debug(f"Sudo btrfs exception: {e}", exc_info=True)
+
+        # Test write permissions
+        logger.debug(f"Testing write permissions to path: {path}")
+        try:
+            test_file = f"{path}/.btrfs-backup-write-test-{uuid.uuid4().hex[:8]}"
+            logger.debug(f"Testing write with test file: {test_file}")
+            result = self._exec_remote_command(["touch", test_file], check=False)
+            if result.returncode == 0:
+                self._exec_remote_command(["rm", "-f", test_file], check=False)
+                results["write_permissions"] = True
+                logger.info(f"Path is directly writable: {path}")
+                logger.debug("Direct write test passed")
+            else:
+                logger.debug(
+                    f"Direct write failed, trying with sudo. Error: {result.stderr.decode() if result.stderr else 'None'}"
+                )
+                # Try with sudo
+                result = self._exec_remote_command(
+                    ["sudo", "-n", "touch", test_file], check=False
+                )
+                if result.returncode == 0:
+                    self._exec_remote_command(
+                        ["sudo", "-n", "rm", "-f", test_file], check=False
+                    )
+                    results["write_permissions"] = True
+                    logger.info(f"Path is writable with sudo: {path}")
+                    logger.debug("Sudo write test passed")
+                else:
+                    logger.error(f"Path is not writable (even with sudo): {path}")
+                    logger.debug(
+                        f"Sudo write failed. Error: {result.stderr.decode() if result.stderr else 'None'}"
+                    )
+        except Exception as e:
+            logger.error(f"Error checking write permissions: {e}")
+            logger.debug(f"Write permissions exception: {e}", exc_info=True)
+
+        # Test if filesystem is btrfs
+        logger.debug(f"Testing filesystem type for path: {path}")
+        try:
+            result = self._exec_remote_command(
+                ["stat", "-f", "-c", "%T", path],
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            fs_type = result.stdout.decode().strip() if result.stdout else ""
+            results["btrfs_filesystem"] = fs_type == "btrfs"
+            if results["btrfs_filesystem"]:
+                logger.info(f"Path is on a btrfs filesystem: {path}")
+                logger.debug(f"Filesystem type confirmed: {fs_type}")
+            else:
+                logger.error(f"Path is not on a btrfs filesystem (found: {fs_type})")
+                logger.debug(f"Expected 'btrfs', got '{fs_type}'")
+        except Exception as e:
+            logger.error(f"Error checking filesystem type: {e}")
+            logger.debug(f"Filesystem type check exception: {e}", exc_info=True)
+
+        # Log summary of results
+        logger.debug("Diagnostic tests completed, generating summary...")
+        logger.info("\nDiagnostic Summary:")
+        logger.info("-" * 50)
+        for test, result in results.items():
+            status = "✓" if result else "✗"
+            logger.info(f"{test.replace('_', ' ').title():20} {status}")
+            logger.debug(f"Test {test}: {'PASSED' if result else 'FAILED'}")
+        logger.info("-" * 50)
+
+        # Debug overall status
+        all_passed = all(results.values())
+        logger.debug(
+            f"Overall diagnostics status: {'ALL PASSED' if all_passed else 'SOME FAILED'}"
+        )
+        if not all_passed:
+            failed_tests = [test for test, result in results.items() if not result]
+            logger.debug(f"Failed tests: {failed_tests}")
+
+        # Provide specific recommendations based on what failed
+        if not all(results.values()):
+            if not results["sudo_btrfs"]:
+                self._show_sudoers_fix_instructions()
+
+            if not results["write_permissions"]:
+                logger.info("\nTo fix write permissions:")
+                logger.info(
+                    f"Ensure that user '{self.config.get('username')}' has write permission to {path}"
+                )
+                logger.info(
+                    "or that sudo is configured properly to allow writing to this location."
+                )
+
+            if not results["btrfs_filesystem"]:
+                logger.info("\nTo fix filesystem type:")
+                logger.info(f"The path {path} must be on a btrfs filesystem.")
+                logger.info("btrfs-backup-ng cannot work with other filesystem types.")
+
+        return results
+
+    def _show_sudoers_fix_instructions(self) -> None:
+        """Show instructions for fixing sudoers configuration."""
+        logger.info("\nTo fix sudo access:")
+        user = self.config.get("username")
+        logger.info(f"Add one of these lines to /etc/sudoers via 'sudo visudo':")
+        logger.info(f"\n# Full access to btrfs commands:")
+        logger.info(f"{user} ALL=(ALL) NOPASSWD: /usr/bin/btrfs")
+        logger.info(f"\n# Or more restricted access:")
+        logger.info(
+            f"{user} ALL=(ALL) NOPASSWD: /usr/bin/btrfs subvolume*, /usr/bin/btrfs send*, /usr/bin/btrfs receive*"
+        )
 
     def get_id(self) -> str:
         """Return a unique identifier for this SSH endpoint."""
-        username = self.config.get('username', '')
-        username_part = f"{username}@" if username else ""
+        username: str = self.config.get("username", "")
+        username_part: str = f"{username}@" if username else ""
         return f"ssh://{username_part}{self.hostname}:{self.config['path']}"
 
     def _build_remote_command(self, command: List[str]) -> List[str]:
         """Prepare a remote command with optional sudo."""
         if not command:
             return command
-            
+
         # Ensure all elements are strings
         command = [str(c) for c in command]
-        
+
         # Check if the ssh_sudo flag is set
         if self.config.get("ssh_sudo", False):
-            cmd_str = " ".join(command)
+            cmd_str: str = " ".join(command)
             logger.debug("Using sudo for remote command: %s", cmd_str)
-            
-            # Special handling for btrfs receive which needs to be root
+
+            passwordless_only = os.environ.get(
+                "BTRFS_BACKUP_PASSWORDLESS_ONLY", "0"
+            ).lower() in ("1", "true", "yes")
+            # Always use -n for passwordless attempts if passwordless_only is set
             if len(command) > 1 and command[0] == "btrfs" and command[1] == "receive":
-                # For btrfs receive, we want to ensure sudo works even if it requires a password
-                # Add -E to preserve environment variables
-                # Add -P to preserve PATH which is important for finding the btrfs binary
-                
-                # Check if we should force passwordless mode
-                passwordless_only = os.environ.get("BTRFS_BACKUP_PASSWORDLESS_ONLY", "0").lower() in ("1", "true", "yes")
-                
-                # Always add -p flag to keep terminal-based stdin functioning properly for btrfs receive
-                # This helps ensure the stream is properly passed through
                 if passwordless_only:
-                    # Use -n flag to fail rather than prompt for password
                     logger.debug("Using sudo with -n flag (passwordless only mode)")
                     return ["sudo", "-n", "-E", "-P", "-p", ""] + command
                 else:
-                    # Use -S to read password from stdin if needed (stdin will be connected to our pipe)
-                    # Use empty password prompt to avoid interfering with btrfs receive stream
-                    logger.debug("Using sudo for btrfs receive command with password support")
-                    logger.warning("Note: If the remote host requires a sudo password, transfer may fail")
-                    logger.warning("Consider setting up passwordless sudo for btrfs commands on remote host")
+                    logger.debug(
+                        "Using sudo for btrfs receive command with password support"
+                    )
+                    logger.warning(
+                        "Note: If the remote host requires a sudo password, transfer may fail"
+                    )
+                    logger.warning(
+                        "Consider setting up passwordless sudo for btrfs commands on remote host"
+                    )
                     return ["sudo", "-S", "-E", "-P", "-p", ""] + command
             elif command[0] == "btrfs":
-                # For other btrfs commands, use -n which will fail rather than prompt for password
                 logger.debug("Using sudo for regular btrfs command")
                 return ["sudo", "-n", "-E"] + command
             else:
-                # Use -n to avoid password prompt for other commands
                 return ["sudo", "-n"] + command
         else:
-            logger.debug("Not using sudo for remote command (ssh_sudo=False): %s", command)
+            logger.debug(
+                "Not using sudo for remote command (ssh_sudo=False): %s", command
+            )
         return command
 
-    def _exec_remote_command(self, command, **kwargs) -> subprocess.CompletedProcess:
-        """Execute a command on the remote host."""
+    def _get_sudo_password(self) -> Optional[str]:
+        # First try environment variable
+        sudo_pw = os.environ.get("BTRFS_BACKUP_SUDO_PASSWORD")
+        if sudo_pw:
+            return sudo_pw
+
+        # Then try interactive password prompt
+        try:
+            return getpass.getpass(
+                f"Sudo password for {self.config.get('username', 'remote user')}: "
+            )
+        except Exception as e:
+            logger.warning(f"Error getting sudo password via getpass: {e}")
+            logger.info(
+                "You may need to run this with sudo privileges or ensure terminal supports password input"
+            )
+            return None
+
+    def _exec_remote_command(
+        self, command: List[Any], **kwargs: Any
+    ) -> CompletedProcess[Any]:
+        """Execute a command on the remote host via SSH."""
         # Process command arguments based on whether they're marked as paths
         string_command = []
-        
+
         logger.debug("Executing remote command, original format: %s", command)
-        logger.debug("Command type: %s, first element type: %s", 
-                    type(command).__name__, 
-                    type(command[0]).__name__ if command else "None")
-        
+        logger.debug(
+            "Command type: %s, first element type: %s",
+            type(command).__name__,
+            type(command[0]).__name__ if command else "None",
+        )
+
         # Check if command is using the tuple format (arg, is_path)
-        if command and isinstance(command[0], tuple) and len(command[0]) == 2:
+        if command and isinstance(command[0], tuple) and len(command[0]) == 2:  # type: ignore
+            # type: ignore
             # New format with (arg, is_path) tuples
             logger.debug("Detected tuple format command (arg, is_path)")
-            for i, (arg, is_path) in enumerate(command):
-                logger.debug("Processing arg %d: '%s' (is_path=%s, type=%s)", 
-                            i, arg, is_path, type(arg).__name__)
+            for i, (arg, is_path) in enumerate(command):  # type: ignore
+                logger.debug(
+                    "Processing arg %d: '%s' (is_path=%s, type=%s)",
+                    i,
+                    arg,
+                    is_path,
+                    type(arg).__name__,
+                )
                 if is_path and isinstance(arg, (str, Path)):
                     normalized = self._normalize_path(arg)
                     logger.debug("Normalized path arg %d: %s -> %s", i, arg, normalized)
-                    string_command.append(normalized)
+                    string_command.append(normalized)  # type: ignore
                 else:
                     # Not a path, just append as-is
                     logger.debug("Using non-path arg %d as-is: %s", i, arg)
-                    string_command.append(arg)
-            logger.debug("Processed marked command arguments for remote execution: %s", string_command)
+                    string_command.append(arg)  # type: ignore
+            logger.debug(
+                "Processed marked command arguments for remote execution: %s",
+                string_command,  # type: ignore
+            )
         else:
             # Legacy format - convert any Path objects in the command to strings
             logger.debug("Using legacy command format")
-            for i, arg in enumerate(command):
+            for i, arg in enumerate(command):  # type: ignore
                 if isinstance(arg, (str, Path)):
                     normalized = self._normalize_path(arg)
                     logger.debug("Normalized arg %d: %s -> %s", i, arg, normalized)
-                    string_command.append(normalized)
+                    string_command.append(normalized)  # type: ignore
                 else:
                     logger.debug("Using non-string arg %d as-is: %s", i, arg)
-                    string_command.append(arg)
-            logger.debug("Processed legacy command format for remote execution: %s", string_command)
-        
-        remote_cmd = self._build_remote_command(string_command)
+                    string_command.append(arg)  # type: ignore
+            logger.debug(
+                "Processed legacy command format for remote execution: %s",
+                string_command,  # type: ignore
+            )
+
+        remote_cmd = self._build_remote_command(string_command)  # type: ignore
         logger.debug("Final remote command after build: %s", remote_cmd)
+        needs_tty = False
+        sudo_password = None
+        # Detect if sudo -S is in the command (needs password on stdin)
+        sudo_password = None
+        if any(arg == "-S" for arg in remote_cmd):
+            sudo_password = self._get_sudo_password()
+            if sudo_password:
+                logger.debug("Supplying sudo password via stdin for remote command.")
+                kwargs["input"] = (sudo_password + "\n").encode()
+                # Remove stdin if present, as input and stdin cannot both be set
+                if "stdin" in kwargs:
+                    del kwargs["stdin"]
+            else:
+                logger.warning("No sudo password available but command requires it")
         # Build the SSH command - if using sudo for this command, consider forcing TTY allocation
         needs_tty = False
-        if self.config.get("ssh_sudo", False) and not self.config.get("passwordless", False):
+        cmd_str = " ".join(map(str, remote_cmd))
+        if self.config.get("ssh_sudo", False) and not self.config.get(
+            "passwordless", False
+        ):
             # Check if this is a command that might need TTY for sudo password
-            cmd_str = " ".join(remote_cmd)
             if "sudo" in cmd_str and "-n" not in cmd_str:
                 needs_tty = True
-            
-        ssh_base_cmd = self.ssh_manager._ssh_base_cmd(force_tty=needs_tty)
+
+        ssh_base_cmd = self.ssh_manager.get_ssh_base_cmd(force_tty=needs_tty)  # type: ignore
         logger.debug("SSH base command: %s", ssh_base_cmd)
-        
+
         ssh_cmd = ssh_base_cmd + ["--"] + remote_cmd
         logger.debug("Complete SSH command: %s", ssh_cmd)
 
@@ -282,47 +774,89 @@ class SSHEndpoint(Endpoint):
         # Default timeout if not specified
         if "timeout" not in kwargs:
             kwargs["timeout"] = 30
+            logger.debug("Using default timeout of 30 seconds")
+        else:
+            logger.debug(f"Using specified timeout of {kwargs['timeout']} seconds")
             logger.debug("Set default timeout to 30 seconds")
 
-        cmd_str = " ".join(map(str, ssh_cmd))
-        logger.debug("Executing remote command: %s", cmd_str)
+        ssh_cmd_str = " ".join(map(str, ssh_cmd))
+        logger.debug("Executing remote command: %s", ssh_cmd_str)
         logger.debug("Working directory: %s", os.getcwd())
 
         try:
-            result = subprocess.run(ssh_cmd, **kwargs)
-            exit_code = result.returncode
+            logger.debug("About to execute subprocess.run with command: %s", ssh_cmd)
+            logger.debug(
+                "subprocess.run kwargs: %s",
+                {k: v for k, v in kwargs.items() if k != "input"},
+            )
+            if "input" in kwargs:
+                logger.debug("subprocess.run has input data (password)")
+
+            result = subprocess.run(ssh_cmd, **kwargs)  # type: ignore
+            exit_code = result.returncode  # type: ignore
 
             if exit_code != 0 and kwargs.get("check", False) is False:
                 stderr = (
-                    result.stderr.decode("utf-8", errors="replace")
-                    if hasattr(result, "stderr") and result.stderr
+                    str(result.stderr.decode("utf-8", errors="replace"))  # type: ignore
+                    if hasattr(result, "stderr") and result.stderr  # type: ignore
                     else ""
                 )
                 logger.debug(
                     "Command exited with non-zero code %d: %s\nError: %s",
-                    exit_code,
-                    cmd_str,
-                    stderr,
+                    exit_code,  # type: ignore
+                    ssh_cmd_str,  # type: ignore
+                    stderr,  # type: ignore
                 )
+                details = {
+                    "command": ssh_cmd_str,
+                    "exit_code": exit_code,
+                    "stderr_length": len(stderr) if stderr else 0,
+                    "has_stdout": hasattr(result, "stdout")
+                    and getattr(result, "stdout", None) is not None,
+                }
+                logger.debug("Non-zero exit command details: %s", details)
             elif exit_code == 0:
-                logger.debug("Command executed successfully: %s", cmd_str)
+                logger.debug("Command executed successfully: %s", ssh_cmd_str)  # type: ignore
+                if hasattr(result, "stdout") and getattr(result, "stdout", None):
+                    stdout_data = getattr(result, "stdout", None)
+                    if stdout_data:
+                        stdout_len = (
+                            len(stdout_data)
+                            if isinstance(stdout_data, bytes)
+                            else len(str(stdout_data))
+                        )
+                        logger.debug("Command stdout length: %d bytes", stdout_len)
 
-            logger.debug("Command execution result: exit_code=%d", result.returncode)
-            return result
+            logger.debug("Command execution result: exit_code=%d", result.returncode)  # type: ignore
+            return result  # type: ignore
 
         except subprocess.TimeoutExpired as e:
-            logger.error("Command timed out after %s seconds: %s", e.timeout, cmd_str)
-            logger.error("Timeout occurred in SSH command execution, command was: %s", ssh_cmd)
+            logger.error(
+                "Command timed out after %s seconds: %s", e.timeout, ssh_cmd_str
+            )
+            logger.error(
+                "Timeout occurred in SSH command execution, command was: %s", ssh_cmd
+            )
+            logger.debug(
+                "Timeout exception details: timeout=%s, cmd=%s", e.timeout, e.cmd
+            )
             raise
         except Exception as e:
             logger.error(
-                "Failed to execute remote command: %s\nError: %s", cmd_str, str(e)
+                "Failed to execute remote command: %s\nError: %s", ssh_cmd_str, str(e)
             )
             logger.error("Exception type: %s", type(e).__name__)
             logger.error("Command that failed: %s", ssh_cmd)
+            logger.debug("Full exception details: %s", e, exc_info=True)
+            logger.debug(
+                "SSH command details: host=%s, port=%s, user=%s",
+                self.config.get("hostname", "unknown"),
+                self.config.get("port", 22),
+                self.config.get("username", "unknown"),
+            )
             raise
 
-    def _btrfs_send(self, source: str, stdout_pipe) -> subprocess.Popen:
+    def _btrfs_send(self, source: str, stdout_pipe: Any) -> subprocess.Popen[Any]:
         """Run btrfs send locally and pipe its output."""
         command = ["btrfs", "send", source]
         logger.debug("Preparing to execute btrfs send: %s", command)
@@ -336,69 +870,76 @@ class SSHEndpoint(Endpoint):
             logger.error("Failed to start btrfs send process: %s", e)
             raise
 
-    def _normalize_path(self, path):
-        """Override to handle remote paths properly."""
-        if path is None:
-            return None
-            
-        # If the path is actually a tuple from our new command format, extract just the path part
-        if isinstance(path, tuple) and len(path) == 2:
-            path, is_path = path
-            logger.debug("Tuple format detected in _normalize_path: %s (is_path=%s)", path, is_path)
+    def _normalize_path(self, val: Any) -> str:
+        if val is None:
+            return ""
+        path = val
+        if isinstance(val, tuple) and len(val) == 2:  # type: ignore
+            path, is_path = cast(Tuple[Any, Any], val)
+            logger.debug(
+                f"Tuple format detected in _normalize_path: {str(path)} (is_path={str(is_path)})"
+            )
             if not is_path:
-                # If it's not a path, just return as-is
-                logger.debug("Not a path, returning as-is: %s", path)
-                return path
-        
-        # For SSH paths, we just want to ensure they're strings,
-        # not convert them to Path objects or resolve them locally
+                logger.debug(f"Not a path, returning as-is: {str(path)}")
+                return str(path)  # type: ignore
         if isinstance(path, Path):
             logger.debug("Converting Path object to string: %s", path)
             return str(path)
-            
-        # If it's a string with a tilde, we need special handling
         if isinstance(path, str) and "~" in path:
             logger.debug("Path contains tilde, handling expansion: %s", path)
-            # Check if running as root via sudo
             if os.geteuid() == 0 and os.environ.get("SUDO_USER"):
                 sudo_user = os.environ.get("SUDO_USER")
                 logger.debug("Running as root via sudo user: %s", sudo_user)
-                try:
-                    # Get the sudo user's home directory
-                    if PWD_MODULE_AVAILABLE:
-                        sudo_user_home = pwd.getpwnam(sudo_user).pw_dir
-                        logger.debug("Found sudo user home: %s", sudo_user_home)
-                        # Replace ~ with sudo user's home
-                        if path.startswith("~"):
-                            original_path = path
-                            path = path.replace("~", sudo_user_home, 1)
-                            logger.debug("Expanded ~ in path: %s -> %s", original_path, path)
+                sudo_user_home = None
+                if sudo_user:
+                    sudo_user_home = None
+                    if _pwd_available and _pwd is not None:
+                        try:
+                            sudo_user_home = _pwd.getpwnam(sudo_user).pw_dir
+                            logger.debug("Found sudo user home: %s", sudo_user_home)
+                        except Exception as e:
+                            logger.warning(
+                                "Error getting home directory for sudo user: {}".format(
+                                    e
+                                )
+                            )
+                            # Fall back to default location
+                            sudo_user_home = None
+
+                    # Use fallback if we couldn't get the home directory
+                    if sudo_user_home is None:
+                        sudo_user_home = (
+                            f"/home/{sudo_user}" if sudo_user != "root" else "/root"
+                        )
+                        logger.debug(
+                            "Using fallback home directory: %s", sudo_user_home
+                        )
+                # By this point sudo_user_home should be set if sudo_user was available
+                # This is just a safety check in case something went wrong
+                if sudo_user_home is None and sudo_user:
+                    logger.warning(
+                        "Home directory still not determined, using fallback"
+                    )
+                    if sudo_user == "root":
+                        sudo_user_home = "/root"
                     else:
-                        # Fallback if pwd module is not available
-                        logger.warning("pwd module not available, using fallback for home directory")
-                        if sudo_user == "root":
-                            sudo_user_home = "/root"
-                        else:
-                            sudo_user_home = f"/home/{sudo_user}"
-                        if path.startswith("~"):
-                            original_path = path
-                            path = path.replace("~", sudo_user_home, 1)
-                            logger.debug("Expanded ~ in path (fallback): %s -> %s", original_path, path)
-                except Exception as e:
-                    logger.error("Error expanding ~ in path: %s", e)
+                        sudo_user_home = f"/home/{sudo_user}"
+                if sudo_user_home and path.startswith("~"):
+                    try:
+                        original_path = path
+                        path = path.replace("~", sudo_user_home, 1)
+                        logger.debug(
+                            "Expanded ~ in path: %s -> %s", original_path, path
+                        )
+                    except Exception as e:
+                        logger.error("Error expanding ~ in path: %s", e)
             else:
-                # Normal user, let Path handle it
                 original_path = path
                 path = os.path.expanduser(path)
                 logger.debug("Expanded user path: %s -> %s", original_path, path)
-                
-        result = str(path) if path is not None else None
-        logger.debug("Final normalized path result: %s", result)
-        return result
-        
-    def _verify_btrfs_availability(self, use_sudo=False):
-        """Verify that btrfs command is available on the remote host."""
-        # Check if btrfs is available
+        return str(path) if path is not None else ""  # type: ignore
+
+    def _verify_btrfs_availability(self, use_sudo: bool = False) -> bool:
         try:
             if use_sudo:
                 test_cmd = ["sudo", "-n", "which", "btrfs"]
@@ -406,180 +947,209 @@ class SSHEndpoint(Endpoint):
             else:
                 test_cmd = ["which", "btrfs"]
                 logger.debug("Testing btrfs availability without sudo")
-
             test_result = self._exec_remote_command(
                 test_cmd,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 check=False,
             )
-
             if test_result.returncode != 0:
                 stderr = test_result.stderr.decode("utf-8", errors="replace")
                 logger.error("btrfs command not found on remote host: %s", stderr)
                 return False
-            
             btrfs_path = test_result.stdout.decode("utf-8", errors="replace").strip()
             logger.debug("Found btrfs on remote host: %s", btrfs_path)
             return True
         except Exception as e:
             logger.error("Failed to verify btrfs availability: %s", e)
             return False
-        
-    def _btrfs_receive(self, destination, stdin_pipe):
+
+    def _btrfs_receive(
+        self, destination: str, stdin_pipe: Any
+    ) -> subprocess.Popen[Any]:
         """Run btrfs receive on the remote host."""
         receive_cmd = ["btrfs", "receive", destination]
         logger.debug("Preparing btrfs receive command: %s", receive_cmd)
-        
+
         # If we're testing in this run, we'll disable sudo password prompt
-        passwordless_only = os.environ.get("BTRFS_BACKUP_PASSWORDLESS_ONLY", "0").lower() in ("1", "true", "yes")
+        passwordless_only = os.environ.get(
+            "BTRFS_BACKUP_PASSWORDLESS_ONLY", "0"
+        ).lower() in ("1", "true", "yes")
         if passwordless_only:
-            logger.warning("Running in passwordless-only mode - will not prompt for sudo password")
-        
+            logger.warning(
+                "Running in passwordless-only mode - will not prompt for sudo password"
+            )
+
         # First ensure the destination directory exists and is writable
         destination_dir = os.path.dirname(destination)
         if destination_dir:
             try:
-                logger.debug(f"Ensuring destination directory exists: {destination_dir}")
+                logger.debug(
+                    f"Ensuring destination directory exists: {destination_dir}"
+                )
                 mkdir_cmd = ["mkdir", "-p", destination_dir]
                 result = self._exec_remote_command(mkdir_cmd, check=False)
                 if result.returncode != 0:
-                    logger.warning(f"Could not create destination directory: {destination_dir}")
+                    logger.warning(
+                        f"Could not create destination directory: {destination_dir}"
+                    )
             except Exception as e:
                 logger.warning(f"Error creating destination directory: {e}")
-        
+
         # Test if remote destination directory is writeable without sudo first
         dest_dir = os.path.dirname(destination)
         if dest_dir:
             try:
-                logger.debug(f"Testing if destination directory is directly writeable without sudo: {dest_dir}")
+                logger.debug(
+                    f"Testing if destination directory is directly writeable without sudo: {dest_dir}"
+                )
                 test_cmd = ["touch", f"{dest_dir}/.test_write_access"]
                 rm_cmd = ["rm", "-f", f"{dest_dir}/.test_write_access"]
                 result = self._exec_remote_command(test_cmd, check=False)
                 if result.returncode == 0:
-                    logger.info("Destination directory is directly writeable without sudo!")
+                    logger.info(
+                        "Destination directory is directly writeable without sudo!"
+                    )
                     # Clean up test file
                     self._exec_remote_command(rm_cmd, check=False)
                     # Also check if btrfs command is available without sudo
                     btrfs_cmd = ["btrfs", "--version"]
                     btrfs_result = self._exec_remote_command(btrfs_cmd, check=False)
                     if btrfs_result.returncode == 0:
-                        logger.info("btrfs command is available without sudo - will try direct receive")
+                        logger.info(
+                            "btrfs command is available without sudo - will try direct receive"
+                        )
                         logger.debug("Using direct btrfs receive without sudo")
-                        requires_sudo = False
                     else:
-                        logger.debug("btrfs command requires sudo even though directory is writeable")
+                        logger.debug(
+                            "btrfs command requires sudo even though directory is writeable"
+                        )
                 else:
                     logger.debug("Destination directory requires sudo for writing")
             except Exception as e:
                 logger.debug(f"Error testing direct write access: {e}")
-        
+
         # Force using sudo if ssh_sudo option is enabled, regardless of write access
         if self.config.get("ssh_sudo", False):
-            logger.debug("ssh_sudo option is enabled, forcing use of sudo for receive command")
-            requires_sudo = True
-        
+            logger.debug(
+                "ssh_sudo option is enabled, forcing use of sudo for receive command"
+            )
+            # (No assignment to requires_sudo)
+
         # Modify the receive command with sudo if needed
-        if requires_sudo and not self.config.get("ssh_sudo", False):
-            logger.warning("btrfs commands require sudo on remote host but --ssh-sudo not specified")
-            logger.warning("Consider using --ssh-sudo option to enable sudo on remote host")
-        
+        sudo_enabled = self.config.get("ssh_sudo", False)
+        if sudo_enabled:
+            logger.info(
+                "Using sudo for remote commands - ensure passwordless sudo is configured"
+            )
+        else:
+            logger.warning(
+                "btrfs commands require sudo on remote host but --ssh-sudo not specified"
+            )
+            logger.warning(
+                "Consider using --ssh-sudo option to enable sudo on remote host"
+            )
+
         # Build the remote command with optional sudo
         # For SSH receive, we'll construct a shell command that saves stderr to a log file
         # This helps diagnose issues when the receive process fails silently
-        log_file = f"/tmp/btrfs-receive-{int(time.time())}.log"
-        
+
+        receive_log = f"/tmp/btrfs-receive-{int(time.time())}.log"
+
         if self.config.get("ssh_sudo", False):
             # Use sudo with -E to preserve environment and redirect stderr to log file
-            receive_shell_cmd = f"sudo -E btrfs receive {destination} 2> {log_file}; echo $? > {log_file}.exitcode"
+            receive_shell_cmd = f"sudo -E btrfs receive {destination} 2> {receive_log}; echo $? > {receive_log}.exitcode"
         else:
             # Direct command with stderr redirection
-            receive_shell_cmd = f"btrfs receive {destination} 2> {log_file}; echo $? > {log_file}.exitcode"
-        
+            receive_shell_cmd = f"btrfs receive {destination} 2> {receive_log}; echo $? > {receive_log}.exitcode"
+
         # Log the shell command for debugging
         logger.debug("Built receive shell command: %s", receive_shell_cmd)
-        
+
         # Use -c to execute the command in the shell
         receive_cmd = ["bash", "-c", receive_shell_cmd]
-        
+
         # Determine if we need a TTY for this command (needed if sudo might prompt for password)
         needs_tty = False
         # Always set needs_tty to True if ssh_sudo is enabled, regardless of passwordless setting
         if self.config.get("ssh_sudo", False):
-            logger.debug("SSH sudo enabled - forcing TTY allocation for sudo authentication")
+            logger.debug(
+                "SSH sudo enabled - forcing TTY allocation for sudo authentication"
+            )
             needs_tty = True
         elif not self.config.get("passwordless", False):
             # If using sudo without passwordless, we might need a TTY
             logger.debug("Sudo configuration detected that may require TTY")
             needs_tty = True
-        
+
         # Build the SSH command with appropriate TTY settings
-        ssh_base_cmd = self.ssh_manager._ssh_base_cmd(force_tty=needs_tty)
-        
+        ssh_base_cmd = self.ssh_manager.get_ssh_base_cmd(force_tty=needs_tty)
+
         # Add options to make SSH more resilient to network issues
         # ServerAliveInterval sends a keep-alive packet every N seconds
         # ServerAliveCountMax defines how many missed responses before disconnect
         ssh_options = [
-            "-o", "ServerAliveInterval=5", 
-            "-o", "ServerAliveCountMax=3",
-            "-o", "TCPKeepAlive=yes",
-            "-o", "ConnectTimeout=10",
-            "-o", "ExitOnForwardFailure=yes"
+            "-o",
+            "ServerAliveInterval=5",
+            "-o",
+            "ServerAliveCountMax=3",
+            "-o",
+            "TCPKeepAlive=yes",
+            "-o",
+            "ConnectTimeout=10",
+            "-o",
+            "ExitOnForwardFailure=yes",
         ]
-        
+
         # If we need TTY, ensure related SSH options are set correctly
         if needs_tty:
-            ssh_options.extend([
-                "-o", "RequestTTY=yes",
-                "-o", "BatchMode=no"  # Allow password prompts if necessary
-            ])
+            ssh_options.extend(
+                [
+                    "-o",
+                    "RequestTTY=yes",
+                    "-o",
+                    "BatchMode=no",  # Allow password prompts if necessary
+                ]
+            )
             logger.debug("Adding TTY-related SSH options for sudo authentication")
-        
+
         # Insert options after the SSH command but before any other arguments
         for i, opt in enumerate(ssh_options):
             ssh_base_cmd.insert(i + 1, opt)
-        
+
         ssh_cmd = ssh_base_cmd + ["--"] + receive_cmd
-        
+
         # Log the full command for debugging
         logger.debug("Full SSH btrfs receive command: %s", " ".join(map(str, ssh_cmd)))
-        
+
         try:
             # Start the btrfs receive process
             logger.debug("Starting btrfs receive process")
-                
+
             # Set up the environment for better handling of SSH processes
             env = os.environ.copy()
-            
+
             # Environment setup for SSH authentication
             if needs_tty:
                 # If we're using TTY for sudo, try to make session interactive
                 if "SSH_ASKPASS" in env:
-                    env["SSH_ASKPASS_REQUIRE"] = "force"  # Force using askpass if available
+                    env["SSH_ASKPASS_REQUIRE"] = "force"
                 if "DISPLAY" not in env and os.environ.get("SUDO_USER"):
-                    # Try to get DISPLAY from original user's environment
-                    try:
-                        sudo_user = os.environ.get("SUDO_USER")
+                    sudo_user = os.environ.get("SUDO_USER")
+                    if sudo_user:
                         proc = subprocess.run(
                             ["sudo", "-u", sudo_user, "printenv", "DISPLAY"],
                             capture_output=True,
                             text=True,
-                            check=False
+                            check=False,
                         )
-                        if proc.returncode == 0 and proc.stdout.strip():
+                        if proc.returncode == 0 and proc.stdout and proc.stdout.strip():
                             env["DISPLAY"] = proc.stdout.strip()
-                            logger.debug(f"Set DISPLAY={env['DISPLAY']} from sudo user")
-                    except Exception as e:
-                        logger.debug(f"Could not get DISPLAY from sudo user: {e}")
+                            logger.debug(
+                                f"Set DISPLAY for SSH session: {env['DISPLAY']}"
+                            )
             else:
-                # Not using TTY, ensure non-interactive mode
                 env["SSH_ASKPASS_REQUIRE"] = "never"
-            
-            # Log the complete command for debugging
-            full_cmd_str = " ".join(map(str, ssh_cmd))
-            logger.debug("Full SSH receive command: %s", full_cmd_str)
-            
-            logger.debug("Starting btrfs receive via SSH, sudo=%s", self.config.get("ssh_sudo", False))
             receive_process = subprocess.Popen(
                 ssh_cmd,
                 stdin=stdin_pipe,
@@ -588,743 +1158,556 @@ class SSHEndpoint(Endpoint):
                 bufsize=0,  # Use unbuffered mode for better streaming
                 env=env,
                 text=False,  # Use binary mode for streams
-                start_new_session=True  # Avoid signal propagation issues
+                start_new_session=True,  # Avoid signal propagation issues
             )
-            
-            logger.debug("btrfs receive process started with PID: %d", receive_process.pid)
-            logger.debug("If receive fails, verify remote user has sudo access for btrfs commands")
-            
-            # Store the log file path for later verification
-            self._last_receive_log = log_file
+            logger.debug(
+                "btrfs receive process started with PID: %d", receive_process.pid
+            )
+            logger.debug(
+                "If receive fails, verify remote user has sudo access for btrfs commands"
+            )
+            self._last_receive_log = receive_log
             self._last_transfer_snapshot = True
-            
-            return receive_process
-            logger.debug("Remote log file for this transfer: %s", log_file)
-            
-            # Store the log file path for later verification
-            self._last_receive_log = log_file
-            
             return receive_process
         except Exception as e:
             logger.error("Failed to start btrfs receive process: %s", e)
-            # Check if this is a connection-related error
             if isinstance(e, (BrokenPipeError, ConnectionError, ConnectionResetError)):
-                logger.error("SSH connection error detected. The connection might be broken.")
-                # Re-raise as a more specific exception for better retry handling
+                logger.error(
+                    "SSH connection error detected. The connection might be broken."
+                )
                 raise ConnectionError(f"SSH connection error: {e}")
             raise
 
-    def _listdir(self, location):
-        """List directory contents on remote host."""
-        location = self._normalize_path(location)
-        logger.debug(
-            "SSH _listdir: Listing directory contents of %s on %s",
-            location,
-            self.hostname,
-        )
-
-        cmd = ["ls", "-1a", location]
+    def list_snapshots(self, flush_cache: bool = False) -> List[Any]:
+        """
+        List snapshots (btrfs subvolumes) on the remote host at the configured path.
+        Returns a list of Snapshot objects.
+        """
+        path = self.config["path"]
+        use_sudo = self.config.get("ssh_sudo", False)
+        cmd = ["btrfs", "subvolume", "list", "-o", path]
+        if use_sudo:
+            cmd = ["sudo", "-n"] + cmd  # Try passwordless sudo first
         try:
-            with self.ssh_manager:
-                result = self._exec_remote_command(
-                    cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False
-                )
-
-                if result.returncode != 0:
-                    stderr = (
-                        result.stderr.decode("utf-8", errors="replace")
-                        if hasattr(result, "stderr")
-                        else ""
-                    )
-                    logger.error(
-                        "Failed to list directory %s on %s: %s",
-                        location,
-                        self.hostname,
-                        stderr,
-                    )
-                    return []
-
-                if hasattr(result, "stdout") and result.stdout:
-                    output = result.stdout.decode(
-                        "utf-8", errors="replace"
-                    ).splitlines()
-                    # Filter out '.' and '..' entries
-                    filtered = [
-                        os.path.join(location, item)
-                        for item in output
-                        if item not in (".", "..")
-                    ]
-                    logger.debug("Found %d items in %s", len(filtered), location)
-                    return filtered
-                return []
-        except Exception as e:
-            logger.error(
-                "Error listing directory %s on %s: %s", location, self.hostname, e
+            logger.debug(f"Listing remote snapshots with command: %s", cmd)
+            result = self._exec_remote_command(
+                cmd, check=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE
             )
+            if result.returncode != 0:
+                stderr = (
+                    result.stderr.decode(errors="replace").strip()
+                    if result.stderr
+                    else ""
+                )
+                # Detect sudo password prompt error
+                if use_sudo and (
+                    "a password is required" in stderr or "sudo:" in stderr
+                ):
+                    logger.warning(f"Passwordless sudo failed: {stderr}")
+                    # Try password-based sudo, but do NOT let _build_remote_command add another sudo
+                    cmd_pw = ["sudo", "-S", "btrfs", "subvolume", "list", "-o", path]
+                    logger.info(
+                        "Retrying remote snapshot listing with password-based sudo..."
+                    )
+                    orig_ssh_sudo = self.config.get("ssh_sudo", False)
+                    self.config["ssh_sudo"] = False
+                    try:
+                        result_pw = self._exec_remote_command(
+                            cmd_pw,
+                            check=False,
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE,
+                        )
+                    finally:
+                        self.config["ssh_sudo"] = orig_ssh_sudo
+                    if result_pw.returncode == 0:
+                        output = (
+                            result_pw.stdout.decode(errors="replace")
+                            if result_pw.stdout
+                            else ""
+                        )
+                        snapshots: List[Any] = []
+                        snap_prefix = self.config.get("snap_prefix", "")
+                        for line in output.splitlines():
+                            parts = line.split("path ", 1)
+                            if len(parts) == 2:
+                                snap_path = parts[1].strip()
+                                snap_name = os.path.basename(snap_path)
+                                if snap_name.startswith(snap_prefix):
+                                    date_part = snap_name[len(snap_prefix):]
+                                    try:
+                                        from btrfs_backup_ng import __util__
+                                        time_obj = __util__.str_to_date(date_part)
+                                        snapshot = __util__.Snapshot(
+                                            self.config["path"], snap_prefix, self, time_obj=time_obj
+                                        )
+                                        snapshots.append(snapshot)
+                                    except Exception as e:
+                                        logger.warning(
+                                            "Could not parse date from: %r (%s)", snap_name, e
+                                        )
+                                        continue
+                        logger.warning(
+                            "Passwordless sudo is not available, but password-based sudo succeeded for remote snapshot listing."
+                        )
+                        logger.info(
+                            f"Found {len(snapshots)} remote snapshots at {path}"
+                        )
+                        logger.debug(f"Remote snapshot names: {snapshots}")
+                        return snapshots
+                    else:
+                        stderr_pw = (
+                            result_pw.stderr.decode(errors="replace").strip()
+                            if result_pw.stderr
+                            else ""
+                        )
+                        logger.error(
+                            f"Failed to list remote snapshots with password-based sudo: {stderr_pw}"
+                        )
+                        logger.error(
+                            "Passwordless sudo is not available for the remote user '%s' on host '%s'.",
+                            self.config.get("username"),
+                            self.hostname,
+                        )
+                        logger.error(
+                            "To enable passwordless sudo, add the user to sudoers with NOPASSWD, e.g.:"
+                        )
+                        logger.error(
+                            "    %s ALL=(ALL) NOPASSWD: /usr/bin/btrfs",
+                            self.config.get("username"),
+                        )
+                        logger.error(
+                            "SSH endpoint: %s@%s:%s (ssh_sudo=%s)",
+                            self.config.get("username"),
+                            self.hostname,
+                            path,
+                            use_sudo,
+                        )
+                        self._run_diagnostics(path)
+                        return []
+                else:
+                    logger.warning(f"Failed to list remote snapshots: {stderr}")
+                    return []
+            output = result.stdout.decode(errors="replace") if result.stdout else ""
+            snapshots: List[Any] = []
+            snap_prefix = self.config.get("snap_prefix", "")
+            for line in output.splitlines():
+                parts = line.split("path ", 1)
+                if len(parts) == 2:
+                    snap_path = parts[1].strip()
+                    snap_name = os.path.basename(snap_path)
+                    if snap_name.startswith(snap_prefix):
+                        date_part = snap_name[len(snap_prefix):]
+                        try:
+                            from btrfs_backup_ng import __util__
+                            time_obj = __util__.str_to_date(date_part)
+                            snapshot = __util__.Snapshot(
+                                self.config["path"], snap_prefix, self, time_obj=time_obj
+                            )
+                            snapshots.append(snapshot)
+                        except Exception as e:
+                            logger.warning(
+                                "Could not parse date from: %r (%s)", snap_name, e
+                            )
+                            continue
+            snapshots.sort()
+            logger.info(f"Found {len(snapshots)} remote snapshots at {path}")
+            logger.debug(f"Remote snapshots: {[str(s) for s in snapshots]}")
+            return snapshots
+        except Exception as e:
+            logger.error(f"Exception while listing remote snapshots: {e}")
+            self._run_diagnostics(path)
             return []
 
-    def send_receive(self, source: str, destination: str, max_retries: int = 3) -> None:
-        """Perform btrfs send/receive operation with retry capability."""
-        logger.info(
-            "Starting btrfs send/receive operation from %s to %s", source, destination
-        )
-        logger.debug("Source path: %s", source)
-        logger.debug("Destination path: %s", destination)
-        
-        # Test if destination already exists
-        try:
-            # First check if the destination exists
-            test_cmd = ["test", "-e", destination]
-            result = self._exec_remote_command(test_cmd, check=False)
-            if result.returncode == 0:
-                logger.warning(
-                    "Destination path already exists: %s - this might cause btrfs receive to fail", 
-                    destination
-                )
-                
-                # Also check what type of file it is
-                file_type_cmd = ["stat", "-c", "%F", destination]
-                type_result = self._exec_remote_command(file_type_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
-                if type_result.returncode == 0:
-                    file_type = type_result.stdout.decode(errors="replace").strip()
-                    logger.warning("Existing destination is of type: %s", file_type)
-                    if "directory" in file_type.lower():
-                        logger.error("Destination is a directory - btrfs receive cannot write to a directory!")
-                        logger.error("Make sure the destination path points to a subvolume, not a directory")
-        except Exception as e:
-            logger.warning("Could not check if destination exists: %s", e)
-        
-        retry_count = 0
-        last_exception = None
-        
-        while retry_count <= max_retries:
-            # If this is a retry, log it and wait before trying again
-            if retry_count > 0:
-                logger.info(f"Retry attempt {retry_count}/{max_retries} for send/receive operation")
-                time.sleep(5)  # Wait 5 seconds between retries
-                
-                # Re-establish SSH connection if needed
-                if not self.ssh_manager.is_master_alive():
-                    logger.info("SSH connection lost, attempting to re-establish...")
-                    if not self.ssh_manager.start_master():
-                        logger.error("Failed to re-establish SSH connection")
-                        raise RuntimeError("Failed to re-establish SSH connection after disconnect")
-                    logger.info("SSH connection re-established successfully")
-            
-            send_proc = None
-            recv_proc = None
-                
-            # Establish SSH connection with context manager
-            with self.ssh_manager:
-                try:
-                    # Start the send process
-                    logger.debug("Starting local btrfs send process for %s", source)
-                    send_cmd = ["btrfs", "send", source]
-                    logger.info("Running local command: %s", " ".join(send_cmd))
-                    send_proc = subprocess.Popen(
-                        send_cmd,
-                        stdout=subprocess.PIPE,
-                        stderr=subprocess.PIPE,
-                        bufsize=0,  # Use unbuffered mode for better streaming
-                    )
-                    
-                    # Start the receive process
-                    logger.debug("Starting btrfs receive process on remote host")
-                    
-                    # Check if we're in passwordless-only mode
-                    passwordless_only = os.environ.get("BTRFS_BACKUP_PASSWORDLESS_ONLY", "0").lower() in ("1", "true", "yes")
-                    if passwordless_only:
-                        logger.warning("Running in passwordless-only mode - any sudo password prompt will cause failure")
-                    
-                    # Check for sudo requirements on remote host
-                    if self.config.get("ssh_sudo", False):
-                        logger.info("Verifying sudo access on remote host...")
-                        try:
-                            # First verify sudo access in general
-                            sudo_test = self._exec_remote_command(
-                                ["sudo", "-n", "-v"], 
-                                check=False, 
-                                timeout=10
-                            )
-                                
-                            if sudo_test.returncode != 0:
-                                logger.warning("Passwordless sudo is not available on remote host.")
-                                logger.warning("This will likely cause the transfer to fail if sudo is required.")
-                            else:
-                                logger.info("Passwordless sudo is available on the remote host")
-                                
-                            # Then specifically test btrfs receive with sudo
-                            btrfs_test = self._exec_remote_command(
-                                ["sudo", "-n", "btrfs", "--version"],
-                                check=False,
-                                timeout=10,
-                                stdout=subprocess.PIPE,
-                                stderr=subprocess.PIPE
-                            )
-                                
-                            if btrfs_test.returncode != 0:
-                                logger.warning("Cannot run btrfs commands with passwordless sudo on remote host.")
-                                logger.warning("Transfer will fail if sudo password is required for btrfs commands.")
-                                logger.warning("Add the following to sudoers on remote host to fix this:")
-                                logger.warning("    %sudo ALL=(ALL) NOPASSWD: /usr/bin/btrfs")
-                                # Log the error output to help diagnose the issue
-                                stderr = btrfs_test.stderr.decode(errors="replace").strip()
-                                if stderr:
-                                    logger.warning("Remote sudo error: %s", stderr)
-                            else:
-                                btrfs_version = btrfs_test.stdout.decode(errors="replace").strip()
-                                logger.info("Passwordless sudo for btrfs verified on remote host: %s", btrfs_version)
-                                
-                            # Also check direct write access to destination directory
-                            dest_dir = os.path.dirname(destination)
-                            if dest_dir:
-                                write_test = self._exec_remote_command(
-                                    ["touch", f"{dest_dir}/.test_write_access"],
-                                    check=False,
-                                    timeout=10,
-                                    stderr=subprocess.PIPE
-                                )
-                                if write_test.returncode == 0:
-                                    logger.info("Destination directory is directly writeable without sudo")
-                                    self._exec_remote_command(
-                                        ["rm", "-f", f"{dest_dir}/.test_write_access"],
-                                        check=False
-                                    )
-                                else:
-                                    stderr = write_test.stderr.decode(errors="replace").strip()
-                                    logger.info("Destination directory requires sudo for writing: %s", stderr)
-                            
-                                    # Test if it's writable with sudo
-                                    sudo_write_test = self._exec_remote_command(
-                                        ["sudo", "-n", "touch", f"{dest_dir}/.test_write_access_sudo"],
-                                        check=False,
-                                        timeout=10
-                                    )
-                                    if sudo_write_test.returncode == 0:
-                                        logger.info("Destination directory is writeable with sudo")
-                                        self._exec_remote_command(
-                                            ["sudo", "-n", "rm", "-f", f"{dest_dir}/.test_write_access_sudo"],
-                                            check=False
-                                        )
-                                    else:
-                                        logger.warning("Destination directory is not writeable even with sudo!")
-                            else:
-                                logger.warning("Cannot determine destination directory for write testing")
-                                
-                        except Exception as e:
-                            logger.warning(f"Could not verify sudo access: {e}")
-                        
-                    recv_proc = self._btrfs_receive(destination, send_proc.stdout)
+    def _verify_snapshot_exists(self, dest_path: str, snapshot_name: str) -> bool:
+        """Verify a snapshot exists on the remote host.
 
-                    # Close stdout after passing to receive process to allow proper SIGPIPE
-                    logger.debug(
-                        "Closing send_proc stdout to allow SIGPIPE if recv_proc exits"
-                    )
-                    send_proc.stdout.close()
-                    
-                    # If sudo requires a password and we're using -S flag, 
-                    # it will be read from stdin (which is connected to our pipe)
-                    logger.debug("btrfs receive process started with PID: %d", recv_proc.pid)
-                    
-                    # Log additional debug info about the receive process
-                    logger.debug("Process information: stdin=%s, stdout=%s, stderr=%s", 
-                                recv_proc.stdin, recv_proc.stdout, recv_proc.stderr)
-
-                    # Use select to wait for processes with timeout to detect stalled connections
-                    def wait_with_timeout(proc, timeout=30):
-                        """Wait for process with timeout to detect stalled connections."""
-                        end_time = time.time() + timeout
-                        
-                        # Setup file descriptors to monitor for activity
-                        fds_to_watch: Dict[int, Tuple[Any, str]] = {}
-                        if hasattr(proc, 'stderr') and proc.stderr:
-                            fds_to_watch[proc.stderr.fileno()] = (proc.stderr, 'stderr')
-                        
-                        while proc.poll() is None and time.time() < end_time:
-                            if fds_to_watch:
-                                # Wait for activity on file descriptors or timeout
-                                try:
-                                    ready, _, _ = select.select(fds_to_watch.keys(), [], [], 0.5)
-                                    for fd in ready:
-                                        fd_obj, fd_name = fds_to_watch[fd]
-                                        data = fd_obj.read(1024)
-                                        if not data:  # EOF
-                                            del fds_to_watch[fd]
-                                        else:
-                                            logger.debug(f"Activity on {fd_name}: {data.decode(errors='replace').strip()}")
-                                except (select.error, ValueError, IOError) as e:
-                                    # Handle select errors (including closed file descriptors)
-                                    logger.debug(f"Select error: {e}")
-                                    break
-                            else:
-                                time.sleep(0.1)
-                                
-                        return proc.poll() is not None
-
-                    # Wait for processes to complete with monitoring
-                    logger.debug("Waiting for btrfs send process to complete...")
-                    if not wait_with_timeout(send_proc, timeout=60):  # Increased timeout
-                        logger.warning("btrfs send process appears stalled, checking SSH connection")
-                        if not self.ssh_manager.is_master_alive():
-                            logger.error("SSH connection appears to be broken")
-                            # Try to kill the stuck process before raising error
-                            try:
-                                logger.warning("Terminating stuck send process...")
-                                send_proc.terminate()
-                                time.sleep(0.5)
-                                if send_proc.poll() is None:
-                                    logger.warning("Forcefully killing stuck send process...")
-                                    send_proc.kill()
-                            except Exception as e:
-                                logger.error(f"Error cleaning up send process: {e}")
-                            raise ConnectionError("SSH connection broken during transfer")
-                        else:
-                            logger.warning("SSH connection is alive but transfer appears stalled - continuing to wait")
-                    send_returncode = send_proc.wait()
-                    logger.debug("btrfs send process completed with return code: %d", send_returncode)
-
-                    logger.debug("Waiting for btrfs receive process to complete...")
-                    if not wait_with_timeout(recv_proc, timeout=60):  # Increased timeout
-                        logger.warning("btrfs receive process appears stalled, checking SSH connection")
-                        if not self.ssh_manager.is_master_alive():
-                            logger.error("SSH connection appears to be broken")
-                            # Try to kill the stuck process before raising error
-                            try:
-                                logger.warning("Terminating stuck receive process...")
-                                recv_proc.terminate()
-                                time.sleep(0.5)
-                                if recv_proc.poll() is None:
-                                    logger.warning("Forcefully killing stuck receive process...")
-                                    recv_proc.kill()
-                            except Exception as e:
-                                logger.error(f"Error cleaning up receive process: {e}")
-                            raise ConnectionError("SSH connection broken during receive operation")
-                        else:
-                            logger.warning("SSH connection is alive but receive process appears stalled - continuing to wait")
-                    recv_returncode = recv_proc.wait()
-                    logger.debug("btrfs receive process completed with return code: %d", recv_returncode)
-
-                    # Check for errors and log output
-                    if send_returncode != 0:
-                        send_stderr = send_proc.stderr.read().decode(errors="replace")
-                        logger.error("btrfs send failed with return code %d", send_returncode)
-                        logger.error("btrfs send stderr: %s", send_stderr)
-                        
-                        # Detect specific error conditions
-                        if "Broken pipe" in send_stderr or "Connection reset" in send_stderr:
-                            raise ConnectionError(f"btrfs send failed due to connection issue: {send_stderr}")
-                        elif "not a btrfs subvolume" in send_stderr.lower():
-                            raise ValueError(f"Source path is not a btrfs subvolume: {source}")
-                        elif "failed to open" in send_stderr.lower():
-                            raise FileNotFoundError(f"Failed to open source subvolume: {source}")
-                        else:
-                            raise RuntimeError(f"btrfs send failed: {send_stderr}")
-
-                    if recv_returncode != 0:
-                        recv_stderr = recv_proc.stderr.read().decode(errors="replace")
-                        logger.error("btrfs receive failed with return code %d", recv_returncode)
-                        logger.error("btrfs receive stderr: %s", recv_stderr)
-                        
-                        # Detect specific error conditions
-                        if "Connection closed" in recv_stderr or "broken pipe" in recv_stderr.lower():
-                            raise ConnectionError(f"btrfs receive failed due to connection issue: {recv_stderr}")
-                        elif "sudo" in recv_stderr.lower() and "password" in recv_stderr.lower():
-                            logger.error("=============================================================")
-                            logger.error("SUDO PASSWORD REQUIRED ON REMOTE HOST")
-                            logger.error("This transfer cannot complete because sudo requires a password")
-                            logger.error("To fix this, run the following on the remote host as root:")
-                            logger.error("echo '%sudo ALL=(ALL) NOPASSWD: /usr/bin/btrfs' >> /etc/sudoers.d/btrfs")
-                            logger.error("=============================================================")
-                            raise PermissionError(f"Sudo password required but not provided: {recv_stderr}")
-                        elif "permission denied" in recv_stderr.lower():
-                            logger.error("=============================================================")
-                            logger.error("PERMISSION DENIED ON REMOTE HOST")
-                            logger.error("Make sure the destination path is writable by your SSH user")
-                            logger.error("=============================================================")
-                            raise PermissionError(f"Permission denied on remote host: {recv_stderr}")
-                        elif "not a btrfs" in recv_stderr.lower():
-                            raise ValueError(f"Destination is not on a btrfs filesystem: {destination}")
-                        elif "no space left" in recv_stderr.lower():
-                            raise OSError(f"No space left on remote device: {recv_stderr}")
-                        elif "askpass" in recv_stderr.lower():
-                            logger.error("=============================================================")
-                            logger.error("SUDO ASKPASS PROBLEM DETECTED")
-                            logger.error("This may be related to sudo requiring a password prompt")
-                            logger.error("Try setting up passwordless sudo for btrfs on the remote host")
-                            logger.error("=============================================================")
-                            raise PermissionError(f"Sudo askpass problem: {recv_stderr}")
-                        else:
-                            raise RuntimeError(f"btrfs receive failed: {recv_stderr}")
-                    
-                    # Verify transfer completion
-                    logger.debug("Verifying transfer completion on remote host...")
-                    verify_cmd = self._build_remote_command(["ls", "-l", destination])
-                    verify_proc = self._exec_remote_command(verify_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                    if verify_proc.returncode != 0:
-                        logger.error("Verification failed: %s", verify_proc.stderr.decode(errors="replace"))
-                        raise RuntimeError("Failed to verify transfer on remote host")
-                    logger.debug("Transfer verified successfully on remote host.")
-                    
-                    # If we get here without exceptions, the transfer was successful
-                    logger.info("btrfs send/receive completed successfully")
-                    return
-                    
-                except (ConnectionError, ConnectionResetError, BrokenPipeError, OSError) as e:
-                    # These are network-related errors we can retry
-                    last_exception = e
-                    logger.warning(f"Network error during transfer (attempt {retry_count+1}/{max_retries+1}): {e}")
-                    retry_count += 1
-                    
-                    # Clean up any potentially stuck processes
-                    if send_proc and send_proc.poll() is None:
-                        try:
-                            logger.warning("Terminating stuck send process during retry...")
-                            send_proc.terminate()
-                            time.sleep(0.5)
-                            if send_proc.poll() is None:
-                                logger.warning("Forcefully killing stuck send process during retry...")
-                                send_proc.kill()
-                        except Exception as e:
-                            logger.error(f"Error cleaning up send process during retry: {e}")
-                    
-                    if recv_proc and recv_proc.poll() is None:
-                        try:
-                            logger.warning("Terminating stuck receive process during retry...")
-                            recv_proc.terminate()
-                            time.sleep(0.5)
-                            if recv_proc.poll() is None:
-                                logger.warning("Forcefully killing stuck receive process during retry...")
-                                recv_proc.kill()
-                        except Exception as e:
-                            logger.error(f"Error cleaning up receive process during retry: {e}")
-                    
-                    # Force cleanup of SSH connection to ensure clean slate for retry
-                    self.ssh_manager.stop_master()
-                    continue
-                    
-                except Exception as e:
-                    # Log other exceptions that we won't retry
-                    logger.error(f"Error during transfer: {e}")
-                    raise
-                    
-                finally:
-                    # Ensure proper cleanup of processes
-                    if send_proc:
-                        # Ensure process is terminated before cleaning up
-                        if send_proc.poll() is None:
-                            try:
-                                send_proc.terminate()
-                                time.sleep(0.5)
-                                if send_proc.poll() is None:
-                                    send_proc.kill()
-                            except Exception as e:
-                                logger.debug(f"Error terminating send process: {e}")
-                                
-                        # Close file descriptors
-                        if hasattr(send_proc, "stderr") and send_proc.stderr:
-                            send_proc.stderr.close()
-                    
-                    if recv_proc:
-                        # Ensure process is terminated before cleaning up
-                        if recv_proc.poll() is None:
-                            try:
-                                recv_proc.terminate()
-                                time.sleep(0.5)
-                                if recv_proc.poll() is None:
-                                    recv_proc.kill()
-                            except Exception as e:
-                                logger.debug(f"Error terminating receive process: {e}")
-                                
-                        # Close file descriptors
-                        if hasattr(recv_proc, "stdout") and recv_proc.stdout:
-                            recv_proc.stdout.close()
-                        if hasattr(recv_proc, "stderr") and recv_proc.stderr:
-                            recv_proc.stderr.close()
-        
-        # If we've exhausted all retries, raise the last exception
-        if last_exception:
-            logger.error(f"Failed to complete transfer after {max_retries+1} attempts")
-            raise last_exception
-        
-        logger.info("btrfs send/receive completed successfully")
-        logger.info("Transfer completed successfully")
-        
-        # Verify the transfer was successful by checking for the snapshot on the remote system
-        try:
-            if self.verify_snapshot_transfer(snapshot):
-                logger.info("Snapshot verification successful - snapshot exists on remote host")
-            else:
-                logger.error("SNAPSHOT VERIFICATION FAILED - snapshot NOT found on remote host!")
-                logger.error("This means the transfer appeared to complete but did not create a snapshot")
-                logger.error("Check remote host permissions and filesystem type")
-                # Raise an exception to indicate the failure
-                raise RuntimeError("Snapshot verification failed - snapshot not found on remote host")
-        except Exception as e:
-            logger.error("Error during snapshot verification: %s", e)
-            logger.error("Cannot confirm if snapshot was successfully created on remote host")
-
-    def verify_snapshot_transfer(self, snapshot):
-        """Verify that a snapshot was successfully transferred to the remote host.
-                
         Args:
-            snapshot: The snapshot to verify
-                    
+            dest_path: Remote destination path
+            snapshot_name: Name of the snapshot to verify
+
         Returns:
-            bool: True if the snapshot exists on the remote host, False otherwise
+            True if the snapshot exists, False otherwise
         """
-        if not hasattr(self, '_last_transfer_snapshot') or not self._last_transfer_snapshot:
-            logger.warning("No snapshot to verify - skipping verification")
-            return False
-                    
+        logger.debug(
+            f"Starting snapshot verification for '{snapshot_name}' in '{dest_path}'"
+        )
+        logger.debug(f"SSH sudo enabled: {self.config.get('ssh_sudo', False)}")
+
+        # Try direct subvolume list first
+        list_cmd = ["btrfs", "subvolume", "list", "-o", dest_path]
+        if self.config.get("ssh_sudo", False):
+            list_cmd = ["sudo", "-n"] + list_cmd
+
+        logger.debug(f"Verifying snapshot existence with command: {' '.join(list_cmd)}")
+
         try:
-            # Get the snapshot name
-            snapshot_name = os.path.basename(str(snapshot.get_path()))
-            destination_path = self._normalize_path(self.config["path"])
-                    
-            logger.debug("Verifying snapshot transfer: %s at %s", snapshot_name, destination_path)
-                    
-            # First check the return code from the receive operation if we have a log file
-            if hasattr(self, '_last_receive_log') and self._last_receive_log:
-                exitcode_file = f"{self._last_receive_log}.exitcode"
-                cat_cmd = ["cat", exitcode_file]
-                try:
-                    result = self._exec_remote_command(cat_cmd, check=False, stdout=subprocess.PIPE)
-                    if result.returncode == 0:
-                        exit_code_str = result.stdout.decode('utf-8').strip()
-                        try:
-                            exit_code = int(exit_code_str)
-                            if exit_code != 0:
-                                logger.error("Remote btrfs receive process exited with non-zero code: %d", exit_code)
-                                # Get the log file contents
-                                log_cmd = ["cat", self._last_receive_log]
-                                log_result = self._exec_remote_command(log_cmd, check=False, stdout=subprocess.PIPE)
-                                if log_result.returncode == 0:
-                                    log_content = log_result.stdout.decode('utf-8').strip()
-                                    logger.error("Remote receive log: %s", log_content)
-                                return False
-                        except ValueError:
-                            logger.warning("Invalid exit code in file: %s", exit_code_str)
-                except Exception as e:
-                    logger.warning("Error reading exit code file: %s", e)
-                    
-            # Run btrfs subvolume list to check if the snapshot exists
-            if self.config.get("ssh_sudo", False):
-                list_cmd = ["sudo", "btrfs", "subvolume", "list", "-o", destination_path]
-            else:
-                list_cmd = ["btrfs", "subvolume", "list", "-o", destination_path]
-                        
-            logger.debug("Running remote subvolume list command: %s", list_cmd)
-            result = self._exec_remote_command(
-                list_cmd, 
-                check=False, 
+            logger.debug("Executing subvolume list command...")
+            list_result = self._exec_remote_command(
+                list_cmd,
+                check=False,
                 stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE
+                stderr=subprocess.PIPE,
             )
-                    
-            if result.returncode != 0:
-                stderr = result.stderr.decode('utf-8').strip() if result.stderr else ""
-                logger.error("Failed to list subvolumes on remote host: %s", stderr)
-                        
-                # Try a more direct test - check if the path exists
-                test_cmd = ["test", "-d", f"{destination_path}/{snapshot_name}"]
-                test_result = self._exec_remote_command(test_cmd, check=False)
-                if test_result.returncode == 0:
-                    logger.info("Snapshot directory exists on remote host")
+
+            logger.debug(f"Subvolume list command exit code: {list_result.returncode}")
+            if list_result.returncode != 0:
+                stderr_text = (
+                    list_result.stderr.decode(errors="replace")
+                    if list_result.stderr
+                    else ""
+                )
+                logger.warning(
+                    f"Failed to list subvolumes (exit code {list_result.returncode}): {stderr_text}"
+                )
+                logger.debug("Falling back to simple path check")
+
+                # Fall back to simple path check
+                check_cmd = [
+                    "test",
+                    "-d",
+                    f"{dest_path}/{snapshot_name}",
+                    "&&",
+                    "echo",
+                    "EXISTS",
+                ]
+                logger.debug(f"Fallback verification command: {' '.join(check_cmd)}")
+                check_result = self._exec_remote_command(
+                    check_cmd,
+                    check=False,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                )
+
+                logger.debug(f"Path check exit code: {check_result.returncode}")
+                if check_result.stdout and b"EXISTS" in check_result.stdout:
+                    logger.info(f"Snapshot exists at path: {dest_path}/{snapshot_name}")
+                    logger.debug("Path-based verification successful")
                     return True
                 else:
-                    logger.error("Snapshot directory does not exist on remote host")
+                    logger.error(
+                        f"Snapshot not found at path: {dest_path}/{snapshot_name}"
+                    )
+                    logger.debug(
+                        f"Path check stdout: {check_result.stdout.decode() if check_result.stdout else 'None'}"
+                    )
+                    logger.debug(
+                        f"Path check stderr: {check_result.stderr.decode() if check_result.stderr else 'None'}"
+                    )
                     return False
-                    
-            # Parse the output to look for our snapshot
-            output = result.stdout.decode('utf-8').strip()
-            logger.debug("Remote subvolume list output: %s", output)
-                    
-            # Check if the snapshot name appears in the output
-            if snapshot_name in output:
-                logger.info("Found snapshot in remote subvolume list: %s", snapshot_name)
+
+            # Check if the snapshot name appears in the subvolume list
+            stdout_text = (
+                list_result.stdout.decode(errors="replace")
+                if list_result.stdout
+                else ""
+            )
+            logger.debug(f"Subvolume list output length: {len(stdout_text)} characters")
+            logger.debug(f"Searching for snapshot name '{snapshot_name}' in output")
+
+            if list_result.stdout and snapshot_name in stdout_text:
+                logger.info(f"Snapshot found in subvolume list: {snapshot_name}")
+                logger.debug("Subvolume-based verification successful")
                 return True
             else:
-                logger.error("Snapshot not found in remote subvolume list: %s", snapshot_name)
-                # Try a direct path test as backup
-                test_cmd = ["test", "-d", f"{destination_path}/{snapshot_name}"]
-                test_result = self._exec_remote_command(test_cmd, check=False)
-                return test_result.returncode == 0
-                        
+                logger.error(f"Snapshot not found in subvolume list")
+                logger.debug(f"Subvolume list output: {stdout_text}")
+
+                # Log each line of output for debugging
+                if stdout_text:
+                    lines = stdout_text.splitlines()
+                    logger.debug(f"Subvolume list has {len(lines)} lines:")
+                    for i, line in enumerate(lines[:10]):  # Limit to first 10 lines
+                        logger.debug(f"  Line {i+1}: {line}")
+                    if len(lines) > 10:
+                        logger.debug(f"  ... and {len(lines) - 10} more lines")
+                return False
+
         except Exception as e:
-            logger.error("Error verifying snapshot transfer: %s", e)
+            logger.error(f"Error verifying snapshot: {e}")
+            logger.debug(f"Verification exception details: {e}", exc_info=True)
             return False
 
-    def _prepare(self) -> None:
-        """Prepare the SSH endpoint by ensuring SSH connectivity."""
-        logger.debug("Preparing SSH endpoint for hostname: %s", self.hostname)
-        # Ensure path is a string
-        path = self._normalize_path(self.config["path"])
-        logger.debug("Preparing remote directory: %s", path)
-        
-        # Log detailed SSH connection settings for debugging
-        logger.debug("SSH connection settings:")
-        logger.debug("  Hostname: %s", self.hostname)
-        logger.debug("  Username: %s", self.config.get("username"))
-        logger.debug("  Port: %s", self.config.get("port"))
-        logger.debug("  SSH options: %s", self.config.get("ssh_opts", []))
-        logger.debug("  Identity file: %s", self.config.get("ssh_identity_file"))
-        logger.debug("  SSH sudo enabled: %s", self.config.get("ssh_sudo", False))
-        
-        # Check if running as root via sudo
-        if os.geteuid() == 0 and os.environ.get("SUDO_USER"):
-            sudo_user = os.environ.get("SUDO_USER")
-            logger.debug("Running as root via sudo from user: %s", sudo_user)
-            logger.debug("Effective UID: %s", os.geteuid())
-            logger.debug("Real UID: %s", os.getuid())
-            
-            # Check SSH agent forwarding
-            if "SSH_AUTH_SOCK" in os.environ:
-                logger.debug("SSH_AUTH_SOCK is set: %s", os.environ.get("SSH_AUTH_SOCK"))
-            else:
-                logger.warning("SSH_AUTH_SOCK is not set, agent forwarding won't work")
-                logger.warning("Consider: sudo SSH_AUTH_SOCK=$SSH_AUTH_SOCK btrfs-backup-ng ...")
-        
-        if not self.ssh_manager.start_master(timeout=30.0, retries=3):
-            logger.error("Failed to establish SSH connection to %s", self.hostname)
-            
-            # Provide detailed error information
-            error_msg = f"Cannot establish SSH connection to {self.hostname}"
-            
-            # Check for common issues
-            identity_file = self.config.get("ssh_identity_file")
-            if identity_file:
-                id_path = Path(identity_file)
-                if not id_path.exists():
-                    error_msg += f"\n- Identity file does not exist: {id_path}"
-                elif not os.access(str(id_path), os.R_OK):
-                    error_msg += f"\n- Identity file is not readable: {id_path}"
-                else:
-                    error_msg += f"\n- Using identity file: {id_path}"
-            else:
-                error_msg += "\n- No identity file specified"
-            
-            if os.geteuid() == 0 and os.environ.get("SUDO_USER"):
-                sudo_user = os.environ.get("SUDO_USER")
-                error_msg += f"\n- Running as root via sudo from user {sudo_user}"
-                if not "SSH_AUTH_SOCK" in os.environ:
-                    error_msg += "\n- SSH_AUTH_SOCK is not set, agent forwarding won't work"
-                    error_msg += f"\n  Try: sudo SSH_AUTH_SOCK=$SSH_AUTH_SOCK btrfs-backup-ng ..."
-            
-            raise RuntimeError(error_msg)
-        
-        # If we're using sudo, verify sudo works
-        if self.config.get("ssh_sudo", False):
-            logger.debug("Testing sudo access on remote host")
-            try:
-                test_cmd = ["sudo", "-n", "echo", "sudo test successful"]
-                logger.debug("Testing sudo access with command: %s", test_cmd)
-                result = self._exec_remote_command(test_cmd, check=False)
-                if result.returncode != 0:
-                    stderr = result.stderr.decode("utf-8", errors="replace") if hasattr(result, "stderr") and result.stderr else ""
-                    logger.warning("Remote sudo test failed. Error: %s", stderr)
-                    logger.warning("The remote user may not have passwordless sudo permissions.")
-                    logger.warning("You may need to configure /etc/sudoers on the remote system to allow passwordless sudo for btrfs commands.")
-                    logger.warning("Add this line to /etc/sudoers: %s ALL=(ALL) NOPASSWD: /usr/bin/btrfs", 
-                                  self.config.get("username", "username"))
-                    
-                    # Check for common sudo issues
-                    if "tty" in stderr.lower() or "terminal" in stderr.lower():
-                        logger.warning("Sudo is requiring a terminal. You may need to add 'Defaults:%s !requiretty' to sudoers", 
-                                      self.config.get("username", "username"))
-                    
-                    # Don't fail here as sudo might still work interactively or for specific commands
-                else:
-                    logger.debug("Remote sudo test successful")
-                    
-                # Also test btrfs with sudo specifically
-                btrfs_test_cmd = ["sudo", "-n", "btrfs", "--version"]
-                logger.debug("Testing btrfs with sudo: %s", btrfs_test_cmd)
-                btrfs_result = self._exec_remote_command(btrfs_test_cmd, check=False)
-                if btrfs_result.returncode == 0:
-                    btrfs_version = btrfs_result.stdout.decode("utf-8", errors="replace") if hasattr(btrfs_result, "stdout") and btrfs_result.stdout else ""
-                    logger.debug("Sudo access for btrfs commands verified: %s", btrfs_version.strip())
-                else:
-                    btrfs_stderr = btrfs_result.stderr.decode("utf-8", errors="replace") if hasattr(btrfs_result, "stderr") and btrfs_result.stderr else ""
-                    logger.warning("Sudo access for btrfs failed: %s", btrfs_stderr)
-            except Exception as e:
-                logger.warning("Error testing sudo: %s", e)
-            
-        # Check if the directory exists and create if needed
+    def _find_buffer_program(self) -> Tuple[Optional[str], Optional[str]]:
+        """Find pv program to use for transfer progress display.
+
+        Returns:
+            A tuple of (program_name, command_string) or (None, None) if not found
+        """
+        # Check for pv
+        if self._check_command_exists("pv"):
+            logger.debug("Found pv - using it for transfer progress")
+            return "pv", "pv -q"
+
+        # No buffer program found
+        logger.debug("No buffer program (pv) found - transfers may be less reliable")
+        return None, None
+
+    def _check_command_exists(self, command: str) -> bool:
+        """Check if a command exists in the PATH.
+
+        Args:
+            command: The command to check for
+
+        Returns:
+            True if command exists, False otherwise
+        """
         try:
-            # First check if the path exists
-            logger.debug("Checking if remote path exists: %s", path)
-            check_cmd = ["test", "-d", path]
-            logger.debug("Executing remote command: %s", check_cmd)
-            result = self._exec_remote_command(check_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
-            logger.debug("Remote path check returned: %d", result.returncode)
-            
-            if result.returncode != 0:
-                logger.debug("Remote directory %s does not exist, creating it", path)
-                mkdir_cmd = ["mkdir", "-p", path]
-                create_result = self._exec_remote_command(mkdir_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
-                
-                if create_result.returncode != 0:
-                    stderr = create_result.stderr.decode('utf-8', errors='replace') if hasattr(create_result, 'stderr') else "Unknown error"
-                    logger.error("Failed to create remote directory: %s, Error: %s", path, stderr)
-                    
-                    # If regular mkdir failed and sudo is enabled, try with sudo
-                    if self.config.get("ssh_sudo", False):
-                        logger.debug("Trying to create directory with sudo")
-                        sudo_mkdir_cmd = ["sudo", "mkdir", "-p", path]
-                        sudo_result = self._exec_remote_command(sudo_mkdir_cmd, check=False)
-                        
-                        if sudo_result.returncode != 0:
-                            sudo_stderr = sudo_result.stderr.decode('utf-8', errors='replace') if hasattr(sudo_result, 'stderr') else ""
-                            logger.error("Failed to create directory with sudo: %s", sudo_stderr)
-                            raise RuntimeError(f"Cannot create destination directory {path} even with sudo: {sudo_stderr}")
-                        
-                        # Also set permissions
-                        chmod_cmd = ["sudo", "chmod", "755", path]
-                        self._exec_remote_command(chmod_cmd, check=False)
-                        logger.debug("Created directory with sudo: %s", path)
-                    else:
-                        raise RuntimeError(f"Failed to create remote directory {path}: {stderr}")
-                    
-                # Verify the directory was created
-                verify_cmd = ["test", "-d", path]
-                verify_result = self._exec_remote_command(verify_cmd, check=False)
-                if verify_result.returncode != 0:
-                    logger.error("Directory creation verification failed for %s", path)
-                    raise RuntimeError(f"Directory creation verification failed for {path}")
-                    
-                logger.debug("Remote directory created and verified: %s", path)
+            check_cmd = ["which", command]
+            result = subprocess.run(
+                check_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False
+            )
+            return result.returncode == 0
+        except (subprocess.SubprocessError, FileNotFoundError):
+            return False
+
+    def _try_direct_transfer(
+        self,
+        source_path: str,
+        dest_path: str,
+        snapshot_name: str,
+        parent_path: Optional[str] = None,
+        **kwargs: Any,
+    ) -> bool:
+        """Direct SSH transfer for btrfs-backup-ng, using robust logic and logging."""
+        logger.debug("Entering _try_direct_transfer")
+        logger.debug(f"Source path: {source_path}")
+        logger.debug(f"Destination path: {dest_path}")
+        logger.debug(f"Snapshot name: {snapshot_name}")
+        logger.debug(f"Parent path: {parent_path}")
+        logger.debug(f"SSH sudo: {self.config.get('ssh_sudo', False)}")
+
+        # Check if source path exists
+        if not os.path.exists(source_path):
+            logger.error(f"Source path does not exist: {source_path}")
+            return False
+
+        # Run pre-transfer diagnostics
+        logger.info(f"Testing SSH connectivity and filesystem...")
+        diagnostics = self._run_diagnostics(dest_path)
+        if not all(
+            [
+                diagnostics["ssh_connection"],
+                diagnostics["btrfs_command"],
+                diagnostics["write_permissions"],
+                diagnostics["btrfs_filesystem"],
+            ]
+        ):
+            logger.error("Pre-transfer diagnostics failed")
+            return False
+
+        # Find buffer program for progress display and reliability
+        buffer_name, buffer_cmd = self._find_buffer_program()
+
+        # Build the transfer command
+        if parent_path and os.path.exists(parent_path):
+            logger.info(f"Using incremental transfer with parent: {parent_path}")
+            send_cmd = ["sudo", "btrfs", "send", "-p", parent_path, source_path]
+            logger.debug(f"Incremental send command: {' '.join(send_cmd)}")
+        else:
+            logger.info(f"Using full transfer")
+            send_cmd = ["sudo", "btrfs", "send", source_path]
+            logger.debug(f"Full send command: {' '.join(send_cmd)}")
+
+        receive_cmd = ["btrfs", "receive", dest_path]
+        if self.config.get("ssh_sudo", False):
+            # Add sudo with appropriate flags for receive command
+            passwordless_only = os.environ.get(
+                "BTRFS_BACKUP_PASSWORDLESS_ONLY", "0"
+            ).lower() in ("1", "true", "yes")
+            logger.debug(f"SSH sudo enabled, passwordless_only: {passwordless_only}")
+            if passwordless_only:
+                receive_cmd = ["sudo", "-n", "-E", "-P", "-p", ""] + receive_cmd
             else:
-                logger.debug("Remote directory already exists: %s", path)
-                
-            # Verify we can write to the directory
-            logger.debug("Verifying write permissions for remote directory: %s", path)
-            test_write_cmd = ["touch", f"{path}/.btrfs-backup-ng-write-test"]
-            write_result = self._exec_remote_command(test_write_cmd, check=False)
-            
-            if write_result.returncode != 0:
-                stderr = write_result.stderr.decode('utf-8', errors='replace') if hasattr(write_result, 'stderr') else "Unknown error"
-                logger.warning("Write permission test failed for %s: %s", path, stderr)
-                
-                # If using sudo, try again with sudo
-                if self.config.get("ssh_sudo", False):
-                    logger.debug("Retrying write test with explicit sudo")
-                    sudo_test_cmd = ["sudo", "touch", f"{path}/.btrfs-backup-ng-write-test"]
-                    sudo_result = self._exec_remote_command(sudo_test_cmd, check=False)
-                    if sudo_result.returncode == 0:
-                        logger.debug("Write permission test passed with explicit sudo")
-                        # Clean up test file
-                        self._exec_remote_command(["sudo", "rm", f"{path}/.btrfs-backup-ng-write-test"], check=False)
-                    else:
-                        sudo_stderr = sudo_result.stderr.decode('utf-8', errors='replace') if hasattr(sudo_result, 'stderr') else ""
-                        logger.warning("Write permission test with sudo also failed: %s", sudo_stderr)
-            else:
-                # Clean up test file
-                self._exec_remote_command(
-                    ["rm", f"{path}/.btrfs-backup-ng-write-test"], check=False
+                receive_cmd = ["sudo", "-S", "-E", "-P", "-p", ""] + receive_cmd
+            logger.debug(f"Remote receive command: {' '.join(receive_cmd)}")
+        else:
+            logger.debug(f"SSH sudo disabled, receive command: {' '.join(receive_cmd)}")
+
+        try:
+            # Start local send process
+            logger.info(f"Starting transfer from {source_path}...")
+            logger.debug(f"Executing local send command: {' '.join(send_cmd)}")
+            send_process = subprocess.Popen(
+                send_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0
+            )
+            start_time = time.time()
+            logger.debug(f"Send process started at {start_time}")
+
+            # Pipe through buffer program if available
+            buffer_process = None
+            if buffer_cmd:
+                logger.info(f"Using {buffer_name} to improve transfer reliability")
+                buffer_args = buffer_cmd.split()
+                logger.debug(f"Buffer command: {' '.join(buffer_args)}")
+                buffer_process = subprocess.Popen(
+                    buffer_args,
+                    stdin=send_process.stdout,
+                    stdout=subprocess.PIPE,
+                    bufsize=0,
                 )
-                logger.debug("Write permission test passed for: %s", path)
-                
-            logger.info("Remote directory prepared successfully: %s", path)
+                if send_process.stdout:
+                    send_process.stdout.close()  # Allow send_process to receive SIGPIPE
+                stdin_pipe = buffer_process.stdout
+                logger.debug("Buffer process started and connected to send process")
+            else:
+                stdin_pipe = send_process.stdout
+                logger.debug("No buffer program available, using direct pipe")
+
+            # Start remote receive process
+            if not stdin_pipe:
+                logger.error("No input pipe available for receive process")
+                return False
+
+            logger.debug("Starting remote receive process")
+            receive_process = self._btrfs_receive(dest_path, stdin_pipe)
+            logger.debug("Remote receive process started")
+
+            # Wait for processes to complete
+            logger.debug("Waiting for send process to complete...")
+            send_result = send_process.wait()
+            logger.debug(f"Send process completed with exit code: {send_result}")
+
+            if buffer_process:
+                logger.debug("Waiting for buffer process to complete...")
+                buffer_result = buffer_process.wait()
+                logger.debug(
+                    f"Buffer process completed with exit code: {buffer_result}"
+                )
+
+            logger.debug("Waiting for receive process to complete...")
+            receive_result = receive_process.wait()
+            logger.debug(f"Receive process completed with exit code: {receive_result}")
+
+            elapsed_time = time.time() - start_time
+            logger.debug(f"Total transfer time: {elapsed_time:.2f} seconds")
+
+            # Check send process result
+            if send_result != 0:
+                stderr_text = ""
+                if send_process.stderr:
+                    stderr_text = send_process.stderr.read().decode(errors="replace")
+                logger.error(
+                    f"Send process failed with exit code {send_result}: {stderr_text}"
+                )
+                return False
+
+            # Check receive process result
+            if receive_result != 0:
+                stderr_text = ""
+                if receive_process.stderr:
+                    stderr_text = receive_process.stderr.read().decode(errors="replace")
+                logger.error(
+                    f"Receive process failed with exit code {receive_result}: {stderr_text}"
+                )
+                return False
+
+            logger.info(f"Transfer completed in {elapsed_time:.2f} seconds")
+
+            # Verify the transfer
+            logger.info("Verifying snapshot was created on remote host...")
+            logger.debug(
+                f"Verifying snapshot '{snapshot_name}' exists in '{dest_path}'"
+            )
+            if self._verify_snapshot_exists(dest_path, snapshot_name):
+                logger.info("Transfer verification successful")
+                logger.debug(f"Snapshot '{snapshot_name}' confirmed on remote host")
+                return True
+            else:
+                logger.error(
+                    "Transfer verification failed - snapshot not found on remote host"
+                )
+                logger.debug(f"Snapshot '{snapshot_name}' not found in '{dest_path}'")
+                return False
+
         except Exception as e:
-            logger.error("Error preparing remote directory: %s", e)
-            raise RuntimeError(f"Failed to prepare SSH endpoint: {e}") from e
+            logger.error(f"Error during transfer: {e}")
+            logger.debug(f"Full error details: {e}", exc_info=True)
+            if isinstance(e, (BrokenPipeError, ConnectionError, ConnectionResetError)):
+                logger.error("SSH connection error detected")
+                logger.debug("Connection-related error occurred during transfer")
+            return False
+
+    def send_receive(self, snapshot, parent=None, clones=None, timeout=3600) -> bool:
+        """Perform direct SSH pipe transfer with verification.
+        
+        This method implements a direct SSH pipe for btrfs send/receive operations,
+        providing better reliability and verification than traditional methods.
+        
+        Args:
+            snapshot: The snapshot object to transfer
+            parent: Optional parent snapshot for incremental transfers
+            clones: Optional clones for the transfer (not currently used)
+            timeout: Timeout in seconds for the transfer operation
+            
+        Returns:
+            bool: True if transfer was successful and verified, False otherwise
+        """
+        logger.info("Starting direct SSH pipe transfer for %s", snapshot)
+        
+        # Get snapshot details
+        snapshot_path = str(snapshot.get_path())
+        snapshot_name = snapshot.get_name()
+        dest_path = self.config["path"]
+        
+        logger.debug("Source snapshot path: %s", snapshot_path)
+        logger.debug("Destination path: %s", dest_path)
+        logger.debug("Snapshot name: %s", snapshot_name)
+        
+        # Check if parent is provided for incremental transfers
+        parent_path = None
+        if parent:
+            parent_path = str(parent.get_path())
+            logger.debug("Parent snapshot path: %s", parent_path)
+        
+        # Verify destination path exists and create if needed
+        try:
+            if hasattr(self, "_exec_remote_command"):
+                normalized_path = self._normalize_path(dest_path)
+                logger.debug("Ensuring remote destination path exists: %s", normalized_path)
+                
+                cmd = ["test", "-d", normalized_path]
+                result = self._exec_remote_command(cmd, check=False)
+                if result.returncode != 0:
+                    logger.warning("Destination path doesn't exist, creating it: %s", normalized_path)
+                    mkdir_cmd = ["mkdir", "-p", normalized_path]
+                    mkdir_result = self._exec_remote_command(mkdir_cmd, check=False)
+                    if mkdir_result.returncode != 0:
+                        stderr = mkdir_result.stderr.decode("utf-8", errors="replace") if mkdir_result.stderr else ""
+                        logger.error("Failed to create destination directory: %s", stderr)
+                        return False
+        except Exception as e:
+            logger.error("Error verifying/creating destination: %s", e)
+            return False
+        
+        # Run diagnostics to ensure everything is ready
+        logger.debug("Running pre-transfer diagnostics")
+        diagnostics = self._run_diagnostics(dest_path)
+        if not all([
+            diagnostics["ssh_connection"],
+            diagnostics["btrfs_command"], 
+            diagnostics["write_permissions"],
+            diagnostics["btrfs_filesystem"]
+        ]):
+            logger.error("Pre-transfer diagnostics failed")
+            return False
+        
+        # Use the existing _try_direct_transfer method which has all the logic
+        try:
+            success = self._try_direct_transfer(
+                source_path=snapshot_path,
+                dest_path=dest_path,
+                snapshot_name=snapshot_name,
+                parent_path=parent_path
+            )
+            
+            if success:
+                logger.info("Direct SSH pipe transfer completed successfully")
+                return True
+            else:
+                logger.error("Direct SSH pipe transfer failed")
+                return False
+                
+        except Exception as e:
+            logger.error("Error during direct SSH pipe transfer: %s", e)
+            return False

@@ -8,6 +8,10 @@ Backups can be stored locally and/or remotely (e.g. via SSH).
 Multi-target setups are supported as well as dealing with transmission
 failures (e.g. due to network outage).
 
+> **Important**: The standalone `ssh_transfer.py` module is now deprecated. Its functionality
+> has been integrated directly into the `SSHEndpoint` class for better maintainability and
+> reliability. Please use `SSHEndpoint._try_direct_transfer()` instead.
+
 Its main goals are to be **reliable** and **functional** while
 maintaining **user-friendliness**. It should be easy to get started in
 just a few minutes without detailed knowledge on how btrfs send/receive

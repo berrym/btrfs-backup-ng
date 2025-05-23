@@ -103,17 +103,24 @@ def send_snapshot(snapshot, destination_endpoint, parent=None, clones=None) -> N
                 except Exception as e:
                     logger.error("Error verifying/creating destination: %s", e)
         # For local endpoints, ensure directory exists
-        elif hasattr(destination_endpoint, "config") and "path" in destination_endpoint.config:
+        elif (
+            hasattr(destination_endpoint, "config")
+            and "path" in destination_endpoint.config
+        ):
             path = destination_endpoint.config["path"]
             logger.debug("Ensuring local destination path exists: %s", path)
             try:
                 path_obj = Path(path)
                 if not path_obj.exists():
-                    logger.warning("Local destination path doesn't exist, creating it: %s", path)
+                    logger.warning(
+                        "Local destination path doesn't exist, creating it: %s", path
+                    )
                     path_obj.mkdir(parents=True, exist_ok=True)
             except Exception as e:
                 logger.error("Error creating local destination directory: %s", e)
-                raise __util__.SnapshotTransferError(f"Cannot create local destination directory: {e}")
+                raise __util__.SnapshotTransferError(
+                    f"Cannot create local destination directory: {e}"
+                )
     except Exception as e:
         logger.warning(
             "Error during destination verification (will try transfer anyway): %s", e
@@ -143,7 +150,7 @@ def send_snapshot(snapshot, destination_endpoint, parent=None, clones=None) -> N
             and destination_endpoint._is_remote
         )
         is_using_sudo = False
-            
+
         if is_ssh_endpoint:
             # Ensure the ssh_sudo flag is propagated to the endpoint config
             if options.get("ssh_sudo", False):
@@ -158,245 +165,51 @@ def send_snapshot(snapshot, destination_endpoint, parent=None, clones=None) -> N
                 logger.info("Forcing SSH sudo based on command-line option")
                 destination_endpoint.config["ssh_sudo"] = True
                 is_using_sudo = True
-            
+
             if not is_using_sudo:
                 logger.warning(
                     "Using SSH destination without --ssh-sudo. This may fail if the remote user doesn't have permissions for btrfs commands."
                 )
 
-        # For SSH endpoints, use our dedicated SSH transfer script
-        use_ssh_transfer = is_ssh_endpoint
-        logger.debug("Using dedicated SSH transfer script: %s", use_ssh_transfer)
-        
-        if use_ssh_transfer:
+        # Check if we need to use direct SSH pipe for reliability
+        logger.info("Checking for direct SSH pipe capability...")
+        logger.info("Is SSH endpoint: %s", is_ssh_endpoint)
+        logger.info("Has send_receive method: %s", hasattr(destination_endpoint, 'send_receive'))
+        use_direct_pipe = is_ssh_endpoint and hasattr(destination_endpoint, 'send_receive')
+        logger.info("Using direct SSH pipe: %s", use_direct_pipe)
+
+        if use_direct_pipe:
             try:
-                # Get the snapshot and config details
-                snapshot_path = str(snapshot.get_path())
-                snapshot_name = snapshot.get_name()
-                dest_host = destination_endpoint.hostname
-                dest_path = destination_endpoint.config["path"]
-                dest_user = destination_endpoint.config.get("username", os.getenv("USER"))
-                use_sudo = destination_endpoint.config.get("ssh_sudo", False)
-                identity_file = destination_endpoint.config.get("ssh_identity_file", "")
-                
-                # Parent for incremental transfers
-                parent_path = str(parent.get_path()) if parent else None
-                
-                # Build the destination in user@host:/path format
-                ssh_destination = f"{dest_user}@{dest_host}:{dest_path}"
-                logger.info(f"Using dedicated SSH transfer script from {snapshot_path} to {ssh_destination}")
-                
-                # Find our btrfs-ssh-send script (search in multiple locations)
-                script_name = "btrfs-ssh-send"
-                
-                # Get this file's directory to find relative paths
-                current_dir = os.path.dirname(os.path.abspath(__file__))
-                project_root = os.path.dirname(os.path.dirname(os.path.dirname(current_dir)))
-                
-                # Add all possible locations to search
-                script_paths = [
-                    # System paths
-                    os.path.join("/usr/bin", script_name),
-                    os.path.join("/usr/local/bin", script_name),
-                    os.path.join("/usr/sbin", script_name),
-                    os.path.join("/bin", script_name),
-                    os.path.join("/sbin", script_name),
-                    # Project paths
-                    os.path.join(project_root, script_name),
-                    os.path.join(os.getcwd(), script_name),
-                    os.path.join(os.path.dirname(os.getcwd()), script_name),
-                    # Absolute path from current directory
-                    os.path.abspath(script_name),
-                    # Additional project-related paths
-                    os.path.join(os.path.dirname(project_root), script_name),
-                    os.path.join(project_root, "bin", script_name),
-                ]
-                
-                # Deduplicate paths
-                script_paths = list(set(script_paths))
-                
-                # Debug output of all paths being checked
-                logger.debug(f"Searching for {script_name} in following locations:")
-                for i, path in enumerate(script_paths):
-                    logger.debug(f"  {i+1}. {path}")
-                
-                # Try to find the script
-                script_path = None
-                for path in script_paths:
-                    if os.path.exists(path):
-                        if os.access(path, os.X_OK):
-                            script_path = path
-                            break
-                        else:
-                            logger.debug(f"Found {path} but it's not executable")
-                            # Try to make it executable
-                            try:
-                                os.chmod(path, 0o755)
-                                logger.debug(f"Made {path} executable")
-                                script_path = path
-                                break
-                            except Exception as e:
-                                logger.debug(f"Failed to make {path} executable: {e}")
-                
-                # Check if script was found
-                if script_path:
-                    logger.debug(f"Using SSH transfer script at: {script_path}")
-                else:
-                    # Last resort - create a temporary copy of the embedded script
-                    logger.warning(f"SSH transfer script '{script_name}' not found in standard locations")
-                    try:
-                        # Check if we have the script embedded as a resource
-                        embedded_script_path = os.path.join(os.path.dirname(__file__), "resources", script_name)
-                        if os.path.exists(embedded_script_path):
-                            # Copy to /tmp and make executable
-                            tmp_script_path = os.path.join("/tmp", script_name)
-                            with open(embedded_script_path, "r") as src, open(tmp_script_path, "w") as dst:
-                                dst.write(src.read())
-                            os.chmod(tmp_script_path, 0o755)
-                            script_path = tmp_script_path
-                            logger.info(f"Created temporary script at {tmp_script_path}")
-                        else:
-                            # Try to create a basic version of the script
-                            logger.warning("Embedded script not found, creating a basic version")
-                            basic_script = """#!/bin/bash
-# Basic SSH transfer script for btrfs-backup-ng
-set -e
-echo "Transferring $1 to $2..."
-btrfs send "$1" | ssh $3 "sudo btrfs receive $(echo $2 | cut -d: -f2)"
-"""
-                            tmp_script_path = os.path.join("/tmp", script_name)
-                            with open(tmp_script_path, "w") as f:
-                                f.write(basic_script)
-                            os.chmod(tmp_script_path, 0o755)
-                            script_path = tmp_script_path
-                            logger.info(f"Created basic script at {tmp_script_path}")
-                    except Exception as e:
-                        logger.error(f"Failed to create temporary script: {e}")
-                        logger.error(f"SSH transfer script '{script_name}' not found")
-                        logger.error(f"Searched in: {', '.join(script_paths)}")
-                        raise __util__.SnapshotTransferError("SSH transfer script not found")
-                
-                cmd = [script_path]
-                
-                # Add options
-                if use_sudo:
-                    cmd.append("--sudo")
-                else:
-                    cmd.append("--no-sudo")
-                if identity_file:
-                    cmd.extend(["--identity", identity_file])
-                if parent_path:
-                    cmd.extend(["--parent", parent_path])
-                    # Also pass parent path as an alternate option for compatibility
-                    cmd.extend(["-p", parent_path])
-                
-                # Add verbose flag if requested
-                if options.get("verbosity", "").upper() in ("DEBUG", "TRACE"):
-                    cmd.append("--verbose")
-                
-                # Benefit from btrfs-backup-ng's incremental transfer knowledge
-                if parent:
-                    logger.debug(f"Using incremental transfer with parent snapshot: {parent}")
-                    
-                # Add source and destination
-                cmd.append(snapshot_path)
-                cmd.append(ssh_destination)
-                
-                logger.debug(f"Running SSH transfer script: {' '.join(cmd)}")
-                
-                # Set up environment for consistent execution
-                env = os.environ.copy()
-                
-                # Ensure script directory is in PATH
-                script_dir = os.path.dirname(script_path)
-                if script_dir not in env.get("PATH", ""):
-                    env["PATH"] = f"{script_dir}:{env.get('PATH', '')}"
-                    logger.debug(f"Added {script_dir} to PATH")
-                
-                # Ensure SSH_AUTH_SOCK is preserved if present
-                if "SSH_AUTH_SOCK" in os.environ and "SSH_AUTH_SOCK" not in env:
-                    env["SSH_AUTH_SOCK"] = os.environ["SSH_AUTH_SOCK"]
-                    logger.debug(f"Preserved SSH_AUTH_SOCK: {env['SSH_AUTH_SOCK']}")
-                
-                # Execute the transfer script with expanded environment
-                try:
-                    logger.info(f"Transferring snapshot using external SSH script")
-                    logger.debug(f"Executing: {' '.join(cmd)}")
-                    result = subprocess.run(cmd, capture_output=True, text=True, env=env)
-                except Exception as e:
-                    logger.error(f"Failed to execute SSH transfer script: {e}")
-                    logger.error(f"Script path: {script_path}")
-                    logger.error(f"Command: {' '.join(cmd)}")
-                    if "SSH_AUTH_SOCK" not in env:
-                        logger.error("SSH_AUTH_SOCK not found in environment - authentication may fail")
-                        logger.error("Try running with: sudo SSH_AUTH_SOCK=$SSH_AUTH_SOCK btrfs-backup-ng ...")
-                    raise __util__.SnapshotTransferError(f"SSH transfer script execution failed: {e}")
-                
-                if result.returncode == 0:
-                    logger.info("SSH transfer completed successfully")
-                    # Process stdout for important information
-                    for line in result.stdout.splitlines():
-                        if line.strip():
-                            # Log important lines from script output
-                            if any(marker in line for marker in ["SUCCESS", "INFO", "snapshot verified", "Transfer completed"]):
-                                logger.info(f"Transfer: {line}")
-                            elif "WARNING" in line:
-                                logger.warning(f"Transfer: {line}")
-                            elif "ERROR" in line:
-                                logger.error(f"Transfer: {line}")
-                            elif "DEBUG" in line and options.get("verbosity", "").upper() == "DEBUG":
-                                logger.debug(f"Transfer: {line}")
-                    
-                    # Perform additional verification to ensure transfer worked
-                    logger.debug("Performing verification of successful transfer")
-                    verify_cmd = ["ssh"]
-                    if identity_file:
-                        verify_cmd.extend(["-i", identity_file])
-                    verify_cmd.extend([f"{dest_user}@{dest_host}", f"test -d {dest_path}/{os.path.basename(snapshot_path)} && echo 'VERIFIED' || echo 'NOT_FOUND'"])
-                    
-                    try:
-                        verify_result = subprocess.run(verify_cmd, capture_output=True, text=True)
-                        if verify_result.returncode == 0 and "VERIFIED" in verify_result.stdout:
-                            logger.info("Snapshot successfully verified on remote host")
-                            # Register snapshot in destination endpoint's cache
-                            try:
-                                destination_endpoint.add_snapshot(snapshot)
-                                logger.debug(f"Added snapshot {snapshot} to destination endpoint cache")
-                            except Exception as e:
-                                logger.debug(f"Could not add snapshot to destination cache: {e}")
-                        else:
-                            logger.warning("Verification could not confirm snapshot exists - transfer may have failed")
-                            logger.warning("This could mean either an SSH connectivity issue or the transfer did not complete")
-                    except Exception as e:
-                        logger.warning(f"Could not perform verification: {e}")
-                else:
-                    logger.error(f"SSH transfer failed with exit code {result.returncode}")
-                    for line in result.stderr.splitlines():
-                        if line.strip():
-                            logger.error(f"Transfer error: {line}")
-                    
-                    # Show stdout for debugging even on failure
-                    if options.get("verbosity", "").upper() == "DEBUG":
-                        logger.debug("Transfer output:")
-                        for line in result.stdout.splitlines():
-                            if line.strip():
-                                logger.debug(f"  {line}")
-                    
-                    raise __util__.SnapshotTransferError("SSH transfer script failed - see logs for details")
-                
-                # For direct SSH transfer, we fake the return codes as successful
+                # Use the specialized SSH direct pipe method
+                logger.info("=== USING SSH DIRECT PIPE TRANSFER ===")
+                logger.info("Using SSH direct pipe transfer method for better reliability")
+                success = destination_endpoint.send_receive(
+                    snapshot,
+                    parent=parent,
+                    clones=clones,
+                    timeout=3600  # 1 hour timeout for large transfers
+                )
+                if not success:
+                    raise __util__.SnapshotTransferError("SSH direct pipe transfer failed")
+
+                # For direct pipe, we fake the return codes as successful
                 return_codes = [0, 0]
             except Exception as e:
-                logger.error("Error during SSH transfer: %s", e)
-                logger.error("SSH transfer failed. Check remote host permissions and filesystem type.")
-                logger.error("The remote filesystem MUST be btrfs and user MUST have sudo rights for btrfs commands")
-                raise __util__.SnapshotTransferError(f"SSH transfer failed: {e}")
+                logger.error("Error during SSH direct pipe transfer: %s", e)
+                # Try to get log from endpoint
+                if hasattr(destination_endpoint, "_last_receive_log"):
+                    logger.error("Check remote log file: %s", destination_endpoint._last_receive_log)
+                raise __util__.SnapshotTransferError(f"SSH direct pipe transfer failed: {e}")
         else:
             # Traditional send/receive process approach
+            logger.info("=== USING TRADITIONAL SEND/RECEIVE ===")
+            logger.info("Using traditional send/receive process approach")
             try:
                 receive_process = destination_endpoint.receive(send_process.stdout)
                 if receive_process is None:
-                    logger.error("Failed to start receive process - receive_process is None")
+                    logger.error(
+                        "Failed to start receive process - receive_process is None"
+                    )
                     if is_ssh_endpoint:
                         if not destination_endpoint.config.get("ssh_sudo", False):
                             logger.error(
@@ -405,34 +218,46 @@ btrfs send "$1" | ssh $3 "sudo btrfs receive $(echo $2 | cut -d: -f2)"
                     raise __util__.SnapshotTransferError("Receive process failed to start")
             except Exception as e:
                 logger.error("Failed to start receive process: %s", e)
-                raise __util__.SnapshotTransferError(f"Receive process failed to start: {e}")
+                raise __util__.SnapshotTransferError(
+                    f"Receive process failed to start: {e}"
+                )
 
-            logger.debug("Waiting for processes to complete...")
-            # Set a timeout for the processes to prevent hanging indefinitely
-            timeout_seconds = 3600  # 1 hour timeout for large transfers
-            logger.debug("Waiting for send/receive processes to complete (timeout=%ds)", timeout_seconds)
-            
-            # Wait for send process first
-            try:
-                logger.debug("Waiting for send process to complete...")
-                return_code_send = send_process.wait(timeout=timeout_seconds)
-                logger.debug("Send process completed with return code: %d", return_code_send)
-            except subprocess.TimeoutExpired:
-                logger.error("Timeout waiting for send process to complete")
-                send_process.kill()
-                raise __util__.SnapshotTransferError("Timeout waiting for send process")
-            
-            # Then wait for receive process - it should finish soon after send process
-            try:
-                logger.debug("Waiting for receive process to complete...")
-                return_code_receive = receive_process.wait(timeout=300)  # 5 minute timeout after send completes
-                logger.debug("Receive process completed with return code: %d", return_code_receive)
-            except subprocess.TimeoutExpired:
-                logger.error("Timeout waiting for receive process to complete")
-                receive_process.kill()
-                raise __util__.SnapshotTransferError("Timeout waiting for receive process")
-            
-            return_codes = [return_code_send, return_code_receive]
+        logger.debug("Waiting for processes to complete...")
+        # Set a timeout for the processes to prevent hanging indefinitely
+        timeout_seconds = 3600  # 1 hour timeout for large transfers
+        logger.debug(
+            "Waiting for send/receive processes to complete (timeout=%ds)",
+            timeout_seconds,
+        )
+
+        # Wait for send process first
+        try:
+            logger.debug("Waiting for send process to complete...")
+            return_code_send = send_process.wait(timeout=timeout_seconds)
+            logger.debug(
+                "Send process completed with return code: %d", return_code_send
+            )
+        except subprocess.TimeoutExpired:
+            logger.error("Timeout waiting for send process to complete")
+            send_process.kill()
+            raise __util__.SnapshotTransferError("Timeout waiting for send process")
+
+        # Then wait for receive process - it should finish soon after send process
+        try:
+            logger.debug("Waiting for receive process to complete...")
+            return_code_receive = receive_process.wait(
+                timeout=300
+            )  # 5 minute timeout after send completes
+            logger.debug(
+                "Receive process completed with return code: %d",
+                return_code_receive,
+            )
+        except subprocess.TimeoutExpired:
+            logger.error("Timeout waiting for receive process to complete")
+            receive_process.kill()
+            raise __util__.SnapshotTransferError("Timeout waiting for receive process")
+
+        return_codes = [return_code_send, return_code_receive]
         logger.debug(
             "Process return codes: send=%d, receive=%d",
             return_codes[0],
@@ -563,9 +388,30 @@ def sync_snapshots(
     # )
     clear_locks(source_endpoint, source_snapshots, destination_endpoint.get_id())
 
-    to_transfer = plan_transfers(
-        source_snapshots, destination_snapshots, keep_num_backups
-    )
+    # Debug logging to understand transfer planning
+    logger.info("Source snapshots found: %d", len(source_snapshots))
+    for i, snap in enumerate(source_snapshots):
+        logger.info("  Source[%d]: %s", i, snap)
+    
+    logger.info("Destination snapshots found: %d", len(destination_snapshots))
+    for i, snap in enumerate(destination_snapshots):
+        logger.info("  Destination[%d]: %s", i, snap)
+
+    logger.info("About to call plan_transfers with keep_num_backups=%d", keep_num_backups)
+    logger.info("Source snapshots types: %s", [type(s).__name__ for s in source_snapshots])
+    logger.info("Destination snapshots types: %s", [type(s).__name__ for s in destination_snapshots])
+    
+    try:
+        to_transfer = plan_transfers(
+            source_snapshots, destination_snapshots, keep_num_backups
+        )
+        logger.info("Snapshots planned for transfer: %d", len(to_transfer))
+        for i, snap in enumerate(to_transfer):
+            logger.info("  ToTransfer[%d]: %s", i, snap)
+    except Exception as e:
+        logger.error("Error in plan_transfers: %s", e)
+        logger.error("Exception details:", exc_info=True)
+        raise
 
     if not to_transfer:
         logger.info("No snapshots need to be transferred.")
@@ -626,10 +472,15 @@ def do_sync_transfer(transfer_objs, **kwargs):
             if destination_path:
                 path_obj = Path(destination_path)
                 if not path_obj.exists():
-                    logger.warning("Creating local destination directory: %s", destination_path)
+                    logger.warning(
+                        "Creating local destination directory: %s", destination_path
+                    )
                     path_obj.mkdir(parents=True, exist_ok=True)
                 elif not path_obj.is_dir():
-                    logger.error("Destination exists but is not a directory: %s", destination_path)
+                    logger.error(
+                        "Destination exists but is not a directory: %s",
+                        destination_path,
+                    )
                     raise __util__.AbortError("Destination is not a directory")
     except Exception as e:
         logger.warning(
@@ -686,9 +537,11 @@ def do_sync_transfer(transfer_objs, **kwargs):
             )
             # Ensure destination_endpoint is properly initialized
             if transfer_objs["destination_endpoint"] is None:
-                logger.error("Destination endpoint is None, cannot proceed with transfer")
+                logger.error(
+                    "Destination endpoint is None, cannot proceed with transfer"
+                )
                 raise __util__.AbortError("Invalid destination endpoint for transfer")
-                
+
             send_snapshot(
                 best_snapshot,
                 transfer_objs["destination_endpoint"],
@@ -979,20 +832,24 @@ files is allowed as well."""
     # Process SSH identity file if provided
     if "ssh_identity_file" in options and options["ssh_identity_file"]:
         identity_file = options["ssh_identity_file"]
-        
+
         # Special handling when running as root via sudo
         running_as_sudo = os.geteuid() == 0 and os.environ.get("SUDO_USER")
         if running_as_sudo:
             sudo_user = os.environ.get("SUDO_USER")
             sudo_user_home = pwd.getpwnam(sudo_user).pw_dir
-            logger.debug("Running as sudo from user: %s (home: %s)", sudo_user, sudo_user_home)
-            
+            logger.debug(
+                "Running as sudo from user: %s (home: %s)", sudo_user, sudo_user_home
+            )
+
             # Handle ~ expansion for sudo
             if identity_file.startswith("~"):
                 # Replace ~ with the sudo user's home
                 identity_file = identity_file.replace("~", sudo_user_home, 1)
-                logger.debug("Expanded identity file path for sudo user: %s", identity_file)
-            
+                logger.debug(
+                    "Expanded identity file path for sudo user: %s", identity_file
+                )
+
             # For relative paths that don't start with ~, still ensure they're under the user's home
             elif not os.path.isabs(identity_file):
                 identity_file = os.path.join(sudo_user_home, identity_file)
@@ -1000,17 +857,21 @@ files is allowed as well."""
         else:
             # Normal expansion for regular user
             identity_file = os.path.expanduser(identity_file)
-            
+
         # Convert to absolute path and store
         identity_path = Path(identity_file).absolute()
         options["ssh_identity_file"] = str(identity_path)
-        
+
         # Validate the identity file
         if not identity_path.exists():
             logger.warning("SSH identity file does not exist: %s", identity_path)
             if running_as_sudo:
-                logger.warning("When running with sudo, ensure the path is correct and accessible to root")
-                logger.warning("Try using absolute path: /home/%s/.ssh/your_key", sudo_user)
+                logger.warning(
+                    "When running with sudo, ensure the path is correct and accessible to root"
+                )
+                logger.warning(
+                    "Try using absolute path: /home/%s/.ssh/your_key", sudo_user
+                )
         elif not os.access(identity_path, os.R_OK):
             logger.warning("SSH identity file is not readable: %s", identity_path)
             if running_as_sudo:
@@ -1037,10 +898,10 @@ def run_task(options, queue=None):
         # Ensure options dict has all required keys with defaults
         if "source" not in options or not options["source"]:
             raise __util__.AbortError("No source specified")
-        
+
         # Ensure destination path exists
         options.setdefault("destinations", [])
-        
+
     except Exception as e:
         print(f"Error initializing task options: {e}")
         traceback.print_exc()
@@ -1090,30 +951,43 @@ def run_task(options, queue=None):
     # Wait a moment for any pending operations to complete
     logger.debug("Waiting briefly for any pending operations to complete...")
     time.sleep(1)
-    
+
     # For SSH endpoints, perform one final comprehensive verification
     logger.debug("Performing final verification for SSH endpoints")
     for destination_endpoint in destination_endpoints:
-        if (hasattr(destination_endpoint, "_is_remote") and 
-            getattr(destination_endpoint, "_is_remote", False)):
+        if hasattr(destination_endpoint, "_is_remote") and getattr(
+            destination_endpoint, "_is_remote", False
+        ):
             try:
                 logger.debug(f"Verifying SSH endpoint: {destination_endpoint}")
                 source_snapshots = source_endpoint.list_snapshots()
                 logger.debug(f"Found {len(source_snapshots)} source snapshots")
-                
+
                 # Check for snapshots on destination
                 dest_snapshots = destination_endpoint.list_snapshots(flush_cache=True)
                 logger.debug(f"Found {len(dest_snapshots)} destination snapshots")
-                
+
                 # Calculate successful transfer rate
                 if source_snapshots and dest_snapshots:
-                    transferred = [s for s in source_snapshots if any(d.get_name() == s.get_name() for d in dest_snapshots)]
-                    percent = len(transferred) / len(source_snapshots) * 100 if source_snapshots else 0
-                    logger.info(f"SSH backups: {len(transferred)}/{len(source_snapshots)} snapshots transferred ({percent:.1f}%)")
-                
+                    transferred = [
+                        s
+                        for s in source_snapshots
+                        if any(d.get_name() == s.get_name() for d in dest_snapshots)
+                    ]
+                    percent = (
+                        len(transferred) / len(source_snapshots) * 100
+                        if source_snapshots
+                        else 0
+                    )
+                    logger.info(
+                        f"SSH backups: {len(transferred)}/{len(source_snapshots)} snapshots transferred ({percent:.1f}%)"
+                    )
+
                 # If no snapshots found on destination, log a warning
                 if not dest_snapshots:
-                    logger.warning(f"No snapshots found on SSH destination: {destination_endpoint}")
+                    logger.warning(
+                        f"No snapshots found on SSH destination: {destination_endpoint}"
+                    )
                     logger.warning("SSH transfers may not be working correctly")
             except Exception as e:
                 logger.warning(f"Error during final verification: {e}")
@@ -1261,7 +1135,7 @@ def prepare_destination_endpoints(options, source_endpoint):
     endpoint_kwargs = build_endpoint_kwargs(options)
     # Ensure 'path' is NOT in endpoint_kwargs
     endpoint_kwargs.pop("path", None)
-    
+
     # Ensure SSH sudo flag is propagated - force it to True if specified
     ssh_sudo = options.get("ssh_sudo", False)
     if ssh_sudo:
@@ -1269,15 +1143,19 @@ def prepare_destination_endpoints(options, source_endpoint):
         endpoint_kwargs["ssh_sudo"] = True
         # Force enable in options too, in case it was set in another way
         options["ssh_sudo"] = True
-    
+
     # For SSH transfers, we always force direct pipe and verification on
     endpoint_kwargs["direct_ssh_pipe"] = True
     endpoint_kwargs["verify_transfer"] = True
     options["direct_ssh_pipe"] = True
     options["verify_transfer"] = True
-    
-    logger.debug("SSH sudo in endpoint kwargs: %s", endpoint_kwargs.get("ssh_sudo", False))
-    logger.debug("Direct SSH pipe and verification now forced on for better reliability")
+
+    logger.debug(
+        "SSH sudo in endpoint kwargs: %s", endpoint_kwargs.get("ssh_sudo", False)
+    )
+    logger.debug(
+        "Direct SSH pipe and verification now forced on for better reliability"
+    )
 
     logger.info("Preparing destination endpoints...")
     for destination in options["destinations"]:
@@ -1298,24 +1176,38 @@ def prepare_destination_endpoints(options, source_endpoint):
                 logger.debug(
                     "Endpoint path: %s", destination_endpoint.config.get("path")
                 )
-                
+
                 # Verify and force SSH sudo config if this is an SSH endpoint and --ssh-sudo was specified
-                if hasattr(destination_endpoint, "_is_remote") and destination_endpoint._is_remote:
+                if (
+                    hasattr(destination_endpoint, "_is_remote")
+                    and destination_endpoint._is_remote
+                ):
                     # Check if we need to force ssh_sudo based on command line options
                     if options.get("ssh_sudo", False):
-                        current_ssh_sudo = destination_endpoint.config.get("ssh_sudo", False)
+                        current_ssh_sudo = destination_endpoint.config.get(
+                            "ssh_sudo", False
+                        )
                         logger.debug("SSH sudo setting before: %s", current_ssh_sudo)
                         if not current_ssh_sudo:
-                            logger.warning("SSH sudo flag not properly propagated, forcing to True")
+                            logger.warning(
+                                "SSH sudo flag not properly propagated, forcing to True"
+                            )
                             destination_endpoint.config["ssh_sudo"] = True
                         # Double check it's actually set now
                         if not destination_endpoint.config.get("ssh_sudo", False):
                             destination_endpoint.config["ssh_sudo"] = True
-                            logger.warning("Forcing SSH sudo flag to True for this endpoint")
-                        logger.debug("SSH sudo setting after: %s", destination_endpoint.config.get("ssh_sudo", False))
+                            logger.warning(
+                                "Forcing SSH sudo flag to True for this endpoint"
+                            )
+                        logger.debug(
+                            "SSH sudo setting after: %s",
+                            destination_endpoint.config.get("ssh_sudo", False),
+                        )
                     else:
-                        logger.debug("SSH sudo not enabled in options, current setting: %s",
-                                    destination_endpoint.config.get("ssh_sudo", False))
+                        logger.debug(
+                            "SSH sudo not enabled in options, current setting: %s",
+                            destination_endpoint.config.get("ssh_sudo", False),
+                        )
             except NameError as e:
                 logger.error("NameError in choose_endpoint: %s", e)
                 logger.error("Missing import? %s", str(e))
@@ -1385,26 +1277,30 @@ def build_endpoint_kwargs(options):
         "ssh_sudo": options["ssh_sudo"],
         # DO NOT include 'path' here!
     }
-    
+
     # Include SSH username if specified
     if "ssh_username" in options and options["ssh_username"]:
         kwargs["username"] = options["ssh_username"]
-        logger.info("Using explicitly configured SSH username: %s", options["ssh_username"])
+        logger.info(
+            "Using explicitly configured SSH username: %s", options["ssh_username"]
+        )
 
     # Include SSH identity file if specified
     if "ssh_identity_file" in options and options["ssh_identity_file"]:
         identity_file = options["ssh_identity_file"]
         kwargs["ssh_identity_file"] = identity_file
         logger.info("SSH identity file configured: %s", identity_file)
-        
+
         # When running as sudo, add special options to help with auth
         if os.geteuid() == 0 and os.environ.get("SUDO_USER"):
             # Preserve SSH agent forwarding if available
             ssh_auth_sock = os.environ.get("SSH_AUTH_SOCK")
             if ssh_auth_sock:
                 logger.debug("SSH agent socket found: %s", ssh_auth_sock)
-                kwargs.setdefault("ssh_opts", []).append(f"IdentityAgent={ssh_auth_sock}")
-            
+                kwargs.setdefault("ssh_opts", []).append(
+                    f"IdentityAgent={ssh_auth_sock}"
+                )
+
             # Add debug flag for more verbose SSH output
             if options.get("debug", False):
                 kwargs.setdefault("ssh_opts", []).append("LogLevel=DEBUG")
