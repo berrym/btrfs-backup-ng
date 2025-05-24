@@ -734,8 +734,12 @@ class SSHEndpoint(Endpoint):
                 else:
                     return ["sudo", "-S"] + command
             else:
-                # For other commands, always use passwordless sudo to avoid hanging
-                return ["sudo", "-n"] + command
+                # For other commands, respect the password mode setting
+                logger.debug("Using sudo for other command: %s", command[0])
+                if passwordless_mode:
+                    return ["sudo", "-n"] + command
+                else:
+                    return ["sudo", "-S"] + command
         else:
             logger.debug(
                 "Not using sudo for remote command (ssh_sudo=False): %s", command
@@ -1311,8 +1315,8 @@ echo $? >"{receive_log}.exitcode"
         path = self.config["path"]
         use_sudo = self.config.get("ssh_sudo", False)
         cmd = ["btrfs", "subvolume", "list", "-o", path]
-        if use_sudo:
-            cmd = ["sudo", "-n"] + cmd  # Try passwordless sudo first
+        # Use _build_remote_command to apply proper sudo handling based on password mode
+        cmd = self._build_remote_command(cmd)
         try:
             logger.debug(f"Listing remote snapshots with command: %s", cmd)
             result = self._exec_remote_command(
@@ -1342,12 +1346,16 @@ echo $? >"{receive_log}.exitcode"
                         logger.debug(f"Using original failed result due to no available authentication")
                         result_pw = result  # Use the original failed result
                     else:
-                        # Try password-based sudo, but do NOT let _build_remote_command add another sudo
-                        cmd_pw = ["sudo", "-S", "btrfs", "subvolume", "list", "-o", path]
+                        # Try password-based sudo using _build_remote_command for consistency
+                        cmd_pw = ["btrfs", "subvolume", "list", "-o", path]
+                        # Temporarily force password mode to ensure sudo -S is used
+                        orig_passwordless = self.config.get("passwordless", None)
+                        orig_passwordless_available = self.config.get("passwordless_sudo_available", None)
+                        self.config["passwordless"] = False
+                        self.config["passwordless_sudo_available"] = False
+                        cmd_pw = self._build_remote_command(cmd_pw)
                         logger.debug("Retrying remote snapshot listing with password-based sudo...")
                         logger.debug(f"Using cached sudo password for retry (length: {len(cached_password)})")
-                        orig_ssh_sudo = self.config.get("ssh_sudo", False)
-                        self.config["ssh_sudo"] = False
                         try:
                             result_pw = self._exec_remote_command(
                                 cmd_pw,
@@ -1357,7 +1365,15 @@ echo $? >"{receive_log}.exitcode"
                                 input=cached_password.encode() + b'\n'
                             )
                         finally:
-                            self.config["ssh_sudo"] = orig_ssh_sudo
+                            # Restore original configuration values
+                            if orig_passwordless is not None:
+                                self.config["passwordless"] = orig_passwordless
+                            else:
+                                self.config.pop("passwordless", None)
+                            if orig_passwordless_available is not None:
+                                self.config["passwordless_sudo_available"] = orig_passwordless_available
+                            else:
+                                self.config.pop("passwordless_sudo_available", None)
                     if result_pw.returncode == 0:
                         output = (
                             result_pw.stdout.decode(errors="replace")
@@ -1474,8 +1490,8 @@ echo $? >"{receive_log}.exitcode"
 
         # Try direct subvolume list first
         list_cmd = ["btrfs", "subvolume", "list", "-o", dest_path]
-        if self.config.get("ssh_sudo", False):
-            list_cmd = ["sudo", "-n"] + list_cmd
+        # Use _build_remote_command to apply proper sudo handling based on password mode
+        list_cmd = self._build_remote_command(list_cmd)
 
         logger.info(f"Verifying snapshot existence with command: {' '.join(list_cmd)}")
 
