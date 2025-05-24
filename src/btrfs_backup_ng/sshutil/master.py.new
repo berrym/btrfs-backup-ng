@@ -141,14 +141,3 @@ class SSHMasterManager:
                 self.control_path.unlink()
         except Exception as e:
             logger.error(f"Failed to cleanup socket: {e}")
-            
-    def get_ssh_base_cmd(self, force_tty=False):
-        """Get the base SSH command with all necessary options.
-        
-        Args:
-            force_tty (bool): Whether to force TTY allocation with -tt flag
-            
-        Returns:
-            List[str]: The base SSH command as a list of strings
-        """
-        return self._ssh_base_cmd(force_tty=force_tty)

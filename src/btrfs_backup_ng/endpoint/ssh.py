@@ -20,6 +20,7 @@ Environment variables that affect behavior:
 """
 
 import copy
+import getpass
 import os
 import subprocess
 import time
@@ -28,7 +29,6 @@ from pathlib import Path
 from threading import Lock
 from typing import Optional, List, Any, Dict, Tuple, cast, TypeVar
 from subprocess import CompletedProcess
-import getpass
 
 try:
     import pwd
@@ -114,6 +114,7 @@ class SSHEndpoint(Endpoint):
         logger.debug(
             "SSHEndpoint: Config keys before parent init: %s", list(config.keys())
         )
+        self._cached_sudo_password: Optional[str] = None  # Add this line
 
         # Call parent init with both config and kwargs
         super().__init__(config=self.config, **kwargs)
@@ -687,21 +688,43 @@ class SSHEndpoint(Endpoint):
         return command
 
     def _get_sudo_password(self) -> Optional[str]:
-        # First try environment variable
-        sudo_pw = os.environ.get("BTRFS_BACKUP_SUDO_PASSWORD")
-        if sudo_pw:
-            return sudo_pw
+        logger.debug("Attempting to get sudo password...")
+        if self._cached_sudo_password is not None:
+            # Using info for better visibility during testing
+            logger.info("SSHEndpoint._get_sudo_password: Using cached sudo password.")
+            return self._cached_sudo_password
 
-        # Then try interactive password prompt
+        sudo_pw_env = os.environ.get("BTRFS_BACKUP_SUDO_PASSWORD")
+        if sudo_pw_env:
+            logger.info("SSHEndpoint._get_sudo_password: Using sudo password from BTRFS_BACKUP_SUDO_PASSWORD env var.")
+            self._cached_sudo_password = sudo_pw_env
+            logger.debug("SSHEndpoint._get_sudo_password: Cached sudo password from env var.")
+            return sudo_pw_env
+
+        logger.debug("SSHEndpoint._get_sudo_password: Attempting to prompt for sudo password interactively...")
         try:
-            return getpass.getpass(
-                f"Sudo password for {self.config.get('username', 'remote user')}: "
-            )
+            prompt_message = f"Sudo password for {self.config.get('username', 'remote user')}@{self.hostname}: "
+            # Log before getpass call
+            logger.debug(f"SSHEndpoint._get_sudo_password: About to call getpass.getpass() with prompt: '{prompt_message}'")
+            
+            password = getpass.getpass(prompt_message)
+            
+            # Log after getpass call
+            if password: # Check if any password was entered
+                logger.info("SSHEndpoint._get_sudo_password: Sudo password received from prompt.")
+                # Log length for confirmation, not the password itself
+                logger.debug(f"SSHEndpoint._get_sudo_password: Password of length {len(password)} received. Caching it.")
+                self._cached_sudo_password = password
+                return password
+            else:
+                logger.warning("SSHEndpoint._get_sudo_password: Empty password received from prompt. Not caching. Will return None.")
+                return None # Explicitly return None for empty password
         except Exception as e:
-            logger.warning(f"Error getting sudo password via getpass: {e}")
-            logger.info(
-                "You may need to run this with sudo privileges or ensure terminal supports password input"
-            )
+            logger.error(f"SSHEndpoint._get_sudo_password: Error during interactive sudo password prompt: {type(e).__name__}: {e}")
+            logger.debug("SSHEndpoint._get_sudo_password: Interactive password prompt failed - this is normal when running in non-interactive environments")
+            logger.info("Interactive password prompt not available")
+            logger.info("To provide sudo password non-interactively, set the BTRFS_BACKUP_SUDO_PASSWORD environment variable")
+            logger.info("Alternatively, configure passwordless sudo for btrfs commands on the remote host")
             return None
 
     def _exec_remote_command(
@@ -765,7 +788,9 @@ class SSHEndpoint(Endpoint):
         sudo_password = None
         # Detect if sudo -S is in the command (needs password on stdin)
         sudo_password = None
-        if any(arg == "-S" for arg in remote_cmd):
+        using_sudo_with_stdin = any(arg == "-S" for arg in remote_cmd)
+        
+        if using_sudo_with_stdin:
             sudo_password = self._get_sudo_password()
             if sudo_password:
                 logger.debug("Supplying sudo password via stdin for remote command.")
@@ -775,14 +800,17 @@ class SSHEndpoint(Endpoint):
                     del kwargs["stdin"]
             else:
                 logger.warning("No sudo password available but command requires it")
-        # Build the SSH command - if using sudo for this command, consider forcing TTY allocation
+        
+        # Build the SSH command - determine if TTY allocation is needed
         needs_tty = False
         cmd_str = " ".join(map(str, remote_cmd))
         if self.config.get("ssh_sudo", False) and not self.config.get(
             "passwordless", False
         ):
             # Check if this is a command that might need TTY for sudo password
-            if "sudo" in cmd_str and "-n" not in cmd_str:
+            # BUT: if we're using sudo -S with password via stdin, we DON'T want TTY
+            # as it interferes with the stdin password input
+            if "sudo" in cmd_str and "-n" not in cmd_str and not using_sudo_with_stdin:
                 needs_tty = True
 
         ssh_base_cmd = self.ssh_manager.get_ssh_base_cmd(force_tty=needs_tty)  # type: ignore
@@ -1239,23 +1267,36 @@ echo $? >"{receive_log}.exitcode"
                 if use_sudo and (
                     "a password is required" in stderr or "sudo:" in stderr
                 ):
-                    logger.warning(f"Passwordless sudo failed: {stderr}")
-                    # Try password-based sudo, but do NOT let _build_remote_command add another sudo
-                    cmd_pw = ["sudo", "-S", "btrfs", "subvolume", "list", "-o", path]
-                    logger.info(
-                        "Retrying remote snapshot listing with password-based sudo..."
-                    )
-                    orig_ssh_sudo = self.config.get("ssh_sudo", False)
-                    self.config["ssh_sudo"] = False
-                    try:
-                        result_pw = self._exec_remote_command(
-                            cmd_pw,
-                            check=False,
-                            stdout=subprocess.PIPE,
-                            stderr=subprocess.PIPE,
-                        )
-                    finally:
-                        self.config["ssh_sudo"] = orig_ssh_sudo
+                    logger.debug(f"Passwordless sudo failed, checking for alternative authentication: {stderr}")
+                    
+                    # Check if we have a cached password before attempting retry
+                    cached_password = self._get_sudo_password()
+                    if not cached_password:
+                        logger.warning("Passwordless sudo failed and no alternative authentication available")
+                        logger.info("To resolve this issue:")
+                        logger.info("1. Configure passwordless sudo for btrfs commands on remote host, OR")
+                        logger.info("2. Set BTRFS_BACKUP_SUDO_PASSWORD environment variable, OR") 
+                        logger.info("3. Run in an interactive terminal for password prompting")
+                        # Skip retry and use the original failed result
+                        logger.debug(f"Using original failed result due to no available authentication")
+                        result_pw = result  # Use the original failed result
+                    else:
+                        # Try password-based sudo, but do NOT let _build_remote_command add another sudo
+                        cmd_pw = ["sudo", "-S", "btrfs", "subvolume", "list", "-o", path]
+                        logger.debug("Retrying remote snapshot listing with password-based sudo...")
+                        logger.debug(f"Using cached sudo password for retry (length: {len(cached_password)})")
+                        orig_ssh_sudo = self.config.get("ssh_sudo", False)
+                        self.config["ssh_sudo"] = False
+                        try:
+                            result_pw = self._exec_remote_command(
+                                cmd_pw,
+                                check=False,
+                                stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE,
+                                input=cached_password.encode() + b'\n'
+                            )
+                        finally:
+                            self.config["ssh_sudo"] = orig_ssh_sudo
                     if result_pw.returncode == 0:
                         output = (
                             result_pw.stdout.decode(errors="replace")
