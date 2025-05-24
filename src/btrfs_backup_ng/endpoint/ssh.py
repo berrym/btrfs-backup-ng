@@ -281,6 +281,7 @@ class SSHEndpoint(Endpoint):
             persist="60",
             debug=True,
             identity_file=self.config.get("ssh_identity_file"),
+            allow_password_auth=True,
         )
         logger.debug("SSHMasterManager created successfully")
 
@@ -306,6 +307,24 @@ class SSHEndpoint(Endpoint):
         logger.debug(
             f"[SSHEndpoint.__init__] Final ssh_sudo: {self.config.get('ssh_sudo', False)}"
         )
+        
+        # Try to run initial diagnostics to detect passwordless sudo capability
+        # This will only work if the SSH connection is available, but we don't want
+        # initialization to fail if the remote host is not reachable
+        logger.debug("Attempting to run initial diagnostics for passwordless sudo detection")
+        try:
+            # Try a quick connection test using a simple command
+            result = self._exec_remote_command(["true"], timeout=5, check=False)
+            if result.returncode == 0:
+                logger.debug("SSH connection test successful, running full diagnostics")
+                self._run_diagnostics()
+                logger.debug("Initial diagnostics completed successfully")
+            else:
+                logger.debug("SSH connection test failed, skipping initial diagnostics")
+        except Exception as e:
+            logger.debug("SSH connection not available during initialization, will run diagnostics later: %s", e)
+            # This is normal - diagnostics will run automatically during first transfer
+        
         logger.debug("SSHEndpoint initialization completed")
 
     def __repr__(self) -> str:
@@ -624,6 +643,13 @@ class SSHEndpoint(Endpoint):
                 logger.info(f"The path {path} must be on a btrfs filesystem.")
                 logger.info("btrfs-backup-ng cannot work with other filesystem types.")
 
+        # Store passwordless sudo detection result for automatic use
+        self.config["passwordless_sudo_available"] = results["passwordless_sudo"]
+        if results["passwordless_sudo"]:
+            logger.info("Auto-detected passwordless sudo capability - will use passwordless mode by default")
+        else:
+            logger.debug("Passwordless sudo not available - will require password prompts or manual configuration")
+
         return results
 
     def _show_sudoers_fix_instructions(self) -> None:
@@ -664,41 +690,51 @@ class SSHEndpoint(Endpoint):
             cmd_str: str = " ".join(command)
             logger.debug("Using sudo for remote command: %s", cmd_str)
 
-            passwordless_only = os.environ.get(
+            # Check config setting, environment variable, and auto-detected capability
+            passwordless_config = self.config.get("passwordless", False)
+            passwordless_env = os.environ.get(
                 "BTRFS_BACKUP_PASSWORDLESS_ONLY", "0"
             ).lower() in ("1", "true", "yes")
-            # Always use -n for passwordless attempts if passwordless_only is set
+            
+            # Auto-detect passwordless sudo capability if not explicitly configured
+            passwordless_available = self.config.get("passwordless_sudo_available", False)
+            
+            # Use passwordless mode if explicitly enabled OR if auto-detected as available
+            passwordless_mode = passwordless_config or passwordless_env or passwordless_available
+            
+            if passwordless_mode:
+                if passwordless_config:
+                    logger.debug("Passwordless mode enabled via config - using sudo -n")
+                elif passwordless_env:
+                    logger.debug("Passwordless mode enabled via environment - using sudo -n")
+                else:
+                    logger.debug("Passwordless mode auto-detected - using sudo -n")
+            else:
+                logger.debug("Password mode enabled - using sudo -S (allow password via stdin)")
+            
+            # Always use -n for passwordless attempts if passwordless mode is enabled
             if len(command) > 1 and command[0] == "btrfs" and command[1] == "receive":
-                if passwordless_only:
-                    logger.debug("Using sudo with -n flag (passwordless only mode)")
+                if passwordless_mode:
+                    logger.debug("Using sudo with -n flag (passwordless mode)")
                     return ["sudo", "-n", "-E", "-P", "-p", ""] + command
                 else:
-                    logger.debug(
-                        "Using sudo for btrfs receive command with password support"
-                    )
-                    logger.warning(
-                        "Note: If the remote host requires a sudo password, transfer may fail"
-                    )
-                    logger.warning(
-                        "Consider setting up passwordless sudo for btrfs commands on remote host"
-                    )
+                    logger.debug("Using sudo for btrfs receive command with password support")
                     return ["sudo", "-S", "-E", "-P", "-p", ""] + command
             elif command[0] == "btrfs":
                 logger.debug("Using sudo for regular btrfs command")
-                if passwordless_only:
+                if passwordless_mode:
                     return ["sudo", "-n", "-E"] + command
                 else:
-                    # Try passwordless first, but allow fallback to password mode
                     return ["sudo", "-S", "-E"] + command
             elif command[0] in ["mkdir", "touch", "rm", "test"]:
                 # Directory operations and basic file operations that commonly need sudo privileges
                 logger.debug("Using sudo for directory/file operation: %s", command[0])
-                if passwordless_only:
+                if passwordless_mode:
                     return ["sudo", "-n"] + command
                 else:
-                    # Use password-capable sudo for directory operations
                     return ["sudo", "-S"] + command
             else:
+                # For other commands, always use passwordless sudo to avoid hanging
                 return ["sudo", "-n"] + command
         else:
             logger.debug(
@@ -1127,8 +1163,14 @@ class SSHEndpoint(Endpoint):
         
         # Create an inline script that avoids parsing issues
         if self.config.get("ssh_sudo", False):
+            # Determine sudo flag based on password authentication capability
+            if hasattr(self.ssh_manager, 'allow_password_auth') and self.ssh_manager.allow_password_auth:
+                sudo_flag = "-S"
+            else:
+                sudo_flag = "-n"
+            
             script_content = f'''#!/bin/bash
-sudo -n -E btrfs receive "{destination}" 2>"{receive_log}"
+sudo {sudo_flag} -E btrfs receive "{destination}" 2>"{receive_log}"
 echo $? >"{receive_log}.exitcode"
 '''
         else:
