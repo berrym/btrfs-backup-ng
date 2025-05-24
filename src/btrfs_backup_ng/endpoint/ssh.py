@@ -652,8 +652,15 @@ class SSHEndpoint(Endpoint):
         # Ensure all elements are strings
         command = [str(c) for c in command]
 
-        # Check if the ssh_sudo flag is set
-        if self.config.get("ssh_sudo", False):
+        # Check if the ssh_sudo flag is set and command needs sudo
+        needs_sudo = (
+            self.config.get("ssh_sudo", False) and 
+            command and 
+            (command[0] == "btrfs" or 
+             (command[0] == "test" and len(command) > 2 and "-d" in command))
+        )
+        
+        if needs_sudo:
             cmd_str: str = " ".join(command)
             logger.debug("Using sudo for remote command: %s", cmd_str)
 

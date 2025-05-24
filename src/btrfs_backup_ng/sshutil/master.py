@@ -23,6 +23,7 @@ class SSHMasterManager:
         persist: str = "60",
         debug: bool = False,
         identity_file: Optional[str] = None,
+        allow_password_auth: bool = False,
     ):
         self.hostname = hostname
         self.username = username or getpass.getuser()
@@ -31,6 +32,7 @@ class SSHMasterManager:
         self.persist = persist
         self.debug = debug
         self.identity_file = identity_file
+        self.allow_password_auth = allow_password_auth
         
         self.running_as_sudo = os.environ.get("SUDO_USER") is not None and os.geteuid() == 0
         self.sudo_user = os.environ.get("SUDO_USER")
@@ -64,7 +66,6 @@ class SSHMasterManager:
             f"ControlPath={self.control_path}",
             "ControlMaster=auto", 
             f"ControlPersist={self.persist}",
-            "BatchMode=yes",
             "ServerAliveInterval=5",
             "ServerAliveCountMax=6",
             "TCPKeepAlive=yes",
@@ -73,6 +74,12 @@ class SSHMasterManager:
             "StrictHostKeyChecking=accept-new",
             "PasswordAuthentication=yes"
         ]
+        
+        # Only use BatchMode if password authentication is not needed
+        if not self.allow_password_auth:
+            opts.append("BatchMode=yes")
+        else:
+            opts.append("BatchMode=no")
         
         for opt in opts:
             cmd.extend(["-o", opt])
