@@ -678,7 +678,19 @@ class SSHEndpoint(Endpoint):
                     return ["sudo", "-S", "-E", "-P", "-p", ""] + command
             elif command[0] == "btrfs":
                 logger.debug("Using sudo for regular btrfs command")
-                return ["sudo", "-n", "-E"] + command
+                if passwordless_only:
+                    return ["sudo", "-n", "-E"] + command
+                else:
+                    # Try passwordless first, but allow fallback to password mode
+                    return ["sudo", "-S", "-E"] + command
+            elif command[0] in ["mkdir", "touch", "rm", "test"]:
+                # Directory operations and basic file operations that commonly need sudo privileges
+                logger.debug("Using sudo for directory/file operation: %s", command[0])
+                if passwordless_only:
+                    return ["sudo", "-n"] + command
+                else:
+                    # Use password-capable sudo for directory operations
+                    return ["sudo", "-S"] + command
             else:
                 return ["sudo", "-n"] + command
         else:
