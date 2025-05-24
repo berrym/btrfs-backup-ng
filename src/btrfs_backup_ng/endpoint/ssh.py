@@ -1556,31 +1556,67 @@ echo $? >"{receive_log}.exitcode"
                     )
                     return False
 
-            # Check if the snapshot name appears in the subvolume list
+            # Check if the snapshot appears in the subvolume list
             stdout_text = (
                 list_result.stdout.decode(errors="replace")
                 if list_result.stdout
                 else ""
             )
             logger.debug(f"Subvolume list output length: {len(stdout_text)} characters")
-            logger.debug(f"Searching for snapshot name '{snapshot_name}' in output")
+            logger.debug(f"Searching for snapshot '{snapshot_name}' at path '{dest_path}'")
 
-            if list_result.stdout and snapshot_name in stdout_text:
-                logger.info(f"Snapshot found in subvolume list: {snapshot_name}")
+            # Look for the snapshot in the subvolume list output
+            # The output format is typically: "ID xxx gen xxx top level xxx path <path>"
+            # We need to check if our snapshot path appears in any of these lines
+            snapshot_found = False
+            expected_path = f"{dest_path.rstrip('/')}/{snapshot_name}"
+            
+            if stdout_text:
+                lines = stdout_text.splitlines()
+                logger.debug(f"Subvolume list has {len(lines)} lines:")
+                for i, line in enumerate(lines):
+                    if i < 10:  # Log first 10 lines for debugging
+                        logger.debug(f"  Line {i+1}: {line}")
+                    
+                    # Look for "path" keyword and check if our snapshot path is there
+                    if "path " in line:
+                        # Extract the path part after "path "
+                        path_part = line.split("path ", 1)[-1].strip()
+                        
+                        # Check if this path contains our expected snapshot
+                        # It could be the exact path or a subpath containing our snapshot
+                        if (snapshot_name in path_part and 
+                            (expected_path in path_part or 
+                             path_part.endswith(snapshot_name) or
+                             f"/{snapshot_name}/" in path_part)):
+                            logger.info(f"Snapshot found in subvolume list: {snapshot_name}")
+                            logger.debug(f"  Found in path: {path_part}")
+                            snapshot_found = True
+                            break
+                
+                if len(lines) > 10:
+                    logger.debug(f"  ... and {len(lines) - 10} more lines")
+
+            if snapshot_found:
                 logger.debug("Subvolume-based verification successful")
                 return True
             else:
                 logger.error(f"Snapshot not found in subvolume list")
-                logger.debug(f"Subvolume list output: {stdout_text}")
-
-                # Log each line of output for debugging
-                if stdout_text:
-                    lines = stdout_text.splitlines()
-                    logger.debug(f"Subvolume list has {len(lines)} lines:")
-                    for i, line in enumerate(lines[:10]):  # Limit to first 10 lines
-                        logger.debug(f"  Line {i+1}: {line}")
-                    if len(lines) > 10:
-                        logger.debug(f"  ... and {len(lines) - 10} more lines")
+                logger.debug(f"Expected path: {expected_path}")
+                logger.debug(f"Full subvolume list output:\n{stdout_text}")
+                
+                # Try simple path existence check as fallback
+                logger.debug("Trying simple path existence check as fallback")
+                simple_check_cmd = ["test", "-d", expected_path]
+                simple_result = self._exec_remote_command(
+                    simple_check_cmd, check=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+                )
+                if simple_result.returncode == 0:
+                    logger.info(f"Snapshot exists via path check: {expected_path}")
+                    return True
+                else:
+                    logger.debug(f"Path check also failed for: {expected_path}")
+                
                 return False
 
         except Exception as e:
