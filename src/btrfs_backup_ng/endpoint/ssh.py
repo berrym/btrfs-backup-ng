@@ -1226,6 +1226,143 @@ export SUDO_ASKPASS="$askpass_script"
 
         except Exception as e:
             logger.error("Failed to start integrated btrfs receive process: %s", e)
+            
+            # Check if we should try the fallback method
+            use_fallback = self.config.get("ssh_sudo_fallback", False) or os.environ.get("BTRFS_BACKUP_SUDO_FALLBACK", "").lower() in ("1", "true", "yes")
+            
+            if use_fallback and using_sudo_with_stdin:
+                logger.warning("Primary SUDO_ASKPASS approach failed, attempting sudo -S fallback")
+                try:
+                    return self._btrfs_receive_fallback(destination, stdin_pipe)
+                except Exception as fallback_error:
+                    logger.error("Fallback method also failed: %s", fallback_error)
+                    # Continue to raise original error
+            
+            if isinstance(e, (BrokenPipeError, ConnectionError, ConnectionResetError)):
+                logger.error("SSH connection error detected")
+                raise ConnectionError(f"SSH connection error: {e}")
+            raise
+
+    def _btrfs_receive_fallback(
+        self, destination: str, stdin_pipe: Any
+    ) -> subprocess.Popen[Any]:
+        """Fallback btrfs receive implementation using sudo -S directly with password input."""
+        logger.debug("Using fallback btrfs receive with sudo -S approach for destination: %s", destination)
+
+        # Build the btrfs receive command
+        receive_cmd = ["btrfs", "receive", destination]
+        logger.debug("Base btrfs receive command: %s", receive_cmd)
+
+        # Get the properly constructed remote command (with correct sudo handling)
+        remote_cmd = self._build_remote_command(receive_cmd)
+        logger.debug("Remote command after build: %s", remote_cmd)
+
+        # Check if we need password authentication
+        using_sudo_with_stdin = any(arg == "-S" for arg in remote_cmd)
+        
+        if not using_sudo_with_stdin:
+            logger.debug("No sudo -S detected, falling back to direct command")
+            # Use the standard approach for non-password commands
+            return self._btrfs_receive(destination, stdin_pipe)
+
+        # Get SSH base command configured for password input
+        ssh_base_cmd = self.ssh_manager.get_ssh_base_cmd(force_tty=False)
+
+        # Add SSH options optimized for password input
+        ssh_options = [
+            "-o", "ServerAliveInterval=5",
+            "-o", "ServerAliveCountMax=3", 
+            "-o", "TCPKeepAlive=yes",
+            "-o", "ConnectTimeout=10",
+            "-o", "ExitOnForwardFailure=yes",
+            "-o", "RequestTTY=no",  # Critical: no TTY for password input
+            "-o", "BatchMode=yes",  # Non-interactive mode
+            "-o", "StrictHostKeyChecking=accept-new",  # Accept new host keys
+        ]
+
+        # Insert SSH options
+        for i, opt in enumerate(ssh_options):
+            ssh_base_cmd.insert(i + 1, opt)
+
+        # Get sudo password
+        sudo_password = self._get_sudo_password()
+        if not sudo_password:
+            logger.error("No sudo password available for fallback method")
+            raise ValueError("Sudo password required for fallback btrfs receive")
+
+        # Create a wrapper script that handles password input and data piping
+        password_escaped = sudo_password.replace("'", "'\"'\"'")  # Escape single quotes
+        remote_cmd_str = " ".join(f"'{arg}'" for arg in remote_cmd)
+        
+        # Create a script that:
+        # 1. Starts the sudo command in the background
+        # 2. Sends the password to sudo
+        # 3. Pipes the actual data to btrfs receive
+        wrapper_script = f"""
+set -e
+set -o pipefail
+
+# Create named pipes for coordination
+password_pipe=$(mktemp -u)
+data_pipe=$(mktemp -u)
+mkfifo "$password_pipe" "$data_pipe"
+
+# Cleanup function
+cleanup() {{
+    rm -f "$password_pipe" "$data_pipe" 2>/dev/null || true
+}}
+trap cleanup EXIT
+
+# Start the btrfs receive command with password input
+(
+    # Send password first, then read from data pipe
+    echo '{password_escaped}'
+    cat "$data_pipe"
+) | {remote_cmd_str} &
+
+# Get the PID of the background process
+RECEIVE_PID=$!
+
+# Copy stdin to the data pipe (this will be the btrfs data)
+cat > "$data_pipe" &
+CAT_PID=$!
+
+# Wait for both processes
+wait $CAT_PID
+wait $RECEIVE_PID
+"""
+
+        final_cmd = ssh_base_cmd + ["--", "bash", "-c", wrapper_script]
+
+        logger.info("=== FALLBACK BTRFS RECEIVE DEBUG ===")
+        logger.info("Destination: %s", destination)
+        logger.info("Remote command: %s", remote_cmd)
+        logger.info("Using sudo -S fallback approach")
+        logger.info("Final SSH command: %s", " ".join(map(str, final_cmd[:5])) + "... [script]")
+
+        try:
+            # Set up environment
+            env = os.environ.copy()
+            
+            # Start the fallback btrfs receive process
+            receive_process = subprocess.Popen(
+                final_cmd,
+                stdin=stdin_pipe,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                bufsize=0,  # Unbuffered for real-time streaming
+                env=env,
+                text=False,  # Binary mode for data streams
+                start_new_session=True,  # Avoid signal propagation issues
+            )
+            
+            logger.debug("Fallback btrfs receive process started with PID: %d", receive_process.pid)
+            logger.info("Fallback btrfs receive process started successfully")
+            
+            return receive_process
+
+        except Exception as e:
+            logger.error("Failed to start fallback btrfs receive process: %s", e)
             if isinstance(e, (BrokenPipeError, ConnectionError, ConnectionResetError)):
                 logger.error("SSH connection error detected")
                 raise ConnectionError(f"SSH connection error: {e}")

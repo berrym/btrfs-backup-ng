@@ -1,6 +1,6 @@
 # BTRFS Backup NG - Source Code
 
-This directory contains the source code for the BTRFS Backup NG project.
+This directory contains the source code for the BTRFS Backup NG project, a production-ready BTRFS snapshot backup solution with robust SSH authentication support.
 
 ## Project Structure
 
@@ -11,7 +11,7 @@ This directory contains the source code for the BTRFS Backup NG project.
   - `__util__.py`: Common utility functions
   - `endpoint/`: Endpoint implementations for local and remote operations
     - `local.py`: Local filesystem operations
-    - `ssh.py`: Remote SSH operations
+    - `ssh.py`: Remote SSH operations with enhanced authentication
     - `common.py`: Base endpoint class and shared functionality
     - `shell.py`: Shell command execution
   - `sshutil/`: SSH utilities
@@ -95,6 +95,14 @@ The code is self-documented with docstrings. You can generate documentation usin
 
 ## Technical Implementation Details
 
+### SSH Authentication System
+
+The SSH authentication system implements a robust dual-method approach:
+
+1. **Primary Method - SUDO_ASKPASS**: Uses temporary authentication scripts to avoid stdin conflicts
+2. **Fallback Method - sudo -S**: Direct password input via named pipes when primary method fails
+3. **Automatic Detection**: Detects passwordless sudo availability and adapts accordingly
+
 ### SSH Transfer Process
 
 The SSH transfer functionality works through multiple components:
@@ -102,6 +110,7 @@ The SSH transfer functionality works through multiple components:
 1. **SSHEndpoint Class**: Handles SSH connections and command execution
    - Manages SSH identity files and authentication
    - Implements the BTRFS send/receive protocol over SSH
+   - Provides comprehensive error handling and fallback mechanisms
 
 2. **Master Connection Manager**: Optimizes SSH connections using control sockets
    - Maintains persistent SSH connections for improved performance
@@ -117,9 +126,10 @@ The SSH transfer functionality works through multiple components:
 
 The application carefully manages BTRFS commands:
 - Properly handles path differences between user and root environments
-- Automatically elevates privileges when needed
+- Automatically elevates privileges when needed using multiple authentication methods
 - Uses direct command path resolution to avoid PATH issues
 - Implements comprehensive error handling for BTRFS operations
+- Supports both passwordless and password-based sudo configurations
 
 ## Contributions
 
