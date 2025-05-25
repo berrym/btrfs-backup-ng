@@ -1079,231 +1079,155 @@ class SSHEndpoint(Endpoint):
     def _btrfs_receive(
         self, destination: str, stdin_pipe: Any
     ) -> subprocess.Popen[Any]:
-        """Run btrfs receive on the remote host."""
-        receive_cmd = ["btrfs", "receive", destination]
-        logger.debug("Preparing btrfs receive command: %s", receive_cmd)
-
-        # If we're testing in this run, we'll disable sudo password prompt
-        passwordless_only = os.environ.get(
-            "BTRFS_BACKUP_PASSWORDLESS_ONLY", "0"
-        ).lower() in ("1", "true", "yes")
-        if passwordless_only:
-            logger.warning(
-                "Running in passwordless-only mode - will not prompt for sudo password"
-            )
+        """Run btrfs receive on the remote host using integrated Python approach."""
+        logger.debug("Preparing btrfs receive command for destination: %s", destination)
 
         # First ensure the destination directory exists and is writable
         destination_dir = os.path.dirname(destination)
         if destination_dir:
             try:
-                logger.debug(
-                    f"Ensuring destination directory exists: {destination_dir}"
-                )
+                logger.debug("Ensuring destination directory exists: %s", destination_dir)
                 mkdir_cmd = ["mkdir", "-p", destination_dir]
-                result = self._exec_remote_command(mkdir_cmd, check=False)
+                result = self._exec_remote_command(mkdir_cmd, check=False, timeout=15)
                 if result.returncode != 0:
-                    logger.warning(
-                        f"Could not create destination directory: {destination_dir}"
-                    )
+                    logger.warning("Could not create destination directory: %s", destination_dir)
             except Exception as e:
-                logger.warning(f"Error creating destination directory: {e}")
+                logger.warning("Error creating destination directory: %s", e)
 
-        # Test if remote destination directory is writeable without sudo first
-        dest_dir = os.path.dirname(destination)
-        if dest_dir:
-            try:
-                logger.debug(
-                    f"Testing if destination directory is directly writeable without sudo: {dest_dir}"
-                )
-                test_cmd = ["touch", f"{dest_dir}/.test_write_access"]
-                rm_cmd = ["rm", "-f", f"{dest_dir}/.test_write_access"]
-                result = self._exec_remote_command(test_cmd, check=False)
-                if result.returncode == 0:
-                    logger.info(
-                        "Destination directory is directly writeable without sudo!"
-                    )
-                    # Clean up test file
-                    self._exec_remote_command(rm_cmd, check=False)
-                    # Also check if btrfs command is available without sudo
-                    btrfs_cmd = ["btrfs", "--version"]
-                    btrfs_result = self._exec_remote_command(btrfs_cmd, check=False)
-                    if btrfs_result.returncode == 0:
-                        logger.info(
-                            "btrfs command is available without sudo - will try direct receive"
-                        )
-                        logger.debug("Using direct btrfs receive without sudo")
-                    else:
-                        logger.debug(
-                            "btrfs command requires sudo even though directory is writeable"
-                        )
-                else:
-                    logger.debug("Destination directory requires sudo for writing")
-            except Exception as e:
-                logger.debug(f"Error testing direct write access: {e}")
+        # Build the btrfs receive command - _build_remote_command will handle sudo logic
+        receive_cmd = ["btrfs", "receive", destination]
+        logger.debug("Base btrfs receive command: %s", receive_cmd)
 
-        # Force using sudo if ssh_sudo option is enabled, regardless of write access
-        if self.config.get("ssh_sudo", False):
-            logger.debug(
-                "ssh_sudo option is enabled, forcing use of sudo for receive command"
-            )
-            # (No assignment to requires_sudo)
+        # Get the properly constructed remote command (with correct sudo handling)
+        remote_cmd = self._build_remote_command(receive_cmd)
+        logger.debug("Remote command after build: %s", remote_cmd)
 
-        # Modify the receive command with sudo if needed
-        sudo_enabled = self.config.get("ssh_sudo", False)
-        if sudo_enabled:
-            logger.info(
-                "Using sudo for remote commands - ensure passwordless sudo is configured"
-            )
-        else:
-            logger.warning(
-                "btrfs commands require sudo on remote host but --ssh-sudo not specified"
-            )
-            logger.warning(
-                "Consider using --ssh-sudo option to enable sudo on remote host"
-            )
-
-        # Use inline script approach to avoid all shell parsing issues
-        receive_log = f"/tmp/btrfs-receive-{int(time.time())}.log"
+        # Check if we need password authentication
+        using_sudo_with_stdin = any(arg == "-S" for arg in remote_cmd)
         
-        # Create an inline script that avoids parsing issues
-        if self.config.get("ssh_sudo", False):
-            # Determine sudo flag based on password authentication capability
-            if hasattr(self.ssh_manager, 'allow_password_auth') and self.ssh_manager.allow_password_auth:
-                sudo_flag = "-S"
-            else:
-                sudo_flag = "-n"
-            
-            script_content = f'''#!/bin/bash
-sudo {sudo_flag} -E btrfs receive "{destination}" 2>"{receive_log}"
-echo $? >"{receive_log}.exitcode"
-'''
-        else:
-            script_content = f'''#!/bin/bash
-btrfs receive "{destination}" 2>"{receive_log}"
-echo $? >"{receive_log}.exitcode"
-'''
-
-        # Use bash with here-document to execute the script
-        receive_cmd = ["bash", "-c", script_content]
-
-        # Log the command for debugging
-        logger.info("=== SSH COMMAND CONSTRUCTION DEBUG ===")
-        logger.info("Built script content: %s", script_content.strip())
-        logger.info("SSH command array: %s", receive_cmd)
-        logger.info("Destination path: %s", destination)
-        logger.info("Log file path: %s", receive_log)
-
-        # Determine if we need a TTY for this command (needed if sudo might prompt for password)
+        # Determine TTY requirements
         needs_tty = False
-        # Always set needs_tty to True if ssh_sudo is enabled, regardless of passwordless setting
         if self.config.get("ssh_sudo", False):
-            logger.debug(
-                "SSH sudo enabled - forcing TTY allocation for sudo authentication"
-            )
-            needs_tty = True
-        elif not self.config.get("passwordless", False):
-            # If using sudo without passwordless, we might need a TTY
-            logger.debug("Sudo configuration detected that may require TTY")
-            needs_tty = True
+            # Only need TTY if using sudo without password input via stdin
+            if not using_sudo_with_stdin:
+                needs_tty = True
+                logger.debug("SSH sudo enabled without password input - requiring TTY")
+            else:
+                logger.debug("SSH sudo enabled with password input - TTY not needed")
 
-        # Build the SSH command with appropriate TTY settings
+        # Get SSH base command with appropriate TTY settings
         ssh_base_cmd = self.ssh_manager.get_ssh_base_cmd(force_tty=needs_tty)
 
-        # Add options to make SSH more resilient to network issues
-        # ServerAliveInterval sends a keep-alive packet every N seconds
-        # ServerAliveCountMax defines how many missed responses before disconnect
+        # Add SSH options for reliability and proper authentication
         ssh_options = [
-            "-o",
-            "ServerAliveInterval=5",
-            "-o",
-            "ServerAliveCountMax=3",
-            "-o",
-            "TCPKeepAlive=yes",
-            "-o",
-            "ConnectTimeout=10",
-            "-o",
-            "ExitOnForwardFailure=yes",
+            "-o", "ServerAliveInterval=5",
+            "-o", "ServerAliveCountMax=3", 
+            "-o", "TCPKeepAlive=yes",
+            "-o", "ConnectTimeout=10",
+            "-o", "ExitOnForwardFailure=yes",
         ]
 
-        # If we need TTY, ensure related SSH options are set correctly
+        # Configure TTY and authentication options
         if needs_tty:
-            ssh_options.extend(
-                [
-                    "-o",
-                    "RequestTTY=yes",
-                    "-o",
-                    "BatchMode=no",  # Allow password prompts if necessary
-                ]
-            )
-            logger.debug("Adding TTY-related SSH options for sudo authentication")
+            ssh_options.extend([
+                "-o", "RequestTTY=yes",
+                "-o", "BatchMode=no",  # Allow interactive prompts
+            ])
+            logger.debug("Adding TTY-related SSH options for interactive sudo")
+        else:
+            # When using password via stdin, ensure no TTY conflicts
+            ssh_options.extend([
+                "-o", "RequestTTY=no", 
+                "-o", "BatchMode=yes",  # Non-interactive mode
+            ])
+            logger.debug("Using non-interactive SSH mode for password input")
 
-        # Insert options after the SSH command but before any other arguments
+        # Insert SSH options
         for i, opt in enumerate(ssh_options):
             ssh_base_cmd.insert(i + 1, opt)
 
-        ssh_cmd = ssh_base_cmd + ["--"] + receive_cmd
+        # For password authentication, we need to handle it specially
+        if using_sudo_with_stdin:
+            sudo_password = self._get_sudo_password()
+            if sudo_password:
+                # Use SUDO_ASKPASS approach to completely avoid stdin conflicts
+                # This creates a temporary script that returns the password when called
+                import shlex
+                escaped_password = shlex.quote(sudo_password)
+                
+                # Modify the command to use sudo -A instead of sudo -S
+                modified_cmd = []
+                for arg in remote_cmd:
+                    if arg == "sudo" and len(modified_cmd) > 0 and remote_cmd[remote_cmd.index(arg) + 1] == "-S":
+                        # Replace 'sudo -S' with 'sudo -A'
+                        modified_cmd.append("sudo")
+                        # Skip the -S flag
+                        continue
+                    elif arg == "-S" and len(modified_cmd) > 0 and modified_cmd[-1] == "sudo":
+                        # Skip the -S flag, add -A instead
+                        modified_cmd.append("-A")
+                    else:
+                        modified_cmd.append(arg)
+                
+                # Create the askpass script and run the command
+                escaped_modified_cmd = " ".join(shlex.quote(arg) for arg in modified_cmd)
+                askpass_script = f"""
+set -e
+# Create temporary askpass script
+askpass_script=$(mktemp)
+trap 'rm -f "$askpass_script"' EXIT
+cat > "$askpass_script" << 'EOF'
+#!/bin/bash
+echo -e {escaped_password}
+EOF
+chmod +x "$askpass_script"
+export SUDO_ASKPASS="$askpass_script"
+{escaped_modified_cmd}
+"""
+                final_cmd = ssh_base_cmd + ["--", "bash", "-c", askpass_script]
+                logger.debug("Using SUDO_ASKPASS approach for password authentication")
+            else:
+                logger.warning("No sudo password available but command requires it")
+                logger.info("Consider setting BTRFS_BACKUP_SUDO_PASSWORD environment variable")
+                logger.info("or configuring passwordless sudo for btrfs commands")
+                # Fall back to direct command (will likely fail)
+                final_cmd = ssh_base_cmd + ["--"] + remote_cmd
+        else:
+            # No password needed, use direct command
+            final_cmd = ssh_base_cmd + ["--"] + remote_cmd
 
-        # Log the full command for debugging
-        logger.info("=== FINAL SSH COMMAND DEBUG ===")
-        logger.info("SSH base command: %s", ssh_base_cmd)
-        logger.info("Receive command: %s", receive_cmd)
-        logger.info("Full SSH command: %s", ssh_cmd)
-        logger.info("Full SSH command as string: %s", " ".join(map(str, ssh_cmd)))
+        logger.info("=== INTEGRATED BTRFS RECEIVE DEBUG ===")
+        logger.info("Destination: %s", destination)
+        logger.info("Remote command: %s", remote_cmd)
+        logger.info("Using sudo with password input: %s", using_sudo_with_stdin)
+        logger.info("Needs TTY: %s", needs_tty)
+        logger.info("Final SSH command: %s", " ".join(map(str, final_cmd)))
 
         try:
-            # Start the btrfs receive process
-            logger.debug("Starting btrfs receive process")
-
-            # Set up the environment for better handling of SSH processes
+            # Set up environment
             env = os.environ.copy()
-
-            # Environment setup for SSH authentication
-            if needs_tty:
-                # If we're using TTY for sudo, try to make session interactive
-                if "SSH_ASKPASS" in env:
-                    env["SSH_ASKPASS_REQUIRE"] = "force"
-                if "DISPLAY" not in env and os.environ.get("SUDO_USER"):
-                    sudo_user = os.environ.get("SUDO_USER")
-                    if sudo_user:
-                        proc = subprocess.run(
-                            ["sudo", "-u", sudo_user, "printenv", "DISPLAY"],
-                            capture_output=True,
-                            text=True,
-                            check=False,
-                        )
-                        if proc.returncode == 0 and proc.stdout and proc.stdout.strip():
-                            env["DISPLAY"] = proc.stdout.strip()
-                            logger.debug(
-                                f"Set DISPLAY for SSH session: {env['DISPLAY']}"
-                            )
-            else:
-                env["SSH_ASKPASS_REQUIRE"] = "never"
+            
+            # Start the btrfs receive process
             receive_process = subprocess.Popen(
-                ssh_cmd,
+                final_cmd,
                 stdin=stdin_pipe,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                bufsize=0,  # Use unbuffered mode for better streaming
+                bufsize=0,  # Unbuffered for real-time streaming
                 env=env,
-                text=False,  # Use binary mode for streams
+                text=False,  # Binary mode for data streams
                 start_new_session=True,  # Avoid signal propagation issues
             )
-            logger.debug(
-                "btrfs receive process started with PID: %d", receive_process.pid
-            )
-            logger.debug(
-                "If receive fails, verify remote user has sudo access for btrfs commands"
-            )
-            # Set log file path for compatibility with error checking code
-            self._last_receive_log = receive_log
-            self._last_transfer_snapshot = True
+            
+            logger.debug("btrfs receive process started with PID: %d", receive_process.pid)
+            logger.info("Integrated btrfs receive process started successfully")
+            
             return receive_process
+
         except Exception as e:
-            logger.error("Failed to start btrfs receive process: %s", e)
+            logger.error("Failed to start integrated btrfs receive process: %s", e)
             if isinstance(e, (BrokenPipeError, ConnectionError, ConnectionResetError)):
-                logger.error(
-                    "SSH connection error detected. The connection might be broken."
-                )
+                logger.error("SSH connection error detected")
                 raise ConnectionError(f"SSH connection error: {e}")
             raise
 
@@ -1497,11 +1421,21 @@ echo $? >"{receive_log}.exitcode"
 
         try:
             logger.info("Executing subvolume list command...")
+            
+            # Check if we need to provide password input for sudo
+            sudo_input = None
+            if "sudo" in list_cmd and "-S" in list_cmd:
+                sudo_password = self._get_sudo_password()
+                if sudo_password:
+                    sudo_input = sudo_password.encode() + b'\n'
+                    logger.debug("Providing sudo password for verification command")
+            
             list_result = self._exec_remote_command(
                 list_cmd,
                 check=False,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
+                input=sudo_input,
             )
 
             logger.info(f"Subvolume list command exit code: {list_result.returncode}")
@@ -1531,12 +1465,24 @@ echo $? >"{receive_log}.exitcode"
                     "echo",
                     "EXISTS",
                 ]
+                # Apply proper authentication handling to the fallback command too
+                check_cmd = self._build_remote_command(check_cmd)
                 logger.debug(f"Fallback verification command: {' '.join(check_cmd)}")
+                
+                # Check if we need to provide password input for sudo
+                fallback_input = None
+                if "sudo" in check_cmd and "-S" in check_cmd:
+                    sudo_password = self._get_sudo_password()
+                    if sudo_password:
+                        fallback_input = sudo_password.encode() + b'\n'
+                        logger.debug("Providing sudo password for fallback verification command")
+                
                 check_result = self._exec_remote_command(
                     check_cmd,
                     check=False,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
+                    input=fallback_input,
                 )
 
                 logger.debug(f"Path check exit code: {check_result.returncode}")
@@ -1583,13 +1529,22 @@ echo $? >"{receive_log}.exitcode"
                         # Extract the path part after "path "
                         path_part = line.split("path ", 1)[-1].strip()
                         
-                        # Check if this path contains our expected snapshot
-                        # It could be the exact path or a subpath containing our snapshot
-                        if (snapshot_name in path_part and 
-                            (expected_path in path_part or 
-                             path_part.endswith(snapshot_name) or
-                             f"/{snapshot_name}/" in path_part)):
-                            logger.info(f"Snapshot found in subvolume list: {snapshot_name}")
+                        # More flexible matching - check if the snapshot name appears in the path
+                        # and if the path is within our destination directory
+                        if snapshot_name in path_part:
+                            # Check if this path is within our destination directory
+                            if (path_part == expected_path or  # Exact match
+                                path_part.startswith(dest_path.rstrip('/') + '/') or  # Under dest_path
+                                expected_path in path_part):  # Expected path is contained
+                                logger.info(f"Snapshot found in subvolume list: {snapshot_name}")
+                                logger.debug(f"  Found in path: {path_part}")
+                                logger.debug(f"  Expected path: {expected_path}")
+                                snapshot_found = True
+                                break
+                        
+                        # Also check if the path ends with our snapshot name (handles nested paths)
+                        if path_part.endswith(f"/{snapshot_name}"):
+                            logger.info(f"Snapshot found by suffix match: {snapshot_name}")
                             logger.debug(f"  Found in path: {path_part}")
                             snapshot_found = True
                             break
@@ -1608,8 +1563,19 @@ echo $? >"{receive_log}.exitcode"
                 # Try simple path existence check as fallback
                 logger.debug("Trying simple path existence check as fallback")
                 simple_check_cmd = ["test", "-d", expected_path]
+                # Apply proper authentication handling to the final fallback command too
+                simple_check_cmd = self._build_remote_command(simple_check_cmd)
+                
+                # Check if we need to provide password input for sudo
+                final_input = None
+                if "sudo" in simple_check_cmd and "-S" in simple_check_cmd:
+                    sudo_password = self._get_sudo_password()
+                    if sudo_password:
+                        final_input = sudo_password.encode() + b'\n'
+                        logger.debug("Providing sudo password for final fallback verification command")
+                
                 simple_result = self._exec_remote_command(
-                    simple_check_cmd, check=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+                    simple_check_cmd, check=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE, input=final_input
                 )
                 if simple_result.returncode == 0:
                     logger.info(f"Snapshot exists via path check: {expected_path}")
