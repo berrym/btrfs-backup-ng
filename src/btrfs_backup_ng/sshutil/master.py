@@ -69,7 +69,7 @@ class SSHMasterManager:
             "ServerAliveInterval=5",
             "ServerAliveCountMax=6",
             "TCPKeepAlive=yes",
-            "ConnectTimeout=15",
+            "ConnectTimeout=30",  # Increased from 15 to allow password entry
             "ConnectionAttempts=3",
             "StrictHostKeyChecking=accept-new",
             "PasswordAuthentication=yes"

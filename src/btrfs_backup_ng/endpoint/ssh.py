@@ -132,6 +132,11 @@ class SSHEndpoint(Endpoint):
         # Initialize tracking variables for verification
         self._last_receive_log = None
         self._last_transfer_snapshot = None
+        
+        # Cache for diagnostics to avoid redundant testing
+        self._diagnostics_cache: Dict[str, Tuple[Dict[str, bool], float]] = {}
+        self._diagnostics_cache_timeout = 300  # 5 minutes
+        
         self.config["path"] = self.config.get("path", "/")
         self.config["ssh_sudo"] = self.config.get("ssh_sudo", False)
         self.config["passwordless"] = self.config.get("passwordless", False)
@@ -315,8 +320,8 @@ class SSHEndpoint(Endpoint):
         # initialization to fail if the remote host is not reachable
         logger.debug("Attempting to run initial diagnostics for passwordless sudo detection")
         try:
-            # Try a quick connection test using a simple command
-            result = self._exec_remote_command(["true"], timeout=5, check=False)
+            # Try a connection test with adequate timeout for password entry
+            result = self._exec_remote_command(["true"], timeout=30, check=False)
             if result.returncode == 0:
                 logger.debug("SSH connection test successful, running full diagnostics")
                 self._run_diagnostics()
@@ -369,12 +374,23 @@ class SSHEndpoint(Endpoint):
             logger.debug("Executing remote deletion command: %s", cmd)
             
             try:
-                result = self._exec_remote_command(
-                    cmd,
-                    check=False,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                )
+                # Use retry mechanism for commands that may require authentication
+                use_sudo = self.config.get("ssh_sudo", False)
+                if use_sudo:
+                    result = self._exec_remote_command_with_retry(
+                        cmd,
+                        max_retries=2,
+                        check=False,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                    )
+                else:
+                    result = self._exec_remote_command(
+                        cmd,
+                        check=False,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                    )
                 if result.returncode == 0:
                     logger.info("Deleted remote snapshot subvolume: %s", remote_path)
                 else:
@@ -441,7 +457,7 @@ class SSHEndpoint(Endpoint):
                     "SSH agent forwarding requested but SSH_AUTH_SOCK is not set. Agent forwarding will not work."
                 )
 
-    def _run_diagnostics(self, path: str = "/") -> Dict[str, bool]:
+    def _run_diagnostics(self, path: str = "/", force_refresh: bool = False) -> Dict[str, bool]:
         """Run SSH and sudo diagnostics to identify potential issues.
 
         Attempts several tests to verify SSH connectivity, btrfs availability,
@@ -450,6 +466,7 @@ class SSHEndpoint(Endpoint):
 
         Args:
             path: Remote path to test for btrfs operations
+            force_refresh: If True, bypass cache and run fresh diagnostics
 
         Returns:
             Dictionary with test results (True=passed, False=failed):
@@ -462,6 +479,25 @@ class SSHEndpoint(Endpoint):
                 'btrfs_filesystem': bool  # Path is on btrfs filesystem
             }
         """
+        # Check cache first to avoid redundant testing
+        current_time = time.time()
+        cache_key = f"{self.hostname}:{path}"
+        
+        if not force_refresh and cache_key in self._diagnostics_cache:
+            cached_result, cache_time = self._diagnostics_cache[cache_key]
+            if current_time - cache_time < self._diagnostics_cache_timeout:
+                logger.debug(f"Using cached diagnostics for {cache_key} (age: {current_time - cache_time:.1f}s)")
+                # Update config with cached result
+                self.config["passwordless_sudo_available"] = cached_result.get("passwordless_sudo", False)
+                return cached_result
+            else:
+                logger.debug(f"Diagnostics cache expired for {cache_key}, running fresh tests")
+        
+        if force_refresh:
+            logger.debug(f"Forcing fresh diagnostics for {cache_key}")
+        else:
+            logger.debug(f"Running fresh diagnostics for {cache_key}")
+        
         # Initialize results dictionary
         results: Dict[str, bool] = {
             "ssh_connection": False,
@@ -516,7 +552,10 @@ class SSHEndpoint(Endpoint):
         # Test passwordless sudo
         logger.debug("Testing passwordless sudo...")
         try:
-            result = self._exec_remote_command(["sudo", "-n", "true"], check=False)
+            # Use retry mechanism for sudo testing to handle potential authentication issues
+            result = self._exec_remote_command_with_retry(
+                ["sudo", "-n", "true"], max_retries=2, check=False
+            )
             results["passwordless_sudo"] = result.returncode == 0
             if results["passwordless_sudo"]:
                 logger.info("Passwordless sudo is available")
@@ -533,8 +572,9 @@ class SSHEndpoint(Endpoint):
         # Test sudo with btrfs
         logger.debug("Testing sudo with btrfs command...")
         try:
-            result = self._exec_remote_command(
-                ["sudo", "-n", "btrfs", "--version"], check=False
+            # Use retry mechanism for sudo btrfs testing to handle potential authentication issues
+            result = self._exec_remote_command_with_retry(
+                ["sudo", "-n", "btrfs", "--version"], max_retries=2, check=False
             )
             results["sudo_btrfs"] = result.returncode == 0
             if results["sudo_btrfs"]:
@@ -566,13 +606,13 @@ class SSHEndpoint(Endpoint):
                 logger.debug(
                     f"Direct write failed, trying with sudo. Error: {result.stderr.decode() if result.stderr else 'None'}"
                 )
-                # Try with sudo
-                result = self._exec_remote_command(
-                    ["sudo", "-n", "touch", test_file], check=False
+                # Try with sudo  
+                result = self._exec_remote_command_with_retry(
+                    ["sudo", "-n", "touch", test_file], max_retries=2, check=False
                 )
                 if result.returncode == 0:
-                    self._exec_remote_command(
-                        ["sudo", "-n", "rm", "-f", test_file], check=False
+                    self._exec_remote_command_with_retry(
+                        ["sudo", "-n", "rm", "-f", test_file], max_retries=2, check=False
                     )
                     results["write_permissions"] = True
                     logger.info(f"Path is writable with sudo: {path}")
@@ -651,6 +691,10 @@ class SSHEndpoint(Endpoint):
             logger.info("Auto-detected passwordless sudo capability - will use passwordless mode by default")
         else:
             logger.debug("Passwordless sudo not available - will require password prompts or manual configuration")
+
+        # Cache the results to avoid redundant testing
+        self._diagnostics_cache[cache_key] = (results.copy(), current_time)
+        logger.debug(f"Cached diagnostics for {cache_key}")
 
         return results
 
@@ -748,23 +792,28 @@ class SSHEndpoint(Endpoint):
             )
         return command
 
-    def _get_sudo_password(self) -> Optional[str]:
+    def _get_sudo_password(self, retry_on_failure: bool = False) -> Optional[str]:
         logger.debug("Attempting to get sudo password...")
-        if self._cached_sudo_password is not None:
+        if self._cached_sudo_password is not None and not retry_on_failure:
             # Using info for better visibility during testing
             logger.info("SSHEndpoint._get_sudo_password: Using cached sudo password.")
             return self._cached_sudo_password
 
         sudo_pw_env = os.environ.get("BTRFS_BACKUP_SUDO_PASSWORD")
-        if sudo_pw_env:
+        if sudo_pw_env and not retry_on_failure:
             logger.info("SSHEndpoint._get_sudo_password: Using sudo password from BTRFS_BACKUP_SUDO_PASSWORD env var.")
             self._cached_sudo_password = sudo_pw_env
             logger.debug("SSHEndpoint._get_sudo_password: Cached sudo password from env var.")
             return sudo_pw_env
 
+        if retry_on_failure and self._cached_sudo_password:
+            logger.info("Clearing cached password and prompting for fresh password due to authentication failure")
+            self._cached_sudo_password = None
+
         logger.debug("SSHEndpoint._get_sudo_password: Attempting to prompt for sudo password interactively...")
         try:
-            prompt_message = f"Sudo password for {self.config.get('username', 'remote user')}@{self.hostname}: "
+            retry_msg = " (retry after authentication failure)" if retry_on_failure else ""
+            prompt_message = f"Sudo password for {self.config.get('username', 'remote user')}@{self.hostname}{retry_msg}: "
             # Log before getpass call
             logger.debug(f"SSHEndpoint._get_sudo_password: About to call getpass.getpass() with prompt: '{prompt_message}'")
             
@@ -787,6 +836,94 @@ class SSHEndpoint(Endpoint):
             logger.info("To provide sudo password non-interactively, set the BTRFS_BACKUP_SUDO_PASSWORD environment variable")
             logger.info("Alternatively, configure passwordless sudo for btrfs commands on the remote host")
             return None
+
+    def _exec_remote_command_with_retry(
+        self, command: List[Any], max_retries: int = 1, **kwargs: Any
+    ) -> CompletedProcess[Any]:
+        """Execute a command with automatic retry on authentication failures."""
+        result = None
+        for attempt in range(max_retries + 1):
+            try:
+                result = self._exec_remote_command(command, **kwargs)
+                
+                # Check if this was a sudo command that failed with authentication issues
+                if (result.returncode != 0 and attempt < max_retries and 
+                    any(arg == "-S" for arg in self._build_remote_command([str(c) for c in command]))):
+                    
+                    stderr = (
+                        str(result.stderr.decode("utf-8", errors="replace"))
+                        if hasattr(result, "stderr") and result.stderr
+                        else ""
+                    )
+                    
+                    # Check for authentication failure indicators
+                    auth_failure_indicators = [
+                        "Sorry, try again",
+                        "incorrect password", 
+                        "authentication failure",
+                        "3 incorrect password attempts"
+                    ]
+                    
+                    stderr_lower = stderr.lower()
+                    auth_failed = any(indicator.lower() in stderr_lower for indicator in auth_failure_indicators)
+                    
+                    if auth_failed:
+                        logger.warning(f"Authentication failure detected on attempt {attempt + 1}/{max_retries + 1}")
+                        logger.info("Retrying with fresh password prompt...")
+                        
+                        # Clear the cached password and get a fresh one
+                        self._clear_sudo_password_cache()
+                        fresh_password = self._get_sudo_password(retry_on_failure=True)
+                        
+                        if fresh_password:
+                            # Update kwargs with fresh password
+                            if "input" in kwargs:
+                                kwargs["input"] = (fresh_password + "\n").encode()
+                            logger.debug(f"Retrying command with fresh password (attempt {attempt + 2}/{max_retries + 1})")
+                            continue
+                        else:
+                            logger.error("Could not obtain fresh password for retry")
+                            return result
+                
+                return result
+                
+            except Exception as e:
+                if attempt == max_retries:
+                    raise
+                logger.warning(f"Command execution failed on attempt {attempt + 1}, retrying: {e}")
+        
+        # This should never be reached, but just in case
+        return result  # type: ignore
+
+    def _clear_sudo_password_cache(self) -> None:
+        """Clear the cached sudo password if authentication fails."""
+        if self._cached_sudo_password is not None:
+            logger.debug("Clearing cached sudo password due to authentication failure")
+            self._cached_sudo_password = None
+
+    def _check_and_handle_auth_failure(self, stderr: str, using_sudo_with_stdin: bool) -> None:
+        """Check for authentication failures and clear cached password if needed."""
+        if not using_sudo_with_stdin or not stderr:
+            return
+            
+        # Check for common sudo authentication failure messages
+        auth_failure_indicators = [
+            "Sorry, try again",
+            "incorrect password",
+            "authentication failure",
+            "sudo: 3 incorrect password attempts",
+            "sudo: no password was provided",
+            "sudo: unable to read password",
+            "sudo: a password is required"
+        ]
+        
+        stderr_lower = stderr.lower()
+        for indicator in auth_failure_indicators:
+            if indicator.lower() in stderr_lower:
+                logger.warning(f"Authentication failure detected: {indicator}")
+                logger.info("Clearing cached sudo password to allow fresh authentication attempt")
+                self._clear_sudo_password_cache()
+                break
 
     def _exec_remote_command(
         self, command: List[Any], **kwargs: Any
@@ -855,6 +992,9 @@ class SSHEndpoint(Endpoint):
             sudo_password = self._get_sudo_password()
             if sudo_password:
                 logger.debug("Supplying sudo password via stdin for remote command.")
+                # Add a small delay to ensure proper timing for password input
+                import time
+                time.sleep(0.1)  # 100ms delay to prevent timing issues
                 kwargs["input"] = (sudo_password + "\n").encode()
                 # Remove stdin if present, as input and stdin cannot both be set
                 if "stdin" in kwargs:
@@ -915,6 +1055,10 @@ class SSHEndpoint(Endpoint):
                     if hasattr(result, "stderr") and result.stderr  # type: ignore
                     else ""
                 )
+                
+                # Check for authentication failures and clear cached password
+                self._check_and_handle_auth_failure(stderr, using_sudo_with_stdin)
+                
                 logger.debug(
                     "Command exited with non-zero code %d: %s\nError: %s",
                     exit_code,  # type: ignore
@@ -1057,15 +1201,23 @@ class SSHEndpoint(Endpoint):
             if use_sudo:
                 test_cmd = ["sudo", "-n", "which", "btrfs"]
                 logger.debug("Testing btrfs availability with sudo")
+                # Use retry mechanism for sudo commands to handle authentication
+                test_result = self._exec_remote_command_with_retry(
+                    test_cmd,
+                    max_retries=2,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    check=False,
+                )
             else:
                 test_cmd = ["which", "btrfs"]
                 logger.debug("Testing btrfs availability without sudo")
-            test_result = self._exec_remote_command(
-                test_cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                check=False,
-            )
+                test_result = self._exec_remote_command(
+                    test_cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    check=False,
+                )
             if test_result.returncode != 0:
                 stderr = test_result.stderr.decode("utf-8", errors="replace")
                 logger.error("btrfs command not found on remote host: %s", stderr)
@@ -1089,7 +1241,10 @@ class SSHEndpoint(Endpoint):
             try:
                 logger.debug("Ensuring destination directory exists: %s", destination_dir)
                 mkdir_cmd = ["mkdir", "-p", destination_dir]
-                result = self._exec_remote_command(mkdir_cmd, check=False, timeout=15)
+                # Use retry mechanism for mkdir command as it may require sudo authentication
+                result = self._exec_remote_command_with_retry(
+                    mkdir_cmd, max_retries=2, check=False, timeout=15
+                )
                 if result.returncode != 0:
                     logger.warning("Could not create destination directory: %s", destination_dir)
             except Exception as e:
@@ -1380,129 +1535,47 @@ wait $RECEIVE_PID
         cmd = self._build_remote_command(cmd)
         try:
             logger.debug(f"Listing remote snapshots with command: %s", cmd)
-            result = self._exec_remote_command(
-                cmd, check=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE
-            )
+            # Use retry mechanism for commands that may require authentication
+            if use_sudo:
+                result = self._exec_remote_command_with_retry(
+                    cmd, max_retries=2, check=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+                )
+            else:
+                result = self._exec_remote_command(
+                    cmd, check=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+                )
             if result.returncode != 0:
                 stderr = (
                     result.stderr.decode(errors="replace").strip()
                     if result.stderr
                     else ""
                 )
-                # Detect sudo password prompt error
+                
+                # The retry mechanism should have already handled authentication failures
+                # Log the final failure and provide diagnostic information
+                logger.warning(f"Failed to list remote snapshots: {stderr}")
+                
                 if use_sudo and (
-                    "a password is required" in stderr or "sudo:" in stderr
+                    "a password is required" in stderr or 
+                    "sudo:" in stderr or
+                    "Sorry, try again" in stderr
                 ):
-                    logger.debug(f"Passwordless sudo failed, checking for alternative authentication: {stderr}")
+                    logger.error("Authentication issues detected during snapshot listing")
+                    logger.error(
+                        "SSH endpoint: %s@%s:%s (ssh_sudo=%s)",
+                        self.config.get("username"),
+                        self.hostname,
+                        path,
+                        use_sudo,
+                    )
+                    logger.info("To resolve authentication issues:")
+                    logger.info("1. Configure passwordless sudo for btrfs commands on remote host, OR")
+                    logger.info("2. Set BTRFS_BACKUP_SUDO_PASSWORD environment variable, OR") 
+                    logger.info("3. Run in an interactive terminal for password prompting")
+                    logger.info(f"   Example sudoers entry: {self.config.get('username')} ALL=(ALL) NOPASSWD: /usr/bin/btrfs")
+                    self._run_diagnostics(path, force_refresh=True)
                     
-                    # Check if we have a cached password before attempting retry
-                    cached_password = self._get_sudo_password()
-                    if not cached_password:
-                        logger.warning("Passwordless sudo failed and no alternative authentication available")
-                        logger.info("To resolve this issue:")
-                        logger.info("1. Configure passwordless sudo for btrfs commands on remote host, OR")
-                        logger.info("2. Set BTRFS_BACKUP_SUDO_PASSWORD environment variable, OR") 
-                        logger.info("3. Run in an interactive terminal for password prompting")
-                        # Skip retry and use the original failed result
-                        logger.debug(f"Using original failed result due to no available authentication")
-                        result_pw = result  # Use the original failed result
-                    else:
-                        # Try password-based sudo using _build_remote_command for consistency
-                        cmd_pw = ["btrfs", "subvolume", "list", "-o", path]
-                        # Temporarily force password mode to ensure sudo -S is used
-                        orig_passwordless = self.config.get("passwordless", None)
-                        orig_passwordless_available = self.config.get("passwordless_sudo_available", None)
-                        self.config["passwordless"] = False
-                        self.config["passwordless_sudo_available"] = False
-                        cmd_pw = self._build_remote_command(cmd_pw)
-                        logger.debug("Retrying remote snapshot listing with password-based sudo...")
-                        logger.debug(f"Using cached sudo password for retry (length: {len(cached_password)})")
-                        try:
-                            result_pw = self._exec_remote_command(
-                                cmd_pw,
-                                check=False,
-                                stdout=subprocess.PIPE,
-                                stderr=subprocess.PIPE,
-                                input=cached_password.encode() + b'\n'
-                            )
-                        finally:
-                            # Restore original configuration values
-                            if orig_passwordless is not None:
-                                self.config["passwordless"] = orig_passwordless
-                            else:
-                                self.config.pop("passwordless", None)
-                            if orig_passwordless_available is not None:
-                                self.config["passwordless_sudo_available"] = orig_passwordless_available
-                            else:
-                                self.config.pop("passwordless_sudo_available", None)
-                    if result_pw.returncode == 0:
-                        output = (
-                            result_pw.stdout.decode(errors="replace")
-                            if result_pw.stdout
-                            else ""
-                        )
-                        snapshots: List[Any] = []
-                        snap_prefix = self.config.get("snap_prefix", "")
-                        for line in output.splitlines():
-                            parts = line.split("path ", 1)
-                            if len(parts) == 2:
-                                snap_path = parts[1].strip()
-                                snap_name = os.path.basename(snap_path)
-                                if snap_name.startswith(snap_prefix):
-                                    date_part = snap_name[len(snap_prefix):]
-                                    try:
-                                        from btrfs_backup_ng import __util__
-                                        time_obj = __util__.str_to_date(date_part)
-                                        snapshot = __util__.Snapshot(
-                                            self.config["path"], snap_prefix, self, time_obj=time_obj
-                                        )
-                                        snapshots.append(snapshot)
-                                    except Exception as e:
-                                        logger.warning(
-                                            "Could not parse date from: %r (%s)", snap_name, e
-                                        )
-                                        continue
-                        logger.warning(
-                            "Passwordless sudo is not available, but password-based sudo succeeded for remote snapshot listing."
-                        )
-                        logger.info(
-                            f"Found {len(snapshots)} remote snapshots at {path}"
-                        )
-                        logger.debug(f"Remote snapshot names: {snapshots}")
-                        return snapshots
-                    else:
-                        stderr_pw = (
-                            result_pw.stderr.decode(errors="replace").strip()
-                            if result_pw.stderr
-                            else ""
-                        )
-                        logger.error(
-                            f"Failed to list remote snapshots with password-based sudo: {stderr_pw}"
-                        )
-                        logger.error(
-                            "Passwordless sudo is not available for the remote user '%s' on host '%s'.",
-                            self.config.get("username"),
-                            self.hostname,
-                        )
-                        logger.error(
-                            "To enable passwordless sudo, add the user to sudoers with NOPASSWD, e.g.:"
-                        )
-                        logger.error(
-                            "    %s ALL=(ALL) NOPASSWD: /usr/bin/btrfs",
-                            self.config.get("username"),
-                        )
-                        logger.error(
-                            "SSH endpoint: %s@%s:%s (ssh_sudo=%s)",
-                            self.config.get("username"),
-                            self.hostname,
-                            path,
-                            use_sudo,
-                        )
-                        self._run_diagnostics(path)
-                        return []
-                else:
-                    logger.warning(f"Failed to list remote snapshots: {stderr}")
-                    return []
+                return []
             output = result.stdout.decode(errors="replace") if result.stdout else ""
             snapshots: List[Any] = []
             snap_prefix = self.config.get("snap_prefix", "")
@@ -1531,7 +1604,7 @@ wait $RECEIVE_PID
             return snapshots
         except Exception as e:
             logger.error(f"Exception while listing remote snapshots: {e}")
-            self._run_diagnostics(path)
+            self._run_diagnostics(path, force_refresh=True)
             return []
 
     def _verify_snapshot_exists(self, dest_path: str, snapshot_name: str) -> bool:
@@ -1559,21 +1632,23 @@ wait $RECEIVE_PID
         try:
             logger.info("Executing subvolume list command...")
             
-            # Check if we need to provide password input for sudo
-            sudo_input = None
-            if "sudo" in list_cmd and "-S" in list_cmd:
-                sudo_password = self._get_sudo_password()
-                if sudo_password:
-                    sudo_input = sudo_password.encode() + b'\n'
-                    logger.debug("Providing sudo password for verification command")
-            
-            list_result = self._exec_remote_command(
-                list_cmd,
-                check=False,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                input=sudo_input,
-            )
+            # Use retry mechanism for commands that may require authentication
+            use_sudo = self.config.get("ssh_sudo", False)
+            if use_sudo:
+                list_result = self._exec_remote_command_with_retry(
+                    list_cmd,
+                    max_retries=2,
+                    check=False,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                )
+            else:
+                list_result = self._exec_remote_command(
+                    list_cmd,
+                    check=False,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                )
 
             logger.info(f"Subvolume list command exit code: {list_result.returncode}")
             if list_result.stdout:
@@ -1614,8 +1689,10 @@ wait $RECEIVE_PID
                         fallback_input = sudo_password.encode() + b'\n'
                         logger.debug("Providing sudo password for fallback verification command")
                 
-                check_result = self._exec_remote_command(
+                # Use retry mechanism for fallback verification commands with authentication
+                check_result = self._exec_remote_command_with_retry(
                     check_cmd,
+                    max_retries=2,
                     check=False,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
@@ -1711,8 +1788,14 @@ wait $RECEIVE_PID
                         final_input = sudo_password.encode() + b'\n'
                         logger.debug("Providing sudo password for final fallback verification command")
                 
-                simple_result = self._exec_remote_command(
-                    simple_check_cmd, check=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE, input=final_input
+                # Use retry mechanism for simple path check with authentication
+                simple_result = self._exec_remote_command_with_retry(
+                    simple_check_cmd, 
+                    max_retries=2, 
+                    check=False, 
+                    stdout=subprocess.PIPE, 
+                    stderr=subprocess.PIPE, 
+                    input=final_input
                 )
                 if simple_result.returncode == 0:
                     logger.info(f"Snapshot exists via path check: {expected_path}")
@@ -1789,7 +1872,7 @@ wait $RECEIVE_PID
             return False
 
         # Run pre-transfer diagnostics
-        logger.info(f"Testing SSH connectivity and filesystem...")
+        logger.info(f"Verifying SSH connectivity and filesystem readiness...")
         diagnostics = self._run_diagnostics(dest_path)
         if not all(
             [
@@ -2063,7 +2146,7 @@ wait $RECEIVE_PID
             return False
         
         # Run diagnostics to ensure everything is ready
-        logger.debug("Running pre-transfer diagnostics")
+        logger.debug("Verifying pre-transfer readiness")
         diagnostics = self._run_diagnostics(dest_path)
         if not all([
             diagnostics["ssh_connection"],
