@@ -22,6 +22,7 @@ Environment variables that affect behavior:
 import copy
 import getpass
 import os
+import shlex
 import subprocess
 import time
 import uuid
@@ -42,6 +43,7 @@ except ImportError:
 
 from btrfs_backup_ng.__logger__ import logger
 from btrfs_backup_ng.sshutil.master import SSHMasterManager
+from btrfs_backup_ng import __util__
 from .common import Endpoint
 
 # Type variable for self in SSHEndpoint
@@ -104,7 +106,7 @@ class SSHEndpoint(Endpoint):
             logger.debug("SSHEndpoint: No config provided, using empty dict")
 
         # Initialize our config before calling parent init
-        self.config: Dict[str, Any] = config if config is not None else {}
+        self.config: Dict[str, Any] = config or {}
         self.hostname: str = hostname
         self._instance_id: str = f"{os.getpid()}_{uuid.uuid4().hex[:8]}"
         self._lock: Lock = Lock()
@@ -904,8 +906,8 @@ class SSHEndpoint(Endpoint):
             if "input" in kwargs:
                 logger.debug("subprocess.run has input data (password)")
 
-            result = subprocess.run(ssh_cmd, **kwargs)  # type: ignore
-            exit_code = result.returncode  # type: ignore
+            result = subprocess.run(ssh_cmd, **kwargs)  # type: ignore[misc]
+            exit_code = result.returncode  # type: ignore[attr-defined]
 
             if exit_code != 0 and kwargs.get("check", False) is False:
                 stderr = (
@@ -919,28 +921,27 @@ class SSHEndpoint(Endpoint):
                     ssh_cmd_str,  # type: ignore
                     stderr,  # type: ignore
                 )
-                details = {
+                details: Dict[str, Any] = {
                     "command": ssh_cmd_str,
                     "exit_code": exit_code,
                     "stderr_length": len(stderr) if stderr else 0,
-                    "has_stdout": hasattr(result, "stdout")
-                    and getattr(result, "stdout", None) is not None,
+                    "has_stdout": result.stdout is not None,  # type: ignore[attr-defined]
                 }
                 logger.debug("Non-zero exit command details: %s", details)
             elif exit_code == 0:
                 logger.debug("Command executed successfully: %s", ssh_cmd_str)  # type: ignore
-                if hasattr(result, "stdout") and getattr(result, "stdout", None):
-                    stdout_data = getattr(result, "stdout", None)
+                if result.stdout:  # type: ignore[attr-defined]
+                    stdout_data = result.stdout  # type: ignore[attr-defined]
                     if stdout_data:
                         stdout_len = (
                             len(stdout_data)
                             if isinstance(stdout_data, bytes)
-                            else len(str(stdout_data))
+                            else len(str(stdout_data))  # type: ignore[arg-type]
                         )
                         logger.debug("Command stdout length: %d bytes", stdout_len)
 
-            logger.debug("Command execution result: exit_code=%d", result.returncode)  # type: ignore
-            return result  # type: ignore
+            logger.debug("Command execution result: exit_code=%d", result.returncode)  # type: ignore[attr-defined]
+            return result  # type: ignore[return-value]
 
         except subprocess.TimeoutExpired as e:
             logger.error(
@@ -1152,11 +1153,10 @@ class SSHEndpoint(Endpoint):
             if sudo_password:
                 # Use SUDO_ASKPASS approach to completely avoid stdin conflicts
                 # This creates a temporary script that returns the password when called
-                import shlex
                 escaped_password = shlex.quote(sudo_password)
                 
                 # Modify the command to use sudo -A instead of sudo -S
-                modified_cmd = []
+                modified_cmd: List[str] = []
                 for arg in remote_cmd:
                     if arg == "sudo" and len(modified_cmd) > 0 and remote_cmd[remote_cmd.index(arg) + 1] == "-S":
                         # Replace 'sudo -S' with 'sudo -A'
@@ -1812,12 +1812,10 @@ wait $RECEIVE_PID
         # For now, we'll create a minimal snapshot object to use the source endpoint's send method
         try:
             # Create a snapshot object that represents our source
-            source_endpoint = None
             # We need to get this from the source path - this is a limitation of the current design
             # For now, we'll use the traditional approach but with better process management
             
             # Determine parent for incremental transfer
-            parent_snapshot = None
             if parent_path and os.path.exists(parent_path):
                 logger.info(f"Using incremental transfer with parent: {parent_path}")
                 # We'll handle incremental logic in the actual send call
@@ -1919,7 +1917,6 @@ wait $RECEIVE_PID
             # Set dummy results for compatibility
             send_result = 0 if transfer_succeeded else 1
             receive_result = 0 if transfer_succeeded else 1
-            buffer_result = 0
             
             elapsed_time = time.time() - start_time
             logger.info(f"Transfer completed in {elapsed_time:.2f} seconds")
@@ -2013,7 +2010,7 @@ wait $RECEIVE_PID
             logger.debug(f"Full error details: {e}", exc_info=True)
             return False
 
-    def send_receive(self, snapshot, parent=None, clones=None, timeout=3600) -> bool:
+    def send_receive(self, snapshot: '__util__.Snapshot', parent: Optional['__util__.Snapshot'] = None, clones: Optional[List['__util__.Snapshot']] = None, timeout: int = 3600) -> bool:
         """Perform direct SSH pipe transfer with verification.
         
         This method implements a direct SSH pipe for btrfs send/receive operations,
@@ -2098,7 +2095,7 @@ wait $RECEIVE_PID
             logger.error("Error during direct SSH pipe transfer: %s", e)
             return False
 
-    def _monitor_transfer_progress(self, processes, start_time, dest_path, snapshot_name, max_wait_time=3600):
+    def _monitor_transfer_progress(self, processes: Dict[str, Any], start_time: float, dest_path: str, snapshot_name: str, max_wait_time: int = 3600) -> bool:
         """Enhanced transfer monitoring with real-time progress feedback.
         
         Args:
@@ -2116,6 +2113,11 @@ wait $RECEIVE_PID
         send_process = processes['send']
         receive_process = processes['receive'] 
         buffer_process = processes.get('buffer')
+        
+        # Type guards to ensure processes are not None
+        if send_process is None or receive_process is None:
+            logger.error("CRITICAL: Required processes are None")
+            return False
         
         transfer_succeeded = False
         last_status_time = start_time
@@ -2182,7 +2184,7 @@ wait $RECEIVE_PID
             
         return transfer_succeeded
         
-    def _log_transfer_status(self, elapsed, send_alive, receive_alive, buffer_alive, buffer_process):
+    def _log_transfer_status(self, elapsed: float, send_alive: bool, receive_alive: bool, buffer_alive: bool, buffer_process: Any) -> None:
         """Log detailed transfer status with professional indicators."""
         minutes = elapsed / 60
         
@@ -2201,7 +2203,7 @@ wait $RECEIVE_PID
         if elapsed > 60:  # After 1 minute
             logger.info(f"   STATUS: Transfer progressing normally...")
             
-    def _log_process_error(self, process, process_name):
+    def _log_process_error(self, process: Any, process_name: str) -> None:
         """Log detailed error information for a failed process."""
         try:
             if process.stderr:
