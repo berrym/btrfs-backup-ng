@@ -606,7 +606,8 @@ class SSHEndpoint(Endpoint):
                 logger.debug(
                     f"Direct write failed, trying with sudo. Error: {result.stderr.decode() if result.stderr else 'None'}"
                 )
-                # Try with sudo  
+                
+                # Try with passwordless sudo first
                 result = self._exec_remote_command_with_retry(
                     ["sudo", "-n", "touch", test_file], max_retries=2, check=False
                 )
@@ -615,13 +616,28 @@ class SSHEndpoint(Endpoint):
                         ["sudo", "-n", "rm", "-f", test_file], max_retries=2, check=False
                     )
                     results["write_permissions"] = True
-                    logger.info(f"Path is writable with sudo: {path}")
-                    logger.debug("Sudo write test passed")
+                    logger.info(f"Path is writable with passwordless sudo: {path}")
+                    logger.debug("Passwordless sudo write test passed")
                 else:
-                    logger.error(f"Path is not writable (even with sudo): {path}")
-                    logger.debug(
-                        f"Sudo write failed. Error: {result.stderr.decode() if result.stderr else 'None'}"
-                    )
+                    # If passwordless sudo fails, check if we have password-based sudo available
+                    logger.debug("Passwordless sudo write failed, checking if password-based sudo could work")
+                    
+                    # If ssh_sudo is enabled and we're not in passwordless mode, 
+                    # assume write permissions will work with password-based sudo
+                    use_sudo = self.config.get("ssh_sudo", False)
+                    passwordless_available = results.get("passwordless_sudo", False)
+                    
+                    if use_sudo and not passwordless_available:
+                        # We have sudo configured but not passwordless - likely will work with password
+                        results["write_permissions"] = True
+                        logger.info(f"Path likely writable with password-based sudo: {path}")
+                        logger.debug("Assuming write permissions available via password-based sudo")
+                    else:
+                        # No sudo configuration or other issue
+                        results["write_permissions"] = False
+                        logger.error(f"Path is not writable (even with sudo): {path}")
+                        logger.debug(f"Sudo write failed. Error: {result.stderr.decode() if result.stderr else 'None'}")
+                        logger.debug("Consider enabling ssh_sudo in configuration if elevated permissions are needed")
         except Exception as e:
             logger.error(f"Error checking write permissions: {e}")
             logger.debug(f"Write permissions exception: {e}", exc_info=True)
@@ -676,9 +692,23 @@ class SSHEndpoint(Endpoint):
                 logger.info(
                     f"Ensure that user '{self.config.get('username')}' has write permission to {path}"
                 )
-                logger.info(
-                    "or that sudo is configured properly to allow writing to this location."
-                )
+                
+                # Provide more specific guidance based on sudo configuration
+                use_sudo = self.config.get("ssh_sudo", False)
+                passwordless_sudo = results.get("passwordless_sudo", False)
+                
+                if use_sudo and not passwordless_sudo:
+                    logger.info("OR configure passwordless sudo for write operations:")
+                    logger.info("  sudo visudo")
+                    logger.info(f"  Add: {self.config.get('username')} ALL=(ALL) NOPASSWD: /usr/bin/btrfs")
+                elif not use_sudo:
+                    logger.info("OR enable ssh_sudo in configuration to use elevated permissions:")
+                    logger.info("  Set ssh_sudo: true in your configuration")
+                else:
+                    logger.info("OR ensure sudo is configured properly to allow writing to this location.")
+                    
+                logger.info("\nNote: Write permission errors during diagnostics may be false negatives")
+                logger.info("if password-based sudo is available but passwordless sudo is not configured.")
 
             if not results["btrfs_filesystem"]:
                 logger.info("\nTo fix filesystem type:")
