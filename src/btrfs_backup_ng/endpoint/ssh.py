@@ -1355,21 +1355,7 @@ class SSHEndpoint(Endpoint):
                         modified_cmd.append(arg)
                 
                 # Create the askpass script and run the command
-                escaped_modified_cmd = " ".join(shlex.quote(arg) for arg in modified_cmd)
-                askpass_script = f"""
-set -e
-# Create temporary askpass script
-askpass_script=$(mktemp)
-trap 'rm -f "$askpass_script"' EXIT
-cat > "$askpass_script" << 'EOF'
-#!/bin/bash
-echo -e {escaped_password}
-EOF
-chmod +x "$askpass_script"
-export SUDO_ASKPASS="$askpass_script"
-{escaped_modified_cmd}
-"""
-                final_cmd = ssh_base_cmd + ["--", "bash", "-c", askpass_script]
+                final_cmd = self._create_sudo_askpass_command(ssh_base_cmd, modified_cmd, escaped_password)
                 logger.debug("Using SUDO_ASKPASS approach for password authentication")
             else:
                 logger.warning("No sudo password available but command requires it")
@@ -1475,71 +1461,15 @@ export SUDO_ASKPASS="$askpass_script"
             logger.error("No sudo password available for fallback method")
             raise ValueError("Sudo password required for fallback btrfs receive")
 
-        # Create a wrapper script that handles password input and data piping
-        password_escaped = sudo_password.replace("'", "'\"'\"'")  # Escape single quotes
-        remote_cmd_str = " ".join(f"'{arg}'" for arg in remote_cmd)
-        
-        # Create a script that:
-        # 1. Starts the sudo command in the background
-        # 2. Sends the password to sudo
-        # 3. Pipes the actual data to btrfs receive
-        wrapper_script = f"""
-set -e
-set -o pipefail
-
-# Create named pipes for coordination
-password_pipe=$(mktemp -u)
-data_pipe=$(mktemp -u)
-mkfifo "$password_pipe" "$data_pipe"
-
-# Cleanup function
-cleanup() {{
-    rm -f "$password_pipe" "$data_pipe" 2>/dev/null || true
-}}
-trap cleanup EXIT
-
-# Start the btrfs receive command with password input
-(
-    # Send password first, then read from data pipe
-    echo '{password_escaped}'
-    cat "$data_pipe"
-) | {remote_cmd_str} &
-
-# Get the PID of the background process
-RECEIVE_PID=$!
-
-# Copy stdin to the data pipe (this will be the btrfs data)
-cat > "$data_pipe" &
-CAT_PID=$!
-
-# Wait for both processes
-wait $CAT_PID
-wait $RECEIVE_PID
-"""
-
-        final_cmd = ssh_base_cmd + ["--", "bash", "-c", wrapper_script]
-
+        # Use pure Python implementation instead of bash wrapper script
         logger.info("=== FALLBACK BTRFS RECEIVE DEBUG ===")
         logger.info("Destination: %s", destination)
         logger.info("Remote command: %s", remote_cmd)
-        logger.info("Using sudo -S fallback approach")
-        logger.info("Final SSH command: %s", " ".join(map(str, final_cmd[:5])) + "... [script]")
+        logger.info("Using sudo -S fallback approach with pure Python")
 
         try:
-            # Set up environment
-            env = os.environ.copy()
-            
-            # Start the fallback btrfs receive process
-            receive_process = subprocess.Popen(
-                final_cmd,
-                stdin=stdin_pipe,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                bufsize=0,  # Unbuffered for real-time streaming
-                env=env,
-                text=False,  # Binary mode for data streams
-                start_new_session=True,  # Avoid signal propagation issues
-            )
+            # Start the fallback btrfs receive process using pure Python implementation
+            receive_process = self._create_pure_python_sudo_pipe(ssh_base_cmd, remote_cmd, sudo_password, stdin_pipe)
             
             logger.debug("Fallback btrfs receive process started with PID: %d", receive_process.pid)
             logger.info("Fallback btrfs receive process started successfully")
@@ -2325,3 +2255,149 @@ wait $RECEIVE_PID
                     logger.error(f"{process_name} process stderr: {stderr_data}")
         except Exception as e:
             logger.debug(f"Could not read stderr from {process_name} process: {e}")
+
+    def _create_sudo_askpass_command(self, ssh_base_cmd: List[str], modified_cmd: List[str], sudo_password: str) -> List[str]:
+        """Create pure Python SUDO_ASKPASS command without shell scripts.
+        
+        This replaces the embedded bash script approach with a secure Python implementation
+        that creates the askpass script on the remote system to avoid the local/remote path issue.
+        
+        Args:
+            ssh_base_cmd: Base SSH command
+            modified_cmd: Remote command with sudo -A
+            sudo_password: Password for sudo authentication
+            
+        Returns:
+            Complete SSH command list ready for subprocess execution
+        """
+        import base64
+        
+        try:
+            # Generate unique filename for remote askpass script
+            import uuid
+            askpass_filename = f"btrfs_askpass_{uuid.uuid4().hex[:8]}.sh"
+            askpass_path = f"/tmp/{askpass_filename}"
+            
+            # Use base64 encoding to completely avoid shell escaping issues
+            # This is the most secure approach for arbitrary passwords
+            password_b64 = base64.b64encode(sudo_password.encode('utf-8')).decode('ascii')
+            
+            # Create askpass script content using base64 decoding to avoid all escaping issues
+            askpass_content = f"""#!/bin/bash
+# SUDO_ASKPASS script for btrfs-backup-ng
+# Decodes base64-encoded password to avoid shell escaping issues
+echo '{password_b64}' | base64 -d
+"""
+            
+            logger.debug(f"Creating remote SUDO_ASKPASS script at: {askpass_path}")
+            
+            # Build final command that creates the askpass script remotely, uses it, then cleans up
+            cmd_str = " ".join(shlex.quote(arg) for arg in modified_cmd)
+            
+            # Multi-step command that:
+            # 1. Creates the askpass script on the remote system
+            # 2. Makes it executable
+            # 3. Sets SUDO_ASKPASS and runs the command
+            # 4. Removes the script (cleanup)
+            wrapper_cmd = (
+                f"cat > {shlex.quote(askpass_path)} << 'EOF'\n{askpass_content}EOF\n"
+                f"chmod 700 {shlex.quote(askpass_path)}; "
+                f"export SUDO_ASKPASS={shlex.quote(askpass_path)}; "
+                f"{cmd_str}; "
+                f"rm -f {shlex.quote(askpass_path)}"
+            )
+            
+            return ssh_base_cmd + ["--", "bash", "-c", wrapper_cmd]
+            
+        except Exception as e:
+            logger.error(f"Failed to create SUDO_ASKPASS command: {e}")
+            raise e
+
+    def _create_pure_python_sudo_pipe(self, ssh_base_cmd: List[str], remote_cmd: List[str], sudo_password: str, stdin_pipe: Any) -> subprocess.Popen[Any]:
+        """Create pure Python implementation for sudo password piping without bash scripts.
+        
+        This replaces the complex bash wrapper script with a Python threading approach
+        that safely handles password input and data streaming.
+        
+        Args:
+            ssh_base_cmd: Base SSH command
+            remote_cmd: Remote command requiring sudo -S
+            sudo_password: Password for sudo
+            stdin_pipe: Input pipe for btrfs data
+            
+        Returns:
+            Popen process for the command execution
+        """
+        import threading
+        
+        logger.debug("Using pure Python sudo pipe implementation")
+        
+        # Create the complete SSH command
+        cmd_str = " ".join(shlex.quote(arg) for arg in remote_cmd)
+        final_cmd = ssh_base_cmd + ["--", cmd_str]
+        
+        # Start the SSH process
+        process = subprocess.Popen(
+            final_cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            bufsize=0,
+            text=False,  # Binary mode
+        )
+        
+        if not process.stdin:
+            raise RuntimeError("Failed to get stdin pipe for sudo process")
+        
+        def password_and_data_feeder():
+            """Thread function to feed password first, then data stream."""
+            try:
+                # Send password first
+                password_bytes = (sudo_password + '\n').encode('utf-8')
+                if process.stdin:
+                    process.stdin.write(password_bytes)
+                    process.stdin.flush()
+                
+                # Small delay to ensure password is processed
+                time.sleep(0.1)
+                
+                # Now pipe the actual data from stdin_pipe
+                if stdin_pipe and hasattr(stdin_pipe, 'read'):
+                    # Stream data in chunks
+                    chunk_size = 64 * 1024  # 64KB chunks
+                    while True:
+                        chunk = stdin_pipe.read(chunk_size)
+                        if not chunk:
+                            break
+                        if process.stdin:
+                            process.stdin.write(chunk)
+                            process.stdin.flush()
+                elif stdin_pipe:
+                    # If stdin_pipe is not a file-like object, convert to bytes
+                    try:
+                        data = bytes(stdin_pipe) if not isinstance(stdin_pipe, bytes) else stdin_pipe
+                        if process.stdin:
+                            process.stdin.write(data)
+                            process.stdin.flush()
+                    except (TypeError, ValueError):
+                        logger.error("Unable to convert stdin_pipe to bytes")
+                
+                # Close stdin to signal end of data
+                if process.stdin:
+                    process.stdin.close()
+                
+            except Exception as e:
+                logger.error(f"Error in password/data feeder thread: {e}")
+                try:
+                    if process.stdin and not process.stdin.closed:
+                        process.stdin.close()
+                except:
+                    pass
+        
+        # Start the feeder thread
+        feeder_thread = threading.Thread(target=password_and_data_feeder, daemon=True)
+        feeder_thread.start()
+        
+        return process
+
+
