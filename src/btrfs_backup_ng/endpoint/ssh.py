@@ -140,13 +140,15 @@ class SSHEndpoint(Endpoint):
         self.config["path"] = self.config.get("path", "/")
         self.config["ssh_sudo"] = self.config.get("ssh_sudo", False)
         self.config["passwordless"] = self.config.get("passwordless", False)
+        self.config["simple_progress"] = kwargs.get("simple_progress", True)
 
         # Log important settings for troubleshooting
         logger.info(
-            "SSH endpoint configuration: hostname=%s, sudo=%s, passwordless=%s",
+            "SSH endpoint configuration: hostname=%s, sudo=%s, passwordless=%s, simple_progress=%s",
             self.hostname,
             self.config.get("ssh_sudo", False),
             self.config.get("passwordless", False),
+            self.config.get("simple_progress", True),
         )
 
         # Username handling with clear precedence:
@@ -1776,11 +1778,18 @@ class SSHEndpoint(Endpoint):
         Returns:
             A tuple of (program_name, command_string) or (None, None) if not found
         """
-        # Check for pv with progress display
+        use_simple_progress = self.config.get("simple_progress", True)
+        
+        # Check for pv
         if self._check_command_exists("pv"):
-            logger.debug("Found pv - using it for transfer progress")
-            # Use pv with progress display (don't use -q for quiet, we want progress)
-            return "pv", "pv -p -t -e -r -b"
+            if use_simple_progress:
+                logger.debug("Found pv - using it in simple mode (no progress indicators)")
+                # Use pv quietly without progress display in simple mode
+                return "pv", "pv -q"
+            else:
+                logger.debug("Found pv - using it for transfer progress")
+                # Use pv with progress display (don't use -q for quiet, we want progress)
+                return "pv", "pv -p -t -e -r -b"
 
         # Check for mbuffer as fallback
         if self._check_command_exists("mbuffer"):
@@ -1922,14 +1931,26 @@ class SSHEndpoint(Endpoint):
                 'buffer': buffer_process
             }
             
-            logger.info("SYSTEM: Using enhanced monitoring system for real-time progress...")
-            transfer_succeeded = self._monitor_transfer_progress(
-                processes=processes,
-                start_time=start_time,
-                dest_path=dest_path,
-                snapshot_name=snapshot_name,
-                max_wait_time=max_wait_time
-            )
+            # Choose monitoring system based on configuration
+            use_simple_progress = self.config.get("simple_progress", True)
+            if use_simple_progress:
+                logger.info("SYSTEM: Using simplified monitoring system for basic process tracking (default)...")
+                transfer_succeeded = self._simple_transfer_monitor(
+                    processes=processes,
+                    start_time=start_time,
+                    dest_path=dest_path,
+                    snapshot_name=snapshot_name,
+                    max_wait_time=max_wait_time
+                )
+            else:
+                logger.info("SYSTEM: Using enhanced monitoring system for real-time progress...")
+                transfer_succeeded = self._monitor_transfer_progress(
+                    processes=processes,
+                    start_time=start_time,
+                    dest_path=dest_path,
+                    snapshot_name=snapshot_name,
+                    max_wait_time=max_wait_time
+                )
             
             # Final verification if we timed out
             if not transfer_succeeded:
@@ -2291,7 +2312,7 @@ echo '{password_b64}' | base64 -d
             
             logger.debug(f"Creating remote SUDO_ASKPASS script at: {askpass_path}")
             
-            # Build final command that creates the askpass script remotely, uses it, then cleans up
+            # Build final command that creates the askpass script on the remote system, uses it, then cleans up
             cmd_str = " ".join(shlex.quote(arg) for arg in modified_cmd)
             
             # Multi-step command that:
@@ -2399,5 +2420,110 @@ echo '{password_b64}' | base64 -d
         feeder_thread.start()
         
         return process
+
+    def _simple_transfer_monitor(self, processes: Dict[str, Any], start_time: float, dest_path: str, snapshot_name: str, max_wait_time: int = 3600) -> bool:
+        """Simplified transfer monitoring with basic process tracking.
+        
+        This method provides basic process monitoring that just tracks process completion
+        and exit codes without the complex threading and real-time progress monitoring.
+        
+        Args:
+            processes: Dict containing 'send', 'receive', and optionally 'buffer' processes
+            start_time: Transfer start time
+            dest_path: Destination path for verification
+            snapshot_name: Name of snapshot being transferred
+            max_wait_time: Maximum time to wait in seconds
+            
+        Returns:
+            bool: True if transfer succeeded, False otherwise
+        """
+        logger.info("Using simplified transfer monitoring...")
+        
+        send_process = processes['send']
+        receive_process = processes['receive']
+        buffer_process = processes.get('buffer')
+        
+        # Type guards to ensure processes are not None
+        if send_process is None or receive_process is None:
+            logger.error("CRITICAL: Required processes are None")
+            return False
+        
+        # Wait for processes to complete
+        processes_to_wait = [send_process, receive_process]
+        if buffer_process:
+            processes_to_wait.append(buffer_process)
+        
+        logger.info("STATUS: Waiting for transfer processes to complete...")
+        
+        # Simple polling loop with timeout
+        while time.time() - start_time < max_wait_time:
+            all_finished = True
+            
+            for proc in processes_to_wait:
+                if proc.poll() is None:  # Still running
+                    all_finished = False
+                    break
+            
+            if all_finished:
+                break
+                
+            # Log status every 30 seconds
+            elapsed = time.time() - start_time
+            if int(elapsed) % 30 == 0:
+                active_count = sum(1 for proc in processes_to_wait if proc.poll() is None)
+                logger.info(f"STATUS: Transfer in progress... ({elapsed:.0f}s elapsed, {active_count} processes active)")
+                
+            time.sleep(1)
+        
+        # Check results
+        elapsed_final = time.time() - start_time
+        
+        # Check send process
+        send_code = send_process.returncode
+        if send_code != 0:
+            logger.error(f"FAILED: Send process failed with exit code {send_code}")
+            self._log_simple_process_error(send_process, "send")
+            return False
+        
+        logger.info("SUCCESS: Send process completed successfully")
+        
+        # Check receive process
+        receive_code = receive_process.returncode
+        if receive_code != 0:
+            logger.warning(f"WARNING: Receive process exit code: {receive_code}")
+            # Don't fail immediately - some exit codes may be acceptable
+        else:
+            logger.info("SUCCESS: Receive process completed successfully")
+        
+        # Check buffer process if present
+        if buffer_process:
+            buffer_code = buffer_process.returncode
+            if buffer_code != 0:
+                logger.warning(f"WARNING: Buffer process exit code: {buffer_code}")
+            else:
+                logger.info("SUCCESS: Buffer process completed successfully")
+        
+        # Final verification
+        logger.info("STATUS: Performing final verification...")
+        try:
+            if self._verify_snapshot_exists(dest_path, snapshot_name):
+                logger.info(f"SUCCESS: Transfer completed successfully in {elapsed_final:.1f}s")
+                return True
+            else:
+                logger.error("FAILED: Transfer failed - snapshot not found on remote host")
+                return False
+        except Exception as e:
+            logger.error(f"ERROR: Final verification failed: {e}")
+            return False
+
+    def _log_simple_process_error(self, process: Any, process_name: str) -> None:
+        """Log error information for a failed process in simple monitoring mode."""
+        try:
+            if hasattr(process, 'stderr') and process.stderr:
+                stderr_data = process.stderr.read().decode('utf-8', errors='replace')
+                if stderr_data.strip():
+                    logger.error(f"{process_name} process stderr: {stderr_data}")
+        except Exception as e:
+            logger.debug(f"Could not read stderr from {process_name} process: {e}")
 
 

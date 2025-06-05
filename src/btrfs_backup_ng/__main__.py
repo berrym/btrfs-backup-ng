@@ -772,6 +772,20 @@ files is allowed as well."""
         help="Explicitly specify the SSH username to use when connecting to remote hosts. "
         "Overrides usernames specified in SSH URLs.",
     )
+    group.add_argument(
+        "--simple-progress",
+        action="store_true",
+        default=True,
+        help="Use simplified progress monitoring for SSH transfers (default). "
+        "This provides basic process tracking with exit code monitoring and optional pv usage without progress indicators.",
+    )
+    group.add_argument(
+        "--advanced-progress",
+        action="store_true",
+        default=False,
+        help="Use advanced real-time monitoring system for SSH transfers instead of the simplified monitoring. "
+        "This provides detailed progress bars, threading-based monitoring, and comprehensive status updates.",
+    )
 
     group = parser.add_argument_group("Miscellaneous options")
     group.add_argument(
@@ -864,6 +878,15 @@ files is allowed as well."""
         options["num_backups"] = int(options.get("num_backups", 0))
     except Exception:
         options["num_backups"] = 0
+
+    # Handle progress monitoring mode selection
+    # Default is simple progress monitoring
+    if options.get("advanced_progress", False):
+        # User explicitly requested advanced monitoring
+        options["simple_progress"] = False
+    else:
+        # Default to simple progress monitoring
+        options["simple_progress"] = True
 
     # Process SSH identity file if provided
     if "ssh_identity_file" in options and options["ssh_identity_file"]:
@@ -1315,6 +1338,7 @@ def build_endpoint_kwargs(options):
         "fs_checks": not options["skip_fs_checks"],
         "ssh_opts": options["ssh_opt"],
         "ssh_sudo": options["ssh_sudo"],
+        "simple_progress": options.get("simple_progress", True),
         # DO NOT include 'path' here!
     }
 
