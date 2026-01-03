@@ -283,11 +283,6 @@ class SSHMasterManager:
         cmd.insert(1, "-tt")
         cmd.insert(2, "-MNf")
 
-        logger.info(
-            f"Attempting SSH password authentication for {self.username}@{self.hostname}"
-        )
-        logger.info("You may be prompted for your SSH password...")
-
         try:
             # Run without capturing output to allow interactive password prompt
             result = subprocess.run(
@@ -338,23 +333,24 @@ class SSHMasterManager:
             if self.allow_password_auth:
                 logger.debug("Key auth failed, attempting password fallback...")
 
-                # Try with password from env or prompt
-                password = self._get_ssh_password()
-                if password and self._has_sshpass():
-                    logger.debug("Trying sshpass password authentication...")
-                    if self._try_password_auth(env, password):
-                        return True
-
-                    # If password failed, try prompting for new one
-                    if self._password_auth_failed:
-                        logger.warning(
-                            "SSH password authentication failed, trying again..."
-                        )
-                        password = self._get_ssh_password(retry=True)
-                        if password and self._try_password_auth(env, password):
+                # If sshpass is available, try password from env or prompt
+                if self._has_sshpass():
+                    password = self._get_ssh_password()
+                    if password:
+                        logger.debug("Trying sshpass password authentication...")
+                        if self._try_password_auth(env, password):
                             return True
 
-                # Last resort: interactive password prompt
+                        # If password failed, try prompting for new one
+                        if self._password_auth_failed:
+                            logger.warning(
+                                "SSH password authentication failed, trying again..."
+                            )
+                            password = self._get_ssh_password(retry=True)
+                            if password and self._try_password_auth(env, password):
+                                return True
+
+                # Interactive password prompt (let SSH prompt natively)
                 if self._try_interactive_password_auth(env):
                     return True
 

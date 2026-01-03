@@ -424,10 +424,18 @@ def sync_snapshots(
     """Synchronizes snapshots from source to destination."""
     logger.info(__util__.log_heading(f"  To {destination_endpoint} ..."))
 
+    # Always list all source snapshots - needed for finding parents for incremental transfers
+    all_source_snapshots = source_endpoint.list_snapshots()
+
+    # Determine which snapshots to transfer
     if snapshot is None:
-        source_snapshots = source_endpoint.list_snapshots()
+        source_snapshots = all_source_snapshots
+        snapshots_to_transfer = None  # Will be determined by plan_transfers
     else:
-        source_snapshots = [snapshot]
+        # When a specific snapshot is passed, use all source snapshots for parent
+        # detection, but only transfer the specified one
+        source_snapshots = all_source_snapshots
+        snapshots_to_transfer = [snapshot]  # Only transfer this specific snapshot
 
     destination_snapshots = destination_endpoint.list_snapshots()
     # destination_snapshots = delete_corrupt_snapshots(  # REMOVE THIS LINE
@@ -456,9 +464,19 @@ def sync_snapshots(
     )
 
     try:
-        to_transfer = plan_transfers(
-            source_snapshots, destination_snapshots, keep_num_backups
-        )
+        if snapshots_to_transfer is not None:
+            # Specific snapshot(s) requested - only transfer those that aren't already on dest
+            to_transfer = [
+                snap
+                for snap in snapshots_to_transfer
+                if snap not in destination_snapshots
+            ]
+            logger.debug("Using specified snapshots for transfer: %d", len(to_transfer))
+        else:
+            # No specific snapshot - use plan_transfers to determine what to send
+            to_transfer = plan_transfers(
+                source_snapshots, destination_snapshots, keep_num_backups
+            )
         logger.debug("Snapshots planned for transfer: %d", len(to_transfer))
         for i, snap in enumerate(to_transfer):
             logger.debug("  ToTransfer[%d]: %s", i, snap)
@@ -553,7 +571,7 @@ def do_sync_transfer(transfer_objs, **kwargs):
                 snapshot
                 for snapshot in source_snapshots
                 if snapshot in destination_snapshots
-                and snapshot.get_id() not in snapshot.locks
+                and snapshot.get_name() not in snapshot.locks
             ]
             logger.debug(
                 "Found %d present snapshots for incremental transfer",
@@ -612,21 +630,12 @@ def do_sync_transfer(transfer_objs, **kwargs):
             # Update destination snapshot list
             logger.debug("Adding snapshot %s to destination", best_snapshot)
             destination_endpoint.add_snapshot(best_snapshot)
-            # Skip snapshot list refresh for SSH endpoints with password auth to avoid hanging
-            # The transfer itself is already verified by send_receive
-            skip_refresh = hasattr(
-                destination_endpoint, "config"
-            ) and destination_endpoint.config.get("ssh_password_fallback", False)
-            if not skip_refresh:
-                try:
-                    destination_endpoint.list_snapshots()
-                except Exception as e:
-                    logger.debug(
-                        "Post-transfer snapshot list refresh failed (non-fatal): %s", e
-                    )
-            else:
+            # Refresh snapshot list after transfer
+            try:
+                destination_endpoint.list_snapshots()
+            except Exception as e:
                 logger.debug(
-                    "Skipping post-transfer list_snapshots for password auth mode"
+                    "Post-transfer snapshot list refresh failed (non-fatal): %s", e
                 )
 
         except __util__.SnapshotTransferError as e:
@@ -808,12 +817,13 @@ files is allowed as well."""
         "Overrides usernames specified in SSH URLs.",
     )
     group.add_argument(
-        "--ssh-password-fallback",
+        "--no-password-auth",
         action="store_true",
         default=False,
-        help="Enable SSH password authentication fallback when key-based authentication fails. "
-        "Password can be provided via BTRFS_BACKUP_SSH_PASSWORD environment variable, "
-        "or interactively if running in a terminal. Requires 'sshpass' for non-interactive use.",
+        help="Disable SSH password authentication prompts. By default, if key-based auth "
+        "fails, you'll be prompted for a password. Use this flag for automation/scripts "
+        "where you want to fail immediately instead. "
+        "Can also be set via BTRFS_BACKUP_NO_PASSWORD_AUTH=1 environment variable.",
     )
     group.add_argument(
         "--simple-progress",
@@ -1034,21 +1044,11 @@ def run_task(options):
     time.sleep(1)
 
     # For SSH endpoints, perform one final comprehensive verification
-    # Skip verification for password auth mode to avoid hanging
     logger.debug("Performing final verification for SSH endpoints")
     for destination_endpoint in destination_endpoints:
         if hasattr(destination_endpoint, "_is_remote") and getattr(
             destination_endpoint, "_is_remote", False
         ):
-            # Skip verification for password auth mode
-            if hasattr(
-                destination_endpoint, "config"
-            ) and destination_endpoint.config.get("ssh_password_fallback", False):
-                logger.debug(
-                    "Skipping final verification for password auth mode - transfer already verified"
-                )
-                continue
-
             try:
                 logger.debug(f"Verifying SSH endpoint: {destination_endpoint}")
                 source_snapshots = source_endpoint.list_snapshots()
@@ -1141,12 +1141,6 @@ def cleanup_snapshots(source_endpoint, destination_endpoints, options):
 
     if options.get("num_backups", 0) > 0:
         for destination_endpoint in destination_endpoints:
-            # Skip cleanup for password auth mode to avoid hanging
-            if hasattr(
-                destination_endpoint, "config"
-            ) and destination_endpoint.config.get("ssh_password_fallback", False):
-                logger.debug("Skipping remote cleanup for password auth mode")
-                continue
             try:
                 destination_endpoint.delete_old_snapshots(options["num_backups"])
             except __util__.AbortError as e:
@@ -1338,6 +1332,15 @@ def prepare_destination_endpoints(options, source_endpoint):
 
 def build_endpoint_kwargs(options):
     """Build common kwargs for endpoints."""
+    # Determine if password auth should be allowed
+    # Default: enabled (automatic fallback to password if keys fail)
+    # Disabled via: --no-password-auth flag or BTRFS_BACKUP_NO_PASSWORD_AUTH env var
+    no_password_auth = options.get("no_password_auth", False) or os.environ.get(
+        "BTRFS_BACKUP_NO_PASSWORD_AUTH", ""
+    ).lower() in ("1", "true", "yes")
+
+    allow_password_auth = not no_password_auth
+
     kwargs = {
         "snap_prefix": options.get("snapshot_prefix", f"{os.uname()[1]}-"),
         "convert_rw": options["convert_rw"],
@@ -1347,7 +1350,7 @@ def build_endpoint_kwargs(options):
         "ssh_opts": options["ssh_opt"],
         "ssh_sudo": options["ssh_sudo"],
         "simple_progress": options.get("simple_progress", True),
-        "ssh_password_fallback": options.get("ssh_password_fallback", False),
+        "ssh_password_fallback": allow_password_auth,  # Now True by default
         # DO NOT include 'path' here!
     }
 

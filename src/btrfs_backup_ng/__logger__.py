@@ -98,13 +98,15 @@ def create_logger(live_layout, level=None) -> None:
         rich_handler = RichHandler(console=cons, show_path=False)
 
     rich_handler.setLevel(log_level)
+    # Set a simple formatter that only shows the message (no process name, filename, etc.)
+    rich_handler.setFormatter(logging.Formatter("%(message)s"))
     logger.handlers.clear()
     logger.propagate = False
     logger.addHandler(rich_handler)
     logger.setLevel(log_level)
 
     logging.basicConfig(
-        format="(%(processName)s) %(message)s",
+        format="%(message)s",
         datefmt="%H:%M:%S",
         level=log_level,
         handlers=[rich_handler],

@@ -24,12 +24,21 @@ import getpass
 import os
 import shlex
 import subprocess
+import threading
 import time
 import uuid
 from pathlib import Path
 from subprocess import CompletedProcess
 from threading import Lock
 from typing import Any, Dict, List, Optional, Tuple, TypeVar, cast
+
+try:
+    import paramiko
+
+    PARAMIKO_AVAILABLE = True
+except ImportError:
+    paramiko = None  # type: ignore
+    PARAMIKO_AVAILABLE = False
 
 try:
     import pwd
@@ -146,7 +155,6 @@ class SSHEndpoint(Endpoint):
         self.config["ssh_sudo"] = self.config.get("ssh_sudo", False)
         self.config["passwordless"] = self.config.get("passwordless", False)
         self.config["simple_progress"] = kwargs.get("simple_progress", True)
-        # Preserve ssh_password_fallback from original config or kwargs
         self.config["ssh_password_fallback"] = config.get(
             "ssh_password_fallback", False
         ) or kwargs.get("ssh_password_fallback", False)
@@ -291,11 +299,12 @@ class SSHEndpoint(Endpoint):
             self.config["username"],
             self.config["port"],
         )
-        # Check if password fallback is enabled via config or environment
-        allow_password = self.config.get("ssh_password_fallback", False)
-        if os.environ.get("BTRFS_BACKUP_SSH_PASSWORD"):
-            allow_password = True
-            logger.debug("SSH password fallback enabled via environment variable")
+        # Allow SSH password auth if flag is set or environment variable is set
+        allow_password = self.config.get("ssh_password_fallback", False) or bool(
+            os.environ.get("BTRFS_BACKUP_SSH_PASSWORD")
+        )
+        if allow_password:
+            logger.debug("SSH password auth enabled")
 
         self.ssh_manager: SSHMasterManager = SSHMasterManager(
             hostname=self.hostname,
@@ -332,30 +341,16 @@ class SSHEndpoint(Endpoint):
             f"[SSHEndpoint.__init__] Final ssh_sudo: {self.config.get('ssh_sudo', False)}"
         )
 
-        # Try to run initial diagnostics to detect passwordless sudo capability
-        # This will only work if the SSH connection is available, but we don't want
-        # initialization to fail if the remote host is not reachable
-        logger.debug(
-            "Attempting to run initial diagnostics for passwordless sudo detection"
-        )
-        try:
-            # Try a connection test with adequate timeout for password entry
-            result = self._exec_remote_command(["true"], timeout=30, check=False)
-            if result.returncode == 0:
-                logger.debug("SSH connection test successful, running full diagnostics")
-                diag_path = self.config.get("path", "/")
-                self._run_diagnostics(path=diag_path)
-                logger.debug("Initial diagnostics completed successfully")
-            else:
-                logger.debug("SSH connection test failed, skipping initial diagnostics")
-        except Exception as e:
-            logger.debug(
-                "SSH connection not available during initialization, will run diagnostics later: %s",
-                e,
-            )
-            # This is normal - diagnostics will run automatically during first transfer
+        # Password collection is deferred to _prepare() -> start_master()
+        # This allows key-based auth to be tried first, and only prompts for
+        # password if keys fail. The SSHMasterManager handles this flow.
 
-        logger.debug("SSHEndpoint initialization completed")
+        # Skip diagnostics during __init__ - they will run in _prepare() after
+        # the SSH master connection is established. This avoids connection issues
+        # and redundant password prompts.
+        logger.debug(
+            "SSHEndpoint initialization completed (diagnostics deferred to _prepare)"
+        )
 
     def _prepare(self) -> None:
         """Prepare the SSH endpoint by starting the master connection.
@@ -366,6 +361,9 @@ class SSHEndpoint(Endpoint):
         """
         logger.debug("Preparing SSH endpoint, starting master connection...")
 
+        # Password should already be collected in __init__ if ssh_password_fallback is enabled
+        # This is just a fallback in case _prepare is called without __init__ password collection
+
         # Start the SSH master connection (handles password fallback if needed)
         if not self.ssh_manager.start_master():
             logger.error(
@@ -373,22 +371,24 @@ class SSHEndpoint(Endpoint):
             )
             raise ConnectionError(
                 f"Could not establish SSH connection to {self.hostname}. "
-                "Check SSH credentials or use --ssh-password-fallback for password auth."
+                "Check SSH credentials (keys or password)."
             )
 
         logger.debug("SSH master connection established successfully")
 
-        # For password fallback mode with sudo, prompt for sudo password early
-        # This ensures the password is cached before any commands need it
-        if self.config.get("ssh_password_fallback") and self.config.get("ssh_sudo"):
-            logger.debug(
-                "Password fallback mode with sudo: prompting for sudo password early"
+        # After master connection, sync password caches
+        # If SSH master collected a password, use it for sudo too (common scenario)
+        if (
+            hasattr(self.ssh_manager, "_cached_ssh_password")
+            and self.ssh_manager._cached_ssh_password
+            and not self._cached_sudo_password
+        ):
+            logger.debug("Syncing SSH password to sudo cache (same credentials)")
+            self._cached_sudo_password = self.ssh_manager._cached_ssh_password
+            cache_key = f"{self.config.get('username', 'unknown')}@{self.hostname}"
+            SSHEndpoint._sudo_password_cache[cache_key] = (
+                self.ssh_manager._cached_ssh_password
             )
-            sudo_password = self._get_sudo_password()
-            if sudo_password:
-                logger.debug("Sudo password cached for subsequent commands")
-            else:
-                logger.warning("No sudo password provided - sudo commands may fail")
 
         # Now run diagnostics to detect capabilities using the actual configured path
         try:
@@ -636,54 +636,45 @@ class SSHEndpoint(Endpoint):
             logger.error(f"Error checking btrfs command: {e}")
             logger.debug(f"btrfs command check exception: {e}", exc_info=True)
 
-        # Test passwordless sudo (skip if using password fallback with askpass)
-        if self.config.get("ssh_password_fallback", False):
-            # When using password fallback, we use sudo -S with password via stdin
-            # Skip the passwordless tests but keep passwordless_sudo=False so sudo -S is used
-            logger.debug(
-                "Password fallback mode: skipping passwordless sudo tests (will use sudo -S)"
+        # Test passwordless sudo
+        logger.debug("Testing passwordless sudo...")
+        try:
+            # Use retry mechanism for sudo testing to handle potential authentication issues
+            result = self._exec_remote_command_with_retry(
+                ["sudo", "-n", "true"], max_retries=2, check=False
             )
-            results["passwordless_sudo"] = False  # Use sudo -S, not sudo -n
-            results["sudo_btrfs"] = True  # Assume it works with password
-        else:
-            logger.debug("Testing passwordless sudo...")
-            try:
-                # Use retry mechanism for sudo testing to handle potential authentication issues
-                result = self._exec_remote_command_with_retry(
-                    ["sudo", "-n", "true"], max_retries=2, check=False
+            results["passwordless_sudo"] = result.returncode == 0
+            if results["passwordless_sudo"]:
+                logger.debug("Passwordless sudo is available")
+            else:
+                logger.warning("Passwordless sudo is not available")
+                logger.debug(
+                    f"Passwordless sudo stderr: {result.stderr.decode() if result.stderr else 'None'}"
                 )
-                results["passwordless_sudo"] = result.returncode == 0
-                if results["passwordless_sudo"]:
-                    logger.debug("Passwordless sudo is available")
-                else:
-                    logger.warning("Passwordless sudo is not available")
-                    logger.debug(
-                        f"Passwordless sudo stderr: {result.stderr.decode() if result.stderr else 'None'}"
-                    )
-            except Exception as e:
-                logger.error(f"Error checking passwordless sudo: {e}")
-                logger.debug(f"Passwordless sudo exception: {e}", exc_info=True)
+        except Exception as e:
+            logger.error(f"Error checking passwordless sudo: {e}")
+            logger.debug(f"Passwordless sudo exception: {e}", exc_info=True)
 
-            # Test sudo with btrfs
-            logger.debug("Testing sudo with btrfs command...")
-            try:
-                # Use retry mechanism for sudo btrfs testing to handle potential authentication issues
-                result = self._exec_remote_command_with_retry(
-                    ["sudo", "-n", "btrfs", "--version"], max_retries=2, check=False
+        # Test sudo with btrfs
+        logger.debug("Testing sudo with btrfs command...")
+        try:
+            # Use retry mechanism for sudo btrfs testing to handle potential authentication issues
+            result = self._exec_remote_command_with_retry(
+                ["sudo", "-n", "btrfs", "--version"], max_retries=2, check=False
+            )
+            results["sudo_btrfs"] = result.returncode == 0
+            if results["sudo_btrfs"]:
+                logger.debug("Sudo btrfs command works")
+                if result.stdout:
+                    logger.debug(f"btrfs version: {result.stdout.decode().strip()}")
+            else:
+                logger.warning("Cannot run btrfs with passwordless sudo")
+                logger.debug(
+                    f"Sudo btrfs stderr: {result.stderr.decode() if result.stderr else 'None'}"
                 )
-                results["sudo_btrfs"] = result.returncode == 0
-                if results["sudo_btrfs"]:
-                    logger.debug("Sudo btrfs command works")
-                    if result.stdout:
-                        logger.debug(f"btrfs version: {result.stdout.decode().strip()}")
-                else:
-                    logger.warning("Cannot run btrfs with passwordless sudo")
-                    logger.debug(
-                        f"Sudo btrfs stderr: {result.stderr.decode() if result.stderr else 'None'}"
-                    )
-            except Exception as e:
-                logger.error(f"Error checking sudo btrfs: {e}")
-                logger.debug(f"Sudo btrfs exception: {e}", exc_info=True)
+        except Exception as e:
+            logger.error(f"Error checking sudo btrfs: {e}")
+            logger.debug(f"Sudo btrfs exception: {e}", exc_info=True)
 
         # Test write permissions
         logger.debug(f"Testing write permissions to path: {path}")
@@ -975,6 +966,22 @@ class SSHEndpoint(Endpoint):
             )
             return self._cached_sudo_password
 
+        # Check SSH master manager's cache (often same password for SSH and sudo)
+        if not retry_on_failure:
+            if hasattr(self, "ssh_manager") and hasattr(
+                self.ssh_manager, "_cached_ssh_password"
+            ):
+                if self.ssh_manager._cached_ssh_password:
+                    logger.debug(
+                        "Using SSH password from master cache as sudo password (same credentials)"
+                    )
+                    # Cache it for future use
+                    self._cached_sudo_password = self.ssh_manager._cached_ssh_password
+                    SSHEndpoint._sudo_password_cache[cache_key] = (
+                        self.ssh_manager._cached_ssh_password
+                    )
+                    return self.ssh_manager._cached_ssh_password
+
         sudo_pw_env = os.environ.get("BTRFS_BACKUP_SUDO_PASSWORD")
         if sudo_pw_env and not retry_on_failure:
             logger.debug(
@@ -1045,6 +1052,81 @@ class SSHEndpoint(Endpoint):
                 "Alternatively, configure passwordless sudo for btrfs commands on the remote host"
             )
             return None
+
+    def _get_ssh_password(self, prompt: bool = False) -> Optional[str]:
+        """Get SSH password from cache, environment, or prompt user.
+
+        Checks multiple sources in order:
+        1. SSH master manager's cached password (already entered for connection)
+        2. Instance sudo password cache (often same as SSH password)
+        3. Class-level sudo password cache
+        4. Instance SSH cache
+        5. Environment variable
+        6. Interactive prompt (if requested)
+
+        Args:
+            prompt: If True, prompt user interactively if no cached/env password
+
+        Returns:
+            SSH password or None if not available
+        """
+        # Check SSH master manager's cache first (password already entered for connection)
+        if hasattr(self, "ssh_manager") and hasattr(
+            self.ssh_manager, "_cached_ssh_password"
+        ):
+            if self.ssh_manager._cached_ssh_password:
+                logger.debug("Using SSH password from master connection cache")
+                return self.ssh_manager._cached_ssh_password
+
+        # Check sudo password cache (often same as SSH password)
+        if self._cached_sudo_password:
+            logger.debug("Using sudo password as SSH password (same credentials)")
+            return self._cached_sudo_password
+
+        # Check class-level sudo cache
+        cache_key = f"{self.config.get('username', 'unknown')}@{self.hostname}"
+        if cache_key in SSHEndpoint._sudo_password_cache:
+            logger.debug("Using class-level sudo cache as SSH password")
+            return SSHEndpoint._sudo_password_cache[cache_key]
+
+        # Check instance SSH cache
+        ssh_cache_key = f"ssh_{cache_key}"
+        if (
+            hasattr(self, "_ssh_password_cache")
+            and ssh_cache_key in self._ssh_password_cache
+        ):
+            logger.debug("Using cached SSH password from instance cache")
+            return self._ssh_password_cache[ssh_cache_key]
+
+        # Check environment variable
+        ssh_password = os.environ.get("BTRFS_BACKUP_SSH_PASSWORD")
+        if ssh_password:
+            logger.debug("Using SSH password from BTRFS_BACKUP_SSH_PASSWORD env var")
+            return ssh_password
+
+        # Prompt interactively if requested
+        if prompt:
+            try:
+                ssh_user = self.config.get("username", "unknown")
+                password = getpass.getpass(
+                    f"SSH password for {ssh_user}@{self.hostname}: "
+                )
+                if password:
+                    if not hasattr(self, "_ssh_password_cache"):
+                        self._ssh_password_cache: Dict[str, str] = {}
+                    self._ssh_password_cache[ssh_cache_key] = password
+                    # Also cache in SSH master manager if available
+                    if hasattr(self, "ssh_manager"):
+                        self.ssh_manager._cached_ssh_password = password
+                    # Also cache as sudo password (often same)
+                    self._cached_sudo_password = password
+                    SSHEndpoint._sudo_password_cache[cache_key] = password
+                    logger.debug("SSH password collected and cached")
+                    return password
+            except Exception as e:
+                logger.debug(f"Could not get SSH password interactively: {e}")
+
+        return None
 
     def _exec_remote_command_with_retry(
         self, command: List[Any], max_retries: int = 1, **kwargs: Any
@@ -1219,9 +1301,9 @@ class SSHEndpoint(Endpoint):
         if using_sudo_with_stdin:
             sudo_password = self._get_sudo_password()
             if sudo_password:
-                logger.debug("Supplying sudo password via stdin for remote command.")
-                logger.info(
-                    f"PASSWORD DEBUG: Got password of length {len(sudo_password)}, setting as input"
+                logger.debug("Supplying sudo password via stdin for remote command")
+                logger.debug(
+                    f"Got cached password of length {len(sudo_password)}, setting as input"
                 )
                 kwargs["input"] = (sudo_password + "\n").encode()
                 # Remove stdin if present, as input and stdin cannot both be set
@@ -1461,277 +1543,65 @@ class SSHEndpoint(Endpoint):
     def _btrfs_receive(
         self, destination: str, stdin_pipe: Any
     ) -> subprocess.Popen[Any]:
-        """Run btrfs receive on the remote host using integrated Python approach."""
+        """Run btrfs receive on the remote host.
+
+        This method assumes sudo credentials are already cached (either passwordless
+        sudo is available, or credentials were primed via _prime_remote_sudo).
+
+        Args:
+            destination: Remote path to receive the snapshot
+            stdin_pipe: Pipe providing btrfs send stream data
+
+        Returns:
+            Popen process for the receive command
+        """
         logger.debug("Preparing btrfs receive command for destination: %s", destination)
 
-        # First ensure the destination directory exists and is writable
-        destination_dir = os.path.dirname(destination)
-        if destination_dir:
-            try:
-                logger.debug(
-                    "Ensuring destination directory exists: %s", destination_dir
-                )
-                mkdir_cmd = ["mkdir", "-p", destination_dir]
-                # Use retry mechanism for mkdir command as it may require sudo authentication
-                result = self._exec_remote_command_with_retry(
-                    mkdir_cmd, max_retries=2, check=False, timeout=15
-                )
-                if result.returncode != 0:
-                    logger.warning(
-                        "Could not create destination directory: %s", destination_dir
-                    )
-            except Exception as e:
-                logger.warning("Error creating destination directory: %s", e)
+        # Build the SSH command for remote btrfs receive
+        control_path = str(self.ssh_manager.control_path)
+        ssh_user = self.config.get("username", "root")
+        ssh_port = self.config.get("port")
+        remote_host = f"{ssh_user}@{self.hostname}"
 
-        # Build the btrfs receive command - _build_remote_command will handle sudo logic
-        receive_cmd = ["btrfs", "receive", destination]
-        logger.debug("Base btrfs receive command: %s", receive_cmd)
-
-        # Get the properly constructed remote command (with correct sudo handling)
-        remote_cmd = self._build_remote_command(receive_cmd)
-        logger.debug("Remote command after build: %s", remote_cmd)
-
-        # Check if we need password authentication
-        using_sudo_with_stdin = any(arg == "-S" for arg in remote_cmd)
-
-        # Determine TTY requirements
-        needs_tty = False
-        if self.config.get("ssh_sudo", False):
-            # Only need TTY if using sudo without password input via stdin
-            if not using_sudo_with_stdin:
-                needs_tty = True
-                logger.debug("SSH sudo enabled without password input - requiring TTY")
-            else:
-                logger.debug("SSH sudo enabled with password input - TTY not needed")
-
-        # Get SSH base command with appropriate TTY settings
-        ssh_base_cmd = self.ssh_manager.get_ssh_base_cmd(force_tty=needs_tty)
-
-        # Add SSH options for reliability and proper authentication
-        ssh_options = [
+        # Build SSH command with ControlMaster
+        ssh_cmd = [
+            "ssh",
+            "-o",
+            f"ControlPath={control_path}",
+            "-o",
+            "BatchMode=yes",
             "-o",
             "ServerAliveInterval=5",
             "-o",
             "ServerAliveCountMax=3",
-            "-o",
-            "TCPKeepAlive=yes",
-            "-o",
-            "ConnectTimeout=10",
-            "-o",
-            "ExitOnForwardFailure=yes",
         ]
+        if ssh_port:
+            ssh_cmd.extend(["-p", str(ssh_port)])
 
-        # Configure TTY and authentication options
-        if needs_tty:
-            ssh_options.extend(
-                [
-                    "-o",
-                    "RequestTTY=yes",
-                    "-o",
-                    "BatchMode=no",  # Allow interactive prompts
-                ]
-            )
-            logger.debug("Adding TTY-related SSH options for interactive sudo")
+        # Add remote command - use sudo if configured
+        if self.config.get("ssh_sudo", False):
+            ssh_cmd.extend([remote_host, "sudo", "btrfs", "receive", destination])
         else:
-            # When using password via stdin, ensure no TTY conflicts
-            ssh_options.extend(
-                [
-                    "-o",
-                    "RequestTTY=no",
-                    "-o",
-                    "BatchMode=yes",  # Non-interactive mode
-                ]
-            )
-            logger.debug("Using non-interactive SSH mode for password input")
+            ssh_cmd.extend([remote_host, "btrfs", "receive", destination])
 
-        # Insert SSH options
-        for i, opt in enumerate(ssh_options):
-            ssh_base_cmd.insert(i + 1, opt)
-
-        # For password authentication, we need to handle it specially
-        if using_sudo_with_stdin:
-            sudo_password = self._get_sudo_password()
-            if sudo_password:
-                # Use SUDO_ASKPASS approach to completely avoid stdin conflicts
-                # This creates a temporary script that returns the password when called
-                escaped_password = shlex.quote(sudo_password)
-
-                # Modify the command to use sudo -A instead of sudo -S
-                modified_cmd: List[str] = []
-                for arg in remote_cmd:
-                    if arg == "sudo" and len(modified_cmd) == 0:
-                        # First element is sudo, check if next is -S
-                        idx = remote_cmd.index(arg)
-                        if idx + 1 < len(remote_cmd) and remote_cmd[idx + 1] == "-S":
-                            modified_cmd.append("sudo")
-                            continue
-                    elif (
-                        arg == "-S"
-                        and len(modified_cmd) > 0
-                        and modified_cmd[-1] == "sudo"
-                    ):
-                        # Skip the -S flag, add -A instead
-                        modified_cmd.append("-A")
-                    else:
-                        modified_cmd.append(arg)
-
-                # Create the askpass script and run the command
-                final_cmd = self._create_sudo_askpass_command(
-                    ssh_base_cmd, modified_cmd, escaped_password
-                )
-                logger.debug("Using SUDO_ASKPASS approach for password authentication")
-            else:
-                logger.warning("No sudo password available but command requires it")
-                logger.info(
-                    "Consider setting BTRFS_BACKUP_SUDO_PASSWORD environment variable"
-                )
-                logger.info("or configuring passwordless sudo for btrfs commands")
-                # Fall back to direct command (will likely fail)
-                final_cmd = ssh_base_cmd + ["--"] + remote_cmd
-        else:
-            # No password needed, use direct command
-            final_cmd = ssh_base_cmd + ["--"] + remote_cmd
-
-        logger.debug("=== INTEGRATED BTRFS RECEIVE DEBUG ===")
-        logger.debug("Destination: %s", destination)
-        logger.debug("Remote command: %s", remote_cmd)
-        logger.debug("Using sudo with password input: %s", using_sudo_with_stdin)
-        logger.debug("Needs TTY: %s", needs_tty)
-        logger.debug("Final SSH command: %s", " ".join(map(str, final_cmd)))
+        logger.debug("SSH receive command: %s", " ".join(ssh_cmd))
 
         try:
-            # Set up environment
-            env = os.environ.copy()
-
-            # Start the btrfs receive process
             receive_process = subprocess.Popen(
-                final_cmd,
+                ssh_cmd,
                 stdin=stdin_pipe,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                bufsize=0,  # Unbuffered for real-time streaming
-                env=env,
-                text=False,  # Binary mode for data streams
-                start_new_session=True,  # Avoid signal propagation issues
+                bufsize=0,
             )
 
             logger.debug(
                 "btrfs receive process started with PID: %d", receive_process.pid
             )
-            logger.debug("Integrated btrfs receive process started successfully")
-
             return receive_process
 
         except Exception as e:
-            logger.error("Failed to start integrated btrfs receive process: %s", e)
-
-            # Check if we should try the fallback method
-            use_fallback = self.config.get(
-                "ssh_sudo_fallback", False
-            ) or os.environ.get("BTRFS_BACKUP_SUDO_FALLBACK", "").lower() in (
-                "1",
-                "true",
-                "yes",
-            )
-
-            if use_fallback and using_sudo_with_stdin:
-                logger.warning(
-                    "Primary SUDO_ASKPASS approach failed, attempting sudo -S fallback"
-                )
-                try:
-                    return self._btrfs_receive_fallback(destination, stdin_pipe)
-                except Exception as fallback_error:
-                    logger.error("Fallback method also failed: %s", fallback_error)
-                    # Continue to raise original error
-
-            if isinstance(e, (BrokenPipeError, ConnectionError, ConnectionResetError)):
-                logger.error("SSH connection error detected")
-                raise ConnectionError(f"SSH connection error: {e}")
-            raise
-
-    def _btrfs_receive_fallback(
-        self, destination: str, stdin_pipe: Any
-    ) -> subprocess.Popen[Any]:
-        """Fallback btrfs receive implementation using sudo -S directly with password input."""
-        logger.debug(
-            "Using fallback btrfs receive with sudo -S approach for destination: %s",
-            destination,
-        )
-
-        # Build the btrfs receive command
-        receive_cmd = ["btrfs", "receive", destination]
-        logger.debug("Base btrfs receive command: %s", receive_cmd)
-
-        # Get the properly constructed remote command (with correct sudo handling)
-        remote_cmd = self._build_remote_command(receive_cmd)
-        logger.debug("Remote command after build: %s", remote_cmd)
-
-        # Check if we need password authentication
-        using_sudo_with_stdin = any(arg == "-S" for arg in remote_cmd)
-
-        if not using_sudo_with_stdin:
-            logger.debug("No sudo -S detected, falling back to direct command")
-            # Use the standard approach for non-password commands
-            return self._btrfs_receive(destination, stdin_pipe)
-
-        # Get SSH base command configured for password input
-        ssh_base_cmd = self.ssh_manager.get_ssh_base_cmd(force_tty=False)
-
-        # Add SSH options optimized for password input
-        ssh_options = [
-            "-o",
-            "ServerAliveInterval=5",
-            "-o",
-            "ServerAliveCountMax=3",
-            "-o",
-            "TCPKeepAlive=yes",
-            "-o",
-            "ConnectTimeout=10",
-            "-o",
-            "ExitOnForwardFailure=yes",
-            "-o",
-            "RequestTTY=no",  # Critical: no TTY for password input
-            "-o",
-            "BatchMode=yes",  # Non-interactive mode
-            "-o",
-            "StrictHostKeyChecking=accept-new",  # Accept new host keys
-        ]
-
-        # Insert SSH options
-        for i, opt in enumerate(ssh_options):
-            ssh_base_cmd.insert(i + 1, opt)
-
-        # Get sudo password
-        sudo_password = self._get_sudo_password()
-        if not sudo_password:
-            logger.error("No sudo password available for fallback method")
-            raise ValueError("Sudo password required for fallback btrfs receive")
-
-        # Use pure Python implementation instead of bash wrapper script
-        logger.debug("=== FALLBACK BTRFS RECEIVE DEBUG ===")
-        logger.debug("Destination: %s", destination)
-        logger.debug("Remote command: %s", remote_cmd)
-        logger.debug("Using sudo -S fallback approach with pure Python")
-
-        try:
-            # Start the fallback btrfs receive process using pure Python implementation
-            receive_process = self._create_pure_python_sudo_pipe(
-                ssh_base_cmd, remote_cmd, sudo_password, stdin_pipe
-            )
-
-            logger.debug(
-                "Fallback btrfs receive process started with PID: %d",
-                receive_process.pid,
-            )
-            logger.debug("Fallback btrfs receive process started successfully")
-
-            return receive_process
-
-        except Exception as e:
-            logger.error("Failed to start fallback btrfs receive process: %s", e)
-            if isinstance(e, (BrokenPipeError, ConnectionError, ConnectionResetError)):
-                logger.error("SSH connection error detected")
-                raise ConnectionError(f"SSH connection error: {e}")
+            logger.error("Failed to start btrfs receive process: %s", e)
             raise
 
     def list_snapshots(self, flush_cache: bool = False) -> List[Any]:
@@ -1741,7 +1611,25 @@ class SSHEndpoint(Endpoint):
         """
         path = self.config["path"]
         use_sudo = self.config.get("ssh_sudo", False)
-        # Don't call _build_remote_command here - _exec_remote_command does it internally
+
+        # If we need sudo with password, prime credentials first
+        if use_sudo and self._is_master_active():
+            # Check if we have passwordless sudo
+            try:
+                result = self._exec_remote_command(
+                    ["sudo", "-n", "true"],
+                    check=False,
+                    timeout=10,
+                )
+                if result.returncode != 0:
+                    # Need password - prime remote sudo credentials
+                    logger.debug("Priming remote sudo credentials for snapshot listing")
+                    if not self._prime_remote_sudo():
+                        logger.warning("Failed to prime remote sudo, listing may fail")
+            except Exception:
+                pass
+
+        # Standard method - works with cached credentials
         cmd = ["btrfs", "subvolume", "list", "-o", path]
         try:
             logger.debug(f"Listing remote snapshots with command: %s", cmd)
@@ -1801,39 +1689,53 @@ class SSHEndpoint(Endpoint):
 
                 return []
             output = result.stdout.decode(errors="replace") if result.stdout else ""
-            snapshots: List[Any] = []
-            snap_prefix = self.config.get("snap_prefix", "")
-            for line in output.splitlines():
-                parts = line.split("path ", 1)
-                if len(parts) == 2:
-                    snap_path = parts[1].strip()
-                    snap_name = os.path.basename(snap_path)
-                    if snap_name.startswith(snap_prefix):
-                        date_part = snap_name[len(snap_prefix) :]
-                        try:
-                            from btrfs_backup_ng import __util__
-
-                            time_obj = __util__.str_to_date(date_part)
-                            snapshot = __util__.Snapshot(
-                                self.config["path"],
-                                snap_prefix,
-                                self,
-                                time_obj=time_obj,
-                            )
-                            snapshots.append(snapshot)
-                        except Exception as e:
-                            logger.warning(
-                                "Could not parse date from: %r (%s)", snap_name, e
-                            )
-                            continue
-            snapshots.sort()
-            logger.info(f"Found {len(snapshots)} remote snapshots at {path}")
-            logger.debug(f"Remote snapshots: {[str(s) for s in snapshots]}")
-            return snapshots
+            return self._parse_snapshot_list(output, path)
         except Exception as e:
             logger.error(f"Exception while listing remote snapshots: {e}")
             self._run_diagnostics(path, force_refresh=True)
             return []
+
+    def _parse_snapshot_list(self, output: str, path: str) -> List[Any]:
+        """Parse btrfs subvolume list output into Snapshot objects.
+
+        Args:
+            output: Raw output from btrfs subvolume list command
+            path: The path where snapshots are located
+
+        Returns:
+            List of Snapshot objects, sorted by time
+        """
+        from btrfs_backup_ng import __util__
+
+        snapshots: List[Any] = []
+        snap_prefix = self.config.get("snap_prefix", "")
+
+        for line in output.splitlines():
+            parts = line.split("path ", 1)
+            if len(parts) == 2:
+                snap_path = parts[1].strip()
+                snap_name = os.path.basename(snap_path)
+                if snap_name.startswith(snap_prefix):
+                    date_part = snap_name[len(snap_prefix) :]
+                    try:
+                        time_obj = __util__.str_to_date(date_part)
+                        snapshot = __util__.Snapshot(
+                            self.config["path"],
+                            snap_prefix,
+                            self,
+                            time_obj=time_obj,
+                        )
+                        snapshots.append(snapshot)
+                    except Exception as e:
+                        logger.warning(
+                            "Could not parse date from: %r (%s)", snap_name, e
+                        )
+                        continue
+
+        snapshots.sort()
+        logger.info(f"Found {len(snapshots)} remote snapshots at {path}")
+        logger.debug(f"Remote snapshots: {[str(s) for s in snapshots]}")
+        return snapshots
 
     def _verify_snapshot_exists(self, dest_path: str, snapshot_name: str) -> bool:
         """Verify a snapshot exists on the remote host.
@@ -2103,6 +2005,757 @@ class SSHEndpoint(Endpoint):
         except (subprocess.SubprocessError, FileNotFoundError):
             return False
 
+    def _is_master_active(self) -> bool:
+        """Verify the OpenSSH master socket is alive and responding."""
+        control_path = str(self.ssh_manager.control_path)
+        ssh_user = self.config.get("username", "root")
+        remote_host = f"{ssh_user}@{self.hostname}"
+
+        check_cmd = [
+            "ssh",
+            "-o",
+            f"ControlPath={control_path}",
+            "-O",
+            "check",
+            remote_host,
+        ]
+
+        try:
+            result = subprocess.run(
+                check_cmd,
+                capture_output=True,
+                timeout=10,
+            )
+            return result.returncode == 0
+        except Exception:
+            return False
+
+    def _prime_local_sudo(self) -> bool:
+        """Prime local sudo credentials using sudo -v.
+
+        Prompts for password via stdin and caches credentials for subsequent
+        sudo commands. This avoids embedding passwords in command lines.
+
+        Returns:
+            True if sudo credentials were successfully cached, False otherwise
+        """
+        # Check if we already have passwordless sudo
+        try:
+            result = subprocess.run(
+                ["sudo", "-n", "true"],
+                capture_output=True,
+                timeout=5,
+            )
+            if result.returncode == 0:
+                logger.debug("Local passwordless sudo available")
+                return True
+        except Exception:
+            pass
+
+        # Need to prompt for password
+        sudo_password = self._get_sudo_password()
+        if not sudo_password:
+            logger.error("No sudo password available for local priming")
+            return False
+
+        try:
+            # Use sudo -S -v to validate and cache credentials
+            # -S reads password from stdin, -v validates without running a command
+            result = subprocess.run(
+                ["sudo", "-S", "-v"],
+                input=(sudo_password + "\n").encode(),
+                capture_output=True,
+                timeout=30,
+            )
+            if result.returncode == 0:
+                logger.debug("Local sudo credentials cached successfully")
+                return True
+            else:
+                stderr = result.stderr.decode(errors="replace")
+                logger.error(f"Failed to cache local sudo credentials: {stderr}")
+                return False
+        except subprocess.TimeoutExpired:
+            logger.error("Timeout while priming local sudo credentials")
+            return False
+        except Exception as e:
+            logger.error(f"Error priming local sudo credentials: {e}")
+            return False
+
+    def _prime_remote_sudo(self) -> bool:
+        """Prime remote sudo credentials using sudo -v over SSH.
+
+        Uses the SSH ControlMaster connection to run sudo -v on the remote host,
+        caching credentials for subsequent sudo commands.
+
+        Returns:
+            True if remote sudo credentials were successfully cached, False otherwise
+        """
+        if not self._is_master_active():
+            logger.error("SSH master connection not active")
+            return False
+
+        # Check if remote has passwordless sudo
+        try:
+            result = self._exec_remote_command(
+                ["sudo", "-n", "true"],
+                check=False,
+                timeout=10,
+            )
+            if result.returncode == 0:
+                logger.debug("Remote passwordless sudo available")
+                return True
+        except Exception:
+            pass
+
+        # Need to prompt for password
+        sudo_password = self._get_sudo_password()
+        if not sudo_password:
+            logger.error("No sudo password available for remote priming")
+            return False
+
+        # Build SSH command to run sudo -S -v on remote
+        control_path = str(self.ssh_manager.control_path)
+        ssh_user = self.config.get("username", "root")
+        ssh_port = self.config.get("port")
+        remote_host = f"{ssh_user}@{self.hostname}"
+
+        ssh_cmd = [
+            "ssh",
+            "-o",
+            f"ControlPath={control_path}",
+            "-o",
+            "BatchMode=no",
+        ]
+        if ssh_port:
+            ssh_cmd.extend(["-p", str(ssh_port)])
+        ssh_cmd.extend([remote_host, "sudo", "-S", "-v"])
+
+        try:
+            result = subprocess.run(
+                ssh_cmd,
+                input=(sudo_password + "\n").encode(),
+                capture_output=True,
+                timeout=30,
+            )
+            if result.returncode == 0:
+                logger.debug("Remote sudo credentials cached successfully")
+                return True
+            else:
+                stderr = result.stderr.decode(errors="replace")
+                logger.error(f"Failed to cache remote sudo credentials: {stderr}")
+                return False
+        except subprocess.TimeoutExpired:
+            logger.error("Timeout while priming remote sudo credentials")
+            return False
+        except Exception as e:
+            logger.error(f"Error priming remote sudo credentials: {e}")
+            return False
+
+    def _estimate_snapshot_size(
+        self, snapshot_path: str, parent_path: Optional[str] = None
+    ) -> Optional[int]:
+        """Estimate the size of a snapshot transfer for progress display.
+
+        For full transfers: Uses btrfs subvolume show to get exclusive data size.
+        For incremental transfers: Returns None (indeterminate) since estimating
+        the delta accurately is expensive and the actual transfer is usually fast.
+
+        Args:
+            snapshot_path: Path to the snapshot
+            parent_path: Optional parent snapshot path for incremental transfers
+
+        Returns:
+            Estimated size in bytes, or None if unable to determine or incremental
+        """
+        # For incremental transfers, return None (indeterminate progress)
+        # The delta size is hard to estimate accurately without doing the actual send
+        if parent_path and os.path.exists(parent_path):
+            logger.debug(
+                "Incremental transfer detected - using indeterminate progress bar"
+            )
+            return None
+
+        # Try btrfs subvolume show first for full transfers
+        try:
+            result = subprocess.run(
+                ["sudo", "btrfs", "subvolume", "show", snapshot_path],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            if result.returncode == 0:
+                # Parse "Exclusive" line for data size
+                for line in result.stdout.splitlines():
+                    if "Exclusive" in line and "Exclusive" not in line.split(":")[
+                        0
+                    ].strip().replace(" ", ""):
+                        continue
+                    if line.strip().startswith("Exclusive"):
+                        # Format: "Exclusive: 1.23GiB" or similar
+                        size_str = line.split(":")[-1].strip()
+                        return self._parse_size_string(size_str)
+        except Exception as e:
+            logger.debug(f"btrfs subvolume show failed: {e}")
+
+        # Fallback to du
+        try:
+            result = subprocess.run(
+                ["sudo", "du", "-sb", snapshot_path],
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+            if result.returncode == 0:
+                size_str = result.stdout.split()[0]
+                return int(size_str)
+        except Exception as e:
+            logger.debug(f"du failed: {e}")
+
+        return None
+
+    def _parse_size_string(self, size_str: str) -> Optional[int]:
+        """Parse a human-readable size string to bytes.
+
+        Args:
+            size_str: Size string like "1.23GiB", "500MiB", "1024KiB"
+
+        Returns:
+            Size in bytes, or None if parsing fails
+        """
+        size_str = size_str.strip()
+        multipliers = {
+            "B": 1,
+            "KiB": 1024,
+            "MiB": 1024**2,
+            "GiB": 1024**3,
+            "TiB": 1024**4,
+            "KB": 1000,
+            "MB": 1000**2,
+            "GB": 1000**3,
+            "TB": 1000**4,
+            "K": 1024,
+            "M": 1024**2,
+            "G": 1024**3,
+            "T": 1024**4,
+        }
+
+        for suffix, multiplier in sorted(multipliers.items(), key=lambda x: -len(x[0])):
+            if size_str.endswith(suffix):
+                try:
+                    num = float(size_str[: -len(suffix)].strip())
+                    return int(num * multiplier)
+                except ValueError:
+                    continue
+
+        # Try parsing as plain number
+        try:
+            return int(float(size_str))
+        except ValueError:
+            return None
+
+    def _do_piped_transfer(
+        self,
+        source_path: str,
+        dest_path: str,
+        snapshot_name: str,
+        parent_path: Optional[str] = None,
+    ) -> bool:
+        """Execute btrfs send | ssh btrfs receive transfer with progress.
+
+        Uses Paramiko for password-based sudo (secure stdin handling),
+        or falls back to shell pipeline for passwordless sudo.
+
+        Args:
+            source_path: Path to the source snapshot
+            dest_path: Destination path on remote
+            snapshot_name: Name of the snapshot being transferred
+            parent_path: Optional parent snapshot for incremental transfer
+
+        Returns:
+            True if transfer succeeded, False otherwise
+        """
+        use_sudo = self.config.get("ssh_sudo", False)
+        passwordless_available = self.config.get("passwordless_sudo_available", False)
+        sudo_password = self._cached_sudo_password
+
+        # If we need password-based sudo but don't have a password, try to get one now
+        if use_sudo and not passwordless_available and not sudo_password:
+            logger.debug("No cached password, prompting for sudo password...")
+            sudo_password = self._get_sudo_password()
+            if sudo_password:
+                self._cached_sudo_password = sudo_password
+            else:
+                logger.error("Password-based sudo required but no password provided")
+                return False
+
+        # Use Paramiko for password-based sudo (cleaner stdin handling)
+        if (
+            use_sudo
+            and not passwordless_available
+            and sudo_password
+            and PARAMIKO_AVAILABLE
+        ):
+            return self._do_paramiko_transfer(
+                source_path=source_path,
+                dest_path=dest_path,
+                snapshot_name=snapshot_name,
+                parent_path=parent_path,
+                sudo_password=sudo_password,
+            )
+
+        # Fall back to shell pipeline for passwordless sudo or no-sudo cases
+        return self._do_shell_pipeline_transfer(
+            source_path=source_path,
+            dest_path=dest_path,
+            snapshot_name=snapshot_name,
+            parent_path=parent_path,
+        )
+
+    def _do_paramiko_transfer(
+        self,
+        source_path: str,
+        dest_path: str,
+        snapshot_name: str,
+        parent_path: Optional[str],
+        sudo_password: str,
+    ) -> bool:
+        """Execute transfer using Paramiko for clean password handling.
+
+        Paramiko gives us direct control over stdin, allowing us to:
+        1. Connect with SSH password auth (collected via getpass)
+        2. Send sudo password + newline to sudo -S
+        3. Then stream btrfs data
+        Without any shell escaping issues.
+
+        Args:
+            source_path: Path to the source snapshot
+            dest_path: Destination path on remote
+            snapshot_name: Name of the snapshot being transferred
+            parent_path: Optional parent snapshot for incremental transfer
+            sudo_password: The sudo password to use
+
+        Returns:
+            True if transfer succeeded, False otherwise
+        """
+        import sys
+
+        # Get username from config (from CLI --ssh-username or ssh://user@host URL)
+        ssh_user = self.config.get("username", "root")
+        ssh_port = self.config.get("port", 22) or 22
+
+        # Get SSH password - use cached password first, only prompt if not available
+        ssh_password_fallback = self.config.get("ssh_password_fallback", False)
+        ssh_password: Optional[str] = None
+        if ssh_password_fallback:
+            # First check if we already have the password cached (from _prepare or earlier)
+            ssh_password = self._get_ssh_password(prompt=False)
+            if not ssh_password:
+                # Also check if sudo_password is available (often same as SSH password)
+                ssh_password = self._cached_sudo_password or sudo_password
+            if not ssh_password:
+                # Last resort: prompt user
+                ssh_password = self._get_ssh_password(prompt=True)
+            if not ssh_password:
+                logger.error("SSH password required but not provided")
+                return False
+            # Cache it for future use
+            if hasattr(self, "ssh_manager"):
+                self.ssh_manager._cached_ssh_password = ssh_password
+
+        # Estimate snapshot size for progress display (None for incremental)
+        estimated_size = self._estimate_snapshot_size(source_path, parent_path)
+        is_incremental = parent_path and os.path.exists(parent_path)
+        if estimated_size:
+            size_mb = estimated_size / (1024 * 1024)
+            logger.info(f"Estimated snapshot size: {size_mb:.1f} MiB")
+        elif is_incremental:
+            logger.info(
+                "Incremental transfer - size will be determined during transfer"
+            )
+
+        logger.info(f"Transferring {snapshot_name} to {self.hostname}:{dest_path}")
+        logger.info("Using Paramiko for secure password-based transfer")
+
+        # Build local btrfs send command
+        send_cmd = ["sudo", "btrfs", "send"]
+        if is_incremental:
+            send_cmd.extend(["-p", parent_path])
+            logger.info(f"Using parent: {os.path.basename(parent_path)}")
+        send_cmd.append(source_path)
+
+        # Remote command: sudo -S reads password from stdin, then receives btrfs stream
+        escaped_dest = shlex.quote(dest_path)
+        remote_cmd = f"sudo -S btrfs receive {escaped_dest}"
+
+        client: Optional[paramiko.SSHClient] = None
+        send_proc: Optional[subprocess.Popen[bytes]] = None
+
+        try:
+            # Connect via Paramiko using the pattern:
+            # 1. Get username (from CLI/URL - already in ssh_user)
+            # 2. Get password (via getpass - in ssh_password)
+            # 3. Connect with those credentials
+            client = paramiko.SSHClient()
+            client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+
+            connect_kwargs: Dict[str, Any] = {
+                "hostname": self.hostname,
+                "port": ssh_port,
+                "username": ssh_user,
+                "timeout": 30,
+            }
+
+            # Use password auth if we have an SSH password
+            if ssh_password:
+                connect_kwargs["password"] = ssh_password
+                connect_kwargs["allow_agent"] = False
+                connect_kwargs["look_for_keys"] = False
+                logger.debug(
+                    f"Connecting to {ssh_user}@{self.hostname}:{ssh_port} with password auth"
+                )
+            else:
+                # Fall back to key-based auth
+                ssh_identity_file = self.config.get("ssh_identity_file")
+                if ssh_identity_file and os.path.exists(ssh_identity_file):
+                    connect_kwargs["key_filename"] = ssh_identity_file
+                else:
+                    connect_kwargs["allow_agent"] = True
+                    connect_kwargs["look_for_keys"] = True
+                logger.debug(
+                    f"Connecting to {ssh_user}@{self.hostname}:{ssh_port} with key auth"
+                )
+
+            client.connect(**connect_kwargs)
+            logger.debug("Paramiko SSH connection established")
+
+            # Open channel and execute remote command
+            transport = client.get_transport()
+            if not transport:
+                logger.error("Failed to get SSH transport")
+                return False
+
+            channel = transport.open_session()
+            channel.exec_command(remote_cmd)
+
+            # Start local btrfs send process
+            send_proc = subprocess.Popen(
+                send_cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+
+            # Send password first (sudo -S reads from stdin)
+            channel.sendall((sudo_password + "\n").encode())
+            logger.debug("Sent sudo password to remote")
+
+            # Give sudo a moment to process password
+            time.sleep(0.1)
+
+            # Stream btrfs send output to remote with rich progress bar
+            from rich.progress import (
+                BarColumn,
+                DownloadColumn,
+                Progress,
+                TextColumn,
+                TimeRemainingColumn,
+                TransferSpeedColumn,
+            )
+
+            bytes_sent = 0
+            start_time = time.time()
+            chunk_size = 65536
+
+            with Progress(
+                TextColumn("[bold blue]{task.description}"),
+                BarColumn(bar_width=40),
+                "[progress.percentage]{task.percentage:>3.1f}%",
+                DownloadColumn(),
+                TransferSpeedColumn(),
+                TimeRemainingColumn(),
+                transient=False,
+            ) as progress:
+                task = progress.add_task(
+                    f"Sending {snapshot_name}",
+                    total=estimated_size if estimated_size else None,
+                )
+
+                while True:
+                    if send_proc.stdout is None:
+                        break
+                    chunk = send_proc.stdout.read(chunk_size)
+                    if not chunk:
+                        break
+                    channel.sendall(chunk)
+                    bytes_sent += len(chunk)
+                    progress.update(task, advance=len(chunk))
+
+            # Signal end of data
+            channel.shutdown_write()
+
+            # Wait for send process
+            send_proc.wait()
+            send_stderr = (
+                send_proc.stderr.read().decode(errors="replace")
+                if send_proc.stderr
+                else ""
+            )
+
+            if send_proc.returncode != 0:
+                logger.error(
+                    f"btrfs send failed (exit {send_proc.returncode}): {send_stderr}"
+                )
+                return False
+
+            # Wait for remote command to complete
+            exit_status = channel.recv_exit_status()
+
+            # Get any remote output
+            remote_stdout = b""
+            remote_stderr = b""
+            while channel.recv_ready():
+                remote_stdout += channel.recv(4096)
+            while channel.recv_stderr_ready():
+                remote_stderr += channel.recv_stderr(4096)
+
+            if exit_status != 0:
+                stderr_text = remote_stderr.decode(errors="replace")
+                logger.error(
+                    f"btrfs receive failed (exit {exit_status}): {stderr_text}"
+                )
+                return False
+
+            elapsed = time.time() - start_time
+            rate = bytes_sent / elapsed if elapsed > 0 else 0
+            logger.info(
+                f"Transfer completed: {bytes_sent / (1024 * 1024):.1f} MiB in {elapsed:.1f}s "
+                f"({rate / (1024 * 1024):.1f} MiB/s)"
+            )
+
+            # Verify snapshot exists on remote
+            if self._verify_snapshot_exists(dest_path, snapshot_name):
+                logger.info(f"Snapshot {snapshot_name} verified on remote")
+                return True
+            else:
+                logger.error(
+                    "Transfer verification failed - snapshot not found on remote"
+                )
+                return False
+
+        except paramiko.AuthenticationException as e:
+            logger.error(f"SSH authentication failed: {e}")
+            return False
+        except paramiko.SSHException as e:
+            logger.error(f"SSH error: {e}")
+            return False
+        except Exception as e:
+            logger.error(f"Transfer failed: {e}")
+            return False
+        finally:
+            if send_proc and send_proc.poll() is None:
+                send_proc.terminate()
+            if client:
+                client.close()
+
+    def _do_shell_pipeline_transfer(
+        self,
+        source_path: str,
+        dest_path: str,
+        snapshot_name: str,
+        parent_path: Optional[str] = None,
+    ) -> bool:
+        """Execute transfer using shell pipeline (for passwordless sudo).
+
+        Args:
+            source_path: Path to the source snapshot
+            dest_path: Destination path on remote
+            snapshot_name: Name of the snapshot being transferred
+            parent_path: Optional parent snapshot for incremental transfer
+
+        Returns:
+            True if transfer succeeded, False otherwise
+        """
+        import sys
+
+        control_path = str(self.ssh_manager.control_path)
+        ssh_user = self.config.get("username", "root")
+        ssh_port = self.config.get("port")
+        remote_host = f"{ssh_user}@{self.hostname}"
+        use_sudo = self.config.get("ssh_sudo", False)
+
+        # Estimate snapshot size for progress display (None for incremental)
+        estimated_size = self._estimate_snapshot_size(source_path, parent_path)
+        is_incremental = parent_path and os.path.exists(parent_path)
+        if estimated_size:
+            size_mb = estimated_size / (1024 * 1024)
+            logger.info(f"Estimated snapshot size: {size_mb:.1f} MiB")
+        elif is_incremental:
+            logger.info(
+                "Incremental transfer - size will be determined during transfer"
+            )
+
+        # Build send command
+        send_parts = ["sudo", "btrfs", "send"]
+        if is_incremental:
+            send_parts.extend(["-p", shlex.quote(parent_path)])
+            logger.info(f"Using parent: {os.path.basename(parent_path)}")
+        send_parts.append(shlex.quote(source_path))
+        send_cmd = " ".join(send_parts)
+
+        # Build pv command for progress
+        has_pv = self._check_command_exists("pv")
+        if has_pv:
+            if estimated_size:
+                pv_cmd = f"pv -f -p -t -e -r -b -s {estimated_size}"
+            else:
+                pv_cmd = "pv -f -p -t -e -r -b"
+        else:
+            pv_cmd = "cat"
+            logger.warning("pv not found - progress display unavailable")
+
+        # Build SSH command
+        ssh_parts = ["ssh", "-o", f"ControlPath={shlex.quote(control_path)}"]
+        ssh_parts.extend(["-o", "BatchMode=yes"])
+        ssh_parts.append("-T")
+        if ssh_port:
+            ssh_parts.extend(["-p", str(ssh_port)])
+        ssh_parts.append(remote_host)
+
+        # Build remote command (passwordless sudo)
+        escaped_dest = shlex.quote(dest_path)
+        if use_sudo:
+            remote_cmd = f"sudo -n btrfs receive {escaped_dest}"
+        else:
+            remote_cmd = f"btrfs receive {escaped_dest}"
+        ssh_parts.append(shlex.quote(remote_cmd))
+        ssh_cmd = " ".join(ssh_parts)
+
+        full_pipeline = f"{send_cmd} | {pv_cmd} | {ssh_cmd}"
+
+        logger.info(f"Transferring {snapshot_name} to {self.hostname}:{dest_path}")
+        logger.debug(f"Pipeline: {full_pipeline}")
+
+        try:
+            proc = subprocess.Popen(
+                full_pipeline,
+                shell=True,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+
+            stderr_lines: List[str] = []
+
+            def stream_stderr() -> None:
+                if proc.stderr:
+                    for chunk in iter(lambda: proc.stderr.read(80), b""):
+                        if chunk:
+                            text = chunk.decode(errors="replace")
+                            sys.stderr.write(text)
+                            sys.stderr.flush()
+                            stderr_lines.append(text)
+
+            stderr_thread = threading.Thread(target=stream_stderr, daemon=True)
+            stderr_thread.start()
+
+            proc.wait()
+            stderr_thread.join(timeout=5)
+
+            if proc.returncode != 0:
+                stderr_output = "".join(stderr_lines)
+                logger.error(f"Transfer failed (exit {proc.returncode})")
+                if stderr_output:
+                    logger.error(f"Error output: {stderr_output}")
+                return False
+
+            logger.info("Transfer completed successfully")
+
+            if self._verify_snapshot_exists(dest_path, snapshot_name):
+                logger.info(f"Snapshot {snapshot_name} verified on remote")
+                return True
+            else:
+                logger.error(
+                    "Transfer verification failed - snapshot not found on remote"
+                )
+                return False
+
+        except Exception as e:
+            logger.error(f"Transfer failed with exception: {e}")
+            return False
+
+    def _try_sudo_cached_transfer(
+        self,
+        source_path: str,
+        dest_path: str,
+        snapshot_name: str,
+        parent_path: Optional[str] = None,
+    ) -> bool:
+        """Transfer using pre-fetched sudo password with pv for progress.
+
+        This method:
+        1. Pre-fetches sudo password via getpass (stored securely in memory)
+        2. Primes local sudo credentials
+        3. Primes remote sudo credentials via SSH
+        4. Runs transfer: sudo btrfs send | pv | ssh 'sudo btrfs receive'
+
+        Password is passed via environment variable to shell (not in cmdline),
+        then injected into stdin for sudo -S on the remote side.
+
+        Args:
+            source_path: Path to the source snapshot
+            dest_path: Destination path on remote
+            snapshot_name: Name of the snapshot being transferred
+            parent_path: Optional parent snapshot for incremental transfer
+
+        Returns:
+            True if transfer succeeded, False otherwise
+        """
+        # Verify SSH master connection is active
+        if not self._is_master_active():
+            logger.error("SSH master connection is down")
+            try:
+                self.ssh_manager.stop()
+                self.ssh_manager.start()
+                if not self._is_master_active():
+                    logger.error("Failed to re-establish SSH master connection")
+                    return False
+                logger.info("SSH master connection re-established")
+            except Exception as e:
+                logger.error(f"Failed to restart SSH master: {e}")
+                return False
+
+        # Step 0: Pre-fetch sudo password upfront (before any transfers)
+        if not self._cached_sudo_password:
+            logger.info("Collecting sudo password for transfer...")
+            password = self._get_sudo_password()
+            if not password:
+                logger.error(
+                    "No sudo password provided - cannot proceed with password-based sudo"
+                )
+                return False
+            self._cached_sudo_password = password
+            logger.debug("Sudo password collected and cached securely")
+
+        # Step 1: Prime local sudo credentials
+        logger.info("Priming local sudo credentials...")
+        if not self._prime_local_sudo():
+            logger.error("Failed to prime local sudo credentials")
+            return False
+
+        # Step 2: Prime remote sudo credentials
+        logger.info("Priming remote sudo credentials...")
+        if not self._prime_remote_sudo():
+            logger.error("Failed to prime remote sudo credentials")
+            return False
+
+        # Step 3: Run the actual transfer with pv for progress
+        logger.info(f"Starting transfer of {snapshot_name}...")
+        return self._do_piped_transfer(
+            source_path=source_path,
+            dest_path=dest_path,
+            snapshot_name=snapshot_name,
+            parent_path=parent_path,
+        )
+
     def _try_direct_transfer(
         self,
         source_path: str,
@@ -2138,6 +2791,18 @@ class SSHEndpoint(Endpoint):
         ):
             logger.error("Pre-transfer diagnostics failed")
             return False
+
+        # Use invoke transfer if ssh_sudo and no passwordless sudo
+        if self.config.get("ssh_sudo", False) and not diagnostics.get(
+            "passwordless_sudo", False
+        ):
+            logger.info("Using sudo credential caching for password-based sudo")
+            return self._try_sudo_cached_transfer(
+                source_path=source_path,
+                dest_path=dest_path,
+                snapshot_name=snapshot_name,
+                parent_path=parent_path,
+            )
 
         # Find buffer program for progress display and reliability
         buffer_name, buffer_cmd = self._find_buffer_program()
@@ -2239,10 +2904,7 @@ class SSHEndpoint(Endpoint):
                 )
 
             # Final verification if we timed out
-            # Skip verification for password auth mode to avoid hanging
-            if not transfer_succeeded and not self.config.get(
-                "ssh_password_fallback", False
-            ):
+            if not transfer_succeeded:
                 logger.warning(
                     "Reached maximum wait time, performing final verification..."
                 )
@@ -2665,164 +3327,6 @@ class SSHEndpoint(Endpoint):
         except Exception as e:
             logger.debug(f"Could not read stderr from {process_name} process: {e}")
 
-    def _create_sudo_askpass_command(
-        self, ssh_base_cmd: List[str], modified_cmd: List[str], sudo_password: str
-    ) -> List[str]:
-        """Create pure Python SUDO_ASKPASS command without shell scripts.
-
-        This replaces the embedded bash script approach with a secure Python implementation
-        that creates the askpass script on the remote system to avoid the local/remote path issue.
-
-        Args:
-            ssh_base_cmd: Base SSH command
-            modified_cmd: Remote command with sudo -A
-            sudo_password: Password for sudo authentication
-
-        Returns:
-            Complete SSH command list ready for subprocess execution
-        """
-        import base64
-
-        try:
-            # Generate unique filename for remote askpass script
-            import uuid
-
-            askpass_filename = f"btrfs_askpass_{uuid.uuid4().hex[:8]}.sh"
-            askpass_path = f"/tmp/{askpass_filename}"
-
-            # Use base64 encoding to completely avoid shell escaping issues
-            # This is the most secure approach for arbitrary passwords
-            password_b64 = base64.b64encode(sudo_password.encode("utf-8")).decode(
-                "ascii"
-            )
-
-            logger.debug(f"Creating remote SUDO_ASKPASS script at: {askpass_path}")
-
-            # Create askpass script content using base64 decoding to avoid all escaping issues
-            askpass_content = f"""#!/bin/bash
-# SUDO_ASKPASS script for btrfs-backup-ng
-# Decodes base64-encoded password to avoid shell escaping issues
-echo '{password_b64}' | base64 -d
-"""
-
-            logger.debug(f"Creating remote SUDO_ASKPASS script at: {askpass_path}")
-
-            # Build final command that creates the askpass script on the remote system, uses it, then cleans up
-            cmd_str = " ".join(shlex.quote(arg) for arg in modified_cmd)
-
-            # Use heredoc - this is the only approach that actually transfers
-            # The hang after transfer needs to be fixed in the monitoring code, not here
-            wrapper_cmd = (
-                f"cat > {shlex.quote(askpass_path)} << 'EOF'\n{askpass_content}EOF\n"
-                f"chmod 700 {shlex.quote(askpass_path)}; "
-                f"export SUDO_ASKPASS={shlex.quote(askpass_path)}; "
-                f"{cmd_str}; "
-                f"rm -f {shlex.quote(askpass_path)}"
-            )
-
-            return ssh_base_cmd + ["--", "bash", "-c", wrapper_cmd]
-
-        except Exception as e:
-            logger.error(f"Failed to create SUDO_ASKPASS command: {e}")
-            raise e
-
-    def _create_pure_python_sudo_pipe(
-        self,
-        ssh_base_cmd: List[str],
-        remote_cmd: List[str],
-        sudo_password: str,
-        stdin_pipe: Any,
-    ) -> subprocess.Popen[Any]:
-        """Create pure Python implementation for sudo password piping without bash scripts.
-
-        This replaces the complex bash wrapper script with a Python threading approach
-        that safely handles password input and data streaming.
-
-        Args:
-            ssh_base_cmd: Base SSH command
-            remote_cmd: Remote command requiring sudo -S
-            sudo_password: Password for sudo
-            stdin_pipe: Input pipe for btrfs data
-
-        Returns:
-            Popen process for the command execution
-        """
-        import threading
-
-        logger.debug("Using pure Python sudo pipe implementation")
-
-        # Create the complete SSH command
-        cmd_str = " ".join(shlex.quote(arg) for arg in remote_cmd)
-        final_cmd = ssh_base_cmd + ["--", cmd_str]
-
-        # Start the SSH process
-        process = subprocess.Popen(
-            final_cmd,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            bufsize=0,
-            text=False,  # Binary mode
-        )
-
-        if not process.stdin:
-            raise RuntimeError("Failed to get stdin pipe for sudo process")
-
-        def password_and_data_feeder():
-            """Thread function to feed password first, then data stream."""
-            try:
-                # Send password first
-                password_bytes = (sudo_password + "\n").encode("utf-8")
-                if process.stdin:
-                    process.stdin.write(password_bytes)
-                    process.stdin.flush()
-
-                # Small delay to ensure password is processed
-                time.sleep(0.1)
-
-                # Now pipe the actual data from stdin_pipe
-                if stdin_pipe and hasattr(stdin_pipe, "read"):
-                    # Stream data in chunks
-                    chunk_size = 64 * 1024  # 64KB chunks
-                    while True:
-                        chunk = stdin_pipe.read(chunk_size)
-                        if not chunk:
-                            break
-                        if process.stdin:
-                            process.stdin.write(chunk)
-                            process.stdin.flush()
-                elif stdin_pipe:
-                    # If stdin_pipe is not a file-like object, convert to bytes
-                    try:
-                        data = (
-                            bytes(stdin_pipe)
-                            if not isinstance(stdin_pipe, bytes)
-                            else stdin_pipe
-                        )
-                        if process.stdin:
-                            process.stdin.write(data)
-                            process.stdin.flush()
-                    except (TypeError, ValueError):
-                        logger.error("Unable to convert stdin_pipe to bytes")
-
-                # Close stdin to signal end of data
-                if process.stdin:
-                    process.stdin.close()
-
-            except Exception as e:
-                logger.error(f"Error in password/data feeder thread: {e}")
-                try:
-                    if process.stdin and not process.stdin.closed:
-                        process.stdin.close()
-                except:
-                    pass
-
-        # Start the feeder thread
-        feeder_thread = threading.Thread(target=password_and_data_feeder, daemon=True)
-        feeder_thread.start()
-
-        return process
-
     def _simple_transfer_monitor(
         self,
         processes: Dict[str, Any],
@@ -2864,12 +3368,6 @@ echo '{password_b64}' | base64 -d
 
         logger.debug("STATUS: Waiting for transfer processes to complete...")
 
-        # For password fallback mode, we need special handling because the heredoc
-        # approach leaves processes hanging even after transfer completes.
-        # We detect completion by periodically checking if the snapshot exists.
-        password_fallback_mode = self.config.get("ssh_password_fallback", False)
-        transfer_verified = False
-
         # Simple polling loop with timeout
         while time.time() - start_time < max_wait_time:
             all_finished = True
@@ -2882,35 +3380,6 @@ echo '{password_b64}' | base64 -d
             if all_finished:
                 break
 
-            # For password fallback: periodically check if snapshot exists on remote
-            # The heredoc approach causes processes to hang even after transfer completes,
-            # so we verify by checking for the snapshot every 5 seconds
-            if password_fallback_mode and not transfer_verified:
-                elapsed = time.time() - start_time
-                if (
-                    elapsed > 3 and int(elapsed) % 5 == 0
-                ):  # Check every 5 seconds after 3s
-                    try:
-                        if self._verify_snapshot_exists(dest_path, snapshot_name):
-                            logger.info("Transfer verified - snapshot exists on remote")
-                            transfer_verified = True
-                            # Kill all processes since transfer is complete
-                            for proc in [send_process, receive_process]:
-                                if proc.poll() is None:
-                                    logger.debug(
-                                        "Terminating hung process (transfer complete)"
-                                    )
-                                    proc.terminate()
-                                    try:
-                                        proc.wait(timeout=3)
-                                    except:
-                                        proc.kill()
-                            if buffer_process and buffer_process.poll() is None:
-                                buffer_process.terminate()
-                            break
-                    except Exception as e:
-                        logger.debug(f"Verification check failed: {e}")
-
             # Log status every 30 seconds
             elapsed = time.time() - start_time
             if int(elapsed) % 30 == 0:
@@ -2922,14 +3391,6 @@ echo '{password_b64}' | base64 -d
                 )
 
             time.sleep(1)
-
-        # If we verified the transfer in password fallback mode, return success early
-        if password_fallback_mode and transfer_verified:
-            elapsed_final = time.time() - start_time
-            logger.info(
-                f"SUCCESS: Transfer completed successfully in {elapsed_final:.1f}s"
-            )
-            return True
 
         # Check results
         elapsed_final = time.time() - start_time
@@ -2959,17 +3420,7 @@ echo '{password_b64}' | base64 -d
             else:
                 logger.info("SUCCESS: Buffer process completed successfully")
 
-        # Final verification - skip for password auth mode to avoid hanging
-        if self.config.get("ssh_password_fallback", False):
-            logger.debug(
-                "STATUS: Skipping final verification for password auth mode - "
-                "assuming success based on process exit codes"
-            )
-            logger.info(
-                f"SUCCESS: Transfer completed successfully in {elapsed_final:.1f}s"
-            )
-            return True
-
+        # Final verification
         logger.debug("STATUS: Performing final verification...")
         try:
             if self._verify_snapshot_exists(dest_path, snapshot_name):
