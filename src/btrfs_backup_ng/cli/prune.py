@@ -9,6 +9,7 @@ from pathlib import Path
 from .. import __util__, endpoint
 from ..__logger__ import create_logger
 from ..config import ConfigError, find_config_file, load_config
+from ..retention import apply_retention, format_retention_summary
 from .common import get_log_level
 
 logger = logging.getLogger(__name__)
@@ -17,7 +18,7 @@ logger = logging.getLogger(__name__)
 def execute_prune(args: argparse.Namespace) -> int:
     """Execute the prune command.
 
-    Applies retention policies to clean up old snapshots and backups.
+    Applies time-based retention policies to clean up old snapshots and backups.
 
     Args:
         args: Parsed command line arguments
@@ -60,16 +61,20 @@ def execute_prune(args: argparse.Namespace) -> int:
 
     total_deleted = 0
     total_kept = 0
+    errors = 0
 
     for volume in volumes:
         logger.info("Volume: %s", volume.path)
 
         retention = config.get_effective_retention(volume)
-
-        # For now, use simple count-based retention
-        # TODO: Implement time-based retention (Phase 3)
-        # Using daily count as the primary retention limit
-        keep_count = retention.daily + retention.weekly + retention.monthly
+        logger.info(
+            "  Retention: min=%s, hourly=%d, daily=%d, weekly=%d, monthly=%d",
+            retention.min,
+            retention.hourly,
+            retention.daily,
+            retention.weekly,
+            retention.monthly,
+        )
 
         # Build endpoint kwargs
         endpoint_kwargs = {
@@ -79,6 +84,8 @@ def execute_prune(args: argparse.Namespace) -> int:
             "btrfs_debug": False,
             "fs_checks": True,
         }
+
+        prefix = volume.snapshot_prefix or f"{os.uname()[1]}-"
 
         # Prune source snapshots
         try:
@@ -107,35 +114,41 @@ def execute_prune(args: argparse.Namespace) -> int:
             source_endpoint.prepare()
 
             snapshots = source_endpoint.list_snapshots()
-            logger.info(
-                "  Source: %d snapshots, keeping %d", len(snapshots), keep_count
-            )
+            logger.info("  Source: %d snapshots", len(snapshots))
 
-            if len(snapshots) > keep_count:
-                to_delete = snapshots[:-keep_count]
-                logger.info("  Would delete %d old snapshot(s)", len(to_delete))
+            if snapshots:
+                # Apply time-based retention
+                to_keep, to_delete = apply_retention(
+                    snapshots,
+                    retention,
+                    get_name=lambda s: s.get_name(),
+                    prefix=prefix,
+                )
 
-                if not dry_run:
-                    for snap in to_delete:
-                        try:
-                            source_endpoint.delete_snapshots([snap])
-                            logger.info("    Deleted: %s", snap.get_name())
-                            total_deleted += 1
-                        except Exception as e:
-                            logger.error(
-                                "    Failed to delete %s: %s", snap.get_name(), e
-                            )
-                else:
-                    for snap in to_delete:
-                        logger.info("    Would delete: %s", snap.get_name())
-                    total_deleted += len(to_delete)
+                logger.info("  Keeping %d, deleting %d", len(to_keep), len(to_delete))
 
-                total_kept += keep_count
-            else:
-                total_kept += len(snapshots)
+                if to_delete:
+                    if dry_run:
+                        for snap in to_delete:
+                            logger.info("    Would delete: %s", snap.get_name())
+                        total_deleted += len(to_delete)
+                    else:
+                        for snap in to_delete:
+                            try:
+                                source_endpoint.delete_snapshots([snap])
+                                logger.info("    Deleted: %s", snap.get_name())
+                                total_deleted += 1
+                            except Exception as e:
+                                logger.error(
+                                    "    Failed to delete %s: %s", snap.get_name(), e
+                                )
+                                errors += 1
+
+                total_kept += len(to_keep)
 
         except Exception as e:
             logger.error("  Error pruning source: %s", e)
+            errors += 1
 
         # Prune target backups
         for target in volume.targets:
@@ -152,38 +165,45 @@ def execute_prune(args: argparse.Namespace) -> int:
                 dest_endpoint.prepare()
 
                 dest_snapshots = dest_endpoint.list_snapshots()
-                logger.info(
-                    "  Target %s: %d backups, keeping %d",
-                    target.path,
-                    len(dest_snapshots),
-                    keep_count,
-                )
+                logger.info("  Target %s: %d backups", target.path, len(dest_snapshots))
 
-                if len(dest_snapshots) > keep_count:
-                    to_delete = dest_snapshots[:-keep_count]
-                    logger.info("    Would delete %d old backup(s)", len(to_delete))
+                if dest_snapshots:
+                    # Apply time-based retention
+                    to_keep, to_delete = apply_retention(
+                        dest_snapshots,
+                        retention,
+                        get_name=lambda s: s.get_name(),
+                        prefix=prefix,
+                    )
 
-                    if not dry_run:
-                        for snap in to_delete:
-                            try:
-                                dest_endpoint.delete_snapshots([snap])
-                                logger.info("      Deleted: %s", snap.get_name())
-                                total_deleted += 1
-                            except Exception as e:
-                                logger.error(
-                                    "      Failed to delete %s: %s", snap.get_name(), e
-                                )
-                    else:
-                        for snap in to_delete:
-                            logger.info("      Would delete: %s", snap.get_name())
-                        total_deleted += len(to_delete)
+                    logger.info(
+                        "    Keeping %d, deleting %d", len(to_keep), len(to_delete)
+                    )
 
-                    total_kept += keep_count
-                else:
-                    total_kept += len(dest_snapshots)
+                    if to_delete:
+                        if dry_run:
+                            for snap in to_delete:
+                                logger.info("      Would delete: %s", snap.get_name())
+                            total_deleted += len(to_delete)
+                        else:
+                            for snap in to_delete:
+                                try:
+                                    dest_endpoint.delete_snapshots([snap])
+                                    logger.info("      Deleted: %s", snap.get_name())
+                                    total_deleted += 1
+                                except Exception as e:
+                                    logger.error(
+                                        "      Failed to delete %s: %s",
+                                        snap.get_name(),
+                                        e,
+                                    )
+                                    errors += 1
+
+                    total_kept += len(to_keep)
 
             except Exception as e:
                 logger.error("  Error pruning target %s: %s", target.path, e)
+                errors += 1
 
     logger.info(__util__.log_heading(f"Finished at {time.ctime()}"))
 
@@ -191,5 +211,9 @@ def execute_prune(args: argparse.Namespace) -> int:
         logger.info("Dry run: would delete %d, keep %d", total_deleted, total_kept)
     else:
         logger.info("Deleted %d snapshot(s), kept %d", total_deleted, total_kept)
+
+    if errors > 0:
+        logger.warning("Encountered %d error(s)", errors)
+        return 1
 
     return 0
