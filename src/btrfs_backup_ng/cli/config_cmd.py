@@ -93,14 +93,48 @@ def _init_config(args: argparse.Namespace) -> int:
 
 def _import_config(args: argparse.Namespace) -> int:
     """Import btrbk configuration."""
+    from ..btrbk_import import import_btrbk_config
+
     btrbk_file = getattr(args, "btrbk_config", None)
     if not btrbk_file:
         print("Error: btrbk configuration file path required")
         return 1
 
-    print(f"Importing from: {btrbk_file}")
-    print("")
-    print("btrbk config import not yet implemented.")
-    print("This feature will parse btrbk.conf and convert to TOML format.")
+    try:
+        toml_content, warnings = import_btrbk_config(btrbk_file)
+    except FileNotFoundError as e:
+        print(f"Error: {e}")
+        return 1
+    except Exception as e:
+        print(f"Error parsing btrbk config: {e}")
+        return 1
 
-    return 1
+    # Show warnings
+    if warnings:
+        print("# Conversion warnings:", file=sys.stderr)
+        for warning in warnings:
+            print(f"#   {warning}", file=sys.stderr)
+        print("", file=sys.stderr)
+
+    # Output TOML
+    output = getattr(args, "output", None)
+    if output:
+        try:
+            with open(output, "w") as f:
+                f.write(toml_content)
+            print(f"Configuration written to: {output}", file=sys.stderr)
+            print(f"Review the file and adjust as needed.", file=sys.stderr)
+        except OSError as e:
+            print(f"Error writing file: {e}")
+            return 1
+    else:
+        print(toml_content)
+
+    if warnings:
+        print("", file=sys.stderr)
+        print(f"Conversion complete with {len(warnings)} warning(s).", file=sys.stderr)
+        print(
+            "Review the warnings above and adjust the configuration.", file=sys.stderr
+        )
+
+    return 0
