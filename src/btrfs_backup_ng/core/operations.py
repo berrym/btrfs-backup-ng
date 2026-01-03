@@ -8,6 +8,7 @@ import subprocess
 from pathlib import Path
 
 from .. import __util__
+from . import transfer as transfer_utils
 
 logger = logging.getLogger(__name__)
 
@@ -73,13 +74,22 @@ def send_snapshot(
             destination_endpoint, "send_receive"
         )
 
+        # Get compression and rate limit options
+        compress = options.get("compress", "none")
+        rate_limit = options.get("rate_limit")
+
         if use_direct_pipe:
             return_codes = _do_direct_pipe_transfer(
                 snapshot, destination_endpoint, parent, clones, send_process
             )
         else:
             return_codes = _do_process_transfer(
-                send_process, destination_endpoint, receive_process, is_ssh_endpoint
+                send_process,
+                destination_endpoint,
+                receive_process,
+                is_ssh_endpoint,
+                compress=compress,
+                rate_limit=rate_limit,
             )
 
         if any(rc != 0 for rc in return_codes):
@@ -182,13 +192,43 @@ def _do_direct_pipe_transfer(
 
 
 def _do_process_transfer(
-    send_process, destination_endpoint, receive_process, is_ssh_endpoint
+    send_process,
+    destination_endpoint,
+    receive_process,
+    is_ssh_endpoint,
+    compress: str = "none",
+    rate_limit: str | None = None,
 ) -> list[int]:
-    """Perform transfer using traditional process piping."""
+    """Perform transfer using traditional process piping.
+
+    Args:
+        send_process: btrfs send subprocess
+        destination_endpoint: Destination endpoint
+        receive_process: Placeholder for receive process
+        is_ssh_endpoint: Whether destination is SSH
+        compress: Compression method (none, gzip, zstd, lz4, etc.)
+        rate_limit: Bandwidth limit (e.g., '10M', '1G')
+
+    Returns:
+        List of return codes from all processes
+    """
     logger.debug("Using traditional send/receive process approach")
 
+    pipeline_processes = []
+    current_stdout = send_process.stdout
+
     try:
-        receive_process = destination_endpoint.receive(send_process.stdout)
+        # Build transfer pipeline with compression and throttling
+        if compress != "none" or rate_limit:
+            current_stdout, pipeline_processes = transfer_utils.build_transfer_pipeline(
+                send_stdout=send_process.stdout,
+                compress=compress,
+                rate_limit=rate_limit,
+                show_progress=True,
+            )
+
+        # Start receive process with potentially modified input stream
+        receive_process = destination_endpoint.receive(current_stdout)
         if receive_process is None:
             logger.error("Failed to start receive process")
             if is_ssh_endpoint and not destination_endpoint.config.get(
@@ -196,7 +236,11 @@ def _do_process_transfer(
             ):
                 logger.error("Try using --ssh-sudo for SSH destinations")
             raise __util__.SnapshotTransferError("Receive process failed to start")
+    except __util__.SnapshotTransferError:
+        transfer_utils.cleanup_pipeline(pipeline_processes)
+        raise
     except Exception as e:
+        transfer_utils.cleanup_pipeline(pipeline_processes)
         logger.error("Failed to start receive process: %s", e)
         raise __util__.SnapshotTransferError(f"Receive process failed to start: {e}")
 
@@ -208,7 +252,13 @@ def _do_process_transfer(
     except subprocess.TimeoutExpired:
         logger.error("Timeout waiting for send process")
         send_process.kill()
+        transfer_utils.cleanup_pipeline(pipeline_processes)
         raise __util__.SnapshotTransferError("Timeout waiting for send process")
+
+    # Wait for pipeline processes
+    pipeline_return_codes = transfer_utils.wait_for_pipeline(
+        pipeline_processes, timeout=timeout_seconds
+    )
 
     try:
         return_code_receive = receive_process.wait(timeout=300)
@@ -220,7 +270,7 @@ def _do_process_transfer(
         receive_process.kill()
         raise __util__.SnapshotTransferError("Timeout waiting for receive process")
 
-    return [return_code_send, return_code_receive]
+    return [return_code_send] + pipeline_return_codes + [return_code_receive]
 
 
 def _log_process_errors(send_process, receive_process) -> None:

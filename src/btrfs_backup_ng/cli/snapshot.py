@@ -60,6 +60,17 @@ def execute_snapshot(args: argparse.Namespace) -> int:
         logger.error("No volumes configured")
         return 1
 
+    dry_run = getattr(args, "dry_run", False)
+
+    if dry_run:
+        logger.info("Dry run mode - showing what would be done")
+        print("")
+        print("Would create snapshots for:")
+        for volume in volumes:
+            prefix = volume.snapshot_prefix or f"{os.uname()[1]}-"
+            print(f"  {volume.path} (prefix: {prefix})")
+        return 0
+
     logger.info(__util__.log_heading(f"Creating snapshots at {time.ctime()}"))
 
     success_count = 0

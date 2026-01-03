@@ -121,12 +121,28 @@ def create_subcommand_parser() -> argparse.ArgumentParser:
         metavar="N",
         help="Max concurrent target transfers per volume (overrides config)",
     )
+    run_parser.add_argument(
+        "--compress",
+        metavar="METHOD",
+        choices=["none", "gzip", "zstd", "lz4", "pigz", "lzop"],
+        help="Compression method for transfers (overrides config)",
+    )
+    run_parser.add_argument(
+        "--rate-limit",
+        metavar="RATE",
+        help="Bandwidth limit (e.g., '10M', '1G') (overrides config)",
+    )
 
     # snapshot command
     snapshot_parser = subparsers.add_parser(
         "snapshot",
         help="Create snapshots only",
         description="Take snapshots without transferring to targets",
+    )
+    snapshot_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Show what would be done without making changes",
     )
     snapshot_parser.add_argument(
         "--volume",
@@ -142,10 +158,26 @@ def create_subcommand_parser() -> argparse.ArgumentParser:
         description="Transfer snapshots without creating new ones",
     )
     transfer_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Show what would be done without making changes",
+    )
+    transfer_parser.add_argument(
         "--volume",
         metavar="PATH",
         action="append",
         help="Only transfer specific volume(s)",
+    )
+    transfer_parser.add_argument(
+        "--compress",
+        metavar="METHOD",
+        choices=["none", "gzip", "zstd", "lz4", "pigz", "lzop"],
+        help="Compression method for transfers (overrides config)",
+    )
+    transfer_parser.add_argument(
+        "--rate-limit",
+        metavar="RATE",
+        help="Bandwidth limit (e.g., '10M', '1G') (overrides config)",
     )
 
     # prune command

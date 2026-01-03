@@ -10,7 +10,14 @@ from pathlib import Path
 from .. import __util__, endpoint
 from ..__logger__ import create_logger
 from ..__logger__ import logger as root_logger
-from ..config import Config, ConfigError, VolumeConfig, find_config_file, load_config
+from ..config import (
+    Config,
+    ConfigError,
+    TargetConfig,
+    VolumeConfig,
+    find_config_file,
+    load_config,
+)
 from ..core.operations import sync_snapshots
 from .common import get_log_level
 
@@ -71,6 +78,10 @@ def execute_run(args: argparse.Namespace) -> int:
         "Parallel volumes: %d, parallel targets: %d", parallel_volumes, parallel_targets
     )
 
+    # Get CLI overrides for compression/throttling
+    compress_override = getattr(args, "compress", None)
+    rate_limit_override = getattr(args, "rate_limit", None)
+
     # Execute backup for each enabled volume
     enabled_volumes = config.get_enabled_volumes()
     logger.info("Processing %d volume(s)", len(enabled_volumes))
@@ -82,7 +93,12 @@ def execute_run(args: argparse.Namespace) -> int:
         with ThreadPoolExecutor(max_workers=parallel_volumes) as executor:
             futures = {
                 executor.submit(
-                    _backup_volume, volume, config, parallel_targets
+                    _backup_volume,
+                    volume,
+                    config,
+                    parallel_targets,
+                    compress_override,
+                    rate_limit_override,
                 ): volume
                 for volume in enabled_volumes
             }
@@ -98,7 +114,13 @@ def execute_run(args: argparse.Namespace) -> int:
         # Sequential execution
         for volume in enabled_volumes:
             try:
-                success = _backup_volume(volume, config, parallel_targets)
+                success = _backup_volume(
+                    volume,
+                    config,
+                    parallel_targets,
+                    compress_override,
+                    rate_limit_override,
+                )
                 results.append((volume.path, success))
             except Exception as e:
                 logger.error("Volume %s failed: %s", volume.path, e)
@@ -147,13 +169,21 @@ def _dry_run(config: Config) -> int:
     return 0
 
 
-def _backup_volume(volume: VolumeConfig, config: Config, parallel_targets: int) -> bool:
+def _backup_volume(
+    volume: VolumeConfig,
+    config: Config,
+    parallel_targets: int,
+    compress_override: str | None = None,
+    rate_limit_override: str | None = None,
+) -> bool:
     """Execute backup for a single volume.
 
     Args:
         volume: Volume configuration
         config: Full configuration
         parallel_targets: Max concurrent target transfers
+        compress_override: CLI override for compression method
+        rate_limit_override: CLI override for bandwidth limit
 
     Returns:
         True if successful, False otherwise
@@ -229,7 +259,8 @@ def _backup_volume(volume: VolumeConfig, config: Config, parallel_targets: int) 
                 source=False,
             )
             dest_endpoint.prepare()
-            destination_endpoints.append(dest_endpoint)
+            # Store endpoint with its target config for compression/throttle options
+            destination_endpoints.append((dest_endpoint, target))
             logger.debug("Destination endpoint ready: %s", dest_endpoint)
 
         except Exception as e:
@@ -249,11 +280,14 @@ def _backup_volume(volume: VolumeConfig, config: Config, parallel_targets: int) 
                 executor.submit(
                     _transfer_to_target,
                     source_endpoint,
-                    dest,
+                    dest_endpoint,
+                    target_config,
                     snapshot,
                     config.global_config.incremental,
-                ): dest
-                for dest in destination_endpoints
+                    compress_override,
+                    rate_limit_override,
+                ): dest_endpoint
+                for dest_endpoint, target_config in destination_endpoints
             }
             for future in as_completed(futures):
                 dest = futures[future]
@@ -266,18 +300,21 @@ def _backup_volume(volume: VolumeConfig, config: Config, parallel_targets: int) 
                     all_success = False
     else:
         # Sequential transfers
-        for dest in destination_endpoints:
+        for dest_endpoint, target_config in destination_endpoints:
             try:
                 success = _transfer_to_target(
                     source_endpoint,
-                    dest,
+                    dest_endpoint,
+                    target_config,
                     snapshot,
                     config.global_config.incremental,
+                    compress_override,
+                    rate_limit_override,
                 )
                 if not success:
                     all_success = False
             except Exception as e:
-                logger.error("Transfer to %s failed: %s", dest, e)
+                logger.error("Transfer to %s failed: %s", dest_endpoint, e)
                 all_success = False
 
     return all_success
@@ -286,28 +323,42 @@ def _backup_volume(volume: VolumeConfig, config: Config, parallel_targets: int) 
 def _transfer_to_target(
     source_endpoint,
     destination_endpoint,
+    target_config: TargetConfig,
     snapshot,
     incremental: bool,
+    compress_override: str | None = None,
+    rate_limit_override: str | None = None,
 ) -> bool:
     """Transfer snapshot to a single target.
 
     Args:
         source_endpoint: Source endpoint
         destination_endpoint: Destination endpoint
+        target_config: Target configuration with compression/throttle settings
         snapshot: Snapshot to transfer
         incremental: Whether to use incremental transfers
+        compress_override: CLI override for compression method
+        rate_limit_override: CLI override for bandwidth limit
 
     Returns:
         True if successful
     """
     try:
+        # Build transfer options with compression and throttling
+        # CLI overrides take precedence over config
+        transfer_options = {
+            "compress": compress_override or target_config.compress,
+            "rate_limit": rate_limit_override or target_config.rate_limit,
+            "ssh_sudo": target_config.ssh_sudo,
+        }
+
         sync_snapshots(
             source_endpoint,
             destination_endpoint,
             keep_num_backups=0,
             no_incremental=not incremental,
             snapshot=snapshot,
-            options={},
+            options=transfer_options,
         )
         return True
     except __util__.AbortError as e:

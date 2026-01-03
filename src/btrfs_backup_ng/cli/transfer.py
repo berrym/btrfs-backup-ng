@@ -61,6 +61,21 @@ def execute_transfer(args: argparse.Namespace) -> int:
         logger.error("No volumes configured")
         return 1
 
+    dry_run = getattr(args, "dry_run", False)
+
+    if dry_run:
+        logger.info("Dry run mode - showing what would be done")
+        print("")
+        for volume in volumes:
+            print(f"Volume: {volume.path}")
+            if volume.targets:
+                print("  Would transfer to:")
+                for target in volume.targets:
+                    print(f"    -> {target.path}")
+            else:
+                print("  (no targets configured)")
+        return 0
+
     logger.info(__util__.log_heading(f"Transferring snapshots at {time.ctime()}"))
 
     success_count = 0
@@ -135,13 +150,24 @@ def execute_transfer(args: argparse.Namespace) -> int:
                     )
                     dest_endpoint.prepare()
 
+                    # Build transfer options with compression and throttling
+                    # CLI overrides take precedence over config
+                    compress_override = getattr(args, "compress", None)
+                    rate_limit_override = getattr(args, "rate_limit", None)
+
+                    transfer_options = {
+                        "compress": compress_override or target.compress,
+                        "rate_limit": rate_limit_override or target.rate_limit,
+                        "ssh_sudo": target.ssh_sudo,
+                    }
+
                     sync_snapshots(
                         source_endpoint,
                         dest_endpoint,
                         keep_num_backups=0,
                         no_incremental=not config.global_config.incremental,
                         snapshot=None,  # Transfer all pending
-                        options={},
+                        options=transfer_options,
                     )
                     success_count += 1
 

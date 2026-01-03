@@ -38,6 +38,8 @@ class TargetConfig:
         ssh_port: SSH port for remote targets
         ssh_key: Path to SSH private key
         ssh_password_auth: Allow password authentication fallback
+        compress: Compression algorithm for transfers (none, gzip, zstd, lz4)
+        rate_limit: Bandwidth limit for transfers (e.g., "10M", "1G", "500K")
     """
 
     path: str
@@ -45,6 +47,8 @@ class TargetConfig:
     ssh_port: int = 22
     ssh_key: Optional[str] = None
     ssh_password_auth: bool = True
+    compress: str = "none"
+    rate_limit: Optional[str] = None
 
 
 @dataclass

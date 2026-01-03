@@ -68,12 +68,20 @@ def _parse_target(data: dict[str, Any]) -> TargetConfig:
     if "path" not in data:
         raise ConfigError("Target missing required 'path' field")
 
+    # Validate compression algorithm
+    compress = data.get("compress", "none")
+    valid_compress = {"none", "gzip", "zstd", "lz4", "pigz", "lzop"}
+    if compress not in valid_compress:
+        raise ConfigError(f"Invalid compression: {compress}. Valid: {valid_compress}")
+
     return TargetConfig(
         path=data["path"],
         ssh_sudo=data.get("ssh_sudo", False),
         ssh_port=data.get("ssh_port", 22),
         ssh_key=data.get("ssh_key"),
         ssh_password_auth=data.get("ssh_password_auth", True),
+        compress=compress,
+        rate_limit=data.get("rate_limit"),
     )
 
 
