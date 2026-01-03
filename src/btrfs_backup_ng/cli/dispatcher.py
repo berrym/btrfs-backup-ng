@@ -447,6 +447,8 @@ def cmd_uninstall(args: argparse.Namespace) -> int:
     """Execute uninstall command."""
     from .install import execute_uninstall
 
+    return execute_uninstall(args)
+
 
 def main(argv: list[str] | None = None) -> int:
     """Main entry point for btrfs-backup-ng CLI.
