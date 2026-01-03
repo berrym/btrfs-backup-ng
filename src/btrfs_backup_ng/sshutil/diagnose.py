@@ -70,7 +70,7 @@ def test_ssh_connection(
     host: str, port: Optional[int] = None, identity_file: Optional[str] = None
 ) -> bool:
     """Test basic SSH connectivity."""
-    logger.info(f"Testing SSH connectivity to {host}...")
+    logger.debug(f"Testing SSH connectivity to {host}...")
 
     cmd = ssh_command_base(host, port, identity_file)
     cmd.append("echo SSH connection successful")
@@ -78,7 +78,7 @@ def test_ssh_connection(
     returncode, stdout, stderr = run_command(cmd)
 
     if returncode == 0:
-        logger.info("SSH connection successful")
+        logger.debug("SSH connection successful")
         return True
     else:
         logger.error(f"SSH connection failed: {stderr}")
@@ -89,7 +89,7 @@ def test_sudo_access(
     host: str, port: Optional[int] = None, identity_file: Optional[str] = None
 ) -> bool:
     """Test if passwordless sudo is available."""
-    logger.info(f"Testing passwordless sudo access on {host}...")
+    logger.debug(f"Testing passwordless sudo access on {host}...")
 
     cmd = ssh_command_base(host, port, identity_file)
     cmd.append("sudo -n true")
@@ -97,11 +97,11 @@ def test_sudo_access(
     returncode, stdout, stderr = run_command(cmd)
 
     if returncode == 0:
-        logger.info("Passwordless sudo available")
+        logger.debug("Passwordless sudo available")
         return True
     else:
-        logger.error("Passwordless sudo not available")
-        logger.error(f"Error: {stderr}")
+        logger.debug("Passwordless sudo not available")
+        logger.debug(f"Error: {stderr}")
         return False
 
 
@@ -109,7 +109,7 @@ def test_btrfs_command(
     host: str, port: Optional[int] = None, identity_file: Optional[str] = None
 ) -> bool:
     """Test if btrfs command is available."""
-    logger.info(f"Testing btrfs command availability on {host}...")
+    logger.debug(f"Testing btrfs command availability on {host}...")
 
     cmd = ssh_command_base(host, port, identity_file)
     cmd.append("command -v btrfs")
@@ -117,7 +117,7 @@ def test_btrfs_command(
     returncode, stdout, stderr = run_command(cmd)
 
     if returncode == 0:
-        logger.info(f"btrfs command available: {stdout.strip()}")
+        logger.debug(f"btrfs command available: {stdout.strip()}")
         return True
     else:
         logger.error("btrfs command not found")
@@ -128,7 +128,7 @@ def test_sudo_btrfs(
     host: str, port: Optional[int] = None, identity_file: Optional[str] = None
 ) -> bool:
     """Test if btrfs command can be run with sudo."""
-    logger.info(f"Testing sudo btrfs on {host}...")
+    logger.debug(f"Testing sudo btrfs on {host}...")
 
     cmd = ssh_command_base(host, port, identity_file)
     cmd.append("sudo -n btrfs --version")
@@ -136,11 +136,11 @@ def test_sudo_btrfs(
     returncode, stdout, stderr = run_command(cmd)
 
     if returncode == 0:
-        logger.info(f"Passwordless sudo btrfs works: {stdout.strip()}")
+        logger.debug(f"Passwordless sudo btrfs works: {stdout.strip()}")
         return True
     else:
-        logger.error("Cannot run btrfs with passwordless sudo")
-        logger.error(f"Error: {stderr}")
+        logger.debug("Cannot run btrfs with passwordless sudo")
+        logger.debug(f"Error: {stderr}")
         return False
 
 
@@ -151,7 +151,7 @@ def test_write_permissions(
     identity_file: Optional[str] = None,
 ) -> bool:
     """Test if specified path is writable."""
-    logger.info(f"Testing write permissions for {path} on {host}...")
+    logger.debug(f"Testing write permissions for {path} on {host}...")
 
     # First check if path exists
     cmd = ssh_command_base(host, port, identity_file)
@@ -160,7 +160,7 @@ def test_write_permissions(
     returncode, stdout, stderr = run_command(cmd)
 
     if returncode != 0:
-        logger.warning(f"Path does not exist: {path}")
+        logger.debug(f"Path does not exist: {path}")
 
         # Check if parent directory exists and is writable
         parent_path = str(Path(path).parent)
@@ -170,10 +170,10 @@ def test_write_permissions(
         returncode, stdout, stderr = run_command(cmd)
 
         if returncode == 0:
-            logger.info(f"Parent directory {parent_path} exists and is writable")
+            logger.debug(f"Parent directory {parent_path} exists and is writable")
             return True
         else:
-            logger.error(
+            logger.debug(
                 f"Parent directory {parent_path} does not exist or is not writable"
             )
             return False
@@ -185,10 +185,10 @@ def test_write_permissions(
     returncode, stdout, stderr = run_command(cmd)
 
     if returncode == 0:
-        logger.info(f"Path is writable: {path}")
+        logger.debug(f"Path is writable: {path}")
         return True
     else:
-        logger.error(f"Path is not writable: {path}")
+        logger.debug(f"Path is not writable: {path}")
 
         # Check if it's writable with sudo
         cmd = ssh_command_base(host, port, identity_file)
@@ -197,10 +197,10 @@ def test_write_permissions(
         returncode, stdout, stderr = run_command(cmd)
 
         if returncode == 0:
-            logger.info(f"Path is writable with sudo: {path}")
+            logger.debug(f"Path is writable with sudo: {path}")
             return True
         else:
-            logger.error(f"Path is not writable even with sudo: {path}")
+            logger.debug(f"Path is not writable even with sudo: {path}")
             return False
 
 
@@ -211,7 +211,7 @@ def test_btrfs_filesystem(
     identity_file: Optional[str] = None,
 ) -> bool:
     """Test if the path is on a btrfs filesystem."""
-    logger.info(f"Testing if {path} is on a btrfs filesystem...")
+    logger.debug(f"Testing if {path} is on a btrfs filesystem...")
 
     cmd = ssh_command_base(host, port, identity_file)
     cmd.append(
@@ -223,13 +223,13 @@ def test_btrfs_filesystem(
     if returncode == 0:
         fs_type = stdout.strip()
         if fs_type == "btrfs":
-            logger.info(f"Path is on a btrfs filesystem: {path}")
+            logger.debug(f"Path is on a btrfs filesystem: {path}")
             return True
         else:
-            logger.error(f"Path is on a {fs_type} filesystem, not btrfs: {path}")
+            logger.debug(f"Path is on a {fs_type} filesystem, not btrfs: {path}")
             return False
     else:
-        logger.error(f"Could not determine filesystem type: {stderr}")
+        logger.debug(f"Could not determine filesystem type: {stderr}")
         return False
 
 
@@ -240,7 +240,7 @@ def test_btrfs_receive(
     identity_file: Optional[str] = None,
 ) -> bool:
     """Test if btrfs receive command works in the specified path."""
-    logger.info(f"Testing 'btrfs receive' capability on {host} for path {path}...")
+    logger.debug(f"Testing 'btrfs receive' capability on {host} for path {path}...")
 
     # First check filesystem type
     if not test_btrfs_filesystem(host, path, port, identity_file):
@@ -255,8 +255,8 @@ def test_btrfs_receive(
         # Check if we can run btrfs commands locally
         returncode, stdout, stderr = run_command(["btrfs", "--version"])
         if returncode != 0:
-            logger.error("btrfs command not available locally")
-            logger.error("Cannot test btrfs send/receive without local btrfs support")
+            logger.debug("btrfs command not available locally")
+            logger.debug("Cannot test btrfs send/receive without local btrfs support")
             return False
 
         # Skip actual send/receive test for now as it's complex to do safely
@@ -274,13 +274,13 @@ def test_btrfs_receive(
         returncode, stdout, stderr = run_command(cmd, timeout=60)
 
         if returncode == 0:
-            logger.info(
+            logger.debug(
                 "Successfully tested btrfs subvolume create/delete on remote host"
             )
             return True
         else:
-            logger.error("Failed to create/delete test subvolume on remote host")
-            logger.error(f"Error: {stderr}")
+            logger.debug("Failed to create/delete test subvolume on remote host")
+            logger.debug(f"Error: {stderr}")
             return False
 
 
@@ -333,8 +333,8 @@ def main():
         logger.setLevel(logging.DEBUG)
 
     logger.info("Starting SSH and sudo diagnostics for btrfs-backup-ng")
-    logger.info(f"Testing host: {args.host}")
-    logger.info(f"Testing path: {args.path}")
+    logger.debug(f"Testing host: {args.host}")
+    logger.debug(f"Testing path: {args.path}")
 
     # Run tests
     ssh_ok = test_ssh_connection(args.host, args.port, args.identity_file)
@@ -353,7 +353,7 @@ def main():
     )
 
     # Print summary
-    logger.info("\n" + "-" * 50)
+    logger.info("-" * 50)
     logger.info("DIAGNOSTIC SUMMARY")
     logger.info("-" * 50)
     logger.info(f"SSH Connection:          {'PASS' if ssh_ok else 'FAIL'}")

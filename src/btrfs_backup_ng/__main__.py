@@ -31,33 +31,22 @@ SOFTWARE.
 """
 
 import argparse
-import concurrent.futures
 import logging
-import logging.handlers
-import multiprocessing
 import os
 import pwd
 import subprocess
 import sys
-import threading
 import time
 import traceback
 from pathlib import Path  # Required for path handling
 
-# No SSH transfer module import needed for standalone script
-
-from rich.align import Align
-from rich.layout import Layout
-from rich.live import Live
-from rich.panel import Panel
-from rich.progress import BarColumn, Progress, SpinnerColumn, TimeElapsedColumn
-from rich.text import Text
-
 from . import __util__, __version__, endpoint
-from .__logger__ import RichLogger, cons, create_logger, logger
+from .__logger__ import create_logger, logger
 
 
-def send_snapshot(snapshot, destination_endpoint, parent=None, clones=None, options=None) -> None:
+def send_snapshot(
+    snapshot, destination_endpoint, parent=None, clones=None, options=None
+) -> None:
     """Sends snapshot to destination endpoint, using given parent and clones."""
     if options is None:
         options = {}
@@ -139,19 +128,19 @@ def send_snapshot(snapshot, destination_endpoint, parent=None, clones=None, opti
     send_process = None
     receive_process = None
     try:
-        logger.info("=== STARTING SEND PROCESS ===")
+        logger.debug("=== STARTING SEND PROCESS ===")
         logger.debug("Starting send process from %s", snapshot.endpoint)
-        logger.info("About to call snapshot.endpoint.send()")
+        logger.debug("About to call snapshot.endpoint.send()")
         send_process = snapshot.endpoint.send(snapshot, parent=parent, clones=clones)
-        logger.info("Send process call completed, result: %s", send_process)
+        logger.debug("Send process call completed, result: %s", send_process)
         if send_process is None:
             logger.error("Failed to start send process - send_process is None")
             raise __util__.SnapshotTransferError("Send process failed to start")
 
-        logger.info("Send process started successfully")
-        
+        logger.debug("Send process started successfully")
+
         try:
-            logger.info("=== CONTINUING WITH TRANSFER LOGIC ===")
+            logger.debug("=== CONTINUING WITH TRANSFER LOGIC ===")
             logger.debug("Starting receive process on %s", destination_endpoint)
             # Check if using SSH destination without sudo
             is_ssh_endpoint = (
@@ -160,9 +149,9 @@ def send_snapshot(snapshot, destination_endpoint, parent=None, clones=None, opti
             )
             is_using_sudo = False
 
-            logger.info("Checking SSH endpoint status...")
+            logger.debug("Checking SSH endpoint status...")
             if is_ssh_endpoint:
-                logger.info("Detected SSH endpoint, configuring sudo settings")
+                logger.debug("Detected SSH endpoint, configuring sudo settings")
                 # Ensure the ssh_sudo flag is propagated to the endpoint config
                 if options.get("ssh_sudo", False):
                     destination_endpoint.config["ssh_sudo"] = True
@@ -173,7 +162,7 @@ def send_snapshot(snapshot, destination_endpoint, parent=None, clones=None, opti
             # Always force ssh_sudo if specified in options
             if is_ssh_endpoint:
                 if options.get("ssh_sudo", False):
-                    logger.info("Forcing SSH sudo based on command-line option")
+                    logger.debug("Forcing SSH sudo based on command-line option")
                     destination_endpoint.config["ssh_sudo"] = True
                     is_using_sudo = True
 
@@ -183,50 +172,66 @@ def send_snapshot(snapshot, destination_endpoint, parent=None, clones=None, opti
                     )
 
             # Check if we need to use direct SSH pipe for reliability
-            logger.info("=== SSH PIPE CAPABILITY CHECK ===")
-            logger.info("Checking for direct SSH pipe capability...")
-            logger.info("Is SSH endpoint: %s", is_ssh_endpoint)
-            logger.info("Has send_receive method: %s", hasattr(destination_endpoint, 'send_receive'))
-            use_direct_pipe = is_ssh_endpoint and hasattr(destination_endpoint, 'send_receive')
-            logger.info("Using direct SSH pipe: %s", use_direct_pipe)
+            logger.debug("=== SSH PIPE CAPABILITY CHECK ===")
+            logger.debug("Checking for direct SSH pipe capability...")
+            logger.debug("Is SSH endpoint: %s", is_ssh_endpoint)
+            logger.debug(
+                "Has send_receive method: %s",
+                hasattr(destination_endpoint, "send_receive"),
+            )
+            use_direct_pipe = is_ssh_endpoint and hasattr(
+                destination_endpoint, "send_receive"
+            )
+            logger.debug("Using direct SSH pipe: %s", use_direct_pipe)
 
             if use_direct_pipe:
                 try:
                     # Use the specialized SSH direct pipe method
-                    logger.info("=== USING SSH DIRECT PIPE TRANSFER ===")
-                    logger.info("Using SSH direct pipe transfer method for better reliability")
-                    
+                    logger.debug("=== USING SSH DIRECT PIPE TRANSFER ===")
+                    logger.debug(
+                        "Using SSH direct pipe transfer method for better reliability"
+                    )
+
                     # Close the send process since we'll use direct pipe
-                    logger.info("Terminating local send process for direct pipe method")
+                    logger.debug(
+                        "Terminating local send process for direct pipe method"
+                    )
                     if send_process:
                         send_process.terminate()
                         send_process.wait()
-                    
+
                     success = destination_endpoint.send_receive(
                         snapshot,
                         parent=parent,
                         clones=clones,
-                        timeout=3600  # 1 hour timeout for large transfers
+                        timeout=3600,  # 1 hour timeout for large transfers
                     )
                     if not success:
-                        raise __util__.SnapshotTransferError("SSH direct pipe transfer failed")
+                        raise __util__.SnapshotTransferError(
+                            "SSH direct pipe transfer failed"
+                        )
 
                     # For direct pipe, we fake the return codes as successful
                     return_codes = [0, 0]
-                    logger.info("Direct SSH pipe transfer completed successfully")
+                    logger.debug("Direct SSH pipe transfer completed successfully")
                 except Exception as e:
                     logger.error("Error during SSH direct pipe transfer: %s", e)
                     logger.error("Exception details:", exc_info=True)
                     # Try to get log from endpoint
                     if hasattr(destination_endpoint, "_last_receive_log"):
-                        logger.error("Check remote log file: %s", destination_endpoint._last_receive_log)
-                    raise __util__.SnapshotTransferError(f"SSH direct pipe transfer failed: {e}")
+                        logger.error(
+                            "Check remote log file: %s",
+                            destination_endpoint._last_receive_log,
+                        )
+                    raise __util__.SnapshotTransferError(
+                        f"SSH direct pipe transfer failed: {e}"
+                    )
             else:
                 # Traditional send/receive process approach
-                logger.info("=== USING TRADITIONAL SEND/RECEIVE ===")
-                logger.info("Using traditional send/receive process approach")
+                logger.debug("=== USING TRADITIONAL SEND/RECEIVE ===")
+                logger.debug("Using traditional send/receive process approach")
                 try:
-                    logger.info("Starting receive process on destination endpoint")
+                    logger.debug("Starting receive process on destination endpoint")
                     receive_process = destination_endpoint.receive(send_process.stdout)
                     if receive_process is None:
                         logger.error(
@@ -237,9 +242,11 @@ def send_snapshot(snapshot, destination_endpoint, parent=None, clones=None, opti
                                 logger.error(
                                     "For SSH destinations, try using --ssh-sudo if the remote user needs elevated permissions"
                                 )
-                        raise __util__.SnapshotTransferError("Receive process failed to start")
-                    
-                    logger.info("Receive process started successfully")
+                        raise __util__.SnapshotTransferError(
+                            "Receive process failed to start"
+                        )
+
+                    logger.debug("Receive process started successfully")
                 except Exception as e:
                     logger.error("Failed to start receive process: %s", e)
                     logger.error("Exception details:", exc_info=True)
@@ -247,7 +254,9 @@ def send_snapshot(snapshot, destination_endpoint, parent=None, clones=None, opti
                         f"Receive process failed to start: {e}"
                     )
 
-                logger.info("Both send and receive processes started, waiting for completion...")
+                logger.debug(
+                    "Both send and receive processes started, waiting for completion..."
+                )
                 logger.debug("Waiting for processes to complete...")
                 # Set a timeout for the processes to prevent hanging indefinitely
                 timeout_seconds = 3600  # 1 hour timeout for large transfers
@@ -258,23 +267,25 @@ def send_snapshot(snapshot, destination_endpoint, parent=None, clones=None, opti
 
                 # Wait for send process first
                 try:
-                    logger.info("Waiting for send process to complete...")
+                    logger.debug("Waiting for send process to complete...")
                     return_code_send = send_process.wait(timeout=timeout_seconds)
-                    logger.info(
+                    logger.debug(
                         "Send process completed with return code: %d", return_code_send
                     )
                 except subprocess.TimeoutExpired:
                     logger.error("Timeout waiting for send process to complete")
                     send_process.kill()
-                    raise __util__.SnapshotTransferError("Timeout waiting for send process")
+                    raise __util__.SnapshotTransferError(
+                        "Timeout waiting for send process"
+                    )
 
                 # Then wait for receive process - it should finish soon after send process
                 try:
-                    logger.info("Waiting for receive process to complete...")
+                    logger.debug("Waiting for receive process to complete...")
                     return_code_receive = receive_process.wait(
                         timeout=300
                     )  # 5 minute timeout after send completes
-                    logger.info(
+                    logger.debug(
                         "Receive process completed with return code: %d",
                         return_code_receive,
                     )
@@ -286,7 +297,7 @@ def send_snapshot(snapshot, destination_endpoint, parent=None, clones=None, opti
                     )
 
                 return_codes = [return_code_send, return_code_receive]
-                
+
         except Exception as e:
             logger.error("=== CRITICAL ERROR IN TRANSFER LOGIC ===")
             logger.error("Exception occurred during transfer setup: %s", e)
@@ -425,25 +436,32 @@ def sync_snapshots(
     clear_locks(source_endpoint, source_snapshots, destination_endpoint.get_id())
 
     # Debug logging to understand transfer planning
-    logger.info("Source snapshots found: %d", len(source_snapshots))
+    logger.debug("Source snapshots found: %d", len(source_snapshots))
     for i, snap in enumerate(source_snapshots):
-        logger.info("  Source[%d]: %s", i, snap)
-    
-    logger.info("Destination snapshots found: %d", len(destination_snapshots))
-    for i, snap in enumerate(destination_snapshots):
-        logger.info("  Destination[%d]: %s", i, snap)
+        logger.debug("  Source[%d]: %s", i, snap)
 
-    logger.info("About to call plan_transfers with keep_num_backups=%d", keep_num_backups)
-    logger.info("Source snapshots types: %s", [type(s).__name__ for s in source_snapshots])
-    logger.info("Destination snapshots types: %s", [type(s).__name__ for s in destination_snapshots])
-    
+    logger.debug("Destination snapshots found: %d", len(destination_snapshots))
+    for i, snap in enumerate(destination_snapshots):
+        logger.debug("  Destination[%d]: %s", i, snap)
+
+    logger.debug(
+        "About to call plan_transfers with keep_num_backups=%d", keep_num_backups
+    )
+    logger.debug(
+        "Source snapshots types: %s", [type(s).__name__ for s in source_snapshots]
+    )
+    logger.debug(
+        "Destination snapshots types: %s",
+        [type(s).__name__ for s in destination_snapshots],
+    )
+
     try:
         to_transfer = plan_transfers(
             source_snapshots, destination_snapshots, keep_num_backups
         )
-        logger.info("Snapshots planned for transfer: %d", len(to_transfer))
+        logger.debug("Snapshots planned for transfer: %d", len(to_transfer))
         for i, snap in enumerate(to_transfer):
-            logger.info("  ToTransfer[%d]: %s", i, snap)
+            logger.debug("  ToTransfer[%d]: %s", i, snap)
     except Exception as e:
         logger.error("Error in plan_transfers: %s", e)
         logger.error("Exception details:", exc_info=True)
@@ -582,7 +600,7 @@ def do_sync_transfer(transfer_objs, **kwargs):
                 best_snapshot,
                 transfer_objs["destination_endpoint"],
                 parent=parent,
-                options=kwargs.get('options', {}),
+                options=kwargs.get("options", {}),
             )
             logger.info("Transfer of %s completed successfully", best_snapshot)
 
@@ -594,8 +612,22 @@ def do_sync_transfer(transfer_objs, **kwargs):
             # Update destination snapshot list
             logger.debug("Adding snapshot %s to destination", best_snapshot)
             destination_endpoint.add_snapshot(best_snapshot)
-            # Refresh snapshot list
-            destination_endpoint.list_snapshots()
+            # Skip snapshot list refresh for SSH endpoints with password auth to avoid hanging
+            # The transfer itself is already verified by send_receive
+            skip_refresh = hasattr(
+                destination_endpoint, "config"
+            ) and destination_endpoint.config.get("ssh_password_fallback", False)
+            if not skip_refresh:
+                try:
+                    destination_endpoint.list_snapshots()
+                except Exception as e:
+                    logger.debug(
+                        "Post-transfer snapshot list refresh failed (non-fatal): %s", e
+                    )
+            else:
+                logger.debug(
+                    "Skipping post-transfer list_snapshots for password auth mode"
+                )
 
         except __util__.SnapshotTransferError as e:
             logger.error("Snapshot transfer failed for %s: %s", best_snapshot, e)
@@ -773,6 +805,14 @@ files is allowed as well."""
         "Overrides usernames specified in SSH URLs.",
     )
     group.add_argument(
+        "--ssh-password-fallback",
+        action="store_true",
+        default=False,
+        help="Enable SSH password authentication fallback when key-based authentication fails. "
+        "Password can be provided via BTRFS_BACKUP_SSH_PASSWORD environment variable, "
+        "or interactively if running in a terminal. Requires 'sshpass' for non-interactive use.",
+    )
+    group.add_argument(
         "--simple-progress",
         action="store_true",
         default=True,
@@ -936,23 +976,13 @@ files is allowed as well."""
             if running_as_sudo:
                 logger.warning("Check file permissions: chmod 644 %s", identity_path)
         else:
-            logger.info("Using SSH identity file: %s", identity_path)
+            logger.debug("Using SSH identity file: %s", identity_path)
 
     return options
 
 
-def run_task(options, queue=None):
-    """Create a list of tasks to run."""
-    # Set up process-specific logger if queue is provided
-    if queue is not None:
-        try:
-            verbosity = options.get("verbosity", "INFO").upper()
-            log = setup_logger(queue, verbosity)
-            log.debug(f"Process {os.getpid()} logger initialized with queue")
-        except Exception as e:
-            print(f"Error setting up logger in process {os.getpid()}: {e}")
-            traceback.print_exc()
-
+def run_task(options):
+    """Run a backup task with the given options."""
     try:
         # Ensure options dict has all required keys with defaults
         if "source" not in options or not options["source"]:
@@ -1013,11 +1043,21 @@ def run_task(options, queue=None):
     time.sleep(1)
 
     # For SSH endpoints, perform one final comprehensive verification
+    # Skip verification for password auth mode to avoid hanging
     logger.debug("Performing final verification for SSH endpoints")
     for destination_endpoint in destination_endpoints:
         if hasattr(destination_endpoint, "_is_remote") and getattr(
             destination_endpoint, "_is_remote", False
         ):
+            # Skip verification for password auth mode
+            if hasattr(
+                destination_endpoint, "config"
+            ) and destination_endpoint.config.get("ssh_password_fallback", False):
+                logger.debug(
+                    "Skipping final verification for password auth mode - transfer already verified"
+                )
+                continue
+
             try:
                 logger.debug(f"Verifying SSH endpoint: {destination_endpoint}")
                 source_snapshots = source_endpoint.list_snapshots()
@@ -1056,30 +1096,6 @@ def run_task(options, queue=None):
     cleanup_snapshots(source_endpoint, destination_endpoints, options)
 
 
-def setup_logger(queue, level):
-    """Set up the logger with the appropriate verbosity."""
-    # Simple QueueHandler setup - works reliably with multiprocessing
-    qh = logging.handlers.QueueHandler(queue)
-    # Get the logger instance
-    log = logging.getLogger("btrfs-backup-ng")
-    # Reset handlers
-    log.handlers.clear()
-    log.propagate = False
-    # Add queue handler and set level
-    log.addHandler(qh)
-    try:
-        # Convert string level to logging constant
-        if isinstance(level, str):
-            level = getattr(logging, level.upper())
-        log.setLevel(level)
-    except (ValueError, TypeError, AttributeError):
-        # Fallback to INFO if level is invalid
-        print(f"Invalid log level: {level}, using INFO")
-        log.setLevel(logging.INFO)
-    # Return for confirmation
-    return log
-
-
 def apply_shortcuts(options):
     """Apply shortcuts for verbosity and snapshot settings."""
     if "quiet" in options:
@@ -1111,7 +1127,7 @@ def log_initial_settings(options):
     logger.debug("Extra SSH config options: %s", options["ssh_opt"])
     logger.debug("Use sudo at SSH remote host: %r", options["ssh_sudo"])
     if options["ssh_sudo"]:
-        logger.info(
+        logger.debug(
             "Using sudo for btrfs commands on remote hosts - ensure passwordless sudo is configured"
         )
     elif any(dest.startswith("ssh://") for dest in options.get("destinations", [])):
@@ -1139,6 +1155,12 @@ def cleanup_snapshots(source_endpoint, destination_endpoints, options):
 
     if options.get("num_backups", 0) > 0:
         for destination_endpoint in destination_endpoints:
+            # Skip cleanup for password auth mode to avoid hanging
+            if hasattr(
+                destination_endpoint, "config"
+            ) and destination_endpoint.config.get("ssh_password_fallback", False):
+                logger.debug("Skipping remote cleanup for password auth mode")
+                continue
             try:
                 destination_endpoint.delete_old_snapshots(options["num_backups"])
             except __util__.AbortError as e:
@@ -1220,9 +1242,9 @@ def prepare_destination_endpoints(options, source_endpoint):
         "Direct SSH pipe and verification now forced on for better reliability"
     )
 
-    logger.info("Preparing destination endpoints...")
+    logger.debug("Preparing destination endpoints...")
     for destination in options["destinations"]:
-        logger.info("Setting up destination: %s", destination)
+        logger.debug("Setting up destination: %s", destination)
         try:
             # Create the destination endpoint
             logger.debug("Creating destination endpoint object for: %s", destination)
@@ -1290,7 +1312,7 @@ def prepare_destination_endpoints(options, source_endpoint):
                 raise __util__.AbortError(f"Failed to prepare destination: {str(e)}")
 
             destination_endpoints.append(destination_endpoint)
-            logger.info("Destination endpoint ready: %s", destination_endpoint)
+            logger.debug("Destination endpoint ready: %s", destination_endpoint)
 
         except ValueError as e:
             logger.error("Couldn't parse destination specification: %s", e)
@@ -1339,13 +1361,14 @@ def build_endpoint_kwargs(options):
         "ssh_opts": options["ssh_opt"],
         "ssh_sudo": options["ssh_sudo"],
         "simple_progress": options.get("simple_progress", True),
+        "ssh_password_fallback": options.get("ssh_password_fallback", False),
         # DO NOT include 'path' here!
     }
 
     # Include SSH username if specified
     if "ssh_username" in options and options["ssh_username"]:
         kwargs["username"] = options["ssh_username"]
-        logger.info(
+        logger.debug(
             "Using explicitly configured SSH username: %s", options["ssh_username"]
         )
 
@@ -1353,7 +1376,7 @@ def build_endpoint_kwargs(options):
     if "ssh_identity_file" in options and options["ssh_identity_file"]:
         identity_file = options["ssh_identity_file"]
         kwargs["ssh_identity_file"] = identity_file
-        logger.info("SSH identity file configured: %s", identity_file)
+        logger.debug("SSH identity file configured: %s", identity_file)
 
         # When running as sudo, add special options to help with auth
         if os.geteuid() == 0 and os.environ.get("SUDO_USER"):
@@ -1375,7 +1398,7 @@ def build_endpoint_kwargs(options):
         logger.debug("SSH options: %s", options["ssh_opt"])
     if options["ssh_sudo"]:
         logger.debug("SSH sudo enabled: %s", options["ssh_sudo"])
-        logger.info(
+        logger.debug(
             "Using sudo for remote commands - ensure remote user has passwordless sudo rights for btrfs commands"
         )
 
@@ -1442,23 +1465,6 @@ def transfer_snapshots(source_endpoint, destination_endpoints, options):
             logger.debug("Exception was: %s", e)
 
 
-def serve_logger_thread(queue) -> None:
-    """Run the logger from a thread in main to talk to all children."""
-    print("Logger thread started")
-    while True:
-        try:
-            record = queue.get()
-            if record is None:
-                print("Logger thread received shutdown signal")
-                break
-            logger.handle(record)
-        except Exception as e:
-            print(f"Error in logger thread: {e}")
-            traceback.print_exc()
-            break
-    print("Logger thread shutting down")
-
-
 def main() -> None:
     """Main function."""
     # Check if we're running with sudo and provide guidance
@@ -1488,13 +1494,6 @@ def main() -> None:
 
     global_parser = argparse.ArgumentParser(add_help=False)
     group = global_parser.add_argument_group("Global Display settings")
-    group.add_argument(
-        "-l",
-        "--live-layout",
-        default=False,
-        action="store_true",
-        help="EXPERIMENTAL - Display a Live layout interface.",
-    )
     group.add_argument(
         "-v",
         "--verbosity",
@@ -1526,157 +1525,21 @@ def main() -> None:
 
     task_options = [parse_options([global_parser], task) for task in tasks]
 
-    # Determine if we're using a live layout
-    live_layout = False
-    for options in task_options:
-        if options.get("live_layout"):
-            live_layout = True
-            break
-
-    # Create a shared logger for all child processes
-    create_logger(live_layout)
-    # Setup queue for cross-process logging
-    queue = multiprocessing.Manager().Queue(-1)
-    # Create and start logger thread
-    logger_thread = threading.Thread(target=serve_logger_thread, args=(queue,))
-    logger_thread.daemon = True  # Make thread daemon so it doesn't block program exit
-    logger_thread.start()
-    # Configure main process logger
+    # Get the verbosity level from task options
     level = task_options[0].get("verbosity", "INFO").upper()
-    setup_logger(queue, level)
-    logger.debug("Main process logger initialized")
 
+    # Simple direct logger - no multiprocessing, no queues
+    create_logger(False, level=level)
+    logger.debug("Logger initialized")
+
+    # Execute tasks sequentially in the main process
+    # For parallel execution, users can run multiple instances (systemd handles this naturally)
     try:
-        if live_layout:
-            do_live_layout(tasks, task_options, queue)
-        else:
-            do_logging(tasks, task_options, queue)
-    finally:
-        # Ensure logger thread gets shutdown signal
-        logger.info("All tasks completed, shutting down logger")
-        queue.put_nowait(None)
-        # Wait for logger thread to finish processing all messages
-        logger_thread.join(timeout=5.0)
-        print("Logger thread joined")
-
-
-def do_logging(tasks, task_options, queue) -> None:
-    """Execute tasks output only logging."""
-    futures = []  # keep track of the concurrent futures
-    try:
-        with concurrent.futures.ProcessPoolExecutor(
-            max_workers=min(8, len(tasks))
-        ) as executor:
-            # Submit all tasks, passing queue to each
-            for n in range(len(tasks)):
-                logger.debug(f"Submitting task {n+1}/{len(tasks)}")
-                futures.append(executor.submit(run_task, task_options[n], queue))
-
-            # Wait for all futures to complete
-            logger.info(f"Waiting for {len(futures)} tasks to complete")
-            concurrent.futures.wait(futures)
-            logger.info("All tasks completed")
+        for n, options in enumerate(task_options):
+            logger.debug(f"Starting task {n + 1}/{len(task_options)}")
+            run_task(options)
+            logger.debug(f"Completed task {n + 1}/{len(task_options)}")
+        logger.info("All tasks completed successfully")
     except (__util__.AbortError, KeyboardInterrupt):
         logger.error("Process aborted by user or error")
-        sys.exit(1)
-
-
-def do_live_layout(tasks, task_options, queue) -> None:
-    """Execute tasks using rich live layout."""
-    logger.debug("Starting live layout with queue")
-    layout = Layout(name="root")
-
-    layout.split(
-        Layout(name="header", size=5),
-        Layout(name="main"),
-        Layout(name="footer", size=3),
-    )
-
-    layout["main"].split_row(
-        Layout(name="tasks"),
-        Layout(name="logs", ratio=2, minimum_size=80),
-    )
-
-    layout["header"].update(
-        Panel(
-            Align.center(
-                Text(
-                    """btrfs-backup-ng\n\nIncremental backups for the btrfs filesystem.""",
-                    justify="center",
-                ),
-                vertical="middle",
-            ),
-        ),
-    )
-
-    overall_progress = Progress(
-        "[progress.description]{task.description}",
-        BarColumn(),
-        "[progress.percentage]{task.percentage:>3.0f}%",
-        SpinnerColumn(),
-        TimeElapsedColumn(),
-    )
-
-    tasks_progress = Progress(
-        "{task.description}",
-        BarColumn(),
-        SpinnerColumn(),
-        TimeElapsedColumn(),
-    )
-
-    overall_task_id = overall_progress.add_task(
-        "[green]All jobs progress:",
-        total=len(tasks),
-    )
-
-    log = RichLogger()
-
-    layout["tasks"].update(Panel(tasks_progress))
-    layout["logs"].update(Panel(Text("\n".join(log.messages))))
-    layout["footer"].update(Panel(overall_progress))
-
-    futures = []  # keep track of the concurrent futures
-    futures_id_map = {}  # associate a task_id with futures
-
-    try:
-        with concurrent.futures.ProcessPoolExecutor(
-            max_workers=min(8, len(tasks))
-        ) as executor:
-            for n in range(len(tasks)):
-                logger.debug(f"Submitting live layout task {n+1}/{len(tasks)}")
-                futures.append(executor.submit(run_task, task_options[n], queue))
-                task_id = tasks_progress.add_task(
-                    f"[red]task: [cyan]{task_options[n]['source']}",
-                    total=None,
-                )
-                futures_id_map[futures[n]] = task_id
-
-            with Live(layout, console=cons):
-                while not overall_progress.finished:
-                    layout["logs"].update(Panel(Text("\n".join(log.messages))))
-                    done, _ = concurrent.futures.wait(futures, timeout=1)
-                    for future in done:
-                        layout["logs"].update(Panel(Text("\n".join(log.messages))))
-                        task_id = futures_id_map[future]
-                        tasks_progress.update(
-                            task_id,
-                            total=1,
-                            completed=1,
-                        )
-                        overall_progress.update(
-                            overall_task_id,
-                            advance=1,
-                        )
-                        futures.remove(future)
-                        time.sleep(1)
-                overall_progress.update(
-                    overall_task_id,
-                    completed=len(tasks),
-                )
-                time.sleep(1)
-                layout["logs"].update(Panel(Text("\n".join(log.messages))))
-                logger.debug("Live layout completed all tasks")
-        # Signal is sent in main() after this function returns
-    except (__util__.AbortError, KeyboardInterrupt):
-        logger.error("Live layout aborted by user or error")
         sys.exit(1)
