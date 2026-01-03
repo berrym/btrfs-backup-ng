@@ -715,16 +715,19 @@ files is allowed as well."""
         "-N",
         "--num-snapshots",
         type=int,
-        default=0,
-        help="Only keep latest n snapshots on source filesystem.",
+        default=20,
+        help="Only keep latest n snapshots on source filesystem. "
+        "Default is 20 to ensure incremental transfers have parent snapshots available. "
+        "Set to 0 to keep all snapshots.",
     )
     group.add_argument(
         "-n",
         "--num-backups",
         type=int,
         default=0,
-        help="Only keep latest n backups at destination."
-        " This option is not supported for 'shell://' storage.",
+        help="Only keep latest n backups at destination. "
+        "Default is 0 (keep all backups). "
+        "Not supported for 'shell://' storage.",
     )
 
     group = parser.add_argument_group("Snapshot creation settings")
@@ -859,18 +862,6 @@ files is allowed as well."""
         " If it is necessary in a working setup, please consider filing a bug.",
     )
 
-    # for backwards compatibility only
-    group = parser.add_argument_group(
-        "Deprecated options",
-        description="These options are available for backwards compatibility only"
-        " and might be removed in future releases. Please stop using them.",
-    )
-    group.add_argument(
-        "--latest-only",
-        action="store_true",
-        help="Shortcut for '--num-snapshots 1'.",
-    )
-
     group = parser.add_argument_group("Source and destination")
     group.add_argument(
         "--locked-destinations",
@@ -911,9 +902,9 @@ files is allowed as well."""
 
     # Ensure retention options are always integers
     try:
-        options["num_snapshots"] = int(options.get("num_snapshots", 0))
+        options["num_snapshots"] = int(options.get("num_snapshots", 20))
     except Exception:
-        options["num_snapshots"] = 0
+        options["num_snapshots"] = 20
     try:
         options["num_backups"] = int(options.get("num_backups", 0))
     except Exception:
@@ -1100,11 +1091,6 @@ def apply_shortcuts(options):
     """Apply shortcuts for verbosity and snapshot settings."""
     if "quiet" in options:
         options["verbosity"] = "warning"
-    # Only override if user did NOT supply --num-snapshots
-    if "latest_only" in options and (
-        "num_snapshots" not in options or options["num_snapshots"] == 0
-    ):
-        options["num_snapshots"] = 1
 
 
 def log_initial_settings(options):
