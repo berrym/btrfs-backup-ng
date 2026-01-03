@@ -1,0 +1,14 @@
+# btrfs-backup-ng Minimal Configuration
+#
+# A simple configuration for backing up /home to a local drive.
+# Copy to ~/.config/btrfs-backup-ng/config.toml
+
+[global.retention]
+daily = 7
+weekly = 4
+
+[[volumes]]
+path = "/home"
+
+[[volumes.targets]]
+path = "/mnt/backup/home"

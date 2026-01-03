@@ -1,0 +1,70 @@
+# btrfs-backup-ng Server Configuration
+#
+# Configuration for a server with frequent snapshots and multiple backup targets.
+# Copy to /etc/btrfs-backup-ng/config.toml
+
+[global]
+snapshot_dir = ".snapshots"
+incremental = true
+log_file = "/var/log/btrfs-backup-ng.log"
+parallel_volumes = 1      # Sequential for servers (less resource contention)
+parallel_targets = 2
+
+[global.retention]
+min = "6h"
+hourly = 48
+daily = 14
+weekly = 8
+monthly = 12
+yearly = 2
+
+# Web application data
+[[volumes]]
+path = "/var/www"
+snapshot_prefix = "www-"
+
+[[volumes.targets]]
+path = "/mnt/backup/www"
+
+[[volumes.targets]]
+path = "ssh://backup@offsite:/backups/server/www"
+ssh_sudo = true
+ssh_key = "/root/.ssh/backup_key"
+compress = "zstd"
+rate_limit = "50M"
+
+# Database storage
+[[volumes]]
+path = "/var/lib/mysql"
+snapshot_prefix = "mysql-"
+
+# More frequent retention for databases
+[volumes.retention]
+min = "2h"
+hourly = 72
+daily = 30
+weekly = 12
+monthly = 12
+
+[[volumes.targets]]
+path = "/mnt/backup/mysql"
+
+[[volumes.targets]]
+path = "ssh://backup@offsite:/backups/server/mysql"
+ssh_sudo = true
+ssh_key = "/root/.ssh/backup_key"
+compress = "zstd"
+
+# Mail storage
+[[volumes]]
+path = "/var/mail"
+snapshot_prefix = "mail-"
+
+[[volumes.targets]]
+path = "/mnt/backup/mail"
+
+[[volumes.targets]]
+path = "ssh://backup@offsite:/backups/server/mail"
+ssh_sudo = true
+ssh_key = "/root/.ssh/backup_key"
+compress = "gzip"

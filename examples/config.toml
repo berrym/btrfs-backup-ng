@@ -1,0 +1,139 @@
+# btrfs-backup-ng Configuration Example
+#
+# This file demonstrates all available configuration options.
+# Copy to ~/.config/btrfs-backup-ng/config.toml or /etc/btrfs-backup-ng/config.toml
+
+# =============================================================================
+# Global Settings
+# =============================================================================
+# These apply to all volumes unless overridden at the volume level.
+
+[global]
+# Directory for storing snapshots (relative to volume path or absolute)
+snapshot_dir = ".snapshots"
+
+# Timestamp format for snapshot names (strftime format)
+timestamp_format = "%Y%m%d-%H%M%S"
+
+# Use incremental transfers when possible (recommended)
+incremental = true
+
+# Optional log file path (comment out to disable file logging)
+# log_file = "/var/log/btrfs-backup-ng.log"
+
+# Parallel execution settings
+parallel_volumes = 2    # Max concurrent volume backups
+parallel_targets = 3    # Max concurrent target transfers per volume
+
+# Output verbosity
+quiet = false           # Suppress non-essential output
+verbose = false         # Enable verbose output
+
+# -----------------------------------------------------------------------------
+# Default Retention Policy
+# -----------------------------------------------------------------------------
+# Time-based retention with intuitive bucket system.
+# Duration format: 30m (minutes), 2h (hours), 1d (days), 1w (weeks)
+
+[global.retention]
+min = "1d"       # Keep ALL snapshots for at least 1 day
+hourly = 24      # Then keep 24 hourly (one per hour)
+daily = 7        # Then keep 7 daily (one per day)
+weekly = 4       # Then keep 4 weekly (one per week)
+monthly = 12     # Then keep 12 monthly (one per month)
+yearly = 0       # Don't keep yearly snapshots (0 = disabled)
+
+
+# =============================================================================
+# Volume Configurations
+# =============================================================================
+# Define each BTRFS subvolume you want to back up.
+
+# -----------------------------------------------------------------------------
+# Example 1: Home directory backup to local and remote targets
+# -----------------------------------------------------------------------------
+[[volumes]]
+path = "/home"
+snapshot_prefix = "home-"
+enabled = true
+
+# Local backup target
+[[volumes.targets]]
+path = "/mnt/backup/home"
+
+# Remote backup target with compression
+[[volumes.targets]]
+path = "ssh://backup@nas.local:/backups/home"
+ssh_sudo = true
+ssh_password_auth = true
+compress = "zstd"
+rate_limit = "50M"
+
+
+# -----------------------------------------------------------------------------
+# Example 2: Root filesystem with custom retention
+# -----------------------------------------------------------------------------
+[[volumes]]
+path = "/"
+snapshot_prefix = "root-"
+snapshot_dir = "/.snapshots"    # Absolute path for root
+
+# Override global retention for root (keep fewer snapshots)
+[volumes.retention]
+min = "6h"
+hourly = 12
+daily = 7
+weekly = 2
+monthly = 3
+
+[[volumes.targets]]
+path = "ssh://backup@nas.local:/backups/root"
+ssh_sudo = true
+compress = "lz4"    # Faster compression for root
+
+
+# -----------------------------------------------------------------------------
+# Example 3: Database volume with frequent snapshots, no remote
+# -----------------------------------------------------------------------------
+[[volumes]]
+path = "/var/lib/postgresql"
+snapshot_prefix = "postgres-"
+
+# More aggressive retention for databases
+[volumes.retention]
+min = "2h"
+hourly = 48
+daily = 14
+weekly = 4
+monthly = 6
+
+# Local backup only (no remote targets)
+[[volumes.targets]]
+path = "/mnt/backup/postgres"
+
+
+# -----------------------------------------------------------------------------
+# Example 4: Disabled volume (for reference/later use)
+# -----------------------------------------------------------------------------
+[[volumes]]
+path = "/srv/data"
+snapshot_prefix = "data-"
+enabled = false    # Skip this volume during backups
+
+[[volumes.targets]]
+path = "/mnt/backup/data"
+
+
+# =============================================================================
+# SSH Target Options Reference
+# =============================================================================
+# All available options for SSH targets:
+#
+# [[volumes.targets]]
+# path = "ssh://user@host:/path"    # Required: SSH URL
+# ssh_sudo = false                   # Use sudo on remote host
+# ssh_port = 22                      # SSH port number
+# ssh_key = "~/.ssh/id_rsa"         # Path to SSH private key
+# ssh_password_auth = true           # Allow password authentication fallback
+# compress = "none"                  # Compression: none|gzip|zstd|lz4|pigz|lzop
+# rate_limit = "10M"                 # Bandwidth limit: number with K|M|G suffix

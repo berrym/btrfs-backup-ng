@@ -1,0 +1,54 @@
+# btrfs-backup-ng Remote Backup Configuration
+#
+# Backup multiple volumes to a remote NAS over SSH with compression.
+# Copy to ~/.config/btrfs-backup-ng/config.toml
+
+[global]
+incremental = true
+parallel_volumes = 2
+parallel_targets = 2
+
+[global.retention]
+min = "1d"
+hourly = 24
+daily = 7
+weekly = 4
+monthly = 12
+
+# Home directory
+[[volumes]]
+path = "/home"
+snapshot_prefix = "home-"
+
+[[volumes.targets]]
+path = "ssh://backup@nas:/backups/workstation/home"
+ssh_sudo = true
+compress = "zstd"
+rate_limit = "100M"
+
+# Root filesystem
+[[volumes]]
+path = "/"
+snapshot_prefix = "root-"
+snapshot_dir = "/.snapshots"
+
+[volumes.retention]
+daily = 7
+weekly = 2
+
+[[volumes.targets]]
+path = "ssh://backup@nas:/backups/workstation/root"
+ssh_sudo = true
+compress = "zstd"
+rate_limit = "100M"
+
+# Data volume
+[[volumes]]
+path = "/data"
+snapshot_prefix = "data-"
+
+[[volumes.targets]]
+path = "ssh://backup@nas:/backups/workstation/data"
+ssh_sudo = true
+compress = "lz4"      # Faster for large files
+rate_limit = "100M"
