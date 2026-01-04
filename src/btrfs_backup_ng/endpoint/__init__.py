@@ -2,12 +2,10 @@
 
 """btrfs-backup-ng: btrfs_backup_ng/endpoint/__init__.py."""
 
-import getpass
 import urllib.parse
 from pathlib import Path
 
 from ..__logger__ import logger
-
 from .local import LocalEndpoint
 from .shell import ShellEndpoint
 from .ssh import SSHEndpoint
@@ -116,7 +114,9 @@ def choose_endpoint(spec, common_config=None, source=False, excluded_types=()):
         username_source = (
             "command_line"
             if "username" in common_config
-            else "url" if parsed.username else "will use default"
+            else "url"
+            if parsed.username
+            else "will use default"
         )
         logger.debug("Username source: %s", username_source)
 

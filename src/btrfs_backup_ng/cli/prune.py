@@ -18,7 +18,7 @@ from ..notifications import (
 from ..notifications import (
     NotificationConfig as NotifConfig,
 )
-from ..retention import apply_retention, format_retention_summary
+from ..retention import apply_retention
 from .common import get_log_level
 
 logger = logging.getLogger(__name__)

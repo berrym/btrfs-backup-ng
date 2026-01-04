@@ -856,10 +856,10 @@ class SSHEndpoint(Endpoint):
         """Show instructions for fixing sudoers configuration."""
         logger.info("\nTo fix sudo access:")
         user = self.config.get("username")
-        logger.info(f"Add one of these lines to /etc/sudoers via 'sudo visudo':")
-        logger.info(f"\n# Full access to btrfs commands:")
+        logger.info("Add one of these lines to /etc/sudoers via 'sudo visudo':")
+        logger.info("\n# Full access to btrfs commands:")
         logger.info(f"{user} ALL=(ALL) NOPASSWD: /usr/bin/btrfs")
-        logger.info(f"\n# Or more restricted access:")
+        logger.info("\n# Or more restricted access:")
         logger.info(
             f"{user} ALL=(ALL) NOPASSWD: /usr/bin/btrfs subvolume*, /usr/bin/btrfs send*, /usr/bin/btrfs receive*"
         )
@@ -1646,7 +1646,7 @@ class SSHEndpoint(Endpoint):
         # Standard method - works with cached credentials
         cmd = ["btrfs", "subvolume", "list", "-o", path]
         try:
-            logger.debug(f"Listing remote snapshots with command: %s", cmd)
+            logger.debug("Listing remote snapshots with command: %s", cmd)
             # Use retry mechanism for commands that may require authentication
             if use_sudo:
                 result = self._exec_remote_command_with_retry(
@@ -1927,7 +1927,7 @@ class SSHEndpoint(Endpoint):
                 logger.debug("Subvolume-based verification successful")
                 return True
             else:
-                logger.error(f"Snapshot not found in subvolume list")
+                logger.error("Snapshot not found in subvolume list")
                 logger.debug(f"Expected path: {expected_path}")
                 logger.debug(f"Full subvolume list output:\n{stdout_text}")
 
@@ -2353,7 +2353,6 @@ class SSHEndpoint(Endpoint):
         Returns:
             True if transfer succeeded, False otherwise
         """
-        import sys
 
         # Get username from config (from CLI --ssh-username or ssh://user@host URL)
         ssh_user = self.config.get("username", "root")
@@ -2795,7 +2794,7 @@ class SSHEndpoint(Endpoint):
             return False
 
         # Run pre-transfer diagnostics
-        logger.info(f"Verifying SSH connectivity and filesystem readiness...")
+        logger.info("Verifying SSH connectivity and filesystem readiness...")
         diagnostics = self._run_diagnostics(dest_path)
         if not all(
             [
@@ -2824,7 +2823,6 @@ class SSHEndpoint(Endpoint):
         buffer_name, buffer_cmd = self._find_buffer_program()
 
         # Get the source snapshot object to use proper send method
-        from btrfs_backup_ng import __util__
 
         # Find the source endpoint (should be passed in or accessible)
         # For now, we'll create a minimal snapshot object to use the source endpoint's send method
@@ -2838,7 +2836,7 @@ class SSHEndpoint(Endpoint):
                 logger.info(f"Using incremental transfer with parent: {parent_path}")
                 # We'll handle incremental logic in the actual send call
             else:
-                logger.info(f"Using full transfer")
+                logger.info("Using full transfer")
         except Exception as e:
             logger.error(f"Error setting up transfer parameters: {e}")
             return False
@@ -2948,7 +2946,7 @@ class SSHEndpoint(Endpoint):
                     proc.terminate()
                     try:
                         proc.wait(timeout=5)
-                    except:
+                    except Exception:
                         proc.kill()
 
             # Set dummy results for compatibility
@@ -3331,7 +3329,7 @@ class SSHEndpoint(Endpoint):
         logger.debug(f"   Active Processes: {active_count}/{total_count}")
 
         if elapsed > 60:  # After 1 minute
-            logger.debug(f"   STATUS: Transfer progressing normally...")
+            logger.debug("   STATUS: Transfer progressing normally...")
 
     def _log_process_error(self, process: Any, process_name: str) -> None:
         """Log detailed error information for a failed process."""

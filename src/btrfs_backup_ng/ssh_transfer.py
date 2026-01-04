@@ -22,7 +22,7 @@ import os
 import subprocess
 import time
 import warnings
-from typing import Optional, List, Dict, Any, Tuple
+from typing import Optional, Dict, Tuple
 
 
 # Warning about deprecation
@@ -142,7 +142,7 @@ def _run_diagnostics(
         )
         result["btrfs_filesystem"] = fs_test.returncode == 0
         if not result["btrfs_filesystem"]:
-            print(f"Destination is not a BTRFS filesystem")
+            print("Destination is not a BTRFS filesystem")
     except Exception as e:
         print(f"Filesystem type test failed: {e}")
 
@@ -205,7 +205,7 @@ def direct_ssh_transfer(
         print(f"Using incremental transfer with parent: {parent_path}")
         send_cmd = ["sudo", "btrfs", "send", "-p", parent_path, source_path]
     else:
-        print(f"Using full transfer")
+        print("Using full transfer")
         send_cmd = ["sudo", "btrfs", "send", source_path]
 
     # Build SSH command

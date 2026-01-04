@@ -4,13 +4,12 @@ Tests the complete retention policy application and pruning flow.
 """
 
 from datetime import datetime, timedelta
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import pytest
 
 from btrfs_backup_ng.config.schema import RetentionConfig
 from btrfs_backup_ng.retention import (
-    SnapshotInfo,
     apply_retention,
     extract_timestamp,
     format_retention_summary,

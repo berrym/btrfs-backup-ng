@@ -1,7 +1,7 @@
 """Tests for CLI dispatcher and commands."""
 
 import argparse
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import pytest
 
@@ -236,7 +236,7 @@ class TestCLIIntegration:
         from btrfs_backup_ng.cli.dispatcher import main
 
         mock_legacy.return_value = 0
-        result = main(["/home", "/backup"])
+        main(["/home", "/backup"])
 
         mock_legacy.assert_called_once()
 
@@ -246,7 +246,7 @@ class TestCLIIntegration:
         from btrfs_backup_ng.cli.dispatcher import main
 
         mock_subcommand.return_value = 0
-        result = main(["status"])
+        main(["status"])
 
         mock_subcommand.assert_called_once()
 
@@ -450,7 +450,7 @@ class TestMainFunction:
                 mock.return_value = 0
                 # This would use sys.argv[1:] = ["status"]
                 # But we pass explicit argv to avoid side effects
-                result = main(["status"])
+                main(["status"])
                 mock.assert_called_once()
 
     def test_returns_exit_code(self):
@@ -469,7 +469,7 @@ class TestMainFunction:
         with patch("sys.argv", ["prog", "status"]):
             with patch("btrfs_backup_ng.cli.dispatcher.run_subcommand") as mock:
                 mock.return_value = 0
-                result = main(None)
+                main(None)
                 mock.assert_called_once()
 
 

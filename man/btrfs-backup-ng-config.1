@@ -6,6 +6,7 @@ btrfs-backup-ng-config \- configuration management commands
 .B btrfs-backup-ng config validate
 .br
 .B btrfs-backup-ng config init
+[\fB\-i\fR|\fB\-\-interactive\fR]
 [\fB\-o\fR \fIFILE\fR]
 .br
 .B btrfs-backup-ng config import
@@ -25,11 +26,30 @@ required fields, and invalid values.
 Exit status is 0 if valid, non-zero if errors are found.
 .SS init
 Generate an example configuration file with comments explaining all options.
+Can be run in interactive mode for a guided setup wizard.
 .PP
 .RS
 .B btrfs-backup-ng config init
+[\fB\-i\fR|\fB\-\-interactive\fR]
 [\fB\-o\fR \fIFILE\fR]
 .RE
+.TP
+.BR \-i ", " \-\-interactive
+Run the interactive configuration wizard. This guides you through setting up:
+.RS
+.IP \(bu 2
+Global settings (snapshot directory, timestamp format)
+.IP \(bu 2
+Parallelism settings
+.IP \(bu 2
+Retention policies (hourly, daily, weekly, monthly, yearly)
+.IP \(bu 2
+Email and webhook notifications
+.IP \(bu 2
+Volumes to backup and their targets
+.RE
+.IP
+Requires a terminal (TTY). Press Ctrl+C to cancel at any time.
 .TP
 .BR \-o ", " \-\-output " " \fIFILE\fR
 Write output to FILE instead of stdout.
@@ -38,8 +58,17 @@ Example:
 .PP
 .RS
 .nf
+# Generate example config to stdout
 btrfs-backup-ng config init > ~/.config/btrfs-backup-ng/config.toml
+
+# Generate example config to file
 btrfs-backup-ng config init -o /etc/btrfs-backup-ng/config.toml
+
+# Run interactive wizard
+btrfs-backup-ng config init --interactive
+
+# Run interactive wizard and save to file
+btrfs-backup-ng config init -i -o config.toml
 .fi
 .RE
 .SS import

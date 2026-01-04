@@ -2,7 +2,6 @@
 
 import argparse
 
-import pytest
 
 from btrfs_backup_ng.cli.common import (
     add_verbosity_args,

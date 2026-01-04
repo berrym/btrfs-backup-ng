@@ -204,7 +204,9 @@ def apply_retention(
         now = datetime.now()
 
     if get_name is None:
-        get_name = lambda s: str(s)
+
+        def get_name(s):
+            return str(s)
 
     # Parse minimum retention duration
     try:
@@ -340,7 +342,9 @@ def format_retention_summary(
         Formatted summary string
     """
     if get_name is None:
-        get_name = lambda s: str(s)
+
+        def get_name(s):
+            return str(s)
 
     lines = [
         f"Retention: keeping {len(to_keep)}, deleting {len(to_delete)}",

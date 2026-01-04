@@ -4,7 +4,6 @@ import pytest
 
 from btrfs_backup_ng.btrbk_import import (
     BtrbkLexer,
-    BtrbkParser,
     TokenType,
     import_btrbk_config,
     parse_btrbk_config,
@@ -269,7 +268,7 @@ class TestBtrbkLexerMore:
     def test_tokenize_escaped_quote(self):
         """Test tokenizing escaped quotes in strings."""
         lexer = BtrbkLexer('path "test\\"value"')
-        tokens = lexer.tokenize()
+        lexer.tokenize()
         # Should handle escaped quotes
 
     def test_tokenize_special_chars(self):

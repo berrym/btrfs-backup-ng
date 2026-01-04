@@ -1,7 +1,5 @@
 """Tests for config loader module."""
 
-import os
-import tempfile
 from pathlib import Path
 
 import pytest
@@ -35,7 +33,6 @@ class TestFindConfigFile:
         config_path.write_text(sample_config_toml)
 
         # Patch Path.home() to return our tmp_path
-        original_home = Path.home
         monkeypatch.setattr(Path, "home", staticmethod(lambda: tmp_path))
 
         result = find_config_file(None)

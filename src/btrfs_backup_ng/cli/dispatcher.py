@@ -8,7 +8,7 @@ import argparse
 import sys
 from typing import Callable
 
-from .common import add_progress_args, add_verbosity_args, create_global_parser
+from .common import add_progress_args, add_verbosity_args
 
 # Known subcommands for the new CLI
 SUBCOMMANDS = frozenset(
@@ -252,6 +252,12 @@ def create_subcommand_parser() -> argparse.ArgumentParser:
     init_parser = config_subs.add_parser(
         "init",
         help="Generate example configuration",
+    )
+    init_parser.add_argument(
+        "-i",
+        "--interactive",
+        action="store_true",
+        help="Run interactive configuration wizard",
     )
     init_parser.add_argument(
         "-o",
@@ -666,7 +672,6 @@ Examples:
 
 def show_migration_notice() -> None:
     """Show one-time notice about config file migration."""
-    import os
     from pathlib import Path
 
     notice_file = (

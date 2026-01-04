@@ -14,7 +14,6 @@ MIT License - See LICENSE file for details.
 """
 
 import argparse
-import logging
 import os
 import pwd
 import sys
@@ -25,8 +24,7 @@ from pathlib import Path
 from . import __util__, __version__, endpoint
 from .__logger__ import create_logger, logger
 from .core import progress as progress_utils
-from .core.operations import send_snapshot, sync_snapshots
-from .core.planning import clear_locks, delete_corrupt_snapshots, plan_transfers
+from .core.operations import sync_snapshots
 
 
 def parse_options(global_parser, argv):

@@ -107,6 +107,7 @@ complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_using_command config' -a 
 complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_using_command config' -a import -d 'Import btrbk configuration'
 
 # config init
+complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_config_using_subcommand init' -s i -l interactive -d 'Run interactive configuration wizard'
 complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_config_using_subcommand init' -s o -l output -d 'Output file' -r -F
 
 # config import

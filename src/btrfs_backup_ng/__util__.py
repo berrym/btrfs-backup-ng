@@ -7,7 +7,6 @@ Common utility code shared between modules.
 import functools
 import json
 import os
-import shutil
 import subprocess
 import time
 from pathlib import Path

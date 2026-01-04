@@ -9,7 +9,6 @@ from pathlib import Path
 
 from .. import __util__, endpoint
 from ..__logger__ import add_file_handler, create_logger
-from ..__logger__ import logger as root_logger
 from ..config import (
     Config,
     ConfigError,

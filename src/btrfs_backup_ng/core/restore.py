@@ -8,11 +8,10 @@ import logging
 import time
 import uuid
 from pathlib import Path
-from typing import Callable, Literal
+from typing import Callable
 
 from .. import __util__
 from ..transaction import log_transaction
-from . import progress as progress_utils
 from .operations import send_snapshot
 
 logger = logging.getLogger(__name__)

@@ -3,18 +3,9 @@
 Tests the complete path from loading a config file to planning operations.
 """
 
-from pathlib import Path
-from unittest.mock import MagicMock, patch
-
 import pytest
 
 from btrfs_backup_ng.config.loader import load_config
-from btrfs_backup_ng.config.schema import (
-    Config,
-    GlobalConfig,
-    TargetConfig,
-    VolumeConfig,
-)
 
 
 class TestConfigLoadingFlow:

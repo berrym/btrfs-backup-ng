@@ -1,7 +1,6 @@
 """Shared CLI utilities and argument parsers."""
 
 import argparse
-import os
 import sys
 
 

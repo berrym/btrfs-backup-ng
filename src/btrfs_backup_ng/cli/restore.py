@@ -6,13 +6,12 @@ for disaster recovery, migration, or backup verification.
 
 import argparse
 import logging
-import os
 import time
 from datetime import datetime
 from pathlib import Path
 
 from .. import __util__, endpoint
-from ..__logger__ import add_file_handler, create_logger
+from ..__logger__ import create_logger
 from ..config import ConfigError, find_config_file, load_config
 from ..core.restore import (
     RestoreError,
@@ -130,7 +129,7 @@ def _execute_list_volumes(args: argparse.Namespace) -> int:
         print(f"  Snapshot dir: {vol.snapshot_dir}")
 
         if vol.targets:
-            print(f"  Backup targets:")
+            print("  Backup targets:")
             for j, target in enumerate(vol.targets):
                 ssh_info = " (ssh_sudo)" if target.ssh_sudo else ""
                 mount_info = " (require_mount)" if target.require_mount else ""
@@ -222,14 +221,14 @@ def _execute_config_restore(args: argparse.Namespace, volume_path: str) -> int:
 
     # For actual restore, need destination
     if not destination:
-        print(f"Error: Destination required for restore")
+        print("Error: Destination required for restore")
         print(
             f"Usage: btrfs-backup-ng restore --volume {volume_path} --to <destination>"
         )
         return 1
 
     # Build effective arguments
-    print(f"Config-driven restore:")
+    print("Config-driven restore:")
     print(f"  Volume: {volume_path}")
     print(f"  Source: {source}")
     print(f"  Destination: {destination}")
@@ -735,8 +734,10 @@ def _execute_unlock(args: argparse.Namespace, lock_id: str) -> int:
 
         if lock_id == "all":
             # Remove all restore locks
-            restore_snap_locks = {l for l in snap_locks if l.startswith("restore:")}
-            restore_parent_locks = {l for l in parent_locks if l.startswith("restore:")}
+            restore_snap_locks = {lk for lk in snap_locks if lk.startswith("restore:")}
+            restore_parent_locks = {
+                lk for lk in parent_locks if lk.startswith("restore:")
+            }
             unlocked_count += len(restore_snap_locks) + len(restore_parent_locks)
             snap_locks -= restore_snap_locks
             parent_locks -= restore_parent_locks

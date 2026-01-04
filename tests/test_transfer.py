@@ -3,7 +3,6 @@
 import subprocess
 from unittest.mock import MagicMock, patch
 
-import pytest
 
 from btrfs_backup_ng.core.transfer import (
     COMPRESSION_PROGRAMS,
@@ -372,7 +371,7 @@ class TestCreateThrottleProcessMore:
         mock_proc = MagicMock()
         mock_popen.return_value = mock_proc
 
-        result = create_throttle_process("10M", stdin=MagicMock(), show_progress=False)
+        create_throttle_process("10M", stdin=MagicMock(), show_progress=False)
 
         call_args = mock_popen.call_args
         assert "-q" in call_args[0][0]

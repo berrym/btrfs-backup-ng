@@ -358,7 +358,7 @@ def print_estimate(
         source_name: Display name for source
         dest_name: Display name for destination
     """
-    print(f"\nBackup Size Estimate")
+    print("\nBackup Size Estimate")
     print(f"{'=' * 60}")
     print(f"Source: {source_name}")
     print(f"Destination: {dest_name}")

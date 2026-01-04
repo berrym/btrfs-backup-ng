@@ -1,13 +1,10 @@
 """Tests for backup verification functionality."""
 
 import time
-from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
-import pytest
 
 from btrfs_backup_ng.core.verify import (
-    VerifyError,
     VerifyLevel,
     VerifyReport,
     VerifyResult,
@@ -255,7 +252,7 @@ class TestVerifyMetadata:
         def on_progress(current, total, name):
             progress_calls.append((current, total, name))
 
-        report = verify_metadata(mock_endpoint, on_progress=on_progress)
+        verify_metadata(mock_endpoint, on_progress=on_progress)
 
         assert len(progress_calls) == 2
         assert progress_calls[0] == (1, 2, "snap-1")

@@ -2,8 +2,6 @@
 
 import argparse
 import logging
-import sys
-from pathlib import Path
 
 from rich.console import Console
 from rich.table import Table
@@ -171,7 +169,7 @@ def _display_report(report: VerifyReport, args: argparse.Namespace):
 
     # Summary
     console.print()
-    console.print(f"[bold]Summary:[/bold]")
+    console.print("[bold]Summary:[/bold]")
     console.print(f"  Location: {report.location}")
     console.print(f"  Level: {report.level.value}")
     console.print(f"  Duration: {report.duration:.1f}s")

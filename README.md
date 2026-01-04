@@ -75,6 +75,10 @@ man ./man/btrfs-backup-ng.1
 ### 1. Create a Configuration File
 
 ```bash
+# Option A: Interactive wizard (recommended for new users)
+btrfs-backup-ng config init --interactive -o ~/.config/btrfs-backup-ng/config.toml
+
+# Option B: Generate example config and edit manually
 btrfs-backup-ng config init > ~/.config/btrfs-backup-ng/config.toml
 ```
 
@@ -145,7 +149,7 @@ btrfs-backup-ng install --user --timer=daily
 | `list` | Show snapshots and backups |
 | `status` | Show job status and statistics |
 | `config validate` | Validate configuration file |
-| `config init` | Generate example configuration |
+| `config init` | Generate example configuration (use `-i` for interactive wizard) |
 | `config import` | Import btrbk configuration |
 | `install` | Install systemd timer/service |
 | `uninstall` | Remove systemd timer/service |
@@ -565,17 +569,86 @@ btrfs-backup-ng config validate
 sudo btrfs-backup-ng -c /etc/btrfs-backup-ng/config.toml run
 ```
 
+### Configuration Commands
+
+#### Interactive Configuration Wizard
+
+The easiest way to create a new configuration is the interactive wizard:
+
+```bash
+# Run the wizard
+btrfs-backup-ng config init --interactive
+
+# Run the wizard and save directly to a file
+btrfs-backup-ng config init -i -o ~/.config/btrfs-backup-ng/config.toml
+```
+
+The wizard guides you through:
+- **Global settings**: Snapshot directory, timestamp format, incremental mode
+- **Parallelism**: Max concurrent volumes and targets
+- **Retention policy**: How many hourly, daily, weekly, monthly, yearly snapshots to keep
+- **Notifications**: Email (SMTP) and webhook settings
+- **Volumes**: Which directories to back up
+- **Targets**: Where to send backups (local paths or SSH URLs)
+
+The wizard automatically suggests appropriate options:
+- Prompts for `require_mount` when targeting `/mnt/` paths (external drive safety)
+- Prompts for `ssh_sudo` when targeting SSH URLs
+
+Press Ctrl+C at any time to cancel.
+
+#### Generate Example Configuration
+
+For manual editing, generate an example configuration with comments:
+
+```bash
+# Output to stdout
+btrfs-backup-ng config init
+
+# Save to file
+btrfs-backup-ng config init -o config.toml
+```
+
+#### Validate Configuration
+
+Check your configuration for errors before running backups:
+
+```bash
+btrfs-backup-ng config validate
+
+# Validate a specific file
+btrfs-backup-ng config validate -c /path/to/config.toml
+```
+
+#### Import btrbk Configuration
+
+Migrate from btrbk by importing your existing configuration:
+
+```bash
+# Convert and output to stdout
+btrfs-backup-ng config import /etc/btrbk/btrbk.conf
+
+# Convert and save to file
+btrfs-backup-ng config import /etc/btrbk/btrbk.conf -o config.toml
+```
+
+See [Migrating from btrbk](#migrating-from-btrbk) for more details.
+
 ### Recommended Setup for Automated Backups
 
 For production servers with systemd timers:
 
 ```bash
-# 1. Create system-wide configuration
+# 1. Create system-wide configuration (interactive wizard)
 sudo mkdir -p /etc/btrfs-backup-ng
-btrfs-backup-ng config init | sudo tee /etc/btrfs-backup-ng/config.toml
+sudo btrfs-backup-ng config init -i -o /etc/btrfs-backup-ng/config.toml
 sudo chmod 600 /etc/btrfs-backup-ng/config.toml
 
-# 2. Edit configuration
+# Or generate example and edit manually:
+# btrfs-backup-ng config init | sudo tee /etc/btrfs-backup-ng/config.toml
+# sudo chmod 600 /etc/btrfs-backup-ng/config.toml
+
+# 2. Edit configuration (if not using interactive wizard)
 sudo $EDITOR /etc/btrfs-backup-ng/config.toml
 
 # 3. Validate configuration
@@ -1714,11 +1787,13 @@ btrfs-backup-ng uninstall
 ### Complete System-Wide Setup Example
 
 ```bash
-# 1. Create and configure
+# 1. Create and configure (using interactive wizard)
 sudo mkdir -p /etc/btrfs-backup-ng
-btrfs-backup-ng config init | sudo tee /etc/btrfs-backup-ng/config.toml
+sudo btrfs-backup-ng config init -i -o /etc/btrfs-backup-ng/config.toml
 sudo chmod 600 /etc/btrfs-backup-ng/config.toml
-sudo $EDITOR /etc/btrfs-backup-ng/config.toml
+
+# Or manually: btrfs-backup-ng config init | sudo tee /etc/btrfs-backup-ng/config.toml
+# sudo $EDITOR /etc/btrfs-backup-ng/config.toml
 
 # 2. Validate and test
 sudo btrfs-backup-ng config validate

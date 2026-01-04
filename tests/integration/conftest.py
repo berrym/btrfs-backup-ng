@@ -1,6 +1,5 @@
 """Shared fixtures for integration tests."""
 
-import subprocess
 from datetime import datetime, timedelta
 from pathlib import Path
 from unittest.mock import MagicMock, patch

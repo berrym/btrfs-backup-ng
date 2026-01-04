@@ -4,7 +4,6 @@
 Create destinations with shell command endpoints.
 """
 
-from pathlib import Path
 from .common import Endpoint
 
 

@@ -109,6 +109,7 @@ _btrfs-backup-ng() {
                                     ;;
                                 init)
                                     _arguments \
+                                        '(-i --interactive)'{-i,--interactive}'[Run interactive configuration wizard]' \
                                         '(-o --output)'{-o,--output}'[Output file]:file:_files'
                                     ;;
                                 import)

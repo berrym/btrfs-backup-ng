@@ -4,10 +4,8 @@ Tests the complete CLI flow from argument parsing through execution.
 """
 
 import argparse
-import sys
-from io import StringIO
 from pathlib import Path
-from unittest.mock import MagicMock, call, patch
+from unittest.mock import patch
 
 import pytest
 
@@ -397,7 +395,7 @@ class TestMigrationNotice:
 
     def test_notice_creates_marker_file(self, tmp_path):
         """Test migration notice creates marker file."""
-        notice_file = tmp_path / ".migration-notice-shown"
+        tmp_path / ".migration-notice-shown"
 
         with patch.object(Path, "home", return_value=tmp_path):
             with patch("builtins.print"):
@@ -432,7 +430,7 @@ class TestCLIErrorHandling:
 
     def test_unknown_command(self):
         """Test unknown command returns error."""
-        parser = create_subcommand_parser()
+        create_subcommand_parser()
         args = argparse.Namespace(command="unknown_cmd", version=False)
 
         with patch("builtins.print"):

@@ -29,7 +29,7 @@ def has_btrfs_support() -> bool:
 
     # Check if btrfs module is available
     try:
-        result = subprocess.run(
+        subprocess.run(
             ["modprobe", "btrfs"],
             capture_output=True,
             timeout=10,

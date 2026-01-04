@@ -1,7 +1,5 @@
 """Tests for config schema dataclasses."""
 
-import pytest
-
 from btrfs_backup_ng.config.schema import (
     Config,
     GlobalConfig,

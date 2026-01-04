@@ -1,9 +1,7 @@
 """Tests for logger module."""
 
 import logging
-from unittest.mock import MagicMock, patch
 
-import pytest
 
 from btrfs_backup_ng.__logger__ import (
     RichLogger,
@@ -71,7 +69,7 @@ class TestRichLogger:
     def test_write_message(self):
         """Test writing a message."""
         rich_logger = RichLogger()
-        initial_len = len(rich_logger.messages)
+        len(rich_logger.messages)
         rich_logger.write("test message")
         assert "test message" in list(rich_logger.messages)
 

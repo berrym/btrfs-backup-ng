@@ -65,14 +65,14 @@ class NotificationEvent:
     def to_text(self) -> str:
         """Format as plain text for email body."""
         lines = [
-            f"btrfs-backup-ng Notification",
-            f"=" * 40,
-            f"",
+            "btrfs-backup-ng Notification",
+            "=" * 40,
+            "",
             f"Event: {self.event_type}",
             f"Status: {self.status.upper()}",
             f"Time: {self.timestamp}",
             f"Host: {self.hostname}",
-            f"",
+            "",
             f"Summary: {self.summary}",
         ]
 

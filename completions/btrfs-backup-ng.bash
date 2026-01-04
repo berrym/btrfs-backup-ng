@@ -22,7 +22,7 @@ _btrfs_backup_ng() {
     local uninstall_opts=""
     local restore_opts="-l --list -s --snapshot --before -a --all -i --interactive --dry-run --no-incremental --overwrite --in-place --yes-i-know-what-i-am-doing --prefix --ssh-sudo --ssh-key --compress --rate-limit --no-fs-checks --status --unlock --cleanup --progress --no-progress -c --config --volume --target --list-volumes --to"
     local config_validate_opts=""
-    local config_init_opts="-o --output"
+    local config_init_opts="-i --interactive -o --output"
     local config_import_opts="-o --output"
     local verify_opts="--level --snapshot --temp-dir --no-cleanup --prefix --ssh-sudo --ssh-key --no-fs-checks --json -q --quiet"
     local estimate_opts="-c --config --volume --target --prefix --ssh-sudo --ssh-key --no-fs-checks --json"

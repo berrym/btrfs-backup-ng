@@ -3,10 +3,9 @@ import os
 import pwd
 import shutil
 import subprocess
-import tempfile
 import threading
 from pathlib import Path
-from typing import Any, List, Optional
+from typing import List, Optional
 
 from btrfs_backup_ng.__logger__ import logger
 

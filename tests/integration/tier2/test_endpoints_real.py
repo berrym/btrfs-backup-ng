@@ -4,15 +4,12 @@ These tests verify that the LocalEndpoint class works correctly
 with actual btrfs filesystems.
 """
 
-import os
 import subprocess
 from datetime import datetime
 from pathlib import Path
 
 import pytest
 
-from btrfs_backup_ng import __util__
-from btrfs_backup_ng.endpoint.common import Endpoint
 from btrfs_backup_ng.endpoint.local import LocalEndpoint
 
 from .conftest import (
@@ -369,7 +366,7 @@ class TestEndpointSendReceiveReal:
         # Need to get the received snap1 as parent reference for dest
         dest_endpoint.list_snapshots(flush_cache=True)
         dest_snaps = dest_endpoint.list_snapshots()
-        dest_snap1 = dest_snaps[0]
+        dest_snaps[0]
 
         send_proc = source_endpoint.send(snap2, parent=snap1)
         recv_proc = dest_endpoint.receive(send_proc.stdout)
