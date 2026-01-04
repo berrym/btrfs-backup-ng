@@ -34,14 +34,26 @@ def execute(args: argparse.Namespace) -> int:
     level = VerifyLevel(args.level)
 
     # Build endpoint kwargs
+    no_fs_checks = getattr(args, "no_fs_checks", False)
     endpoint_kwargs = {
-        "snapshot_prefix": args.prefix or "",
+        "snap_prefix": args.prefix or "",
+        "convert_rw": False,
+        "subvolume_sync": False,
+        "btrfs_debug": False,
+        "fs_checks": not no_fs_checks,
     }
 
-    if args.ssh_sudo:
-        endpoint_kwargs["ssh_sudo"] = True
-    if args.ssh_key:
-        endpoint_kwargs["ssh_key"] = args.ssh_key
+    # SSH options
+    if args.location.startswith("ssh://"):
+        if args.ssh_sudo:
+            endpoint_kwargs["ssh_sudo"] = True
+        if args.ssh_key:
+            endpoint_kwargs["ssh_identity_file"] = args.ssh_key
+    else:
+        # For local paths, set 'path' for LocalEndpoint
+        from pathlib import Path
+
+        endpoint_kwargs["path"] = Path(args.location).resolve()
 
     # Create endpoint for backup location
     try:
@@ -49,8 +61,9 @@ def execute(args: argparse.Namespace) -> int:
             args.location,
             endpoint_kwargs,
             source=False,  # Path goes to config["path"]
-            no_subvol_check=args.no_fs_checks,
         )
+        # Prepare endpoint (runs diagnostics for SSH, detects passwordless sudo, etc.)
+        backup_ep.prepare()
     except Exception as e:
         console.print(f"[red]Error:[/red] Cannot access backup location: {e}")
         return 2
