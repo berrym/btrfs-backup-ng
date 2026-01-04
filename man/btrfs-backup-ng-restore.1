@@ -10,6 +10,12 @@ btrfs-backup-ng-restore \- restore snapshots from backup location
 \fB\-\-list\fR \fISOURCE\fR
 .br
 .B btrfs-backup-ng restore
+\fB\-\-volume\fR \fIPATH\fR \fB\-\-to\fR \fIDESTINATION\fR
+.br
+.B btrfs-backup-ng restore
+\fB\-\-list-volumes\fR
+.br
+.B btrfs-backup-ng restore
 \fB\-\-status\fR \fISOURCE\fR
 .SH DESCRIPTION
 Pull snapshots from backup storage back to a local system. This command
@@ -91,6 +97,24 @@ Filter snapshots by prefix (e.g., "home-" to only show home snapshots).
 .B \-\-no-fs-checks
 Skip btrfs subvolume verification. Needed when backup directories are
 regular directories rather than btrfs subvolumes.
+.SS Config-Driven Restore Options
+.TP
+.BR \-c ", " \-\-config " " \fIFILE\fR
+Path to configuration file.
+.TP
+.BI \-\-volume " PATH"
+Restore backups for volume defined in config (e.g., /home). Uses the
+backup target(s) configured for that volume.
+.TP
+.BI \-\-target " INDEX"
+Target index to restore from (0-based). Default: first target (0).
+Use with \fB\-\-volume\fR to select which backup target to restore from.
+.TP
+.BI \-\-to " PATH"
+Destination path for config-driven restore. Required when using \fB\-\-volume\fR.
+.TP
+.B \-\-list-volumes
+List volumes and their backup targets from the configuration file.
 .SS Recovery Options
 .TP
 .B \-\-status
@@ -164,6 +188,18 @@ Unlock all stuck restore sessions:
 .TP
 Clean up partial restores:
 .B btrfs-backup-ng restore --cleanup /mnt/restore
+.TP
+List configured volumes and targets:
+.B btrfs-backup-ng restore --list-volumes
+.TP
+List snapshots for a configured volume:
+.B btrfs-backup-ng restore --volume /home --list
+.TP
+Restore using config (knows backup location):
+.B btrfs-backup-ng restore --volume /home --to /mnt/restore
+.TP
+Restore from second configured target:
+.B btrfs-backup-ng restore --volume /home --target 1 --to /mnt/restore
 .SH INCREMENTAL CHAINS
 When restoring a snapshot that was created incrementally, all parent snapshots
 in the chain must also be restored. The restore command automatically detects

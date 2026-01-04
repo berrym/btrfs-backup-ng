@@ -15,7 +15,7 @@ See the [LICENSE](LICENSE) file for full copyright attribution.
 ## Features
 
 - **TOML Configuration**: Clean, validated configuration files (no custom syntax)
-- **Subcommand CLI**: Modern interface with `run`, `snapshot`, `transfer`, `prune`, `restore`, `verify`, `list`, `status`
+- **Subcommand CLI**: Modern interface with `run`, `snapshot`, `transfer`, `prune`, `restore`, `verify`, `estimate`, `list`, `status`
 - **Disaster Recovery**: Built-in restore command to pull backups back to local systems
 - **Backup Verification**: Multi-level integrity checks (metadata, stream, full restore test)
 - **Time-based Retention**: Intuitive policies (hourly, daily, weekly, monthly, yearly)
@@ -141,6 +141,7 @@ btrfs-backup-ng install --user --timer=daily
 | `prune` | Apply retention policies |
 | `restore` | Restore snapshots from backup location |
 | `verify` | Verify backup integrity (metadata, stream, or full test) |
+| `estimate` | Estimate backup transfer sizes before execution |
 | `list` | Show snapshots and backups |
 | `status` | Show job status and statistics |
 | `config validate` | Validate configuration file |
@@ -933,6 +934,39 @@ The restore command:
 | `--unlock [ID]` | Unlock stuck restore sessions ('all' or specific session ID) |
 | `--cleanup` | Clean up partial/incomplete restores at destination |
 
+**Config-driven restore options:**
+
+| Option | Description |
+|--------|-------------|
+| `-c, --config FILE` | Path to configuration file |
+| `--volume PATH` | Restore backups for volume defined in config (e.g., `/home`) |
+| `--target INDEX` | Target index to restore from (0-based, default: first target) |
+| `--to PATH` | Destination path for config-driven restore |
+| `--list-volumes` | List volumes and their backup targets from config |
+
+### Config-Driven Restore
+
+Instead of specifying full paths, you can use your configuration file to restore from configured backup targets:
+
+```bash
+# List all configured volumes and their backup targets
+btrfs-backup-ng restore --list-volumes
+
+# List available snapshots for a configured volume
+btrfs-backup-ng restore --volume /home --list
+
+# Restore from configured backup target
+btrfs-backup-ng restore --volume /home --to /mnt/restore
+
+# Restore from second target (index 1)
+btrfs-backup-ng restore --volume /home --target 1 --to /mnt/restore
+
+# Interactive restore from config
+btrfs-backup-ng restore --volume /home --to /mnt/restore --interactive
+```
+
+This is especially useful when you have complex SSH paths or multiple backup targets - the config file stores all the details.
+
 ### Restore from Local Backup
 
 ```bash
@@ -1425,6 +1459,96 @@ fi
 | `--no-fs-checks` | Skip btrfs subvolume verification |
 | `--json` | Output in JSON format |
 | `-q, --quiet` | Suppress progress output |
+
+## Backup Size Estimation
+
+Before running backups, you can estimate how much data will be transferred using the `estimate` command. This helps with:
+
+- Planning bandwidth usage and backup windows
+- Verifying expected transfer sizes
+- Scripting and automation decisions
+
+### Basic Estimation
+
+```bash
+# Estimate transfer size for direct paths
+btrfs-backup-ng estimate /mnt/snapshots /mnt/backup
+
+# Estimate for remote backup
+btrfs-backup-ng estimate /home/.snapshots ssh://backup@server:/backups/home
+```
+
+### Config-Driven Estimation
+
+```bash
+# List configured volumes and their targets
+btrfs-backup-ng estimate --list-volumes
+
+# Estimate for a specific volume from config
+btrfs-backup-ng estimate --volume /home
+
+# Estimate for a specific target (0-based index)
+btrfs-backup-ng estimate --volume /home --target 1
+```
+
+### JSON Output for Scripting
+
+```bash
+# Get machine-readable output
+btrfs-backup-ng estimate --volume /home --json
+
+# Example: Check if backup will fit
+SIZE=$(btrfs-backup-ng estimate --volume /home --json | jq '.total_transfer_bytes')
+AVAILABLE=$(df --output=avail -B1 /mnt/backup | tail -1)
+if [ "$SIZE" -gt "$AVAILABLE" ]; then
+    echo "Warning: Not enough space for backup"
+fi
+```
+
+### Example Output
+
+```
+Backup Size Estimate
+============================================================
+Source: /home/.snapshots
+Destination: ssh://backup@server:/backups/home
+
+Snapshots already at destination: 45
+Snapshots to transfer: 3
+
+Snapshot                                 Size         Type         Parent
+---------------------------------------- ------------ ------------ --------------------
+home-20260104-080000                     156.23 MiB   incremental  home-20260103-200000
+home-20260104-120000                     89.45 MiB    incremental  home-20260104-080000
+home-20260104-160000                     234.12 MiB   incremental  home-20260104-120000
+
+------------------------------------------------------------
+Total data to transfer: 479.80 MiB
+Full size (uncompressed): 2.34 GiB
+Estimation time: 1.23s
+```
+
+### Estimation Options
+
+| Option | Description |
+|--------|-------------|
+| `--volume PATH` | Estimate for volume defined in config |
+| `--target INDEX` | Target index to estimate for (0-based) |
+| `-c, --config FILE` | Path to configuration file |
+| `--prefix PREFIX` | Snapshot prefix filter |
+| `--ssh-sudo` | Use sudo on remote host |
+| `--ssh-key FILE` | SSH private key file |
+| `--json` | Output in JSON format |
+
+### Estimation Methods
+
+The estimate command uses multiple methods to determine sizes:
+
+1. **btrfs subvolume show** - Uses exclusive data size (most accurate, requires quotas)
+2. **btrfs filesystem du** - Handles reflinks and deduplication correctly
+3. **du** - Fallback for when btrfs commands aren't available
+
+For incremental transfers, the command uses `btrfs send --no-data` to estimate the delta size without actually transferring data.
 
 ## Legacy CLI Mode
 

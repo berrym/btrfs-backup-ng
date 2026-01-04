@@ -1,0 +1,143 @@
+.\" Man page for btrfs-backup-ng estimate
+.TH BTRFS-BACKUP-NG-ESTIMATE 1 "January 2026" "btrfs-backup-ng" "User Commands"
+.SH NAME
+btrfs-backup-ng-estimate \- estimate backup transfer sizes
+.SH SYNOPSIS
+.B btrfs-backup-ng estimate
+[\fIOPTIONS\fR] \fISOURCE\fR \fIDESTINATION\fR
+.br
+.B btrfs-backup-ng estimate
+\fB\-\-volume\fR \fIPATH\fR [\fB\-\-target\fR \fIINDEX\fR]
+.SH DESCRIPTION
+Calculate and display estimated transfer sizes for backup operations before
+actually running them. This helps with:
+.IP \(bu 2
+Planning bandwidth usage and backup windows
+.IP \(bu 2
+Verifying expected transfer sizes before proceeding
+.IP \(bu 2
+Scripting and automation decisions
+.PP
+The estimate command analyzes which snapshots need to be transferred and
+calculates their sizes using multiple methods for accuracy.
+.SH ARGUMENTS
+.TP
+.I SOURCE
+Source snapshot location (local path or ssh://user@host:/path).
+.TP
+.I DESTINATION
+Backup destination (local path or ssh://user@host:/path).
+.SH OPTIONS
+.SS Config-Driven Options
+.TP
+.BR \-c ", " \-\-config " " \fIFILE\fR
+Path to configuration file.
+.TP
+.BI \-\-volume " PATH"
+Estimate for volume defined in config (e.g., /home). Uses the backup
+target(s) configured for that volume.
+.TP
+.BI \-\-target " INDEX"
+Target index to estimate for (0-based). Default: first target (0).
+.SS Filtering Options
+.TP
+.BI \-\-prefix " PREFIX"
+Filter snapshots by prefix.
+.SS SSH Options
+.TP
+.B \-\-ssh-sudo
+Use sudo for btrfs commands on the remote host.
+.TP
+.BI \-\-ssh-key " FILE"
+Path to SSH private key file.
+.SS Output Options
+.TP
+.B \-\-json
+Output results in JSON format for scripting.
+.TP
+.B \-\-no-fs-checks
+Skip btrfs subvolume verification.
+.SH ESTIMATION METHODS
+The estimate command uses multiple methods to determine snapshot sizes,
+in order of preference:
+.IP 1. 3
+.B btrfs subvolume show
+\- Uses exclusive data size (most accurate, requires quotas enabled)
+.IP 2. 3
+.B btrfs filesystem du
+\- Handles reflinks and deduplication correctly
+.IP 3. 3
+.B du
+\- Fallback when btrfs commands aren't available
+.PP
+For incremental transfers, the command uses \fBbtrfs send --no-data\fR
+to estimate the delta size without actually transferring data.
+.SH OUTPUT FORMAT
+The default output shows a table with:
+.IP \(bu 2
+Snapshot name
+.IP \(bu 2
+Size (incremental or full)
+.IP \(bu 2
+Transfer type (incremental or full)
+.IP \(bu 2
+Parent snapshot (for incremental)
+.PP
+Followed by totals for data to transfer and estimation time.
+.SH JSON OUTPUT
+With \fB\-\-json\fR, the output includes:
+.IP \(bu 2
+source, destination paths
+.IP \(bu 2
+snapshot_count, new_snapshot_count, skipped_count
+.IP \(bu 2
+total_transfer_bytes, total_transfer_human
+.IP \(bu 2
+total_full_bytes, total_full_human
+.IP \(bu 2
+estimation_time_seconds
+.IP \(bu 2
+snapshots array with details for each snapshot
+.SH EXAMPLES
+.TP
+Estimate transfer for direct paths:
+.B btrfs-backup-ng estimate /mnt/snapshots /mnt/backup
+.TP
+Estimate for remote backup:
+.B btrfs-backup-ng estimate /home/.snapshots ssh://backup@server:/backups/home
+.TP
+Estimate using configuration file:
+.B btrfs-backup-ng estimate --volume /home
+.TP
+Estimate for specific target:
+.B btrfs-backup-ng estimate --volume /home --target 1
+.TP
+JSON output for scripting:
+.B btrfs-backup-ng estimate --volume /home --json
+.TP
+Check if backup will fit (bash example):
+.nf
+SIZE=$(btrfs-backup-ng estimate --volume /home --json | jq '.total_transfer_bytes')
+AVAILABLE=$(df --output=avail -B1 /mnt/backup | tail -1)
+if [ "$SIZE" -gt "$AVAILABLE" ]; then
+    echo "Warning: Not enough space"
+fi
+.fi
+.SH NOTES
+.IP \(bu 2
+Estimates are approximate and actual transfer sizes may vary slightly
+due to btrfs stream overhead and compression.
+.IP \(bu 2
+Incremental estimates require the parent snapshot to exist.
+.IP \(bu 2
+The estimation process is read-only and does not modify any data.
+.IP \(bu 2
+For large backup sets, estimation may take several minutes.
+.SH SEE ALSO
+.BR btrfs-backup-ng (1),
+.BR btrfs-backup-ng-run (1),
+.BR btrfs-backup-ng-transfer (1)
+.SH COPYRIGHT
+Copyright 2024-present Michael Berry.
+.PP
+License: MIT License
