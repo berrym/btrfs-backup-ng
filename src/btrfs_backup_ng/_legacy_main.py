@@ -24,6 +24,7 @@ from pathlib import Path
 
 from . import __util__, __version__, endpoint
 from .__logger__ import create_logger, logger
+from .core import progress as progress_utils
 from .core.operations import send_snapshot, sync_snapshots
 from .core.planning import clear_locks, delete_corrupt_snapshots, plan_transfers
 
@@ -287,6 +288,10 @@ def run_task(options):
 
     if "quiet" in options:
         options["verbosity"] = "warning"
+
+    # Enable Rich progress bars for interactive terminals
+    if "show_progress" not in options:
+        options["show_progress"] = progress_utils.is_interactive()
 
     log_initial_settings(options)
 
