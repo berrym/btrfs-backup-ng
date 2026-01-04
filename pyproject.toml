@@ -20,8 +20,59 @@ classifiers = [
 requires-python = ">=3.11"
 readme = "README.md"
 
+[project.optional-dependencies]
+test = [
+    "pytest>=7.0",
+    "pytest-cov>=4.0",
+]
+dev = [
+    "pytest>=7.0",
+    "pytest-cov>=4.0",
+    "ruff>=0.1.0",
+    "mypy>=1.0",
+]
+
 [project.urls]
 Homepage = "https://github.com/berrym/btrfs-backup-ng"
 
 [project.scripts]
 btrfs-backup-ng = "btrfs_backup_ng.__main__:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_functions = ["test_*"]
+addopts = "-v --tb=short"
+
+[tool.coverage.run]
+source = ["src/btrfs_backup_ng"]
+branch = true
+omit = [
+    # Integration-only modules requiring actual btrfs operations
+    "src/btrfs_backup_ng/_legacy_main.py",
+    "src/btrfs_backup_ng/__main__.py",
+    "src/btrfs_backup_ng/endpoint/*",
+    "src/btrfs_backup_ng/ssh_transfer.py",
+    "src/btrfs_backup_ng/sshutil/*",
+    # CLI subcommand implementations (require config + btrfs)
+    "src/btrfs_backup_ng/cli/run.py",
+    "src/btrfs_backup_ng/cli/snapshot.py",
+    "src/btrfs_backup_ng/cli/transfer.py",
+    "src/btrfs_backup_ng/cli/prune.py",
+    "src/btrfs_backup_ng/cli/list_cmd.py",
+    "src/btrfs_backup_ng/cli/status.py",
+    "src/btrfs_backup_ng/cli/config_cmd.py",
+    "src/btrfs_backup_ng/cli/install.py",
+    # Core execution requiring actual btrfs
+    "src/btrfs_backup_ng/core/operations.py",
+    "src/btrfs_backup_ng/core/execution.py",
+    "src/btrfs_backup_ng/core/planning.py",
+]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "if TYPE_CHECKING:",
+    "raise NotImplementedError",
+]
+fail_under = 90
