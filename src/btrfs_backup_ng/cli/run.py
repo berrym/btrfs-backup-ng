@@ -206,16 +206,20 @@ def _backup_volume(
         # Set up snapshot directory
         snapshot_dir = Path(volume.snapshot_dir)
         if not snapshot_dir.is_absolute():
-            snapshot_dir = source_path.parent / snapshot_dir
-        snapshot_dir = snapshot_dir.resolve()
+            # Relative snapshot_dir: relative to source volume
+            # e.g., ".btrfs-backup-ng/snapshots" -> source/.btrfs-backup-ng/snapshots
+            full_snapshot_dir = (source_path / snapshot_dir).resolve()
+        else:
+            # Absolute snapshot_dir: use it directly, add source name as subdirectory
+            # e.g., "/snapshots" + source "myvolume" -> /snapshots/myvolume
+            full_snapshot_dir = (snapshot_dir / source_path.name).resolve()
 
-        # Create snapshot directory structure
-        relative_source = str(source_path).lstrip(os.sep)
-        full_snapshot_dir = snapshot_dir.joinpath(*relative_source.split(os.sep))
         full_snapshot_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
 
         source_kwargs = dict(endpoint_kwargs)
         source_kwargs["path"] = full_snapshot_dir
+        # Set snapshot_folder - use absolute path for external snapshot directories
+        source_kwargs["snapshot_folder"] = str(full_snapshot_dir)
 
         source_endpoint = endpoint.choose_endpoint(
             str(source_path),

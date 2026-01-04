@@ -10,7 +10,7 @@ import logging
 import os
 import subprocess
 from pathlib import Path
-from typing import Any, Optional, List, Dict
+from typing import Any, Dict, List, Optional
 
 from filelock import FileLock
 
@@ -138,7 +138,14 @@ class Endpoint:
     def snapshot(self, readonly: bool = True, sync: bool = True) -> Any:
         """Take a snapshot and return the created object."""
         base_path = Path(self.config["source"]).resolve()
-        snapshot_dir = (base_path / self.config["snapshot_folder"]).resolve()
+        snapshot_folder = self.config["snapshot_folder"]
+
+        # Support absolute snapshot_folder paths (external snapshot directories)
+        if Path(snapshot_folder).is_absolute():
+            snapshot_dir = Path(snapshot_folder).resolve()
+        else:
+            snapshot_dir = (base_path / snapshot_folder).resolve()
+
         self.config["path"] = snapshot_dir
         snap_prefix = self.config["snap_prefix"]
 
@@ -632,18 +639,60 @@ class Endpoint:
         return [str(item) for item in location.iterdir()]
 
     def _remount(self, path: Any, read_write: bool = True) -> None:
-        logger.debug("Remounting %s as read-write: %r", path, read_write)
+        """Remount a filesystem as read-write or read-only.
+
+        Note: This only works on actual mount points. Subvolumes within a btrfs
+        filesystem are not mount points and cannot be remounted independently.
+        If the path is not a mount point, this method logs a debug message and
+        returns without error, as the parent filesystem is likely already rw.
+        """
+        logger.debug("Checking remount for %s as read-write: %r", path, read_write)
         mode = "rw" if read_write else "ro"
+        path_str = str(path)
+
+        # Check if this path is actually a mount point
         try:
             output = subprocess.check_output(["mount"], text=True).splitlines()
+            is_mount_point = False
+            already_correct_mode = False
+
             for line in output:
-                if str(path) in line and f"(flags:{mode})" in line:
-                    logger.debug("%s already mounted as %s", path, mode)
-                    return
+                # Parse mount output: "device on /path type fstype (options)"
+                parts = line.split(" on ", 1)
+                if len(parts) < 2:
+                    continue
+                mount_info = parts[1]
+                # Extract mount point (before " type ")
+                if " type " in mount_info:
+                    mount_point = mount_info.split(" type ")[0].strip()
+                    if mount_point == path_str:
+                        is_mount_point = True
+                        # Check if already in correct mode
+                        if (
+                            f",{mode}," in line
+                            or f"({mode}," in line
+                            or f",{mode})" in line
+                        ):
+                            already_correct_mode = True
+                        break
+
+            if not is_mount_point:
+                logger.debug(
+                    "%s is not a mount point (likely a btrfs subvolume), skipping remount",
+                    path_str,
+                )
+                return
+
+            if already_correct_mode:
+                logger.debug("%s already mounted as %s", path_str, mode)
+                return
+
         except subprocess.CalledProcessError as e:
             logger.error("Failed to check mount status %r", e)
             raise __util__.AbortError from e
-        cmd = ["mount", "-o", f"remount,{mode}", str(path)]
+
+        # Path is a mount point, attempt remount
+        cmd = ["mount", "-o", f"remount,{mode}", path_str]
         if os.geteuid() != 0:
             cmd = ["sudo"] + cmd
         logger.debug("Executing remount command: %s", cmd)
@@ -653,7 +702,7 @@ class Endpoint:
         except subprocess.CalledProcessError as e:
             logger.error(
                 "Failed to remount %s as %s: %r %r %r",
-                path,
+                path_str,
                 mode,
                 e.returncode,
                 e.stderr,

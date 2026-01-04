@@ -103,11 +103,11 @@ def execute_transfer(args: argparse.Namespace) -> int:
 
             snapshot_dir = Path(volume.snapshot_dir)
             if not snapshot_dir.is_absolute():
-                snapshot_dir = source_path.parent / snapshot_dir
-            snapshot_dir = snapshot_dir.resolve()
-
-            relative_source = str(source_path).lstrip(os.sep)
-            full_snapshot_dir = snapshot_dir.joinpath(*relative_source.split(os.sep))
+                # Relative snapshot_dir: relative to source volume
+                full_snapshot_dir = (source_path / snapshot_dir).resolve()
+            else:
+                # Absolute snapshot_dir: add source name as subdirectory
+                full_snapshot_dir = (snapshot_dir / source_path.name).resolve()
 
             if not full_snapshot_dir.exists():
                 logger.warning(
@@ -117,6 +117,7 @@ def execute_transfer(args: argparse.Namespace) -> int:
 
             source_kwargs = dict(endpoint_kwargs)
             source_kwargs["path"] = full_snapshot_dir
+            source_kwargs["snapshot_folder"] = str(full_snapshot_dir)
 
             source_endpoint = endpoint.choose_endpoint(
                 str(source_path),
