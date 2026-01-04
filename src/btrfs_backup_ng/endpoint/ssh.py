@@ -220,6 +220,35 @@ class SSHEndpoint(Endpoint):
 
         identity_file = self.config.get("ssh_identity_file")
         logger.debug("SSH identity file from config: %s", identity_file)
+
+        # Auto-detect SSH key when running as sudo without explicit identity file
+        running_as_sudo = os.geteuid() == 0 and os.environ.get("SUDO_USER")
+        if not identity_file and running_as_sudo:
+            sudo_user = os.environ.get("SUDO_USER")
+            sudo_user_home = None
+            if _pwd_available and _pwd is not None:
+                try:
+                    sudo_user_home = _pwd.getpwnam(sudo_user).pw_dir
+                except Exception:
+                    pass
+            if sudo_user_home is None:
+                sudo_user_home = (
+                    f"/home/{sudo_user}" if sudo_user != "root" else "/root"
+                )
+
+            # Check for common SSH key types
+            for key_name in ["id_ed25519", "id_rsa", "id_ecdsa"]:
+                key_path = os.path.join(sudo_user_home, ".ssh", key_name)
+                if os.path.exists(key_path) and os.access(key_path, os.R_OK):
+                    identity_file = key_path
+                    self.config["ssh_identity_file"] = identity_file
+                    logger.debug(
+                        "Auto-detected SSH key for sudo user %s: %s",
+                        sudo_user,
+                        identity_file,
+                    )
+                    break
+
         if identity_file:
             running_as_sudo = os.geteuid() == 0 and os.environ.get("SUDO_USER")
             logger.debug(
@@ -636,16 +665,20 @@ class SSHEndpoint(Endpoint):
             logger.error(f"Error checking btrfs command: {e}")
             logger.debug(f"btrfs command check exception: {e}", exc_info=True)
 
-        # Test passwordless sudo
-        logger.debug("Testing passwordless sudo...")
+        # Test passwordless sudo for btrfs commands
+        # We test with btrfs directly since sudoers rules often only allow specific commands
+        logger.debug("Testing passwordless sudo for btrfs...")
         try:
-            # Use retry mechanism for sudo testing to handle potential authentication issues
+            # Use retry mechanism for sudo btrfs testing to handle potential authentication issues
             result = self._exec_remote_command_with_retry(
-                ["sudo", "-n", "true"], max_retries=2, check=False
+                ["sudo", "-n", "btrfs", "--version"], max_retries=2, check=False
             )
+            # Both passwordless_sudo and sudo_btrfs are set based on btrfs test
+            # This handles sudoers rules that only allow btrfs, not generic sudo
             results["passwordless_sudo"] = result.returncode == 0
+            results["sudo_btrfs"] = result.returncode == 0
             if results["passwordless_sudo"]:
-                logger.debug("Passwordless sudo is available")
+                logger.debug("Passwordless sudo for btrfs is available")
             else:
                 logger.warning("Passwordless sudo is not available")
                 logger.debug(
@@ -654,27 +687,6 @@ class SSHEndpoint(Endpoint):
         except Exception as e:
             logger.error(f"Error checking passwordless sudo: {e}")
             logger.debug(f"Passwordless sudo exception: {e}", exc_info=True)
-
-        # Test sudo with btrfs
-        logger.debug("Testing sudo with btrfs command...")
-        try:
-            # Use retry mechanism for sudo btrfs testing to handle potential authentication issues
-            result = self._exec_remote_command_with_retry(
-                ["sudo", "-n", "btrfs", "--version"], max_retries=2, check=False
-            )
-            results["sudo_btrfs"] = result.returncode == 0
-            if results["sudo_btrfs"]:
-                logger.debug("Sudo btrfs command works")
-                if result.stdout:
-                    logger.debug(f"btrfs version: {result.stdout.decode().strip()}")
-            else:
-                logger.warning("Cannot run btrfs with passwordless sudo")
-                logger.debug(
-                    f"Sudo btrfs stderr: {result.stderr.decode() if result.stderr else 'None'}"
-                )
-        except Exception as e:
-            logger.error(f"Error checking sudo btrfs: {e}")
-            logger.debug(f"Sudo btrfs exception: {e}", exc_info=True)
 
         # Test write permissions
         logger.debug(f"Testing write permissions to path: {path}")
@@ -911,21 +923,22 @@ class SSHEndpoint(Endpoint):
                 )
 
             # Always use -n for passwordless attempts if passwordless mode is enabled
+            # Note: We don't use -E (preserve environment) as it may be blocked by sudoers
             if len(command) > 1 and command[0] == "btrfs" and command[1] == "receive":
                 if passwordless_mode:
                     logger.debug("Using sudo with -n flag (passwordless mode)")
-                    return ["sudo", "-n", "-E", "-P", "-p", ""] + command
+                    return ["sudo", "-n", "-P", "-p", ""] + command
                 else:
                     logger.debug(
                         "Using sudo for btrfs receive command with password support"
                     )
-                    return ["sudo", "-S", "-E", "-P", "-p", ""] + command
+                    return ["sudo", "-S", "-P", "-p", ""] + command
             elif command[0] == "btrfs":
                 logger.debug("Using sudo for regular btrfs command")
                 if passwordless_mode:
-                    return ["sudo", "-n", "-E"] + command
+                    return ["sudo", "-n"] + command
                 else:
-                    return ["sudo", "-S", "-E"] + command
+                    return ["sudo", "-S"] + command
             elif command[0] in ["mkdir", "touch", "rm", "test"]:
                 # Directory operations and basic file operations that commonly need sudo privileges
                 logger.debug("Using sudo for directory/file operation: %s", command[0])
@@ -1614,10 +1627,11 @@ class SSHEndpoint(Endpoint):
 
         # If we need sudo with password, prime credentials first
         if use_sudo and self._is_master_active():
-            # Check if we have passwordless sudo
+            # Check if we have passwordless sudo for btrfs
+            # Use btrfs --version instead of sudo -n true since sudoers may only allow btrfs
             try:
                 result = self._exec_remote_command(
-                    ["sudo", "-n", "true"],
+                    ["sudo", "-n", "btrfs", "--version"],
                     check=False,
                     timeout=10,
                 )
@@ -2039,15 +2053,16 @@ class SSHEndpoint(Endpoint):
         Returns:
             True if sudo credentials were successfully cached, False otherwise
         """
-        # Check if we already have passwordless sudo
+        # Check if we already have passwordless sudo for btrfs
+        # Use btrfs --version instead of true since sudoers may only allow btrfs
         try:
             result = subprocess.run(
-                ["sudo", "-n", "true"],
+                ["sudo", "-n", "btrfs", "--version"],
                 capture_output=True,
                 timeout=5,
             )
             if result.returncode == 0:
-                logger.debug("Local passwordless sudo available")
+                logger.debug("Local passwordless sudo for btrfs available")
                 return True
         except Exception:
             pass
@@ -2094,15 +2109,16 @@ class SSHEndpoint(Endpoint):
             logger.error("SSH master connection not active")
             return False
 
-        # Check if remote has passwordless sudo
+        # Check if remote has passwordless sudo for btrfs
+        # Use btrfs --version instead of true since sudoers may only allow btrfs
         try:
             result = self._exec_remote_command(
-                ["sudo", "-n", "true"],
+                ["sudo", "-n", "btrfs", "--version"],
                 check=False,
                 timeout=10,
             )
             if result.returncode == 0:
-                logger.debug("Remote passwordless sudo available")
+                logger.debug("Remote passwordless sudo for btrfs available")
                 return True
         except Exception:
             pass
