@@ -57,6 +57,10 @@ sudo dnf install pv               # Fedora/RHEL
 sudo apt install pv               # Debian/Ubuntu
 ```
 
+### Shell Completions
+
+Shell completion scripts are available in the `completions/` directory for bash, zsh, and fish. See `completions/README.md` for installation instructions.
+
 ## Quick Start
 
 ### 1. Create a Configuration File
