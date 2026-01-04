@@ -971,19 +971,195 @@ ls -la /mnt/newroot/restored-home/
 # (depends on your specific setup)
 ```
 
-### In-Place Restore (Dangerous)
+### Restore Strategies: Choosing the Right Approach
 
-Restoring directly to the original location requires explicit confirmation:
+There are several ways to restore data from backups, each with different trade-offs. Choose the approach that best fits your situation and comfort level.
+
+#### Strategy 1: Restore to Temporary Location (Recommended)
+
+**Best for:** Most recovery scenarios, file recovery, verification before committing
+
+This is the safest approach - restore to a separate location, verify the contents, then manually move or copy what you need.
 
 ```bash
-# This will OVERWRITE your current /home with the backup
+# 1. Create a temporary restore directory (must be on btrfs)
+sudo mkdir -p /mnt/btrfs-restore
+
+# 2. Restore the snapshot you want
+sudo btrfs-backup-ng restore /mnt/backup/home /mnt/btrfs-restore \
+    --snapshot home-20260104-120000 \
+    --prefix "home-" \
+    --no-fs-checks
+
+# 3. Verify the restored snapshot contains what you expect
+ls -la /mnt/btrfs-restore/home-20260104-120000/
+diff -r /mnt/btrfs-restore/home-20260104-120000/Documents ~/Documents
+
+# 4a. Copy specific files you need (safest)
+cp -a /mnt/btrfs-restore/home-20260104-120000/Documents/important.doc ~/Documents/
+
+# 4b. Or replace entire directory (after backing up current)
+mv ~/Documents ~/Documents.old
+cp -a /mnt/btrfs-restore/home-20260104-120000/Documents ~/Documents
+
+# 5. Clean up when done
+sudo btrfs subvolume delete /mnt/btrfs-restore/home-20260104-120000
+```
+
+**Pros:**
+- Completely safe - original data untouched until you're ready
+- Can inspect and verify before committing
+- Can selectively restore individual files or directories
+- Easy to abort if something is wrong
+
+**Cons:**
+- Requires extra disk space for temporary restore
+- More manual steps involved
+- Slower for full system recovery
+
+#### Strategy 2: Restore and Rename with Btrfs Snapshots
+
+**Best for:** Full directory replacement while keeping a safety net
+
+Use btrfs's native snapshot capability to create a backup of current state before replacing.
+
+```bash
+# 1. Create a snapshot of your CURRENT state (safety net)
+sudo btrfs subvolume snapshot /home /home.before-restore
+
+# 2. Restore the backup snapshot to a temporary location
+sudo btrfs-backup-ng restore /mnt/backup/home /mnt/btrfs-restore \
+    --snapshot home-20260104-120000 \
+    --prefix "home-" \
+    --no-fs-checks
+
+# 3. Verify the restore looks correct
+ls -la /mnt/btrfs-restore/home-20260104-120000/
+
+# 4. Rename current to old, restored to current
+sudo mv /home /home.old
+sudo mv /mnt/btrfs-restore/home-20260104-120000 /home
+
+# 5. If everything works, clean up old versions later
+sudo btrfs subvolume delete /home.old
+sudo btrfs subvolume delete /home.before-restore
+
+# 5b. If something went wrong, roll back:
+sudo mv /home /home.failed-restore
+sudo mv /home.before-restore /home
+```
+
+**Pros:**
+- Full replacement with automatic rollback option
+- Uses btrfs efficiency (snapshots are instant, space-efficient)
+- Clear before/after comparison possible
+
+**Cons:**
+- Requires understanding of btrfs subvolume management
+- Need to handle mount points if /home is a separate subvolume
+- May require reboot or remount for mount point changes
+
+#### Strategy 3: Manual Btrfs Send/Receive
+
+**Best for:** Advanced users, scripted recovery, maximum control
+
+Use raw btrfs commands for complete control over the restore process.
+
+```bash
+# 1. From local backup drive
+sudo btrfs send /mnt/backup/home/home-20260104-120000 | sudo btrfs receive /mnt/restore/
+
+# 2. From remote backup via SSH
+ssh backup@server "sudo btrfs send /backups/home/home-20260104-120000" | \
+    sudo btrfs receive /mnt/restore/
+
+# 3. With compression for slow networks
+ssh backup@server "sudo btrfs send /backups/home/home-20260104-120000 | zstd" | \
+    zstd -d | sudo btrfs receive /mnt/restore/
+
+# 4. Incremental restore (if you have the parent locally)
+ssh backup@server "sudo btrfs send -p /backups/home/home-20260103-120000 \
+    /backups/home/home-20260104-120000" | sudo btrfs receive /mnt/restore/
+```
+
+**Pros:**
+- Maximum flexibility and control
+- Can be easily scripted
+- Works in minimal recovery environments
+- No dependency on btrfs-backup-ng being installed
+
+**Cons:**
+- Must manually handle incremental parent chains
+- No progress display or error recovery
+- Easy to make mistakes with complex commands
+- Must manually manage snapshot prefixes and naming
+
+#### Strategy 4: In-Place Restore (Use with Caution)
+
+**Best for:** Disaster recovery when you're certain, automated recovery scripts
+
+Direct replacement of the target location. This is the most dangerous but fastest approach.
+
+```bash
+# WARNING: This will OVERWRITE existing data at /home
+# Make absolutely sure you have the right snapshot!
+
+# 1. First, verify what you're about to restore
+btrfs-backup-ng restore --list ssh://backup@server:/backups/home \
+    --prefix "home-" --no-fs-checks
+
+# 2. Do a dry-run first
+btrfs-backup-ng restore ssh://backup@server:/backups/home /home \
+    --in-place \
+    --snapshot home-20260104-120000 \
+    --prefix "home-" \
+    --dry-run
+
+# 3. If dry-run looks correct, proceed with actual restore
 btrfs-backup-ng restore ssh://backup@server:/backups/home /home \
     --in-place \
     --yes-i-know-what-i-am-doing \
-    --snapshot home-20260104-120000
+    --snapshot home-20260104-120000 \
+    --prefix "home-" \
+    --ssh-sudo
 ```
 
-**Warning:** In-place restore can cause data loss. Always verify you have the correct snapshot and understand the implications.
+**Pros:**
+- Fastest for full recovery
+- Single command, minimal steps
+- Handles incremental chains automatically
+
+**Cons:**
+- **DESTRUCTIVE** - existing data is overwritten
+- No easy rollback if wrong snapshot chosen
+- Requires explicit confirmation flag
+- Not suitable for partial recovery
+
+#### Strategy Comparison
+
+| Strategy | Safety | Speed | Disk Space | Complexity | Best For |
+|----------|--------|-------|------------|------------|----------|
+| Temporary location | Highest | Slow | Requires extra | Low | File recovery, verification |
+| Rename with snapshots | High | Medium | Minimal extra | Medium | Full replacement with rollback |
+| Manual btrfs commands | Medium | Fast | Minimal | High | Advanced users, scripting |
+| In-place restore | Lowest | Fastest | None | Low | Disaster recovery, automation |
+
+#### Recommendations by Scenario
+
+**"I accidentally deleted some files":**
+→ Use Strategy 1 (temporary location), copy just the files you need
+
+**"My system is corrupted, I need to restore /home":**
+→ Use Strategy 2 (rename with snapshots) for safety, or Strategy 4 if you're confident
+
+**"I'm setting up a new machine from backups":**
+→ Use Strategy 1 or the restore command directly - there's nothing to lose
+
+**"I'm writing an automated disaster recovery script":**
+→ Use Strategy 3 (manual commands) or Strategy 4 (in-place) depending on your safety requirements
+
+**"I'm in a minimal recovery environment without btrfs-backup-ng":**
+→ Use Strategy 3 (manual btrfs send/receive)
 
 ### Collision Handling
 
