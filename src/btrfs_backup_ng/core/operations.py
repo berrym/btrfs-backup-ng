@@ -5,9 +5,11 @@ Extracted from __main__.py for modularity and reuse.
 
 import logging
 import subprocess
+import time
 from pathlib import Path
 
 from .. import __util__
+from ..transaction import log_transaction
 from . import progress as progress_utils
 from . import transfer as transfer_utils
 
@@ -49,6 +51,23 @@ def send_snapshot(
 
     send_process = None
     receive_process = None
+    transfer_start = time.monotonic()
+    estimated_size = None
+
+    # Log transaction start
+    source_path = str(snapshot.get_path())
+    dest_path = str(destination_endpoint.config.get("path", ""))
+    snapshot_name = str(snapshot)
+    parent_name = str(parent) if parent else None
+
+    log_transaction(
+        action="transfer",
+        status="started",
+        source=source_path,
+        destination=dest_path,
+        snapshot=snapshot_name,
+        parent=parent_name,
+    )
 
     try:
         logger.debug("Starting send process from %s", snapshot.endpoint)
@@ -138,9 +157,49 @@ def send_snapshot(
 
         logger.info("Transfer completed successfully")
 
+        # Log successful transaction
+        duration = time.monotonic() - transfer_start
+        log_transaction(
+            action="transfer",
+            status="completed",
+            source=source_path,
+            destination=dest_path,
+            snapshot=snapshot_name,
+            parent=parent_name,
+            duration_seconds=duration,
+            size_bytes=estimated_size,
+        )
+
+    except __util__.SnapshotTransferError as e:
+        # Log failed transaction
+        duration = time.monotonic() - transfer_start
+        log_transaction(
+            action="transfer",
+            status="failed",
+            source=source_path,
+            destination=dest_path,
+            snapshot=snapshot_name,
+            parent=parent_name,
+            duration_seconds=duration,
+            error=str(e),
+        )
+        raise
+
     except (OSError, subprocess.CalledProcessError) as e:
         logger.error("Error during snapshot transfer: %r", e)
         _log_subprocess_error(e, destination_endpoint)
+        # Log failed transaction
+        duration = time.monotonic() - transfer_start
+        log_transaction(
+            action="transfer",
+            status="failed",
+            source=source_path,
+            destination=dest_path,
+            snapshot=snapshot_name,
+            parent=parent_name,
+            duration_seconds=duration,
+            error=str(e),
+        )
         raise __util__.SnapshotTransferError(f"Exception during transfer: {e}") from e
 
     finally:

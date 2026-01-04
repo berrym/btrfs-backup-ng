@@ -117,6 +117,7 @@ def _parse_global(data: dict[str, Any]) -> GlobalConfig:
         timestamp_format=data.get("timestamp_format", "%Y%m%d-%H%M%S"),
         incremental=data.get("incremental", True),
         log_file=data.get("log_file"),
+        transaction_log=data.get("transaction_log"),
         retention=retention,
         parallel_volumes=data.get("parallel_volumes", 2),
         parallel_targets=data.get("parallel_targets", 3),
@@ -205,6 +206,7 @@ snapshot_dir = ".snapshots"
 timestamp_format = "%Y%m%d-%H%M%S"
 incremental = true
 # log_file = "/var/log/btrfs-backup-ng.log"
+# transaction_log = "/var/log/btrfs-backup-ng-transactions.jsonl"
 
 # Parallelism settings
 parallel_volumes = 2

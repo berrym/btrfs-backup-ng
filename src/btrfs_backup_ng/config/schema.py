@@ -87,6 +87,7 @@ class GlobalConfig:
         timestamp_format: Format string for snapshot timestamps
         incremental: Whether to use incremental transfers by default
         log_file: Path to log file (None for no file logging)
+        transaction_log: Path to JSON transaction log for auditing
         retention: Default retention policy
         parallel_volumes: Max concurrent volume backups
         parallel_targets: Max concurrent target transfers per volume
@@ -98,6 +99,7 @@ class GlobalConfig:
     timestamp_format: str = "%Y%m%d-%H%M%S"
     incremental: bool = True
     log_file: Optional[str] = None
+    transaction_log: Optional[str] = None
     retention: RetentionConfig = field(default_factory=RetentionConfig)
     parallel_volumes: int = 2
     parallel_targets: int = 3

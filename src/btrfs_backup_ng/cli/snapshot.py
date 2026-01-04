@@ -7,7 +7,7 @@ import time
 from pathlib import Path
 
 from .. import __util__, endpoint
-from ..__logger__ import create_logger
+from ..__logger__ import add_file_handler, create_logger
 from ..config import ConfigError, find_config_file, load_config
 from .common import get_log_level
 
@@ -45,6 +45,10 @@ def execute_snapshot(args: argparse.Namespace) -> int:
     except ConfigError as e:
         logger.error("Configuration error: %s", e)
         return 1
+
+    # Enable file logging if configured
+    if config.global_config.log_file:
+        add_file_handler(config.global_config.log_file)
 
     # Filter volumes if --volume specified
     volume_filter = getattr(args, "volume", None)

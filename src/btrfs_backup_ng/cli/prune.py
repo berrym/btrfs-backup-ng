@@ -7,7 +7,7 @@ import time
 from pathlib import Path
 
 from .. import __util__, endpoint
-from ..__logger__ import create_logger
+from ..__logger__ import add_file_handler, create_logger
 from ..config import ConfigError, find_config_file, load_config
 from ..retention import apply_retention, format_retention_summary
 from .common import get_log_level
@@ -46,6 +46,10 @@ def execute_prune(args: argparse.Namespace) -> int:
     except ConfigError as e:
         logger.error("Configuration error: %s", e)
         return 1
+
+    # Enable file logging if configured
+    if config.global_config.log_file:
+        add_file_handler(config.global_config.log_file)
 
     volumes = config.get_enabled_volumes()
 

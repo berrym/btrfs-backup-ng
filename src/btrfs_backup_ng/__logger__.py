@@ -1,7 +1,7 @@
 # pyright: standard
 
 """btrfs-backup-ng: btrfs-backup_ng/Logger.py
-A common logger for displaying in a rich layout.
+A common logger for displaying in a rich layout with optional file logging.
 """
 
 import logging
@@ -9,6 +9,7 @@ import logging.handlers
 import os
 import threading
 from collections import deque
+from pathlib import Path
 from typing import IO  # , override (requires python 3.12)
 
 from rich.console import Console
@@ -23,6 +24,9 @@ cons = Console()
 rich_handler = RichHandler(console=cons, show_path=False)
 # Create a logger - level will be set by set_level() or environment variable
 logger = logging.Logger("btrfs-backup-ng", _initial_level)
+
+# File handler (set by add_file_handler)
+_file_handler: logging.Handler | None = None
 
 
 class RichLogger(IO[str]):
@@ -112,3 +116,67 @@ def create_logger(live_layout, level=None) -> None:
         handlers=[rich_handler],
         force=True,
     )
+
+
+def add_file_handler(
+    log_file: str | Path,
+    level: str | int | None = None,
+    max_bytes: int = 10 * 1024 * 1024,  # 10 MB
+    backup_count: int = 5,
+) -> None:
+    """Add a rotating file handler to the logger.
+
+    Args:
+        log_file: Path to the log file
+        level: Log level for file output (default: DEBUG for comprehensive logging)
+        max_bytes: Maximum size of each log file before rotation (default: 10 MB)
+        backup_count: Number of backup files to keep (default: 5)
+    """
+    global _file_handler
+
+    # Remove existing file handler if present
+    if _file_handler is not None:
+        logger.removeHandler(_file_handler)
+        _file_handler.close()
+
+    log_path = Path(log_file)
+
+    # Create parent directories if needed
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Determine log level (default to DEBUG for file to capture everything)
+    if level is None:
+        file_level = logging.DEBUG
+    elif isinstance(level, str):
+        file_level = getattr(logging, level.upper(), logging.DEBUG)
+    else:
+        file_level = level
+
+    # Create rotating file handler
+    _file_handler = logging.handlers.RotatingFileHandler(
+        log_path,
+        maxBytes=max_bytes,
+        backupCount=backup_count,
+        encoding="utf-8",
+    )
+    _file_handler.setLevel(file_level)
+
+    # Use detailed format for file logs
+    file_formatter = logging.Formatter(
+        "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+    _file_handler.setFormatter(file_formatter)
+
+    logger.addHandler(_file_handler)
+    logger.debug("File logging enabled: %s", log_path)
+
+
+def remove_file_handler() -> None:
+    """Remove the file handler if present."""
+    global _file_handler
+
+    if _file_handler is not None:
+        logger.removeHandler(_file_handler)
+        _file_handler.close()
+        _file_handler = None

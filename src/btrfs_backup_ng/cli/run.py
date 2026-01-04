@@ -8,7 +8,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 from .. import __util__, endpoint
-from ..__logger__ import create_logger
+from ..__logger__ import add_file_handler, create_logger
 from ..__logger__ import logger as root_logger
 from ..config import (
     Config,
@@ -19,6 +19,7 @@ from ..config import (
     load_config,
 )
 from ..core.operations import sync_snapshots
+from ..transaction import set_transaction_log
 from .common import get_log_level, should_show_progress
 
 logger = logging.getLogger(__name__)
@@ -56,6 +57,18 @@ def execute_run(args: argparse.Namespace) -> int:
     except ConfigError as e:
         logger.error("Configuration error: %s", e)
         return 1
+
+    # Enable file logging if configured
+    if config.global_config.log_file:
+        add_file_handler(config.global_config.log_file)
+        logger.info("File logging enabled: %s", config.global_config.log_file)
+
+    # Enable transaction logging if configured
+    if config.global_config.transaction_log:
+        set_transaction_log(config.global_config.transaction_log)
+        logger.info(
+            "Transaction logging enabled: %s", config.global_config.transaction_log
+        )
 
     if not config.volumes:
         logger.error("No volumes configured")
