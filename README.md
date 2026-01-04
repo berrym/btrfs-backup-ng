@@ -899,15 +899,22 @@ The restore command:
 |--------|-------------|
 | `-l, --list` | List available snapshots at backup location |
 | `-s, --snapshot NAME` | Restore specific snapshot by name |
-| `--before DATETIME` | Restore snapshot closest to this time |
+| `--before DATETIME` | Restore snapshot closest to this time (YYYY-MM-DD [HH:MM:SS]) |
 | `-a, --all` | Restore all snapshots (full mirror) |
 | `-i, --interactive` | Interactive snapshot selection |
-| `--dry-run` | Show what would be restored |
+| `--dry-run` | Show what would be restored without making changes |
 | `--no-incremental` | Force full transfers (skip incremental) |
 | `--overwrite` | Overwrite existing snapshots instead of skipping |
+| `--in-place` | Restore to original location (DANGEROUS, requires confirmation) |
+| `--yes-i-know-what-i-am-doing` | Confirm dangerous operations like in-place restore |
+| `--prefix PREFIX` | Snapshot prefix filter (include trailing hyphen, e.g., `home-`) |
 | `--ssh-sudo` | Use sudo on remote for btrfs commands |
-| `--compress METHOD` | Compression for transfer (zstd, gzip, lz4) |
+| `--ssh-key FILE` | SSH private key file for authentication |
+| `--compress METHOD` | Compression for transfer (none, zstd, gzip, lz4, pigz, lzop) |
 | `--rate-limit RATE` | Bandwidth limit (e.g., '10M', '1G') |
+| `--no-fs-checks` | Skip btrfs subvolume verification (needed for backup directories) |
+| `--progress` | Show progress bars (default in terminal) |
+| `--no-progress` | Disable progress bars |
 
 ### Restore from Local Backup
 
@@ -992,6 +999,15 @@ btrfs-backup-ng restore ssh://...:/backups/home /mnt/restore --overwrite
 
 ### Troubleshooting Restore
 
+**"Source does not seem to be a btrfs subvolume":**
+```bash
+# Backup directories are regular directories containing snapshot subvolumes
+# Use --no-fs-checks to skip subvolume verification when listing/restoring
+btrfs-backup-ng restore --list /mnt/backup/home --no-fs-checks --prefix "home-"
+
+# This is normal - the backup location is a directory, not a subvolume itself
+```
+
 **"Destination is not on a btrfs filesystem":**
 ```bash
 # The restore target must be on btrfs
@@ -999,13 +1015,30 @@ df -T /mnt/restore | grep btrfs
 # If not btrfs, create or mount a btrfs filesystem first
 ```
 
-**"Snapshot not found at backup location":**
+**"No snapshots found at backup location":**
 ```bash
 # List available snapshots to see what's there
-btrfs-backup-ng restore --list ssh://backup@server:/backups/home
+btrfs-backup-ng restore --list ssh://backup@server:/backups/home --no-fs-checks
 
-# Check the snapshot prefix filter
-btrfs-backup-ng restore --list ssh://...:/backups/home --prefix "home-"
+# IMPORTANT: The prefix must include the trailing hyphen!
+# If snapshots are named "home-20260104-120000", use --prefix "home-"
+btrfs-backup-ng restore --list /mnt/backup --no-fs-checks --prefix "home-"
+
+# Without the correct prefix, date parsing will fail and snapshots won't be found
+```
+
+**"Could not parse date from snapshot name":**
+```bash
+# This usually means the prefix doesn't match or is missing the trailing hyphen
+# Snapshot name format: {prefix}{YYYYMMDD-HHMMSS}
+# Example: home-20260104-120000 requires --prefix "home-"
+
+# Check your snapshot names first
+ls /mnt/backup/home/
+# Output: home-20260104-120000  home-20260104-140000  ...
+
+# Then use the correct prefix (including the hyphen)
+btrfs-backup-ng restore --list /mnt/backup/home --prefix "home-" --no-fs-checks
 ```
 
 **"Permission denied" during restore:**
@@ -1013,8 +1046,19 @@ btrfs-backup-ng restore --list ssh://...:/backups/home --prefix "home-"
 # For SSH backups, ensure ssh_sudo is enabled
 btrfs-backup-ng restore ssh://...:/backups/home /mnt/restore --ssh-sudo
 
-# Local restore requires root
-sudo btrfs-backup-ng restore /mnt/backup /mnt/restore
+# Local restore requires root for btrfs receive
+sudo btrfs-backup-ng restore /mnt/backup /mnt/restore --no-fs-checks
+```
+
+**"btrfs send/receive failed" when snapshot already exists:**
+```bash
+# By default, existing snapshots are skipped but may show errors
+# Use --overwrite to replace existing snapshots
+btrfs-backup-ng restore /mnt/backup /mnt/restore --overwrite --no-fs-checks
+
+# Or restore to a clean directory
+mkdir /mnt/restore-new
+btrfs-backup-ng restore /mnt/backup /mnt/restore-new --no-fs-checks
 ```
 
 **Transfer is very slow:**
@@ -1023,8 +1067,23 @@ sudo btrfs-backup-ng restore /mnt/backup /mnt/restore
 btrfs-backup-ng restore ssh://...:/backups/home /mnt/restore --compress=zstd
 
 # Check if incremental is working (should show "incremental from X")
-btrfs-backup-ng restore -v ssh://...:/backups/home /mnt/restore
+btrfs-backup-ng restore ssh://...:/backups/home /mnt/restore -v
+
+# Limit bandwidth if needed
+btrfs-backup-ng restore ssh://...:/backups/home /mnt/restore --rate-limit=50M
 ```
+
+### Important Notes
+
+1. **The `--no-fs-checks` flag is usually required** when listing or restoring from backup directories. Backup locations are regular directories containing snapshot subvolumes, not subvolumes themselves.
+
+2. **The `--prefix` must include the trailing hyphen** that separates the prefix from the timestamp. If your snapshots are named `home-20260104-120000`, use `--prefix "home-"` not `--prefix "home"`.
+
+3. **Restore destination must be on btrfs**. The `btrfs receive` command requires a btrfs filesystem to create subvolumes.
+
+4. **Incremental restore chains are automatic**. When restoring a snapshot that depends on parent snapshots, all required parents are restored first in the correct order.
+
+5. **Root privileges are typically required** for `btrfs receive`. Use `sudo` for local restores or `--ssh-sudo` for remote restores.
 
 ## Legacy CLI Mode
 
