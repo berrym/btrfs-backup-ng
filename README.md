@@ -242,6 +242,102 @@ compress = "zstd"                      # Compression (none|gzip|zstd|lz4|pigz|lz
 rate_limit = "10M"                     # Bandwidth limit (K|M|G suffix)
 ```
 
+## Configuration File Locations
+
+btrfs-backup-ng searches for configuration files in the following locations, in priority order:
+
+| Priority | Location | Description |
+|----------|----------|-------------|
+| 1 (highest) | `-c /path/to/config.toml` | Explicit path via command line |
+| 2 | `~/.config/btrfs-backup-ng/config.toml` | User-specific configuration |
+| 3 | `/etc/btrfs-backup-ng/config.toml` | System-wide configuration |
+
+The first configuration file found is used. If no configuration file exists in any location and none is specified with `-c`, commands that require configuration will display an error with instructions.
+
+### User Configuration
+
+For personal workstations or when running backups as a regular user:
+
+```bash
+# Create user config directory
+mkdir -p ~/.config/btrfs-backup-ng
+
+# Generate example configuration
+btrfs-backup-ng config init > ~/.config/btrfs-backup-ng/config.toml
+
+# Edit to match your setup
+$EDITOR ~/.config/btrfs-backup-ng/config.toml
+
+# Run backups (config is found automatically)
+sudo btrfs-backup-ng run
+```
+
+### System-Wide Configuration
+
+For servers, shared systems, or when using systemd timers:
+
+```bash
+# Create system config directory
+sudo mkdir -p /etc/btrfs-backup-ng
+
+# Generate example configuration
+btrfs-backup-ng config init | sudo tee /etc/btrfs-backup-ng/config.toml
+
+# Edit to match your setup
+sudo $EDITOR /etc/btrfs-backup-ng/config.toml
+
+# Set appropriate permissions (readable by root only for security)
+sudo chmod 600 /etc/btrfs-backup-ng/config.toml
+
+# Run backups (config is found automatically)
+sudo btrfs-backup-ng run
+```
+
+### Configuration Precedence
+
+When both user and system configurations exist:
+- **User config takes precedence** over system config
+- Use `-c` to explicitly select a different configuration
+- The `config validate` command shows which file is being used
+
+```bash
+# See which config file is active
+btrfs-backup-ng config validate
+# Output: Validating: /home/user/.config/btrfs-backup-ng/config.toml
+
+# Force use of system config
+sudo btrfs-backup-ng -c /etc/btrfs-backup-ng/config.toml run
+```
+
+### Recommended Setup for Automated Backups
+
+For production servers with systemd timers:
+
+```bash
+# 1. Create system-wide configuration
+sudo mkdir -p /etc/btrfs-backup-ng
+btrfs-backup-ng config init | sudo tee /etc/btrfs-backup-ng/config.toml
+sudo chmod 600 /etc/btrfs-backup-ng/config.toml
+
+# 2. Edit configuration
+sudo $EDITOR /etc/btrfs-backup-ng/config.toml
+
+# 3. Validate configuration
+sudo btrfs-backup-ng config validate
+
+# 4. Test manually first
+sudo btrfs-backup-ng run --dry-run
+sudo btrfs-backup-ng run
+
+# 5. Install and enable systemd timer
+sudo btrfs-backup-ng install --timer=hourly
+sudo systemctl daemon-reload
+sudo systemctl enable --now btrfs-backup-ng.timer
+
+# 6. Verify timer is active
+systemctl list-timers btrfs-backup-ng.timer
+```
+
 ## Migrating from btrbk
 
 Import your existing btrbk configuration:
@@ -327,49 +423,172 @@ Legacy mode is auto-detected when the first argument is a path.
 
 ## Systemd Integration
 
-### Install Timer
+btrfs-backup-ng can install systemd timer and service units for automated backups. There are two installation modes:
+
+| Mode | Install Location | Runs As | Use Case |
+|------|------------------|---------|----------|
+| System-wide | `/etc/systemd/system/` | root | Servers, production systems |
+| User-level | `~/.config/systemd/user/` | current user | Personal workstations |
+
+### System-Wide Installation (Recommended for Servers)
+
+System-wide installation runs backups as root, which is required for backing up system volumes.
+
+**Prerequisites:**
+1. Configuration file at `/etc/btrfs-backup-ng/config.toml` (or user config)
+2. Root privileges (sudo)
+
+**Installation:**
 
 ```bash
-# System-wide (requires root)
-sudo btrfs-backup-ng install --timer=hourly
-sudo btrfs-backup-ng install --timer=daily
-sudo btrfs-backup-ng install --timer=weekly
+# Install with a preset timer
+sudo btrfs-backup-ng install --timer=hourly   # Every hour at :00
+sudo btrfs-backup-ng install --timer=daily    # Daily at 02:00
+sudo btrfs-backup-ng install --timer=weekly   # Weekly on Sunday at 02:00
 
-# Custom schedule
-sudo btrfs-backup-ng install --oncalendar='*:0/15'     # Every 15 minutes
-sudo btrfs-backup-ng install --oncalendar='*:0/5'      # Every 5 minutes
-sudo btrfs-backup-ng install --oncalendar='02:00'      # Daily at 2am
-
-# User-level (no root needed)
-btrfs-backup-ng install --user --timer=hourly
+# Or use a custom OnCalendar specification
+sudo btrfs-backup-ng install --oncalendar='*:0/15'           # Every 15 minutes
+sudo btrfs-backup-ng install --oncalendar='*:0/5'            # Every 5 minutes
+sudo btrfs-backup-ng install --oncalendar='*-*-* 02:00:00'   # Daily at 2am
+sudo btrfs-backup-ng install --oncalendar='Mon *-*-* 03:00'  # Monday at 3am
 ```
 
-### Enable Timer
+**Enable and start the timer:**
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now btrfs-backup-ng.timer
+```
+
+**Generated files:**
+- `/etc/systemd/system/btrfs-backup-ng.service` - The backup service unit
+- `/etc/systemd/system/btrfs-backup-ng.timer` - The timer unit
+
+### User-Level Installation
+
+User-level installation runs backups as the current user. Useful for personal workstations where sudo is available but system-wide installation isn't desired.
+
+**Note:** User-level services require the user to be logged in (or lingering enabled).
+
+```bash
+# Install user timer
+btrfs-backup-ng install --user --timer=hourly
+
+# Enable and start
+systemctl --user daemon-reload
+systemctl --user enable --now btrfs-backup-ng.timer
+
+# Optional: Enable lingering so timers run even when logged out
+loginctl enable-linger $USER
+```
+
+**Generated files:**
+- `~/.config/systemd/user/btrfs-backup-ng.service`
+- `~/.config/systemd/user/btrfs-backup-ng.timer`
+
+### Timer Presets
+
+| Preset | OnCalendar Value | Description |
+|--------|------------------|-------------|
+| `hourly` | `*:00` | Every hour at minute 00 |
+| `daily` | `*-*-* 02:00:00` | Every day at 2:00 AM |
+| `weekly` | `Sun *-*-* 02:00:00` | Every Sunday at 2:00 AM |
+
+### Custom OnCalendar Examples
+
+The `--oncalendar` option accepts any valid systemd calendar specification:
+
+| Specification | Description |
+|---------------|-------------|
+| `*:0/5` | Every 5 minutes |
+| `*:0/15` | Every 15 minutes |
+| `*:0/30` | Every 30 minutes |
+| `hourly` | Every hour |
+| `*-*-* 02:00:00` | Daily at 2:00 AM |
+| `*-*-* 00/6:00:00` | Every 6 hours |
+| `Mon,Thu *-*-* 03:00:00` | Monday and Thursday at 3:00 AM |
+| `*-*-01 04:00:00` | First day of each month at 4:00 AM |
+
+Test your specification with: `systemd-analyze calendar '*:0/15'`
+
+### Monitoring and Logs
+
+**Check timer status:**
 
 ```bash
 # System-wide
-sudo systemctl daemon-reload
-sudo systemctl enable --now btrfs-backup-ng.timer
-
-# User-level
-systemctl --user daemon-reload
-systemctl --user enable --now btrfs-backup-ng.timer
-```
-
-### Check Status
-
-```bash
 systemctl status btrfs-backup-ng.timer
 systemctl list-timers btrfs-backup-ng.timer
-journalctl -u btrfs-backup-ng.service
+
+# User-level
+systemctl --user status btrfs-backup-ng.timer
+systemctl --user list-timers btrfs-backup-ng.timer
+```
+
+**View logs:**
+
+```bash
+# System-wide - recent logs
+journalctl -u btrfs-backup-ng.service -n 50
+
+# System-wide - follow logs in real-time
+journalctl -u btrfs-backup-ng.service -f
+
+# System-wide - logs since last boot
+journalctl -u btrfs-backup-ng.service -b
+
+# User-level
+journalctl --user -u btrfs-backup-ng.service -n 50
+```
+
+**Manually trigger a backup:**
+
+```bash
+# System-wide
+sudo systemctl start btrfs-backup-ng.service
+
+# User-level
+systemctl --user start btrfs-backup-ng.service
 ```
 
 ### Uninstall
 
+The uninstall command removes the timer and service files:
+
 ```bash
+# System-wide
 sudo btrfs-backup-ng uninstall
-# or
-btrfs-backup-ng uninstall  # for user-level
+
+# User-level
+btrfs-backup-ng uninstall
+```
+
+**Note:** Uninstall checks both system and user locations and removes files from wherever they're found.
+
+### Complete System-Wide Setup Example
+
+```bash
+# 1. Create and configure
+sudo mkdir -p /etc/btrfs-backup-ng
+btrfs-backup-ng config init | sudo tee /etc/btrfs-backup-ng/config.toml
+sudo chmod 600 /etc/btrfs-backup-ng/config.toml
+sudo $EDITOR /etc/btrfs-backup-ng/config.toml
+
+# 2. Validate and test
+sudo btrfs-backup-ng config validate
+sudo btrfs-backup-ng run --dry-run
+sudo btrfs-backup-ng run
+
+# 3. Install timer (hourly backups)
+sudo btrfs-backup-ng install --timer=hourly
+
+# 4. Enable timer
+sudo systemctl daemon-reload
+sudo systemctl enable --now btrfs-backup-ng.timer
+
+# 5. Verify
+systemctl list-timers btrfs-backup-ng.timer
+sudo btrfs-backup-ng status
 ```
 
 ## Troubleshooting
