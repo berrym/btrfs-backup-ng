@@ -5,7 +5,7 @@ _btrfs_backup_ng() {
     local cur prev words cword split
     _init_completion -s || return
 
-    local commands="run snapshot transfer prune list status config install uninstall restore verify"
+    local commands="run snapshot transfer prune list status config install uninstall restore verify estimate"
     local config_subcommands="validate init import"
 
     # Global options
@@ -20,11 +20,12 @@ _btrfs_backup_ng() {
     local status_opts="-t --transactions -n --limit"
     local install_opts="--timer --oncalendar --user"
     local uninstall_opts=""
-    local restore_opts="-l --list -s --snapshot --before -a --all -i --interactive --dry-run --no-incremental --overwrite --in-place --yes-i-know-what-i-am-doing --prefix --ssh-sudo --ssh-key --compress --rate-limit --no-fs-checks --status --unlock --cleanup --progress --no-progress"
+    local restore_opts="-l --list -s --snapshot --before -a --all -i --interactive --dry-run --no-incremental --overwrite --in-place --yes-i-know-what-i-am-doing --prefix --ssh-sudo --ssh-key --compress --rate-limit --no-fs-checks --status --unlock --cleanup --progress --no-progress -c --config --volume --target --list-volumes --to"
     local config_validate_opts=""
     local config_init_opts="-o --output"
     local config_import_opts="-o --output"
     local verify_opts="--level --snapshot --temp-dir --no-cleanup --prefix --ssh-sudo --ssh-key --no-fs-checks --json -q --quiet"
+    local estimate_opts="-c --config --volume --target --prefix --ssh-sudo --ssh-key --no-fs-checks --json"
     local verify_levels="metadata stream full"
 
     # Compression methods
@@ -169,6 +170,14 @@ _btrfs_backup_ng() {
                 COMPREPLY=($(compgen -W "$verify_opts" -- "$cur"))
             else
                 # Complete paths for LOCATION
+                _filedir -d
+            fi
+            ;;
+        estimate)
+            if [[ "$cur" == -* ]]; then
+                COMPREPLY=($(compgen -W "$estimate_opts" -- "$cur"))
+            else
+                # Complete paths for SOURCE and DESTINATION
                 _filedir -d
             fi
             ;;

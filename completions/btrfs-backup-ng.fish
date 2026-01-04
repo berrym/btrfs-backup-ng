@@ -61,6 +61,7 @@ complete -c btrfs-backup-ng -n __fish_btrfs_backup_ng_no_subcommand -a install -
 complete -c btrfs-backup-ng -n __fish_btrfs_backup_ng_no_subcommand -a uninstall -d 'Remove systemd timer/service'
 complete -c btrfs-backup-ng -n __fish_btrfs_backup_ng_no_subcommand -a restore -d 'Restore snapshots from backup location'
 complete -c btrfs-backup-ng -n __fish_btrfs_backup_ng_no_subcommand -a verify -d 'Verify backup integrity'
+complete -c btrfs-backup-ng -n __fish_btrfs_backup_ng_no_subcommand -a estimate -d 'Estimate backup transfer sizes'
 
 # Compression methods
 set -l compress_methods none zstd gzip lz4 pigz lzop
@@ -139,6 +140,12 @@ complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_using_command restore' -l
 complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_using_command restore' -l cleanup -d 'Clean up partial/incomplete snapshot restores'
 complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_using_command restore' -l progress -d 'Show progress bars'
 complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_using_command restore' -l no-progress -d 'Disable progress bars'
+# Config-driven restore options
+complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_using_command restore' -s c -l config -d 'Path to configuration file' -r -F
+complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_using_command restore' -l volume -d 'Restore backups for volume defined in config' -xa '(__fish_complete_directories)'
+complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_using_command restore' -l target -d 'Target index to restore from (0-based)' -x
+complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_using_command restore' -l list-volumes -d 'List volumes and their backup targets from config'
+complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_using_command restore' -l to -d 'Destination path for config-driven restore' -xa '(__fish_complete_directories)'
 # Enable path completion for restore positional arguments
 complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_using_command restore' -a '(__fish_complete_directories)'
 
@@ -156,3 +163,15 @@ complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_using_command verify' -l 
 complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_using_command verify' -s q -l quiet -d 'Suppress progress output'
 # Enable path completion for verify positional argument
 complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_using_command verify' -a '(__fish_complete_directories)'
+
+# estimate command
+complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_using_command estimate' -s c -l config -d 'Path to configuration file' -r -F
+complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_using_command estimate' -l volume -d 'Estimate for volume defined in config' -xa '(__fish_complete_directories)'
+complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_using_command estimate' -l target -d 'Target index to estimate for (0-based)' -x
+complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_using_command estimate' -l prefix -d 'Snapshot prefix filter' -x
+complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_using_command estimate' -l ssh-sudo -d 'Use sudo for btrfs commands on remote host'
+complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_using_command estimate' -l ssh-key -d 'SSH private key file' -r -F
+complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_using_command estimate' -l no-fs-checks -d 'Skip btrfs subvolume verification'
+complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_using_command estimate' -l json -d 'Output results in JSON format'
+# Enable path completion for estimate positional arguments
+complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_using_command estimate' -a '(__fish_complete_directories)'

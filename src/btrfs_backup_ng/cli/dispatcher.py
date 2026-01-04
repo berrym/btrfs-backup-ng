@@ -24,6 +24,7 @@ SUBCOMMANDS = frozenset(
         "uninstall",
         "restore",
         "verify",
+        "estimate",
     }
 )
 
@@ -326,6 +327,19 @@ Examples:
 
   # Interactive selection
   btrfs-backup-ng restore ssh://...:/backups/home /mnt/restore --interactive
+
+Config-driven restore:
+  # List volumes and backup targets from config
+  btrfs-backup-ng restore --list-volumes
+
+  # List snapshots available for a configured volume
+  btrfs-backup-ng restore --volume /home --list
+
+  # Restore /home from its configured backup target
+  btrfs-backup-ng restore --volume /home --to /mnt/restore
+
+  # Restore from second target (index 1)
+  btrfs-backup-ng restore --volume /home --target 1 --to /mnt/restore
 """,
     )
     restore_parser.add_argument(
@@ -424,6 +438,39 @@ Examples:
         "--no-fs-checks",
         action="store_true",
         help="Skip btrfs subvolume verification (for listing backups in regular directories)",
+    )
+
+    # Config-driven restore options
+    config_group = restore_parser.add_argument_group(
+        "Config-driven restore",
+        "Use configuration file to determine backup sources",
+    )
+    config_group.add_argument(
+        "-c",
+        "--config",
+        metavar="FILE",
+        help="Path to configuration file",
+    )
+    config_group.add_argument(
+        "--volume",
+        metavar="PATH",
+        help="Restore backups for volume defined in config (e.g., /home)",
+    )
+    config_group.add_argument(
+        "--target",
+        metavar="INDEX",
+        type=int,
+        help="Target index to restore from (0-based, default: first target)",
+    )
+    config_group.add_argument(
+        "--list-volumes",
+        action="store_true",
+        help="List volumes and their backup targets from config",
+    )
+    config_group.add_argument(
+        "--to",
+        metavar="PATH",
+        help="Destination path for config-driven restore (used with --volume)",
     )
 
     # Recovery commands group
@@ -538,6 +585,82 @@ Examples:
         help="Suppress progress output",
     )
 
+    # estimate command
+    estimate_parser = subparsers.add_parser(
+        "estimate",
+        help="Estimate backup transfer sizes",
+        description="Calculate data sizes before transferring backups",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Estimate transfer size for direct paths
+  btrfs-backup-ng estimate /mnt/snapshots ssh://backup@server:/backups
+
+  # Estimate using configuration file
+  btrfs-backup-ng estimate --volume /home
+
+  # Estimate with JSON output
+  btrfs-backup-ng estimate --volume /home --json
+
+  # Estimate for specific target
+  btrfs-backup-ng estimate --volume /home --target 1
+""",
+    )
+    estimate_parser.add_argument(
+        "source",
+        nargs="?",
+        metavar="SOURCE",
+        help="Source snapshot location",
+    )
+    estimate_parser.add_argument(
+        "destination",
+        nargs="?",
+        metavar="DESTINATION",
+        help="Backup destination (local path or ssh://user@host:/path)",
+    )
+    estimate_parser.add_argument(
+        "-c",
+        "--config",
+        metavar="FILE",
+        help="Path to configuration file",
+    )
+    estimate_parser.add_argument(
+        "--volume",
+        metavar="PATH",
+        help="Estimate for volume defined in config (e.g., /home)",
+    )
+    estimate_parser.add_argument(
+        "--target",
+        metavar="INDEX",
+        type=int,
+        help="Target index to estimate for (0-based, default: first target)",
+    )
+    estimate_parser.add_argument(
+        "--prefix",
+        metavar="PREFIX",
+        help="Snapshot prefix filter",
+    )
+    estimate_parser.add_argument(
+        "--ssh-sudo",
+        action="store_true",
+        help="Use sudo for btrfs commands on remote host",
+    )
+    estimate_parser.add_argument(
+        "--ssh-key",
+        metavar="FILE",
+        help="SSH private key file",
+    )
+    estimate_parser.add_argument(
+        "--no-fs-checks",
+        action="store_true",
+        help="Skip btrfs subvolume verification",
+    )
+    estimate_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Output results in JSON format",
+    )
+
     return parser
 
 
@@ -627,6 +750,7 @@ def run_subcommand(args: argparse.Namespace) -> int:
         "uninstall": cmd_uninstall,
         "restore": cmd_restore,
         "verify": cmd_verify,
+        "estimate": cmd_estimate,
     }
 
     handler = handlers.get(args.command)
@@ -716,6 +840,13 @@ def cmd_verify(args: argparse.Namespace) -> int:
     from .verify import execute
 
     return execute(args)
+
+
+def cmd_estimate(args: argparse.Namespace) -> int:
+    """Execute estimate command."""
+    from .estimate import execute_estimate
+
+    return execute_estimate(args)
 
 
 def main(argv: list[str] | None = None) -> int:

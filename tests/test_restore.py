@@ -410,3 +410,535 @@ class TestRestoreChainEdgeCases:
         # Verify oldest first order
         times = [s.time_obj for s in chain]
         assert times == sorted(times)
+
+
+# Tests for error recovery commands (--status, --unlock, --cleanup)
+
+
+class TestExecuteStatus:
+    """Tests for _execute_status function."""
+
+    @patch("btrfs_backup_ng.cli.restore._prepare_backup_endpoint")
+    def test_status_no_source(self, mock_prepare):
+        """Test --status without source shows error."""
+        from btrfs_backup_ng.cli.restore import _execute_status
+
+        args = MagicMock()
+        args.source = None
+
+        result = _execute_status(args)
+
+        assert result == 1
+        mock_prepare.assert_not_called()
+
+    @patch("btrfs_backup_ng.cli.restore._prepare_backup_endpoint")
+    @patch("btrfs_backup_ng.cli.restore.list_remote_snapshots")
+    def test_status_no_locks(self, mock_list, mock_prepare, tmp_path):
+        """Test --status with no locks."""
+        from btrfs_backup_ng.cli.restore import _execute_status
+
+        # Setup mock endpoint
+        mock_endpoint = MagicMock()
+        mock_endpoint.config = {
+            "path": tmp_path,
+            "lock_file_name": ".btrfs-backup-ng.locks",
+        }
+        mock_prepare.return_value = mock_endpoint
+        mock_list.return_value = []
+
+        args = MagicMock()
+        args.source = "/backup"
+
+        result = _execute_status(args)
+
+        assert result == 0
+
+    @patch("btrfs_backup_ng.cli.restore._prepare_backup_endpoint")
+    @patch("btrfs_backup_ng.cli.restore.list_remote_snapshots")
+    def test_status_with_restore_locks(self, mock_list, mock_prepare, tmp_path):
+        """Test --status shows restore locks."""
+        from btrfs_backup_ng import __util__
+        from btrfs_backup_ng.cli.restore import _execute_status
+
+        # Create lock file with restore locks
+        lock_file = tmp_path / ".btrfs-backup-ng.locks"
+        locks = {
+            "snap-1": {"locks": ["restore:session-123"]},
+            "snap-2": {"parent_locks": ["restore:session-123"]},
+        }
+        lock_file.write_text(__util__.write_locks(locks))
+
+        # Setup mock endpoint
+        mock_endpoint = MagicMock()
+        mock_endpoint.config = {
+            "path": tmp_path,
+            "lock_file_name": ".btrfs-backup-ng.locks",
+        }
+        mock_prepare.return_value = mock_endpoint
+        mock_list.return_value = []
+
+        args = MagicMock()
+        args.source = "/backup"
+
+        result = _execute_status(args)
+
+        assert result == 0
+
+
+class TestExecuteUnlock:
+    """Tests for _execute_unlock function."""
+
+    @patch("btrfs_backup_ng.cli.restore._prepare_backup_endpoint")
+    def test_unlock_no_source(self, mock_prepare):
+        """Test --unlock without source shows error."""
+        from btrfs_backup_ng.cli.restore import _execute_unlock
+
+        args = MagicMock()
+        args.source = None
+
+        result = _execute_unlock(args, "all")
+
+        assert result == 1
+
+    @patch("btrfs_backup_ng.cli.restore._prepare_backup_endpoint")
+    def test_unlock_no_lock_file(self, mock_prepare, tmp_path):
+        """Test --unlock when no lock file exists."""
+        from btrfs_backup_ng.cli.restore import _execute_unlock
+
+        mock_endpoint = MagicMock()
+        mock_endpoint.config = {
+            "path": tmp_path,
+            "lock_file_name": ".btrfs-backup-ng.locks",
+        }
+        mock_prepare.return_value = mock_endpoint
+
+        args = MagicMock()
+        args.source = "/backup"
+
+        result = _execute_unlock(args, "all")
+
+        assert result == 0  # No error, just nothing to unlock
+
+    @patch("btrfs_backup_ng.cli.restore._prepare_backup_endpoint")
+    def test_unlock_all_restore_locks(self, mock_prepare, tmp_path):
+        """Test --unlock all removes all restore locks."""
+        from btrfs_backup_ng import __util__
+        from btrfs_backup_ng.cli.restore import _execute_unlock
+
+        # Create lock file with mixed locks
+        lock_file = tmp_path / ".btrfs-backup-ng.locks"
+        locks = {
+            "snap-1": {"locks": ["restore:session-123", "backup:transfer-456"]},
+            "snap-2": {"locks": ["restore:session-789"]},
+        }
+        lock_file.write_text(__util__.write_locks(locks))
+
+        mock_endpoint = MagicMock()
+        mock_endpoint.config = {
+            "path": tmp_path,
+            "lock_file_name": ".btrfs-backup-ng.locks",
+        }
+        mock_prepare.return_value = mock_endpoint
+
+        args = MagicMock()
+        args.source = "/backup"
+
+        result = _execute_unlock(args, "all")
+
+        assert result == 0
+
+        # Verify only restore locks were removed
+        new_locks = __util__.read_locks(lock_file.read_text())
+        assert "snap-1" in new_locks
+        assert "backup:transfer-456" in new_locks["snap-1"]["locks"]
+        assert "restore:session-123" not in new_locks["snap-1"].get("locks", [])
+        # snap-2 had only restore locks, so should be gone
+        assert "snap-2" not in new_locks
+
+    @patch("btrfs_backup_ng.cli.restore._prepare_backup_endpoint")
+    def test_unlock_specific_session(self, mock_prepare, tmp_path):
+        """Test --unlock with specific session ID."""
+        from btrfs_backup_ng import __util__
+        from btrfs_backup_ng.cli.restore import _execute_unlock
+
+        # Create lock file
+        lock_file = tmp_path / ".btrfs-backup-ng.locks"
+        locks = {
+            "snap-1": {"locks": ["restore:session-123", "restore:session-456"]},
+        }
+        lock_file.write_text(__util__.write_locks(locks))
+
+        mock_endpoint = MagicMock()
+        mock_endpoint.config = {
+            "path": tmp_path,
+            "lock_file_name": ".btrfs-backup-ng.locks",
+        }
+        mock_prepare.return_value = mock_endpoint
+
+        args = MagicMock()
+        args.source = "/backup"
+
+        result = _execute_unlock(args, "session-123")
+
+        assert result == 0
+
+        # Verify only the specific lock was removed
+        new_locks = __util__.read_locks(lock_file.read_text())
+        assert "snap-1" in new_locks
+        assert "restore:session-456" in new_locks["snap-1"]["locks"]
+        assert "restore:session-123" not in new_locks["snap-1"]["locks"]
+
+    @patch("btrfs_backup_ng.cli.restore._prepare_backup_endpoint")
+    def test_unlock_nonexistent_session(self, mock_prepare, tmp_path):
+        """Test --unlock with non-existent session ID."""
+        from btrfs_backup_ng import __util__
+        from btrfs_backup_ng.cli.restore import _execute_unlock
+
+        lock_file = tmp_path / ".btrfs-backup-ng.locks"
+        locks = {"snap-1": {"locks": ["restore:session-123"]}}
+        lock_file.write_text(__util__.write_locks(locks))
+
+        mock_endpoint = MagicMock()
+        mock_endpoint.config = {
+            "path": tmp_path,
+            "lock_file_name": ".btrfs-backup-ng.locks",
+        }
+        mock_prepare.return_value = mock_endpoint
+
+        args = MagicMock()
+        args.source = "/backup"
+
+        result = _execute_unlock(args, "nonexistent")
+
+        assert result == 1  # Not found
+
+
+class TestExecuteCleanup:
+    """Tests for _execute_cleanup function."""
+
+    def test_cleanup_no_destination(self):
+        """Test --cleanup without destination shows error."""
+        from btrfs_backup_ng.cli.restore import _execute_cleanup
+
+        args = MagicMock()
+        args.destination = None
+        args.source = None
+
+        result = _execute_cleanup(args)
+
+        assert result == 1
+
+    def test_cleanup_nonexistent_path(self, tmp_path):
+        """Test --cleanup with non-existent path."""
+        from btrfs_backup_ng.cli.restore import _execute_cleanup
+
+        args = MagicMock()
+        args.destination = str(tmp_path / "nonexistent")
+        args.source = None
+
+        result = _execute_cleanup(args)
+
+        assert result == 1
+
+    @patch("btrfs_backup_ng.cli.restore.__util__.is_subvolume")
+    def test_cleanup_no_partial_subvolumes(self, mock_is_subvol, tmp_path):
+        """Test --cleanup finds no partial subvolumes."""
+        from btrfs_backup_ng.cli.restore import _execute_cleanup
+
+        # Create a regular directory (not subvolume)
+        (tmp_path / "regular_dir").mkdir()
+        mock_is_subvol.return_value = False
+
+        args = MagicMock()
+        args.destination = str(tmp_path)
+        args.source = None
+        args.dry_run = False
+
+        result = _execute_cleanup(args)
+
+        assert result == 0
+
+    @patch("btrfs_backup_ng.cli.restore.__util__.is_subvolume")
+    def test_cleanup_finds_empty_subvolume(self, mock_is_subvol, tmp_path):
+        """Test --cleanup identifies empty subvolumes as partial."""
+        from btrfs_backup_ng.cli.restore import _execute_cleanup
+
+        # Create empty directory (simulating empty subvolume)
+        empty_snap = tmp_path / "snap-partial"
+        empty_snap.mkdir()
+        mock_is_subvol.return_value = True
+
+        args = MagicMock()
+        args.destination = str(tmp_path)
+        args.source = None
+        args.dry_run = True  # Don't actually delete
+
+        result = _execute_cleanup(args)
+
+        assert result == 0
+
+    @patch("btrfs_backup_ng.cli.restore.__util__.is_subvolume")
+    def test_cleanup_finds_partial_suffix(self, mock_is_subvol, tmp_path):
+        """Test --cleanup identifies .partial suffix as partial."""
+        from btrfs_backup_ng.cli.restore import _execute_cleanup
+
+        # Create directory with .partial suffix
+        partial_snap = tmp_path / "snap-1.partial"
+        partial_snap.mkdir()
+        (partial_snap / "somefile").touch()  # Not empty
+        mock_is_subvol.return_value = True
+
+        args = MagicMock()
+        args.destination = str(tmp_path)
+        args.source = None
+        args.dry_run = True
+
+        result = _execute_cleanup(args)
+
+        assert result == 0
+
+    @patch("btrfs_backup_ng.cli.restore.__util__.is_subvolume")
+    def test_cleanup_dry_run_no_delete(self, mock_is_subvol, tmp_path):
+        """Test --cleanup --dry-run doesn't delete anything."""
+        from btrfs_backup_ng.cli.restore import _execute_cleanup
+
+        empty_snap = tmp_path / "snap-partial"
+        empty_snap.mkdir()
+        mock_is_subvol.return_value = True
+
+        args = MagicMock()
+        args.destination = str(tmp_path)
+        args.source = None
+        args.dry_run = True
+
+        result = _execute_cleanup(args)
+
+        assert result == 0
+        assert empty_snap.exists()  # Should still exist
+
+
+# Tests for config-driven restore (--volume flag)
+
+
+class TestExecuteListVolumes:
+    """Tests for _execute_list_volumes function."""
+
+    @patch("btrfs_backup_ng.cli.restore.find_config_file")
+    def test_list_volumes_no_config(self, mock_find):
+        """Test --list-volumes when no config file exists."""
+        from btrfs_backup_ng.cli.restore import _execute_list_volumes
+
+        mock_find.return_value = None
+
+        args = MagicMock()
+        args.config = None
+
+        result = _execute_list_volumes(args)
+
+        assert result == 1
+
+    @patch("btrfs_backup_ng.cli.restore.load_config")
+    @patch("btrfs_backup_ng.cli.restore.find_config_file")
+    def test_list_volumes_empty_config(self, mock_find, mock_load, tmp_path):
+        """Test --list-volumes with empty config."""
+        from btrfs_backup_ng.cli.restore import _execute_list_volumes
+        from btrfs_backup_ng.config.schema import Config
+
+        config_path = tmp_path / "config.toml"
+        mock_find.return_value = str(config_path)
+        mock_load.return_value = Config()
+
+        args = MagicMock()
+        args.config = None
+
+        result = _execute_list_volumes(args)
+
+        assert result == 0
+
+    @patch("btrfs_backup_ng.cli.restore.load_config")
+    @patch("btrfs_backup_ng.cli.restore.find_config_file")
+    def test_list_volumes_with_volumes(self, mock_find, mock_load, tmp_path):
+        """Test --list-volumes shows configured volumes."""
+        from btrfs_backup_ng.cli.restore import _execute_list_volumes
+        from btrfs_backup_ng.config.schema import Config, TargetConfig, VolumeConfig
+
+        config_path = tmp_path / "config.toml"
+        mock_find.return_value = str(config_path)
+
+        config = Config(
+            volumes=[
+                VolumeConfig(
+                    path="/home",
+                    snapshot_prefix="home",
+                    targets=[
+                        TargetConfig(
+                            path="ssh://backup@server:/backups/home", ssh_sudo=True
+                        ),
+                        TargetConfig(path="/mnt/external/home"),
+                    ],
+                ),
+                VolumeConfig(
+                    path="/var/log",
+                    snapshot_prefix="logs",
+                    targets=[TargetConfig(path="/mnt/backup/logs")],
+                ),
+            ]
+        )
+        mock_load.return_value = config
+
+        args = MagicMock()
+        args.config = None
+
+        result = _execute_list_volumes(args)
+
+        assert result == 0
+
+
+class TestExecuteConfigRestore:
+    """Tests for _execute_config_restore function."""
+
+    @patch("btrfs_backup_ng.cli.restore.find_config_file")
+    def test_config_restore_no_config(self, mock_find):
+        """Test --volume when no config file exists."""
+        from btrfs_backup_ng.cli.restore import _execute_config_restore
+
+        mock_find.return_value = None
+
+        args = MagicMock()
+        args.config = None
+
+        result = _execute_config_restore(args, "/home")
+
+        assert result == 1
+
+    @patch("btrfs_backup_ng.cli.restore.load_config")
+    @patch("btrfs_backup_ng.cli.restore.find_config_file")
+    def test_config_restore_volume_not_found(self, mock_find, mock_load, tmp_path):
+        """Test --volume with non-existent volume."""
+        from btrfs_backup_ng.cli.restore import _execute_config_restore
+        from btrfs_backup_ng.config.schema import Config, VolumeConfig
+
+        mock_find.return_value = str(tmp_path / "config.toml")
+        mock_load.return_value = Config(
+            volumes=[VolumeConfig(path="/var/log", snapshot_prefix="logs")]
+        )
+
+        args = MagicMock()
+        args.config = None
+
+        result = _execute_config_restore(args, "/home")
+
+        assert result == 1  # Volume not found
+
+    @patch("btrfs_backup_ng.cli.restore.load_config")
+    @patch("btrfs_backup_ng.cli.restore.find_config_file")
+    def test_config_restore_no_targets(self, mock_find, mock_load, tmp_path):
+        """Test --volume with volume that has no targets."""
+        from btrfs_backup_ng.cli.restore import _execute_config_restore
+        from btrfs_backup_ng.config.schema import Config, VolumeConfig
+
+        mock_find.return_value = str(tmp_path / "config.toml")
+        mock_load.return_value = Config(
+            volumes=[VolumeConfig(path="/home", snapshot_prefix="home", targets=[])]
+        )
+
+        args = MagicMock()
+        args.config = None
+
+        result = _execute_config_restore(args, "/home")
+
+        assert result == 1  # No targets
+
+    @patch("btrfs_backup_ng.cli.restore.load_config")
+    @patch("btrfs_backup_ng.cli.restore.find_config_file")
+    def test_config_restore_invalid_target_index(self, mock_find, mock_load, tmp_path):
+        """Test --volume with invalid target index."""
+        from btrfs_backup_ng.cli.restore import _execute_config_restore
+        from btrfs_backup_ng.config.schema import Config, TargetConfig, VolumeConfig
+
+        mock_find.return_value = str(tmp_path / "config.toml")
+        mock_load.return_value = Config(
+            volumes=[
+                VolumeConfig(
+                    path="/home",
+                    snapshot_prefix="home",
+                    targets=[TargetConfig(path="/mnt/backup/home")],
+                )
+            ]
+        )
+
+        args = MagicMock()
+        args.config = None
+        args.target = 5  # Invalid index
+
+        result = _execute_config_restore(args, "/home")
+
+        assert result == 1
+
+    @patch("btrfs_backup_ng.cli.restore._execute_list")
+    @patch("btrfs_backup_ng.cli.restore.load_config")
+    @patch("btrfs_backup_ng.cli.restore.find_config_file")
+    def test_config_restore_list_mode(self, mock_find, mock_load, mock_list, tmp_path):
+        """Test --volume --list uses config to list snapshots."""
+        from btrfs_backup_ng.cli.restore import _execute_config_restore
+        from btrfs_backup_ng.config.schema import Config, TargetConfig, VolumeConfig
+
+        mock_find.return_value = str(tmp_path / "config.toml")
+        mock_load.return_value = Config(
+            volumes=[
+                VolumeConfig(
+                    path="/home",
+                    snapshot_prefix="home",
+                    targets=[
+                        TargetConfig(
+                            path="ssh://backup@server:/backups/home", ssh_sudo=True
+                        )
+                    ],
+                )
+            ]
+        )
+        mock_list.return_value = 0
+
+        args = MagicMock()
+        args.config = None
+        args.target = None
+        args.list = True
+        args.prefix = None
+
+        result = _execute_config_restore(args, "/home")
+
+        assert result == 0
+        mock_list.assert_called_once()
+        # Verify args were updated with config values
+        assert args.source == "ssh://backup@server:/backups/home"
+        assert args.ssh_sudo is True
+        assert args.prefix == "home"
+
+    @patch("btrfs_backup_ng.cli.restore.load_config")
+    @patch("btrfs_backup_ng.cli.restore.find_config_file")
+    def test_config_restore_no_destination(self, mock_find, mock_load, tmp_path):
+        """Test --volume without --to shows error."""
+        from btrfs_backup_ng.cli.restore import _execute_config_restore
+        from btrfs_backup_ng.config.schema import Config, TargetConfig, VolumeConfig
+
+        mock_find.return_value = str(tmp_path / "config.toml")
+        mock_load.return_value = Config(
+            volumes=[
+                VolumeConfig(
+                    path="/home",
+                    snapshot_prefix="home",
+                    targets=[TargetConfig(path="/mnt/backup/home")],
+                )
+            ]
+        )
+
+        args = MagicMock()
+        args.config = None
+        args.target = None
+        args.list = False
+        args.to = None
+        args.destination = None
+
+        result = _execute_config_restore(args, "/home")
+
+        assert result == 1  # Need destination

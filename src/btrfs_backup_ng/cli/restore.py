@@ -39,6 +39,15 @@ def execute_restore(args: argparse.Namespace) -> int:
     log_level = get_log_level(args)
     create_logger(False, level=log_level)
 
+    # Handle --list-volumes mode (list configured volumes)
+    if getattr(args, "list_volumes", False):
+        return _execute_list_volumes(args)
+
+    # Handle config-driven restore with --volume flag
+    volume_path = getattr(args, "volume", None)
+    if volume_path:
+        return _execute_config_restore(args, volume_path)
+
     # Handle --list mode (just list available snapshots)
     if getattr(args, "list", False):
         return _execute_list(args)
@@ -64,12 +73,204 @@ def execute_restore(args: argparse.Namespace) -> int:
         print("Error: Source backup location required")
         print("Usage: btrfs-backup-ng restore <source> <destination>")
         print("       btrfs-backup-ng restore --list <source>")
+        print("       btrfs-backup-ng restore --volume <path> --to <destination>")
         return 1
 
     if not destination:
         print("Error: Destination path required")
         print("Usage: btrfs-backup-ng restore <source> <destination>")
         return 1
+
+    # Delegate to main restore logic
+    args.source = source
+    args.destination = destination
+    return _execute_main_restore(args)
+
+
+def _execute_list_volumes(args: argparse.Namespace) -> int:
+    """List volumes and their backup targets from config.
+
+    Args:
+        args: Command arguments
+
+    Returns:
+        Exit code (0 for success, non-zero for failure)
+    """
+    # Load config
+    config_path = getattr(args, "config", None)
+    try:
+        if config_path:
+            config = load_config(config_path)
+        else:
+            found_path = find_config_file()
+            if not found_path:
+                print("Error: No configuration file found")
+                print("Use --config to specify a config file, or create one at:")
+                print("  ~/.config/btrfs-backup-ng/config.toml")
+                print("  /etc/btrfs-backup-ng/config.toml")
+                return 1
+            config = load_config(found_path)
+            config_path = found_path
+    except ConfigError as e:
+        logger.error("Failed to load config: %s", e)
+        return 1
+
+    print(f"Configuration: {config_path}")
+    print("=" * 60)
+    print()
+
+    volumes = config.get_enabled_volumes()
+    if not volumes:
+        print("No volumes configured")
+        return 0
+
+    for i, vol in enumerate(volumes):
+        print(f"Volume {i + 1}: {vol.path}")
+        print(f"  Snapshot prefix: {vol.snapshot_prefix}")
+        print(f"  Snapshot dir: {vol.snapshot_dir}")
+
+        if vol.targets:
+            print(f"  Backup targets:")
+            for j, target in enumerate(vol.targets):
+                ssh_info = " (ssh_sudo)" if target.ssh_sudo else ""
+                mount_info = " (require_mount)" if target.require_mount else ""
+                print(f"    [{j}] {target.path}{ssh_info}{mount_info}")
+        else:
+            print("  No backup targets configured")
+        print()
+
+    print(f"Total: {len(volumes)} volume(s)")
+    return 0
+
+
+def _execute_config_restore(args: argparse.Namespace, volume_path: str) -> int:
+    """Execute config-driven restore for a specific volume.
+
+    Uses the configuration file to determine where backups are stored,
+    then restores from the configured target.
+
+    Args:
+        args: Command arguments
+        volume_path: Path of the volume to restore (e.g., /home)
+
+    Returns:
+        Exit code (0 for success, non-zero for failure)
+    """
+    # Load config
+    config_path = getattr(args, "config", None)
+    try:
+        if config_path:
+            config = load_config(config_path)
+        else:
+            found_path = find_config_file()
+            if not found_path:
+                print("Error: No configuration file found")
+                print("Use --config to specify a config file")
+                return 1
+            config = load_config(found_path)
+    except ConfigError as e:
+        logger.error("Failed to load config: %s", e)
+        return 1
+
+    # Find the requested volume
+    volume = None
+    for vol in config.get_enabled_volumes():
+        if vol.path == volume_path:
+            volume = vol
+            break
+
+    if not volume:
+        print(f"Error: Volume '{volume_path}' not found in configuration")
+        print("Available volumes:")
+        for vol in config.get_enabled_volumes():
+            print(f"  {vol.path}")
+        return 1
+
+    # Check volume has targets
+    if not volume.targets:
+        print(f"Error: Volume '{volume_path}' has no backup targets configured")
+        return 1
+
+    # Get target index
+    target_idx = getattr(args, "target", None) or 0
+    if target_idx < 0 or target_idx >= len(volume.targets):
+        print(f"Error: Invalid target index {target_idx}")
+        print(f"Volume '{volume_path}' has {len(volume.targets)} target(s):")
+        for j, t in enumerate(volume.targets):
+            print(f"  [{j}] {t.path}")
+        return 1
+
+    target = volume.targets[target_idx]
+    source = target.path
+
+    # Get destination
+    destination = getattr(args, "to", None) or getattr(args, "destination", None)
+
+    # Handle --list mode for config-driven restore
+    if getattr(args, "list", False):
+        # Set source and call list
+        args.source = source
+        # Apply target's SSH settings
+        if target.ssh_sudo:
+            args.ssh_sudo = True
+        if target.ssh_key:
+            args.ssh_key = target.ssh_key
+        # Use volume's snapshot prefix
+        if volume.snapshot_prefix and not getattr(args, "prefix", None):
+            args.prefix = volume.snapshot_prefix
+        return _execute_list(args)
+
+    # For actual restore, need destination
+    if not destination:
+        print(f"Error: Destination required for restore")
+        print(
+            f"Usage: btrfs-backup-ng restore --volume {volume_path} --to <destination>"
+        )
+        return 1
+
+    # Build effective arguments
+    print(f"Config-driven restore:")
+    print(f"  Volume: {volume_path}")
+    print(f"  Source: {source}")
+    print(f"  Destination: {destination}")
+    print()
+
+    # Update args with config values
+    args.source = source
+    args.destination = destination
+
+    # Apply target's settings if not overridden on CLI
+    if target.ssh_sudo and not getattr(args, "ssh_sudo", False):
+        args.ssh_sudo = True
+    if target.ssh_key and not getattr(args, "ssh_key", None):
+        args.ssh_key = target.ssh_key
+    if target.compress != "none" and not getattr(args, "compress", None):
+        args.compress = target.compress
+    if target.rate_limit and not getattr(args, "rate_limit", None):
+        args.rate_limit = target.rate_limit
+
+    # Use volume's snapshot prefix if not overridden
+    if volume.snapshot_prefix and not getattr(args, "prefix", None):
+        args.prefix = volume.snapshot_prefix
+
+    # Now call the main restore logic (fall through to execute_restore's main path)
+    # We need to reprocess since we've set up the args
+    return _execute_main_restore(args)
+
+
+def _execute_main_restore(args: argparse.Namespace) -> int:
+    """Execute the main restore logic after arguments are resolved.
+
+    This is called both from direct CLI usage and config-driven restore.
+
+    Args:
+        args: Parsed arguments with source and destination set
+
+    Returns:
+        Exit code (0 for success, non-zero for failure)
+    """
+    source = args.source
+    destination = args.destination
 
     # Validate destination
     dest_path = Path(destination).resolve()

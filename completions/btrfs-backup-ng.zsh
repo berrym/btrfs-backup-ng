@@ -20,6 +20,7 @@ _btrfs-backup-ng() {
         'uninstall:Remove systemd timer/service'
         'restore:Restore snapshots from backup location'
         'verify:Verify backup integrity'
+        'estimate:Estimate backup transfer sizes'
     )
 
     local -a global_opts
@@ -151,6 +152,11 @@ _btrfs-backup-ng() {
                         '--cleanup[Clean up partial/incomplete snapshot restores]' \
                         '(--progress --no-progress)'--progress'[Show progress bars]' \
                         '(--progress --no-progress)'--no-progress'[Disable progress bars]' \
+                        '(-c --config)'{-c,--config}'[Path to configuration file]:config file:_files' \
+                        '--volume[Restore backups for volume defined in config]:volume path:_directories' \
+                        '--target[Target index to restore from (0-based)]:index:' \
+                        '--list-volumes[List volumes and their backup targets from config]' \
+                        '--to[Destination path for config-driven restore]:destination:_directories' \
                         '1:source (backup location):_files -/' \
                         '2:destination (local path):_directories'
                     ;;
@@ -169,6 +175,19 @@ _btrfs-backup-ng() {
                         '--json[Output results in JSON format]' \
                         '(-q --quiet)'{-q,--quiet}'[Suppress progress output]' \
                         '1:backup location:_files -/'
+                    ;;
+                estimate)
+                    _arguments \
+                        '(-c --config)'{-c,--config}'[Path to configuration file]:config file:_files' \
+                        '--volume[Estimate for volume defined in config]:volume path:_directories' \
+                        '--target[Target index to estimate for (0-based)]:index:' \
+                        '--prefix[Snapshot prefix filter]:prefix:' \
+                        '--ssh-sudo[Use sudo for btrfs commands on remote host]' \
+                        '--ssh-key[SSH private key file]:key file:_files' \
+                        '--no-fs-checks[Skip btrfs subvolume verification]' \
+                        '--json[Output results in JSON format]' \
+                        '1:source (snapshot location):_files -/' \
+                        '2:destination (backup location):_files -/'
                     ;;
             esac
             ;;
