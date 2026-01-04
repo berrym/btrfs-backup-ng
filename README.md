@@ -915,6 +915,9 @@ The restore command:
 | `--no-fs-checks` | Skip btrfs subvolume verification (needed for backup directories) |
 | `--progress` | Show progress bars (default in terminal) |
 | `--no-progress` | Disable progress bars |
+| `--status` | Show locks and incomplete restores at backup location |
+| `--unlock [ID]` | Unlock stuck restore sessions ('all' or specific session ID) |
+| `--cleanup` | Clean up partial/incomplete restores at destination |
 
 ### Restore from Local Backup
 
@@ -1171,6 +1174,78 @@ btrfs-backup-ng restore ssh://...:/backups/home /mnt/restore
 
 # Overwrite existing snapshots
 btrfs-backup-ng restore ssh://...:/backups/home /mnt/restore --overwrite
+```
+
+### Recovery from Failed Restores
+
+If a restore operation is interrupted or fails, use these recovery commands:
+
+#### Check Status of Locks
+
+```bash
+# See what locks exist at the backup location
+btrfs-backup-ng restore --status /mnt/backup/home --no-fs-checks --prefix "home-"
+
+# For SSH backups
+btrfs-backup-ng restore --status ssh://backup@server:/backups/home \
+    --no-fs-checks --prefix "home-" --ssh-sudo
+```
+
+Output shows:
+- **Restore locks** - From incomplete restore operations
+- **Other locks** - From backup/transfer operations (not touched by unlock)
+- Number of available snapshots
+
+#### Unlock Stuck Sessions
+
+If a restore was interrupted, locks may remain on snapshots preventing future operations:
+
+```bash
+# Unlock ALL restore sessions (recommended)
+btrfs-backup-ng restore --unlock all /mnt/backup/home --no-fs-checks
+
+# Unlock a specific session by ID
+btrfs-backup-ng restore --unlock abc123 /mnt/backup/home --no-fs-checks
+
+# For SSH backups
+btrfs-backup-ng restore --unlock all ssh://backup@server:/backups/home \
+    --no-fs-checks --ssh-sudo
+```
+
+**Note:** `--unlock` only removes restore locks. Backup and transfer locks are preserved to prevent accidental data loss.
+
+#### Clean Up Partial Restores
+
+If a restore failed mid-transfer, partial subvolumes may remain at the destination:
+
+```bash
+# Scan for partial restores (dry-run first)
+btrfs-backup-ng restore --cleanup /mnt/restore --dry-run
+
+# Actually clean up partial subvolumes (requires confirmation)
+btrfs-backup-ng restore --cleanup /mnt/restore
+```
+
+The cleanup command detects:
+- Empty subvolumes
+- Subvolumes containing only metadata directories
+- Subvolumes with `.partial` suffix
+
+#### Complete Recovery Example
+
+```bash
+# 1. Check what's stuck
+btrfs-backup-ng restore --status /mnt/backup/home --no-fs-checks --prefix "home-"
+
+# 2. Unlock any stuck restore sessions
+btrfs-backup-ng restore --unlock all /mnt/backup/home --no-fs-checks
+
+# 3. Clean up any partial restores at destination
+btrfs-backup-ng restore --cleanup /mnt/restore
+
+# 4. Retry the restore
+btrfs-backup-ng restore /mnt/backup/home /mnt/restore \
+    --prefix "home-" --no-fs-checks
 ```
 
 ### Troubleshooting Restore
