@@ -424,6 +424,30 @@ Examples:
         action="store_true",
         help="Skip btrfs subvolume verification (for listing backups in regular directories)",
     )
+
+    # Recovery commands group
+    recovery_group = restore_parser.add_argument_group(
+        "Recovery options",
+        "Commands for managing failed or incomplete restores",
+    )
+    recovery_group.add_argument(
+        "--status",
+        action="store_true",
+        help="Show status of locks and incomplete restores at backup location",
+    )
+    recovery_group.add_argument(
+        "--unlock",
+        metavar="LOCK_ID",
+        nargs="?",
+        const="all",
+        help="Unlock stuck restore session(s). Use 'all' or specify a lock ID",
+    )
+    recovery_group.add_argument(
+        "--cleanup",
+        action="store_true",
+        help="Clean up partial/incomplete snapshot restores at destination",
+    )
+
     add_progress_args(restore_parser)
 
     return parser

@@ -43,6 +43,19 @@ def execute_restore(args: argparse.Namespace) -> int:
     if getattr(args, "list", False):
         return _execute_list(args)
 
+    # Handle --status mode (show locks and incomplete restores)
+    if getattr(args, "status", False):
+        return _execute_status(args)
+
+    # Handle --unlock mode (unlock stuck sessions)
+    unlock_arg = getattr(args, "unlock", None)
+    if unlock_arg is not None:
+        return _execute_unlock(args, unlock_arg)
+
+    # Handle --cleanup mode (clean up partial restores)
+    if getattr(args, "cleanup", False):
+        return _execute_cleanup(args)
+
     # Get source and destination
     source = getattr(args, "source", None)
     destination = getattr(args, "destination", None)
@@ -371,3 +384,330 @@ def _interactive_select(backup_endpoint) -> str | None:
         except (EOFError, KeyboardInterrupt):
             print("\nCancelled")
             return None
+
+
+def _execute_status(args: argparse.Namespace) -> int:
+    """Show status of locks and incomplete restores at backup location.
+
+    Displays:
+    - Active locks on snapshots (from restore or backup operations)
+    - Any partial/incomplete snapshots detected
+
+    Args:
+        args: Command arguments
+
+    Returns:
+        Exit code (0 for success, non-zero for failure)
+    """
+    source = getattr(args, "source", None)
+    if not source:
+        print("Error: Source backup location required")
+        print("Usage: btrfs-backup-ng restore --status <source>")
+        return 1
+
+    try:
+        backup_endpoint = _prepare_backup_endpoint(args, source)
+    except Exception as e:
+        logger.error("Failed to prepare backup endpoint: %s", e)
+        return 1
+
+    print(f"Restore status for {source}")
+    print("=" * 60)
+    print()
+
+    # Read locks from the backup location
+    try:
+        lock_file_path = backup_endpoint.config["path"] / backup_endpoint.config.get(
+            "lock_file_name", ".btrfs-backup-ng.locks"
+        )
+        locks = {}
+        if lock_file_path.exists():
+            with open(lock_file_path, encoding="utf-8") as f:
+                locks = __util__.read_locks(f.read())
+    except Exception as e:
+        logger.warning("Could not read lock file: %s", e)
+        locks = {}
+
+    # Display locks
+    if locks:
+        print("Active Locks:")
+        print("-" * 40)
+        restore_locks = {}
+        other_locks = {}
+
+        for snap_name, lock_info in locks.items():
+            snap_locks = lock_info.get("locks", [])
+            parent_locks = lock_info.get("parent_locks", [])
+            all_locks = snap_locks + parent_locks
+
+            for lock_id in all_locks:
+                if lock_id.startswith("restore:"):
+                    if snap_name not in restore_locks:
+                        restore_locks[snap_name] = []
+                    restore_locks[snap_name].append(lock_id)
+                else:
+                    if snap_name not in other_locks:
+                        other_locks[snap_name] = []
+                    other_locks[snap_name].append(lock_id)
+
+        if restore_locks:
+            print("\n  Restore locks (from restore operations):")
+            for snap_name, lock_ids in restore_locks.items():
+                for lock_id in lock_ids:
+                    session_id = lock_id.replace("restore:", "")
+                    print(f"    {snap_name}: session {session_id}")
+
+        if other_locks:
+            print("\n  Other locks (from backup/transfer operations):")
+            for snap_name, lock_ids in other_locks.items():
+                for lock_id in lock_ids:
+                    print(f"    {snap_name}: {lock_id}")
+
+        print()
+        print(f"Total: {len(locks)} snapshot(s) with locks")
+        print()
+        print("To unlock restore sessions:")
+        print("  btrfs-backup-ng restore --unlock all <source>")
+        print("  btrfs-backup-ng restore --unlock <session-id> <source>")
+    else:
+        print("No active locks found.")
+        print()
+
+    # List snapshots for reference
+    try:
+        snapshots = list_remote_snapshots(backup_endpoint)
+        print(f"\nAvailable snapshots: {len(snapshots)}")
+    except Exception as e:
+        logger.warning("Could not list snapshots: %s", e)
+
+    return 0
+
+
+def _execute_unlock(args: argparse.Namespace, lock_id: str) -> int:
+    """Unlock stuck restore session(s).
+
+    Args:
+        args: Command arguments
+        lock_id: Lock ID to unlock, or "all" to unlock all restore locks
+
+    Returns:
+        Exit code (0 for success, non-zero for failure)
+    """
+    source = getattr(args, "source", None)
+    if not source:
+        print("Error: Source backup location required")
+        print("Usage: btrfs-backup-ng restore --unlock [LOCK_ID] <source>")
+        return 1
+
+    try:
+        backup_endpoint = _prepare_backup_endpoint(args, source)
+    except Exception as e:
+        logger.error("Failed to prepare backup endpoint: %s", e)
+        return 1
+
+    # Read current locks
+    try:
+        lock_file_path = backup_endpoint.config["path"] / backup_endpoint.config.get(
+            "lock_file_name", ".btrfs-backup-ng.locks"
+        )
+        if not lock_file_path.exists():
+            print("No lock file found - nothing to unlock.")
+            return 0
+
+        with open(lock_file_path, encoding="utf-8") as f:
+            locks = __util__.read_locks(f.read())
+    except Exception as e:
+        logger.error("Could not read lock file: %s", e)
+        return 1
+
+    if not locks:
+        print("No locks found - nothing to unlock.")
+        return 0
+
+    # Find and remove matching locks
+    unlocked_count = 0
+    new_locks = {}
+
+    for snap_name, lock_info in locks.items():
+        snap_locks = set(lock_info.get("locks", []))
+        parent_locks = set(lock_info.get("parent_locks", []))
+
+        if lock_id == "all":
+            # Remove all restore locks
+            restore_snap_locks = {l for l in snap_locks if l.startswith("restore:")}
+            restore_parent_locks = {l for l in parent_locks if l.startswith("restore:")}
+            unlocked_count += len(restore_snap_locks) + len(restore_parent_locks)
+            snap_locks -= restore_snap_locks
+            parent_locks -= restore_parent_locks
+        else:
+            # Remove specific lock
+            full_lock_id = (
+                f"restore:{lock_id}" if not lock_id.startswith("restore:") else lock_id
+            )
+            if full_lock_id in snap_locks:
+                snap_locks.discard(full_lock_id)
+                unlocked_count += 1
+            if full_lock_id in parent_locks:
+                parent_locks.discard(full_lock_id)
+                unlocked_count += 1
+
+        # Keep entry if it still has locks
+        if snap_locks or parent_locks:
+            new_entry = {}
+            if snap_locks:
+                new_entry["locks"] = list(snap_locks)
+            if parent_locks:
+                new_entry["parent_locks"] = list(parent_locks)
+            new_locks[snap_name] = new_entry
+
+    # Write updated locks
+    try:
+        with open(lock_file_path, "w", encoding="utf-8") as f:
+            f.write(__util__.write_locks(new_locks))
+    except Exception as e:
+        logger.error("Could not write lock file: %s", e)
+        return 1
+
+    if unlocked_count > 0:
+        print(f"Unlocked {unlocked_count} lock(s).")
+        if new_locks:
+            print(f"Remaining locks: {len(new_locks)} snapshot(s)")
+        else:
+            print("All locks cleared.")
+    else:
+        if lock_id == "all":
+            print("No restore locks found to unlock.")
+        else:
+            print(f"Lock '{lock_id}' not found.")
+        return 1
+
+    return 0
+
+
+def _execute_cleanup(args: argparse.Namespace) -> int:
+    """Clean up partial/incomplete snapshot restores at destination.
+
+    Scans the destination for partial subvolumes (from interrupted restores)
+    and offers to delete them.
+
+    Args:
+        args: Command arguments
+
+    Returns:
+        Exit code (0 for success, non-zero for failure)
+    """
+    # For cleanup, accept either destination or source as the path
+    # (user might use either positional argument)
+    destination = getattr(args, "destination", None) or getattr(args, "source", None)
+    if not destination:
+        print("Error: Destination path required")
+        print("Usage: btrfs-backup-ng restore --cleanup <destination>")
+        return 1
+
+    dest_path = Path(destination).resolve()
+
+    if not dest_path.exists():
+        print(f"Error: Destination path does not exist: {dest_path}")
+        return 1
+
+    print(f"Scanning for partial restores in {dest_path}")
+    print("=" * 60)
+    print()
+
+    # Look for partial subvolumes
+    # Partial restores typically:
+    # 1. Have incomplete btrfs receive (no received_uuid)
+    # 2. Are empty or nearly empty
+    # 3. May have .partial suffix or similar markers
+
+    partial_subvolumes = []
+
+    try:
+        for item in dest_path.iterdir():
+            if not item.is_dir():
+                continue
+
+            # Check if it's a subvolume
+            if not __util__.is_subvolume(item):
+                continue
+
+            # Check for signs of incomplete restore
+            is_partial = False
+            reason = ""
+
+            # Check if subvolume is empty or very small
+            try:
+                contents = list(item.iterdir())
+                if len(contents) == 0:
+                    is_partial = True
+                    reason = "empty subvolume"
+                elif len(contents) == 1 and contents[0].name == ".btrfs-backup-ng":
+                    is_partial = True
+                    reason = "only contains metadata directory"
+            except PermissionError:
+                pass
+
+            # Check for .partial marker in name
+            if item.name.endswith(".partial"):
+                is_partial = True
+                reason = "has .partial suffix"
+
+            if is_partial:
+                partial_subvolumes.append((item, reason))
+
+    except Exception as e:
+        logger.error("Error scanning destination: %s", e)
+        return 1
+
+    if not partial_subvolumes:
+        print("No partial restores found.")
+        return 0
+
+    print(f"Found {len(partial_subvolumes)} potentially incomplete restore(s):\n")
+    for i, (subvol, reason) in enumerate(partial_subvolumes, 1):
+        print(f"  {i}. {subvol.name}")
+        print(f"      Reason: {reason}")
+        print()
+
+    # Ask for confirmation
+    dry_run = getattr(args, "dry_run", False)
+    if dry_run:
+        print("Dry run - no changes made.")
+        return 0
+
+    print("These subvolumes appear to be from incomplete restores.")
+    confirm = input("Delete all partial subvolumes? [y/N]: ").strip().lower()
+
+    if confirm not in ("y", "yes"):
+        print("Cancelled.")
+        return 0
+
+    # Delete partial subvolumes
+    deleted = 0
+    failed = 0
+
+    for subvol, reason in partial_subvolumes:
+        try:
+            logger.info("Deleting partial subvolume: %s", subvol)
+            # Use btrfs subvolume delete
+            import subprocess
+
+            result = subprocess.run(
+                ["btrfs", "subvolume", "delete", str(subvol)],
+                capture_output=True,
+                text=True,
+            )
+            if result.returncode == 0:
+                print(f"  Deleted: {subvol.name}")
+                deleted += 1
+            else:
+                logger.error("Failed to delete %s: %s", subvol, result.stderr)
+                failed += 1
+        except Exception as e:
+            logger.error("Failed to delete %s: %s", subvol, e)
+            failed += 1
+
+    print()
+    print(f"Cleanup complete: {deleted} deleted, {failed} failed")
+
+    return 0 if failed == 0 else 1
