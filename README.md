@@ -363,46 +363,232 @@ The importer will:
 | CLI output | Plain text | Rich formatting |
 | SSH handling | External ssh | Native Paramiko option |
 
-## SSH Configuration
+## SSH Remote Backup Setup
 
-### Passwordless Sudo (Recommended)
+This section provides a complete guide for setting up passwordless SSH backups to a remote server. For fully automated backups, you need:
 
-On remote hosts, add to `/etc/sudoers` via `visudo`:
+1. SSH key authentication (no password prompts)
+2. Passwordless sudo on the remote for btrfs commands
+3. A btrfs filesystem on the remote to receive backups
+
+### Step 1: Create a Dedicated Backup User (Remote Server)
+
+On the **remote backup server**, create a dedicated user for backups:
+
+```bash
+# Create backup user with no password (key-only auth)
+sudo useradd -m -s /bin/bash backup
+
+# Create the backup directory on a btrfs filesystem
+sudo mkdir -p /mnt/backups
+sudo chown backup:backup /mnt/backups
+
+# Verify the backup location is on a btrfs filesystem
+df -T /mnt/backups | grep btrfs || echo "WARNING: Not a btrfs filesystem!"
+```
+
+### Step 2: Configure Passwordless Sudo (Remote Server)
+
+btrfs send/receive requires root privileges. On the **remote server**, configure sudo:
+
+```bash
+# Create sudoers file for backup user
+sudo visudo -f /etc/sudoers.d/btrfs-backup
+```
+
+Add one of these configurations:
 
 ```sudoers
-# Full access to btrfs commands
-backup_user ALL=(ALL) NOPASSWD: /usr/bin/btrfs
+# Option 1: Full btrfs access (simplest, recommended)
+backup ALL=(ALL) NOPASSWD: /usr/bin/btrfs
 
-# Or restricted access
-backup_user ALL=(ALL) NOPASSWD: /usr/bin/btrfs subvolume *, /usr/bin/btrfs send *, /usr/bin/btrfs receive *
+# Option 2: Restricted to specific btrfs subcommands (more secure)
+backup ALL=(ALL) NOPASSWD: /usr/bin/btrfs receive *
+backup ALL=(ALL) NOPASSWD: /usr/bin/btrfs subvolume *
+backup ALL=(ALL) NOPASSWD: /usr/bin/btrfs send *
+backup ALL=(ALL) NOPASSWD: /usr/bin/btrfs filesystem *
 ```
 
-### Password Authentication
-
-If passwordless sudo isn't available:
+Verify sudo works without password:
 
 ```bash
-# Environment variable
-export BTRFS_BACKUP_SUDO_PASSWORD="password"
-
-# Or enable password prompts
-export BTRFS_BACKUP_SSH_PASSWORD=1
+# Test on remote server (as backup user)
+sudo -n btrfs --version
+# Should print version without prompting for password
 ```
 
-### SSH Key Setup
+### Step 3: Set Up SSH Key Authentication (Local Machine)
+
+On your **local machine**, generate a dedicated SSH key for backups:
 
 ```bash
-# Generate dedicated backup key
-ssh-keygen -t ed25519 -f ~/.ssh/backup_key -C "btrfs-backup"
+# Generate Ed25519 key (recommended)
+ssh-keygen -t ed25519 -f ~/.ssh/btrfs-backup-key -C "btrfs-backup-ng"
 
-# Copy to remote host
-ssh-copy-id -i ~/.ssh/backup_key backup_user@remote
+# Or RSA if Ed25519 isn't supported
+ssh-keygen -t rsa -b 4096 -f ~/.ssh/btrfs-backup-key -C "btrfs-backup-ng"
+```
 
-# Use in config
+Copy the public key to the remote server:
+
+```bash
+# Copy key to remote backup user
+ssh-copy-id -i ~/.ssh/btrfs-backup-key backup@remote-server
+
+# Test the connection
+ssh -i ~/.ssh/btrfs-backup-key backup@remote-server 'echo "SSH works!"'
+```
+
+### Step 4: Test Remote btrfs Access
+
+Verify everything works end-to-end:
+
+```bash
+# Test SSH + sudo + btrfs (from local machine)
+ssh -i ~/.ssh/btrfs-backup-key backup@remote-server 'sudo btrfs filesystem show /mnt/backups'
+```
+
+If this command succeeds without prompting for any passwords, you're ready.
+
+### Step 5: Configure btrfs-backup-ng
+
+Create your configuration file:
+
+```toml
+[global]
+snapshot_dir = ".snapshots"
+log_file = "/var/log/btrfs-backup-ng.log"
+transaction_log = "/var/log/btrfs-backup-ng.jsonl"
+
+[[volumes]]
+path = "/home"
+snapshot_prefix = "home"
+
 [[volumes.targets]]
-path = "ssh://backup_user@remote:/backups"
-ssh_key = "~/.ssh/backup_key"
+path = "ssh://backup@remote-server:/mnt/backups/home"
+ssh_sudo = true                           # Required for btrfs receive
+ssh_key = "~/.ssh/btrfs-backup-key"       # Path to private key
 ```
+
+### Step 6: Running Backups with sudo Locally
+
+btrfs operations on the local machine also require root. When running with `sudo`, you need to preserve your SSH agent:
+
+```bash
+# Method 1: Use sudo -E to preserve environment (including SSH_AUTH_SOCK)
+sudo -E btrfs-backup-ng run
+
+# Method 2: Explicitly specify the SSH key in config (works without agent)
+# Just ensure ssh_key is set in your target configuration
+sudo btrfs-backup-ng run
+```
+
+**Important:** When sudo changes to root, it normally loses access to your user's SSH agent. Options:
+
+| Method | How | Best For |
+|--------|-----|----------|
+| `sudo -E` | Preserves SSH_AUTH_SOCK | Interactive use |
+| `ssh_key` in config | Uses key file directly | Automated/systemd |
+| Root's SSH key | Generate key for root user | Dedicated backup systems |
+
+### Complete Working Example
+
+**Local machine setup:**
+```bash
+# 1. Generate SSH key
+ssh-keygen -t ed25519 -f ~/.ssh/btrfs-backup-key -N "" -C "btrfs-backup-ng"
+
+# 2. Copy to remote
+ssh-copy-id -i ~/.ssh/btrfs-backup-key backup@backupserver
+
+# 3. Create config
+sudo mkdir -p /etc/btrfs-backup-ng
+sudo tee /etc/btrfs-backup-ng/config.toml << 'EOF'
+[global]
+snapshot_dir = ".snapshots"
+
+[[volumes]]
+path = "/home"
+
+[[volumes.targets]]
+path = "ssh://backup@backupserver:/mnt/backups/home"
+ssh_sudo = true
+ssh_key = "/home/myuser/.ssh/btrfs-backup-key"
+EOF
+
+# 4. Test
+sudo btrfs-backup-ng run --dry-run
+sudo btrfs-backup-ng run
+```
+
+**Remote server setup:**
+```bash
+# 1. Create backup user
+sudo useradd -m backup
+
+# 2. Configure passwordless sudo
+echo 'backup ALL=(ALL) NOPASSWD: /usr/bin/btrfs' | sudo tee /etc/sudoers.d/btrfs-backup
+
+# 3. Create backup directory (must be on btrfs)
+sudo mkdir -p /mnt/backups/home
+sudo chown backup:backup /mnt/backups/home
+```
+
+### SSH Troubleshooting
+
+**"Permission denied" on SSH connect:**
+```bash
+# Check key permissions (must be 600)
+chmod 600 ~/.ssh/btrfs-backup-key
+
+# Test SSH manually with verbose output
+ssh -vvv -i ~/.ssh/btrfs-backup-key backup@remote-server
+```
+
+**"sudo: a password is required":**
+```bash
+# On remote, check sudoers syntax
+sudo visudo -c -f /etc/sudoers.d/btrfs-backup
+
+# Test sudo as backup user
+sudo -u backup sudo -n btrfs --version
+```
+
+**"ERROR: not a btrfs filesystem":**
+```bash
+# On remote, verify backup location is btrfs
+df -T /mnt/backups
+# Must show "btrfs" as filesystem type
+```
+
+**SSH works manually but fails in btrfs-backup-ng:**
+```bash
+# Check if running with sudo drops SSH agent
+sudo env | grep SSH_AUTH_SOCK   # Should show your socket
+
+# If empty, either use sudo -E or specify ssh_key in config
+sudo -E btrfs-backup-ng run
+```
+
+### Password-Based Authentication (Not Recommended)
+
+If you cannot set up passwordless authentication, btrfs-backup-ng supports password prompts:
+
+```toml
+[[volumes.targets]]
+path = "ssh://backup@remote-server:/mnt/backups"
+ssh_sudo = true
+ssh_password_auth = true    # Enable SSH password prompts
+```
+
+For sudo passwords on remote:
+```bash
+# Set via environment variable (insecure - visible in process list)
+export BTRFS_BACKUP_SUDO_PASSWORD="password"
+sudo -E btrfs-backup-ng run
+```
+
+**Warning:** Password-based authentication is not suitable for automated/unattended backups.
 
 ## Legacy CLI Mode
 
