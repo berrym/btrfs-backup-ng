@@ -571,13 +571,13 @@ def convert_to_toml(btrbk_config: BtrbkConfig) -> tuple[str, list[str]]:
                 # Convert btrbk target path format
                 target_path = target.path
                 if ":" in target_path and not target_path.startswith("ssh://"):
-                    # Convert host:path to ssh://host/path
+                    # Convert host:path to ssh://host:/path
                     host, path = target_path.split(":", 1)
                     if "@" in host:
                         user, hostname = host.split("@", 1)
-                        target_path = f"ssh://{user}@{hostname}{path}"
+                        target_path = f"ssh://{user}@{hostname}:{path}"
                     else:
-                        target_path = f"ssh://{host}{path}"
+                        target_path = f"ssh://{host}:{path}"
                     warnings.append(
                         f"Line {target.line}: Converted '{target.path}' to '{target_path}'"
                     )
