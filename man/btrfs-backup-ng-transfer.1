@@ -1,0 +1,44 @@
+.\" Man page for btrfs-backup-ng transfer
+.TH BTRFS-BACKUP-NG-TRANSFER 1 "January 2026" "btrfs-backup-ng" "User Commands"
+.SH NAME
+btrfs-backup-ng-transfer \- transfer existing snapshots to targets
+.SH SYNOPSIS
+.B btrfs-backup-ng transfer
+[\fIOPTIONS\fR]
+.SH DESCRIPTION
+Transfer existing snapshots to configured targets without creating new ones.
+Uses incremental transfers when possible for efficiency.
+.SH OPTIONS
+.TP
+.B \-\-dry-run
+Show what would be done without making any changes.
+.TP
+.BI \-\-volume " PATH"
+Only transfer the specified volume(s). Can be specified multiple times.
+.TP
+.BI \-\-compress " METHOD"
+Compression method for transfers. Overrides per-target configuration.
+Valid methods: none, zstd, gzip, lz4, pigz, lzop.
+.TP
+.BI \-\-rate-limit " RATE"
+Bandwidth limit for transfers. Examples: 10M, 1G, 500K.
+.TP
+.B \-\-progress
+Show progress bars during transfers.
+.TP
+.B \-\-no-progress
+Disable progress bars.
+.SH EXAMPLES
+.TP
+Transfer all pending snapshots:
+.B btrfs-backup-ng transfer
+.TP
+Transfer with compression:
+.B btrfs-backup-ng transfer --compress zstd
+.TP
+Transfer specific volume with rate limiting:
+.B btrfs-backup-ng transfer --volume /home --rate-limit 50M
+.SH SEE ALSO
+.BR btrfs-backup-ng (1),
+.BR btrfs-backup-ng-run (1),
+.BR btrfs-send (8)

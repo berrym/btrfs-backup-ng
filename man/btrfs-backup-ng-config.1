@@ -1,0 +1,164 @@
+.\" Man page for btrfs-backup-ng config
+.TH BTRFS-BACKUP-NG-CONFIG 1 "January 2026" "btrfs-backup-ng" "User Commands"
+.SH NAME
+btrfs-backup-ng-config \- configuration management commands
+.SH SYNOPSIS
+.B btrfs-backup-ng config validate
+.br
+.B btrfs-backup-ng config init
+[\fB\-o\fR \fIFILE\fR]
+.br
+.B btrfs-backup-ng config import
+[\fB\-o\fR \fIFILE\fR] \fIBTRBK_CONF\fR
+.SH DESCRIPTION
+Manage btrfs-backup-ng configuration files. These commands help create,
+validate, and migrate configurations.
+.SH SUBCOMMANDS
+.SS validate
+Validate the current configuration file. Checks for syntax errors, missing
+required fields, and invalid values.
+.PP
+.RS
+.B btrfs-backup-ng config validate
+.RE
+.PP
+Exit status is 0 if valid, non-zero if errors are found.
+.SS init
+Generate an example configuration file with comments explaining all options.
+.PP
+.RS
+.B btrfs-backup-ng config init
+[\fB\-o\fR \fIFILE\fR]
+.RE
+.TP
+.BR \-o ", " \-\-output " " \fIFILE\fR
+Write output to FILE instead of stdout.
+.PP
+Example:
+.PP
+.RS
+.nf
+btrfs-backup-ng config init > ~/.config/btrfs-backup-ng/config.toml
+btrfs-backup-ng config init -o /etc/btrfs-backup-ng/config.toml
+.fi
+.RE
+.SS import
+Import a btrbk configuration file and convert it to TOML format. This helps
+migrate from btrbk to btrfs-backup-ng.
+.PP
+.RS
+.B btrfs-backup-ng config import
+[\fB\-o\fR \fIFILE\fR] \fIBTRBK_CONF\fR
+.RE
+.TP
+.I BTRBK_CONF
+Path to the btrbk.conf file to import.
+.TP
+.BR \-o ", " \-\-output " " \fIFILE\fR
+Write output to FILE instead of stdout.
+.PP
+The importer:
+.IP \(bu 2
+Parses btrbk's custom syntax
+.IP \(bu 2
+Resolves inheritance (options cascade down)
+.IP \(bu 2
+Converts retention policies
+.IP \(bu 2
+Warns about common btrbk pitfalls
+.IP \(bu 2
+Outputs valid TOML
+.PP
+Example:
+.PP
+.RS
+.nf
+btrfs-backup-ng config import /etc/btrbk/btrbk.conf
+btrfs-backup-ng config import /etc/btrbk/btrbk.conf -o config.toml
+.fi
+.RE
+.SH CONFIGURATION FORMAT
+Configuration uses TOML format. Key sections:
+.SS [global]
+Global settings applied to all volumes unless overridden.
+.PP
+.RS
+.nf
+[global]
+snapshot_dir = ".snapshots"
+timestamp_format = "%Y%m%d-%H%M%S"
+incremental = true
+log_file = "/var/log/btrfs-backup-ng.log"
+parallel_volumes = 2
+parallel_targets = 2
+.fi
+.RE
+.SS [global.retention]
+Default retention policy.
+.PP
+.RS
+.nf
+[global.retention]
+min = "1d"
+hourly = 24
+daily = 7
+weekly = 4
+monthly = 12
+yearly = 0
+.fi
+.RE
+.SS [[volumes]]
+Volume definitions. Each volume specifies a source path and targets.
+.PP
+.RS
+.nf
+[[volumes]]
+path = "/home"
+snapshot_prefix = "home-"
+snapshot_dir = ".snapshots"  # optional override
+
+[[volumes.targets]]
+path = "/mnt/backup/home"
+
+[[volumes.targets]]
+path = "ssh://backup@server:/backups/home"
+ssh_sudo = true
+compress = "zstd"
+rate_limit = "50M"
+
+[volumes.retention]  # optional override
+daily = 14
+.fi
+.RE
+.SS [notifications]
+Optional notification settings.
+.PP
+.RS
+.nf
+[notifications]
+on_success = false
+on_failure = true
+
+[notifications.email]
+smtp_host = "smtp.example.com"
+smtp_port = 587
+from_addr = "backup@example.com"
+to_addrs = ["admin@example.com"]
+use_tls = true
+username = "backup@example.com"
+password = "secret"
+
+[notifications.webhook]
+url = "https://hooks.example.com/backup"
+.fi
+.RE
+.SH FILES
+.TP
+.I ~/.config/btrfs-backup-ng/config.toml
+User configuration file.
+.TP
+.I /etc/btrfs-backup-ng/config.toml
+System-wide configuration file.
+.SH SEE ALSO
+.BR btrfs-backup-ng (1),
+.BR toml (5)

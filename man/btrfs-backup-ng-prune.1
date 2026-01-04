@@ -1,0 +1,54 @@
+.\" Man page for btrfs-backup-ng prune
+.TH BTRFS-BACKUP-NG-PRUNE 1 "January 2026" "btrfs-backup-ng" "User Commands"
+.SH NAME
+btrfs-backup-ng-prune \- apply retention policies
+.SH SYNOPSIS
+.B btrfs-backup-ng prune
+[\fIOPTIONS\fR]
+.SH DESCRIPTION
+Apply retention policies to clean up old snapshots and backups. Evaluates
+each snapshot against the configured retention rules and removes those
+that exceed the limits.
+.PP
+Retention is evaluated with these rules:
+.IP 1. 3
+.B min
+\- Absolute minimum retention. Nothing is deleted before this age.
+.IP 2. 3
+Time buckets (hourly, daily, weekly, monthly, yearly) are evaluated
+newest-to-oldest.
+.IP 3. 3
+The first snapshot in each bucket is kept.
+.IP 4. 3
+The latest snapshot is always preserved.
+.IP 5. 3
+Snapshots needed for incremental backup chains are preserved.
+.SH OPTIONS
+.TP
+.B \-\-dry-run
+Show what would be deleted without making any changes. Highly recommended
+before running prune for the first time.
+.SH EXAMPLES
+.TP
+Show what would be pruned (dry run):
+.B btrfs-backup-ng prune --dry-run
+.TP
+Apply retention policies:
+.B btrfs-backup-ng prune
+.SH RETENTION CONFIGURATION
+Example retention settings in config.toml:
+.PP
+.RS
+.nf
+[global.retention]
+min = "1d"      # Keep everything for at least 1 day
+hourly = 24    # Then keep 24 hourly snapshots
+daily = 7      # Then keep 7 daily snapshots
+weekly = 4     # Then keep 4 weekly snapshots
+monthly = 12   # Then keep 12 monthly snapshots
+yearly = 0     # Don't keep yearly (0 = disabled)
+.fi
+.RE
+.SH SEE ALSO
+.BR btrfs-backup-ng (1),
+.BR btrfs-backup-ng-run (1)

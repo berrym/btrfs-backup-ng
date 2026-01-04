@@ -1,0 +1,195 @@
+.\" Man page for btrfs-backup-ng restore
+.TH BTRFS-BACKUP-NG-RESTORE 1 "January 2026" "btrfs-backup-ng" "User Commands"
+.SH NAME
+btrfs-backup-ng-restore \- restore snapshots from backup location
+.SH SYNOPSIS
+.B btrfs-backup-ng restore
+[\fIOPTIONS\fR] \fISOURCE\fR \fIDESTINATION\fR
+.br
+.B btrfs-backup-ng restore
+\fB\-\-list\fR \fISOURCE\fR
+.br
+.B btrfs-backup-ng restore
+\fB\-\-status\fR \fISOURCE\fR
+.SH DESCRIPTION
+Pull snapshots from backup storage back to a local system. This command
+enables disaster recovery, migration between machines, and point-in-time
+restoration.
+.PP
+The restore command automatically handles incremental chains, ensuring all
+parent snapshots required for a successful restore are transferred.
+.SH ARGUMENTS
+.TP
+.I SOURCE
+Backup location to restore from. Can be a local path (e.g., /mnt/backup/home)
+or an SSH URL (e.g., ssh://user@host:/path/to/backup).
+.TP
+.I DESTINATION
+Local path to restore snapshots to. Must be on a btrfs filesystem.
+.SH OPTIONS
+.SS Listing and Selection
+.TP
+.BR \-l ", " \-\-list
+List available snapshots at backup location without restoring.
+.TP
+.BR \-s ", " \-\-snapshot " " \fINAME\fR
+Restore a specific snapshot by name.
+.TP
+.BI \-\-before " DATETIME"
+Restore the snapshot closest to the specified time. Format: YYYY-MM-DD or
+YYYY-MM-DD HH:MM:SS.
+.TP
+.BR \-a ", " \-\-all
+Restore all snapshots from the backup location (full mirror).
+.TP
+.BR \-i ", " \-\-interactive
+Interactively select which snapshot to restore from a list.
+.SS Transfer Options
+.TP
+.B \-\-dry-run
+Show what would be restored without making any changes.
+.TP
+.B \-\-no-incremental
+Force full transfers instead of incremental. Use when incremental chain
+is broken.
+.TP
+.BI \-\-compress " METHOD"
+Compression method for transfers. Valid methods: none, zstd, gzip, lz4,
+pigz, lzop.
+.TP
+.BI \-\-rate-limit " RATE"
+Bandwidth limit for transfers. Examples: 10M, 1G, 500K.
+.TP
+.B \-\-progress
+Show progress bars during transfers.
+.TP
+.B \-\-no-progress
+Disable progress bars.
+.SS Safety Options
+.TP
+.B \-\-overwrite
+Overwrite existing snapshots at destination instead of skipping them.
+.TP
+.B \-\-in-place
+Restore to the original location. This is dangerous and requires
+\fB\-\-yes-i-know-what-i-am-doing\fR.
+.TP
+.B \-\-yes-i-know-what-i-am-doing
+Confirm dangerous operations like in-place restore.
+.SS SSH Options
+.TP
+.B \-\-ssh-sudo
+Use sudo for btrfs commands on the remote host.
+.TP
+.BI \-\-ssh-key " FILE"
+Path to SSH private key file.
+.SS Other Options
+.TP
+.BI \-\-prefix " PREFIX"
+Filter snapshots by prefix (e.g., "home-" to only show home snapshots).
+.TP
+.B \-\-no-fs-checks
+Skip btrfs subvolume verification. Needed when backup directories are
+regular directories rather than btrfs subvolumes.
+.SS Recovery Options
+.TP
+.B \-\-status
+Show status of locks and incomplete restores at the backup location.
+.TP
+.BI \-\-unlock " " [\fILOCK_ID\fR]
+Unlock stuck restore sessions. Use "all" to unlock all restore locks,
+or specify a specific lock ID.
+.TP
+.B \-\-cleanup
+Clean up partial/incomplete snapshot restores at the destination.
+.SH RESTORE STRATEGIES
+.SS Strategy 1: Direct Restore (Default)
+Restore the latest snapshot directly:
+.PP
+.RS
+.nf
+btrfs-backup-ng restore /mnt/backup/home /mnt/restore \\
+    --prefix "home-" --no-fs-checks
+.fi
+.RE
+.SS Strategy 2: Specific Snapshot
+Restore a specific point in time:
+.PP
+.RS
+.nf
+btrfs-backup-ng restore /mnt/backup/home /mnt/restore \\
+    --snapshot home-20260101-120000 --no-fs-checks
+.fi
+.RE
+.SS Strategy 3: Interactive Selection
+Choose from a list:
+.PP
+.RS
+.nf
+btrfs-backup-ng restore /mnt/backup/home /mnt/restore \\
+    --interactive --no-fs-checks
+.fi
+.RE
+.SS Strategy 4: Full Mirror
+Restore all snapshots:
+.PP
+.RS
+.nf
+btrfs-backup-ng restore /mnt/backup/home /mnt/restore \\
+    --all --no-fs-checks
+.fi
+.RE
+.SH EXAMPLES
+.TP
+List available snapshots:
+.B btrfs-backup-ng restore --list /mnt/backup/home --no-fs-checks
+.TP
+Restore latest snapshot from local backup:
+.B btrfs-backup-ng restore /mnt/backup/home /mnt/restore --no-fs-checks
+.TP
+Restore from SSH backup with sudo:
+.B btrfs-backup-ng restore ssh://backup@server:/backups/home /mnt/restore --ssh-sudo
+.TP
+Restore specific snapshot:
+.B btrfs-backup-ng restore /mnt/backup/home /mnt/restore --snapshot home-20260101-120000
+.TP
+Restore snapshot closest to a date:
+.B btrfs-backup-ng restore /mnt/backup/home /mnt/restore --before "2026-01-01 12:00"
+.TP
+Check for stuck locks:
+.B btrfs-backup-ng restore --status /mnt/backup/home --no-fs-checks
+.TP
+Unlock all stuck restore sessions:
+.B btrfs-backup-ng restore --unlock all /mnt/backup/home --no-fs-checks
+.TP
+Clean up partial restores:
+.B btrfs-backup-ng restore --cleanup /mnt/restore
+.SH INCREMENTAL CHAINS
+When restoring a snapshot that was created incrementally, all parent snapshots
+in the chain must also be restored. The restore command automatically detects
+and transfers the required chain.
+.PP
+Example chain:
+.PP
+.RS
+.nf
+snap-1 (full) -> snap-2 (incr) -> snap-3 (incr) -> snap-4 (incr)
+.fi
+.RE
+.PP
+To restore snap-4, snapshots 1, 2, 3, and 4 are all transferred.
+.SH RECOVERY FROM FAILURES
+If a restore is interrupted:
+.PP
+.IP 1. 3
+Check status: \fBbtrfs-backup-ng restore --status SOURCE\fR
+.IP 2. 3
+Unlock any stuck sessions: \fBbtrfs-backup-ng restore --unlock all SOURCE\fR
+.IP 3. 3
+Clean up partial restores: \fBbtrfs-backup-ng restore --cleanup DESTINATION\fR
+.IP 4. 3
+Retry the restore
+.SH SEE ALSO
+.BR btrfs-backup-ng (1),
+.BR btrfs-receive (8),
+.BR btrfs-send (8)

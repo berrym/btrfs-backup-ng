@@ -1,0 +1,31 @@
+.\" Man page for btrfs-backup-ng snapshot
+.TH BTRFS-BACKUP-NG-SNAPSHOT 1 "January 2026" "btrfs-backup-ng" "User Commands"
+.SH NAME
+btrfs-backup-ng-snapshot \- create snapshots only
+.SH SYNOPSIS
+.B btrfs-backup-ng snapshot
+[\fIOPTIONS\fR]
+.SH DESCRIPTION
+Create snapshots of configured volumes without transferring to targets.
+Useful for frequent local snapshots between less frequent remote backups.
+.SH OPTIONS
+.TP
+.B \-\-dry-run
+Show what would be done without making any changes.
+.TP
+.BI \-\-volume " PATH"
+Only snapshot the specified volume(s). Can be specified multiple times.
+.SH EXAMPLES
+.TP
+Create snapshots for all configured volumes:
+.B btrfs-backup-ng snapshot
+.TP
+Create snapshot for specific volume only:
+.B btrfs-backup-ng snapshot --volume /home
+.TP
+Dry run:
+.B btrfs-backup-ng snapshot --dry-run
+.SH SEE ALSO
+.BR btrfs-backup-ng (1),
+.BR btrfs-backup-ng-run (1),
+.BR btrfs-subvolume (8)

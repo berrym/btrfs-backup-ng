@@ -1,0 +1,240 @@
+.\" Man page for btrfs-backup-ng
+.TH BTRFS-BACKUP-NG 1 "January 2026" "btrfs-backup-ng" "User Commands"
+.SH NAME
+btrfs-backup-ng \- automated btrfs backup management with incremental transfers
+.SH SYNOPSIS
+.B btrfs-backup-ng
+[\fIOPTIONS\fR] \fICOMMAND\fR [\fICOMMAND_OPTIONS\fR]
+.SH DESCRIPTION
+.B btrfs-backup-ng
+is a modern, feature-rich tool for automated BTRFS snapshot backup management.
+It supports TOML configuration files, time-based retention policies, parallel
+execution, stream compression, and robust SSH transfer support.
+.PP
+The tool can operate in two modes:
+.TP
+.B Config-driven mode
+Uses a TOML configuration file to define volumes, targets, and retention
+policies. Accessed via subcommands like \fBrun\fR, \fBsnapshot\fR, \fBtransfer\fR.
+.TP
+.B Legacy mode
+Direct command-line specification of source and destination paths, compatible
+with the original btrfs-backup tool.
+.SH GLOBAL OPTIONS
+.TP
+.BR \-h ", " \-\-help
+Show help message and exit.
+.TP
+.BR \-v ", " \-\-verbose
+Enable verbose output.
+.TP
+.BR \-q ", " \-\-quiet
+Suppress non-essential output.
+.TP
+.B \-\-debug
+Enable debug output with detailed logging.
+.TP
+.BR \-V ", " \-\-version
+Show version and exit.
+.TP
+.BR \-c ", " \-\-config " " \fIFILE\fR
+Path to configuration file. Defaults to ~/.config/btrfs-backup-ng/config.toml
+or /etc/btrfs-backup-ng/config.toml.
+.SH COMMANDS
+.TP
+.B run
+Execute all configured backup jobs (snapshot + transfer + prune).
+See \fBbtrfs-backup-ng-run\fR(1).
+.TP
+.B snapshot
+Create snapshots only, without transferring to targets.
+See \fBbtrfs-backup-ng-snapshot\fR(1).
+.TP
+.B transfer
+Transfer existing snapshots to targets without creating new ones.
+See \fBbtrfs-backup-ng-transfer\fR(1).
+.TP
+.B prune
+Apply retention policies to clean up old snapshots and backups.
+See \fBbtrfs-backup-ng-prune\fR(1).
+.TP
+.B list
+Show snapshots and backups across all configured volumes.
+See \fBbtrfs-backup-ng-list\fR(1).
+.TP
+.B status
+Show job status, last run times, and statistics.
+See \fBbtrfs-backup-ng-status\fR(1).
+.TP
+.B config
+Configuration management (validate, init, import).
+See \fBbtrfs-backup-ng-config\fR(1).
+.TP
+.B install
+Install systemd timer/service for automated backups.
+See \fBbtrfs-backup-ng-install\fR(1).
+.TP
+.B uninstall
+Remove installed systemd timer/service.
+.TP
+.B restore
+Restore snapshots from backup location back to local system.
+See \fBbtrfs-backup-ng-restore\fR(1).
+.SH CONFIGURATION
+Configuration files use TOML format and are searched in this order:
+.IP 1. 3
+CLI specified: \fB\-\-config /path/to/config.toml\fR
+.IP 2. 3
+User config: \fB~/.config/btrfs-backup-ng/config.toml\fR
+.IP 3. 3
+System config: \fB/etc/btrfs-backup-ng/config.toml\fR
+.PP
+Example configuration:
+.PP
+.RS
+.nf
+[global]
+snapshot_dir = ".snapshots"
+incremental = true
+
+[global.retention]
+min = "1d"
+hourly = 24
+daily = 7
+weekly = 4
+monthly = 12
+
+[[volumes]]
+path = "/home"
+snapshot_prefix = "home-"
+
+[[volumes.targets]]
+path = "/mnt/backup/home"
+
+[[volumes.targets]]
+path = "ssh://backup@server:/backups/home"
+ssh_sudo = true
+compress = "zstd"
+.fi
+.RE
+.SH RETENTION POLICIES
+Time-based retention uses these settings:
+.TP
+.B min
+Minimum retention period (e.g., "1d", "12h"). Nothing is deleted before this age.
+.TP
+.B hourly
+Number of hourly snapshots to keep.
+.TP
+.B daily
+Number of daily snapshots to keep.
+.TP
+.B weekly
+Number of weekly snapshots to keep.
+.TP
+.B monthly
+Number of monthly snapshots to keep.
+.TP
+.B yearly
+Number of yearly snapshots to keep.
+.SH COMPRESSION
+Supported compression methods for transfers:
+.TP
+.B none
+No compression (default).
+.TP
+.B zstd
+Zstandard compression (recommended, fast with good ratio).
+.TP
+.B gzip
+Standard gzip compression.
+.TP
+.B lz4
+Very fast compression with lower ratio.
+.TP
+.B pigz
+Parallel gzip (multi-threaded).
+.TP
+.B lzop
+Fast compression, low CPU usage.
+.SH SSH TARGETS
+Remote targets use SSH URLs:
+.PP
+.RS
+ssh://user@host:/path/to/backup
+.RE
+.PP
+Options for SSH targets:
+.TP
+.B ssh_sudo
+Use sudo for btrfs commands on remote host.
+.TP
+.B ssh_key
+Path to SSH private key file.
+.SH EXAMPLES
+.TP
+Run all backup jobs:
+.B btrfs-backup-ng run
+.TP
+Create snapshots only:
+.B btrfs-backup-ng snapshot
+.TP
+Run with compression and rate limiting:
+.B btrfs-backup-ng run --compress zstd --rate-limit 50M
+.TP
+List all snapshots:
+.B btrfs-backup-ng list
+.TP
+Validate configuration:
+.B btrfs-backup-ng config validate
+.TP
+Install hourly timer:
+.B sudo btrfs-backup-ng install --timer hourly
+.TP
+Restore from backup:
+.B btrfs-backup-ng restore ssh://server:/backups/home /mnt/restore
+.SH FILES
+.TP
+.I ~/.config/btrfs-backup-ng/config.toml
+User configuration file.
+.TP
+.I /etc/btrfs-backup-ng/config.toml
+System-wide configuration file.
+.TP
+.I /var/log/btrfs-backup-ng.log
+Default log file location.
+.TP
+.I ~/.local/share/btrfs-backup-ng/transactions.jsonl
+Transaction log for user installations.
+.TP
+.I /var/lib/btrfs-backup-ng/transactions.jsonl
+Transaction log for system installations.
+.SH EXIT STATUS
+.TP
+.B 0
+Success.
+.TP
+.B 1
+General error.
+.TP
+.B 2
+Configuration error.
+.SH SEE ALSO
+.BR btrfs-backup-ng-run (1),
+.BR btrfs-backup-ng-restore (1),
+.BR btrfs-backup-ng-config (1),
+.BR btrfs (8),
+.BR btrfs-send (8),
+.BR btrfs-receive (8)
+.SH BUGS
+Report bugs at https://github.com/berrym/btrfs-backup-ng/issues
+.SH AUTHORS
+.TP
+Michael Berry <trismegustis@gmail.com> (2024-present)
+.TP
+Robert Schindler <r.schindler@efficiosoft.com> (2017)
+.TP
+Chris Lawrence <lawrencc@debian.org> (2014, original author)
+.SH COPYRIGHT
+Copyright (C) 2014-2026 Chris Lawrence, Robert Schindler, Michael Berry.
+Licensed under the GNU General Public License v2.

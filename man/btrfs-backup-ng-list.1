@@ -1,0 +1,30 @@
+.\" Man page for btrfs-backup-ng list
+.TH BTRFS-BACKUP-NG-LIST 1 "January 2026" "btrfs-backup-ng" "User Commands"
+.SH NAME
+btrfs-backup-ng-list \- show snapshots and backups
+.SH SYNOPSIS
+.B btrfs-backup-ng list
+[\fIOPTIONS\fR]
+.SH DESCRIPTION
+List all snapshots across configured volumes and their backup targets.
+Shows snapshot names, timestamps, and locations.
+.SH OPTIONS
+.TP
+.BI \-\-volume " PATH"
+Only list snapshots for the specified volume(s). Can be specified multiple times.
+.TP
+.B \-\-json
+Output in JSON format for scripting and automation.
+.SH EXAMPLES
+.TP
+List all snapshots:
+.B btrfs-backup-ng list
+.TP
+List snapshots for specific volume:
+.B btrfs-backup-ng list --volume /home
+.TP
+Output as JSON:
+.B btrfs-backup-ng list --json
+.SH SEE ALSO
+.BR btrfs-backup-ng (1),
+.BR btrfs-backup-ng-status (1)

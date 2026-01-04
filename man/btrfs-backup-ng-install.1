@@ -1,0 +1,92 @@
+.\" Man page for btrfs-backup-ng install
+.TH BTRFS-BACKUP-NG-INSTALL 1 "January 2026" "btrfs-backup-ng" "User Commands"
+.SH NAME
+btrfs-backup-ng-install \- install systemd timer/service
+.SH SYNOPSIS
+.B btrfs-backup-ng install
+[\fIOPTIONS\fR]
+.SH DESCRIPTION
+Generate and install systemd units for automated backups. Creates both a
+service unit and a timer unit that runs backups on a schedule.
+.PP
+By default, installs system-wide services requiring root privileges.
+Use \fB\-\-user\fR for user-level services.
+.SH OPTIONS
+.TP
+.BI \-\-timer " " \fIPRESET\fR
+Use a preset timer interval. Valid presets: hourly, daily, weekly.
+.TP
+.BI \-\-oncalendar " " \fISPEC\fR
+Custom OnCalendar specification for flexible scheduling.
+.PP
+Examples:
+.RS
+.TP
+.B *:0/15
+Every 15 minutes
+.TP
+.B *:0/5
+Every 5 minutes
+.TP
+.B *-*-* 02:00:00
+Daily at 2 AM
+.TP
+.B Mon *-*-* 03:00:00
+Every Monday at 3 AM
+.RE
+.TP
+.B \-\-user
+Install as a user service instead of a system service. Does not require
+root privileges and runs in the user's session.
+.SH GENERATED FILES
+.SS System Installation
+.TP
+.I /etc/systemd/system/btrfs-backup-ng.service
+Service unit file.
+.TP
+.I /etc/systemd/system/btrfs-backup-ng.timer
+Timer unit file.
+.SS User Installation
+.TP
+.I ~/.config/systemd/user/btrfs-backup-ng.service
+User service unit file.
+.TP
+.I ~/.config/systemd/user/btrfs-backup-ng.timer
+User timer unit file.
+.SH EXAMPLES
+.TP
+Install hourly timer (system-wide):
+.B sudo btrfs-backup-ng install --timer hourly
+.TP
+Install daily timer at 2 AM:
+.B sudo btrfs-backup-ng install --oncalendar "*-*-* 02:00:00"
+.TP
+Install every 15 minutes:
+.B sudo btrfs-backup-ng install --oncalendar "*:0/15"
+.TP
+Install as user service:
+.B btrfs-backup-ng install --timer hourly --user
+.SH POST-INSTALLATION
+After installation, the timer is automatically enabled and started.
+.PP
+To check status:
+.PP
+.RS
+.nf
+systemctl status btrfs-backup-ng.timer
+systemctl list-timers btrfs-backup-ng.timer
+.fi
+.RE
+.PP
+For user services:
+.PP
+.RS
+.nf
+systemctl --user status btrfs-backup-ng.timer
+.fi
+.RE
+.SH SEE ALSO
+.BR btrfs-backup-ng (1),
+.BR btrfs-backup-ng-uninstall (1),
+.BR systemd.timer (5),
+.BR systemd.time (7)

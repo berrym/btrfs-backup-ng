@@ -1,0 +1,63 @@
+.\" Man page for btrfs-backup-ng run
+.TH BTRFS-BACKUP-NG-RUN 1 "January 2026" "btrfs-backup-ng" "User Commands"
+.SH NAME
+btrfs-backup-ng-run \- execute all configured backup jobs
+.SH SYNOPSIS
+.B btrfs-backup-ng run
+[\fIOPTIONS\fR]
+.SH DESCRIPTION
+Execute all configured backup jobs. This command performs three operations
+in sequence for each configured volume:
+.IP 1. 3
+Create a new snapshot of the source volume
+.IP 2. 3
+Transfer snapshots to all configured targets (incrementally when possible)
+.IP 3. 3
+Apply retention policies to clean up old snapshots and backups
+.PP
+This is the primary command for automated backups via systemd timers or cron.
+.SH OPTIONS
+.TP
+.B \-\-dry-run
+Show what would be done without making any changes. Useful for testing
+configuration and verifying behavior.
+.TP
+.BI \-\-parallel-volumes " N"
+Maximum number of volumes to process concurrently. Overrides the
+\fBparallel_volumes\fR setting in the configuration file.
+.TP
+.BI \-\-parallel-targets " N"
+Maximum number of targets to transfer to concurrently per volume.
+Overrides the \fBparallel_targets\fR setting in the configuration file.
+.TP
+.BI \-\-compress " METHOD"
+Compression method for transfers. Overrides per-target configuration.
+Valid methods: none, zstd, gzip, lz4, pigz, lzop.
+.TP
+.BI \-\-rate-limit " RATE"
+Bandwidth limit for transfers. Overrides per-target configuration.
+Examples: 10M (10 MB/s), 1G (1 GB/s), 500K (500 KB/s).
+.TP
+.B \-\-progress
+Show progress bars during transfers. Default when running in a terminal.
+.TP
+.B \-\-no-progress
+Disable progress bars. Default when not running in a terminal (e.g., cron).
+.SH EXAMPLES
+.TP
+Run all backup jobs:
+.B btrfs-backup-ng run
+.TP
+Dry run to see what would happen:
+.B btrfs-backup-ng run --dry-run
+.TP
+Run with parallel processing:
+.B btrfs-backup-ng run --parallel-volumes 2 --parallel-targets 3
+.TP
+Run with compression and rate limiting:
+.B btrfs-backup-ng run --compress zstd --rate-limit 50M
+.SH SEE ALSO
+.BR btrfs-backup-ng (1),
+.BR btrfs-backup-ng-snapshot (1),
+.BR btrfs-backup-ng-transfer (1),
+.BR btrfs-backup-ng-prune (1)

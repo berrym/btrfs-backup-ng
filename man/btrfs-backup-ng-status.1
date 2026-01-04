@@ -1,0 +1,52 @@
+.\" Man page for btrfs-backup-ng status
+.TH BTRFS-BACKUP-NG-STATUS 1 "January 2026" "btrfs-backup-ng" "User Commands"
+.SH NAME
+btrfs-backup-ng-status \- show job status and statistics
+.SH SYNOPSIS
+.B btrfs-backup-ng status
+[\fIOPTIONS\fR]
+.SH DESCRIPTION
+Display last run times, snapshot counts, transfer statistics, and overall
+health status for configured backup jobs.
+.SH OPTIONS
+.TP
+.BR \-t ", " \-\-transactions
+Show recent transaction history from the transaction log.
+.TP
+.BR \-n ", " \-\-limit " " \fIN\fR
+Number of transactions to show. Default: 10.
+.SH OUTPUT
+The status command shows:
+.IP \(bu 2
+Last successful run time
+.IP \(bu 2
+Snapshot counts per volume
+.IP \(bu 2
+Backup counts per target
+.IP \(bu 2
+Any errors or warnings
+.PP
+With \fB\-\-transactions\fR, also shows:
+.IP \(bu 2
+Recent backup/transfer operations
+.IP \(bu 2
+Success/failure status
+.IP \(bu 2
+Transfer sizes and durations
+.SH EXAMPLES
+.TP
+Show current status:
+.B btrfs-backup-ng status
+.TP
+Show last 20 transactions:
+.B btrfs-backup-ng status --transactions --limit 20
+.SH FILES
+.TP
+.I ~/.local/share/btrfs-backup-ng/transactions.jsonl
+User transaction log.
+.TP
+.I /var/lib/btrfs-backup-ng/transactions.jsonl
+System transaction log.
+.SH SEE ALSO
+.BR btrfs-backup-ng (1),
+.BR btrfs-backup-ng-list (1)

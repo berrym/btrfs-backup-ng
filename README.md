@@ -61,6 +61,14 @@ sudo apt install pv               # Debian/Ubuntu
 
 Shell completion scripts are available in the `completions/` directory for bash, zsh, and fish. See `completions/README.md` for installation instructions.
 
+### Man Pages
+
+Manual pages are available in the `man/` directory. See `man/README.md` for installation instructions. View without installing:
+
+```bash
+man ./man/btrfs-backup-ng.1
+```
+
 ## Quick Start
 
 ### 1. Create a Configuration File
