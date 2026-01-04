@@ -391,8 +391,10 @@ df -T /mnt/backups | grep btrfs || echo "WARNING: Not a btrfs filesystem!"
 
 btrfs send/receive requires root privileges. On the **remote server**, configure sudo:
 
+Create a dedicated sudoers file in `/etc/sudoers.d/` (preferred over editing `/etc/sudoers` directly):
+
 ```bash
-# Create sudoers file for backup user
+# Create sudoers drop-in file for backup user
 sudo visudo -f /etc/sudoers.d/btrfs-backup
 ```
 
@@ -407,6 +409,12 @@ backup ALL=(ALL) NOPASSWD: /usr/bin/btrfs receive *
 backup ALL=(ALL) NOPASSWD: /usr/bin/btrfs subvolume *
 backup ALL=(ALL) NOPASSWD: /usr/bin/btrfs send *
 backup ALL=(ALL) NOPASSWD: /usr/bin/btrfs filesystem *
+```
+
+**Important:** Set correct permissions on the sudoers file (required by most distros):
+
+```bash
+sudo chmod 440 /etc/sudoers.d/btrfs-backup
 ```
 
 Verify sudo works without password:
@@ -528,6 +536,7 @@ sudo useradd -m backup
 
 # 2. Configure passwordless sudo
 echo 'backup ALL=(ALL) NOPASSWD: /usr/bin/btrfs' | sudo tee /etc/sudoers.d/btrfs-backup
+sudo chmod 440 /etc/sudoers.d/btrfs-backup
 
 # 3. Create backup directory (must be on btrfs)
 sudo mkdir -p /mnt/backups/home
