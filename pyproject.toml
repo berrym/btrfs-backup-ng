@@ -42,7 +42,10 @@ btrfs-backup-ng = "btrfs_backup_ng.__main__:main"
 testpaths = ["tests"]
 python_files = ["test_*.py"]
 python_functions = ["test_*"]
-addopts = "-v --tb=short"
+addopts = "-v --tb=short -m 'not tier2'"
+markers = [
+    "tier2: Tier 2 integration tests requiring real btrfs and root privileges",
+]
 
 [tool.coverage.run]
 source = ["src/btrfs_backup_ng"]
