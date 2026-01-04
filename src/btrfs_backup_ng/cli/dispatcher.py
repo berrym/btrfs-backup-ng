@@ -213,10 +213,24 @@ def create_subcommand_parser() -> argparse.ArgumentParser:
     )
 
     # status command
-    subparsers.add_parser(
+    status_parser = subparsers.add_parser(
         "status",
         help="Show job status and statistics",
         description="Display last run times, snapshot counts, and health status",
+    )
+    status_parser.add_argument(
+        "-t",
+        "--transactions",
+        action="store_true",
+        help="Show recent transaction history",
+    )
+    status_parser.add_argument(
+        "-n",
+        "--limit",
+        type=int,
+        default=10,
+        metavar="N",
+        help="Number of transactions to show (default: 10)",
     )
 
     # config command with subcommands

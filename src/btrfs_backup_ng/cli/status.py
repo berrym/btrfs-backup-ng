@@ -9,9 +9,29 @@ from pathlib import Path
 from .. import endpoint
 from ..__logger__ import create_logger
 from ..config import ConfigError, find_config_file, load_config
+from ..transaction import get_transaction_stats, read_transaction_log
 from .common import get_log_level
 
 logger = logging.getLogger(__name__)
+
+
+def _format_bytes(size_bytes: int) -> str:
+    """Format bytes as human-readable string."""
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if abs(size_bytes) < 1024:
+            return f"{size_bytes:.1f} {unit}"
+        size_bytes /= 1024
+    return f"{size_bytes:.1f} PB"
+
+
+def _format_duration(seconds: float) -> str:
+    """Format duration as human-readable string."""
+    if seconds < 60:
+        return f"{seconds:.1f}s"
+    elif seconds < 3600:
+        return f"{seconds / 60:.1f}m"
+    else:
+        return f"{seconds / 3600:.1f}h"
 
 
 def execute_status(args: argparse.Namespace) -> int:
@@ -157,6 +177,58 @@ def execute_status(args: argparse.Namespace) -> int:
 
             print(f"  Target: {target.path}")
             print(f"    Status: {target_status} ({target_count} backups)")
+
+        print("")
+
+    # Transaction log stats
+    if config.global_config.transaction_log:
+        print("Transaction History")
+        print("-" * 60)
+        stats = get_transaction_stats(config.global_config.transaction_log)
+
+        if stats["total_records"] > 0:
+            print(f"  Total records: {stats['total_records']}")
+            print(
+                f"  Transfers: {stats['transfers']['completed']} completed, "
+                f"{stats['transfers']['failed']} failed"
+            )
+            print(
+                f"  Total transferred: {_format_bytes(stats['total_bytes_transferred'])}"
+            )
+
+            # Show recent transactions if --transactions flag
+            if getattr(args, "transactions", False):
+                print("")
+                print("Recent Transactions:")
+                limit = getattr(args, "limit", 10)
+                records = read_transaction_log(
+                    config.global_config.transaction_log, limit=limit
+                )
+                for record in records:
+                    ts = record.get("timestamp", "")[:19].replace("T", " ")
+                    status = record.get("status", "?")
+                    action = record.get("action", "?")
+                    snapshot = record.get("snapshot", "N/A")
+
+                    status_icon = (
+                        "✓"
+                        if status == "completed"
+                        else "✗"
+                        if status == "failed"
+                        else "…"
+                    )
+                    line = f"  {status_icon} {ts} {action:10} {snapshot}"
+
+                    if record.get("duration_seconds"):
+                        line += f" ({_format_duration(record['duration_seconds'])})"
+                    if record.get("size_bytes"):
+                        line += f" [{_format_bytes(record['size_bytes'])}]"
+                    if record.get("error"):
+                        line += f" ERROR: {record['error'][:50]}"
+
+                    print(line)
+        else:
+            print("  No transaction history yet")
 
         print("")
 
