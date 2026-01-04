@@ -15,13 +15,15 @@ See the [LICENSE](LICENSE) file for full copyright attribution.
 ## Features
 
 - **TOML Configuration**: Clean, validated configuration files (no custom syntax)
-- **Subcommand CLI**: Modern interface with `run`, `snapshot`, `transfer`, `prune`, `list`, `status`
+- **Subcommand CLI**: Modern interface with `run`, `snapshot`, `transfer`, `prune`, `restore`, `list`, `status`
+- **Disaster Recovery**: Built-in restore command to pull backups back to local systems
 - **Time-based Retention**: Intuitive policies (hourly, daily, weekly, monthly, yearly)
 - **Rich Progress Bars**: Real-time transfer progress with speed, ETA, and percentage
 - **Parallel Execution**: Concurrent volume and target transfers
 - **Stream Compression**: zstd, gzip, lz4, pigz, lzop support
 - **Bandwidth Throttling**: Rate limiting for remote transfers
 - **Transaction Logging**: Structured JSON logs for auditing and automation
+- **Email & Webhook Notifications**: Alerts on backup success/failure
 - **Systemd Integration**: Built-in timer/service installation
 - **btrbk Migration**: Import existing btrbk configurations
 - **Robust SSH**: Password fallback, sudo support, Paramiko integration
@@ -124,6 +126,7 @@ btrfs-backup-ng install --user --timer=daily
 | `snapshot` | Create snapshots only |
 | `transfer` | Transfer existing snapshots to targets |
 | `prune` | Apply retention policies |
+| `restore` | Restore snapshots from backup location |
 | `list` | Show snapshots and backups |
 | `status` | Show job status and statistics |
 | `config validate` | Validate configuration file |
@@ -197,6 +200,200 @@ btrfs-backup-ng status --transactions       # Show recent transactions
 btrfs-backup-ng status -t -n 20             # Show last 20 transactions
 ```
 
+### Notifications
+
+btrfs-backup-ng can send notifications on backup completion or failure via email (SMTP) or webhooks. This is particularly useful for automated/scheduled backups.
+
+#### Email Notifications
+
+```toml
+[global.notifications.email]
+enabled = true
+smtp_host = "smtp.example.com"
+smtp_port = 587
+smtp_tls = "starttls"          # "ssl" (port 465), "starttls" (port 587), or "none"
+smtp_user = "alerts@example.com"
+smtp_password = "your-password"
+from_addr = "btrfs-backup-ng@example.com"
+to_addrs = ["admin@example.com", "ops@example.com"]
+on_success = false             # Don't notify on success (default)
+on_failure = true              # Notify on failure (default)
+```
+
+**SMTP Port Reference:**
+
+| Port | TLS Mode | Description |
+|------|----------|-------------|
+| 465 | `ssl` | Implicit TLS (SMTPS) |
+| 587 | `starttls` | Explicit TLS (submission) |
+| 25 | `none` | Plain text (local mail only) |
+
+**Example: Gmail SMTP**
+```toml
+[global.notifications.email]
+enabled = true
+smtp_host = "smtp.gmail.com"
+smtp_port = 587
+smtp_tls = "starttls"
+smtp_user = "your-email@gmail.com"
+smtp_password = "your-app-password"    # Use App Password, not account password
+from_addr = "your-email@gmail.com"
+to_addrs = ["your-email@gmail.com"]
+on_failure = true
+```
+
+**Example: Local Postfix/Sendmail**
+```toml
+[global.notifications.email]
+enabled = true
+smtp_host = "localhost"
+smtp_port = 25
+smtp_tls = "none"
+from_addr = "btrfs-backup-ng@myserver.local"
+to_addrs = ["root@myserver.local"]
+on_failure = true
+```
+
+#### Webhook Notifications
+
+Send JSON payloads to any HTTP endpoint (Slack, Discord, PagerDuty, custom services, etc.).
+
+```toml
+[global.notifications.webhook]
+enabled = true
+url = "https://hooks.slack.com/services/T00000000/B00000000/XXXXXXXX"
+method = "POST"                # POST or PUT
+timeout = 30                   # Request timeout in seconds
+on_success = false
+on_failure = true
+
+# Optional custom headers
+[global.notifications.webhook.headers]
+Authorization = "Bearer your-token"
+X-Custom-Header = "value"
+```
+
+**Webhook Payload Format:**
+
+The webhook receives a JSON payload with full backup details:
+
+```json
+{
+  "event_type": "backup_complete",
+  "status": "failure",
+  "timestamp": "2026-01-04T18:30:00+00:00",
+  "hostname": "myserver",
+  "summary": "Backup failed: 1 volumes failed",
+  "volumes_processed": 2,
+  "volumes_failed": 1,
+  "snapshots_created": 1,
+  "transfers_completed": 1,
+  "transfers_failed": 1,
+  "duration_seconds": 45.2,
+  "errors": ["Transfer to ssh://backup@remote:/backups: Connection refused"]
+}
+```
+
+**Example: Slack Incoming Webhook**
+
+Slack accepts the payload directly when using their Incoming Webhooks feature.
+
+```toml
+[global.notifications.webhook]
+enabled = true
+url = "https://hooks.slack.com/services/T00000000/B00000000/XXXXXXXX"
+on_failure = true
+```
+
+**Example: Discord Webhook**
+
+Discord webhooks expect a specific format. Use a proxy or serverless function to transform the payload.
+
+**Example: ntfy.sh (Simple Push Notifications)**
+
+```toml
+[global.notifications.webhook]
+enabled = true
+url = "https://ntfy.sh/your-topic"
+method = "POST"
+on_failure = true
+
+[global.notifications.webhook.headers]
+Title = "btrfs-backup-ng Alert"
+Priority = "high"
+Tags = "warning,backup"
+```
+
+#### Notification Events
+
+Notifications are sent for these events:
+
+| Event | Commands | Status Values |
+|-------|----------|---------------|
+| `backup_complete` | `run`, `transfer` | `success`, `partial`, `failure` |
+| `prune_complete` | `prune` | `success`, `partial`, `failure` |
+
+**Status meanings:**
+- `success`: All operations completed without errors
+- `partial`: Some operations succeeded, some failed
+- `failure`: All operations failed
+
+#### Controlling When Notifications Are Sent
+
+By default, notifications are only sent on failure. Configure per notification method:
+
+```toml
+# Email: notify on failure only (default)
+[global.notifications.email]
+enabled = true
+on_success = false
+on_failure = true
+
+# Webhook: notify on both success and failure
+[global.notifications.webhook]
+enabled = true
+on_success = true
+on_failure = true
+```
+
+#### Testing Notifications
+
+To test your notification configuration, run a backup with intentionally bad settings:
+
+```bash
+# Create a test config with a bad target
+cat > /tmp/test-notify.toml << 'EOF'
+[global.notifications.email]
+enabled = true
+smtp_host = "localhost"
+smtp_port = 25
+from_addr = "test@localhost"
+to_addrs = ["root@localhost"]
+on_failure = true
+
+[[volumes]]
+path = "/nonexistent"
+
+[[volumes.targets]]
+path = "/also/nonexistent"
+EOF
+
+# Run with the test config (will fail and trigger notification)
+sudo btrfs-backup-ng -c /tmp/test-notify.toml run
+```
+
+#### Security Considerations
+
+- **SMTP passwords in config files**: Use file permissions (`chmod 600`) to protect your configuration file
+- **Webhook URLs**: Treat webhook URLs as secrets; they often provide unauthenticated access
+- **Environment variables**: Future versions may support reading secrets from environment variables
+
+```bash
+# Protect config file with sensitive credentials
+sudo chmod 600 /etc/btrfs-backup-ng/config.toml
+sudo chown root:root /etc/btrfs-backup-ng/config.toml
+```
+
 ### Retention Policy
 
 ```toml
@@ -240,7 +437,51 @@ ssh_key = "~/.ssh/backup_key"          # SSH private key
 ssh_password_auth = true               # Allow password fallback
 compress = "zstd"                      # Compression (none|gzip|zstd|lz4|pigz|lzop)
 rate_limit = "10M"                     # Bandwidth limit (K|M|G suffix)
+require_mount = false                  # Require path to be a mount point (safety check)
 ```
+
+### Mount Verification (External Drive Safety)
+
+When backing up to external drives or removable media, there's a common pitfall: if the drive isn't mounted, backups will silently write to the mount point directory on your root filesystem, consuming disk space and not actually backing up your data.
+
+The `require_mount` option prevents this by verifying that the target path is an active mount point before starting any transfers.
+
+```toml
+# External USB drive backup with mount verification
+[[volumes.targets]]
+path = "/mnt/usb-backup"
+require_mount = true    # Fail if /mnt/usb-backup is not a mount point
+```
+
+**When to use `require_mount = true`:**
+- External USB drives
+- Removable media (SD cards, etc.)
+- Network mounts (NFS, SMB) that may be disconnected
+- Any target that might not always be available
+
+**Example error when drive is not mounted:**
+```
+ERROR: Target /mnt/usb-backup is not mounted. 
+Ensure the drive is connected and mounted, or set require_mount = false.
+```
+
+**Complete external drive configuration example:**
+```toml
+[[volumes]]
+path = "/home"
+snapshot_prefix = "home"
+
+[[volumes.targets]]
+path = "/mnt/external-backup/home"
+require_mount = true    # Safety check - fail if drive not mounted
+
+# Also backup to remote server (no mount check needed for SSH)
+[[volumes.targets]]
+path = "ssh://backup@server:/backups/home"
+ssh_sudo = true
+```
+
+**Note:** `require_mount` only applies to local targets. It has no effect on SSH targets.
 
 ## Configuration File Locations
 
@@ -598,6 +839,192 @@ sudo -E btrfs-backup-ng run
 ```
 
 **Warning:** Password-based authentication is not suitable for automated/unattended backups.
+
+## Restoring from Backups
+
+The `restore` command enables pulling snapshots from backup storage back to local systems. This is essential for disaster recovery, migration, and backup verification.
+
+### Basic Restore Operations
+
+```bash
+# List available snapshots at backup location
+btrfs-backup-ng restore --list ssh://backup@server:/backups/home
+btrfs-backup-ng restore --list /mnt/external-backup/home
+
+# Restore latest snapshot
+btrfs-backup-ng restore ssh://backup@server:/backups/home /mnt/restore
+
+# Restore specific snapshot by name
+btrfs-backup-ng restore ssh://backup@server:/backups/home /mnt/restore \
+    --snapshot home-20260104-120000
+
+# Restore snapshot before a specific date
+btrfs-backup-ng restore ssh://backup@server:/backups/home /mnt/restore \
+    --before "2026-01-01 12:00"
+
+# Interactive selection (shows list, lets you pick)
+btrfs-backup-ng restore ssh://backup@server:/backups/home /mnt/restore --interactive
+
+# Restore ALL snapshots (full mirror)
+btrfs-backup-ng restore ssh://backup@server:/backups/home /mnt/restore --all
+
+# Dry run (show what would be restored)
+btrfs-backup-ng restore --dry-run ssh://backup@server:/backups/home /mnt/restore
+```
+
+### How Restore Works
+
+btrfs-backup-ng automatically handles incremental restore chains:
+
+```
+Backup has: [snap-1, snap-2, snap-3, snap-4]
+                ↓       ↓       ↓       ↓
+            (full)  (incr)  (incr)  (incr)
+
+You request: snap-4
+
+Restore chain: snap-1 → snap-2 → snap-3 → snap-4
+               (2.1 GB)  (156 MB) (89 MB)  (234 MB)
+```
+
+The restore command:
+1. Analyzes the parent chain required for the target snapshot
+2. Checks which parents already exist locally (can skip those)
+3. Restores snapshots in order (oldest first) to satisfy dependencies
+4. Uses incremental transfers when possible (much faster)
+
+### Restore Options
+
+| Option | Description |
+|--------|-------------|
+| `-l, --list` | List available snapshots at backup location |
+| `-s, --snapshot NAME` | Restore specific snapshot by name |
+| `--before DATETIME` | Restore snapshot closest to this time |
+| `-a, --all` | Restore all snapshots (full mirror) |
+| `-i, --interactive` | Interactive snapshot selection |
+| `--dry-run` | Show what would be restored |
+| `--no-incremental` | Force full transfers (skip incremental) |
+| `--overwrite` | Overwrite existing snapshots instead of skipping |
+| `--ssh-sudo` | Use sudo on remote for btrfs commands |
+| `--compress METHOD` | Compression for transfer (zstd, gzip, lz4) |
+| `--rate-limit RATE` | Bandwidth limit (e.g., '10M', '1G') |
+
+### Restore from Local Backup
+
+```bash
+# External drive backup
+btrfs-backup-ng restore /mnt/external-backup/home /mnt/restore
+
+# With specific snapshot
+btrfs-backup-ng restore /mnt/external-backup/home /mnt/restore \
+    --snapshot home-20260104-120000
+```
+
+### Restore from Remote Backup
+
+```bash
+# SSH backup server
+btrfs-backup-ng restore ssh://backup@server:/backups/home /mnt/restore \
+    --ssh-sudo \
+    --ssh-key ~/.ssh/backup_key
+
+# With compression for slow links
+btrfs-backup-ng restore ssh://backup@server:/backups/home /mnt/restore \
+    --compress=zstd --rate-limit=10M
+```
+
+### Disaster Recovery Walkthrough
+
+Complete example of recovering a system from backup:
+
+```bash
+# 1. Boot from live USB/recovery environment
+
+# 2. Mount your btrfs filesystem
+mount /dev/sda2 /mnt/newroot
+
+# 3. Create restore target directory
+mkdir -p /mnt/newroot/restored-home
+
+# 4. List available backups
+btrfs-backup-ng restore --list ssh://backup@server:/backups/home
+
+# 5. Restore the latest snapshot
+btrfs-backup-ng restore ssh://backup@server:/backups/home /mnt/newroot/restored-home \
+    --ssh-sudo
+
+# 6. (Optional) Restore to specific point in time
+btrfs-backup-ng restore ssh://backup@server:/backups/home /mnt/newroot/restored-home \
+    --before "2026-01-01" --ssh-sudo
+
+# 7. Verify the restore
+ls -la /mnt/newroot/restored-home/
+
+# 8. Rename/move the restored snapshot to final location
+# (depends on your specific setup)
+```
+
+### In-Place Restore (Dangerous)
+
+Restoring directly to the original location requires explicit confirmation:
+
+```bash
+# This will OVERWRITE your current /home with the backup
+btrfs-backup-ng restore ssh://backup@server:/backups/home /home \
+    --in-place \
+    --yes-i-know-what-i-am-doing \
+    --snapshot home-20260104-120000
+```
+
+**Warning:** In-place restore can cause data loss. Always verify you have the correct snapshot and understand the implications.
+
+### Collision Handling
+
+By default, snapshots that already exist locally are skipped:
+
+```bash
+# Skip existing (default)
+btrfs-backup-ng restore ssh://...:/backups/home /mnt/restore
+
+# Overwrite existing snapshots
+btrfs-backup-ng restore ssh://...:/backups/home /mnt/restore --overwrite
+```
+
+### Troubleshooting Restore
+
+**"Destination is not on a btrfs filesystem":**
+```bash
+# The restore target must be on btrfs
+df -T /mnt/restore | grep btrfs
+# If not btrfs, create or mount a btrfs filesystem first
+```
+
+**"Snapshot not found at backup location":**
+```bash
+# List available snapshots to see what's there
+btrfs-backup-ng restore --list ssh://backup@server:/backups/home
+
+# Check the snapshot prefix filter
+btrfs-backup-ng restore --list ssh://...:/backups/home --prefix "home-"
+```
+
+**"Permission denied" during restore:**
+```bash
+# For SSH backups, ensure ssh_sudo is enabled
+btrfs-backup-ng restore ssh://...:/backups/home /mnt/restore --ssh-sudo
+
+# Local restore requires root
+sudo btrfs-backup-ng restore /mnt/backup /mnt/restore
+```
+
+**Transfer is very slow:**
+```bash
+# Use compression for remote restores
+btrfs-backup-ng restore ssh://...:/backups/home /mnt/restore --compress=zstd
+
+# Check if incremental is working (should show "incremental from X")
+btrfs-backup-ng restore -v ssh://...:/backups/home /mnt/restore
+```
 
 ## Legacy CLI Mode
 

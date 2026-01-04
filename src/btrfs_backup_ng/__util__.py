@@ -206,6 +206,77 @@ def is_subvolume(path):
     return result
 
 
+def is_mounted(path):
+    """Check if path is an active mount point.
+
+    This verifies that a filesystem is actually mounted at the given path,
+    which is useful for detecting when an external drive or network share
+    is not connected.
+
+    Args:
+        path: Path to check
+
+    Returns:
+        True if path is an active mount point, False otherwise
+    """
+    path = Path(path).resolve()
+    logger.debug("Checking if path is a mount point: %s", path)
+
+    with open(MOUNTS_FILE, encoding="utf-8") as f:
+        for line in f:
+            try:
+                mount_point = line.split(" ")[1]
+            except (ValueError, IndexError):
+                continue
+            if Path(mount_point).resolve() == path:
+                logger.debug("  -> Path is an active mount point")
+                return True
+
+    logger.debug("  -> Path is NOT a mount point")
+    return False
+
+
+def get_mount_info(path):
+    """Get mount information for the filesystem containing path.
+
+    Args:
+        path: Path to check
+
+    Returns:
+        Dict with 'mount_point', 'fs_type', 'device', or None if not found
+    """
+    path = Path(path).resolve()
+    logger.debug("Getting mount info for: %s", path)
+    best_match = None
+    best_match_len = 0
+
+    with open(MOUNTS_FILE, encoding="utf-8") as f:
+        for line in f:
+            try:
+                parts = line.split(" ")
+                device = parts[0]
+                mount_point = parts[1]
+                fs_type = parts[2]
+            except (ValueError, IndexError):
+                continue
+
+            mount_path = Path(mount_point)
+            if path == mount_path or path.is_relative_to(mount_path):
+                if len(str(mount_point)) > best_match_len:
+                    best_match_len = len(str(mount_point))
+                    best_match = {
+                        "mount_point": mount_point,
+                        "fs_type": fs_type,
+                        "device": device,
+                    }
+
+    if best_match:
+        logger.debug("  -> Mount info: %s", best_match)
+    else:
+        logger.debug("  -> No mount info found")
+    return best_match
+
+
 def read_locks(s):
     """Reads locks from lock file content given as string.
     Returns ``{'snap_name': {'locks': ['lock', ...], ...}, 'parent_locks': ['lock', ...]}``.

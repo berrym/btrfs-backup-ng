@@ -22,6 +22,7 @@ SUBCOMMANDS = frozenset(
         "config",
         "install",
         "uninstall",
+        "restore",
     }
 )
 
@@ -302,6 +303,124 @@ def create_subcommand_parser() -> argparse.ArgumentParser:
         description="Remove installed systemd units",
     )
 
+    # restore command
+    restore_parser = subparsers.add_parser(
+        "restore",
+        help="Restore snapshots from backup location",
+        description="Pull snapshots from backup storage back to local system",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # List available snapshots at backup location
+  btrfs-backup-ng restore --list ssh://backup@server:/backups/home
+
+  # Restore latest snapshot
+  btrfs-backup-ng restore ssh://backup@server:/backups/home /mnt/restore
+
+  # Restore specific snapshot
+  btrfs-backup-ng restore ssh://...:/backups/home /mnt/restore --snapshot home-20260104
+
+  # Restore snapshot before a specific date
+  btrfs-backup-ng restore ssh://...:/backups/home /mnt/restore --before "2026-01-01"
+
+  # Interactive selection
+  btrfs-backup-ng restore ssh://...:/backups/home /mnt/restore --interactive
+""",
+    )
+    restore_parser.add_argument(
+        "source",
+        nargs="?",
+        metavar="SOURCE",
+        help="Backup location (local path or ssh://user@host:/path)",
+    )
+    restore_parser.add_argument(
+        "destination",
+        nargs="?",
+        metavar="DESTINATION",
+        help="Local path to restore to",
+    )
+    restore_parser.add_argument(
+        "-l",
+        "--list",
+        action="store_true",
+        help="List available snapshots at backup location",
+    )
+    restore_parser.add_argument(
+        "-s",
+        "--snapshot",
+        metavar="NAME",
+        help="Restore specific snapshot by name",
+    )
+    restore_parser.add_argument(
+        "--before",
+        metavar="DATETIME",
+        help="Restore snapshot closest to this time (YYYY-MM-DD [HH:MM:SS])",
+    )
+    restore_parser.add_argument(
+        "-a",
+        "--all",
+        action="store_true",
+        help="Restore all snapshots (full mirror)",
+    )
+    restore_parser.add_argument(
+        "-i",
+        "--interactive",
+        action="store_true",
+        help="Interactively select snapshot to restore",
+    )
+    restore_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Show what would be restored without making changes",
+    )
+    restore_parser.add_argument(
+        "--no-incremental",
+        action="store_true",
+        help="Force full transfers (don't use incremental)",
+    )
+    restore_parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Overwrite existing snapshots instead of skipping",
+    )
+    restore_parser.add_argument(
+        "--in-place",
+        action="store_true",
+        help="Restore to original location (DANGEROUS)",
+    )
+    restore_parser.add_argument(
+        "--yes-i-know-what-i-am-doing",
+        action="store_true",
+        help="Confirm dangerous operations like in-place restore",
+    )
+    restore_parser.add_argument(
+        "--prefix",
+        metavar="PREFIX",
+        help="Snapshot prefix filter",
+    )
+    restore_parser.add_argument(
+        "--ssh-sudo",
+        action="store_true",
+        help="Use sudo for btrfs commands on remote host",
+    )
+    restore_parser.add_argument(
+        "--ssh-key",
+        metavar="FILE",
+        help="SSH private key file",
+    )
+    restore_parser.add_argument(
+        "--compress",
+        metavar="METHOD",
+        choices=["none", "gzip", "zstd", "lz4", "pigz", "lzop"],
+        help="Compression method for transfers",
+    )
+    restore_parser.add_argument(
+        "--rate-limit",
+        metavar="RATE",
+        help="Bandwidth limit (e.g., '10M', '1G')",
+    )
+    add_progress_args(restore_parser)
+
     return parser
 
 
@@ -389,6 +508,7 @@ def run_subcommand(args: argparse.Namespace) -> int:
         "config": cmd_config,
         "install": cmd_install,
         "uninstall": cmd_uninstall,
+        "restore": cmd_restore,
     }
 
     handler = handlers.get(args.command)
@@ -464,6 +584,13 @@ def cmd_uninstall(args: argparse.Namespace) -> int:
     from .install import execute_uninstall
 
     return execute_uninstall(args)
+
+
+def cmd_restore(args: argparse.Namespace) -> int:
+    """Execute restore command."""
+    from .restore import execute_restore
+
+    return execute_restore(args)
 
 
 def main(argv: list[str] | None = None) -> int:

@@ -19,6 +19,15 @@ from ..config import (
     load_config,
 )
 from ..core.operations import sync_snapshots
+from ..notifications import (
+    EmailConfig,
+    WebhookConfig,
+    create_backup_event,
+    send_notifications,
+)
+from ..notifications import (
+    NotificationConfig as NotifConfig,
+)
 from ..transaction import set_transaction_log
 from .common import get_log_level, should_show_progress
 
@@ -86,6 +95,7 @@ def execute_run(args: argparse.Namespace) -> int:
         getattr(args, "parallel_targets", None) or config.global_config.parallel_targets
     )
 
+    start_time = time.time()
     logger.info(__util__.log_heading(f"Started at {time.ctime()}"))
     logger.info(
         "Parallel volumes: %d, parallel targets: %d", parallel_volumes, parallel_targets
@@ -107,6 +117,8 @@ def execute_run(args: argparse.Namespace) -> int:
     logger.info("Processing %d volume(s)", len(enabled_volumes))
 
     results = []
+    transfer_stats = {"completed": 0, "failed": 0}
+    error_messages = []
 
     if parallel_volumes > 1 and len(enabled_volumes) > 1:
         # Parallel volume execution
@@ -126,16 +138,20 @@ def execute_run(args: argparse.Namespace) -> int:
             for future in as_completed(futures):
                 volume = futures[future]
                 try:
-                    success = future.result()
+                    success, vol_stats, vol_errors = future.result()
                     results.append((volume.path, success))
+                    transfer_stats["completed"] += vol_stats.get("completed", 0)
+                    transfer_stats["failed"] += vol_stats.get("failed", 0)
+                    error_messages.extend(vol_errors)
                 except Exception as e:
                     logger.error("Volume %s failed: %s", volume.path, e)
                     results.append((volume.path, False))
+                    error_messages.append(f"Volume {volume.path}: {e}")
     else:
         # Sequential execution
         for volume in enabled_volumes:
             try:
-                success = _backup_volume(
+                success, vol_stats, vol_errors = _backup_volume(
                     volume,
                     config,
                     parallel_targets,
@@ -144,11 +160,17 @@ def execute_run(args: argparse.Namespace) -> int:
                     show_progress,
                 )
                 results.append((volume.path, success))
+                transfer_stats["completed"] += vol_stats.get("completed", 0)
+                transfer_stats["failed"] += vol_stats.get("failed", 0)
+                error_messages.extend(vol_errors)
             except Exception as e:
                 logger.error("Volume %s failed: %s", volume.path, e)
                 results.append((volume.path, False))
+                error_messages.append(f"Volume {volume.path}: {e}")
 
     # Summary
+    end_time = time.time()
+    duration = end_time - start_time
     logger.info(__util__.log_heading(f"Finished at {time.ctime()}"))
 
     success_count = sum(1 for _, success in results if success)
@@ -158,10 +180,24 @@ def execute_run(args: argparse.Namespace) -> int:
         logger.warning(
             "Completed with errors: %d succeeded, %d failed", success_count, fail_count
         )
-        return 1
+        exit_code = 1
     else:
         logger.info("All %d volume(s) completed successfully", success_count)
-        return 0
+        exit_code = 0
+
+    # Send notifications if configured
+    _send_backup_notifications(
+        config,
+        volumes_processed=len(results),
+        volumes_failed=fail_count,
+        snapshots_created=success_count,  # One snapshot per successful volume
+        transfers_completed=transfer_stats.get("completed", 0),
+        transfers_failed=transfer_stats.get("failed", 0),
+        duration_seconds=duration,
+        errors=error_messages,
+    )
+
+    return exit_code
 
 
 def _dry_run(config: Config) -> int:
@@ -198,7 +234,7 @@ def _backup_volume(
     compress_override: str | None = None,
     rate_limit_override: str | None = None,
     show_progress: bool = False,
-) -> bool:
+) -> tuple[bool, dict[str, int], list[str]]:
     """Execute backup for a single volume.
 
     Args:
@@ -210,8 +246,10 @@ def _backup_volume(
         show_progress: Whether to show progress bars
 
     Returns:
-        True if successful, False otherwise
+        Tuple of (success, transfer_stats, error_messages)
     """
+    stats = {"completed": 0, "failed": 0}
+    errors = []
     logger.info(__util__.log_heading(f"Volume: {volume.path}"))
 
     # Build endpoint kwargs
@@ -255,7 +293,8 @@ def _backup_volume(
 
     except Exception as e:
         logger.error("Failed to prepare source endpoint for %s: %s", volume.path, e)
-        return False
+        errors.append(f"Source endpoint {volume.path}: {e}")
+        return False, stats, errors
 
     # Create snapshot
     try:
@@ -264,16 +303,27 @@ def _backup_volume(
         logger.info("Created snapshot: %s", snapshot)
     except Exception as e:
         logger.error("Failed to create snapshot: %s", e)
-        return False
+        errors.append(f"Snapshot creation for {volume.path}: {e}")
+        return False, stats, errors
 
     # Prepare destination endpoints
     if not volume.targets:
         logger.info("No targets configured, snapshot created but not transferred")
-        return True
+        return True, stats, errors
 
     destination_endpoints = []
     for target in volume.targets:
         try:
+            # Check mount requirement for local targets
+            if target.require_mount and not target.path.startswith("ssh://"):
+                target_path = Path(target.path).resolve()
+                if not __util__.is_mounted(target_path):
+                    raise __util__.AbortError(
+                        f"Target {target.path} is not mounted. "
+                        f"Ensure the drive is connected and mounted, or set require_mount = false."
+                    )
+                logger.debug("Mount check passed for %s", target.path)
+
             dest_kwargs = dict(endpoint_kwargs)
             dest_kwargs["ssh_sudo"] = target.ssh_sudo
             dest_kwargs["ssh_password_fallback"] = target.ssh_password_auth
@@ -293,10 +343,11 @@ def _backup_volume(
 
         except Exception as e:
             logger.error("Failed to prepare destination %s: %s", target.path, e)
+            errors.append(f"Destination endpoint {target.path}: {e}")
 
     if not destination_endpoints:
         logger.error("No destination endpoints could be prepared")
-        return False
+        return False, stats, errors
 
     # Transfer to destinations
     all_success = True
@@ -315,17 +366,22 @@ def _backup_volume(
                     compress_override,
                     rate_limit_override,
                     show_progress,
-                ): dest_endpoint
+                ): (dest_endpoint, target_config)
                 for dest_endpoint, target_config in destination_endpoints
             }
             for future in as_completed(futures):
-                dest = futures[future]
+                dest, target_cfg = futures[future]
                 try:
                     success = future.result()
-                    if not success:
+                    if success:
+                        stats["completed"] += 1
+                    else:
+                        stats["failed"] += 1
                         all_success = False
                 except Exception as e:
                     logger.error("Transfer to %s failed: %s", dest, e)
+                    stats["failed"] += 1
+                    errors.append(f"Transfer to {target_cfg.path}: {e}")
                     all_success = False
     else:
         # Sequential transfers
@@ -341,13 +397,18 @@ def _backup_volume(
                     rate_limit_override,
                     show_progress,
                 )
-                if not success:
+                if success:
+                    stats["completed"] += 1
+                else:
+                    stats["failed"] += 1
                     all_success = False
             except Exception as e:
                 logger.error("Transfer to %s failed: %s", dest_endpoint, e)
+                stats["failed"] += 1
+                errors.append(f"Transfer to {target_config.path}: {e}")
                 all_success = False
 
-    return all_success
+    return all_success, stats, errors
 
 
 def _transfer_to_target(
@@ -400,3 +461,85 @@ def _transfer_to_target(
     except Exception as e:
         logger.error("Transfer to %s failed: %s", destination_endpoint, e)
         return False
+
+
+def _send_backup_notifications(
+    config: Config,
+    volumes_processed: int,
+    volumes_failed: int,
+    snapshots_created: int,
+    transfers_completed: int,
+    transfers_failed: int,
+    duration_seconds: float,
+    errors: list[str],
+) -> None:
+    """Send backup completion notifications if configured.
+
+    Args:
+        config: Full configuration with notification settings
+        volumes_processed: Total volumes processed
+        volumes_failed: Number of failed volumes
+        snapshots_created: Number of snapshots created
+        transfers_completed: Number of successful transfers
+        transfers_failed: Number of failed transfers
+        duration_seconds: Total backup duration
+        errors: List of error messages
+    """
+    notif_config = config.global_config.notifications
+    if not notif_config.is_enabled():
+        return
+
+    # Determine overall status
+    if volumes_failed == 0 and transfers_failed == 0:
+        status = "success"
+    elif volumes_failed == volumes_processed:
+        status = "failure"
+    else:
+        status = "partial"
+
+    # Create notification event
+    event = create_backup_event(
+        status=status,
+        volumes_processed=volumes_processed,
+        volumes_failed=volumes_failed,
+        snapshots_created=snapshots_created,
+        transfers_completed=transfers_completed,
+        transfers_failed=transfers_failed,
+        duration_seconds=duration_seconds,
+        errors=errors,
+    )
+
+    # Convert config schema to notification module types
+    email_config = EmailConfig(
+        enabled=notif_config.email.enabled,
+        smtp_host=notif_config.email.smtp_host,
+        smtp_port=notif_config.email.smtp_port,
+        smtp_user=notif_config.email.smtp_user,
+        smtp_password=notif_config.email.smtp_password,
+        smtp_tls=notif_config.email.smtp_tls,
+        from_addr=notif_config.email.from_addr,
+        to_addrs=notif_config.email.to_addrs,
+        on_success=notif_config.email.on_success,
+        on_failure=notif_config.email.on_failure,
+    )
+
+    webhook_config = WebhookConfig(
+        enabled=notif_config.webhook.enabled,
+        url=notif_config.webhook.url,
+        method=notif_config.webhook.method,
+        headers=notif_config.webhook.headers,
+        on_success=notif_config.webhook.on_success,
+        on_failure=notif_config.webhook.on_failure,
+        timeout=notif_config.webhook.timeout,
+    )
+
+    notif = NotifConfig(email=email_config, webhook=webhook_config)
+
+    # Send notifications
+    results = send_notifications(notif, event)
+
+    for method, success in results.items():
+        if success:
+            logger.info("Sent %s notification", method)
+        else:
+            logger.warning("Failed to send %s notification", method)

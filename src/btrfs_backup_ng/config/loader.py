@@ -9,10 +9,13 @@ from typing import Any
 
 from .schema import (
     Config,
+    EmailNotificationConfig,
     GlobalConfig,
+    NotificationConfig,
     RetentionConfig,
     TargetConfig,
     VolumeConfig,
+    WebhookNotificationConfig,
 )
 
 
@@ -82,6 +85,7 @@ def _parse_target(data: dict[str, Any]) -> TargetConfig:
         ssh_password_auth=data.get("ssh_password_auth", True),
         compress=compress,
         rate_limit=data.get("rate_limit"),
+        require_mount=data.get("require_mount", False),
     )
 
 
@@ -106,11 +110,57 @@ def _parse_volume(data: dict[str, Any], global_config: GlobalConfig) -> VolumeCo
     )
 
 
+def _parse_email_notification(data: dict[str, Any]) -> EmailNotificationConfig:
+    """Parse email notification configuration from dict."""
+    return EmailNotificationConfig(
+        enabled=data.get("enabled", False),
+        smtp_host=data.get("smtp_host", "localhost"),
+        smtp_port=data.get("smtp_port", 25),
+        smtp_user=data.get("smtp_user"),
+        smtp_password=data.get("smtp_password"),
+        smtp_tls=data.get("smtp_tls", "none"),
+        from_addr=data.get("from_addr", "btrfs-backup-ng@localhost"),
+        to_addrs=data.get("to_addrs", []),
+        on_success=data.get("on_success", False),
+        on_failure=data.get("on_failure", True),
+    )
+
+
+def _parse_webhook_notification(data: dict[str, Any]) -> WebhookNotificationConfig:
+    """Parse webhook notification configuration from dict."""
+    return WebhookNotificationConfig(
+        enabled=data.get("enabled", False),
+        url=data.get("url"),
+        method=data.get("method", "POST"),
+        headers=data.get("headers", {}),
+        on_success=data.get("on_success", False),
+        on_failure=data.get("on_failure", True),
+        timeout=data.get("timeout", 30),
+    )
+
+
+def _parse_notifications(data: dict[str, Any]) -> NotificationConfig:
+    """Parse notification configuration from dict."""
+    email = EmailNotificationConfig()
+    webhook = WebhookNotificationConfig()
+
+    if "email" in data:
+        email = _parse_email_notification(data["email"])
+    if "webhook" in data:
+        webhook = _parse_webhook_notification(data["webhook"])
+
+    return NotificationConfig(email=email, webhook=webhook)
+
+
 def _parse_global(data: dict[str, Any]) -> GlobalConfig:
     """Parse global configuration from dict."""
     retention = RetentionConfig()
     if "retention" in data:
         retention = _parse_retention(data["retention"])
+
+    notifications = NotificationConfig()
+    if "notifications" in data:
+        notifications = _parse_notifications(data["notifications"])
 
     return GlobalConfig(
         snapshot_dir=data.get("snapshot_dir", ".snapshots"),
@@ -119,6 +169,7 @@ def _parse_global(data: dict[str, Any]) -> GlobalConfig:
         log_file=data.get("log_file"),
         transaction_log=data.get("transaction_log"),
         retention=retention,
+        notifications=notifications,
         parallel_volumes=data.get("parallel_volumes", 2),
         parallel_targets=data.get("parallel_targets", 3),
         quiet=data.get("quiet", False),
@@ -220,6 +271,30 @@ weekly = 4          # Then keep 4 weekly snapshots
 monthly = 12        # Then keep 12 monthly snapshots
 yearly = 0          # Don't keep yearly (0 = disabled)
 
+# Email notifications (optional)
+# [global.notifications.email]
+# enabled = true
+# smtp_host = "smtp.example.com"
+# smtp_port = 587
+# smtp_tls = "starttls"          # "ssl", "starttls", or "none"
+# smtp_user = "alerts@example.com"
+# smtp_password = "secret"
+# from_addr = "btrfs-backup-ng@example.com"
+# to_addrs = ["admin@example.com", "ops@example.com"]
+# on_success = false             # Only notify on failure by default
+# on_failure = true
+
+# Webhook notifications (optional)
+# [global.notifications.webhook]
+# enabled = true
+# url = "https://hooks.slack.com/services/xxx/yyy/zzz"
+# method = "POST"
+# on_success = false
+# on_failure = true
+# timeout = 30
+# [global.notifications.webhook.headers]
+# Authorization = "Bearer token123"
+
 # Home directory backup
 [[volumes]]
 path = "/home"
@@ -227,6 +302,11 @@ snapshot_prefix = "home"
 
 [[volumes.targets]]
 path = "/mnt/backup/home"
+
+# Example external drive target with mount verification
+# [[volumes.targets]]
+# path = "/mnt/usb-backup/home"
+# require_mount = true          # Fail if drive is not mounted (safety check)
 
 # Example SSH target
 # [[volumes.targets]]

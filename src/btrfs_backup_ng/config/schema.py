@@ -8,6 +8,77 @@ from typing import Optional
 
 
 @dataclass
+class EmailNotificationConfig:
+    """Email notification configuration.
+
+    Attributes:
+        enabled: Whether email notifications are enabled
+        smtp_host: SMTP server hostname
+        smtp_port: SMTP server port (465 for SSL, 587 for STARTTLS, 25 for plain)
+        smtp_user: SMTP authentication username (optional)
+        smtp_password: SMTP authentication password (optional)
+        smtp_tls: TLS mode: "ssl" (implicit), "starttls" (explicit), or "none"
+        from_addr: Sender email address
+        to_addrs: List of recipient email addresses
+        on_success: Send notification on successful backup
+        on_failure: Send notification on failed backup
+    """
+
+    enabled: bool = False
+    smtp_host: str = "localhost"
+    smtp_port: int = 25
+    smtp_user: Optional[str] = None
+    smtp_password: Optional[str] = None
+    smtp_tls: str = "none"
+    from_addr: str = "btrfs-backup-ng@localhost"
+    to_addrs: list[str] = field(default_factory=list)
+    on_success: bool = False
+    on_failure: bool = True
+
+
+@dataclass
+class WebhookNotificationConfig:
+    """Webhook notification configuration.
+
+    Attributes:
+        enabled: Whether webhook notifications are enabled
+        url: Webhook URL to POST to
+        method: HTTP method (POST or PUT)
+        headers: Additional headers to send
+        on_success: Send notification on successful backup
+        on_failure: Send notification on failed backup
+        timeout: Request timeout in seconds
+    """
+
+    enabled: bool = False
+    url: Optional[str] = None
+    method: str = "POST"
+    headers: dict[str, str] = field(default_factory=dict)
+    on_success: bool = False
+    on_failure: bool = True
+    timeout: int = 30
+
+
+@dataclass
+class NotificationConfig:
+    """Combined notification configuration.
+
+    Attributes:
+        email: Email notification settings
+        webhook: Webhook notification settings
+    """
+
+    email: EmailNotificationConfig = field(default_factory=EmailNotificationConfig)
+    webhook: WebhookNotificationConfig = field(
+        default_factory=WebhookNotificationConfig
+    )
+
+    def is_enabled(self) -> bool:
+        """Check if any notification method is enabled."""
+        return self.email.enabled or self.webhook.enabled
+
+
+@dataclass
 class RetentionConfig:
     """Retention policy configuration.
 
@@ -40,6 +111,7 @@ class TargetConfig:
         ssh_password_auth: Allow password authentication fallback
         compress: Compression algorithm for transfers (none, gzip, zstd, lz4)
         rate_limit: Bandwidth limit for transfers (e.g., "10M", "1G", "500K")
+        require_mount: Require path to be an active mount point (safety check for external drives)
     """
 
     path: str
@@ -49,6 +121,7 @@ class TargetConfig:
     ssh_password_auth: bool = True
     compress: str = "none"
     rate_limit: Optional[str] = None
+    require_mount: bool = False
 
 
 @dataclass
@@ -89,6 +162,7 @@ class GlobalConfig:
         log_file: Path to log file (None for no file logging)
         transaction_log: Path to JSON transaction log for auditing
         retention: Default retention policy
+        notifications: Notification settings (email, webhook)
         parallel_volumes: Max concurrent volume backups
         parallel_targets: Max concurrent target transfers per volume
         quiet: Suppress non-essential output
@@ -101,6 +175,7 @@ class GlobalConfig:
     log_file: Optional[str] = None
     transaction_log: Optional[str] = None
     retention: RetentionConfig = field(default_factory=RetentionConfig)
+    notifications: NotificationConfig = field(default_factory=NotificationConfig)
     parallel_volumes: int = 2
     parallel_targets: int = 3
     quiet: bool = False

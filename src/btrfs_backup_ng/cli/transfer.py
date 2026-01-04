@@ -141,6 +141,16 @@ def execute_transfer(args: argparse.Namespace) -> int:
             # Transfer to each target
             for target in volume.targets:
                 try:
+                    # Check mount requirement for local targets
+                    if target.require_mount and not target.path.startswith("ssh://"):
+                        target_path = Path(target.path).resolve()
+                        if not __util__.is_mounted(target_path):
+                            raise __util__.AbortError(
+                                f"Target {target.path} is not mounted. "
+                                f"Ensure the drive is connected and mounted, or set require_mount = false."
+                            )
+                        logger.debug("Mount check passed for %s", target.path)
+
                     dest_kwargs = dict(endpoint_kwargs)
                     dest_kwargs["ssh_sudo"] = target.ssh_sudo
                     dest_kwargs["ssh_password_fallback"] = target.ssh_password_auth
