@@ -222,13 +222,14 @@ class TestBuildTransferPipeline:
     """Tests for build_transfer_pipeline function."""
 
     def test_no_compression_no_throttle(self):
-        """Test pipeline with no compression or throttling."""
+        """Test pipeline with no compression or throttling (progress disabled)."""
         mock_stdout = MagicMock()
 
         final_stdout, processes = build_transfer_pipeline(
             send_stdout=mock_stdout,
             compress="none",
             rate_limit=None,
+            show_progress=False,
         )
 
         assert final_stdout == mock_stdout
@@ -237,7 +238,7 @@ class TestBuildTransferPipeline:
     @patch("btrfs_backup_ng.core.transfer.check_compression_available")
     @patch("subprocess.Popen")
     def test_with_compression(self, mock_popen, mock_check):
-        """Test pipeline with compression."""
+        """Test pipeline with compression (progress disabled)."""
         mock_check.return_value = True
         mock_process = MagicMock()
         mock_process.stdout = MagicMock()
@@ -249,6 +250,7 @@ class TestBuildTransferPipeline:
             send_stdout=mock_stdout,
             compress="gzip",
             rate_limit=None,
+            show_progress=False,
         )
 
         assert len(processes) == 1
