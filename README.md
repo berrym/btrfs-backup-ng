@@ -422,6 +422,23 @@ src/btrfs_backup_ng/
     btrbk_import.py      # btrbk config importer
 ```
 
+## Documentation
+
+- [CLI Reference](docs/CLI-REFERENCE.md) - Complete command and option reference
+- [Migrating from btrbk](docs/MIGRATING-FROM-BTRBK.md) - Guide for btrbk users
+- [Changelog](CHANGELOG.md) - Version history and release notes
+
+### Example Configurations
+
+Ready-to-use configuration examples in `examples/`:
+
+| File | Description |
+|------|-------------|
+| [`minimal.toml`](examples/minimal.toml) | Simple local backup |
+| [`remote-backup.toml`](examples/remote-backup.toml) | Multi-volume SSH backup |
+| [`server.toml`](examples/server.toml) | Server with frequent snapshots |
+| [`config.toml`](examples/config.toml) | Full reference with all options |
+
 ## License
 
 MIT License - see [LICENSE](LICENSE) for details.
