@@ -8,7 +8,7 @@ import argparse
 import sys
 from typing import Callable
 
-from .common import add_verbosity_args, create_global_parser
+from .common import add_progress_args, add_verbosity_args, create_global_parser
 
 # Known subcommands for the new CLI
 SUBCOMMANDS = frozenset(
@@ -132,6 +132,7 @@ def create_subcommand_parser() -> argparse.ArgumentParser:
         metavar="RATE",
         help="Bandwidth limit (e.g., '10M', '1G') (overrides config)",
     )
+    add_progress_args(run_parser)
 
     # snapshot command
     snapshot_parser = subparsers.add_parser(
@@ -179,6 +180,7 @@ def create_subcommand_parser() -> argparse.ArgumentParser:
         metavar="RATE",
         help="Bandwidth limit (e.g., '10M', '1G') (overrides config)",
     )
+    add_progress_args(transfer_parser)
 
     # prune command
     prune_parser = subparsers.add_parser(

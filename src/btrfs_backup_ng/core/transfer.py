@@ -180,6 +180,50 @@ def create_decompress_process(
     )
 
 
+def create_progress_process(
+    stdin,
+    stdout=subprocess.PIPE,
+) -> Optional[subprocess.Popen]:
+    """Create a progress display subprocess using pv.
+
+    Shows transfer progress (bytes, rate, time, ETA) without rate limiting.
+
+    Args:
+        stdin: Input pipe
+        stdout: Output pipe
+
+    Returns:
+        Popen object for the pv process, or None if pv not available
+    """
+    if not check_pv_available():
+        logger.debug(
+            "pv (pipe viewer) not available, progress display disabled. "
+            "Install with: dnf install pv"
+        )
+        return None
+
+    # Build pv command with progress display options
+    # -f forces output even when stderr is not a TTY
+    cmd = [
+        "pv",
+        "-f",
+        "-p",
+        "-t",
+        "-e",
+        "-r",
+        "-b",
+    ]  # force, progress, time, eta, rate, bytes
+
+    logger.debug("Starting progress process: %s", cmd)
+
+    return subprocess.Popen(
+        cmd,
+        stdin=stdin,
+        stdout=stdout,
+        stderr=None,  # Let progress output go to stderr (terminal)
+    )
+
+
 def create_throttle_process(
     rate_limit: Optional[str],
     stdin,
@@ -219,7 +263,10 @@ def create_throttle_process(
 
     # Add progress display options
     if show_progress:
-        cmd.extend(["-p", "-t", "-e", "-r", "-b"])  # progress, time, eta, rate, bytes
+        # -f forces output even when stderr is not a TTY
+        cmd.extend(
+            ["-f", "-p", "-t", "-e", "-r", "-b"]
+        )  # force, progress, time, eta, rate, bytes
     else:
         cmd.append("-q")  # quiet mode
 
@@ -266,7 +313,7 @@ def build_transfer_pipeline(
             current_stdout = compress_proc.stdout
             logger.info("Transfer compression enabled: %s", compress)
 
-    # Add throttling if requested
+    # Add throttling if requested (includes progress display)
     if rate_limit:
         throttle_proc = create_throttle_process(
             rate_limit,
@@ -277,6 +324,13 @@ def build_transfer_pipeline(
             processes.append(("throttle", throttle_proc))
             current_stdout = throttle_proc.stdout
             logger.info("Transfer rate limited to: %s", rate_limit)
+    elif show_progress:
+        # Add progress display without rate limiting
+        progress_proc = create_progress_process(stdin=current_stdout)
+        if progress_proc:
+            processes.append(("progress", progress_proc))
+            current_stdout = progress_proc.stdout
+            logger.debug("Transfer progress display enabled")
 
     return current_stdout, processes
 

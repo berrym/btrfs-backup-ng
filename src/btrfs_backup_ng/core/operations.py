@@ -8,6 +8,7 @@ import subprocess
 from pathlib import Path
 
 from .. import __util__
+from . import progress as progress_utils
 from . import transfer as transfer_utils
 
 logger = logging.getLogger(__name__)
@@ -74,9 +75,41 @@ def send_snapshot(
             destination_endpoint, "send_receive"
         )
 
-        # Get compression and rate limit options
+        # Get compression, rate limit, and progress options
         compress = options.get("compress", "none")
         rate_limit = options.get("rate_limit")
+        show_progress = options.get("show_progress", False)
+
+        logger.debug(
+            "Transfer options: compress=%s, rate_limit=%s, show_progress=%s",
+            compress,
+            rate_limit,
+            show_progress,
+        )
+        logger.debug(
+            "use_direct_pipe=%s, is_ssh_endpoint=%s", use_direct_pipe, is_ssh_endpoint
+        )
+
+        # Get snapshot info for progress display
+        snapshot_name = str(snapshot)
+        snapshot_path = str(snapshot.get_path())
+        parent_path = str(parent.get_path()) if parent else None
+        estimated_size = None
+        if show_progress:
+            logger.debug(
+                "Getting size estimate for: %s (parent: %s)", snapshot_path, parent_path
+            )
+            estimated_size = progress_utils.estimate_snapshot_size(
+                snapshot_path, parent_path
+            )
+            if estimated_size:
+                logger.debug(
+                    "Estimated transfer size: %d bytes (%.2f MB)",
+                    estimated_size,
+                    estimated_size / (1024 * 1024),
+                )
+            else:
+                logger.debug("Could not estimate transfer size")
 
         if use_direct_pipe:
             return_codes = _do_direct_pipe_transfer(
@@ -90,6 +123,9 @@ def send_snapshot(
                 is_ssh_endpoint,
                 compress=compress,
                 rate_limit=rate_limit,
+                show_progress=show_progress,
+                snapshot_name=snapshot_name,
+                estimated_size=estimated_size,
             )
 
         if any(rc != 0 for rc in return_codes):
@@ -198,6 +234,9 @@ def _do_process_transfer(
     is_ssh_endpoint,
     compress: str = "none",
     rate_limit: str | None = None,
+    show_progress: bool = False,
+    snapshot_name: str = "",
+    estimated_size: int | None = None,
 ) -> list[int]:
     """Perform transfer using traditional process piping.
 
@@ -208,23 +247,62 @@ def _do_process_transfer(
         is_ssh_endpoint: Whether destination is SSH
         compress: Compression method (none, gzip, zstd, lz4, etc.)
         rate_limit: Bandwidth limit (e.g., '10M', '1G')
+        show_progress: Whether to show progress bars
+        snapshot_name: Name of snapshot for progress display
+        estimated_size: Estimated transfer size for progress bar
 
     Returns:
         List of return codes from all processes
     """
     logger.debug("Using traditional send/receive process approach")
 
+    # Check if we can use Rich progress (no compression or rate limiting)
+    # Only show Rich progress for full transfers (where we know the size)
+    # For incremental transfers (estimated_size is None), skip progress display
+    # since they typically complete in under a second
+    use_rich_progress = (
+        show_progress
+        and estimated_size is not None  # Only for full transfers with known size
+        and (compress == "none" or not compress)
+        and not rate_limit
+        and progress_utils.is_interactive()
+    )
+
+    # For incremental transfers, skip pv progress too (too fast to be useful)
+    skip_progress_for_incremental = show_progress and estimated_size is None
+
+    logger.debug(
+        "Progress decision: show_progress=%s, estimated_size=%s, compress=%s, rate_limit=%s -> use_rich=%s",
+        show_progress,
+        estimated_size,
+        compress,
+        rate_limit,
+        use_rich_progress,
+    )
+
+    if use_rich_progress:
+        return _do_rich_progress_transfer(
+            send_process,
+            destination_endpoint,
+            is_ssh_endpoint,
+            snapshot_name,
+            estimated_size,
+        )
+
     pipeline_processes = []
     current_stdout = send_process.stdout
 
+    # For incremental transfers, don't show pv progress (too fast to be useful)
+    effective_show_progress = show_progress and not skip_progress_for_incremental
+
     try:
         # Build transfer pipeline with compression and throttling
-        if compress != "none" or rate_limit:
+        if compress != "none" or rate_limit or effective_show_progress:
             current_stdout, pipeline_processes = transfer_utils.build_transfer_pipeline(
                 send_stdout=send_process.stdout,
                 compress=compress,
                 rate_limit=rate_limit,
-                show_progress=True,
+                show_progress=effective_show_progress,
             )
 
         # Start receive process with potentially modified input stream
@@ -271,6 +349,58 @@ def _do_process_transfer(
         raise __util__.SnapshotTransferError("Timeout waiting for receive process")
 
     return [return_code_send] + pipeline_return_codes + [return_code_receive]
+
+
+def _do_rich_progress_transfer(
+    send_process,
+    destination_endpoint,
+    is_ssh_endpoint: bool,
+    snapshot_name: str,
+    estimated_size: int | None,
+) -> list[int]:
+    """Perform transfer with Rich progress bar display.
+
+    Args:
+        send_process: btrfs send subprocess
+        destination_endpoint: Destination endpoint
+        is_ssh_endpoint: Whether destination is SSH
+        snapshot_name: Name of snapshot for progress display
+        estimated_size: Estimated transfer size for progress bar
+
+    Returns:
+        List of return codes [send_rc, receive_rc]
+    """
+    logger.debug("Using Rich progress bar for transfer")
+
+    # Start receive process (stderr is suppressed at the endpoint level)
+    receive_process = destination_endpoint.receive(subprocess.PIPE)
+    if receive_process is None:
+        logger.error("Failed to start receive process")
+        if is_ssh_endpoint and not destination_endpoint.config.get("ssh_sudo", False):
+            logger.error("Try using --ssh-sudo for SSH destinations")
+        raise __util__.SnapshotTransferError("Receive process failed to start")
+
+    # Run transfer with Rich progress
+    try:
+        send_rc, receive_rc = progress_utils.run_transfer_with_progress(
+            send_process=send_process,
+            receive_process=receive_process,
+            snapshot_name=snapshot_name or "snapshot",
+            estimated_size=estimated_size,
+        )
+        return [send_rc, receive_rc]
+    except Exception as e:
+        logger.error("Error during Rich progress transfer: %s", e)
+        # Try to clean up
+        try:
+            send_process.kill()
+        except Exception:
+            pass
+        try:
+            receive_process.kill()
+        except Exception:
+            pass
+        raise __util__.SnapshotTransferError(f"Transfer failed: {e}")
 
 
 def _log_process_errors(send_process, receive_process) -> None:

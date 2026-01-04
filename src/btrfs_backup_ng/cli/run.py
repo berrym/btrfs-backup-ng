@@ -19,7 +19,7 @@ from ..config import (
     load_config,
 )
 from ..core.operations import sync_snapshots
-from .common import get_log_level
+from .common import get_log_level, should_show_progress
 
 logger = logging.getLogger(__name__)
 
@@ -82,6 +82,13 @@ def execute_run(args: argparse.Namespace) -> int:
     compress_override = getattr(args, "compress", None)
     rate_limit_override = getattr(args, "rate_limit", None)
 
+    # Determine if progress should be shown
+    show_progress = should_show_progress(args)
+    if show_progress:
+        logger.debug("Progress bars enabled (interactive terminal detected)")
+    else:
+        logger.debug("Progress bars disabled")
+
     # Execute backup for each enabled volume
     enabled_volumes = config.get_enabled_volumes()
     logger.info("Processing %d volume(s)", len(enabled_volumes))
@@ -99,6 +106,7 @@ def execute_run(args: argparse.Namespace) -> int:
                     parallel_targets,
                     compress_override,
                     rate_limit_override,
+                    show_progress,
                 ): volume
                 for volume in enabled_volumes
             }
@@ -120,6 +128,7 @@ def execute_run(args: argparse.Namespace) -> int:
                     parallel_targets,
                     compress_override,
                     rate_limit_override,
+                    show_progress,
                 )
                 results.append((volume.path, success))
             except Exception as e:
@@ -175,6 +184,7 @@ def _backup_volume(
     parallel_targets: int,
     compress_override: str | None = None,
     rate_limit_override: str | None = None,
+    show_progress: bool = False,
 ) -> bool:
     """Execute backup for a single volume.
 
@@ -184,6 +194,7 @@ def _backup_volume(
         parallel_targets: Max concurrent target transfers
         compress_override: CLI override for compression method
         rate_limit_override: CLI override for bandwidth limit
+        show_progress: Whether to show progress bars
 
     Returns:
         True if successful, False otherwise
@@ -290,6 +301,7 @@ def _backup_volume(
                     config.global_config.incremental,
                     compress_override,
                     rate_limit_override,
+                    show_progress,
                 ): dest_endpoint
                 for dest_endpoint, target_config in destination_endpoints
             }
@@ -314,6 +326,7 @@ def _backup_volume(
                     config.global_config.incremental,
                     compress_override,
                     rate_limit_override,
+                    show_progress,
                 )
                 if not success:
                     all_success = False
@@ -332,6 +345,7 @@ def _transfer_to_target(
     incremental: bool,
     compress_override: str | None = None,
     rate_limit_override: str | None = None,
+    show_progress: bool = False,
 ) -> bool:
     """Transfer snapshot to a single target.
 
@@ -343,6 +357,7 @@ def _transfer_to_target(
         incremental: Whether to use incremental transfers
         compress_override: CLI override for compression method
         rate_limit_override: CLI override for bandwidth limit
+        show_progress: Whether to show progress bars
 
     Returns:
         True if successful
@@ -354,6 +369,7 @@ def _transfer_to_target(
             "compress": compress_override or target_config.compress,
             "rate_limit": rate_limit_override or target_config.rate_limit,
             "ssh_sudo": target_config.ssh_sudo,
+            "show_progress": show_progress,
         }
 
         sync_snapshots(

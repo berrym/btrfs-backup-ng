@@ -1,6 +1,64 @@
 """Shared CLI utilities and argument parsers."""
 
 import argparse
+import os
+import sys
+
+
+def is_interactive() -> bool:
+    """Check if we're running in an interactive terminal.
+
+    Returns True if stdout is a TTY, which typically means
+    a human is watching and progress bars are appropriate.
+
+    Returns:
+        True if running interactively
+    """
+    return sys.stdout.isatty()
+
+
+def should_show_progress(args: argparse.Namespace) -> bool:
+    """Determine if progress bars should be shown.
+
+    Logic:
+    - If --progress is set, always show
+    - If --no-progress is set, never show
+    - Otherwise, auto-detect based on TTY
+
+    Args:
+        args: Parsed command line arguments
+
+    Returns:
+        True if progress should be shown
+    """
+    # Explicit flags take precedence
+    if getattr(args, "progress", False):
+        return True
+    if getattr(args, "no_progress", False):
+        return False
+
+    # Quiet mode implies no progress
+    if getattr(args, "quiet", False):
+        return False
+
+    # Auto-detect based on TTY
+    return is_interactive()
+
+
+def add_progress_args(parser: argparse.ArgumentParser) -> None:
+    """Add progress-related arguments to a parser."""
+    group = parser.add_argument_group("Progress options")
+    mutex = group.add_mutually_exclusive_group()
+    mutex.add_argument(
+        "--progress",
+        action="store_true",
+        help="Show progress bars (default when running in terminal)",
+    )
+    mutex.add_argument(
+        "--no-progress",
+        action="store_true",
+        help="Disable progress bars (default when not in terminal)",
+    )
 
 
 def create_global_parser() -> argparse.ArgumentParser:

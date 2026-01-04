@@ -183,8 +183,12 @@ class Endpoint:
     ) -> Any:
         """Call 'btrfs send' for the given snapshot and return its Popen object."""
         cmd = self._build_send_command(snapshot, parent=parent, clones=clones)
+        # Suppress stderr ("At subvol" messages) - they're just informational
         return self._exec_command(
-            {"command": cmd}, method="Popen", stdout=subprocess.PIPE
+            {"command": cmd},
+            method="Popen",
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
         )
 
     def receive(self, stdin: Any) -> Any:
@@ -229,8 +233,13 @@ class Endpoint:
 
         logger.debug("Running receive command: %s", cmd)
         try:
+            # Suppress stderr ("At subvol" messages) - they're just informational
             return self._exec_command(
-                {"command": cmd}, method="Popen", stdin=stdin, stdout=stdout
+                {"command": cmd},
+                method="Popen",
+                stdin=stdin,
+                stdout=stdout,
+                stderr=subprocess.DEVNULL,
             )
         except Exception as e:
             logger.error("Error executing receive command: %s", e)
