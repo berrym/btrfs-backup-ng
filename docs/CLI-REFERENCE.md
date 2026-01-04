@@ -345,14 +345,96 @@ btrfs-backup-ng --ssh-sudo --num-snapshots 10 /home ssh://user@host:/backup
 
 ---
 
+## SSH Remote Backups
+
+When backing up to a remote host via SSH, there are several authentication scenarios.
+
+### SSH Authentication
+
+**Key-based authentication (recommended):**
+
+For key-based SSH authentication, ensure your SSH key is loaded in ssh-agent. When running with sudo, you must preserve the `SSH_AUTH_SOCK` environment variable:
+
+```bash
+# Run with sudo -E to preserve SSH agent socket
+sudo -E btrfs-backup-ng run
+```
+
+The tool will automatically detect SSH keys in `~/.ssh/` (id_ed25519, id_rsa, id_ecdsa) for the original user when running via sudo.
+
+**Password authentication:**
+
+Set `ssh_password_auth = true` in your target configuration to enable interactive SSH password prompts:
+
+```toml
+[[volumes.targets]]
+path = "ssh://user@host:/backup"
+ssh_password_auth = true
+```
+
+### Sudo on Remote Host
+
+btrfs commands require root privileges. For remote backups, configure sudo access on the remote host.
+
+**Passwordless sudo (recommended for automated backups):**
+
+Add this to `/etc/sudoers.d/btrfs-backup` on the remote host:
+
+```
+# Allow btrfs commands without password for backup user
+username ALL=(ALL) NOPASSWD: /usr/bin/btrfs
+```
+
+Then enable sudo in your target configuration:
+
+```toml
+[[volumes.targets]]
+path = "ssh://user@host:/backup"
+ssh_sudo = true
+```
+
+**Password-based sudo:**
+
+If passwordless sudo is not configured, the tool will prompt for the sudo password interactively, or you can set it via environment variable:
+
+```bash
+export BTRFS_BACKUP_SUDO_PASSWORD="your-password"
+btrfs-backup-ng run
+```
+
+### Complete Example for Unattended Backups
+
+For fully automated backups without any password prompts:
+
+1. **Local machine:** Run with `sudo -E` to preserve SSH agent
+2. **Remote machine:** Configure passwordless sudo for btrfs
+
+```bash
+# On remote host, create /etc/sudoers.d/btrfs-backup:
+# myuser ALL=(ALL) NOPASSWD: /usr/bin/btrfs
+
+# On local machine, run backup:
+sudo -E btrfs-backup-ng run
+```
+
+Configuration:
+```toml
+[[volumes.targets]]
+path = "ssh://myuser@backupserver:/mnt/backups/myvolume"
+ssh_sudo = true
+```
+
+---
+
 ## Environment Variables
 
 | Variable | Description |
 |----------|-------------|
-| `BTRFS_BACKUP_SUDO_PASSWORD` | Sudo password for remote hosts |
-| `BTRFS_BACKUP_SSH_PASSWORD` | Enable SSH password prompts |
-| `BTRFS_BACKUP_PASSWORDLESS_ONLY` | Only use passwordless sudo (no password prompts) |
+| `BTRFS_BACKUP_SUDO_PASSWORD` | Sudo password for remote hosts (avoids interactive prompt) |
+| `BTRFS_BACKUP_SSH_PASSWORD` | Enable SSH password authentication |
+| `BTRFS_BACKUP_PASSWORDLESS_ONLY` | Only use passwordless sudo (fail if password required) |
 | `BTRFS_BACKUP_LOG_LEVEL` | Override log level (DEBUG, INFO, WARNING, ERROR) |
+| `SSH_AUTH_SOCK` | SSH agent socket (preserve with `sudo -E`) |
 
 ---
 
