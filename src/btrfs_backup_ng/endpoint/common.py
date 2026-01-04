@@ -54,9 +54,7 @@ class Endpoint:
         self.config["lock_file_name"] = config.get(
             "lock_file_name", ".btrfs-backup-ng.locks"
         )
-        self.config["snapshot_folder"] = config.get(
-            "snapshot_folder", ".btrfs-backup-ng/snapshots"
-        )
+        self.config["snapshot_folder"] = config.get("snapshot_folder", ".snapshots")
 
         self.btrfs_flags = ["-vv"] if self.config["btrfs_debug"] else []
         self.__cached_snapshots = None
