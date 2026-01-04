@@ -32,6 +32,8 @@ btrfs-backup-ng run [OPTIONS]
 | `--parallel-targets N` | Max concurrent target transfers per volume |
 | `--compress METHOD` | Compression method: none, gzip, zstd, lz4, pigz, lzop |
 | `--rate-limit RATE` | Bandwidth limit (e.g., '10M', '1G', '500K') |
+| `--progress` | Force progress bar display |
+| `--no-progress` | Disable progress bar display |
 
 **Examples:**
 ```bash
@@ -162,16 +164,35 @@ btrfs-backup-ng list --json
 
 ### status
 
-Show job status, last run times, and statistics.
+Show job status, last run times, statistics, and transaction history.
 
 ```bash
-btrfs-backup-ng status
+btrfs-backup-ng status [OPTIONS]
 ```
+
+**Options:**
+| Option | Description |
+|--------|-------------|
+| `-t, --transactions` | Show recent transaction history |
+| `-n, --limit N` | Number of transactions to show (default: 10) |
 
 **Examples:**
 ```bash
+# Basic status
 btrfs-backup-ng status
+
+# Status with transaction history
+btrfs-backup-ng status --transactions
+
+# Show last 20 transactions
+btrfs-backup-ng status -t -n 20
 ```
+
+**Output includes:**
+- Volume and target health status
+- Snapshot counts
+- Transaction statistics (if transaction_log configured)
+- Recent transaction history (with --transactions flag)
 
 ---
 

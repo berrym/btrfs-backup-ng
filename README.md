@@ -17,9 +17,11 @@ See the [LICENSE](LICENSE) file for full copyright attribution.
 - **TOML Configuration**: Clean, validated configuration files (no custom syntax)
 - **Subcommand CLI**: Modern interface with `run`, `snapshot`, `transfer`, `prune`, `list`, `status`
 - **Time-based Retention**: Intuitive policies (hourly, daily, weekly, monthly, yearly)
+- **Rich Progress Bars**: Real-time transfer progress with speed, ETA, and percentage
 - **Parallel Execution**: Concurrent volume and target transfers
 - **Stream Compression**: zstd, gzip, lz4, pigz, lzop support
 - **Bandwidth Throttling**: Rate limiting for remote transfers
+- **Transaction Logging**: Structured JSON logs for auditing and automation
 - **Systemd Integration**: Built-in timer/service installation
 - **btrbk Migration**: Import existing btrbk configurations
 - **Robust SSH**: Password fallback, sudo support, Paramiko integration
@@ -140,6 +142,10 @@ btrfs-backup-ng prune --dry-run
 # Override compression and rate limit
 btrfs-backup-ng transfer --compress=zstd --rate-limit=10M
 
+# Progress bar control (auto-detected by default)
+btrfs-backup-ng run --progress      # Force progress bars
+btrfs-backup-ng run --no-progress   # Disable progress bars
+
 # Parallel execution
 btrfs-backup-ng run --parallel-volumes=2 --parallel-targets=3
 
@@ -148,6 +154,9 @@ btrfs-backup-ng -c /path/to/config.toml run
 
 # Verbose output
 btrfs-backup-ng -v run
+
+# View transaction history
+btrfs-backup-ng status --transactions
 ```
 
 ## Configuration Reference
@@ -159,11 +168,33 @@ btrfs-backup-ng -v run
 snapshot_dir = ".snapshots"           # Relative to volume or absolute
 timestamp_format = "%Y%m%d-%H%M%S"    # Snapshot timestamp format
 incremental = true                     # Use incremental transfers
-log_file = "/var/log/btrfs-backup-ng.log"  # Optional log file
+log_file = "/var/log/btrfs-backup-ng.log"           # Optional rotating log file
+transaction_log = "/var/log/btrfs-backup-ng.jsonl"  # Optional JSON transaction log
 parallel_volumes = 2                   # Concurrent volume backups
 parallel_targets = 3                   # Concurrent target transfers
 quiet = false                          # Suppress non-essential output
 verbose = false                        # Enable verbose output
+```
+
+### Logging
+
+Two logging systems are available:
+
+**File Logging** (`log_file`): Human-readable rotating log file (10MB max, 5 backups)
+```
+2026-01-04 13:10:51 [INFO] btrfs-backup-ng: Creating snapshot...
+2026-01-04 13:10:57 [INFO] btrfs-backup-ng: Transfer completed successfully
+```
+
+**Transaction Logging** (`transaction_log`): Structured JSONL for auditing and automation
+```json
+{"timestamp": "2026-01-04T18:10:57+00:00", "action": "transfer", "status": "completed", "snapshot": "home-20260104", "duration_seconds": 5.78, "size_bytes": 2175549440}
+```
+
+View transaction history via CLI:
+```bash
+btrfs-backup-ng status --transactions       # Show recent transactions
+btrfs-backup-ng status -t -n 20             # Show last 20 transactions
 ```
 
 ### Retention Policy
