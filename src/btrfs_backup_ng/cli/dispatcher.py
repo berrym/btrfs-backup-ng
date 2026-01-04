@@ -419,6 +419,11 @@ Examples:
         metavar="RATE",
         help="Bandwidth limit (e.g., '10M', '1G')",
     )
+    restore_parser.add_argument(
+        "--no-fs-checks",
+        action="store_true",
+        help="Skip btrfs subvolume verification (for listing backups in regular directories)",
+    )
     add_progress_args(restore_parser)
 
     return parser

@@ -64,16 +64,44 @@ def get_restore_chain(
         # Add to chain (will be reversed at end)
         chain.insert(0, current)  # Prepend to get oldest-first order
 
-        # Find parent in backup snapshots
-        parent = current.find_parent(all_backup_snapshots)
+        # Find parent: the most recent snapshot that is OLDER than current
+        # We only want strictly older snapshots to avoid infinite loops
+        parent = _find_older_parent(current, all_backup_snapshots)
         if parent is None:
             logger.debug(
-                "Snapshot %s has no parent - will be restored in full mode",
+                "Snapshot %s has no older parent - will be restored in full mode",
                 current_name,
             )
         current = parent
 
     return chain
+
+
+def _find_older_parent(snapshot, all_snapshots: list):
+    """Find the most recent snapshot that is strictly older than the given snapshot.
+
+    Unlike Snapshot.find_parent(), this only returns older snapshots and never
+    falls back to returning a newer snapshot. This prevents infinite loops
+    when building restore chains.
+
+    Args:
+        snapshot: The snapshot to find a parent for
+        all_snapshots: All available snapshots to search
+
+    Returns:
+        The most recent snapshot older than `snapshot`, or None if none exists.
+    """
+    candidates = []
+    for s in all_snapshots:
+        # Only consider snapshots that are strictly older
+        if s < snapshot:
+            candidates.append(s)
+
+    if not candidates:
+        return None
+
+    # Return the most recent (last in sorted order) of the older snapshots
+    return max(candidates, key=lambda s: s.time_obj if hasattr(s, "time_obj") else 0)
 
 
 def find_snapshot_by_name(name: str, snapshots: list):
@@ -199,21 +227,22 @@ def verify_restored_snapshot(
         RestoreError: If verification fails
     """
     try:
-        # Refresh snapshot list
-        snapshots = destination_endpoint.list_snapshots(flush_cache=True)
-        found = any(s.get_name() == expected_name for s in snapshots)
+        # Check directly if the snapshot path exists and is a subvolume
+        # We don't rely on list_snapshots() because it filters by prefix,
+        # and the restored snapshot may have a different prefix than the destination
+        snapshot_path = Path(destination_endpoint.config["path"]) / expected_name
 
-        if not found:
+        if not snapshot_path.exists():
             raise RestoreError(
                 f"Snapshot {expected_name} not found after restore. "
                 "The restore may have failed silently."
             )
 
         # Verify it's a valid subvolume
-        snapshot_path = destination_endpoint.config["path"] / expected_name
-        if snapshot_path.exists() and not __util__.is_subvolume(snapshot_path):
-            logger.warning(
-                "%s exists but is not a valid btrfs subvolume", snapshot_path
+        if not __util__.is_subvolume(snapshot_path):
+            raise RestoreError(
+                f"{snapshot_path} exists but is not a valid btrfs subvolume. "
+                "The restore may have failed."
             )
 
         logger.debug("Verified restored snapshot: %s", expected_name)

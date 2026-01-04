@@ -207,12 +207,13 @@ def _prepare_backup_endpoint(args: argparse.Namespace, source: str):
         Configured endpoint
     """
     # Build endpoint kwargs
+    no_fs_checks = getattr(args, "no_fs_checks", False)
     endpoint_kwargs = {
         "snap_prefix": getattr(args, "prefix", "") or "",
         "convert_rw": False,
         "subvolume_sync": False,
         "btrfs_debug": False,
-        "fs_checks": True,
+        "fs_checks": not no_fs_checks,
     }
 
     # SSH options
@@ -224,13 +225,18 @@ def _prepare_backup_endpoint(args: argparse.Namespace, source: str):
         ssh_key = getattr(args, "ssh_key", None)
         if ssh_key:
             endpoint_kwargs["ssh_identity_file"] = ssh_key
+    else:
+        # For local paths, we need to set 'path' as well since LocalEndpoint
+        # always resolves config["path"] during initialization
+        endpoint_kwargs["path"] = Path(source).resolve()
 
-    # Create endpoint - for restore, backup location is the "source"
-    # but we use it for listing and sending, so source=True
+    # Create endpoint - for restore, backup location needs to be set as "path"
+    # (not "source") because list_snapshots() uses config["path"]
+    # The source=False means the path will be stored in config["path"]
     backup_ep = endpoint.choose_endpoint(
         source,
         endpoint_kwargs,
-        source=True,
+        source=False,
     )
     backup_ep.prepare()
 
