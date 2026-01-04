@@ -10,7 +10,7 @@ function __fish_btrfs_backup_ng_no_subcommand
     set -e cmd[1]
     for c in $cmd
         switch $c
-            case run snapshot transfer prune list status config install uninstall restore
+            case run snapshot transfer prune list status config install uninstall restore verify
                 return 1
         end
     end
@@ -60,6 +60,7 @@ complete -c btrfs-backup-ng -n __fish_btrfs_backup_ng_no_subcommand -a config -d
 complete -c btrfs-backup-ng -n __fish_btrfs_backup_ng_no_subcommand -a install -d 'Install systemd timer/service'
 complete -c btrfs-backup-ng -n __fish_btrfs_backup_ng_no_subcommand -a uninstall -d 'Remove systemd timer/service'
 complete -c btrfs-backup-ng -n __fish_btrfs_backup_ng_no_subcommand -a restore -d 'Restore snapshots from backup location'
+complete -c btrfs-backup-ng -n __fish_btrfs_backup_ng_no_subcommand -a verify -d 'Verify backup integrity'
 
 # Compression methods
 set -l compress_methods none zstd gzip lz4 pigz lzop
@@ -140,3 +141,18 @@ complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_using_command restore' -l
 complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_using_command restore' -l no-progress -d 'Disable progress bars'
 # Enable path completion for restore positional arguments
 complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_using_command restore' -a '(__fish_complete_directories)'
+
+# verify command
+set -l verify_levels metadata stream full
+complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_using_command verify' -l level -d 'Verification level' -xa "$verify_levels"
+complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_using_command verify' -l snapshot -d 'Verify specific snapshot only' -x
+complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_using_command verify' -l temp-dir -d 'Temporary directory for full verification' -xa '(__fish_complete_directories)'
+complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_using_command verify' -l no-cleanup -d 'Do not delete restored snapshots after verification'
+complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_using_command verify' -l prefix -d 'Snapshot prefix filter' -x
+complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_using_command verify' -l ssh-sudo -d 'Use sudo for btrfs commands on remote host'
+complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_using_command verify' -l ssh-key -d 'SSH private key file' -r -F
+complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_using_command verify' -l no-fs-checks -d 'Skip btrfs subvolume verification'
+complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_using_command verify' -l json -d 'Output results in JSON format'
+complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_using_command verify' -s q -l quiet -d 'Suppress progress output'
+# Enable path completion for verify positional argument
+complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_using_command verify' -a '(__fish_complete_directories)'

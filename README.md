@@ -15,8 +15,9 @@ See the [LICENSE](LICENSE) file for full copyright attribution.
 ## Features
 
 - **TOML Configuration**: Clean, validated configuration files (no custom syntax)
-- **Subcommand CLI**: Modern interface with `run`, `snapshot`, `transfer`, `prune`, `restore`, `list`, `status`
+- **Subcommand CLI**: Modern interface with `run`, `snapshot`, `transfer`, `prune`, `restore`, `verify`, `list`, `status`
 - **Disaster Recovery**: Built-in restore command to pull backups back to local systems
+- **Backup Verification**: Multi-level integrity checks (metadata, stream, full restore test)
 - **Time-based Retention**: Intuitive policies (hourly, daily, weekly, monthly, yearly)
 - **Rich Progress Bars**: Real-time transfer progress with speed, ETA, and percentage
 - **Parallel Execution**: Concurrent volume and target transfers
@@ -139,6 +140,7 @@ btrfs-backup-ng install --user --timer=daily
 | `transfer` | Transfer existing snapshots to targets |
 | `prune` | Apply retention policies |
 | `restore` | Restore snapshots from backup location |
+| `verify` | Verify backup integrity (metadata, stream, or full test) |
 | `list` | Show snapshots and backups |
 | `status` | Show job status and statistics |
 | `config validate` | Validate configuration file |
@@ -1347,6 +1349,82 @@ btrfs-backup-ng restore ssh://...:/backups/home /mnt/restore --rate-limit=50M
 4. **Incremental restore chains are automatic**. When restoring a snapshot that depends on parent snapshots, all required parents are restored first in the correct order.
 
 5. **Root privileges are typically required** for `btrfs receive`. Use `sudo` for local restores or `--ssh-sudo` for remote restores.
+
+## Backup Verification
+
+Verify that your backups are valid and restorable with the `verify` command. A backup you can't restore from is worthless - regular verification ensures your disaster recovery will work when you need it.
+
+### Verification Levels
+
+| Level | Speed | What It Checks |
+|-------|-------|----------------|
+| `metadata` | Fast | Snapshot existence, parent chain completeness |
+| `stream` | Medium | btrfs send stream can be generated (no data transfer) |
+| `full` | Slow | Actually restores to temp location and verifies |
+
+### Quick Metadata Check
+
+```bash
+# Verify local backup
+btrfs-backup-ng verify /mnt/backup/home --no-fs-checks
+
+# Verify remote backup over SSH
+btrfs-backup-ng verify ssh://backup@server:/backups/home --ssh-sudo --no-fs-checks
+```
+
+### Stream Verification
+
+Tests that `btrfs send` stream can be generated without transferring data:
+
+```bash
+btrfs-backup-ng verify /mnt/backup/home --level stream --no-fs-checks
+```
+
+### Full Restore Test
+
+The definitive test - actually restores snapshot to a temporary location:
+
+```bash
+# For local backups (temp dir created automatically)
+btrfs-backup-ng verify /mnt/backup/home --level full --no-fs-checks
+
+# For remote backups (must specify local btrfs temp dir)
+btrfs-backup-ng verify ssh://server:/backups/home --level full \
+    --temp-dir /mnt/btrfs-test --ssh-sudo --no-fs-checks
+```
+
+### Verify Specific Snapshot
+
+```bash
+btrfs-backup-ng verify /mnt/backup/home --snapshot home-20260104-120000 --no-fs-checks
+```
+
+### Automation with JSON Output
+
+```bash
+# Get machine-readable output
+btrfs-backup-ng verify /mnt/backup/home --json --no-fs-checks
+
+# Example: Alert on failure
+if ! btrfs-backup-ng verify /mnt/backup/home --quiet --no-fs-checks; then
+    echo "Backup verification failed!" | mail -s "Backup Alert" admin@example.com
+fi
+```
+
+### Verification Options
+
+| Option | Description |
+|--------|-------------|
+| `--level` | Verification level: metadata, stream, or full |
+| `--snapshot NAME` | Verify only specific snapshot |
+| `--temp-dir PATH` | Temp directory for full verification (must be on btrfs) |
+| `--no-cleanup` | Keep restored snapshots after full verification |
+| `--prefix PREFIX` | Filter snapshots by prefix |
+| `--ssh-sudo` | Use sudo for remote btrfs commands |
+| `--ssh-key FILE` | SSH private key file |
+| `--no-fs-checks` | Skip btrfs subvolume verification |
+| `--json` | Output in JSON format |
+| `-q, --quiet` | Suppress progress output |
 
 ## Legacy CLI Mode
 

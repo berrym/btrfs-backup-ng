@@ -16,6 +16,7 @@ This directory contains manual pages for btrfs-backup-ng.
 | `btrfs-backup-ng-config(1)` | Configuration management |
 | `btrfs-backup-ng-install(1)` | Install systemd timer/service |
 | `btrfs-backup-ng-restore(1)` | Restore snapshots from backup |
+| `btrfs-backup-ng-verify(1)` | Verify backup integrity |
 
 ## Installation
 

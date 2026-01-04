@@ -19,6 +19,7 @@ _btrfs-backup-ng() {
         'install:Install systemd timer/service'
         'uninstall:Remove systemd timer/service'
         'restore:Restore snapshots from backup location'
+        'verify:Verify backup integrity'
     )
 
     local -a global_opts
@@ -152,6 +153,22 @@ _btrfs-backup-ng() {
                         '(--progress --no-progress)'--no-progress'[Disable progress bars]' \
                         '1:source (backup location):_files -/' \
                         '2:destination (local path):_directories'
+                    ;;
+                verify)
+                    local -a verify_levels
+                    verify_levels=(metadata stream full)
+                    _arguments \
+                        '--level[Verification level]:level:(${verify_levels})' \
+                        '--snapshot[Verify specific snapshot only]:snapshot name:' \
+                        '--temp-dir[Temporary directory for full verification]:directory:_directories' \
+                        '--no-cleanup[Do not delete restored snapshots after full verification]' \
+                        '--prefix[Snapshot prefix filter]:prefix:' \
+                        '--ssh-sudo[Use sudo for btrfs commands on remote host]' \
+                        '--ssh-key[SSH private key file]:key file:_files' \
+                        '--no-fs-checks[Skip btrfs subvolume verification]' \
+                        '--json[Output results in JSON format]' \
+                        '(-q --quiet)'{-q,--quiet}'[Suppress progress output]' \
+                        '1:backup location:_files -/'
                     ;;
             esac
             ;;

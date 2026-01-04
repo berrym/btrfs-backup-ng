@@ -5,7 +5,7 @@ _btrfs_backup_ng() {
     local cur prev words cword split
     _init_completion -s || return
 
-    local commands="run snapshot transfer prune list status config install uninstall restore"
+    local commands="run snapshot transfer prune list status config install uninstall restore verify"
     local config_subcommands="validate init import"
 
     # Global options
@@ -24,6 +24,8 @@ _btrfs_backup_ng() {
     local config_validate_opts=""
     local config_init_opts="-o --output"
     local config_import_opts="-o --output"
+    local verify_opts="--level --snapshot --temp-dir --no-cleanup --prefix --ssh-sudo --ssh-key --no-fs-checks --json -q --quiet"
+    local verify_levels="metadata stream full"
 
     # Compression methods
     local compress_methods="none zstd gzip lz4 pigz lzop"
@@ -37,7 +39,7 @@ _btrfs_backup_ng() {
     local i
     for ((i=1; i < cword; i++)); do
         case "${words[i]}" in
-            run|snapshot|transfer|prune|list|status|config|install|uninstall|restore)
+            run|snapshot|transfer|prune|list|status|config|install|uninstall|restore|verify)
                 cmd="${words[i]}"
                 ;;
             validate|init|import)
@@ -80,6 +82,14 @@ _btrfs_backup_ng() {
             ;;
         --oncalendar|--before|--snapshot|--prefix|--unlock)
             # Free-form text arguments
+            return
+            ;;
+        --level)
+            COMPREPLY=($(compgen -W "$verify_levels" -- "$cur"))
+            return
+            ;;
+        --temp-dir)
+            _filedir -d
             return
             ;;
     esac
@@ -152,6 +162,14 @@ _btrfs_backup_ng() {
                         fi
                         ;;
                 esac
+            fi
+            ;;
+        verify)
+            if [[ "$cur" == -* ]]; then
+                COMPREPLY=($(compgen -W "$verify_opts" -- "$cur"))
+            else
+                # Complete paths for LOCATION
+                _filedir -d
             fi
             ;;
     esac

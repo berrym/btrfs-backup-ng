@@ -80,6 +80,10 @@ Remove installed systemd timer/service.
 .B restore
 Restore snapshots from backup location back to local system.
 See \fBbtrfs-backup-ng-restore\fR(1).
+.TP
+.B verify
+Verify backup integrity at local or remote locations.
+See \fBbtrfs-backup-ng-verify\fR(1).
 .SH CONFIGURATION
 Configuration files use TOML format and are searched in this order:
 .IP 1. 3
@@ -222,6 +226,7 @@ Configuration error.
 .SH SEE ALSO
 .BR btrfs-backup-ng-run (1),
 .BR btrfs-backup-ng-restore (1),
+.BR btrfs-backup-ng-verify (1),
 .BR btrfs-backup-ng-config (1),
 .BR btrfs (8),
 .BR btrfs-send (8),

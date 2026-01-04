@@ -23,6 +23,7 @@ SUBCOMMANDS = frozenset(
         "install",
         "uninstall",
         "restore",
+        "verify",
     }
 )
 
@@ -450,6 +451,93 @@ Examples:
 
     add_progress_args(restore_parser)
 
+    # verify command
+    verify_parser = subparsers.add_parser(
+        "verify",
+        help="Verify backup integrity",
+        description="Check that backups are valid and restorable",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Verification levels:
+  metadata  Quick check of snapshot existence and parent chain integrity
+  stream    Verify btrfs send stream can be generated (no data transfer)
+  full      Complete restore test to temporary location (most thorough)
+
+Examples:
+  # Quick metadata check
+  btrfs-backup-ng verify /mnt/backup/home
+
+  # Verify remote backup over SSH
+  btrfs-backup-ng verify ssh://backup@server:/backups/home --ssh-sudo
+
+  # Stream integrity check
+  btrfs-backup-ng verify /mnt/backup/home --level stream
+
+  # Full restore test (requires temp dir on btrfs)
+  btrfs-backup-ng verify ssh://...:/backups/home --level full --temp-dir /mnt/test
+
+  # Verify specific snapshot
+  btrfs-backup-ng verify /mnt/backup/home --snapshot home-20260104-120000
+""",
+    )
+    verify_parser.add_argument(
+        "location",
+        metavar="LOCATION",
+        help="Backup location to verify (local path or ssh://user@host:/path)",
+    )
+    verify_parser.add_argument(
+        "--level",
+        choices=["metadata", "stream", "full"],
+        default="metadata",
+        help="Verification level (default: metadata)",
+    )
+    verify_parser.add_argument(
+        "--snapshot",
+        metavar="NAME",
+        help="Verify specific snapshot only",
+    )
+    verify_parser.add_argument(
+        "--temp-dir",
+        metavar="PATH",
+        help="Temporary directory for full verification (must be on btrfs)",
+    )
+    verify_parser.add_argument(
+        "--no-cleanup",
+        action="store_true",
+        help="Don't delete restored snapshots after full verification",
+    )
+    verify_parser.add_argument(
+        "--prefix",
+        metavar="PREFIX",
+        help="Snapshot prefix filter",
+    )
+    verify_parser.add_argument(
+        "--ssh-sudo",
+        action="store_true",
+        help="Use sudo for btrfs commands on remote host",
+    )
+    verify_parser.add_argument(
+        "--ssh-key",
+        metavar="FILE",
+        help="SSH private key file",
+    )
+    verify_parser.add_argument(
+        "--no-fs-checks",
+        action="store_true",
+        help="Skip btrfs subvolume verification",
+    )
+    verify_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Output results in JSON format",
+    )
+    verify_parser.add_argument(
+        "-q",
+        "--quiet",
+        action="store_true",
+        help="Suppress progress output",
+    )
+
     return parser
 
 
@@ -538,6 +626,7 @@ def run_subcommand(args: argparse.Namespace) -> int:
         "install": cmd_install,
         "uninstall": cmd_uninstall,
         "restore": cmd_restore,
+        "verify": cmd_verify,
     }
 
     handler = handlers.get(args.command)
@@ -620,6 +709,13 @@ def cmd_restore(args: argparse.Namespace) -> int:
     from .restore import execute_restore
 
     return execute_restore(args)
+
+
+def cmd_verify(args: argparse.Namespace) -> int:
+    """Execute verify command."""
+    from .verify import execute
+
+    return execute(args)
 
 
 def main(argv: list[str] | None = None) -> int:

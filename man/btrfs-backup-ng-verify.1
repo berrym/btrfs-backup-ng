@@ -1,0 +1,175 @@
+.\" Man page for btrfs-backup-ng verify
+.TH BTRFS-BACKUP-NG-VERIFY 1 "January 2026" "btrfs-backup-ng" "User Commands"
+.SH NAME
+btrfs-backup-ng-verify \- verify backup integrity
+.SH SYNOPSIS
+.B btrfs-backup-ng verify
+[\fIOPTIONS\fR] \fILOCATION\fR
+.SH DESCRIPTION
+Verify that backups at a given location are valid and restorable. This command
+provides multiple levels of verification to check backup integrity, from quick
+metadata checks to full restore tests.
+.PP
+Verification works with both local backup directories and remote SSH locations.
+.SH ARGUMENTS
+.TP
+.I LOCATION
+Backup location to verify. Can be a local path (e.g., /mnt/backup/home) or
+an SSH URL (e.g., ssh://user@host:/path/to/backup).
+.SH OPTIONS
+.TP
+.BI \-\-level " " \fILEVEL\fR
+Verification level. Default: metadata. Valid levels:
+.RS
+.TP
+.B metadata
+Quick check of snapshot existence and parent chain integrity. Verifies that
+all snapshots exist and that incremental chains are complete (no missing
+parent snapshots). This is fast and non-destructive.
+.TP
+.B stream
+Verify that btrfs send stream can be generated. Uses \fBbtrfs send --no-data\fR
+to test stream generation without transferring actual file data. This validates
+that snapshot metadata is intact.
+.TP
+.B full
+Complete restore test to a temporary location. Actually restores snapshot(s)
+and verifies the restored subvolume is valid. This is the most thorough check
+but also the slowest. Requires \fB--temp-dir\fR for remote backups.
+.RE
+.TP
+.BI \-\-snapshot " " \fINAME\fR
+Verify only the specified snapshot instead of all snapshots.
+.TP
+.BI \-\-temp-dir " " \fIPATH\fR
+Temporary directory for full verification. Must be on a btrfs filesystem.
+Required for full verification of remote backups.
+.TP
+.B \-\-no-cleanup
+Do not delete restored snapshots after full verification. Useful for
+inspection or debugging.
+.TP
+.BI \-\-prefix " " \fIPREFIX\fR
+Only verify snapshots matching the given prefix.
+.TP
+.B \-\-ssh-sudo
+Use sudo for btrfs commands on remote host.
+.TP
+.BI \-\-ssh-key " " \fIFILE\fR
+SSH private key file for authentication.
+.TP
+.B \-\-no-fs-checks
+Skip btrfs subvolume verification checks.
+.TP
+.B \-\-json
+Output results in JSON format for scripting and automation.
+.TP
+.BR \-q ", " \-\-quiet
+Suppress progress output.
+.SH VERIFICATION LEVELS
+.SS Metadata (Fast)
+Checks performed:
+.IP \(bu 2
+Snapshot existence at backup location
+.IP \(bu 2
+Parent chain completeness (no missing incremental parents)
+.IP \(bu 2
+Optional comparison with source to find missing backups
+.PP
+This level is suitable for routine checks and can verify hundreds of
+snapshots in seconds.
+.SS Stream (Medium)
+In addition to metadata checks:
+.IP \(bu 2
+Generates btrfs send stream with \fB--no-data\fR flag
+.IP \(bu 2
+Validates stream header and metadata integrity
+.IP \(bu 2
+Does not transfer actual file data
+.PP
+This level catches corruption in snapshot metadata that metadata-only
+checks might miss.
+.SS Full (Thorough)
+Performs actual restore:
+.IP \(bu 2
+Restores snapshot to temporary location
+.IP \(bu 2
+Verifies restored path is a valid btrfs subvolume
+.IP \(bu 2
+Tests the complete restore pipeline
+.IP \(bu 2
+Cleans up after verification (unless \fB--no-cleanup\fR)
+.PP
+This is the definitive test that a backup can be restored.
+.SH EXIT STATUS
+.TP
+.B 0
+All verifications passed.
+.TP
+.B 1
+One or more verifications failed.
+.TP
+.B 2
+Error during verification (could not complete).
+.SH EXAMPLES
+.TP
+Quick metadata check of local backup:
+.B btrfs-backup-ng verify /mnt/backup/home
+.TP
+Verify remote backup over SSH:
+.B btrfs-backup-ng verify ssh://backup@server:/backups/home --ssh-sudo
+.TP
+Stream integrity check:
+.B btrfs-backup-ng verify /mnt/backup/home --level stream
+.TP
+Full restore test:
+.B btrfs-backup-ng verify /mnt/backup/home --level full --temp-dir /mnt/test
+.TP
+Full verification of remote backup:
+.B btrfs-backup-ng verify ssh://server:/backups/home --level full --temp-dir /mnt/test
+.TP
+Verify specific snapshot:
+.B btrfs-backup-ng verify /mnt/backup/home --snapshot home-20260104-120000
+.TP
+JSON output for automation:
+.B btrfs-backup-ng verify /mnt/backup/home --json
+.SH OUTPUT
+The verify command displays a table of results showing:
+.IP \(bu 2
+Snapshot name
+.IP \(bu 2
+Pass/Fail status
+.IP \(bu 2
+Details (parent snapshot, error messages)
+.PP
+Summary shows total passed, failed, and duration.
+.PP
+With \fB--json\fR, output is a JSON object containing:
+.IP \(bu 2
+level: Verification level used
+.IP \(bu 2
+location: Backup location
+.IP \(bu 2
+duration_seconds: Total verification time
+.IP \(bu 2
+summary: Counts of passed, failed, total
+.IP \(bu 2
+results: Array of individual snapshot results
+.IP \(bu 2
+errors: Array of error messages
+.SH AUTOMATION
+For automated backup verification in scripts or cron:
+.PP
+.RS
+.nf
+#!/bin/bash
+if ! btrfs-backup-ng verify /mnt/backup/home --json > /tmp/verify.json; then
+    # Send alert on failure
+    cat /tmp/verify.json | mail -s "Backup verification failed" admin@example.com
+fi
+.fi
+.RE
+.SH SEE ALSO
+.BR btrfs-backup-ng (1),
+.BR btrfs-backup-ng-restore (1),
+.BR btrfs-send (8)
