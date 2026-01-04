@@ -10,11 +10,10 @@ name = "btrfs-backup-ng"
 version = "0.7.0"
 description = "Swiss army knife cli tool for atomic, incremental, intelligent, feature-rich backups for btrfs"
 authors = [{ name = "Michael Berry", email = "trismegustis@gmail.com" }]
-license = { text = "MIT" }
+license = "MIT"
 dependencies = ["filelock", "rich", "paramiko"]
 classifiers = [
     "Programming Language :: Python :: 3",
-    "License :: OSI Approved :: MIT License",
     "Operating System :: POSIX :: Linux",
 ]
 requires-python = ">=3.11"
