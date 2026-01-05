@@ -1,5 +1,6 @@
 """Tests for restore functionality."""
 
+import argparse
 import time
 from unittest.mock import ANY, MagicMock, patch
 
@@ -1373,3 +1374,736 @@ class TestRestoreSnapshots:
 
         assert "errors" in stats
         assert isinstance(stats["errors"], list)
+
+
+# Tests for CLI entry points
+
+
+class TestExecuteRestore:
+    """Tests for execute_restore CLI entry point."""
+
+    def test_no_source_shows_error(self):
+        """Test execute_restore with no source shows error."""
+        from btrfs_backup_ng.cli.restore import execute_restore
+
+        args = argparse.Namespace(
+            list_volumes=False,
+            volume=None,
+            list=False,
+            status=False,
+            unlock=None,
+            cleanup=False,
+            source=None,
+            destination=None,
+            verbose=0,
+            quiet=False,
+        )
+
+        result = execute_restore(args)
+
+        assert result == 1
+
+    def test_no_destination_shows_error(self):
+        """Test execute_restore with source but no destination."""
+        from btrfs_backup_ng.cli.restore import execute_restore
+
+        args = argparse.Namespace(
+            list_volumes=False,
+            volume=None,
+            list=False,
+            status=False,
+            unlock=None,
+            cleanup=False,
+            source="/backup",
+            destination=None,
+            verbose=0,
+            quiet=False,
+        )
+
+        result = execute_restore(args)
+
+        assert result == 1
+
+    @patch("btrfs_backup_ng.cli.restore._execute_list_volumes")
+    def test_list_volumes_mode(self, mock_list_volumes):
+        """Test --list-volumes mode calls _execute_list_volumes."""
+        from btrfs_backup_ng.cli.restore import execute_restore
+
+        mock_list_volumes.return_value = 0
+
+        args = argparse.Namespace(
+            list_volumes=True,
+            volume=None,
+            verbose=0,
+            quiet=False,
+        )
+
+        result = execute_restore(args)
+
+        assert result == 0
+        mock_list_volumes.assert_called_once()
+
+    @patch("btrfs_backup_ng.cli.restore._execute_config_restore")
+    def test_volume_mode(self, mock_config_restore):
+        """Test --volume mode calls _execute_config_restore."""
+        from btrfs_backup_ng.cli.restore import execute_restore
+
+        mock_config_restore.return_value = 0
+
+        args = argparse.Namespace(
+            list_volumes=False,
+            volume="/home",
+            verbose=0,
+            quiet=False,
+        )
+
+        result = execute_restore(args)
+
+        assert result == 0
+        mock_config_restore.assert_called_once_with(args, "/home")
+
+    @patch("btrfs_backup_ng.cli.restore._execute_list")
+    def test_list_mode(self, mock_list):
+        """Test --list mode calls _execute_list."""
+        from btrfs_backup_ng.cli.restore import execute_restore
+
+        mock_list.return_value = 0
+
+        args = argparse.Namespace(
+            list_volumes=False,
+            volume=None,
+            list=True,
+            status=False,
+            unlock=None,
+            cleanup=False,
+            source="/backup",
+            destination=None,
+            verbose=0,
+            quiet=False,
+        )
+
+        result = execute_restore(args)
+
+        assert result == 0
+        mock_list.assert_called_once()
+
+    @patch("btrfs_backup_ng.cli.restore._execute_status")
+    def test_status_mode(self, mock_status):
+        """Test --status mode calls _execute_status."""
+        from btrfs_backup_ng.cli.restore import execute_restore
+
+        mock_status.return_value = 0
+
+        args = argparse.Namespace(
+            list_volumes=False,
+            volume=None,
+            list=False,
+            status=True,
+            unlock=None,
+            cleanup=False,
+            source="/backup",
+            destination=None,
+            verbose=0,
+            quiet=False,
+        )
+
+        result = execute_restore(args)
+
+        assert result == 0
+        mock_status.assert_called_once()
+
+    @patch("btrfs_backup_ng.cli.restore._execute_unlock")
+    def test_unlock_mode(self, mock_unlock):
+        """Test --unlock mode calls _execute_unlock."""
+        from btrfs_backup_ng.cli.restore import execute_restore
+
+        mock_unlock.return_value = 0
+
+        args = argparse.Namespace(
+            list_volumes=False,
+            volume=None,
+            list=False,
+            status=False,
+            unlock="session-123",
+            cleanup=False,
+            source="/backup",
+            destination=None,
+            verbose=0,
+            quiet=False,
+        )
+
+        result = execute_restore(args)
+
+        assert result == 0
+        mock_unlock.assert_called_once_with(args, "session-123")
+
+    @patch("btrfs_backup_ng.cli.restore._execute_cleanup")
+    def test_cleanup_mode(self, mock_cleanup):
+        """Test --cleanup mode calls _execute_cleanup."""
+        from btrfs_backup_ng.cli.restore import execute_restore
+
+        mock_cleanup.return_value = 0
+
+        args = argparse.Namespace(
+            list_volumes=False,
+            volume=None,
+            list=False,
+            status=False,
+            unlock=None,
+            cleanup=True,
+            source=None,
+            destination="/restore",
+            verbose=0,
+            quiet=False,
+        )
+
+        result = execute_restore(args)
+
+        assert result == 0
+        mock_cleanup.assert_called_once()
+
+
+class TestExecuteMainRestore:
+    """Tests for _execute_main_restore function."""
+
+    @patch("btrfs_backup_ng.cli.restore.validate_restore_destination")
+    def test_destination_validation_failure(self, mock_validate, tmp_path):
+        """Test handling of destination validation failure."""
+        from btrfs_backup_ng.cli.restore import _execute_main_restore
+
+        mock_validate.side_effect = RestoreError("Not a btrfs filesystem")
+
+        args = argparse.Namespace(
+            source="/backup",
+            destination=str(tmp_path),
+            in_place=False,
+            yes_i_know_what_i_am_doing=False,
+            verbose=0,
+            quiet=False,
+        )
+
+        result = _execute_main_restore(args)
+
+        assert result == 1
+
+    @patch("btrfs_backup_ng.cli.restore._prepare_local_endpoint")
+    @patch("btrfs_backup_ng.cli.restore._prepare_backup_endpoint")
+    @patch("btrfs_backup_ng.cli.restore.validate_restore_destination")
+    def test_backup_endpoint_failure(
+        self, mock_validate, mock_prep_backup, mock_prep_local, tmp_path
+    ):
+        """Test handling of backup endpoint preparation failure."""
+        from btrfs_backup_ng.cli.restore import _execute_main_restore
+
+        mock_prep_backup.side_effect = Exception("SSH connection failed")
+
+        args = argparse.Namespace(
+            source="ssh://server/backup",
+            destination=str(tmp_path),
+            in_place=False,
+            yes_i_know_what_i_am_doing=False,
+            verbose=0,
+            quiet=False,
+        )
+
+        result = _execute_main_restore(args)
+
+        assert result == 1
+
+    @patch("btrfs_backup_ng.cli.restore._prepare_local_endpoint")
+    @patch("btrfs_backup_ng.cli.restore._prepare_backup_endpoint")
+    @patch("btrfs_backup_ng.cli.restore.validate_restore_destination")
+    def test_local_endpoint_failure(
+        self, mock_validate, mock_prep_backup, mock_prep_local, tmp_path
+    ):
+        """Test handling of local endpoint preparation failure."""
+        from btrfs_backup_ng.cli.restore import _execute_main_restore
+
+        mock_prep_backup.return_value = MagicMock()
+        mock_prep_local.side_effect = Exception("Cannot create local endpoint")
+
+        args = argparse.Namespace(
+            source="/backup",
+            destination=str(tmp_path),
+            in_place=False,
+            yes_i_know_what_i_am_doing=False,
+            verbose=0,
+            quiet=False,
+        )
+
+        result = _execute_main_restore(args)
+
+        assert result == 1
+
+    @patch("btrfs_backup_ng.cli.restore.restore_snapshots")
+    @patch("btrfs_backup_ng.cli.restore._prepare_local_endpoint")
+    @patch("btrfs_backup_ng.cli.restore._prepare_backup_endpoint")
+    @patch("btrfs_backup_ng.cli.restore.validate_restore_destination")
+    def test_restore_error(
+        self, mock_validate, mock_prep_backup, mock_prep_local, mock_restore, tmp_path
+    ):
+        """Test handling of RestoreError during restore."""
+        from btrfs_backup_ng.cli.restore import _execute_main_restore
+
+        mock_prep_backup.return_value = MagicMock()
+        mock_prep_local.return_value = MagicMock()
+        mock_restore.side_effect = RestoreError("Snapshot not found")
+
+        args = argparse.Namespace(
+            source="/backup",
+            destination=str(tmp_path),
+            in_place=False,
+            yes_i_know_what_i_am_doing=False,
+            before=None,
+            dry_run=False,
+            snapshot=None,
+            all=False,
+            overwrite=False,
+            no_incremental=False,
+            interactive=False,
+            compress=None,
+            rate_limit=None,
+            verbose=0,
+            quiet=False,
+        )
+
+        result = _execute_main_restore(args)
+
+        assert result == 1
+
+    @patch("btrfs_backup_ng.cli.restore.restore_snapshots")
+    @patch("btrfs_backup_ng.cli.restore._prepare_local_endpoint")
+    @patch("btrfs_backup_ng.cli.restore._prepare_backup_endpoint")
+    @patch("btrfs_backup_ng.cli.restore.validate_restore_destination")
+    def test_successful_restore(
+        self, mock_validate, mock_prep_backup, mock_prep_local, mock_restore, tmp_path
+    ):
+        """Test successful restore returns 0."""
+        from btrfs_backup_ng.cli.restore import _execute_main_restore
+
+        mock_prep_backup.return_value = MagicMock()
+        mock_prep_local.return_value = MagicMock()
+        mock_restore.return_value = {"restored": 2, "skipped": 0, "failed": 0}
+
+        args = argparse.Namespace(
+            source="/backup",
+            destination=str(tmp_path),
+            in_place=False,
+            yes_i_know_what_i_am_doing=False,
+            before=None,
+            dry_run=False,
+            snapshot=None,
+            all=False,
+            overwrite=False,
+            no_incremental=False,
+            interactive=False,
+            compress=None,
+            rate_limit=None,
+            verbose=0,
+            quiet=False,
+        )
+
+        result = _execute_main_restore(args)
+
+        assert result == 0
+
+    @patch("btrfs_backup_ng.cli.restore.restore_snapshots")
+    @patch("btrfs_backup_ng.cli.restore._prepare_local_endpoint")
+    @patch("btrfs_backup_ng.cli.restore._prepare_backup_endpoint")
+    @patch("btrfs_backup_ng.cli.restore.validate_restore_destination")
+    def test_restore_with_failures_returns_1(
+        self, mock_validate, mock_prep_backup, mock_prep_local, mock_restore, tmp_path
+    ):
+        """Test restore with failures returns 1."""
+        from btrfs_backup_ng.cli.restore import _execute_main_restore
+
+        mock_prep_backup.return_value = MagicMock()
+        mock_prep_local.return_value = MagicMock()
+        mock_restore.return_value = {"restored": 1, "skipped": 0, "failed": 1}
+
+        args = argparse.Namespace(
+            source="/backup",
+            destination=str(tmp_path),
+            in_place=False,
+            yes_i_know_what_i_am_doing=False,
+            before=None,
+            dry_run=False,
+            snapshot=None,
+            all=False,
+            overwrite=False,
+            no_incremental=False,
+            interactive=False,
+            compress=None,
+            rate_limit=None,
+            verbose=0,
+            quiet=False,
+        )
+
+        result = _execute_main_restore(args)
+
+        assert result == 1
+
+    @patch("btrfs_backup_ng.cli.restore.restore_snapshots")
+    @patch("btrfs_backup_ng.cli.restore._prepare_local_endpoint")
+    @patch("btrfs_backup_ng.cli.restore._prepare_backup_endpoint")
+    @patch("btrfs_backup_ng.cli.restore.validate_restore_destination")
+    def test_invalid_before_date_format(
+        self, mock_validate, mock_prep_backup, mock_prep_local, mock_restore, tmp_path
+    ):
+        """Test invalid --before date format."""
+        from btrfs_backup_ng.cli.restore import _execute_main_restore
+
+        mock_prep_backup.return_value = MagicMock()
+        mock_prep_local.return_value = MagicMock()
+
+        args = argparse.Namespace(
+            source="/backup",
+            destination=str(tmp_path),
+            in_place=False,
+            yes_i_know_what_i_am_doing=False,
+            before="not-a-date",
+            dry_run=False,
+            snapshot=None,
+            all=False,
+            overwrite=False,
+            no_incremental=False,
+            interactive=False,
+            compress=None,
+            rate_limit=None,
+            verbose=0,
+            quiet=False,
+        )
+
+        result = _execute_main_restore(args)
+
+        assert result == 1
+
+
+class TestExecuteList:
+    """Tests for _execute_list function."""
+
+    def test_list_no_source(self):
+        """Test --list without source shows error."""
+        from btrfs_backup_ng.cli.restore import _execute_list
+
+        args = MagicMock()
+        args.source = None
+
+        result = _execute_list(args)
+
+        assert result == 1
+
+    @patch("btrfs_backup_ng.cli.restore._prepare_backup_endpoint")
+    def test_list_endpoint_failure(self, mock_prepare):
+        """Test --list with endpoint failure."""
+        from btrfs_backup_ng.cli.restore import _execute_list
+
+        mock_prepare.side_effect = Exception("Connection failed")
+
+        args = MagicMock()
+        args.source = "/backup"
+
+        result = _execute_list(args)
+
+        assert result == 1
+
+    @patch("btrfs_backup_ng.cli.restore.list_remote_snapshots")
+    @patch("btrfs_backup_ng.cli.restore._prepare_backup_endpoint")
+    def test_list_empty(self, mock_prepare, mock_list):
+        """Test --list with no snapshots."""
+        from btrfs_backup_ng.cli.restore import _execute_list
+
+        mock_prepare.return_value = MagicMock()
+        mock_list.return_value = []
+
+        args = MagicMock()
+        args.source = "/backup"
+
+        result = _execute_list(args)
+
+        assert result == 0
+
+    @patch("btrfs_backup_ng.cli.restore.list_remote_snapshots")
+    @patch("btrfs_backup_ng.cli.restore._prepare_backup_endpoint")
+    def test_list_with_snapshots(self, mock_prepare, mock_list, capsys):
+        """Test --list shows snapshots."""
+        from btrfs_backup_ng.cli.restore import _execute_list
+
+        mock_prepare.return_value = MagicMock()
+        mock_list.return_value = [
+            MockSnapshot("snap-1"),
+            MockSnapshot("snap-2"),
+        ]
+
+        args = MagicMock()
+        args.source = "/backup"
+
+        result = _execute_list(args)
+
+        assert result == 0
+        captured = capsys.readouterr()
+        assert "snap-1" in captured.out
+        assert "snap-2" in captured.out
+        assert "2 snapshot(s)" in captured.out
+
+    @patch("btrfs_backup_ng.cli.restore.list_remote_snapshots")
+    @patch("btrfs_backup_ng.cli.restore._prepare_backup_endpoint")
+    def test_list_exception(self, mock_prepare, mock_list):
+        """Test --list handles exceptions."""
+        from btrfs_backup_ng.cli.restore import _execute_list
+
+        mock_prepare.return_value = MagicMock()
+        mock_list.side_effect = Exception("Failed to list")
+
+        args = MagicMock()
+        args.source = "/backup"
+
+        result = _execute_list(args)
+
+        assert result == 1
+
+
+class TestPrepareBackupEndpoint:
+    """Tests for _prepare_backup_endpoint function."""
+
+    @patch("btrfs_backup_ng.cli.restore.endpoint.choose_endpoint")
+    def test_local_endpoint(self, mock_choose, tmp_path):
+        """Test preparing local backup endpoint."""
+        from btrfs_backup_ng.cli.restore import _prepare_backup_endpoint
+
+        mock_ep = MagicMock()
+        mock_choose.return_value = mock_ep
+
+        args = MagicMock()
+        args.no_fs_checks = False
+        args.prefix = "home-"
+
+        _prepare_backup_endpoint(args, str(tmp_path))
+
+        mock_choose.assert_called_once()
+        mock_ep.prepare.assert_called_once()
+        # Check endpoint kwargs
+        call_kwargs = mock_choose.call_args[0][1]
+        assert call_kwargs["snap_prefix"] == "home-"
+        assert call_kwargs["fs_checks"] is True
+
+    @patch("btrfs_backup_ng.cli.restore.endpoint.choose_endpoint")
+    def test_ssh_endpoint(self, mock_choose):
+        """Test preparing SSH backup endpoint."""
+        from btrfs_backup_ng.cli.restore import _prepare_backup_endpoint
+
+        mock_ep = MagicMock()
+        mock_choose.return_value = mock_ep
+
+        args = MagicMock()
+        args.no_fs_checks = False
+        args.prefix = ""
+        args.ssh_sudo = True
+        args.ssh_password_auth = False
+        args.ssh_key = "/path/to/key"
+
+        _prepare_backup_endpoint(args, "ssh://user@server/backup")
+
+        call_kwargs = mock_choose.call_args[0][1]
+        assert call_kwargs["ssh_sudo"] is True
+        assert call_kwargs["ssh_identity_file"] == "/path/to/key"
+
+
+class TestPrepareLocalEndpoint:
+    """Tests for _prepare_local_endpoint function."""
+
+    @patch("btrfs_backup_ng.endpoint.local.LocalEndpoint")
+    def test_creates_directory(self, mock_local_ep, tmp_path):
+        """Test local endpoint creates destination directory."""
+        from btrfs_backup_ng.cli.restore import _prepare_local_endpoint
+
+        dest = tmp_path / "new_restore_dir"
+        assert not dest.exists()
+
+        _prepare_local_endpoint(dest)
+
+        assert dest.exists()
+
+    @patch("btrfs_backup_ng.endpoint.local.LocalEndpoint")
+    def test_calls_prepare(self, mock_local_ep, tmp_path):
+        """Test local endpoint prepare is called."""
+        from btrfs_backup_ng.cli.restore import _prepare_local_endpoint
+
+        mock_ep_instance = MagicMock()
+        mock_local_ep.return_value = mock_ep_instance
+
+        _prepare_local_endpoint(tmp_path)
+
+        mock_ep_instance.prepare.assert_called_once()
+
+
+class TestParseDatetime:
+    """Tests for _parse_datetime function."""
+
+    def test_parse_date_only(self):
+        """Test parsing date without time."""
+        from btrfs_backup_ng.cli.restore import _parse_datetime
+
+        result = _parse_datetime("2026-01-15")
+
+        assert result.tm_year == 2026
+        assert result.tm_mon == 1
+        assert result.tm_mday == 15
+
+    def test_parse_date_with_time(self):
+        """Test parsing date with time."""
+        from btrfs_backup_ng.cli.restore import _parse_datetime
+
+        result = _parse_datetime("2026-01-15 14:30:00")
+
+        assert result.tm_year == 2026
+        assert result.tm_hour == 14
+        assert result.tm_min == 30
+        assert result.tm_sec == 0
+
+    def test_parse_date_with_time_no_seconds(self):
+        """Test parsing date with time but no seconds."""
+        from btrfs_backup_ng.cli.restore import _parse_datetime
+
+        result = _parse_datetime("2026-01-15 14:30")
+
+        assert result.tm_hour == 14
+        assert result.tm_min == 30
+
+    def test_parse_iso_format(self):
+        """Test parsing ISO format with T separator."""
+        from btrfs_backup_ng.cli.restore import _parse_datetime
+
+        result = _parse_datetime("2026-01-15T14:30:00")
+
+        assert result.tm_year == 2026
+        assert result.tm_hour == 14
+
+    def test_parse_invalid_format(self):
+        """Test parsing invalid format raises ValueError."""
+        from btrfs_backup_ng.cli.restore import _parse_datetime
+
+        with pytest.raises(ValueError, match="Could not parse date"):
+            _parse_datetime("invalid-date")
+
+
+class TestInteractiveSelect:
+    """Tests for _interactive_select function."""
+
+    @patch("btrfs_backup_ng.cli.restore.list_remote_snapshots")
+    def test_no_snapshots_returns_none(self, mock_list):
+        """Test returns None when no snapshots available."""
+        from btrfs_backup_ng.cli.restore import _interactive_select
+
+        mock_list.return_value = []
+
+        result = _interactive_select(MagicMock())
+
+        assert result is None
+
+    @patch("btrfs_backup_ng.cli.restore.list_remote_snapshots")
+    def test_exception_returns_none(self, mock_list):
+        """Test returns None on exception."""
+        from btrfs_backup_ng.cli.restore import _interactive_select
+
+        mock_list.side_effect = Exception("Failed")
+
+        result = _interactive_select(MagicMock())
+
+        assert result is None
+
+    @patch("builtins.input", side_effect=["0"])
+    @patch("btrfs_backup_ng.cli.restore.list_remote_snapshots")
+    def test_cancel_returns_none(self, mock_list, mock_input):
+        """Test selecting 0 cancels and returns None."""
+        from btrfs_backup_ng.cli.restore import _interactive_select
+
+        mock_list.return_value = [MockSnapshot("snap-1")]
+
+        result = _interactive_select(MagicMock())
+
+        assert result is None
+
+    @patch("builtins.input", side_effect=[""])
+    @patch("btrfs_backup_ng.cli.restore.list_remote_snapshots")
+    def test_empty_input_returns_none(self, mock_list, mock_input):
+        """Test empty input cancels and returns None."""
+        from btrfs_backup_ng.cli.restore import _interactive_select
+
+        mock_list.return_value = [MockSnapshot("snap-1")]
+
+        result = _interactive_select(MagicMock())
+
+        assert result is None
+
+    @patch("builtins.input", side_effect=["1", "y"])
+    @patch("btrfs_backup_ng.cli.restore.list_remote_snapshots")
+    def test_select_and_confirm(self, mock_list, mock_input):
+        """Test selecting a snapshot and confirming."""
+        from btrfs_backup_ng.cli.restore import _interactive_select
+
+        mock_list.return_value = [MockSnapshot("snap-1"), MockSnapshot("snap-2")]
+
+        result = _interactive_select(MagicMock())
+
+        assert result == "snap-1"
+
+    @patch("builtins.input", side_effect=["1", "n"])
+    @patch("btrfs_backup_ng.cli.restore.list_remote_snapshots")
+    def test_select_and_decline(self, mock_list, mock_input):
+        """Test selecting a snapshot but declining confirmation."""
+        from btrfs_backup_ng.cli.restore import _interactive_select
+
+        mock_list.return_value = [MockSnapshot("snap-1")]
+
+        result = _interactive_select(MagicMock())
+
+        assert result is None
+
+    @patch("builtins.input", side_effect=["invalid", "1", "y"])
+    @patch("btrfs_backup_ng.cli.restore.list_remote_snapshots")
+    def test_invalid_input_then_valid(self, mock_list, mock_input):
+        """Test invalid input followed by valid selection."""
+        from btrfs_backup_ng.cli.restore import _interactive_select
+
+        mock_list.return_value = [MockSnapshot("snap-1")]
+
+        result = _interactive_select(MagicMock())
+
+        assert result == "snap-1"
+
+    @patch("builtins.input", side_effect=["5", "1", "y"])
+    @patch("btrfs_backup_ng.cli.restore.list_remote_snapshots")
+    def test_out_of_range_then_valid(self, mock_list, mock_input):
+        """Test out of range selection followed by valid."""
+        from btrfs_backup_ng.cli.restore import _interactive_select
+
+        mock_list.return_value = [MockSnapshot("snap-1")]
+
+        result = _interactive_select(MagicMock())
+
+        assert result == "snap-1"
+
+    @patch("builtins.input", side_effect=KeyboardInterrupt())
+    @patch("btrfs_backup_ng.cli.restore.list_remote_snapshots")
+    def test_keyboard_interrupt(self, mock_list, mock_input):
+        """Test keyboard interrupt returns None."""
+        from btrfs_backup_ng.cli.restore import _interactive_select
+
+        mock_list.return_value = [MockSnapshot("snap-1")]
+
+        result = _interactive_select(MagicMock())
+
+        assert result is None
+
+    @patch("builtins.input", side_effect=EOFError())
+    @patch("btrfs_backup_ng.cli.restore.list_remote_snapshots")
+    def test_eof_error(self, mock_list, mock_input):
+        """Test EOF error returns None."""
+        from btrfs_backup_ng.cli.restore import _interactive_select
+
+        mock_list.return_value = [MockSnapshot("snap-1")]
+
+        result = _interactive_select(MagicMock())
+
+        assert result is None
