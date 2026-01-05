@@ -1,0 +1,18 @@
+# Include tests for distribution
+recursive-include tests *.py
+
+# Include man pages
+recursive-include man *.1
+include man/README.md
+
+# Include shell completions
+recursive-include completions *
+
+# Include documentation
+include README.md
+include LICENSE
+include CHANGELOG.md
+include CONTRIBUTING.md
+
+# Include config example
+include config.example.toml

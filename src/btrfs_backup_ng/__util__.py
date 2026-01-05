@@ -210,12 +210,21 @@ def is_btrfs(path):
 
 
 def is_subvolume(path):
-    """Checks whether the given path is a btrfs subvolume."""
+    """Checks whether the given path is a btrfs subvolume.
+
+    Args:
+        path: Path to check
+
+    Returns:
+        True if path is a btrfs subvolume, False otherwise
+    """
+    path = Path(path).resolve()
+    if not path.exists():
+        return False
     if not is_btrfs(path):
         return False
     logger.debug("Checking for btrfs subvolume: %s", path)
     # subvolumes always have inode 256
-    path = Path(path).resolve()
     st = path.stat()
     result = st.st_ino == 256
     logger.debug("  -> Inode is %d, result is %r", st.st_ino, result)
