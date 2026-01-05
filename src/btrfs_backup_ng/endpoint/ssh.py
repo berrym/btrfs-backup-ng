@@ -24,24 +24,33 @@ import shlex
 import subprocess
 import threading
 import time
+import types
 import uuid
 from pathlib import Path
 from subprocess import CompletedProcess
 from threading import Lock
-from typing import Any, Dict, List, Optional, Tuple, TypeVar, cast
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, TypeVar, Union, cast
 
+# Handle paramiko import with proper typing
+paramiko: Optional[types.ModuleType]
 try:
-    import paramiko
+    import paramiko as _paramiko
 
+    paramiko = _paramiko
     PARAMIKO_AVAILABLE = True
 except ImportError:
-    paramiko = None  # type: ignore
+    paramiko = None
     PARAMIKO_AVAILABLE = False
 
-try:
-    import pwd
+if TYPE_CHECKING:
+    import paramiko as paramiko_types
 
-    _pwd = pwd
+# Handle pwd import with proper typing
+_pwd: Optional[types.ModuleType]
+try:
+    import pwd as _pwd_module
+
+    _pwd = _pwd_module
     _pwd_available = True
 except ImportError:
     _pwd = None
@@ -126,7 +135,6 @@ class SSHEndpoint(Endpoint):
         self._lock: Lock = Lock()
         self._last_receive_log: Optional[str] = None
         self._last_transfer_snapshot: Optional[bool] = None
-        self.ssh_manager: SSHMasterManager
         logger.debug(
             "SSHEndpoint: Config keys before parent init: %s", list(config.keys())
         )
@@ -226,7 +234,7 @@ class SSHEndpoint(Endpoint):
         if not identity_file and running_as_sudo:
             sudo_user = os.environ.get("SUDO_USER")
             sudo_user_home = None
-            if _pwd_available and _pwd is not None:
+            if _pwd_available and _pwd is not None and sudo_user is not None:
                 try:
                     sudo_user_home = _pwd.getpwnam(sudo_user).pw_dir
                 except Exception:
@@ -779,17 +787,17 @@ class SSHEndpoint(Endpoint):
         # Only show full summary at INFO level if there are failures
         if all_passed:
             logger.debug("All diagnostic tests passed")
-            for test, result in results.items():
-                logger.debug(f"Test {test}: PASSED")
+            for test_name, test_passed in results.items():
+                logger.debug(f"Test {test_name}: PASSED")
         else:
             # Show summary at INFO level only for failures
-            failed_tests = [test for test, result in results.items() if not result]
+            failed_tests = [t for t, passed in results.items() if not passed]
             logger.debug(f"Some diagnostic tests failed: {failed_tests}")
             logger.info("\nDiagnostic Summary:")
             logger.info("-" * 50)
-            for test, result in results.items():
-                status = "PASS" if result else "FAIL"
-                logger.info(f"{test.replace('_', ' ').title():20} {status}")
+            for test_name, test_passed in results.items():
+                status = "PASS" if test_passed else "FAIL"
+                logger.info(f"{test_name.replace('_', ' ').title():20} {status}")
             logger.info("-" * 50)
 
         # Provide specific recommendations based on what failed
@@ -2393,7 +2401,7 @@ class SSHEndpoint(Endpoint):
 
         # Build local btrfs send command
         send_cmd = ["sudo", "btrfs", "send"]
-        if is_incremental:
+        if is_incremental and parent_path is not None:
             send_cmd.extend(["-p", parent_path])
             logger.info(f"Using parent: {os.path.basename(parent_path)}")
         send_cmd.append(source_path)
@@ -2402,7 +2410,12 @@ class SSHEndpoint(Endpoint):
         escaped_dest = shlex.quote(dest_path)
         remote_cmd = f"sudo -S btrfs receive {escaped_dest}"
 
-        client: Optional[paramiko.SSHClient] = None
+        # Ensure paramiko is available
+        if paramiko is None:
+            logger.error("Paramiko is not available for SSH transfer")
+            return False
+
+        client: Optional[Any] = None
         send_proc: Optional[subprocess.Popen[bytes]] = None
 
         try:
@@ -2556,13 +2569,15 @@ class SSHEndpoint(Endpoint):
                 )
                 return False
 
-        except paramiko.AuthenticationException as e:
-            logger.error(f"SSH authentication failed: {e}")
-            return False
-        except paramiko.SSHException as e:
-            logger.error(f"SSH error: {e}")
-            return False
         except Exception as e:
+            # Handle paramiko-specific exceptions
+            if paramiko is not None:
+                if isinstance(e, paramiko.AuthenticationException):
+                    logger.error(f"SSH authentication failed: {e}")
+                    return False
+                if isinstance(e, paramiko.SSHException):
+                    logger.error(f"SSH error: {e}")
+                    return False
             logger.error(f"Transfer failed: {e}")
             return False
         finally:
@@ -2610,7 +2625,7 @@ class SSHEndpoint(Endpoint):
 
         # Build send command
         send_parts = ["sudo", "btrfs", "send"]
-        if is_incremental:
+        if is_incremental and parent_path is not None:
             send_parts.extend(["-p", shlex.quote(parent_path)])
             logger.info(f"Using parent: {os.path.basename(parent_path)}")
         send_parts.append(shlex.quote(source_path))
@@ -2661,8 +2676,9 @@ class SSHEndpoint(Endpoint):
             stderr_lines: List[str] = []
 
             def stream_stderr() -> None:
-                if proc.stderr:
-                    for chunk in iter(lambda: proc.stderr.read(80), b""):
+                stderr_stream = proc.stderr
+                if stderr_stream is not None:
+                    for chunk in iter(lambda: stderr_stream.read(80), b""):
                         if chunk:
                             text = chunk.decode(errors="replace")
                             sys.stderr.write(text)
@@ -2728,8 +2744,8 @@ class SSHEndpoint(Endpoint):
         if not self._is_master_active():
             logger.error("SSH master connection is down")
             try:
-                self.ssh_manager.stop()
-                self.ssh_manager.start()
+                self.ssh_manager.stop_master()
+                self.ssh_manager.start_master()
                 if not self._is_master_active():
                     logger.error("Failed to re-establish SSH master connection")
                     return False
