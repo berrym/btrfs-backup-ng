@@ -2,10 +2,7 @@
 
 import io
 import subprocess
-import threading
 from unittest.mock import MagicMock, patch
-
-import pytest
 
 from btrfs_backup_ng.core.progress import (
     ProgressReader,
@@ -338,9 +335,6 @@ class TestCreateRichProgress:
     )
     def test_returns_none_when_rich_unavailable(self):
         """Test returns None when Rich import fails."""
-        # Clear any cached imports
-        import importlib
-
         import btrfs_backup_ng.core.progress as prog_module
 
         # Patch the import to fail

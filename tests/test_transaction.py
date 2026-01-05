@@ -1,11 +1,10 @@
 """Tests for transaction logging."""
 
 import json
-import os
 import threading
 import time
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import pytest
 
@@ -235,7 +234,7 @@ class TestTransactionContext:
         set_transaction_log(log_path)
 
         with pytest.raises(ValueError):
-            with TransactionContext("backup") as tx:
+            with TransactionContext("backup"):
                 raise ValueError("Something went wrong")
 
         lines = log_path.read_text().strip().split("\n")

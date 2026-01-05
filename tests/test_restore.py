@@ -1,7 +1,7 @@
 """Tests for restore functionality."""
 
 import time
-from unittest.mock import MagicMock, patch
+from unittest.mock import ANY, MagicMock, patch
 
 import pytest
 
@@ -1360,7 +1360,3 @@ class TestRestoreSnapshots:
 
         assert "errors" in stats
         assert isinstance(stats["errors"], list)
-
-
-# Import ANY for mock assertions
-from unittest.mock import ANY
