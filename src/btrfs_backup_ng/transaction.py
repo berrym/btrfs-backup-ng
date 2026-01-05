@@ -13,7 +13,7 @@ import os
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 logger = logging.getLogger(__name__)
 
@@ -69,7 +69,7 @@ def log_transaction(
     if _transaction_log_path is None:
         return
 
-    record = {
+    record: dict[str, Any] = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "action": action,
         "status": status,
@@ -146,7 +146,7 @@ class TransactionContext:
         )
         return self
 
-    def __exit__(self, exc_type, exc_val, exc_tb) -> bool:
+    def __exit__(self, exc_type, exc_val, exc_tb) -> Literal[False]:
         import time
 
         duration = None
@@ -273,13 +273,10 @@ def get_transaction_stats(path: str | Path | None = None) -> dict[str, Any]:
             "total_bytes_transferred": 0,
         }
 
-    stats = {
-        "total_records": len(records),
-        "transfers": {"completed": 0, "failed": 0},
-        "snapshots": {"completed": 0, "failed": 0},
-        "deletes": {"completed": 0, "failed": 0},
-        "total_bytes_transferred": 0,
-    }
+    transfers = {"completed": 0, "failed": 0}
+    snapshots = {"completed": 0, "failed": 0}
+    deletes = {"completed": 0, "failed": 0}
+    total_bytes = 0
 
     for record in records:
         action = record.get("action", "")
@@ -287,20 +284,26 @@ def get_transaction_stats(path: str | Path | None = None) -> dict[str, Any]:
 
         if action == "transfer":
             if status == "completed":
-                stats["transfers"]["completed"] += 1
+                transfers["completed"] += 1
                 if record.get("size_bytes"):
-                    stats["total_bytes_transferred"] += record["size_bytes"]
+                    total_bytes += record["size_bytes"]
             elif status == "failed":
-                stats["transfers"]["failed"] += 1
+                transfers["failed"] += 1
         elif action == "snapshot":
             if status == "completed":
-                stats["snapshots"]["completed"] += 1
+                snapshots["completed"] += 1
             elif status == "failed":
-                stats["snapshots"]["failed"] += 1
+                snapshots["failed"] += 1
         elif action in ("delete", "prune"):
             if status == "completed":
-                stats["deletes"]["completed"] += 1
+                deletes["completed"] += 1
             elif status == "failed":
-                stats["deletes"]["failed"] += 1
+                deletes["failed"] += 1
 
-    return stats
+    return {
+        "total_records": len(records),
+        "transfers": transfers,
+        "snapshots": snapshots,
+        "deletes": deletes,
+        "total_bytes_transferred": total_bytes,
+    }

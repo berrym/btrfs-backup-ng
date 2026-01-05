@@ -1,5 +1,3 @@
-# pyright: standard
-
 """Legacy CLI implementation for btrfs-backup-ng.
 
 This module contains the original command-line interface that uses

@@ -15,7 +15,7 @@ import time
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable
 
 from .. import __util__
 
@@ -327,7 +327,7 @@ def verify_full(
             return report
 
     # Verify temp dir is on btrfs
-    if not __util__.is_btrfs(temp_path):
+    if not __util__.is_btrfs(temp_path):  # type: ignore[attr-defined]
         report.errors.append(f"Temp directory {temp_path} is not on btrfs filesystem")
         report.completed_at = time.time()
         return report
@@ -363,7 +363,7 @@ def verify_full(
             }
         )
 
-        restored = []
+        restored: list[Any] = []
 
         for i, snap in enumerate(to_verify, 1):
             name = snap.get_name()
@@ -391,7 +391,7 @@ def verify_full(
                 if not restored_path.exists():
                     raise VerifyError(f"Restored snapshot not found at {restored_path}")
 
-                if not __util__.is_subvolume(restored_path):
+                if not __util__.is_subvolume(restored_path):  # type: ignore[attr-defined]
                     raise VerifyError(
                         f"Restored path {restored_path} is not a valid subvolume"
                     )
@@ -423,8 +423,8 @@ def verify_full(
                 # Delete any restored subvolumes first
                 for snap in to_verify:
                     snap_path = temp_path / snap.get_name()
-                    if snap_path.exists() and __util__.is_subvolume(snap_path):
-                        __util__.delete_subvolume(snap_path)
+                    if snap_path.exists() and __util__.is_subvolume(snap_path):  # type: ignore[attr-defined]
+                        __util__.delete_subvolume(snap_path)  # type: ignore[attr-defined]
                 # Remove temp dir
                 if temp_path.exists():
                     shutil.rmtree(temp_path, ignore_errors=True)

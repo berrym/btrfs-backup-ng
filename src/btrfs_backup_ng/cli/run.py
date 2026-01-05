@@ -6,6 +6,7 @@ import os
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
+from typing import Literal
 
 from .. import __util__, endpoint
 from ..__logger__ import add_file_handler, create_logger
@@ -316,7 +317,7 @@ def _backup_volume(
             # Check mount requirement for local targets
             if target.require_mount and not target.path.startswith("ssh://"):
                 target_path = Path(target.path).resolve()
-                if not __util__.is_mounted(target_path):
+                if not __util__.is_mounted(target_path):  # type: ignore[attr-defined]
                     raise __util__.AbortError(
                         f"Target {target.path} is not mounted. "
                         f"Ensure the drive is connected and mounted, or set require_mount = false."
@@ -489,6 +490,7 @@ def _send_backup_notifications(
         return
 
     # Determine overall status
+    status: Literal["success", "failure", "partial"]
     if volumes_failed == 0 and transfers_failed == 0:
         status = "success"
     elif volumes_failed == volumes_processed:

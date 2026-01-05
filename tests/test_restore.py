@@ -754,7 +754,7 @@ class TestExecuteListVolumes:
 
         config_path = tmp_path / "config.toml"
         mock_find.return_value = str(config_path)
-        mock_load.return_value = Config()
+        mock_load.return_value = (Config(), [])
 
         args = MagicMock()
         args.config = None
@@ -792,7 +792,7 @@ class TestExecuteListVolumes:
                 ),
             ]
         )
-        mock_load.return_value = config
+        mock_load.return_value = (config, [])
 
         args = MagicMock()
         args.config = None
@@ -827,8 +827,9 @@ class TestExecuteConfigRestore:
         from btrfs_backup_ng.config.schema import Config, VolumeConfig
 
         mock_find.return_value = str(tmp_path / "config.toml")
-        mock_load.return_value = Config(
-            volumes=[VolumeConfig(path="/var/log", snapshot_prefix="logs")]
+        mock_load.return_value = (
+            Config(volumes=[VolumeConfig(path="/var/log", snapshot_prefix="logs")]),
+            [],
         )
 
         args = MagicMock()
@@ -846,8 +847,11 @@ class TestExecuteConfigRestore:
         from btrfs_backup_ng.config.schema import Config, VolumeConfig
 
         mock_find.return_value = str(tmp_path / "config.toml")
-        mock_load.return_value = Config(
-            volumes=[VolumeConfig(path="/home", snapshot_prefix="home", targets=[])]
+        mock_load.return_value = (
+            Config(
+                volumes=[VolumeConfig(path="/home", snapshot_prefix="home", targets=[])]
+            ),
+            [],
         )
 
         args = MagicMock()
@@ -865,14 +869,17 @@ class TestExecuteConfigRestore:
         from btrfs_backup_ng.config.schema import Config, TargetConfig, VolumeConfig
 
         mock_find.return_value = str(tmp_path / "config.toml")
-        mock_load.return_value = Config(
-            volumes=[
-                VolumeConfig(
-                    path="/home",
-                    snapshot_prefix="home",
-                    targets=[TargetConfig(path="/mnt/backup/home")],
-                )
-            ]
+        mock_load.return_value = (
+            Config(
+                volumes=[
+                    VolumeConfig(
+                        path="/home",
+                        snapshot_prefix="home",
+                        targets=[TargetConfig(path="/mnt/backup/home")],
+                    )
+                ]
+            ),
+            [],
         )
 
         args = MagicMock()
@@ -892,18 +899,21 @@ class TestExecuteConfigRestore:
         from btrfs_backup_ng.config.schema import Config, TargetConfig, VolumeConfig
 
         mock_find.return_value = str(tmp_path / "config.toml")
-        mock_load.return_value = Config(
-            volumes=[
-                VolumeConfig(
-                    path="/home",
-                    snapshot_prefix="home",
-                    targets=[
-                        TargetConfig(
-                            path="ssh://backup@server:/backups/home", ssh_sudo=True
-                        )
-                    ],
-                )
-            ]
+        mock_load.return_value = (
+            Config(
+                volumes=[
+                    VolumeConfig(
+                        path="/home",
+                        snapshot_prefix="home",
+                        targets=[
+                            TargetConfig(
+                                path="ssh://backup@server:/backups/home", ssh_sudo=True
+                            )
+                        ],
+                    )
+                ]
+            ),
+            [],
         )
         mock_list.return_value = 0
 
@@ -930,14 +940,17 @@ class TestExecuteConfigRestore:
         from btrfs_backup_ng.config.schema import Config, TargetConfig, VolumeConfig
 
         mock_find.return_value = str(tmp_path / "config.toml")
-        mock_load.return_value = Config(
-            volumes=[
-                VolumeConfig(
-                    path="/home",
-                    snapshot_prefix="home",
-                    targets=[TargetConfig(path="/mnt/backup/home")],
-                )
-            ]
+        mock_load.return_value = (
+            Config(
+                volumes=[
+                    VolumeConfig(
+                        path="/home",
+                        snapshot_prefix="home",
+                        targets=[TargetConfig(path="/mnt/backup/home")],
+                    )
+                ]
+            ),
+            [],
         )
 
         args = MagicMock()

@@ -269,7 +269,7 @@ def _run_interactive_wizard() -> str:
     print()
     print("Configure how long to keep snapshots. Set to 0 to disable.")
 
-    retention = {}
+    retention: dict[str, str | int] = {}
     retention["min"] = _prompt("Minimum retention period", "1d")
     retention["hourly"] = _prompt_int("Hourly snapshots to keep", 24, 0, 1000)
     retention["daily"] = _prompt_int("Daily snapshots to keep", 7, 0, 1000)
@@ -320,7 +320,7 @@ def _run_interactive_wizard() -> str:
     print("  Volumes to Backup")
     print("-" * 40)
 
-    volumes = []
+    volumes: list[dict[str, Any]] = []
     add_volume = True
 
     while add_volume:

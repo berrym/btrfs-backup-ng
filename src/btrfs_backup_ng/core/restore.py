@@ -8,9 +8,10 @@ import logging
 import time
 import uuid
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable
 
 from .. import __util__
+from ..__util__ import Snapshot
 from ..transaction import log_transaction
 from .operations import send_snapshot
 
@@ -24,10 +25,10 @@ class RestoreError(Exception):
 
 
 def get_restore_chain(
-    target_snapshot,
-    all_backup_snapshots: list,
-    existing_local: list,
-) -> list:
+    target_snapshot: Snapshot,
+    all_backup_snapshots: list[Snapshot],
+    existing_local: list[Snapshot],
+) -> list[Snapshot]:
     """Determine which snapshots need to be restored to get target_snapshot.
 
     For incremental restore to work, we need the complete parent chain.
@@ -45,8 +46,8 @@ def get_restore_chain(
     # Get names of existing local snapshots for comparison
     existing_names = {s.get_name() for s in existing_local}
 
-    chain = []
-    current = target_snapshot
+    chain: list[Snapshot] = []
+    current: Snapshot | None = target_snapshot
 
     while current is not None:
         current_name = current.get_name()
@@ -171,7 +172,7 @@ def validate_restore_destination(
             raise RestoreError(f"Cannot create destination directory {path}: {e}")
 
     # Must be on btrfs filesystem
-    if not __util__.is_btrfs(path):
+    if not __util__.is_btrfs(path):  # type: ignore[attr-defined]
         raise RestoreError(
             f"Destination {path} is not on a btrfs filesystem. "
             "btrfs receive requires a btrfs filesystem."
@@ -238,7 +239,7 @@ def verify_restored_snapshot(
             )
 
         # Verify it's a valid subvolume
-        if not __util__.is_subvolume(snapshot_path):
+        if not __util__.is_subvolume(snapshot_path):  # type: ignore[attr-defined]
             raise RestoreError(
                 f"{snapshot_path} exists but is not a valid btrfs subvolume. "
                 "The restore may have failed."
@@ -400,7 +401,7 @@ def restore_snapshots(
         options = {}
 
     session_id = str(uuid.uuid4())[:8]
-    stats = {"restored": 0, "skipped": 0, "failed": 0, "errors": []}
+    stats: dict[str, Any] = {"restored": 0, "skipped": 0, "failed": 0, "errors": []}
 
     # List snapshots at backup location
     logger.info("Listing snapshots at backup location...")

@@ -201,7 +201,7 @@ def _execute_volume_targets(
     Returns:
         List of JobResults for this volume
     """
-    results = []
+    results: list[JobResult] = []
 
     if not volume.targets:
         logger.warning("Volume %s has no targets configured", volume.path)

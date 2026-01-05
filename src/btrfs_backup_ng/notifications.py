@@ -9,7 +9,7 @@ import smtplib
 import ssl
 import urllib.error
 import urllib.request
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -52,11 +52,7 @@ class NotificationEvent:
     transfers_failed: int = 0
     snapshots_pruned: int = 0
     duration_seconds: float = 0.0
-    errors: list[str] = None
-
-    def __post_init__(self):
-        if self.errors is None:
-            self.errors = []
+    errors: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         """Convert to dictionary for JSON serialization."""
@@ -194,13 +190,9 @@ class EmailConfig:
     smtp_password: Optional[str] = None
     smtp_tls: str = "none"  # "ssl", "starttls", or "none"
     from_addr: str = "btrfs-backup-ng@localhost"
-    to_addrs: list[str] = None
+    to_addrs: list[str] = field(default_factory=list)
     on_success: bool = False
     on_failure: bool = True
-
-    def __post_init__(self):
-        if self.to_addrs is None:
-            self.to_addrs = []
 
 
 @dataclass
@@ -220,14 +212,10 @@ class WebhookConfig:
     enabled: bool = False
     url: Optional[str] = None
     method: str = "POST"
-    headers: dict[str, str] = None
+    headers: dict[str, str] = field(default_factory=dict)
     on_success: bool = False
     on_failure: bool = True
     timeout: int = 30
-
-    def __post_init__(self):
-        if self.headers is None:
-            self.headers = {}
 
 
 @dataclass
@@ -239,14 +227,8 @@ class NotificationConfig:
         webhook: Webhook notification settings
     """
 
-    email: EmailConfig = None
-    webhook: WebhookConfig = None
-
-    def __post_init__(self):
-        if self.email is None:
-            self.email = EmailConfig()
-        if self.webhook is None:
-            self.webhook = WebhookConfig()
+    email: EmailConfig = field(default_factory=EmailConfig)
+    webhook: WebhookConfig = field(default_factory=WebhookConfig)
 
     def is_enabled(self) -> bool:
         """Check if any notification method is enabled."""
@@ -406,7 +388,7 @@ def create_backup_event(
     transfers_completed: int = 0,
     transfers_failed: int = 0,
     duration_seconds: float = 0.0,
-    errors: list[str] = None,
+    errors: Optional[list[str]] = None,
 ) -> NotificationEvent:
     """Create a backup completion notification event.
 
@@ -457,7 +439,7 @@ def create_prune_event(
     volumes_failed: int = 0,
     snapshots_pruned: int = 0,
     duration_seconds: float = 0.0,
-    errors: list[str] = None,
+    errors: Optional[list[str]] = None,
 ) -> NotificationEvent:
     """Create a prune completion notification event.
 

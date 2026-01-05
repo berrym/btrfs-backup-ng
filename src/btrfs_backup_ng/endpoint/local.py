@@ -1,5 +1,3 @@
-# pyright: standard
-
 """btrfs-backup-ng: btrfs_backup_ng/endpoint/local.py
 Create commands with local endpoints.
 """
@@ -114,7 +112,7 @@ class LocalEndpoint(Endpoint):
         if (
             self.config["source"] is not None
             and self.config["fs_checks"]
-            and not __util__.is_subvolume(self.config["source"])
+            and not __util__.is_subvolume(self.config["source"])  # type: ignore[attr-defined]
         ):
             logger.error(
                 "%s does not seem to be a btrfs subvolume", self.config["source"]
@@ -123,7 +121,7 @@ class LocalEndpoint(Endpoint):
                 f"Source {self.config['source']} is not a btrfs subvolume. Use --no-fs-checks to override."
             )
 
-        if self.config["fs_checks"] and not __util__.is_btrfs(self.config["path"]):
+        if self.config["fs_checks"] and not __util__.is_btrfs(self.config["path"]):  # type: ignore[attr-defined]
             logger.error(
                 "%s does not seem to be on a btrfs filesystem", self.config["path"]
             )

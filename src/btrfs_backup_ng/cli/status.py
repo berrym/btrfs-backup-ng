@@ -14,13 +14,14 @@ from .common import get_log_level
 logger = logging.getLogger(__name__)
 
 
-def _format_bytes(size_bytes: int) -> str:
+def _format_bytes(size_bytes: int | float) -> str:
     """Format bytes as human-readable string."""
+    size: float = float(size_bytes)
     for unit in ("B", "KB", "MB", "GB", "TB"):
-        if abs(size_bytes) < 1024:
-            return f"{size_bytes:.1f} {unit}"
-        size_bytes /= 1024
-    return f"{size_bytes:.1f} PB"
+        if abs(size) < 1024:
+            return f"{size:.1f} {unit}"
+        size /= 1024
+    return f"{size:.1f} PB"
 
 
 def _format_duration(seconds: float) -> str:

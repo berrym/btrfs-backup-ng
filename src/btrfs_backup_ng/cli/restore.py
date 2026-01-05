@@ -9,6 +9,7 @@ import logging
 import time
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 
 from .. import __util__, endpoint
 from ..__logger__ import create_logger
@@ -96,10 +97,11 @@ def _execute_list_volumes(args: argparse.Namespace) -> int:
         Exit code (0 for success, non-zero for failure)
     """
     # Load config
-    config_path = getattr(args, "config", None)
+    config_file = getattr(args, "config", None)
     try:
-        if config_path:
-            config = load_config(config_path)
+        if config_file:
+            config, _warnings = load_config(config_file)
+            config_path = config_file
         else:
             found_path = find_config_file()
             if not found_path:
@@ -108,7 +110,7 @@ def _execute_list_volumes(args: argparse.Namespace) -> int:
                 print("  ~/.config/btrfs-backup-ng/config.toml")
                 print("  /etc/btrfs-backup-ng/config.toml")
                 return 1
-            config = load_config(found_path)
+            config, _warnings = load_config(found_path)
             config_path = found_path
     except ConfigError as e:
         logger.error("Failed to load config: %s", e)
@@ -156,17 +158,17 @@ def _execute_config_restore(args: argparse.Namespace, volume_path: str) -> int:
         Exit code (0 for success, non-zero for failure)
     """
     # Load config
-    config_path = getattr(args, "config", None)
+    config_file = getattr(args, "config", None)
     try:
-        if config_path:
-            config = load_config(config_path)
+        if config_file:
+            config, _warnings = load_config(config_file)
         else:
             found_path = find_config_file()
             if not found_path:
                 print("Error: No configuration file found")
                 print("Use --config to specify a config file")
                 return 1
-            config = load_config(found_path)
+            config, _warnings = load_config(found_path)
     except ConfigError as e:
         logger.error("Failed to load config: %s", e)
         return 1
@@ -481,7 +483,7 @@ def _prepare_local_endpoint(dest_path: Path):
     }
 
     local_ep = LocalEndpoint(config=endpoint_kwargs)
-    local_ep.prepare()
+    local_ep.prepare()  # type: ignore[attr-defined]
 
     return local_ep
 
@@ -623,7 +625,7 @@ def _execute_status(args: argparse.Namespace) -> int:
         locks = {}
         if lock_file_path.exists():
             with open(lock_file_path, encoding="utf-8") as f:
-                locks = __util__.read_locks(f.read())
+                locks = __util__.read_locks(f.read())  # type: ignore[attr-defined]
     except Exception as e:
         logger.warning("Could not read lock file: %s", e)
         locks = {}
@@ -632,8 +634,8 @@ def _execute_status(args: argparse.Namespace) -> int:
     if locks:
         print("Active Locks:")
         print("-" * 40)
-        restore_locks = {}
-        other_locks = {}
+        restore_locks: dict[str, Any] = {}
+        other_locks: dict[str, Any] = {}
 
         for snap_name, lock_info in locks.items():
             snap_locks = lock_info.get("locks", [])
@@ -715,7 +717,7 @@ def _execute_unlock(args: argparse.Namespace, lock_id: str) -> int:
             return 0
 
         with open(lock_file_path, encoding="utf-8") as f:
-            locks = __util__.read_locks(f.read())
+            locks = __util__.read_locks(f.read())  # type: ignore[attr-defined]
     except Exception as e:
         logger.error("Could not read lock file: %s", e)
         return 1
@@ -726,7 +728,7 @@ def _execute_unlock(args: argparse.Namespace, lock_id: str) -> int:
 
     # Find and remove matching locks
     unlocked_count = 0
-    new_locks = {}
+    new_locks: dict[str, Any] = {}
 
     for snap_name, lock_info in locks.items():
         snap_locks = set(lock_info.get("locks", []))
@@ -765,7 +767,7 @@ def _execute_unlock(args: argparse.Namespace, lock_id: str) -> int:
     # Write updated locks
     try:
         with open(lock_file_path, "w", encoding="utf-8") as f:
-            f.write(__util__.write_locks(new_locks))
+            f.write(__util__.write_locks(new_locks))  # type: ignore[attr-defined]
     except Exception as e:
         logger.error("Could not write lock file: %s", e)
         return 1
@@ -830,7 +832,7 @@ def _execute_cleanup(args: argparse.Namespace) -> int:
                 continue
 
             # Check if it's a subvolume
-            if not __util__.is_subvolume(item):
+            if not __util__.is_subvolume(item):  # type: ignore[attr-defined]
                 continue
 
             # Check for signs of incomplete restore

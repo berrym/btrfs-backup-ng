@@ -1,5 +1,3 @@
-# pyright: standard
-
 """btrfs-backup-ng: btrfs_backup_ng/endpoint/__init__.py."""
 
 import urllib.parse
@@ -8,7 +6,7 @@ from pathlib import Path
 from ..__logger__ import logger
 from .local import LocalEndpoint
 from .shell import ShellEndpoint
-from .ssh import SSHEndpoint
+from .ssh import SSHEndpoint  # type: ignore[attr-defined]
 
 
 def choose_endpoint(spec, common_config=None, source=False, excluded_types=()):

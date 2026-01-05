@@ -261,7 +261,7 @@ def estimate_incremental_size(
 def estimate_transfer(
     source_endpoint,
     dest_endpoint,
-    snapshots: list = None,
+    snapshots: list | None = None,
 ) -> TransferEstimate:
     """Estimate the size of a backup transfer operation.
 

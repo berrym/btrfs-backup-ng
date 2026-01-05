@@ -1,5 +1,3 @@
-# pyright: standard
-
 """btrfs-backup-ng: Automated btrfs backup management.
 
 This is the main entry point that dispatches to either the new

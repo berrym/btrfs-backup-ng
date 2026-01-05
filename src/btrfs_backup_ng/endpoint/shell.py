@@ -1,5 +1,3 @@
-# pyright: standard
-
 """btrfs-backup-ng: btrfs_backup_ng/endpoint/shell.py
 Create destinations with shell command endpoints.
 """

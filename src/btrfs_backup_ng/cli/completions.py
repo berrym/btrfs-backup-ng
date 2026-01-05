@@ -5,9 +5,18 @@ import sys
 from argparse import Namespace
 from importlib.resources import files
 from pathlib import Path
+from typing import TypedDict
 
 
-def get_completions_dir() -> Path:
+class ShellConfig(TypedDict):
+    """Type for shell completion configuration."""
+
+    source: str
+    system_dest: Path
+    user_dest: Path
+
+
+def get_completions_dir() -> Path | None:
     """Get the directory containing completion scripts.
 
     Returns:
@@ -94,7 +103,7 @@ def install_completions(args: Namespace) -> int:
         return 1
 
     # Map shell to file and destinations
-    shell_config = {
+    shell_config: dict[str, ShellConfig] = {
         "bash": {
             "source": "btrfs-backup-ng.bash",
             "system_dest": Path("/etc/bash_completion.d/btrfs-backup-ng"),

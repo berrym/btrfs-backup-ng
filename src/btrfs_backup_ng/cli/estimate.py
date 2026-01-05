@@ -10,6 +10,7 @@ import argparse
 import json
 import logging
 from pathlib import Path
+from typing import Any
 
 from .. import endpoint
 from ..__logger__ import create_logger
@@ -72,14 +73,14 @@ def _estimate_from_config(args: argparse.Namespace, volume_path: str) -> int:
     config_path = getattr(args, "config", None)
     try:
         if config_path:
-            config = load_config(config_path)
+            config, _warnings = load_config(config_path)
         else:
             found_path = find_config_file()
             if not found_path:
                 print("Error: No configuration file found")
                 print("Use --config to specify a config file")
                 return 1
-            config = load_config(found_path)
+            config, _warnings = load_config(found_path)
     except ConfigError as e:
         logger.error("Failed to load config: %s", e)
         return 1
@@ -249,7 +250,7 @@ def _print_json(estimate: TransferEstimate, source: str, destination: str) -> No
         source: Source path for display
         destination: Destination path for display
     """
-    data = {
+    data: dict[str, Any] = {
         "source": source,
         "destination": destination,
         "snapshot_count": estimate.snapshot_count,

@@ -1,5 +1,3 @@
-# pyright: standard
-
 """btrfs-backup-ng: btrfs_backup_ng/endpoint/common.py
 Common functionality among modules.
 """

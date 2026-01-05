@@ -1,5 +1,3 @@
-# pyright: strict
-
 """btrfs-backup-ng: SSH Endpoint for managing remote operations.
 
 This module provides the SSHEndpoint class, which integrates with SSHMasterManager
@@ -55,6 +53,8 @@ from btrfs_backup_ng.__logger__ import logger
 from btrfs_backup_ng.sshutil.master import SSHMasterManager
 
 from .common import Endpoint
+
+__all__ = ["SSHEndpoint"]
 
 # Type variable for self in SSHEndpoint
 _Self = TypeVar("_Self", bound="SSHEndpoint")

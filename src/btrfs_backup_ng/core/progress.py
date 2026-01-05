@@ -346,6 +346,9 @@ def run_transfer_with_progress(
         )
 
         # Create reader thread to pipe data with progress updates
+        # These should always be set since the processes are configured with PIPE
+        assert send_process.stdout is not None, "send_process.stdout must be PIPE"
+        assert receive_process.stdin is not None, "receive_process.stdin must be PIPE"
         reader = ProgressReader(
             source=send_process.stdout,
             dest=receive_process.stdin,

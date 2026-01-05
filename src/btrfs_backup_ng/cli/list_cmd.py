@@ -5,6 +5,7 @@ import json
 import logging
 import os
 from pathlib import Path
+from typing import Any
 
 from .. import endpoint
 from ..__logger__ import create_logger
@@ -57,10 +58,10 @@ def execute_list(args: argparse.Namespace) -> int:
         return 1
 
     output_json = getattr(args, "json", False)
-    all_data = []
+    all_data: list[dict[str, Any]] = []
 
     for volume in volumes:
-        volume_data = {
+        volume_data: dict[str, Any] = {
             "path": volume.path,
             "snapshot_prefix": volume.snapshot_prefix,
             "snapshots": [],
@@ -114,7 +115,7 @@ def execute_list(args: argparse.Namespace) -> int:
 
         # Get target snapshots
         for target in volume.targets:
-            target_data = {
+            target_data: dict[str, Any] = {
                 "path": target.path,
                 "snapshots": [],
             }

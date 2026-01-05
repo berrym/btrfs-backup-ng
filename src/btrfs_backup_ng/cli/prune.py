@@ -5,6 +5,7 @@ import logging
 import os
 import time
 from pathlib import Path
+from typing import Literal
 
 from .. import __util__, endpoint
 from ..__logger__ import add_file_handler, create_logger
@@ -275,6 +276,7 @@ def _send_prune_notifications(
         return
 
     # Determine overall status
+    status: Literal["success", "failure", "partial"]
     if volumes_failed == 0:
         status = "success"
     elif volumes_failed == volumes_processed:

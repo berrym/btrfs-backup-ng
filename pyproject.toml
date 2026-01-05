@@ -80,3 +80,20 @@ exclude_lines = [
 # Current coverage ~56% for testable code (many modules require real btrfs)
 # Goal: increase to 70%+ as we add more unit tests with mocking
 fail_under = 55
+
+[tool.mypy]
+python_version = "3.11"
+warn_unused_configs = true
+ignore_missing_imports = true
+exclude = [
+    "tests/",
+]
+
+[tool.basedpyright]
+pythonVersion = "3.11"
+typeCheckingMode = "standard"
+reportMissingImports = false
+reportMissingTypeStubs = false
+exclude = [
+    "**/tests/**",
+]

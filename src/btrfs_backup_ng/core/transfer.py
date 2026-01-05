@@ -6,12 +6,21 @@ Provides stream processing for btrfs send/receive pipelines.
 import logging
 import shutil
 import subprocess
-from typing import Optional
+from typing import Optional, TypedDict
 
 logger = logging.getLogger(__name__)
 
+
+class CompressionConfig(TypedDict):
+    """Type definition for compression program configuration."""
+
+    compress: list[str]
+    decompress: list[str]
+    check: str
+
+
 # Available compression programs with their compress/decompress commands
-COMPRESSION_PROGRAMS = {
+COMPRESSION_PROGRAMS: dict[str, CompressionConfig] = {
     "gzip": {
         "compress": ["gzip", "-c"],
         "decompress": ["gzip", "-dc"],

@@ -2,7 +2,6 @@
 
 from unittest.mock import MagicMock, patch
 
-
 from btrfs_backup_ng.core.estimate import (
     SnapshotEstimate,
     TransferEstimate,
@@ -303,8 +302,9 @@ class TestExecuteEstimate:
         from btrfs_backup_ng.config.schema import Config, VolumeConfig
 
         mock_find.return_value = str(tmp_path / "config.toml")
-        mock_load.return_value = Config(
-            volumes=[VolumeConfig(path="/var/log", snapshot_prefix="logs")]
+        mock_load.return_value = (
+            Config(volumes=[VolumeConfig(path="/var/log", snapshot_prefix="logs")]),
+            [],
         )
 
         args = MagicMock()

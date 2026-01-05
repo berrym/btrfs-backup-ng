@@ -144,7 +144,7 @@ def execute_transfer(args: argparse.Namespace) -> int:
                     # Check mount requirement for local targets
                     if target.require_mount and not target.path.startswith("ssh://"):
                         target_path = Path(target.path).resolve()
-                        if not __util__.is_mounted(target_path):
+                        if not __util__.is_mounted(target_path):  # type: ignore[attr-defined]
                             raise __util__.AbortError(
                                 f"Target {target.path} is not mounted. "
                                 f"Ensure the drive is connected and mounted, or set require_mount = false."

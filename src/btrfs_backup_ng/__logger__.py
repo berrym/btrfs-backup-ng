@@ -1,5 +1,3 @@
-# pyright: standard
-
 """btrfs-backup-ng: btrfs-backup_ng/Logger.py
 A common logger for displaying in a rich layout with optional file logging.
 """
@@ -10,8 +8,8 @@ import os
 import threading
 from collections import deque
 from pathlib import Path
-from typing import IO  # , override (requires python 3.12)
 
+# Note: override decorator requires Python 3.12+
 from rich.console import Console
 from rich.logging import RichHandler
 
@@ -29,8 +27,11 @@ logger = logging.Logger("btrfs-backup-ng", _initial_level)
 _file_handler: logging.Handler | None = None
 
 
-class RichLogger(IO[str]):
-    """A singleton pattern class to share internal state of the rich logger."""
+class RichLogger:
+    """A singleton pattern class to share internal state of the rich logger.
+
+    Implements write() and flush() as required by Rich Console's file parameter.
+    """
 
     __instance = None
     __lock = threading.Lock()
@@ -95,7 +96,7 @@ def create_logger(live_layout, level=None) -> None:
 
     # Create new handlers
     if live_layout:
-        cons = Console(file=RichLogger(), width=150)
+        cons = Console(file=RichLogger(), width=150)  # type: ignore[arg-type]
         rich_handler = RichHandler(console=cons, show_time=False, show_path=False)
     else:
         cons = Console()

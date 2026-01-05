@@ -20,7 +20,7 @@ import logging
 import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Callable
+from typing import Any, Callable
 
 from .config import RetentionConfig
 
@@ -181,7 +181,7 @@ def get_bucket_key(timestamp: datetime, bucket_type: str) -> str:
 def apply_retention(
     snapshots: list,
     config: RetentionConfig,
-    get_name: Callable[[object], str] | None = None,
+    get_name: Callable[[Any], str] | None = None,
     prefix: str = "",
     now: datetime | None = None,
 ) -> tuple[list, list]:

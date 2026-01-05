@@ -1,5 +1,3 @@
-# pyright: standard
-
 """btrfs-backup-ng: btrfs_backup_ng/__util__.py
 Common utility code shared between modules.
 """
@@ -12,6 +10,25 @@ import time
 from pathlib import Path
 
 from .__logger__ import logger
+
+__all__ = [
+    "AbortError",
+    "SnapshotTransferError",
+    "Snapshot",
+    "exec_subprocess",
+    "log_heading",
+    "date_to_str",
+    "str_to_date",
+    "is_btrfs",
+    "is_subvolume",
+    "is_mounted",
+    "get_mount_info",
+    "read_locks",
+    "write_locks",
+    "delete_subvolume",
+    "DATE_FORMAT",
+    "MOUNTS_FILE",
+]
 
 DATE_FORMAT = "%Y%m%d-%H%M%S"
 MOUNTS_FILE = "/proc/mounts"
@@ -203,6 +220,23 @@ def is_subvolume(path):
     result = st.st_ino == 256
     logger.debug("  -> Inode is %d, result is %r", st.st_ino, result)
     return result
+
+
+def delete_subvolume(path):
+    """Delete a btrfs subvolume.
+
+    Args:
+        path: Path to the subvolume to delete
+
+    Raises:
+        AbortError: If deletion fails
+    """
+    path = Path(path).resolve()
+    logger.debug("Deleting btrfs subvolume: %s", path)
+    if not is_subvolume(path):
+        raise AbortError(f"Path is not a subvolume: {path}")
+    exec_subprocess(["btrfs", "subvolume", "delete", str(path)])
+    logger.debug("  -> Subvolume deleted successfully")
 
 
 def is_mounted(path):
