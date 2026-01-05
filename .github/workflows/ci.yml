@@ -81,7 +81,7 @@ jobs:
       - name: Run mypy type checker
         run: |
           mypy src/btrfs_backup_ng --ignore-missing-imports
-        continue-on-error: true # Start permissive, tighten later
+        continue-on-error: true
 
   build:
     name: Build Package
