@@ -5,9 +5,10 @@ _btrfs_backup_ng() {
     local cur prev words cword split
     _init_completion -s || return
 
-    local commands="run snapshot transfer prune list status config install uninstall restore verify estimate completions"
+    local commands="run snapshot transfer prune list status config install uninstall restore verify estimate completions manpages"
     local config_subcommands="validate init import"
     local completions_subcommands="install path"
+    local manpages_subcommands="install path"
 
     # Global options
     local global_opts="-h --help -v --verbose -q --quiet --debug -V --version -c --config"
@@ -28,6 +29,7 @@ _btrfs_backup_ng() {
     local verify_opts="--level --snapshot --temp-dir --no-cleanup --prefix --ssh-sudo --ssh-key --no-fs-checks --json -q --quiet"
     local estimate_opts="-c --config --volume --target --prefix --ssh-sudo --ssh-key --no-fs-checks --json"
     local completions_install_opts="--shell --system"
+    local manpages_install_opts="--system --prefix"
     local verify_levels="metadata stream full"
     local shell_types="bash zsh fish"
 
@@ -43,7 +45,7 @@ _btrfs_backup_ng() {
     local i
     for ((i=1; i < cword; i++)); do
         case "${words[i]}" in
-            run|snapshot|transfer|prune|list|status|config|install|uninstall|restore|verify|completions)
+            run|snapshot|transfer|prune|list|status|config|install|uninstall|restore|verify|completions|manpages)
                 cmd="${words[i]}"
                 ;;
             validate|init|import)
@@ -52,7 +54,7 @@ _btrfs_backup_ng() {
                 fi
                 ;;
             path)
-                if [[ "$cmd" == "completions" ]]; then
+                if [[ "$cmd" == "completions" || "$cmd" == "manpages" ]]; then
                     subcmd="${words[i]}"
                 fi
                 ;;
@@ -204,6 +206,24 @@ _btrfs_backup_ng() {
                 case "$subcmd" in
                     install)
                         COMPREPLY=($(compgen -W "$completions_install_opts" -- "$cur"))
+                        ;;
+                    path)
+                        # No additional options
+                        ;;
+                esac
+            fi
+            ;;
+        manpages)
+            if [[ -z "$subcmd" ]]; then
+                if [[ "$cur" == -* ]]; then
+                    COMPREPLY=($(compgen -W "-h --help" -- "$cur"))
+                else
+                    COMPREPLY=($(compgen -W "$manpages_subcommands" -- "$cur"))
+                fi
+            else
+                case "$subcmd" in
+                    install)
+                        COMPREPLY=($(compgen -W "$manpages_install_opts" -- "$cur"))
                         ;;
                     path)
                         # No additional options

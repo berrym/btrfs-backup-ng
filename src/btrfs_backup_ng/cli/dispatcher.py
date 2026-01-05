@@ -26,6 +26,7 @@ SUBCOMMANDS = frozenset(
         "verify",
         "estimate",
         "completions",
+        "manpages",
     }
 )
 
@@ -621,6 +622,34 @@ Examples:
         help="Show path to completion scripts",
     )
 
+    # manpages command
+    manpages_parser = subparsers.add_parser(
+        "manpages",
+        help="Install man pages",
+        description="Install or locate man pages for btrfs-backup-ng commands",
+    )
+    manpages_subs = manpages_parser.add_subparsers(dest="manpages_action")
+
+    manpages_install = manpages_subs.add_parser(
+        "install",
+        help="Install man pages",
+    )
+    manpages_install.add_argument(
+        "--system",
+        action="store_true",
+        help="Install system-wide to /usr/local/share/man (requires root)",
+    )
+    manpages_install.add_argument(
+        "--prefix",
+        metavar="PATH",
+        help="Install to PREFIX/share/man/man1",
+    )
+
+    manpages_subs.add_parser(
+        "path",
+        help="Show path to man page files",
+    )
+
     # estimate command
     estimate_parser = subparsers.add_parser(
         "estimate",
@@ -787,6 +816,7 @@ def run_subcommand(args: argparse.Namespace) -> int:
         "verify": cmd_verify,
         "estimate": cmd_estimate,
         "completions": cmd_completions,
+        "manpages": cmd_manpages,
     }
 
     handler = handlers.get(args.command)
@@ -890,6 +920,13 @@ def cmd_completions(args: argparse.Namespace) -> int:
     from .completions import execute_completions
 
     return execute_completions(args)
+
+
+def cmd_manpages(args: argparse.Namespace) -> int:
+    """Execute manpages command."""
+    from .manpages import execute_manpages
+
+    return execute_manpages(args)
 
 
 def main(argv: list[str] | None = None) -> int:

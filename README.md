@@ -83,10 +83,32 @@ See `completions/README.md` for manual installation instructions.
 
 ### Man Pages
 
-Manual pages are available in the `man/` directory. See `man/README.md` for installation instructions. View without installing:
+Install man pages for offline documentation:
 
 ```bash
-man ./man/btrfs-backup-ng.1
+# User installation (to ~/.local/share/man)
+btrfs-backup-ng manpages install
+
+# System-wide installation (requires root)
+sudo btrfs-backup-ng manpages install --system
+
+# Custom prefix
+btrfs-backup-ng manpages install --prefix /opt/myapp
+
+# Show path to man page files
+btrfs-backup-ng manpages path
+```
+
+After user installation, add to your MANPATH:
+```bash
+export MANPATH="$HOME/.local/share/man:$MANPATH"
+```
+
+View man pages:
+```bash
+man btrfs-backup-ng
+man btrfs-backup-ng-restore
+man btrfs-backup-ng-config
 ```
 
 ## Quick Start

@@ -22,6 +22,7 @@ _btrfs-backup-ng() {
         'verify:Verify backup integrity'
         'estimate:Estimate backup transfer sizes'
         'completions:Install shell completion scripts'
+        'manpages:Install man pages'
     )
 
     local -a global_opts
@@ -211,6 +212,31 @@ _btrfs-backup-ng() {
                                     _arguments \
                                         '--shell[Shell to install completions for]:shell:(bash zsh fish)' \
                                         '--system[Install system-wide (requires root)]'
+                                    ;;
+                            esac
+                            ;;
+                    esac
+                    ;;
+                manpages)
+                    local -a manpages_commands
+                    manpages_commands=(
+                        'install:Install man pages'
+                        'path:Show path to man page files'
+                    )
+                    _arguments \
+                        '1: :->manpages_cmd' \
+                        '*:: :->manpages_args'
+
+                    case $state in
+                        manpages_cmd)
+                            _describe -t commands 'manpages command' manpages_commands
+                            ;;
+                        manpages_args)
+                            case $line[1] in
+                                install)
+                                    _arguments \
+                                        '--system[Install system-wide to /usr/local/share/man (requires root)]' \
+                                        '--prefix[Install to PREFIX/share/man/man1]:prefix:_directories'
                                     ;;
                             esac
                             ;;

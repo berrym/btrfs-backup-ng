@@ -63,6 +63,7 @@ complete -c btrfs-backup-ng -n __fish_btrfs_backup_ng_no_subcommand -a restore -
 complete -c btrfs-backup-ng -n __fish_btrfs_backup_ng_no_subcommand -a verify -d 'Verify backup integrity'
 complete -c btrfs-backup-ng -n __fish_btrfs_backup_ng_no_subcommand -a estimate -d 'Estimate backup transfer sizes'
 complete -c btrfs-backup-ng -n __fish_btrfs_backup_ng_no_subcommand -a completions -d 'Install shell completion scripts'
+complete -c btrfs-backup-ng -n __fish_btrfs_backup_ng_no_subcommand -a manpages -d 'Install man pages'
 
 # Compression methods
 set -l compress_methods none zstd gzip lz4 pigz lzop
@@ -199,3 +200,25 @@ end
 # completions install
 complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_completions_using_subcommand install' -l shell -d 'Shell to install completions for' -xa 'bash zsh fish'
 complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_completions_using_subcommand install' -l system -d 'Install system-wide (requires root)'
+
+# manpages command subcommands
+complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_using_command manpages' -a install -d 'Install man pages'
+complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_using_command manpages' -a path -d 'Show path to man page files'
+
+# Helper for manpages subcommand
+function __fish_btrfs_backup_ng_manpages_using_subcommand
+    set -l cmd (commandline -opc)
+    set -e cmd[1]
+    if test (count $cmd) -gt 1
+        if test $cmd[1] = manpages
+            if test $argv[1] = $cmd[2]
+                return 0
+            end
+        end
+    end
+    return 1
+end
+
+# manpages install
+complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_manpages_using_subcommand install' -l system -d 'Install system-wide (requires root)'
+complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_manpages_using_subcommand install' -l prefix -d 'Install to PREFIX/share/man/man1' -xa '(__fish_complete_directories)'
