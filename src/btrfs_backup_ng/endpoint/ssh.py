@@ -29,7 +29,7 @@ import uuid
 from pathlib import Path
 from subprocess import CompletedProcess
 from threading import Lock
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, TypeVar, Union, cast
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, TypeVar, cast
 
 # Handle paramiko import with proper typing
 paramiko: Optional[types.ModuleType]
@@ -43,7 +43,7 @@ except ImportError:
     PARAMIKO_AVAILABLE = False
 
 if TYPE_CHECKING:
-    import paramiko as paramiko_types
+    pass
 
 # Handle pwd import with proper typing
 _pwd: Optional[types.ModuleType]
@@ -57,11 +57,11 @@ except ImportError:
     _pwd_available = False
 
 
-from btrfs_backup_ng import __util__
-from btrfs_backup_ng.__logger__ import logger
-from btrfs_backup_ng.sshutil.master import SSHMasterManager
+from btrfs_backup_ng import __util__  # noqa: E402
+from btrfs_backup_ng.__logger__ import logger  # noqa: E402
+from btrfs_backup_ng.sshutil.master import SSHMasterManager  # noqa: E402
 
-from .common import Endpoint
+from .common import Endpoint  # noqa: E402
 
 __all__ = ["SSHEndpoint"]
 
