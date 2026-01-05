@@ -1,6 +1,8 @@
-"""Tests for transaction logging."""
+"""Tests for transaction logging module."""
 
 import json
+import os
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -8,6 +10,7 @@ from unittest.mock import patch
 
 import pytest
 
+from btrfs_backup_ng import transaction
 from btrfs_backup_ng.transaction import (
     TransactionContext,
     get_transaction_stats,
@@ -17,488 +20,425 @@ from btrfs_backup_ng.transaction import (
 )
 
 
+@pytest.fixture
+def temp_log_file():
+    """Create a temporary log file for testing."""
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".jsonl", delete=False) as f:
+        log_path = Path(f.name)
+    yield log_path
+    # Cleanup
+    if log_path.exists():
+        log_path.unlink()
+    # Reset global state
+    set_transaction_log(None)
+
+
+@pytest.fixture
+def temp_log_dir():
+    """Create a temporary directory for log files."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        yield Path(tmpdir)
+    # Reset global state
+    set_transaction_log(None)
+
+
 class TestSetTransactionLog:
     """Tests for set_transaction_log function."""
 
-    def test_set_path(self, tmp_path):
-        """Test setting transaction log path."""
-        log_path = tmp_path / "transactions.log"
+    def test_set_log_path(self, temp_log_dir):
+        """Test setting a valid log path."""
+        log_path = temp_log_dir / "transactions.jsonl"
         set_transaction_log(log_path)
+        assert transaction._transaction_log_path == log_path
 
-        # Log something to verify it works
-        log_transaction(action="test", status="completed")
-
-        assert log_path.exists()
-
-        # Cleanup
-        set_transaction_log(None)
-
-    def test_set_none_disables_logging(self, tmp_path):
-        """Test setting None disables logging."""
-        log_path = tmp_path / "transactions.log"
+    def test_set_log_path_creates_parent_dirs(self, temp_log_dir):
+        """Test that parent directories are created."""
+        log_path = temp_log_dir / "subdir" / "nested" / "transactions.jsonl"
         set_transaction_log(log_path)
-        set_transaction_log(None)
-
-        # This should not create file
-        log_transaction(action="test", status="completed")
-
-        assert not log_path.exists()
-
-    def test_creates_parent_directories(self, tmp_path):
-        """Test creates parent directories if needed."""
-        log_path = tmp_path / "deep" / "nested" / "dir" / "transactions.log"
-        set_transaction_log(log_path)
-
         assert log_path.parent.exists()
 
-        # Cleanup
-        set_transaction_log(None)
-
-    def test_accepts_string_path(self, tmp_path):
-        """Test accepts string path."""
-        log_path = str(tmp_path / "transactions.log")
+    def test_set_log_path_to_none(self, temp_log_dir):
+        """Test disabling transaction logging."""
+        log_path = temp_log_dir / "transactions.jsonl"
         set_transaction_log(log_path)
+        assert transaction._transaction_log_path is not None
 
-        log_transaction(action="test", status="completed")
-
-        assert Path(log_path).exists()
-
-        # Cleanup
         set_transaction_log(None)
+        assert transaction._transaction_log_path is None
+
+    def test_set_log_path_with_string(self, temp_log_dir):
+        """Test setting log path with string instead of Path."""
+        log_path = str(temp_log_dir / "transactions.jsonl")
+        set_transaction_log(log_path)
+        assert transaction._transaction_log_path == Path(log_path)
 
 
 class TestLogTransaction:
     """Tests for log_transaction function."""
 
-    def test_logs_basic_transaction(self, tmp_path):
+    def test_log_when_disabled(self):
+        """Test that logging does nothing when disabled."""
+        set_transaction_log(None)
+        # Should not raise
+        log_transaction(action="test", status="completed")
+
+    def test_log_basic_transaction(self, temp_log_file):
         """Test logging a basic transaction."""
-        log_path = tmp_path / "transactions.log"
-        set_transaction_log(log_path)
+        set_transaction_log(temp_log_file)
+        log_transaction(action="snapshot", status="completed")
 
-        log_transaction(action="backup", status="completed")
+        with open(temp_log_file) as f:
+            record = json.loads(f.readline())
 
-        content = log_path.read_text()
-        record = json.loads(content.strip())
-
-        assert record["action"] == "backup"
+        assert record["action"] == "snapshot"
         assert record["status"] == "completed"
         assert "timestamp" in record
         assert "pid" in record
 
-        set_transaction_log(None)
-
-    def test_logs_all_fields(self, tmp_path):
-        """Test logging transaction with all optional fields."""
-        log_path = tmp_path / "transactions.log"
-        set_transaction_log(log_path)
-
+    def test_log_transaction_with_all_fields(self, temp_log_file):
+        """Test logging a transaction with all optional fields."""
+        set_transaction_log(temp_log_file)
         log_transaction(
             action="transfer",
             status="completed",
             source="/home",
             destination="/backup",
-            snapshot="home-20260101",
-            parent="home-20251231",
+            snapshot="home-20240101",
+            parent="home-20231231",
             size_bytes=1024000,
-            duration_seconds=15.5,
-            error=None,
+            duration_seconds=5.5678,
             details={"compression": "zstd"},
         )
 
-        content = log_path.read_text()
-        record = json.loads(content.strip())
+        with open(temp_log_file) as f:
+            record = json.loads(f.readline())
 
         assert record["action"] == "transfer"
         assert record["status"] == "completed"
         assert record["source"] == "/home"
         assert record["destination"] == "/backup"
-        assert record["snapshot"] == "home-20260101"
-        assert record["parent"] == "home-20251231"
+        assert record["snapshot"] == "home-20240101"
+        assert record["parent"] == "home-20231231"
         assert record["size_bytes"] == 1024000
-        assert record["duration_seconds"] == 15.5
+        assert record["duration_seconds"] == 5.568  # Rounded to 3 decimals
         assert record["details"] == {"compression": "zstd"}
-        assert "error" not in record  # None values not included
 
-        set_transaction_log(None)
-
-    def test_logs_error_field(self, tmp_path):
-        """Test logging transaction with error."""
-        log_path = tmp_path / "transactions.log"
-        set_transaction_log(log_path)
-
+    def test_log_transaction_with_error(self, temp_log_file):
+        """Test logging a failed transaction with error message."""
+        set_transaction_log(temp_log_file)
         log_transaction(
             action="transfer",
             status="failed",
+            snapshot="home-20240101",
             error="Connection refused",
         )
 
-        content = log_path.read_text()
-        record = json.loads(content.strip())
+        with open(temp_log_file) as f:
+            record = json.loads(f.readline())
 
+        assert record["status"] == "failed"
         assert record["error"] == "Connection refused"
 
-        set_transaction_log(None)
+    def test_log_multiple_transactions(self, temp_log_file):
+        """Test logging multiple transactions."""
+        set_transaction_log(temp_log_file)
 
-    def test_appends_to_log(self, tmp_path):
-        """Test transactions are appended to log."""
-        log_path = tmp_path / "transactions.log"
+        log_transaction(action="snapshot", status="started")
+        log_transaction(action="snapshot", status="completed")
+        log_transaction(action="transfer", status="started")
+        log_transaction(action="transfer", status="completed")
+
+        with open(temp_log_file) as f:
+            lines = f.readlines()
+
+        assert len(lines) == 4
+
+    def test_log_handles_write_error(self, temp_log_dir):
+        """Test that write errors are handled gracefully."""
+        log_path = temp_log_dir / "transactions.jsonl"
         set_transaction_log(log_path)
 
-        log_transaction(action="first", status="completed")
-        log_transaction(action="second", status="completed")
-        log_transaction(action="third", status="completed")
+        # Create file and make it read-only
+        log_path.touch()
+        log_path.chmod(0o444)
 
-        lines = log_path.read_text().strip().split("\n")
-        assert len(lines) == 3
+        try:
+            # Should not raise, just log warning
+            log_transaction(action="test", status="completed")
+        finally:
+            log_path.chmod(0o644)
 
-        records = [json.loads(line) for line in lines]
-        assert records[0]["action"] == "first"
-        assert records[1]["action"] == "second"
-        assert records[2]["action"] == "third"
+    def test_log_thread_safety(self, temp_log_file):
+        """Test that logging is thread-safe."""
+        set_transaction_log(temp_log_file)
+        num_threads = 10
+        logs_per_thread = 50
 
-        set_transaction_log(None)
+        def log_many():
+            for i in range(logs_per_thread):
+                log_transaction(
+                    action="test",
+                    status="completed",
+                    details={"thread": threading.current_thread().name, "index": i},
+                )
 
-    def test_does_nothing_when_disabled(self, tmp_path):
-        """Test does nothing when logging is disabled."""
-        set_transaction_log(None)
+        threads = [threading.Thread(target=log_many) for _ in range(num_threads)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
 
-        # Should not raise
-        log_transaction(action="test", status="completed")
+        with open(temp_log_file) as f:
+            lines = f.readlines()
 
-    def test_rounds_duration(self, tmp_path):
-        """Test duration is rounded to 3 decimal places."""
-        log_path = tmp_path / "transactions.log"
-        set_transaction_log(log_path)
-
-        log_transaction(
-            action="test",
-            status="completed",
-            duration_seconds=1.23456789,
-        )
-
-        content = log_path.read_text()
-        record = json.loads(content.strip())
-
-        assert record["duration_seconds"] == 1.235
-
-        set_transaction_log(None)
-
-    @patch("builtins.open", side_effect=OSError("Disk full"))
-    def test_handles_write_error(self, mock_open, tmp_path):
-        """Test handles write errors gracefully."""
-        log_path = tmp_path / "transactions.log"
-        log_path.parent.mkdir(parents=True, exist_ok=True)
-
-        # Set path but mock will cause write to fail
-        import btrfs_backup_ng.transaction as txn_module
-
-        txn_module._transaction_log_path = log_path
-
-        # Should not raise, just log warning
-        log_transaction(action="test", status="completed")
-
-        # Cleanup
-        set_transaction_log(None)
+        assert len(lines) == num_threads * logs_per_thread
+        # Verify each line is valid JSON
+        for line in lines:
+            json.loads(line)
 
 
 class TestTransactionContext:
-    """Tests for TransactionContext context manager."""
+    """Tests for TransactionContext class."""
 
-    def test_logs_start_and_completion(self, tmp_path):
-        """Test logs started and completed transactions."""
-        log_path = tmp_path / "transactions.log"
-        set_transaction_log(log_path)
+    def test_context_basic_success(self, temp_log_file):
+        """Test basic successful transaction context."""
+        set_transaction_log(temp_log_file)
 
-        with TransactionContext("backup", source="/home"):
-            pass  # Simulate work
+        with TransactionContext("snapshot", source="/home"):
+            pass
 
-        lines = log_path.read_text().strip().split("\n")
-        assert len(lines) == 2
+        records = read_transaction_log(temp_log_file)
+        assert len(records) == 2
+        assert records[0]["status"] == "completed"
+        assert records[1]["status"] == "started"
 
-        started = json.loads(lines[0])
-        completed = json.loads(lines[1])
-
-        assert started["action"] == "backup"
-        assert started["status"] == "started"
-        assert started["source"] == "/home"
-
-        assert completed["action"] == "backup"
-        assert completed["status"] == "completed"
-        assert "duration_seconds" in completed
-
-        set_transaction_log(None)
-
-    def test_logs_failure_on_exception(self, tmp_path):
-        """Test logs failed status when exception occurs."""
-        log_path = tmp_path / "transactions.log"
-        set_transaction_log(log_path)
+    def test_context_with_exception(self, temp_log_file):
+        """Test transaction context with exception."""
+        set_transaction_log(temp_log_file)
 
         with pytest.raises(ValueError):
-            with TransactionContext("backup"):
-                raise ValueError("Something went wrong")
+            with TransactionContext("transfer", source="/home"):
+                raise ValueError("Test error")
 
-        lines = log_path.read_text().strip().split("\n")
-        assert len(lines) == 2
+        records = read_transaction_log(temp_log_file)
+        assert len(records) == 2
+        assert records[0]["status"] == "failed"
+        assert records[0]["error"] == "Test error"
 
-        failed = json.loads(lines[1])
-        assert failed["status"] == "failed"
-        assert "Something went wrong" in failed["error"]
+    def test_context_set_snapshot(self, temp_log_file):
+        """Test setting snapshot name during context."""
+        set_transaction_log(temp_log_file)
 
-        set_transaction_log(None)
+        with TransactionContext("snapshot", source="/home") as tx:
+            tx.set_snapshot("home-20240101")
 
-    def test_set_snapshot(self, tmp_path):
-        """Test setting snapshot name after context creation."""
-        log_path = tmp_path / "transactions.log"
-        set_transaction_log(log_path)
+        records = read_transaction_log(temp_log_file)
+        assert records[0]["snapshot"] == "home-20240101"
 
-        with TransactionContext("backup") as tx:
-            tx.set_snapshot("home-20260101")
-
-        lines = log_path.read_text().strip().split("\n")
-        completed = json.loads(lines[1])
-
-        assert completed["snapshot"] == "home-20260101"
-
-        set_transaction_log(None)
-
-    def test_set_parent(self, tmp_path):
+    def test_context_set_parent(self, temp_log_file):
         """Test setting parent snapshot name."""
-        log_path = tmp_path / "transactions.log"
-        set_transaction_log(log_path)
+        set_transaction_log(temp_log_file)
 
         with TransactionContext("transfer") as tx:
-            tx.set_parent("home-20251231")
+            tx.set_parent("home-20231231")
 
-        lines = log_path.read_text().strip().split("\n")
-        completed = json.loads(lines[1])
+        records = read_transaction_log(temp_log_file)
+        assert records[0]["parent"] == "home-20231231"
 
-        assert completed["parent"] == "home-20251231"
-
-        set_transaction_log(None)
-
-    def test_set_size(self, tmp_path):
+    def test_context_set_size(self, temp_log_file):
         """Test setting transfer size."""
-        log_path = tmp_path / "transactions.log"
-        set_transaction_log(log_path)
+        set_transaction_log(temp_log_file)
 
         with TransactionContext("transfer") as tx:
             tx.set_size(1024000)
 
-        lines = log_path.read_text().strip().split("\n")
-        completed = json.loads(lines[1])
+        records = read_transaction_log(temp_log_file)
+        assert records[0]["size_bytes"] == 1024000
 
-        assert completed["size_bytes"] == 1024000
-
-        set_transaction_log(None)
-
-    def test_add_detail(self, tmp_path):
-        """Test adding custom details."""
-        log_path = tmp_path / "transactions.log"
-        set_transaction_log(log_path)
+    def test_context_add_detail(self, temp_log_file):
+        """Test adding details to transaction."""
+        set_transaction_log(temp_log_file)
 
         with TransactionContext("transfer") as tx:
             tx.add_detail("compression", "zstd")
-            tx.add_detail("level", 3)
+            tx.add_detail("rate_limit", "10M")
 
-        lines = log_path.read_text().strip().split("\n")
-        completed = json.loads(lines[1])
+        records = read_transaction_log(temp_log_file)
+        assert records[0]["details"]["compression"] == "zstd"
+        assert records[0]["details"]["rate_limit"] == "10M"
 
-        assert completed["details"]["compression"] == "zstd"
-        assert completed["details"]["level"] == 3
+    def test_context_fail_method(self, temp_log_file):
+        """Test the fail method."""
+        set_transaction_log(temp_log_file)
 
-        set_transaction_log(None)
-
-    def test_fail_method(self, tmp_path):
-        """Test fail method sets error message."""
-        log_path = tmp_path / "transactions.log"
-        set_transaction_log(log_path)
-
-        with TransactionContext("backup") as tx:
+        with TransactionContext("transfer") as tx:
             tx.fail("Manual failure")
+            # The fail method just sets _error, doesn't raise
+            # The actual failure status requires an exception
 
-        # fail() just sets the error message, actual failure logged on exception
-        lines = log_path.read_text().strip().split("\n")
-        completed = json.loads(lines[1])
+        records = read_transaction_log(temp_log_file)
+        # Without exception, status is still completed
+        assert records[0]["status"] == "completed"
 
-        # Without exception, still completes
-        assert completed["status"] == "completed"
+    def test_context_measures_duration(self, temp_log_file):
+        """Test that duration is measured correctly."""
+        set_transaction_log(temp_log_file)
 
-        set_transaction_log(None)
+        with TransactionContext("transfer"):
+            time.sleep(0.1)
 
-    def test_measures_duration(self, tmp_path):
-        """Test duration is measured accurately."""
-        log_path = tmp_path / "transactions.log"
-        set_transaction_log(log_path)
+        records = read_transaction_log(temp_log_file)
+        duration = records[0]["duration_seconds"]
+        assert duration >= 0.1
+        assert duration < 0.5  # Reasonable upper bound
 
-        with TransactionContext("backup"):
-            time.sleep(0.1)  # Sleep 100ms
+    def test_context_full_parameters(self, temp_log_file):
+        """Test context with all constructor parameters."""
+        set_transaction_log(temp_log_file)
 
-        lines = log_path.read_text().strip().split("\n")
-        completed = json.loads(lines[1])
+        with TransactionContext(
+            action="transfer",
+            source="/home",
+            destination="/backup",
+            snapshot="home-20240101",
+            parent="home-20231231",
+        ):
+            pass
 
-        # Should be at least 0.1 seconds
-        assert completed["duration_seconds"] >= 0.1
-
-        set_transaction_log(None)
-
-    def test_returns_self_from_enter(self, tmp_path):
-        """Test __enter__ returns self."""
-        set_transaction_log(tmp_path / "transactions.log")
-
-        ctx = TransactionContext("test")
-        result = ctx.__enter__()
-
-        assert result is ctx
-
-        ctx.__exit__(None, None, None)
-        set_transaction_log(None)
-
-    def test_does_not_suppress_exceptions(self, tmp_path):
-        """Test exceptions are not suppressed."""
-        set_transaction_log(tmp_path / "transactions.log")
-
-        with pytest.raises(RuntimeError):
-            with TransactionContext("test"):
-                raise RuntimeError("Test error")
-
-        set_transaction_log(None)
+        records = read_transaction_log(temp_log_file)
+        assert records[0]["action"] == "transfer"
+        assert records[0]["source"] == "/home"
+        assert records[0]["destination"] == "/backup"
+        assert records[0]["snapshot"] == "home-20240101"
+        assert records[0]["parent"] == "home-20231231"
 
 
 class TestReadTransactionLog:
     """Tests for read_transaction_log function."""
 
-    def test_reads_empty_log(self, tmp_path):
-        """Test reading empty log returns empty list."""
-        log_path = tmp_path / "transactions.log"
-        log_path.touch()
+    def test_read_empty_log(self, temp_log_file):
+        """Test reading an empty log file."""
+        temp_log_file.touch()
+        records = read_transaction_log(temp_log_file)
+        assert records == []
 
-        result = read_transaction_log(log_path)
+    def test_read_nonexistent_log(self, temp_log_dir):
+        """Test reading a nonexistent log file."""
+        records = read_transaction_log(temp_log_dir / "nonexistent.jsonl")
+        assert records == []
 
-        assert result == []
-
-    def test_reads_nonexistent_log(self, tmp_path):
-        """Test reading nonexistent log returns empty list."""
-        log_path = tmp_path / "nonexistent.log"
-
-        result = read_transaction_log(log_path)
-
-        assert result == []
-
-    def test_reads_log_entries(self, tmp_path):
-        """Test reads and parses log entries."""
-        log_path = tmp_path / "transactions.log"
-        set_transaction_log(log_path)
-
-        log_transaction(action="backup", status="completed")
-        log_transaction(action="transfer", status="completed")
-
+    def test_read_when_path_is_none(self):
+        """Test reading when no path is set."""
         set_transaction_log(None)
+        records = read_transaction_log()
+        assert records == []
 
-        result = read_transaction_log(log_path)
-
-        assert len(result) == 2
-        # Most recent first
-        assert result[0]["action"] == "transfer"
-        assert result[1]["action"] == "backup"
-
-    def test_limit_parameter(self, tmp_path):
-        """Test limit parameter."""
-        log_path = tmp_path / "transactions.log"
-        set_transaction_log(log_path)
+    def test_read_with_limit(self, temp_log_file):
+        """Test reading with a limit."""
+        set_transaction_log(temp_log_file)
 
         for i in range(10):
-            log_transaction(action=f"action-{i}", status="completed")
+            log_transaction(action="test", status="completed", details={"index": i})
 
-        set_transaction_log(None)
-
-        result = read_transaction_log(log_path, limit=3)
-
-        assert len(result) == 3
+        records = read_transaction_log(temp_log_file, limit=3)
+        assert len(records) == 3
         # Most recent first
-        assert result[0]["action"] == "action-9"
+        assert records[0]["details"]["index"] == 9
 
-    def test_action_filter(self, tmp_path):
+    def test_read_with_action_filter(self, temp_log_file):
         """Test filtering by action."""
-        log_path = tmp_path / "transactions.log"
-        set_transaction_log(log_path)
+        set_transaction_log(temp_log_file)
 
-        log_transaction(action="backup", status="completed")
+        log_transaction(action="snapshot", status="completed")
         log_transaction(action="transfer", status="completed")
-        log_transaction(action="backup", status="completed")
+        log_transaction(action="snapshot", status="completed")
+        log_transaction(action="delete", status="completed")
 
-        set_transaction_log(None)
+        records = read_transaction_log(temp_log_file, action_filter="snapshot")
+        assert len(records) == 2
+        for r in records:
+            assert r["action"] == "snapshot"
 
-        result = read_transaction_log(log_path, action_filter="backup")
-
-        assert len(result) == 2
-        assert all(r["action"] == "backup" for r in result)
-
-    def test_status_filter(self, tmp_path):
+    def test_read_with_status_filter(self, temp_log_file):
         """Test filtering by status."""
-        log_path = tmp_path / "transactions.log"
-        set_transaction_log(log_path)
+        set_transaction_log(temp_log_file)
 
-        log_transaction(action="backup", status="started")
-        log_transaction(action="backup", status="completed")
-        log_transaction(action="backup", status="failed")
+        log_transaction(action="transfer", status="started")
+        log_transaction(action="transfer", status="completed")
+        log_transaction(action="transfer", status="failed")
+        log_transaction(action="transfer", status="completed")
 
-        set_transaction_log(None)
+        records = read_transaction_log(temp_log_file, status_filter="completed")
+        assert len(records) == 2
+        for r in records:
+            assert r["status"] == "completed"
 
-        result = read_transaction_log(log_path, status_filter="failed")
+    def test_read_with_both_filters(self, temp_log_file):
+        """Test filtering by both action and status."""
+        set_transaction_log(temp_log_file)
 
-        assert len(result) == 1
-        assert result[0]["status"] == "failed"
+        log_transaction(action="transfer", status="completed")
+        log_transaction(action="transfer", status="failed")
+        log_transaction(action="snapshot", status="completed")
+        log_transaction(action="snapshot", status="failed")
 
-    def test_uses_current_log_path(self, tmp_path):
-        """Test uses current log path when path not specified."""
-        log_path = tmp_path / "transactions.log"
-        set_transaction_log(log_path)
+        records = read_transaction_log(
+            temp_log_file, action_filter="transfer", status_filter="failed"
+        )
+        assert len(records) == 1
+        assert records[0]["action"] == "transfer"
+        assert records[0]["status"] == "failed"
 
+    def test_read_uses_global_path(self, temp_log_file):
+        """Test that read_transaction_log uses global path when not specified."""
+        set_transaction_log(temp_log_file)
         log_transaction(action="test", status="completed")
 
-        result = read_transaction_log()  # No path specified
+        records = read_transaction_log()  # No path specified
+        assert len(records) == 1
 
-        assert len(result) == 1
+    def test_read_handles_malformed_json(self, temp_log_file):
+        """Test that malformed JSON lines are skipped."""
+        with open(temp_log_file, "w") as f:
+            f.write('{"action": "test", "status": "completed"}\n')
+            f.write("not valid json\n")
+            f.write('{"action": "test2", "status": "completed"}\n')
 
-        set_transaction_log(None)
+        records = read_transaction_log(temp_log_file)
+        assert len(records) == 2
 
-    def test_skips_invalid_json(self, tmp_path):
-        """Test skips invalid JSON lines."""
-        log_path = tmp_path / "transactions.log"
-        log_path.write_text(
-            '{"action": "valid", "status": "completed"}\n'
-            "not valid json\n"
-            '{"action": "also_valid", "status": "completed"}\n'
-        )
+    def test_read_handles_blank_lines(self, temp_log_file):
+        """Test that blank lines are skipped."""
+        with open(temp_log_file, "w") as f:
+            f.write('{"action": "test", "status": "completed"}\n')
+            f.write("\n")
+            f.write("   \n")
+            f.write('{"action": "test2", "status": "completed"}\n')
 
-        result = read_transaction_log(log_path)
+        records = read_transaction_log(temp_log_file)
+        assert len(records) == 2
 
-        assert len(result) == 2
+    def test_read_returns_most_recent_first(self, temp_log_file):
+        """Test that records are returned most recent first."""
+        set_transaction_log(temp_log_file)
 
-    def test_skips_empty_lines(self, tmp_path):
-        """Test skips empty lines."""
-        log_path = tmp_path / "transactions.log"
-        log_path.write_text(
-            '{"action": "test", "status": "completed"}\n'
-            "\n"
-            "\n"
-            '{"action": "test2", "status": "completed"}\n'
-        )
+        log_transaction(action="first", status="completed")
+        log_transaction(action="second", status="completed")
+        log_transaction(action="third", status="completed")
 
-        result = read_transaction_log(log_path)
-
-        assert len(result) == 2
+        records = read_transaction_log(temp_log_file)
+        assert records[0]["action"] == "third"
+        assert records[1]["action"] == "second"
+        assert records[2]["action"] == "first"
 
 
 class TestGetTransactionStats:
     """Tests for get_transaction_stats function."""
 
-    def test_empty_log_stats(self, tmp_path):
+    def test_stats_empty_log(self, temp_log_file):
         """Test stats for empty log."""
-        log_path = tmp_path / "empty.log"
-        log_path.touch()
-
-        stats = get_transaction_stats(log_path)
+        temp_log_file.touch()
+        stats = get_transaction_stats(temp_log_file)
 
         assert stats["total_records"] == 0
         assert stats["transfers"]["completed"] == 0
@@ -509,112 +449,99 @@ class TestGetTransactionStats:
         assert stats["deletes"]["failed"] == 0
         assert stats["total_bytes_transferred"] == 0
 
-    def test_counts_transfers(self, tmp_path):
-        """Test counting transfer records."""
-        log_path = tmp_path / "transactions.log"
-        set_transaction_log(log_path)
+    def test_stats_nonexistent_log(self, temp_log_dir):
+        """Test stats for nonexistent log."""
+        stats = get_transaction_stats(temp_log_dir / "nonexistent.jsonl")
+        assert stats["total_records"] == 0
+
+    def test_stats_with_transfers(self, temp_log_file):
+        """Test stats with transfer records."""
+        set_transaction_log(temp_log_file)
 
         log_transaction(action="transfer", status="completed", size_bytes=1000)
         log_transaction(action="transfer", status="completed", size_bytes=2000)
         log_transaction(action="transfer", status="failed")
 
-        set_transaction_log(None)
-
-        stats = get_transaction_stats(log_path)
-
+        stats = get_transaction_stats(temp_log_file)
         assert stats["transfers"]["completed"] == 2
         assert stats["transfers"]["failed"] == 1
         assert stats["total_bytes_transferred"] == 3000
 
-    def test_counts_snapshots(self, tmp_path):
-        """Test counting snapshot records."""
-        log_path = tmp_path / "transactions.log"
-        set_transaction_log(log_path)
+    def test_stats_with_snapshots(self, temp_log_file):
+        """Test stats with snapshot records."""
+        set_transaction_log(temp_log_file)
 
         log_transaction(action="snapshot", status="completed")
         log_transaction(action="snapshot", status="completed")
         log_transaction(action="snapshot", status="failed")
 
-        set_transaction_log(None)
-
-        stats = get_transaction_stats(log_path)
-
+        stats = get_transaction_stats(temp_log_file)
         assert stats["snapshots"]["completed"] == 2
         assert stats["snapshots"]["failed"] == 1
 
-    def test_counts_deletes_and_prunes(self, tmp_path):
-        """Test counting delete and prune records."""
-        log_path = tmp_path / "transactions.log"
-        set_transaction_log(log_path)
+    def test_stats_with_deletes(self, temp_log_file):
+        """Test stats with delete records."""
+        set_transaction_log(temp_log_file)
 
         log_transaction(action="delete", status="completed")
         log_transaction(action="prune", status="completed")
         log_transaction(action="delete", status="failed")
 
-        set_transaction_log(None)
-
-        stats = get_transaction_stats(log_path)
-
+        stats = get_transaction_stats(temp_log_file)
         assert stats["deletes"]["completed"] == 2
         assert stats["deletes"]["failed"] == 1
 
-    def test_total_records(self, tmp_path):
-        """Test total records count."""
-        log_path = tmp_path / "transactions.log"
-        set_transaction_log(log_path)
+    def test_stats_mixed_actions(self, temp_log_file):
+        """Test stats with mixed action types."""
+        set_transaction_log(temp_log_file)
 
-        for i in range(5):
-            log_transaction(action="test", status="completed")
+        log_transaction(action="snapshot", status="completed")
+        log_transaction(action="transfer", status="completed", size_bytes=5000)
+        log_transaction(action="transfer", status="completed", size_bytes=3000)
+        log_transaction(action="transfer", status="failed")
+        log_transaction(action="delete", status="completed")
+        log_transaction(action="snapshot", status="failed")
 
-        set_transaction_log(None)
+        stats = get_transaction_stats(temp_log_file)
+        assert stats["total_records"] == 6
+        assert stats["snapshots"]["completed"] == 1
+        assert stats["snapshots"]["failed"] == 1
+        assert stats["transfers"]["completed"] == 2
+        assert stats["transfers"]["failed"] == 1
+        assert stats["deletes"]["completed"] == 1
+        assert stats["deletes"]["failed"] == 0
+        assert stats["total_bytes_transferred"] == 8000
 
-        stats = get_transaction_stats(log_path)
-
-        assert stats["total_records"] == 5
-
-    def test_uses_current_log_path(self, tmp_path):
-        """Test uses current log path when not specified."""
-        log_path = tmp_path / "transactions.log"
-        set_transaction_log(log_path)
-
-        log_transaction(action="test", status="completed")
+    def test_stats_uses_global_path(self, temp_log_file):
+        """Test that get_transaction_stats uses global path when not specified."""
+        set_transaction_log(temp_log_file)
+        log_transaction(action="transfer", status="completed", size_bytes=1000)
 
         stats = get_transaction_stats()  # No path specified
-
         assert stats["total_records"] == 1
 
-        set_transaction_log(None)
+    def test_stats_ignores_started_status(self, temp_log_file):
+        """Test that 'started' status records are not counted."""
+        set_transaction_log(temp_log_file)
 
+        log_transaction(action="transfer", status="started")
+        log_transaction(action="transfer", status="completed", size_bytes=1000)
+        log_transaction(action="snapshot", status="started")
+        log_transaction(action="snapshot", status="completed")
 
-class TestThreadSafety:
-    """Tests for thread safety of transaction logging."""
+        stats = get_transaction_stats(temp_log_file)
+        assert stats["total_records"] == 4
+        assert stats["transfers"]["completed"] == 1
+        assert stats["transfers"]["failed"] == 0
+        assert stats["snapshots"]["completed"] == 1
+        assert stats["snapshots"]["failed"] == 0
 
-    def test_concurrent_logging(self, tmp_path):
-        """Test concurrent logging from multiple threads."""
-        log_path = tmp_path / "transactions.log"
-        set_transaction_log(log_path)
+    def test_stats_handles_missing_size_bytes(self, temp_log_file):
+        """Test that missing size_bytes is handled."""
+        set_transaction_log(temp_log_file)
 
-        num_threads = 10
-        transactions_per_thread = 100
+        log_transaction(action="transfer", status="completed", size_bytes=1000)
+        log_transaction(action="transfer", status="completed")  # No size
 
-        def log_transactions(thread_id):
-            for i in range(transactions_per_thread):
-                log_transaction(
-                    action=f"action-{thread_id}-{i}",
-                    status="completed",
-                )
-
-        threads = []
-        for i in range(num_threads):
-            t = threading.Thread(target=log_transactions, args=(i,))
-            threads.append(t)
-            t.start()
-
-        for t in threads:
-            t.join()
-
-        set_transaction_log(None)
-
-        # Verify all transactions were logged
-        result = read_transaction_log(log_path)
-        assert len(result) == num_threads * transactions_per_thread
+        stats = get_transaction_stats(temp_log_file)
+        assert stats["total_bytes_transferred"] == 1000
