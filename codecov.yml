@@ -1,0 +1,78 @@
+# Codecov configuration for btrfs-backup-ng
+# https://docs.codecov.com/docs/codecovyml-reference
+
+coverage:
+  # Coverage thresholds
+  status:
+    project:
+      default:
+        # Require coverage to not drop below current level
+        target: auto
+        # Allow small decreases (0.5%) to avoid blocking minor changes
+        threshold: 0.5%
+        # Only check against base commit on PRs
+        if_ci_failed: error
+
+    patch:
+      default:
+        # New code in PRs should have reasonable coverage
+        target: 60%
+        # Only fail if significantly below target
+        threshold: 10%
+
+  # Precision for coverage percentage display
+  precision: 2
+  round: down
+
+# PR comment settings
+comment:
+  # Post detailed coverage report as PR comment
+  layout: "condensed_header, diff, flags, components"
+  # Update existing comment instead of posting new ones
+  behavior: default
+  # Always post comment (even if coverage unchanged)
+  require_changes: false
+
+# Component-based coverage tracking
+component_management:
+  individual_components:
+    - component_id: core
+      name: Core Library
+      paths:
+        - src/btrfs_backup_ng/core/**
+
+    - component_id: cli
+      name: CLI Commands
+      paths:
+        - src/btrfs_backup_ng/cli/**
+
+    - component_id: config
+      name: Configuration
+      paths:
+        - src/btrfs_backup_ng/config/**
+
+    - component_id: utilities
+      name: Utilities
+      paths:
+        - src/btrfs_backup_ng/__util__.py
+        - src/btrfs_backup_ng/transaction.py
+        - src/btrfs_backup_ng/retention.py
+        - src/btrfs_backup_ng/notifications.py
+
+# Flag management for test segmentation
+flag_management:
+  individual_flags:
+    - name: unittests
+      paths:
+        - src/btrfs_backup_ng/
+      carryforward: true
+
+# Ignore certain paths from coverage
+ignore:
+  - "tests/**"
+  - "**/__pycache__/**"
+  - "**/conftest.py"
+
+# GitHub integration settings
+github_checks:
+  annotations: true
