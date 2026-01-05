@@ -12,20 +12,20 @@ def get_manpages_dir() -> Path | None:
     """Get the directory containing man page files.
 
     Returns:
-        Path to man directory, or None if not found
+        Path to man/man1 directory, or None if not found
     """
     # Try to find man pages in the package
     try:
         # When installed as a package
         pkg_files = files("btrfs_backup_ng")
-        man_path = Path(str(pkg_files)).parent.parent.parent / "man"
+        man_path = Path(str(pkg_files)).parent.parent.parent / "man" / "man1"
         if man_path.exists():
             return man_path
     except Exception:
         pass
 
     # Try relative to this file (development mode)
-    dev_path = Path(__file__).parent.parent.parent.parent / "man"
+    dev_path = Path(__file__).parent.parent.parent.parent / "man" / "man1"
     if dev_path.exists():
         return dev_path
 

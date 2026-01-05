@@ -24,7 +24,7 @@ This directory contains manual pages for btrfs-backup-ng.
 
 ```bash
 sudo mkdir -p /usr/local/share/man/man1
-sudo cp *.1 /usr/local/share/man/man1/
+sudo cp man1/*.1 /usr/local/share/man/man1/
 sudo mandb
 ```
 
@@ -32,7 +32,7 @@ sudo mandb
 
 ```bash
 mkdir -p ~/.local/share/man/man1
-cp *.1 ~/.local/share/man/man1/
+cp man1/*.1 ~/.local/share/man/man1/
 # Add to ~/.bashrc or ~/.zshrc if not already set:
 # export MANPATH="$HOME/.local/share/man:$MANPATH"
 ```
@@ -50,26 +50,26 @@ man btrfs-backup-ng-config
 Without installation (from this directory):
 
 ```bash
-man ./btrfs-backup-ng.1
-man ./btrfs-backup-ng-restore.1
+man ./man1/btrfs-backup-ng.1
+man ./man1/btrfs-backup-ng-restore.1
 ```
 
 ## Generating HTML/PDF
 
 Convert to HTML:
 ```bash
-groff -mandoc -Thtml btrfs-backup-ng.1 > btrfs-backup-ng.html
+groff -mandoc -Thtml man1/btrfs-backup-ng.1 > btrfs-backup-ng.html
 ```
 
 Convert to PDF:
 ```bash
-groff -mandoc -Tpdf btrfs-backup-ng.1 > btrfs-backup-ng.pdf
+groff -mandoc -Tpdf man1/btrfs-backup-ng.1 > btrfs-backup-ng.pdf
 ```
 
 ## Checking for Errors
 
 ```bash
-for f in *.1; do
+for f in man1/*.1; do
     echo "Checking $f..."
     mandoc -Tlint "$f"
 done
