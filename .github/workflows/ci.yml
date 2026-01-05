@@ -42,13 +42,15 @@ jobs:
           pip install pytest-cov
           pytest tests/ --cov=src/btrfs_backup_ng --cov-report=xml --cov-report=term-missing
 
-      - name: Upload coverage reports
+      - name: Upload coverage to Codecov
         if: matrix.python-version == '3.12'
-        uses: codecov/codecov-action@v4
+        uses: codecov/codecov-action@v5
         with:
-          file: ./coverage.xml
+          files: ./coverage.xml
+          flags: unittests
+          name: codecov-umbrella
           fail_ci_if_error: false
-        continue-on-error: true
+          verbose: true
 
   lint:
     name: Lint & Type Check
@@ -79,7 +81,7 @@ jobs:
       - name: Run mypy type checker
         run: |
           mypy src/btrfs_backup_ng --ignore-missing-imports
-        continue-on-error: true  # Start permissive, tighten later
+        continue-on-error: true # Start permissive, tighten later
 
   build:
     name: Build Package
