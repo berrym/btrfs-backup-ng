@@ -5,8 +5,9 @@ _btrfs_backup_ng() {
     local cur prev words cword split
     _init_completion -s || return
 
-    local commands="run snapshot transfer prune list status config install uninstall restore verify estimate"
+    local commands="run snapshot transfer prune list status config install uninstall restore verify estimate completions"
     local config_subcommands="validate init import"
+    local completions_subcommands="install path"
 
     # Global options
     local global_opts="-h --help -v --verbose -q --quiet --debug -V --version -c --config"
@@ -26,7 +27,9 @@ _btrfs_backup_ng() {
     local config_import_opts="-o --output"
     local verify_opts="--level --snapshot --temp-dir --no-cleanup --prefix --ssh-sudo --ssh-key --no-fs-checks --json -q --quiet"
     local estimate_opts="-c --config --volume --target --prefix --ssh-sudo --ssh-key --no-fs-checks --json"
+    local completions_install_opts="--shell --system"
     local verify_levels="metadata stream full"
+    local shell_types="bash zsh fish"
 
     # Compression methods
     local compress_methods="none zstd gzip lz4 pigz lzop"
@@ -40,11 +43,16 @@ _btrfs_backup_ng() {
     local i
     for ((i=1; i < cword; i++)); do
         case "${words[i]}" in
-            run|snapshot|transfer|prune|list|status|config|install|uninstall|restore|verify)
+            run|snapshot|transfer|prune|list|status|config|install|uninstall|restore|verify|completions)
                 cmd="${words[i]}"
                 ;;
             validate|init|import)
                 if [[ "$cmd" == "config" ]]; then
+                    subcmd="${words[i]}"
+                fi
+                ;;
+            path)
+                if [[ "$cmd" == "completions" ]]; then
                     subcmd="${words[i]}"
                 fi
                 ;;
@@ -87,6 +95,10 @@ _btrfs_backup_ng() {
             ;;
         --level)
             COMPREPLY=($(compgen -W "$verify_levels" -- "$cur"))
+            return
+            ;;
+        --shell)
+            COMPREPLY=($(compgen -W "$shell_types" -- "$cur"))
             return
             ;;
         --temp-dir)
@@ -179,6 +191,24 @@ _btrfs_backup_ng() {
             else
                 # Complete paths for SOURCE and DESTINATION
                 _filedir -d
+            fi
+            ;;
+        completions)
+            if [[ -z "$subcmd" ]]; then
+                if [[ "$cur" == -* ]]; then
+                    COMPREPLY=($(compgen -W "-h --help" -- "$cur"))
+                else
+                    COMPREPLY=($(compgen -W "$completions_subcommands" -- "$cur"))
+                fi
+            else
+                case "$subcmd" in
+                    install)
+                        COMPREPLY=($(compgen -W "$completions_install_opts" -- "$cur"))
+                        ;;
+                    path)
+                        # No additional options
+                        ;;
+                esac
             fi
             ;;
     esac

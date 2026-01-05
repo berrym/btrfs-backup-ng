@@ -64,7 +64,22 @@ sudo apt install pv               # Debian/Ubuntu
 
 ### Shell Completions
 
-Shell completion scripts are available in the `completions/` directory for bash, zsh, and fish. See `completions/README.md` for installation instructions.
+Install shell completions for tab-completion support:
+
+```bash
+# Install for your shell (bash, zsh, or fish)
+btrfs-backup-ng completions install --shell bash
+btrfs-backup-ng completions install --shell zsh
+btrfs-backup-ng completions install --shell fish
+
+# System-wide installation (requires root)
+sudo btrfs-backup-ng completions install --shell bash --system
+
+# Show path to completion scripts
+btrfs-backup-ng completions path
+```
+
+See `completions/README.md` for manual installation instructions.
 
 ### Man Pages
 

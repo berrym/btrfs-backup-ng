@@ -21,6 +21,7 @@ _btrfs-backup-ng() {
         'restore:Restore snapshots from backup location'
         'verify:Verify backup integrity'
         'estimate:Estimate backup transfer sizes'
+        'completions:Install shell completion scripts'
     )
 
     local -a global_opts
@@ -189,6 +190,31 @@ _btrfs-backup-ng() {
                         '--json[Output results in JSON format]' \
                         '1:source (snapshot location):_files -/' \
                         '2:destination (backup location):_files -/'
+                    ;;
+                completions)
+                    local -a completions_commands
+                    completions_commands=(
+                        'install:Install completions for your shell'
+                        'path:Show path to completion scripts'
+                    )
+                    _arguments \
+                        '1: :->completions_cmd' \
+                        '*:: :->completions_args'
+
+                    case $state in
+                        completions_cmd)
+                            _describe -t commands 'completions command' completions_commands
+                            ;;
+                        completions_args)
+                            case $line[1] in
+                                install)
+                                    _arguments \
+                                        '--shell[Shell to install completions for]:shell:(bash zsh fish)' \
+                                        '--system[Install system-wide (requires root)]'
+                                    ;;
+                            esac
+                            ;;
+                    esac
                     ;;
             esac
             ;;

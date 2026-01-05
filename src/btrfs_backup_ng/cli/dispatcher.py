@@ -25,6 +25,7 @@ SUBCOMMANDS = frozenset(
         "restore",
         "verify",
         "estimate",
+        "completions",
     }
 )
 
@@ -591,6 +592,35 @@ Examples:
         help="Suppress progress output",
     )
 
+    # completions command
+    completions_parser = subparsers.add_parser(
+        "completions",
+        help="Install shell completion scripts",
+        description="Install or locate shell completion scripts for bash, zsh, or fish",
+    )
+    completions_subs = completions_parser.add_subparsers(dest="completions_action")
+
+    completions_install = completions_subs.add_parser(
+        "install",
+        help="Install completions for your shell",
+    )
+    completions_install.add_argument(
+        "--shell",
+        choices=["bash", "zsh", "fish"],
+        required=True,
+        help="Shell to install completions for",
+    )
+    completions_install.add_argument(
+        "--system",
+        action="store_true",
+        help="Install system-wide (requires root)",
+    )
+
+    completions_subs.add_parser(
+        "path",
+        help="Show path to completion scripts",
+    )
+
     # estimate command
     estimate_parser = subparsers.add_parser(
         "estimate",
@@ -756,6 +786,7 @@ def run_subcommand(args: argparse.Namespace) -> int:
         "restore": cmd_restore,
         "verify": cmd_verify,
         "estimate": cmd_estimate,
+        "completions": cmd_completions,
     }
 
     handler = handlers.get(args.command)
@@ -852,6 +883,13 @@ def cmd_estimate(args: argparse.Namespace) -> int:
     from .estimate import execute_estimate
 
     return execute_estimate(args)
+
+
+def cmd_completions(args: argparse.Namespace) -> int:
+    """Execute completions command."""
+    from .completions import execute_completions
+
+    return execute_completions(args)
 
 
 def main(argv: list[str] | None = None) -> int:

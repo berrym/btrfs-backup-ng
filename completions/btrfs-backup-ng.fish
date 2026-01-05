@@ -10,7 +10,7 @@ function __fish_btrfs_backup_ng_no_subcommand
     set -e cmd[1]
     for c in $cmd
         switch $c
-            case run snapshot transfer prune list status config install uninstall restore verify
+            case run snapshot transfer prune list status config install uninstall restore verify estimate completions
                 return 1
         end
     end
@@ -62,6 +62,7 @@ complete -c btrfs-backup-ng -n __fish_btrfs_backup_ng_no_subcommand -a uninstall
 complete -c btrfs-backup-ng -n __fish_btrfs_backup_ng_no_subcommand -a restore -d 'Restore snapshots from backup location'
 complete -c btrfs-backup-ng -n __fish_btrfs_backup_ng_no_subcommand -a verify -d 'Verify backup integrity'
 complete -c btrfs-backup-ng -n __fish_btrfs_backup_ng_no_subcommand -a estimate -d 'Estimate backup transfer sizes'
+complete -c btrfs-backup-ng -n __fish_btrfs_backup_ng_no_subcommand -a completions -d 'Install shell completion scripts'
 
 # Compression methods
 set -l compress_methods none zstd gzip lz4 pigz lzop
@@ -176,3 +177,25 @@ complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_using_command estimate' -
 complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_using_command estimate' -l json -d 'Output results in JSON format'
 # Enable path completion for estimate positional arguments
 complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_using_command estimate' -a '(__fish_complete_directories)'
+
+# completions command subcommands
+complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_using_command completions' -a install -d 'Install completions for your shell'
+complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_using_command completions' -a path -d 'Show path to completion scripts'
+
+# Helper for completions subcommand
+function __fish_btrfs_backup_ng_completions_using_subcommand
+    set -l cmd (commandline -opc)
+    set -e cmd[1]
+    if test (count $cmd) -gt 1
+        if test $cmd[1] = completions
+            if test $argv[1] = $cmd[2]
+                return 0
+            end
+        end
+    end
+    return 1
+end
+
+# completions install
+complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_completions_using_subcommand install' -l shell -d 'Shell to install completions for' -xa 'bash zsh fish'
+complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_completions_using_subcommand install' -l system -d 'Install system-wide (requires root)'
