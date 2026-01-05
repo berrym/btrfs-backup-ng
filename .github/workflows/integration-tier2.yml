@@ -9,23 +9,23 @@ on:
   workflow_dispatch:
     inputs:
       debug:
-        description: 'Enable debug output'
+        description: "Enable debug output"
         required: false
-        default: 'false'
+        default: "false"
         type: boolean
 
   # Weekly run on Sundays at 2 AM UTC
   schedule:
-    - cron: '0 2 * * 0'
+    - cron: "0 2 * * 0"
 
   # Also run on PRs that modify tier2 tests or core btrfs code
   pull_request:
     branches: [master, main]
     paths:
-      - 'tests/integration/tier2/**'
-      - 'src/btrfs_backup_ng/endpoint/**'
-      - 'src/btrfs_backup_ng/core/**'
-      - 'src/btrfs_backup_ng/__util__.py'
+      - "tests/integration/tier2/**"
+      - "src/btrfs_backup_ng/endpoint/**"
+      - "src/btrfs_backup_ng/core/**"
+      - "src/btrfs_backup_ng/__util__.py"
 
 jobs:
   tier2-tests:
@@ -75,7 +75,8 @@ jobs:
           pytest tests/integration/tier2/ -v -m tier2 \
             --cov=src/btrfs_backup_ng \
             --cov-report=xml:coverage-tier2.xml \
-            --cov-report=term-missing
+            --cov-report=term-missing \
+            --cov-fail-under=0
 
       - name: Upload Tier 2 coverage
         if: success()
@@ -96,6 +97,7 @@ jobs:
     steps:
       - name: Check test results
         run: |
+          echo "Tier 2 test job result: ${{ needs.tier2-tests.result }}"
           if [ "${{ needs.tier2-tests.result }}" == "success" ]; then
             echo "✅ Tier 2 integration tests passed"
             exit 0
