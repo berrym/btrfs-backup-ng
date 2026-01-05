@@ -1,6 +1,4 @@
-#!/usr/bin/env python3
-"""
-SSH and Sudo Diagnostic Tool for btrfs-backup-ng
+"""SSH and Sudo Diagnostic Tool for btrfs-backup-ng
 
 This script helps diagnose common SSH and sudo configuration issues
 that may prevent btrfs-backup-ng from successfully transferring backups.
