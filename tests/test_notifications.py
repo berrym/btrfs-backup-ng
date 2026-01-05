@@ -1,9 +1,7 @@
 """Tests for the notifications module."""
 
-import json
 from unittest.mock import MagicMock, patch
 
-import pytest
 
 from btrfs_backup_ng.notifications import (
     EmailConfig,
