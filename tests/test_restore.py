@@ -27,6 +27,15 @@ class MockSnapshot:
     def get_name(self) -> str:
         return self._name
 
+    def find_parent(self, snapshots: list):
+        """Find the most recent snapshot older than this one."""
+        candidates = [s for s in snapshots if s < self]
+        if not candidates:
+            return None
+        return max(
+            candidates, key=lambda s: s.time_obj if hasattr(s, "time_obj") else 0
+        )
+
     def __lt__(self, other):
         """Compare by time for sorting."""
         if self.time_obj and other.time_obj:
@@ -941,3 +950,417 @@ class TestExecuteConfigRestore:
         result = _execute_config_restore(args, "/home")
 
         assert result == 1  # Need destination
+
+
+# Tests for core restore functions
+
+
+class TestVerifyRestoredSnapshot:
+    """Tests for verify_restored_snapshot function."""
+
+    @patch("btrfs_backup_ng.core.restore.__util__.is_subvolume")
+    def test_success_when_valid_subvolume(self, mock_is_subvol, tmp_path):
+        """Test verification succeeds for valid subvolume."""
+        from btrfs_backup_ng.core.restore import verify_restored_snapshot
+
+        # Create the snapshot path
+        snapshot_path = tmp_path / "test-snapshot"
+        snapshot_path.mkdir()
+
+        mock_is_subvol.return_value = True
+
+        mock_endpoint = MagicMock()
+        mock_endpoint.config = {"path": str(tmp_path)}
+
+        result = verify_restored_snapshot(mock_endpoint, "test-snapshot")
+
+        assert result is True
+        mock_is_subvol.assert_called_once_with(snapshot_path)
+
+    @patch("btrfs_backup_ng.core.restore.__util__.is_subvolume")
+    def test_raises_when_path_not_exists(self, mock_is_subvol, tmp_path):
+        """Test verification fails when snapshot path doesn't exist."""
+        from btrfs_backup_ng.core.restore import RestoreError, verify_restored_snapshot
+
+        mock_endpoint = MagicMock()
+        mock_endpoint.config = {"path": str(tmp_path)}
+
+        with pytest.raises(RestoreError, match="not found after restore"):
+            verify_restored_snapshot(mock_endpoint, "nonexistent-snapshot")
+
+    @patch("btrfs_backup_ng.core.restore.__util__.is_subvolume")
+    def test_raises_when_not_subvolume(self, mock_is_subvol, tmp_path):
+        """Test verification fails when path is not a subvolume."""
+        from btrfs_backup_ng.core.restore import RestoreError, verify_restored_snapshot
+
+        # Create the path but not as subvolume
+        snapshot_path = tmp_path / "not-subvolume"
+        snapshot_path.mkdir()
+
+        mock_is_subvol.return_value = False
+
+        mock_endpoint = MagicMock()
+        mock_endpoint.config = {"path": str(tmp_path)}
+
+        with pytest.raises(RestoreError, match="not a valid btrfs subvolume"):
+            verify_restored_snapshot(mock_endpoint, "not-subvolume")
+
+    @patch("btrfs_backup_ng.core.restore.__util__.is_subvolume")
+    def test_wraps_unexpected_exceptions(self, mock_is_subvol, tmp_path):
+        """Test unexpected exceptions are wrapped in RestoreError."""
+        from btrfs_backup_ng.core.restore import RestoreError, verify_restored_snapshot
+
+        snapshot_path = tmp_path / "test-snapshot"
+        snapshot_path.mkdir()
+
+        mock_is_subvol.side_effect = OSError("Unexpected error")
+
+        mock_endpoint = MagicMock()
+        mock_endpoint.config = {"path": str(tmp_path)}
+
+        with pytest.raises(RestoreError, match="Verification failed"):
+            verify_restored_snapshot(mock_endpoint, "test-snapshot")
+
+
+class TestRestoreSnapshot:
+    """Tests for restore_snapshot function."""
+
+    @patch("btrfs_backup_ng.core.restore.verify_restored_snapshot")
+    @patch("btrfs_backup_ng.core.restore.send_snapshot")
+    @patch("btrfs_backup_ng.core.restore.log_transaction")
+    def test_restores_single_snapshot(self, mock_log, mock_send, mock_verify, tmp_path):
+        """Test restoring a single snapshot."""
+        from btrfs_backup_ng.core.restore import restore_snapshot
+
+        mock_verify.return_value = True
+
+        backup_endpoint = MagicMock()
+        backup_endpoint.config = {"path": "/backup"}
+        local_endpoint = MagicMock()
+        local_endpoint.config = {"path": str(tmp_path)}
+
+        snapshot = MockSnapshot("test-snap")
+
+        restore_snapshot(backup_endpoint, local_endpoint, snapshot)
+
+        # Verify lock was set
+        backup_endpoint.set_lock.assert_any_call(snapshot, ANY, True)
+
+        # Verify send_snapshot was called
+        mock_send.assert_called_once()
+
+        # Verify lock was released
+        backup_endpoint.set_lock.assert_any_call(snapshot, ANY, False)
+
+    @patch("btrfs_backup_ng.core.restore.verify_restored_snapshot")
+    @patch("btrfs_backup_ng.core.restore.send_snapshot")
+    @patch("btrfs_backup_ng.core.restore.log_transaction")
+    def test_restores_with_parent(self, mock_log, mock_send, mock_verify):
+        """Test restoring with incremental parent."""
+        from btrfs_backup_ng.core.restore import restore_snapshot
+
+        mock_verify.return_value = True
+
+        backup_endpoint = MagicMock()
+        backup_endpoint.config = {"path": "/backup"}
+        local_endpoint = MagicMock()
+        local_endpoint.config = {"path": "/restore"}
+
+        snapshot = MockSnapshot("snap-2")
+        parent = MockSnapshot("snap-1")
+
+        restore_snapshot(backup_endpoint, local_endpoint, snapshot, parent=parent)
+
+        # Verify parent lock was set
+        backup_endpoint.set_lock.assert_any_call(parent, ANY, True, parent=True)
+
+        # Verify send_snapshot was called with parent
+        call_kwargs = mock_send.call_args[1]
+        assert call_kwargs["parent"] == parent
+
+    @patch("btrfs_backup_ng.core.restore.verify_restored_snapshot")
+    @patch("btrfs_backup_ng.core.restore.send_snapshot")
+    @patch("btrfs_backup_ng.core.restore.log_transaction")
+    def test_logs_transaction_on_success(self, mock_log, mock_send, mock_verify):
+        """Test transaction logging on successful restore."""
+        from btrfs_backup_ng.core.restore import restore_snapshot
+
+        mock_verify.return_value = True
+
+        backup_endpoint = MagicMock()
+        backup_endpoint.config = {"path": "/backup"}
+        local_endpoint = MagicMock()
+        local_endpoint.config = {"path": "/restore"}
+
+        snapshot = MockSnapshot("test-snap")
+
+        restore_snapshot(backup_endpoint, local_endpoint, snapshot)
+
+        # Should log started and completed
+        assert mock_log.call_count >= 2
+        statuses = [call[1]["status"] for call in mock_log.call_args_list]
+        assert "started" in statuses
+        assert "completed" in statuses
+
+    @patch("btrfs_backup_ng.core.restore.verify_restored_snapshot")
+    @patch("btrfs_backup_ng.core.restore.send_snapshot")
+    @patch("btrfs_backup_ng.core.restore.log_transaction")
+    def test_logs_failure_on_error(self, mock_log, mock_send, mock_verify):
+        """Test transaction logging on failed restore."""
+        from btrfs_backup_ng.core.restore import RestoreError, restore_snapshot
+
+        mock_send.side_effect = Exception("Transfer failed")
+
+        backup_endpoint = MagicMock()
+        backup_endpoint.config = {"path": "/backup"}
+        local_endpoint = MagicMock()
+        local_endpoint.config = {"path": "/restore"}
+
+        snapshot = MockSnapshot("test-snap")
+
+        with pytest.raises(RestoreError, match="Restore failed"):
+            restore_snapshot(backup_endpoint, local_endpoint, snapshot)
+
+        # Should log failure
+        statuses = [call[1]["status"] for call in mock_log.call_args_list]
+        assert "failed" in statuses
+
+    @patch("btrfs_backup_ng.core.restore.verify_restored_snapshot")
+    @patch("btrfs_backup_ng.core.restore.send_snapshot")
+    @patch("btrfs_backup_ng.core.restore.log_transaction")
+    def test_releases_locks_on_error(self, mock_log, mock_send, mock_verify):
+        """Test locks are released even on error."""
+        from btrfs_backup_ng.core.restore import RestoreError, restore_snapshot
+
+        mock_send.side_effect = Exception("Transfer failed")
+
+        backup_endpoint = MagicMock()
+        backup_endpoint.config = {"path": "/backup"}
+        local_endpoint = MagicMock()
+        local_endpoint.config = {"path": "/restore"}
+
+        snapshot = MockSnapshot("test-snap")
+        parent = MockSnapshot("parent-snap")
+
+        with pytest.raises(RestoreError):
+            restore_snapshot(backup_endpoint, local_endpoint, snapshot, parent=parent)
+
+        # Verify locks were released
+        backup_endpoint.set_lock.assert_any_call(snapshot, ANY, False)
+        backup_endpoint.set_lock.assert_any_call(parent, ANY, False, parent=True)
+
+
+class TestRestoreSnapshots:
+    """Tests for restore_snapshots function."""
+
+    def test_returns_empty_stats_when_no_backups(self):
+        """Test returns empty stats when no backups found."""
+        from btrfs_backup_ng.core.restore import restore_snapshots
+
+        backup_endpoint = MagicMock()
+        backup_endpoint.list_snapshots.return_value = []
+
+        local_endpoint = MagicMock()
+
+        stats = restore_snapshots(backup_endpoint, local_endpoint)
+
+        assert stats["restored"] == 0
+        assert stats["skipped"] == 0
+        assert stats["failed"] == 0
+
+    def test_restores_latest_by_default(self):
+        """Test restores latest snapshot by default."""
+        from btrfs_backup_ng.core.restore import restore_snapshots
+
+        snapshots = make_snapshots(
+            [
+                ("snap-1", "20260101-100000"),
+                ("snap-2", "20260101-110000"),
+            ]
+        )
+
+        backup_endpoint = MagicMock()
+        backup_endpoint.list_snapshots.return_value = snapshots
+
+        local_endpoint = MagicMock()
+        local_endpoint.list_snapshots.return_value = []
+
+        # Dry run to see what would be restored
+        stats = restore_snapshots(backup_endpoint, local_endpoint, dry_run=True)
+
+        # In dry run, nothing is actually restored
+        assert stats["restored"] == 0
+
+    def test_restores_specific_snapshot(self):
+        """Test restores specific named snapshot."""
+        from btrfs_backup_ng.core.restore import restore_snapshots
+
+        snapshots = make_snapshots(
+            [
+                ("snap-1", "20260101-100000"),
+                ("snap-2", "20260101-110000"),
+                ("snap-3", "20260101-120000"),
+            ]
+        )
+
+        backup_endpoint = MagicMock()
+        backup_endpoint.list_snapshots.return_value = snapshots
+
+        local_endpoint = MagicMock()
+        local_endpoint.list_snapshots.return_value = []
+
+        stats = restore_snapshots(
+            backup_endpoint,
+            local_endpoint,
+            snapshot_name="snap-2",
+            dry_run=True,
+        )
+
+        assert stats["restored"] == 0  # Dry run
+
+    def test_raises_when_snapshot_not_found(self):
+        """Test raises error when named snapshot not found."""
+        from btrfs_backup_ng.core.restore import RestoreError, restore_snapshots
+
+        snapshots = make_snapshots([("snap-1", "20260101-100000")])
+
+        backup_endpoint = MagicMock()
+        backup_endpoint.list_snapshots.return_value = snapshots
+
+        local_endpoint = MagicMock()
+
+        with pytest.raises(RestoreError, match="not found"):
+            restore_snapshots(
+                backup_endpoint,
+                local_endpoint,
+                snapshot_name="nonexistent",
+            )
+
+    def test_no_restore_needed_when_all_exist(self):
+        """Test no restore needed when all snapshots already exist locally."""
+        from btrfs_backup_ng.core.restore import restore_snapshots
+
+        snapshots = make_snapshots(
+            [
+                ("snap-1", "20260101-100000"),
+                ("snap-2", "20260101-110000"),
+            ]
+        )
+
+        backup_endpoint = MagicMock()
+        backup_endpoint.list_snapshots.return_value = snapshots
+
+        # Both snapshots already exist locally - chain will be empty
+        local_endpoint = MagicMock()
+        local_endpoint.list_snapshots.return_value = snapshots.copy()
+
+        stats = restore_snapshots(
+            backup_endpoint,
+            local_endpoint,
+            restore_all=True,
+            dry_run=True,
+        )
+
+        # No restores needed since all exist (chain is empty)
+        assert stats["restored"] == 0
+
+    def test_restore_before_time(self):
+        """Test restoring snapshot before specific time."""
+        from btrfs_backup_ng.core.restore import restore_snapshots
+
+        snapshots = make_snapshots(
+            [
+                ("snap-1", "20260101-100000"),
+                ("snap-2", "20260101-110000"),
+                ("snap-3", "20260101-120000"),
+            ]
+        )
+
+        backup_endpoint = MagicMock()
+        backup_endpoint.list_snapshots.return_value = snapshots
+
+        local_endpoint = MagicMock()
+        local_endpoint.list_snapshots.return_value = []
+
+        before_time = time.strptime("20260101-113000", "%Y%m%d-%H%M%S")
+
+        stats = restore_snapshots(
+            backup_endpoint,
+            local_endpoint,
+            before_time=before_time,
+            dry_run=True,
+        )
+
+        assert stats["restored"] == 0  # Dry run
+
+    def test_raises_when_no_snapshot_before_time(self):
+        """Test raises when no snapshot before requested time."""
+        from btrfs_backup_ng.core.restore import RestoreError, restore_snapshots
+
+        snapshots = make_snapshots([("snap-1", "20260101-120000")])
+
+        backup_endpoint = MagicMock()
+        backup_endpoint.list_snapshots.return_value = snapshots
+
+        local_endpoint = MagicMock()
+
+        before_time = time.strptime("20260101-100000", "%Y%m%d-%H%M%S")
+
+        with pytest.raises(RestoreError, match="No snapshot found before"):
+            restore_snapshots(
+                backup_endpoint,
+                local_endpoint,
+                before_time=before_time,
+            )
+
+    def test_calls_progress_callback(self):
+        """Test calls on_progress callback during restore."""
+        from btrfs_backup_ng.core.restore import restore_snapshots
+
+        snapshots = make_snapshots(
+            [
+                ("snap-1", "20260101-100000"),
+                ("snap-2", "20260101-110000"),
+            ]
+        )
+
+        backup_endpoint = MagicMock()
+        backup_endpoint.list_snapshots.return_value = snapshots
+
+        local_endpoint = MagicMock()
+        local_endpoint.list_snapshots.return_value = []
+
+        progress_calls = []
+
+        def on_progress(current, total, name):
+            progress_calls.append((current, total, name))
+
+        # Use dry_run=True so we don't actually try to restore
+        stats = restore_snapshots(
+            backup_endpoint,
+            local_endpoint,
+            restore_all=True,
+            dry_run=True,
+            on_progress=on_progress,
+        )
+
+        # In dry run, progress is not called
+        assert stats["restored"] == 0
+
+    def test_returns_stats_with_errors(self):
+        """Test returns stats including error list."""
+        from btrfs_backup_ng.core.restore import restore_snapshots
+
+        backup_endpoint = MagicMock()
+        backup_endpoint.list_snapshots.return_value = []
+
+        local_endpoint = MagicMock()
+
+        stats = restore_snapshots(backup_endpoint, local_endpoint)
+
+        assert "errors" in stats
+        assert isinstance(stats["errors"], list)
+
+
+# Import ANY for mock assertions
+from unittest.mock import ANY
