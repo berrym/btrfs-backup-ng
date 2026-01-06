@@ -1,12 +1,9 @@
 """Tests for man pages installation command."""
 
 import gzip
-import os
 from argparse import Namespace
 from pathlib import Path
 from unittest.mock import MagicMock, patch
-
-import pytest
 
 
 class TestGetManpagesDir:
@@ -287,9 +284,6 @@ class TestInstallManpages:
         mock_get_dir.return_value = man_dir
 
         mock_can_write.return_value = True
-
-        # Mock the system path to use temp directory
-        system_dest = tmp_path / "usr" / "local" / "share" / "man" / "man1"
 
         with patch("btrfs_backup_ng.cli.manpages.Path") as mock_path_class:
             # Allow normal Path operations but redirect system path

@@ -1,12 +1,8 @@
 """Tests for shell completions installation command."""
 
-import os
-import shutil
 from argparse import Namespace
 from pathlib import Path
 from unittest.mock import MagicMock, patch
-
-import pytest
 
 
 class TestGetCompletionsDir:
@@ -237,9 +233,6 @@ class TestInstallCompletions:
         )
         mock_get_dir.return_value = completions_dir
 
-        # Create target directory path
-        user_dest = tmp_path / "user" / ".local/share/bash-completion/completions"
-
         with patch.object(Path, "home", return_value=tmp_path / "user"):
             args = Namespace(shell="bash", system=False)
             result = install_completions(args)
@@ -453,7 +446,6 @@ class TestShellConfigTypes:
 
     def test_bash_config_has_required_keys(self):
         """Test bash config has all required keys."""
-        from btrfs_backup_ng.cli.completions import install_completions
 
         # We can't easily inspect the config dict, but we can verify
         # the function handles bash correctly

@@ -2612,8 +2612,8 @@ class TestInteractiveSelect:
         assert result is None
 
 
-class TestExecuteListVolumes:
-    """Tests for _execute_list_volumes function."""
+class TestExecuteListVolumesExtended:
+    """Extended tests for _execute_list_volumes function."""
 
     @patch("btrfs_backup_ng.cli.restore.find_config_file")
     def test_no_config_file(self, mock_find, capsys):
@@ -2696,8 +2696,8 @@ class TestExecuteListVolumes:
         assert "Total: 2 volume(s)" in captured.out
 
 
-class TestExecuteConfigRestore:
-    """Tests for _execute_config_restore function."""
+class TestExecuteConfigRestoreExtended:
+    """Extended tests for _execute_config_restore function."""
 
     @patch("btrfs_backup_ng.cli.restore.find_config_file")
     def test_no_config_file(self, mock_find, capsys):
@@ -3307,8 +3307,8 @@ class TestExecuteCleanupDetailed:
         assert result == 1
 
 
-class TestExecuteMainRestore:
-    """Tests for _execute_main_restore function."""
+class TestExecuteMainRestoreExtended:
+    """Extended tests for _execute_main_restore function."""
 
     @patch("btrfs_backup_ng.cli.restore.validate_restore_destination")
     def test_destination_validation_fails(self, mock_validate, tmp_path):
