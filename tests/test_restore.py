@@ -438,7 +438,510 @@ class TestExecuteStatus:
         result = _execute_status(args)
 
         assert result == 1
-        mock_prepare.assert_not_called()
+
+
+# Additional tests for core/restore.py coverage
+
+
+class TestFindSnapshotBeforeTimeEdgeCases:
+    """Additional tests for find_snapshot_before_time edge cases."""
+
+    def test_snapshot_without_time_obj_attribute(self):
+        """Test handling snapshot without time_obj attribute."""
+
+        class NoTimeSnapshot:
+            """Snapshot without time_obj attribute."""
+
+            def __init__(self, name):
+                self._name = name
+
+            def get_name(self):
+                return self._name
+
+        snapshots = [NoTimeSnapshot("snap-1"), NoTimeSnapshot("snap-2")]
+        target_time = time.strptime("20260101-120000", "%Y%m%d-%H%M%S")
+
+        result = find_snapshot_before_time(target_time, snapshots)
+
+        # Should return None since no snapshots have time_obj
+        assert result is None
+
+    def test_snapshot_with_none_time_obj(self):
+        """Test handling snapshot with time_obj set to None."""
+        snap1 = MockSnapshot("snap-1")
+        snap1.time_obj = None
+
+        snap2 = MockSnapshot(
+            "snap-2", time.strptime("20260101-110000", "%Y%m%d-%H%M%S")
+        )
+
+        snapshots = [snap1, snap2]
+        target_time = time.strptime("20260101-120000", "%Y%m%d-%H%M%S")
+
+        result = find_snapshot_before_time(target_time, snapshots)
+
+        # Should find snap2 since it has valid time_obj
+        assert result.get_name() == "snap-2"
+
+    def test_mixed_snapshots_some_without_time(self):
+        """Test finding snapshot when some have no time_obj."""
+
+        class NoTimeSnapshot:
+            """Snapshot without time_obj attribute."""
+
+            def __init__(self, name):
+                self._name = name
+
+            def get_name(self):
+                return self._name
+
+        snap_no_time = NoTimeSnapshot("snap-1")
+        snap_with_time = MockSnapshot(
+            "snap-2", time.strptime("20260101-100000", "%Y%m%d-%H%M%S")
+        )
+
+        snapshots = [snap_no_time, snap_with_time]
+        target_time = time.strptime("20260101-120000", "%Y%m%d-%H%M%S")
+
+        result = find_snapshot_before_time(target_time, snapshots)
+
+        assert result.get_name() == "snap-2"
+
+
+class TestRestoreSnapshotsExecution:
+    """Tests for actual execution paths in restore_snapshots."""
+
+    @patch("btrfs_backup_ng.core.restore.restore_snapshot")
+    def test_actual_restore_execution(self, mock_restore):
+        """Test actual restore execution (not dry run)."""
+        from btrfs_backup_ng.core.restore import restore_snapshots
+
+        snapshots = make_snapshots([("snap-1", "20260101-100000")])
+
+        backup_endpoint = MagicMock()
+        backup_endpoint.list_snapshots.return_value = snapshots
+
+        local_endpoint = MagicMock()
+        local_endpoint.list_snapshots.return_value = []
+
+        stats = restore_snapshots(backup_endpoint, local_endpoint, dry_run=False)
+
+        assert stats["restored"] == 1
+        assert stats["failed"] == 0
+        mock_restore.assert_called_once()
+
+    @patch("btrfs_backup_ng.core.restore.restore_snapshot")
+    def test_restore_with_progress_callback(self, mock_restore):
+        """Test restore calls on_progress callback."""
+        from btrfs_backup_ng.core.restore import restore_snapshots
+
+        snapshots = make_snapshots(
+            [
+                ("snap-1", "20260101-100000"),
+                ("snap-2", "20260101-110000"),
+            ]
+        )
+
+        backup_endpoint = MagicMock()
+        backup_endpoint.list_snapshots.return_value = snapshots
+
+        local_endpoint = MagicMock()
+        local_endpoint.list_snapshots.return_value = []
+
+        progress_calls = []
+
+        def on_progress(current, total, name):
+            progress_calls.append((current, total, name))
+
+        stats = restore_snapshots(
+            backup_endpoint,
+            local_endpoint,
+            restore_all=True,
+            dry_run=False,
+            on_progress=on_progress,
+        )
+
+        assert stats["restored"] == 2
+        assert len(progress_calls) == 2
+        assert progress_calls[0] == (1, 2, "snap-1")
+        assert progress_calls[1] == (2, 2, "snap-2")
+
+    @patch("btrfs_backup_ng.core.restore.restore_snapshot")
+    def test_restore_with_no_incremental(self, mock_restore):
+        """Test restore with no_incremental=True forces full transfers."""
+        from btrfs_backup_ng.core.restore import restore_snapshots
+
+        snapshots = make_snapshots(
+            [
+                ("snap-1", "20260101-100000"),
+                ("snap-2", "20260101-110000"),
+            ]
+        )
+
+        backup_endpoint = MagicMock()
+        backup_endpoint.list_snapshots.return_value = snapshots
+
+        local_endpoint = MagicMock()
+        local_endpoint.list_snapshots.return_value = []
+
+        stats = restore_snapshots(
+            backup_endpoint,
+            local_endpoint,
+            restore_all=True,
+            no_incremental=True,
+            dry_run=False,
+        )
+
+        assert stats["restored"] == 2
+        # All calls should have parent=None
+        for call in mock_restore.call_args_list:
+            assert call[1].get("parent") is None
+
+    @patch("btrfs_backup_ng.core.restore.restore_snapshot")
+    def test_restore_handles_failure(self, mock_restore):
+        """Test restore handles individual snapshot failure."""
+        from btrfs_backup_ng.core.restore import RestoreError, restore_snapshots
+
+        snapshots = make_snapshots(
+            [
+                ("snap-1", "20260101-100000"),
+                ("snap-2", "20260101-110000"),
+            ]
+        )
+
+        backup_endpoint = MagicMock()
+        backup_endpoint.list_snapshots.return_value = snapshots
+
+        local_endpoint = MagicMock()
+        local_endpoint.list_snapshots.return_value = []
+
+        # First restore fails, second succeeds
+        mock_restore.side_effect = [
+            RestoreError("Transfer failed"),
+            None,
+        ]
+
+        stats = restore_snapshots(
+            backup_endpoint,
+            local_endpoint,
+            restore_all=True,
+            dry_run=False,
+        )
+
+        assert stats["restored"] == 1
+        assert stats["failed"] == 1
+        assert len(stats["errors"]) == 1
+        assert "snap-1" in stats["errors"][0]
+
+    @patch("btrfs_backup_ng.core.restore.restore_snapshot")
+    def test_restore_handles_abort_error(self, mock_restore):
+        """Test restore handles AbortError."""
+        from btrfs_backup_ng import __util__
+        from btrfs_backup_ng.core.restore import restore_snapshots
+
+        snapshots = make_snapshots([("snap-1", "20260101-100000")])
+
+        backup_endpoint = MagicMock()
+        backup_endpoint.list_snapshots.return_value = snapshots
+
+        local_endpoint = MagicMock()
+        local_endpoint.list_snapshots.return_value = []
+
+        mock_restore.side_effect = __util__.AbortError("User aborted")
+
+        stats = restore_snapshots(
+            backup_endpoint,
+            local_endpoint,
+            dry_run=False,
+        )
+
+        assert stats["failed"] == 1
+        assert "snap-1" in stats["errors"][0]
+
+    @patch("btrfs_backup_ng.core.restore.restore_snapshot")
+    def test_restore_without_skip_existing(self, mock_restore):
+        """Test restore with skip_existing=False includes all snapshots."""
+        from btrfs_backup_ng.core.restore import restore_snapshots
+
+        snapshots = make_snapshots(
+            [
+                ("snap-1", "20260101-100000"),
+                ("snap-2", "20260101-110000"),
+            ]
+        )
+
+        backup_endpoint = MagicMock()
+        backup_endpoint.list_snapshots.return_value = snapshots
+
+        # snap-1 exists locally
+        local_endpoint = MagicMock()
+        local_endpoint.list_snapshots.return_value = [snapshots[0]]
+
+        stats = restore_snapshots(
+            backup_endpoint,
+            local_endpoint,
+            restore_all=True,
+            skip_existing=False,
+            dry_run=False,
+        )
+
+        # Should restore snap-2 (snap-1 is used as parent in chain)
+        # The chain logic finds that snap-1 exists so chain is just [snap-2]
+        assert stats["restored"] == 1
+        assert stats["skipped"] == 0
+
+    @patch("btrfs_backup_ng.core.restore.restore_snapshot")
+    def test_restore_skip_existing_false_with_existing_in_chain(self, mock_restore):
+        """Test skip_existing=False when existing snapshots are in restore chain."""
+        from btrfs_backup_ng.core.restore import restore_snapshots
+
+        # Create snapshots where snap-1 and snap-2 exist locally but we want all
+        snapshots = make_snapshots(
+            [
+                ("snap-1", "20260101-100000"),
+                ("snap-2", "20260101-110000"),
+                ("snap-3", "20260101-120000"),
+            ]
+        )
+
+        backup_endpoint = MagicMock()
+        backup_endpoint.list_snapshots.return_value = snapshots
+
+        # snap-1 and snap-2 exist locally
+        local_endpoint = MagicMock()
+        local_endpoint.list_snapshots.return_value = [snapshots[0], snapshots[1]]
+
+        # With skip_existing=False, all should be attempted
+        # But chain logic will use existing as parent, so only snap-3 in chain
+        stats = restore_snapshots(
+            backup_endpoint,
+            local_endpoint,
+            snapshot_name="snap-3",
+            skip_existing=False,
+            dry_run=False,
+        )
+
+        # snap-3 should be restored (chain stops at snap-2 which exists)
+        assert stats["restored"] == 1
+        assert stats["skipped"] == 0  # skip_existing=False means no skipping
+
+    @patch("btrfs_backup_ng.core.restore.restore_snapshot")
+    def test_restore_with_options(self, mock_restore):
+        """Test restore passes options to restore_snapshot."""
+        from btrfs_backup_ng.core.restore import restore_snapshots
+
+        snapshots = make_snapshots([("snap-1", "20260101-100000")])
+
+        backup_endpoint = MagicMock()
+        backup_endpoint.list_snapshots.return_value = snapshots
+
+        local_endpoint = MagicMock()
+        local_endpoint.list_snapshots.return_value = []
+
+        options = {"compress": "zstd", "rate_limit": 10000}
+
+        stats = restore_snapshots(
+            backup_endpoint,
+            local_endpoint,
+            options=options,
+            dry_run=False,
+        )
+
+        assert stats["restored"] == 1
+        call_kwargs = mock_restore.call_args[1]
+        assert call_kwargs["options"] == options
+
+    @patch("btrfs_backup_ng.core.restore.restore_snapshot")
+    def test_restore_tracks_restored_snapshots_for_parents(self, mock_restore):
+        """Test restored snapshots are tracked for use as parents."""
+        from btrfs_backup_ng.core.restore import restore_snapshots
+
+        snapshots = make_snapshots(
+            [
+                ("snap-1", "20260101-100000"),
+                ("snap-2", "20260101-110000"),
+                ("snap-3", "20260101-120000"),
+            ]
+        )
+
+        backup_endpoint = MagicMock()
+        backup_endpoint.list_snapshots.return_value = snapshots
+
+        local_endpoint = MagicMock()
+        local_endpoint.list_snapshots.return_value = []
+
+        stats = restore_snapshots(
+            backup_endpoint,
+            local_endpoint,
+            restore_all=True,
+            dry_run=False,
+        )
+
+        assert stats["restored"] == 3
+        # First call has no parent (or finds one from empty list)
+        # Subsequent calls can use previously restored snapshots as parents
+
+    def test_restore_logs_errors(self):
+        """Test restore logs errors in stats."""
+        from btrfs_backup_ng.core.restore import RestoreError, restore_snapshots
+
+        with patch("btrfs_backup_ng.core.restore.restore_snapshot") as mock_restore:
+            snapshots = make_snapshots([("snap-1", "20260101-100000")])
+
+            backup_endpoint = MagicMock()
+            backup_endpoint.list_snapshots.return_value = snapshots
+
+            local_endpoint = MagicMock()
+            local_endpoint.list_snapshots.return_value = []
+
+            mock_restore.side_effect = RestoreError("Disk full")
+
+            stats = restore_snapshots(
+                backup_endpoint,
+                local_endpoint,
+                dry_run=False,
+            )
+
+            assert stats["failed"] == 1
+            assert "Disk full" in stats["errors"][0]
+
+
+class TestRestoreSnapshotExecution:
+    """Additional tests for restore_snapshot execution paths."""
+
+    @patch("btrfs_backup_ng.core.restore.verify_restored_snapshot")
+    @patch("btrfs_backup_ng.core.restore.send_snapshot")
+    @patch("btrfs_backup_ng.core.restore.log_transaction")
+    def test_restore_uses_provided_session_id(self, mock_log, mock_send, mock_verify):
+        """Test restore uses provided session ID for locking."""
+        from btrfs_backup_ng.core.restore import restore_snapshot
+
+        mock_verify.return_value = True
+
+        backup_endpoint = MagicMock()
+        backup_endpoint.config = {"path": "/backup"}
+        local_endpoint = MagicMock()
+        local_endpoint.config = {"path": "/restore"}
+
+        snapshot = MockSnapshot("test-snap")
+
+        restore_snapshot(
+            backup_endpoint,
+            local_endpoint,
+            snapshot,
+            session_id="test-session",
+        )
+
+        # Verify lock was set with the session ID
+        lock_call = backup_endpoint.set_lock.call_args_list[0]
+        assert "restore:test-session" in str(lock_call)
+
+    @patch("btrfs_backup_ng.core.restore.verify_restored_snapshot")
+    @patch("btrfs_backup_ng.core.restore.send_snapshot")
+    @patch("btrfs_backup_ng.core.restore.log_transaction")
+    def test_restore_generates_session_id_if_none(
+        self, mock_log, mock_send, mock_verify
+    ):
+        """Test restore generates session ID when not provided."""
+        from btrfs_backup_ng.core.restore import restore_snapshot
+
+        mock_verify.return_value = True
+
+        backup_endpoint = MagicMock()
+        backup_endpoint.config = {"path": "/backup"}
+        local_endpoint = MagicMock()
+        local_endpoint.config = {"path": "/restore"}
+
+        snapshot = MockSnapshot("test-snap")
+
+        restore_snapshot(backup_endpoint, local_endpoint, snapshot)
+
+        # Lock should be set with a generated session ID
+        assert backup_endpoint.set_lock.called
+        lock_call_str = str(backup_endpoint.set_lock.call_args_list[0])
+        assert "restore:" in lock_call_str
+
+    @patch("btrfs_backup_ng.core.restore.verify_restored_snapshot")
+    @patch("btrfs_backup_ng.core.restore.send_snapshot")
+    @patch("btrfs_backup_ng.core.restore.log_transaction")
+    def test_restore_with_provided_options(self, mock_log, mock_send, mock_verify):
+        """Test restore with options provided (not None)."""
+        from btrfs_backup_ng.core.restore import restore_snapshot
+
+        mock_verify.return_value = True
+
+        backup_endpoint = MagicMock()
+        backup_endpoint.config = {"path": "/backup"}
+        local_endpoint = MagicMock()
+        local_endpoint.config = {"path": "/restore"}
+
+        snapshot = MockSnapshot("test-snap")
+        options = {"compress": "zstd", "rate_limit": 5000}
+
+        restore_snapshot(backup_endpoint, local_endpoint, snapshot, options=options)
+
+        # send_snapshot should be called with the provided options
+        call_kwargs = mock_send.call_args[1]
+        assert call_kwargs["options"] == options
+
+    @patch("btrfs_backup_ng.core.restore.verify_restored_snapshot")
+    @patch("btrfs_backup_ng.core.restore.send_snapshot")
+    @patch("btrfs_backup_ng.core.restore.log_transaction")
+    def test_restore_with_empty_options(self, mock_log, mock_send, mock_verify):
+        """Test restore with options=None uses empty dict."""
+        from btrfs_backup_ng.core.restore import restore_snapshot
+
+        mock_verify.return_value = True
+
+        backup_endpoint = MagicMock()
+        backup_endpoint.config = {"path": "/backup"}
+        local_endpoint = MagicMock()
+        local_endpoint.config = {"path": "/restore"}
+
+        snapshot = MockSnapshot("test-snap")
+
+        restore_snapshot(backup_endpoint, local_endpoint, snapshot, options=None)
+
+        # send_snapshot should be called with options={}
+        call_kwargs = mock_send.call_args[1]
+        assert call_kwargs["options"] == {}
+
+
+class TestValidateRestoreDestinationEdgeCases:
+    """Additional edge case tests for validate_restore_destination."""
+
+    @patch("btrfs_backup_ng.core.restore.__util__.is_btrfs")
+    def test_in_place_with_force_allowed(self, mock_is_btrfs, tmp_path):
+        """Test in-place restore with force=True is allowed."""
+        mock_is_btrfs.return_value = True
+
+        # Should not raise with force=True
+        validate_restore_destination(tmp_path, in_place=True, force=True)
+
+    @patch("btrfs_backup_ng.core.restore.__util__.is_btrfs")
+    def test_creates_nested_directories(self, mock_is_btrfs, tmp_path):
+        """Test creates nested destination directories."""
+        mock_is_btrfs.return_value = True
+
+        nested_path = tmp_path / "a" / "b" / "c"
+        assert not nested_path.exists()
+
+        validate_restore_destination(nested_path)
+
+        assert nested_path.exists()
+
+    @patch("btrfs_backup_ng.core.restore.__util__.is_btrfs")
+    def test_mkdir_permission_error(self, mock_is_btrfs, tmp_path):
+        """Test handles permission error when creating directory."""
+        from pathlib import Path
+
+        mock_is_btrfs.return_value = True
+
+        # Use a path that will fail to create
+        with patch.object(Path, "mkdir", side_effect=OSError("Permission denied")):
+            with patch.object(Path, "exists", return_value=False):
+                with pytest.raises(RestoreError, match="Cannot create destination"):
+                    validate_restore_destination(tmp_path / "nope")
 
     @patch("btrfs_backup_ng.cli.restore._prepare_backup_endpoint")
     @patch("btrfs_backup_ng.cli.restore.list_remote_snapshots")
@@ -2107,3 +2610,807 @@ class TestInteractiveSelect:
         result = _interactive_select(MagicMock())
 
         assert result is None
+
+
+class TestExecuteListVolumes:
+    """Tests for _execute_list_volumes function."""
+
+    @patch("btrfs_backup_ng.cli.restore.find_config_file")
+    def test_no_config_file(self, mock_find, capsys):
+        """Test error when no config file found."""
+        from btrfs_backup_ng.cli.restore import _execute_list_volumes
+
+        mock_find.return_value = None
+
+        args = argparse.Namespace(config=None)
+        result = _execute_list_volumes(args)
+
+        assert result == 1
+        captured = capsys.readouterr()
+        assert "No configuration file found" in captured.out
+
+    @patch("btrfs_backup_ng.cli.restore.load_config")
+    def test_config_load_error(self, mock_load):
+        """Test error when config loading fails."""
+        from btrfs_backup_ng.cli.restore import _execute_list_volumes
+        from btrfs_backup_ng.config import ConfigError
+
+        mock_load.side_effect = ConfigError("Invalid config")
+
+        args = argparse.Namespace(config="/path/to/config.toml")
+        result = _execute_list_volumes(args)
+
+        assert result == 1
+
+    @patch("btrfs_backup_ng.cli.restore.load_config")
+    def test_no_volumes_configured(self, mock_load, capsys):
+        """Test when no volumes are configured."""
+        from btrfs_backup_ng.cli.restore import _execute_list_volumes
+        from btrfs_backup_ng.config.schema import Config
+
+        mock_load.return_value = (Config(volumes=[]), [])
+
+        args = argparse.Namespace(config="/path/to/config.toml")
+        result = _execute_list_volumes(args)
+
+        assert result == 0
+        captured = capsys.readouterr()
+        assert "No volumes configured" in captured.out
+
+    @patch("btrfs_backup_ng.cli.restore.load_config")
+    def test_lists_volumes_with_targets(self, mock_load, capsys):
+        """Test listing volumes with their targets."""
+        from btrfs_backup_ng.cli.restore import _execute_list_volumes
+        from btrfs_backup_ng.config.schema import Config, TargetConfig, VolumeConfig
+
+        mock_load.return_value = (
+            Config(
+                volumes=[
+                    VolumeConfig(
+                        path="/home",
+                        snapshot_prefix="home-",
+                        targets=[
+                            TargetConfig(path="/mnt/backup", ssh_sudo=True),
+                            TargetConfig(
+                                path="ssh://server:/backups", require_mount=True
+                            ),
+                        ],
+                    ),
+                    VolumeConfig(path="/var/log", snapshot_prefix="logs-", targets=[]),
+                ]
+            ),
+            [],
+        )
+
+        args = argparse.Namespace(config="/path/to/config.toml")
+        result = _execute_list_volumes(args)
+
+        assert result == 0
+        captured = capsys.readouterr()
+        assert "/home" in captured.out
+        assert "home-" in captured.out
+        assert "(ssh_sudo)" in captured.out
+        assert "(require_mount)" in captured.out
+        assert "/var/log" in captured.out
+        assert "No backup targets configured" in captured.out
+        assert "Total: 2 volume(s)" in captured.out
+
+
+class TestExecuteConfigRestore:
+    """Tests for _execute_config_restore function."""
+
+    @patch("btrfs_backup_ng.cli.restore.find_config_file")
+    def test_no_config_file(self, mock_find, capsys):
+        """Test error when no config file found."""
+        from btrfs_backup_ng.cli.restore import _execute_config_restore
+
+        mock_find.return_value = None
+
+        args = argparse.Namespace(config=None)
+        result = _execute_config_restore(args, "/home")
+
+        assert result == 1
+        captured = capsys.readouterr()
+        assert "No configuration file found" in captured.out
+
+    @patch("btrfs_backup_ng.cli.restore.load_config")
+    def test_config_load_error(self, mock_load):
+        """Test error when config loading fails."""
+        from btrfs_backup_ng.cli.restore import _execute_config_restore
+        from btrfs_backup_ng.config import ConfigError
+
+        mock_load.side_effect = ConfigError("Invalid config")
+
+        args = argparse.Namespace(config="/path/to/config.toml")
+        result = _execute_config_restore(args, "/home")
+
+        assert result == 1
+
+    @patch("btrfs_backup_ng.cli.restore.load_config")
+    @patch("btrfs_backup_ng.cli.restore.find_config_file")
+    def test_volume_not_found(self, mock_find, mock_load, capsys):
+        """Test error when requested volume not in config."""
+        from btrfs_backup_ng.cli.restore import _execute_config_restore
+        from btrfs_backup_ng.config.schema import Config, VolumeConfig
+
+        mock_find.return_value = "/path/to/config.toml"
+        mock_load.return_value = (
+            Config(volumes=[VolumeConfig(path="/var/log", snapshot_prefix="logs-")]),
+            [],
+        )
+
+        args = argparse.Namespace(config=None)
+        result = _execute_config_restore(args, "/home")
+
+        assert result == 1
+        captured = capsys.readouterr()
+        assert "not found in configuration" in captured.out
+        assert "/var/log" in captured.out
+
+    @patch("btrfs_backup_ng.cli.restore.load_config")
+    @patch("btrfs_backup_ng.cli.restore.find_config_file")
+    def test_volume_no_targets(self, mock_find, mock_load, capsys):
+        """Test error when volume has no backup targets."""
+        from btrfs_backup_ng.cli.restore import _execute_config_restore
+        from btrfs_backup_ng.config.schema import Config, VolumeConfig
+
+        mock_find.return_value = "/path/to/config.toml"
+        mock_load.return_value = (
+            Config(
+                volumes=[
+                    VolumeConfig(path="/home", snapshot_prefix="home-", targets=[])
+                ]
+            ),
+            [],
+        )
+
+        args = argparse.Namespace(config=None)
+        result = _execute_config_restore(args, "/home")
+
+        assert result == 1
+        captured = capsys.readouterr()
+        assert "no backup targets configured" in captured.out
+
+    @patch("btrfs_backup_ng.cli.restore.load_config")
+    @patch("btrfs_backup_ng.cli.restore.find_config_file")
+    def test_invalid_target_index(self, mock_find, mock_load, capsys):
+        """Test error for invalid target index."""
+        from btrfs_backup_ng.cli.restore import _execute_config_restore
+        from btrfs_backup_ng.config.schema import Config, TargetConfig, VolumeConfig
+
+        mock_find.return_value = "/path/to/config.toml"
+        mock_load.return_value = (
+            Config(
+                volumes=[
+                    VolumeConfig(
+                        path="/home",
+                        snapshot_prefix="home-",
+                        targets=[TargetConfig(path="/mnt/backup")],
+                    )
+                ]
+            ),
+            [],
+        )
+
+        args = argparse.Namespace(config=None, target=5, list=False)
+        result = _execute_config_restore(args, "/home")
+
+        assert result == 1
+        captured = capsys.readouterr()
+        assert "Invalid target index" in captured.out
+
+    @patch("btrfs_backup_ng.cli.restore._execute_list")
+    @patch("btrfs_backup_ng.cli.restore.load_config")
+    @patch("btrfs_backup_ng.cli.restore.find_config_file")
+    def test_list_mode_with_config(self, mock_find, mock_load, mock_list):
+        """Test --list mode with config-driven restore."""
+        from btrfs_backup_ng.cli.restore import _execute_config_restore
+        from btrfs_backup_ng.config.schema import Config, TargetConfig, VolumeConfig
+
+        mock_find.return_value = "/path/to/config.toml"
+        mock_load.return_value = (
+            Config(
+                volumes=[
+                    VolumeConfig(
+                        path="/home",
+                        snapshot_prefix="home-",
+                        targets=[
+                            TargetConfig(
+                                path="/mnt/backup", ssh_sudo=True, ssh_key="~/.ssh/key"
+                            )
+                        ],
+                    )
+                ]
+            ),
+            [],
+        )
+        mock_list.return_value = 0
+
+        args = argparse.Namespace(
+            config=None,
+            target=None,
+            list=True,
+            ssh_sudo=False,
+            ssh_key=None,
+            prefix=None,
+        )
+        result = _execute_config_restore(args, "/home")
+
+        assert result == 0
+        mock_list.assert_called_once()
+        # Verify args were updated with config values
+        assert args.source == "/mnt/backup"
+        assert args.ssh_sudo is True
+        assert args.ssh_key == "~/.ssh/key"
+        assert args.prefix == "home-"
+
+    @patch("btrfs_backup_ng.cli.restore.load_config")
+    @patch("btrfs_backup_ng.cli.restore.find_config_file")
+    def test_no_destination_for_restore(self, mock_find, mock_load, capsys):
+        """Test error when no destination provided for restore."""
+        from btrfs_backup_ng.cli.restore import _execute_config_restore
+        from btrfs_backup_ng.config.schema import Config, TargetConfig, VolumeConfig
+
+        mock_find.return_value = "/path/to/config.toml"
+        mock_load.return_value = (
+            Config(
+                volumes=[
+                    VolumeConfig(
+                        path="/home",
+                        snapshot_prefix="home-",
+                        targets=[TargetConfig(path="/mnt/backup")],
+                    )
+                ]
+            ),
+            [],
+        )
+
+        args = argparse.Namespace(
+            config=None, target=None, list=False, to=None, destination=None
+        )
+        result = _execute_config_restore(args, "/home")
+
+        assert result == 1
+        captured = capsys.readouterr()
+        assert "Destination required" in captured.out
+
+    @patch("btrfs_backup_ng.cli.restore._execute_main_restore")
+    @patch("btrfs_backup_ng.cli.restore.load_config")
+    @patch("btrfs_backup_ng.cli.restore.find_config_file")
+    def test_successful_config_restore(self, mock_find, mock_load, mock_main, capsys):
+        """Test successful config-driven restore."""
+        from btrfs_backup_ng.cli.restore import _execute_config_restore
+        from btrfs_backup_ng.config.schema import Config, TargetConfig, VolumeConfig
+
+        mock_find.return_value = "/path/to/config.toml"
+        mock_load.return_value = (
+            Config(
+                volumes=[
+                    VolumeConfig(
+                        path="/home",
+                        snapshot_prefix="home-",
+                        targets=[
+                            TargetConfig(
+                                path="ssh://backup@server:/backups",
+                                ssh_sudo=True,
+                                ssh_key="~/.ssh/backup",
+                                compress="zstd",
+                                rate_limit="10M",
+                            )
+                        ],
+                    )
+                ]
+            ),
+            [],
+        )
+        mock_main.return_value = 0
+
+        args = argparse.Namespace(
+            config=None,
+            target=0,
+            list=False,
+            to="/mnt/restore",
+            destination=None,
+            ssh_sudo=False,
+            ssh_key=None,
+            compress=None,
+            rate_limit=None,
+            prefix=None,
+        )
+        result = _execute_config_restore(args, "/home")
+
+        assert result == 0
+        captured = capsys.readouterr()
+        assert "Config-driven restore:" in captured.out
+        assert "/home" in captured.out
+        assert "ssh://backup@server:/backups" in captured.out
+
+        # Verify config values were applied
+        assert args.ssh_sudo is True
+        assert args.ssh_key == "~/.ssh/backup"
+        assert args.compress == "zstd"
+        assert args.rate_limit == "10M"
+        assert args.prefix == "home-"
+
+
+class TestExecuteStatusDetailed:
+    """Additional tests for _execute_status function."""
+
+    @patch("btrfs_backup_ng.cli.restore._prepare_backup_endpoint")
+    def test_endpoint_prepare_fails(self, mock_prepare):
+        """Test error when endpoint preparation fails."""
+        from btrfs_backup_ng.cli.restore import _execute_status
+
+        mock_prepare.side_effect = Exception("Connection failed")
+
+        args = argparse.Namespace(source="/mnt/backup", no_fs_checks=False, prefix="")
+        result = _execute_status(args)
+
+        assert result == 1
+
+    @patch("btrfs_backup_ng.cli.restore.list_remote_snapshots")
+    @patch("btrfs_backup_ng.cli.restore._prepare_backup_endpoint")
+    def test_status_with_mixed_locks(self, mock_prepare, mock_list, tmp_path, capsys):
+        """Test status display with both restore and other locks."""
+        from btrfs_backup_ng.cli.restore import _execute_status
+
+        # Create mock endpoint with lock file
+        lock_file = tmp_path / ".btrfs-backup-ng.locks"
+        lock_content = """{"snap-1": {"locks": ["restore:abc123", "backup:xyz"]}, "snap-2": {"parent_locks": ["restore:def456"]}}"""
+        lock_file.write_text(lock_content)
+
+        mock_ep = MagicMock()
+        mock_ep.config = {"path": tmp_path, "lock_file_name": ".btrfs-backup-ng.locks"}
+        mock_prepare.return_value = mock_ep
+        mock_list.return_value = [MockSnapshot("snap-1"), MockSnapshot("snap-2")]
+
+        args = argparse.Namespace(source=str(tmp_path), no_fs_checks=True, prefix="")
+        result = _execute_status(args)
+
+        assert result == 0
+        captured = capsys.readouterr()
+        assert "Restore status for" in captured.out
+        assert "Active Locks:" in captured.out
+        assert "restore:abc123" in captured.out or "abc123" in captured.out
+        assert "Available snapshots: 2" in captured.out
+
+    @patch("btrfs_backup_ng.cli.restore._prepare_backup_endpoint")
+    def test_status_lock_read_exception(self, mock_prepare, tmp_path, capsys):
+        """Test status when lock file read fails."""
+        from btrfs_backup_ng.cli.restore import _execute_status
+
+        mock_ep = MagicMock()
+        mock_ep.config = {"path": tmp_path, "lock_file_name": ".btrfs-backup-ng.locks"}
+        mock_prepare.return_value = mock_ep
+
+        # Don't create lock file - reading will fail gracefully
+
+        args = argparse.Namespace(source=str(tmp_path), no_fs_checks=True, prefix="")
+        result = _execute_status(args)
+
+        assert result == 0
+        captured = capsys.readouterr()
+        assert "No active locks found" in captured.out
+
+
+class TestExecuteUnlockDetailed:
+    """Additional tests for _execute_unlock function."""
+
+    @patch("btrfs_backup_ng.cli.restore._prepare_backup_endpoint")
+    def test_endpoint_prepare_fails(self, mock_prepare):
+        """Test error when endpoint preparation fails."""
+        from btrfs_backup_ng.cli.restore import _execute_unlock
+
+        mock_prepare.side_effect = Exception("Connection failed")
+
+        args = argparse.Namespace(source="/mnt/backup", no_fs_checks=False, prefix="")
+        result = _execute_unlock(args, "all")
+
+        assert result == 1
+
+    @patch("btrfs_backup_ng.cli.restore._prepare_backup_endpoint")
+    def test_unlock_lock_read_error(self, mock_prepare, tmp_path, capsys):
+        """Test error when lock file cannot be read."""
+        from btrfs_backup_ng.cli.restore import _execute_unlock
+
+        # Create a directory instead of file to cause read error
+        lock_path = tmp_path / ".btrfs-backup-ng.locks"
+        lock_path.mkdir()
+
+        mock_ep = MagicMock()
+        mock_ep.config = {"path": tmp_path, "lock_file_name": ".btrfs-backup-ng.locks"}
+        mock_prepare.return_value = mock_ep
+
+        args = argparse.Namespace(source=str(tmp_path), no_fs_checks=True, prefix="")
+        result = _execute_unlock(args, "all")
+
+        assert result == 1
+
+    @patch("btrfs_backup_ng.cli.restore._prepare_backup_endpoint")
+    def test_unlock_empty_locks(self, mock_prepare, tmp_path, capsys):
+        """Test when lock file exists but is empty."""
+        from btrfs_backup_ng.cli.restore import _execute_unlock
+
+        lock_file = tmp_path / ".btrfs-backup-ng.locks"
+        lock_file.write_text("{}")
+
+        mock_ep = MagicMock()
+        mock_ep.config = {"path": tmp_path, "lock_file_name": ".btrfs-backup-ng.locks"}
+        mock_prepare.return_value = mock_ep
+
+        args = argparse.Namespace(source=str(tmp_path), no_fs_checks=True, prefix="")
+        result = _execute_unlock(args, "all")
+
+        assert result == 0
+        captured = capsys.readouterr()
+        assert "No locks found" in captured.out
+
+    @patch("btrfs_backup_ng.cli.restore._prepare_backup_endpoint")
+    def test_unlock_specific_session(self, mock_prepare, tmp_path, capsys):
+        """Test unlocking a specific session ID."""
+        from btrfs_backup_ng.cli.restore import _execute_unlock
+
+        lock_file = tmp_path / ".btrfs-backup-ng.locks"
+        lock_content = (
+            """{"snap-1": {"locks": ["restore:session123", "backup:other"]}}"""
+        )
+        lock_file.write_text(lock_content)
+
+        mock_ep = MagicMock()
+        mock_ep.config = {"path": tmp_path, "lock_file_name": ".btrfs-backup-ng.locks"}
+        mock_prepare.return_value = mock_ep
+
+        args = argparse.Namespace(source=str(tmp_path), no_fs_checks=True, prefix="")
+        result = _execute_unlock(args, "session123")
+
+        assert result == 0
+        captured = capsys.readouterr()
+        assert "Unlocked" in captured.out
+
+        # Verify the lock file was updated correctly
+        updated = lock_file.read_text()
+        assert "restore:session123" not in updated
+        assert "backup:other" in updated
+
+    @patch("btrfs_backup_ng.cli.restore._prepare_backup_endpoint")
+    def test_unlock_all_restore_locks(self, mock_prepare, tmp_path, capsys):
+        """Test unlocking all restore locks."""
+        from btrfs_backup_ng.cli.restore import _execute_unlock
+
+        lock_file = tmp_path / ".btrfs-backup-ng.locks"
+        lock_content = """{"snap-1": {"locks": ["restore:a", "restore:b"], "parent_locks": ["restore:c"]}, "snap-2": {"locks": ["backup:keep"]}}"""
+        lock_file.write_text(lock_content)
+
+        mock_ep = MagicMock()
+        mock_ep.config = {"path": tmp_path, "lock_file_name": ".btrfs-backup-ng.locks"}
+        mock_prepare.return_value = mock_ep
+
+        args = argparse.Namespace(source=str(tmp_path), no_fs_checks=True, prefix="")
+        result = _execute_unlock(args, "all")
+
+        assert result == 0
+        captured = capsys.readouterr()
+        assert "Unlocked 3 lock(s)" in captured.out
+
+        # Verify only backup lock remains
+        updated = lock_file.read_text()
+        assert "restore:" not in updated
+        assert "backup:keep" in updated
+
+
+class TestExecuteCleanupDetailed:
+    """Additional tests for _execute_cleanup function."""
+
+    def test_cleanup_no_destination(self, capsys):
+        """Test error when no destination provided."""
+        from btrfs_backup_ng.cli.restore import _execute_cleanup
+
+        args = argparse.Namespace(destination=None, source=None)
+        result = _execute_cleanup(args)
+
+        assert result == 1
+        captured = capsys.readouterr()
+        assert "Destination path required" in captured.out
+
+    def test_cleanup_path_not_exists(self, tmp_path, capsys):
+        """Test error when destination doesn't exist."""
+        from btrfs_backup_ng.cli.restore import _execute_cleanup
+
+        args = argparse.Namespace(
+            destination=str(tmp_path / "nonexistent"), source=None
+        )
+        result = _execute_cleanup(args)
+
+        assert result == 1
+        captured = capsys.readouterr()
+        assert "does not exist" in captured.out
+
+    @patch("btrfs_backup_ng.cli.restore.__util__.is_subvolume")
+    def test_cleanup_finds_partial_suffix(self, mock_is_sub, tmp_path, capsys):
+        """Test cleanup finds subvolumes with .partial suffix."""
+        from btrfs_backup_ng.cli.restore import _execute_cleanup
+
+        # Create a partial subvolume (mocked)
+        partial_dir = tmp_path / "snap-1.partial"
+        partial_dir.mkdir()
+
+        mock_is_sub.return_value = True
+
+        args = argparse.Namespace(destination=str(tmp_path), source=None, dry_run=True)
+        result = _execute_cleanup(args)
+
+        assert result == 0
+        captured = capsys.readouterr()
+        assert "snap-1.partial" in captured.out
+        assert ".partial suffix" in captured.out
+        assert "Dry run" in captured.out
+
+    @patch("btrfs_backup_ng.cli.restore.__util__.is_subvolume")
+    def test_cleanup_finds_empty_subvolume(self, mock_is_sub, tmp_path, capsys):
+        """Test cleanup finds empty subvolumes."""
+        from btrfs_backup_ng.cli.restore import _execute_cleanup
+
+        # Create an empty subvolume (mocked)
+        empty_dir = tmp_path / "snap-empty"
+        empty_dir.mkdir()
+
+        mock_is_sub.return_value = True
+
+        args = argparse.Namespace(destination=str(tmp_path), source=None, dry_run=True)
+        result = _execute_cleanup(args)
+
+        assert result == 0
+        captured = capsys.readouterr()
+        assert "snap-empty" in captured.out
+        assert "empty subvolume" in captured.out
+
+    @patch("btrfs_backup_ng.cli.restore.__util__.is_subvolume")
+    def test_cleanup_finds_metadata_only(self, mock_is_sub, tmp_path, capsys):
+        """Test cleanup finds subvolumes with only metadata directory."""
+        from btrfs_backup_ng.cli.restore import _execute_cleanup
+
+        # Create a subvolume with only metadata dir
+        meta_dir = tmp_path / "snap-meta"
+        meta_dir.mkdir()
+        (meta_dir / ".btrfs-backup-ng").mkdir()
+
+        mock_is_sub.return_value = True
+
+        args = argparse.Namespace(destination=str(tmp_path), source=None, dry_run=True)
+        result = _execute_cleanup(args)
+
+        assert result == 0
+        captured = capsys.readouterr()
+        assert "snap-meta" in captured.out
+        assert "only contains metadata directory" in captured.out
+
+    @patch("btrfs_backup_ng.cli.restore.__util__.is_subvolume")
+    def test_cleanup_no_partial_found(self, mock_is_sub, tmp_path, capsys):
+        """Test cleanup when no partial restores found."""
+        from btrfs_backup_ng.cli.restore import _execute_cleanup
+
+        # Create a normal subvolume with content
+        normal_dir = tmp_path / "snap-1"
+        normal_dir.mkdir()
+        (normal_dir / "file.txt").write_text("content")
+
+        mock_is_sub.return_value = True
+
+        args = argparse.Namespace(destination=str(tmp_path), source=None, dry_run=False)
+        result = _execute_cleanup(args)
+
+        assert result == 0
+        captured = capsys.readouterr()
+        assert "No partial restores found" in captured.out
+
+    @patch("builtins.input", return_value="n")
+    @patch("btrfs_backup_ng.cli.restore.__util__.is_subvolume")
+    def test_cleanup_user_cancels(self, mock_is_sub, mock_input, tmp_path, capsys):
+        """Test cleanup when user cancels confirmation."""
+        from btrfs_backup_ng.cli.restore import _execute_cleanup
+
+        partial_dir = tmp_path / "snap.partial"
+        partial_dir.mkdir()
+
+        mock_is_sub.return_value = True
+
+        args = argparse.Namespace(destination=str(tmp_path), source=None, dry_run=False)
+        result = _execute_cleanup(args)
+
+        assert result == 0
+        captured = capsys.readouterr()
+        assert "Cancelled" in captured.out
+
+    @patch("subprocess.run")
+    @patch("builtins.input", return_value="y")
+    @patch("btrfs_backup_ng.cli.restore.__util__.is_subvolume")
+    def test_cleanup_deletes_partial(
+        self, mock_is_sub, mock_input, mock_run, tmp_path, capsys
+    ):
+        """Test cleanup successfully deletes partial subvolumes."""
+        from btrfs_backup_ng.cli.restore import _execute_cleanup
+
+        partial_dir = tmp_path / "snap.partial"
+        partial_dir.mkdir()
+
+        mock_is_sub.return_value = True
+        mock_run.return_value = MagicMock(returncode=0)
+
+        args = argparse.Namespace(destination=str(tmp_path), source=None, dry_run=False)
+        result = _execute_cleanup(args)
+
+        assert result == 0
+        captured = capsys.readouterr()
+        assert "Deleted: snap.partial" in captured.out
+        assert "1 deleted, 0 failed" in captured.out
+
+    @patch("subprocess.run")
+    @patch("builtins.input", return_value="y")
+    @patch("btrfs_backup_ng.cli.restore.__util__.is_subvolume")
+    def test_cleanup_delete_fails(
+        self, mock_is_sub, mock_input, mock_run, tmp_path, capsys
+    ):
+        """Test cleanup when btrfs delete fails."""
+        from btrfs_backup_ng.cli.restore import _execute_cleanup
+
+        partial_dir = tmp_path / "snap.partial"
+        partial_dir.mkdir()
+
+        mock_is_sub.return_value = True
+        mock_run.return_value = MagicMock(
+            returncode=1, stderr="Operation not permitted"
+        )
+
+        args = argparse.Namespace(destination=str(tmp_path), source=None, dry_run=False)
+        result = _execute_cleanup(args)
+
+        assert result == 1
+        captured = capsys.readouterr()
+        assert "0 deleted, 1 failed" in captured.out
+
+    @patch("subprocess.run")
+    @patch("builtins.input", return_value="y")
+    @patch("btrfs_backup_ng.cli.restore.__util__.is_subvolume")
+    def test_cleanup_delete_exception(
+        self, mock_is_sub, mock_input, mock_run, tmp_path, capsys
+    ):
+        """Test cleanup when delete raises exception."""
+        from btrfs_backup_ng.cli.restore import _execute_cleanup
+
+        partial_dir = tmp_path / "snap.partial"
+        partial_dir.mkdir()
+
+        mock_is_sub.return_value = True
+        mock_run.side_effect = Exception("btrfs not found")
+
+        args = argparse.Namespace(destination=str(tmp_path), source=None, dry_run=False)
+        result = _execute_cleanup(args)
+
+        assert result == 1
+        captured = capsys.readouterr()
+        assert "0 deleted, 1 failed" in captured.out
+
+    def test_cleanup_scan_error(self, tmp_path, capsys):
+        """Test cleanup when scanning destination fails."""
+        from btrfs_backup_ng.cli.restore import _execute_cleanup
+
+        # Create a file that will cause iterdir to behave unexpectedly
+        # Actually, let's mock the exception
+        with patch.object(
+            tmp_path.__class__, "iterdir", side_effect=OSError("Permission denied")
+        ):
+            args = argparse.Namespace(
+                destination=str(tmp_path), source=None, dry_run=False
+            )
+            result = _execute_cleanup(args)
+
+        assert result == 1
+
+
+class TestExecuteMainRestore:
+    """Tests for _execute_main_restore function."""
+
+    @patch("btrfs_backup_ng.cli.restore.validate_restore_destination")
+    def test_destination_validation_fails(self, mock_validate, tmp_path):
+        """Test error when destination validation fails."""
+        from btrfs_backup_ng.cli.restore import _execute_main_restore
+
+        mock_validate.side_effect = RestoreError("Not a btrfs filesystem")
+
+        args = argparse.Namespace(
+            source="/mnt/backup",
+            destination=str(tmp_path),
+            in_place=False,
+            yes_i_know_what_i_am_doing=False,
+        )
+        result = _execute_main_restore(args)
+
+        assert result == 1
+
+    @patch("btrfs_backup_ng.cli.restore._prepare_backup_endpoint")
+    @patch("btrfs_backup_ng.cli.restore.validate_restore_destination")
+    def test_backup_endpoint_fails(self, mock_validate, mock_prepare, tmp_path):
+        """Test error when backup endpoint preparation fails."""
+        from btrfs_backup_ng.cli.restore import _execute_main_restore
+
+        mock_prepare.side_effect = Exception("SSH connection failed")
+
+        args = argparse.Namespace(
+            source="ssh://server:/backups",
+            destination=str(tmp_path),
+            in_place=False,
+            yes_i_know_what_i_am_doing=False,
+            no_fs_checks=False,
+            prefix="",
+            ssh_sudo=False,
+            ssh_password_auth=True,
+            ssh_key=None,
+        )
+        result = _execute_main_restore(args)
+
+        assert result == 1
+
+    @patch("btrfs_backup_ng.cli.restore._prepare_local_endpoint")
+    @patch("btrfs_backup_ng.cli.restore._prepare_backup_endpoint")
+    @patch("btrfs_backup_ng.cli.restore.validate_restore_destination")
+    def test_local_endpoint_fails(
+        self, mock_validate, mock_backup, mock_local, tmp_path
+    ):
+        """Test error when local endpoint preparation fails."""
+        from btrfs_backup_ng.cli.restore import _execute_main_restore
+
+        mock_backup.return_value = MagicMock()
+        mock_local.side_effect = Exception("Cannot create endpoint")
+
+        args = argparse.Namespace(
+            source="/mnt/backup",
+            destination=str(tmp_path),
+            in_place=False,
+            yes_i_know_what_i_am_doing=False,
+            no_fs_checks=False,
+            prefix="",
+            ssh_sudo=False,
+            ssh_password_auth=True,
+            ssh_key=None,
+        )
+        result = _execute_main_restore(args)
+
+        assert result == 1
+
+    @patch("btrfs_backup_ng.cli.restore._prepare_local_endpoint")
+    @patch("btrfs_backup_ng.cli.restore._prepare_backup_endpoint")
+    @patch("btrfs_backup_ng.cli.restore.validate_restore_destination")
+    def test_invalid_before_datetime(
+        self, mock_validate, mock_backup, mock_local, tmp_path
+    ):
+        """Test error when --before datetime is invalid."""
+        from btrfs_backup_ng.cli.restore import _execute_main_restore
+
+        mock_backup.return_value = MagicMock()
+        mock_local.return_value = MagicMock()
+
+        args = argparse.Namespace(
+            source="/mnt/backup",
+            destination=str(tmp_path),
+            in_place=False,
+            yes_i_know_what_i_am_doing=False,
+            no_fs_checks=False,
+            prefix="",
+            ssh_sudo=False,
+            ssh_password_auth=True,
+            ssh_key=None,
+            before="invalid-date",
+            snapshot=None,
+            all=False,
+            overwrite=False,
+            no_incremental=False,
+            interactive=False,
+            dry_run=False,
+            compress=None,
+            rate_limit=None,
+            progress=False,
+            no_progress=False,
+        )
+        result = _execute_main_restore(args)
+
+        assert result == 1

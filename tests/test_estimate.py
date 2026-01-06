@@ -809,3 +809,676 @@ class TestExecuteEstimate:
         result = execute_estimate(args)
 
         assert result == 1
+
+
+class TestEstimateFromConfig:
+    """Tests for _estimate_from_config function."""
+
+    @patch("btrfs_backup_ng.cli.estimate.load_config")
+    def test_config_load_error(self, mock_load):
+        """Test handling of config load error."""
+        from btrfs_backup_ng.cli.estimate import _estimate_from_config
+        from btrfs_backup_ng.config import ConfigError
+
+        mock_load.side_effect = ConfigError("Invalid config")
+
+        args = MagicMock()
+        args.config = "/path/to/config.toml"
+
+        result = _estimate_from_config(args, "/home")
+
+        assert result == 1
+
+    @patch("btrfs_backup_ng.cli.estimate.load_config")
+    @patch("btrfs_backup_ng.cli.estimate.find_config_file")
+    def test_volume_no_targets(self, mock_find, mock_load, tmp_path):
+        """Test volume with no backup targets configured."""
+        from btrfs_backup_ng.cli.estimate import _estimate_from_config
+        from btrfs_backup_ng.config.schema import Config, VolumeConfig
+
+        mock_find.return_value = str(tmp_path / "config.toml")
+        mock_load.return_value = (
+            Config(
+                volumes=[
+                    VolumeConfig(path="/home", snapshot_prefix="home-", targets=[])
+                ]
+            ),
+            [],
+        )
+
+        args = MagicMock()
+        args.config = None
+
+        result = _estimate_from_config(args, "/home")
+
+        assert result == 1
+
+    @patch("btrfs_backup_ng.cli.estimate.load_config")
+    @patch("btrfs_backup_ng.cli.estimate.find_config_file")
+    def test_invalid_target_index(self, mock_find, mock_load, tmp_path):
+        """Test with invalid target index."""
+        from btrfs_backup_ng.cli.estimate import _estimate_from_config
+        from btrfs_backup_ng.config.schema import Config, VolumeConfig, TargetConfig
+
+        mock_find.return_value = str(tmp_path / "config.toml")
+        mock_load.return_value = (
+            Config(
+                volumes=[
+                    VolumeConfig(
+                        path="/home",
+                        snapshot_prefix="home-",
+                        targets=[TargetConfig(path="/mnt/backup")],
+                    )
+                ]
+            ),
+            [],
+        )
+
+        args = MagicMock()
+        args.config = None
+        args.target = 5  # Invalid index
+
+        result = _estimate_from_config(args, "/home")
+
+        assert result == 1
+
+    @patch("btrfs_backup_ng.cli.estimate.endpoint")
+    @patch("btrfs_backup_ng.cli.estimate.load_config")
+    @patch("btrfs_backup_ng.cli.estimate.find_config_file")
+    def test_source_endpoint_prepare_fails(
+        self, mock_find, mock_load, mock_endpoint, tmp_path
+    ):
+        """Test handling when source endpoint preparation fails."""
+        from btrfs_backup_ng.cli.estimate import _estimate_from_config
+        from btrfs_backup_ng.config.schema import Config, VolumeConfig, TargetConfig
+
+        mock_find.return_value = str(tmp_path / "config.toml")
+        mock_load.return_value = (
+            Config(
+                volumes=[
+                    VolumeConfig(
+                        path="/home",
+                        snapshot_prefix="home-",
+                        targets=[TargetConfig(path="/mnt/backup")],
+                    )
+                ]
+            ),
+            [],
+        )
+
+        mock_ep = MagicMock()
+        mock_ep.prepare.side_effect = Exception("Cannot access source")
+        mock_endpoint.choose_endpoint.return_value = mock_ep
+
+        args = MagicMock()
+        args.config = None
+        args.target = None
+        args.json = False
+
+        result = _estimate_from_config(args, "/home")
+
+        assert result == 1
+
+    @patch("btrfs_backup_ng.cli.estimate.estimate_transfer")
+    @patch("btrfs_backup_ng.cli.estimate.endpoint")
+    @patch("btrfs_backup_ng.cli.estimate.load_config")
+    @patch("btrfs_backup_ng.cli.estimate.find_config_file")
+    def test_dest_endpoint_prepare_fails(
+        self, mock_find, mock_load, mock_endpoint, mock_estimate, tmp_path
+    ):
+        """Test handling when destination endpoint preparation fails."""
+        from btrfs_backup_ng.cli.estimate import _estimate_from_config
+        from btrfs_backup_ng.config.schema import Config, VolumeConfig, TargetConfig
+
+        mock_find.return_value = str(tmp_path / "config.toml")
+        mock_load.return_value = (
+            Config(
+                volumes=[
+                    VolumeConfig(
+                        path="/home",
+                        snapshot_prefix="home-",
+                        targets=[TargetConfig(path="/mnt/backup")],
+                    )
+                ]
+            ),
+            [],
+        )
+
+        # First call for source succeeds, second for dest fails
+        source_ep = MagicMock()
+        dest_ep = MagicMock()
+        dest_ep.prepare.side_effect = Exception("Cannot access destination")
+        mock_endpoint.choose_endpoint.side_effect = [source_ep, dest_ep]
+
+        args = MagicMock()
+        args.config = None
+        args.target = None
+        args.json = False
+
+        result = _estimate_from_config(args, "/home")
+
+        assert result == 1
+
+    @patch("btrfs_backup_ng.cli.estimate.estimate_transfer")
+    @patch("btrfs_backup_ng.cli.estimate.endpoint")
+    @patch("btrfs_backup_ng.cli.estimate.load_config")
+    @patch("btrfs_backup_ng.cli.estimate.find_config_file")
+    def test_estimation_fails(
+        self, mock_find, mock_load, mock_endpoint, mock_estimate, tmp_path
+    ):
+        """Test handling when estimation fails."""
+        from btrfs_backup_ng.cli.estimate import _estimate_from_config
+        from btrfs_backup_ng.config.schema import Config, VolumeConfig, TargetConfig
+
+        mock_find.return_value = str(tmp_path / "config.toml")
+        mock_load.return_value = (
+            Config(
+                volumes=[
+                    VolumeConfig(
+                        path="/home",
+                        snapshot_prefix="home-",
+                        targets=[TargetConfig(path="/mnt/backup")],
+                    )
+                ]
+            ),
+            [],
+        )
+
+        mock_ep = MagicMock()
+        mock_endpoint.choose_endpoint.return_value = mock_ep
+        mock_estimate.side_effect = Exception("Estimation error")
+
+        args = MagicMock()
+        args.config = None
+        args.target = None
+        args.json = False
+
+        result = _estimate_from_config(args, "/home")
+
+        assert result == 1
+
+    @patch("btrfs_backup_ng.cli.estimate.print_estimate")
+    @patch("btrfs_backup_ng.cli.estimate.estimate_transfer")
+    @patch("btrfs_backup_ng.cli.estimate.endpoint")
+    @patch("btrfs_backup_ng.cli.estimate.load_config")
+    @patch("btrfs_backup_ng.cli.estimate.find_config_file")
+    def test_successful_estimation(
+        self, mock_find, mock_load, mock_endpoint, mock_estimate, mock_print, tmp_path
+    ):
+        """Test successful config-driven estimation."""
+        from btrfs_backup_ng.cli.estimate import _estimate_from_config
+        from btrfs_backup_ng.config.schema import Config, VolumeConfig, TargetConfig
+
+        mock_find.return_value = str(tmp_path / "config.toml")
+        mock_load.return_value = (
+            Config(
+                volumes=[
+                    VolumeConfig(
+                        path="/home",
+                        snapshot_prefix="home-",
+                        targets=[TargetConfig(path="/mnt/backup")],
+                    )
+                ]
+            ),
+            [],
+        )
+
+        mock_ep = MagicMock()
+        mock_endpoint.choose_endpoint.return_value = mock_ep
+        mock_estimate.return_value = TransferEstimate()
+
+        args = MagicMock()
+        args.config = None
+        args.target = None
+        args.json = False
+
+        result = _estimate_from_config(args, "/home")
+
+        assert result == 0
+        mock_print.assert_called_once()
+
+    @patch("btrfs_backup_ng.cli.estimate._print_json")
+    @patch("btrfs_backup_ng.cli.estimate.estimate_transfer")
+    @patch("btrfs_backup_ng.cli.estimate.endpoint")
+    @patch("btrfs_backup_ng.cli.estimate.load_config")
+    @patch("btrfs_backup_ng.cli.estimate.find_config_file")
+    def test_successful_estimation_json_output(
+        self, mock_find, mock_load, mock_endpoint, mock_estimate, mock_json, tmp_path
+    ):
+        """Test successful estimation with JSON output."""
+        from btrfs_backup_ng.cli.estimate import _estimate_from_config
+        from btrfs_backup_ng.config.schema import Config, VolumeConfig, TargetConfig
+
+        mock_find.return_value = str(tmp_path / "config.toml")
+        mock_load.return_value = (
+            Config(
+                volumes=[
+                    VolumeConfig(
+                        path="/home",
+                        snapshot_prefix="home-",
+                        targets=[
+                            TargetConfig(
+                                path="/mnt/backup",
+                                ssh_sudo=True,
+                                ssh_key="~/.ssh/id_rsa",
+                            )
+                        ],
+                    )
+                ]
+            ),
+            [],
+        )
+
+        mock_ep = MagicMock()
+        mock_endpoint.choose_endpoint.return_value = mock_ep
+        mock_estimate.return_value = TransferEstimate()
+
+        args = MagicMock()
+        args.config = None
+        args.target = 0
+        args.json = True
+
+        result = _estimate_from_config(args, "/home")
+
+        assert result == 0
+        mock_json.assert_called_once()
+
+    @patch("btrfs_backup_ng.cli.estimate.load_config")
+    def test_explicit_config_path(self, mock_load, tmp_path):
+        """Test using explicit config path."""
+        from btrfs_backup_ng.cli.estimate import _estimate_from_config
+        from btrfs_backup_ng.config.schema import Config, VolumeConfig
+
+        config_path = str(tmp_path / "custom-config.toml")
+        mock_load.return_value = (
+            Config(volumes=[VolumeConfig(path="/var/log", snapshot_prefix="logs-")]),
+            [],
+        )
+
+        args = MagicMock()
+        args.config = config_path
+
+        result = _estimate_from_config(args, "/home")
+
+        # Should fail because /home not in config, but load_config should be called with explicit path
+        mock_load.assert_called_once_with(config_path)
+        assert result == 1
+
+
+class TestEstimateDirect:
+    """Tests for _estimate_direct function."""
+
+    @patch("btrfs_backup_ng.cli.estimate.endpoint")
+    def test_source_endpoint_prepare_fails(self, mock_endpoint, tmp_path):
+        """Test handling when source endpoint preparation fails."""
+        from btrfs_backup_ng.cli.estimate import _estimate_direct
+
+        mock_ep = MagicMock()
+        mock_ep.prepare.side_effect = Exception("Cannot access source")
+        mock_endpoint.choose_endpoint.return_value = mock_ep
+
+        args = MagicMock()
+        args.json = False
+        args.prefix = ""
+        args.ssh_sudo = False
+        args.ssh_key = None
+        args.no_fs_checks = False
+
+        result = _estimate_direct(
+            args, str(tmp_path / "source"), str(tmp_path / "dest")
+        )
+
+        assert result == 1
+
+    @patch("btrfs_backup_ng.cli.estimate.endpoint")
+    def test_dest_endpoint_prepare_fails(self, mock_endpoint, tmp_path):
+        """Test handling when destination endpoint preparation fails."""
+        from btrfs_backup_ng.cli.estimate import _estimate_direct
+
+        source_ep = MagicMock()
+        dest_ep = MagicMock()
+        dest_ep.prepare.side_effect = Exception("Cannot access destination")
+        mock_endpoint.choose_endpoint.side_effect = [source_ep, dest_ep]
+
+        args = MagicMock()
+        args.json = False
+        args.prefix = ""
+        args.ssh_sudo = False
+        args.ssh_key = None
+        args.no_fs_checks = False
+
+        result = _estimate_direct(
+            args, str(tmp_path / "source"), str(tmp_path / "dest")
+        )
+
+        assert result == 1
+
+    @patch("btrfs_backup_ng.cli.estimate.estimate_transfer")
+    @patch("btrfs_backup_ng.cli.estimate.endpoint")
+    def test_estimation_fails(self, mock_endpoint, mock_estimate, tmp_path):
+        """Test handling when estimation fails."""
+        from btrfs_backup_ng.cli.estimate import _estimate_direct
+
+        mock_ep = MagicMock()
+        mock_endpoint.choose_endpoint.return_value = mock_ep
+        mock_estimate.side_effect = Exception("Estimation error")
+
+        args = MagicMock()
+        args.json = False
+        args.prefix = ""
+        args.ssh_sudo = False
+        args.ssh_key = None
+        args.no_fs_checks = False
+
+        result = _estimate_direct(
+            args, str(tmp_path / "source"), str(tmp_path / "dest")
+        )
+
+        assert result == 1
+
+    @patch("btrfs_backup_ng.cli.estimate.print_estimate")
+    @patch("btrfs_backup_ng.cli.estimate.estimate_transfer")
+    @patch("btrfs_backup_ng.cli.estimate.endpoint")
+    def test_successful_estimation(
+        self, mock_endpoint, mock_estimate, mock_print, tmp_path
+    ):
+        """Test successful direct path estimation."""
+        from btrfs_backup_ng.cli.estimate import _estimate_direct
+
+        mock_ep = MagicMock()
+        mock_endpoint.choose_endpoint.return_value = mock_ep
+        mock_estimate.return_value = TransferEstimate()
+
+        args = MagicMock()
+        args.json = False
+        args.prefix = "home-"
+        args.ssh_sudo = False
+        args.ssh_key = None
+        args.no_fs_checks = False
+
+        result = _estimate_direct(
+            args, str(tmp_path / "source"), str(tmp_path / "dest")
+        )
+
+        assert result == 0
+        mock_print.assert_called_once()
+
+    @patch("btrfs_backup_ng.cli.estimate._print_json")
+    @patch("btrfs_backup_ng.cli.estimate.estimate_transfer")
+    @patch("btrfs_backup_ng.cli.estimate.endpoint")
+    def test_successful_estimation_json_output(
+        self, mock_endpoint, mock_estimate, mock_json, tmp_path
+    ):
+        """Test successful estimation with JSON output."""
+        from btrfs_backup_ng.cli.estimate import _estimate_direct
+
+        mock_ep = MagicMock()
+        mock_endpoint.choose_endpoint.return_value = mock_ep
+        mock_estimate.return_value = TransferEstimate()
+
+        args = MagicMock()
+        args.json = True
+        args.prefix = ""
+        args.ssh_sudo = False
+        args.ssh_key = None
+        args.no_fs_checks = False
+
+        result = _estimate_direct(
+            args, str(tmp_path / "source"), str(tmp_path / "dest")
+        )
+
+        assert result == 0
+        mock_json.assert_called_once()
+
+    @patch("btrfs_backup_ng.cli.estimate.print_estimate")
+    @patch("btrfs_backup_ng.cli.estimate.estimate_transfer")
+    @patch("btrfs_backup_ng.cli.estimate.endpoint")
+    def test_ssh_source_path(self, mock_endpoint, mock_estimate, mock_print, tmp_path):
+        """Test with SSH source path."""
+        from btrfs_backup_ng.cli.estimate import _estimate_direct
+
+        mock_ep = MagicMock()
+        mock_endpoint.choose_endpoint.return_value = mock_ep
+        mock_estimate.return_value = TransferEstimate()
+
+        args = MagicMock()
+        args.json = False
+        args.prefix = ""
+        args.ssh_sudo = True
+        args.ssh_key = "/path/to/key"
+        args.no_fs_checks = True
+
+        result = _estimate_direct(args, "ssh://user@host:/path", str(tmp_path / "dest"))
+
+        assert result == 0
+        # Check endpoint was created with SSH options
+        calls = mock_endpoint.choose_endpoint.call_args_list
+        assert len(calls) == 2
+
+    @patch("btrfs_backup_ng.cli.estimate.print_estimate")
+    @patch("btrfs_backup_ng.cli.estimate.estimate_transfer")
+    @patch("btrfs_backup_ng.cli.estimate.endpoint")
+    def test_ssh_dest_path(self, mock_endpoint, mock_estimate, mock_print, tmp_path):
+        """Test with SSH destination path."""
+        from btrfs_backup_ng.cli.estimate import _estimate_direct
+
+        mock_ep = MagicMock()
+        mock_endpoint.choose_endpoint.return_value = mock_ep
+        mock_estimate.return_value = TransferEstimate()
+
+        args = MagicMock()
+        args.json = False
+        args.prefix = ""
+        args.ssh_sudo = True
+        args.ssh_key = None
+        args.no_fs_checks = False
+
+        result = _estimate_direct(
+            args, str(tmp_path / "source"), "ssh://backup@server:/backups"
+        )
+
+        assert result == 0
+
+
+class TestPrintJson:
+    """Tests for _print_json function."""
+
+    def test_empty_estimate(self, capsys):
+        """Test JSON output for empty estimate."""
+        import json
+
+        from btrfs_backup_ng.cli.estimate import _print_json
+
+        estimate = TransferEstimate()
+        _print_json(estimate, "/source", "/dest")
+
+        captured = capsys.readouterr()
+        data = json.loads(captured.out)
+
+        assert data["source"] == "/source"
+        assert data["destination"] == "/dest"
+        assert data["snapshot_count"] == 0
+        assert data["new_snapshot_count"] == 0
+        assert data["skipped_count"] == 0
+        assert data["snapshots"] == []
+
+    def test_full_snapshot(self, capsys):
+        """Test JSON output for full snapshot."""
+        import json
+
+        from btrfs_backup_ng.cli.estimate import _print_json
+
+        estimate = TransferEstimate()
+        snap = SnapshotEstimate(
+            name="snap-1",
+            full_size=1024 * 1024 * 100,
+            method="filesystem_du",
+        )
+        estimate.add_snapshot(snap)
+
+        _print_json(estimate, "/source", "/dest")
+
+        captured = capsys.readouterr()
+        data = json.loads(captured.out)
+
+        assert data["snapshot_count"] == 1
+        assert len(data["snapshots"]) == 1
+        assert data["snapshots"][0]["name"] == "snap-1"
+        assert data["snapshots"][0]["full_size_bytes"] == 1024 * 1024 * 100
+        assert data["snapshots"][0]["is_incremental"] is False
+        assert "parent" not in data["snapshots"][0]
+
+    def test_incremental_snapshot(self, capsys):
+        """Test JSON output for incremental snapshot."""
+        import json
+
+        from btrfs_backup_ng.cli.estimate import _print_json
+
+        estimate = TransferEstimate()
+        snap = SnapshotEstimate(
+            name="snap-2",
+            full_size=1024 * 1024 * 100,
+            incremental_size=1024 * 1024 * 10,
+            parent_name="snap-1",
+            is_incremental=True,
+            method="send_no_data",
+        )
+        estimate.add_snapshot(snap)
+
+        _print_json(estimate, "/source", "/dest")
+
+        captured = capsys.readouterr()
+        data = json.loads(captured.out)
+
+        assert data["snapshots"][0]["is_incremental"] is True
+        assert data["snapshots"][0]["incremental_size_bytes"] == 1024 * 1024 * 10
+        assert data["snapshots"][0]["parent"] == "snap-1"
+
+    def test_multiple_snapshots(self, capsys):
+        """Test JSON output for multiple snapshots."""
+        import json
+
+        from btrfs_backup_ng.cli.estimate import _print_json
+
+        estimate = TransferEstimate()
+        estimate.estimation_time = 2.5
+
+        snap1 = SnapshotEstimate(
+            name="snap-1",
+            full_size=1024 * 1024 * 100,
+        )
+        snap2 = SnapshotEstimate(
+            name="snap-2",
+            full_size=1024 * 1024 * 100,
+            incremental_size=1024 * 1024 * 20,
+            parent_name="snap-1",
+            is_incremental=True,
+        )
+        estimate.add_snapshot(snap1)
+        estimate.add_snapshot(snap2)
+        estimate.new_snapshot_count = 2
+        estimate.skipped_count = 3
+
+        _print_json(estimate, "ssh://user@host:/source", "/dest")
+
+        captured = capsys.readouterr()
+        data = json.loads(captured.out)
+
+        assert data["source"] == "ssh://user@host:/source"
+        assert data["snapshot_count"] == 2
+        assert data["new_snapshot_count"] == 2
+        assert data["skipped_count"] == 3
+        assert data["estimation_time_seconds"] == 2.5
+        assert len(data["snapshots"]) == 2
+        assert data["snapshots"][0]["name"] == "snap-1"
+        assert data["snapshots"][1]["name"] == "snap-2"
+
+    def test_human_readable_sizes(self, capsys):
+        """Test that human-readable sizes are included."""
+        import json
+
+        from btrfs_backup_ng.cli.estimate import _print_json
+
+        estimate = TransferEstimate()
+        snap = SnapshotEstimate(
+            name="snap-1",
+            full_size=1024 * 1024 * 1024,  # 1 GiB
+            incremental_size=1024 * 1024 * 50,  # 50 MiB
+            parent_name="snap-0",
+            is_incremental=True,
+        )
+        estimate.add_snapshot(snap)
+
+        _print_json(estimate, "/source", "/dest")
+
+        captured = capsys.readouterr()
+        data = json.loads(captured.out)
+
+        assert "GiB" in data["snapshots"][0]["full_size_human"]
+        assert "MiB" in data["snapshots"][0]["incremental_size_human"]
+        assert "total_transfer_human" in data
+        assert "total_full_human" in data
+
+
+class TestExecuteEstimateIntegration:
+    """Integration tests for execute_estimate."""
+
+    @patch("btrfs_backup_ng.cli.estimate._estimate_direct")
+    def test_direct_mode_called(self, mock_direct):
+        """Test that direct estimation is called with source and dest."""
+        from btrfs_backup_ng.cli.estimate import execute_estimate
+
+        mock_direct.return_value = 0
+
+        args = MagicMock()
+        args.volume = None
+        args.source = "/source"
+        args.destination = "/dest"
+
+        result = execute_estimate(args)
+
+        assert result == 0
+        mock_direct.assert_called_once_with(args, "/source", "/dest")
+
+    @patch("btrfs_backup_ng.cli.estimate._estimate_from_config")
+    def test_config_mode_called(self, mock_config):
+        """Test that config estimation is called with --volume."""
+        from btrfs_backup_ng.cli.estimate import execute_estimate
+
+        mock_config.return_value = 0
+
+        args = MagicMock()
+        args.volume = "/home"
+        args.source = None
+        args.destination = None
+
+        result = execute_estimate(args)
+
+        assert result == 0
+        mock_config.assert_called_once_with(args, "/home")
+
+    def test_missing_source_with_dest(self):
+        """Test error when only destination is provided."""
+        from btrfs_backup_ng.cli.estimate import execute_estimate
+
+        args = MagicMock()
+        args.volume = None
+        args.source = None
+        args.destination = "/dest"
+
+        result = execute_estimate(args)
+
+        assert result == 1
+
+    def test_missing_dest_with_source(self):
+        """Test error when only source is provided."""
+        from btrfs_backup_ng.cli.estimate import execute_estimate
+
+        args = MagicMock()
+        args.volume = None
+        args.source = "/source"
+        args.destination = None
+
+        result = execute_estimate(args)
+
+        assert result == 1
