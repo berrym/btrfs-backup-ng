@@ -5,6 +5,7 @@ including configuration validation, snapshot integrity, transfer state, and
 system health monitoring.
 """
 
+import getpass
 import logging
 import os
 import time
@@ -1118,9 +1119,14 @@ class Doctor:
 
         findings: list[DiagnosticFinding] = []
 
+        try:
+            username = getpass.getuser()
+        except Exception:
+            username = None
+
         timer_names = [
             "btrfs-backup-ng.timer",
-            f"btrfs-backup-ng-{os.getlogin()}.timer" if os.getlogin() else None,
+            f"btrfs-backup-ng-{username}.timer" if username else None,
         ]
 
         for timer_name in timer_names:
