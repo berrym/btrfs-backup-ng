@@ -20,7 +20,7 @@ from ..core.restore import (
     restore_snapshots,
     validate_restore_destination,
 )
-from .common import get_log_level, should_show_progress
+from .common import get_fs_checks_mode, get_log_level, should_show_progress
 
 logger = logging.getLogger(__name__)
 
@@ -422,13 +422,12 @@ def _prepare_backup_endpoint(args: argparse.Namespace, source: str):
         Configured endpoint
     """
     # Build endpoint kwargs
-    no_fs_checks = getattr(args, "no_fs_checks", False)
     endpoint_kwargs = {
         "snap_prefix": getattr(args, "prefix", "") or "",
         "convert_rw": False,
         "subvolume_sync": False,
         "btrfs_debug": False,
-        "fs_checks": not no_fs_checks,
+        "fs_checks": get_fs_checks_mode(args),
     }
 
     # SSH options
@@ -479,7 +478,7 @@ def _prepare_local_endpoint(dest_path: Path):
         "convert_rw": False,
         "subvolume_sync": False,
         "btrfs_debug": False,
-        "fs_checks": True,
+        "fs_checks": "auto",
     }
 
     local_ep = LocalEndpoint(config=endpoint_kwargs)

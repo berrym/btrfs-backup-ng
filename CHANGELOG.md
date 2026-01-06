@@ -5,6 +5,49 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.1] - 2026-01-06
+
+### Added
+
+#### Space-Aware Operations
+- **Destination space checking** before backup transfers with `--check-space` flag on estimate command
+- **btrfs quota (qgroup) awareness** - detects when quota limits are more restrictive than filesystem space
+- **Safety margin** calculation (default 10%, minimum 100 MiB) to prevent transfers that would fill destinations
+- **JSON output** includes complete space check details including quota information
+- Pre-flight space verification in operations with clear insufficient space warnings
+
+#### Subvolume Detection
+- **`config detect`** command to scan for btrfs subvolumes system-wide
+- Automatic categorization of subvolumes (recommended for backup, optional, excluded)
+- Suggested snapshot prefixes based on mount paths
+- JSON output mode for scripting (`--json`)
+- Integration with interactive wizard (`--wizard`)
+
+#### User-Friendly Filesystem Checks
+- **Three-mode `--fs-checks` system**: `auto` (default), `strict`, `skip`
+  - `auto`: Warns about issues but continues operation (user-friendly default)
+  - `strict`: Errors out on filesystem check failures (original behavior)
+  - `skip`: Bypasses all filesystem verification checks
+- Backwards-compatible aliases: `--no-fs-checks` and `--skip-fs-checks` map to `skip` mode
+- Applied consistently across all commands: estimate, verify, restore, run, transfer, legacy mode
+
+#### Legacy Mode Enhancements
+- Added `--no-check-space`, `--force`, `--safety-margin` options for space-aware operations
+- Added `--fs-checks` option with auto/strict/skip modes
+- Full parity with subcommand mode for new features
+
+### Changed
+
+- **Default `--fs-checks` mode changed from `strict` to `auto`** - operations now warn and continue instead of erroring on non-critical filesystem issues
+- Reduced output noise: "Could not parse date from snapshot" messages moved from WARNING to DEBUG level
+- Improved quota parsing using `btrfs qgroup show --raw` for accurate byte values
+
+### Fixed
+
+- Quota detection now correctly matches qgroups by path basename
+- Fixed MagicMock issues in tests when fs_checks attribute wasn't explicitly set
+- Improved path matching in qgroup output parsing for nested subvolumes
+
 ## [0.8.0] - 2026-01-04
 
 ### Added
@@ -86,5 +129,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 Previous release. See git history for details.
 
+[0.8.1]: https://github.com/berrym/btrfs-backup-ng/compare/v0.8.0...v0.8.1
 [0.8.0]: https://github.com/berrym/btrfs-backup-ng/compare/v0.6.8...v0.8.0
 [0.6.8]: https://github.com/berrym/btrfs-backup-ng/releases/tag/v0.6.8

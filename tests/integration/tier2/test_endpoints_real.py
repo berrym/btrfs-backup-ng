@@ -33,7 +33,7 @@ class TestLocalEndpointWithRealBtrfs:
             config={
                 "path": str(dest),
                 "snap_prefix": "test-",
-                "fs_checks": True,
+                "fs_checks": "auto",
             }
         )
 
@@ -61,7 +61,7 @@ class TestLocalEndpointWithRealBtrfs:
                 "source": str(source),
                 "path": str(dest),
                 "snap_prefix": "test-",
-                "fs_checks": True,
+                "fs_checks": "auto",
             }
         )
 

@@ -1,20 +1,23 @@
 .\" Man page for btrfs-backup-ng estimate
 .TH BTRFS-BACKUP-NG-ESTIMATE 1 "January 2026" "btrfs-backup-ng" "User Commands"
 .SH NAME
-btrfs-backup-ng-estimate \- estimate backup transfer sizes
+btrfs-backup-ng-estimate \- estimate backup transfer sizes and check destination space
 .SH SYNOPSIS
 .B btrfs-backup-ng estimate
 [\fIOPTIONS\fR] \fISOURCE\fR \fIDESTINATION\fR
 .br
 .B btrfs-backup-ng estimate
-\fB\-\-volume\fR \fIPATH\fR [\fB\-\-target\fR \fIINDEX\fR]
+\fB\-\-volume\fR \fIPATH\fR [\fB\-\-target\fR \fIINDEX\fR] [\fB\-\-check-space\fR]
 .SH DESCRIPTION
 Calculate and display estimated transfer sizes for backup operations before
-actually running them. This helps with:
+actually running them. Optionally verify that the destination has sufficient
+space, including awareness of btrfs quotas (qgroups). This helps with:
 .IP \(bu 2
 Planning bandwidth usage and backup windows
 .IP \(bu 2
 Verifying expected transfer sizes before proceeding
+.IP \(bu 2
+Checking destination space availability before transfers fail
 .IP \(bu 2
 Scripting and automation decisions
 .PP
@@ -50,13 +53,40 @@ Use sudo for btrfs commands on the remote host.
 .TP
 .BI \-\-ssh-key " FILE"
 Path to SSH private key file.
+.SS Space Checking Options
+.TP
+.B \-\-check-space
+Check if the destination has sufficient space for the estimated transfer.
+When enabled, queries both filesystem free space and btrfs quota limits
+(if quotas are enabled), using the more restrictive value.
+.TP
+.BI \-\-safety-margin " PERCENT"
+Safety margin percentage to add to required space calculation. Default is 10%.
+A minimum of 100 MiB is always applied regardless of the percentage.
+.SS Filesystem Check Options
+.TP
+.BI \-\-fs-checks " MODE"
+Filesystem verification mode. Valid values:
+.RS
+.TP
+.B auto
+(Default) Warn about issues but continue operation.
+.TP
+.B strict
+Error out on filesystem check failures.
+.TP
+.B skip
+Bypass all filesystem verification checks.
+.RE
+.TP
+.B \-\-no-fs-checks
+Skip btrfs subvolume verification. Alias for \fB\-\-fs-checks=skip\fR.
 .SS Output Options
 .TP
 .B \-\-json
-Output results in JSON format for scripting.
-.TP
-.B \-\-no-fs-checks
-Skip btrfs subvolume verification.
+Output results in JSON format for scripting. When \fB\-\-check-space\fR is
+enabled, includes a \fBspace_check\fR object with detailed space information
+including quota data.
 .SH ESTIMATION METHODS
 The estimate command uses multiple methods to determine snapshot sizes,
 in order of preference:
@@ -112,17 +142,51 @@ Estimate using configuration file:
 Estimate for specific target:
 .B btrfs-backup-ng estimate --volume /home --target 1
 .TP
-JSON output for scripting:
-.B btrfs-backup-ng estimate --volume /home --json
+Estimate with destination space check:
+.B btrfs-backup-ng estimate --volume /home --check-space
 .TP
-Check if backup will fit (bash example):
+Space check with custom safety margin (20%):
+.B btrfs-backup-ng estimate /mnt/snapshots /mnt/backup --check-space --safety-margin 20
+.TP
+JSON output with space check for scripting:
+.B btrfs-backup-ng estimate --volume /home --check-space --json
+.TP
+Check if backup will fit (bash example using built-in space check):
 .nf
-SIZE=$(btrfs-backup-ng estimate --volume /home --json | jq '.total_transfer_bytes')
-AVAILABLE=$(df --output=avail -B1 /mnt/backup | tail -1)
-if [ "$SIZE" -gt "$AVAILABLE" ]; then
-    echo "Warning: Not enough space"
+if ! btrfs-backup-ng estimate --volume /home --check-space --json | \\
+     jq -e '.space_check.sufficient' > /dev/null; then
+    echo "Warning: Not enough space for backup"
+    exit 1
 fi
 .fi
+.SH SPACE CHECK OUTPUT
+When \fB\-\-check-space\fR is enabled, the output includes a destination
+space check section showing:
+.IP \(bu 2
+\fBFilesystem space\fR: Available and total space on the destination filesystem
+.IP \(bu 2
+\fBQuota limit\fR: If btrfs quotas are enabled, shows the quota limit, current
+usage, and remaining space
+.IP \(bu 2
+\fBEffective limit\fR: The more restrictive of filesystem space or quota remaining
+.IP \(bu 2
+\fBRequired\fR: Estimated transfer size plus safety margin
+.IP \(bu 2
+\fBStatus\fR: OK or INSUFFICIENT with details
+.PP
+Example output with quotas:
+.PP
+.RS
+.nf
+Destination Space Check
+------------------------------------------------------------
+Filesystem space:  850.00 GiB available of 1.00 TiB
+Quota limit:       100.00 GiB (45.50 GiB used, 54.50 GiB remaining)
+Effective limit:   54.50 GiB (quota is more restrictive)
+Required:          2.49 GiB (+ 10% safety margin = 2.74 GiB)
+Status:            OK - Sufficient space available
+.fi
+.RE
 .SH NOTES
 .IP \(bu 2
 Estimates are approximate and actual transfer sizes may vary slightly
@@ -133,6 +197,9 @@ Incremental estimates require the parent snapshot to exist.
 The estimation process is read-only and does not modify any data.
 .IP \(bu 2
 For large backup sets, estimation may take several minutes.
+.IP \(bu 2
+Space checking queries quota information using \fBbtrfs qgroup show\fR.
+If quotas are not enabled, only filesystem space is checked.
 .SH SEE ALSO
 .BR btrfs-backup-ng (1),
 .BR btrfs-backup-ng-run (1),

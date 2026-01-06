@@ -26,6 +26,8 @@ See the [LICENSE](LICENSE) file for full copyright attribution.
 - **Subcommand CLI**: Modern interface with `run`, `snapshot`, `transfer`, `prune`, `restore`, `verify`, `estimate`, `list`, `status`
 - **Disaster Recovery**: Built-in restore command to pull backups back to local systems
 - **Backup Verification**: Multi-level integrity checks (metadata, stream, full restore test)
+- **Space-Aware Operations**: Pre-flight destination space checking with btrfs quota support
+- **Subvolume Detection**: Automatic discovery of btrfs subvolumes for easy configuration
 - **Time-based Retention**: Intuitive policies (hourly, daily, weekly, monthly, yearly)
 - **Rich Progress Bars**: Real-time transfer progress with speed, ETA, and percentage
 - **Parallel Execution**: Concurrent volume and target transfers
@@ -36,6 +38,7 @@ See the [LICENSE](LICENSE) file for full copyright attribution.
 - **Systemd Integration**: Built-in timer/service installation
 - **btrbk Migration**: Import existing btrbk configurations
 - **Robust SSH**: Password fallback, sudo support, Paramiko integration
+- **User-Friendly Defaults**: Auto-mode for filesystem checks warns but continues
 - **Legacy Compatibility**: Original CLI still works
 
 ## Installation
@@ -190,12 +193,13 @@ btrfs-backup-ng install --user --timer=daily
 | `prune` | Apply retention policies |
 | `restore` | Restore snapshots from backup location |
 | `verify` | Verify backup integrity (metadata, stream, or full test) |
-| `estimate` | Estimate backup transfer sizes before execution |
+| `estimate` | Estimate backup transfer sizes (use `--check-space` for space verification) |
 | `list` | Show snapshots and backups |
 | `status` | Show job status and statistics |
 | `config validate` | Validate configuration file |
 | `config init` | Generate example configuration (use `-i` for interactive wizard) |
 | `config import` | Import btrbk configuration |
+| `config detect` | Detect btrfs subvolumes on the system (use `--wizard` for guided setup) |
 | `install` | Install systemd timer/service |
 | `uninstall` | Remove systemd timer/service |
 
@@ -1584,6 +1588,7 @@ Before running backups, you can estimate how much data will be transferred using
 
 - Planning bandwidth usage and backup windows
 - Verifying expected transfer sizes
+- **Checking destination space availability** (including btrfs quota limits)
 - Scripting and automation decisions
 
 ### Basic Estimation
@@ -1596,6 +1601,43 @@ btrfs-backup-ng estimate /mnt/snapshots /mnt/backup
 btrfs-backup-ng estimate /home/.snapshots ssh://backup@server:/backups/home
 ```
 
+### Space Checking
+
+The `--check-space` flag adds destination space verification to the estimate, including btrfs quota awareness:
+
+```bash
+# Estimate with space check
+btrfs-backup-ng estimate /mnt/snapshots /mnt/backup --check-space
+
+# With custom safety margin (default is 10%)
+btrfs-backup-ng estimate /mnt/snapshots /mnt/backup --check-space --safety-margin 20
+```
+
+**Example output with space check:**
+
+```
+Backup Size Estimate
+============================================================
+Source: /home/.snapshots
+Destination: /mnt/backup/home
+
+Snapshots to transfer: 3
+...
+Total data to transfer: 479.80 MiB
+Full size (uncompressed): 2.34 GiB
+Estimation time: 1.23s
+
+Destination Space Check
+------------------------------------------------------------
+Filesystem space:  850.00 GiB available of 1.00 TiB
+Quota limit:       100.00 GiB (45.50 GiB used, 54.50 GiB remaining)
+Effective limit:   54.50 GiB (quota is more restrictive)
+Required:          479.80 MiB (+ 10% safety margin = 527.78 MiB)
+Status:            OK - Sufficient space available
+```
+
+When quotas are enabled on the destination, the space check uses the **more restrictive** of filesystem free space or quota remaining.
+
 ### Config-Driven Estimation
 
 ```bash
@@ -1607,21 +1649,24 @@ btrfs-backup-ng estimate --volume /home
 
 # Estimate for a specific target (0-based index)
 btrfs-backup-ng estimate --volume /home --target 1
+
+# With space check
+btrfs-backup-ng estimate --volume /home --check-space
 ```
 
 ### JSON Output for Scripting
 
 ```bash
-# Get machine-readable output
-btrfs-backup-ng estimate --volume /home --json
-
-# Example: Check if backup will fit
-SIZE=$(btrfs-backup-ng estimate --volume /home --json | jq '.total_transfer_bytes')
-AVAILABLE=$(df --output=avail -B1 /mnt/backup | tail -1)
-if [ "$SIZE" -gt "$AVAILABLE" ]; then
-    echo "Warning: Not enough space for backup"
-fi
+# Get machine-readable output with space check
+btrfs-backup-ng estimate --volume /home --check-space --json
 ```
+
+The JSON output includes a `space_check` object with:
+- `available_bytes`, `total_bytes` - Filesystem space
+- `quota_enabled`, `quota_limit_bytes`, `quota_used_bytes` - Quota information
+- `effective_available_bytes` - The actual available space (min of fs and quota)
+- `required_with_margin_bytes` - Required space including safety margin
+- `sufficient` - Boolean indicating if transfer will fit
 
 ### Example Output
 
@@ -1656,6 +1701,8 @@ Estimation time: 1.23s
 | `--prefix PREFIX` | Snapshot prefix filter |
 | `--ssh-sudo` | Use sudo on remote host |
 | `--ssh-key FILE` | SSH private key file |
+| `--check-space` | Check if destination has sufficient space |
+| `--safety-margin PERCENT` | Safety margin percentage (default: 10%) |
 | `--json` | Output in JSON format |
 
 ### Estimation Methods
@@ -1667,6 +1714,70 @@ The estimate command uses multiple methods to determine sizes:
 3. **du** - Fallback for when btrfs commands aren't available
 
 For incremental transfers, the command uses `btrfs send --no-data` to estimate the delta size without actually transferring data.
+
+## Subvolume Detection
+
+The `config detect` command scans your system for btrfs subvolumes and helps you set up backup configurations:
+
+```bash
+# Scan for subvolumes (requires root for full scan)
+sudo btrfs-backup-ng config detect
+
+# Output in JSON format for scripting
+sudo btrfs-backup-ng config detect --json
+
+# Launch interactive wizard with detected volumes
+sudo btrfs-backup-ng config detect --wizard
+```
+
+### Example Output
+
+```
+============================================================
+  Btrfs Subvolume Detection Results
+============================================================
+
+Found 19 btrfs filesystem(s)
+Found 262 subvolume(s)
+
+----------------------------------------
+  Recommended for backup:
+----------------------------------------
+  [1] /home
+      Type: user data
+      Suggested prefix: home
+
+  [2] /home/user/.config/google-chrome
+      Type: user data
+      Suggested prefix: home-user-.config-google-chrome
+
+----------------------------------------
+  Optional (lower priority):
+----------------------------------------
+  - /opt (system data)
+  - /var/log (variable)
+  - /var/cache (variable)
+
+----------------------------------------
+  Excluded (snapshots/system):
+----------------------------------------
+  - 185 snapshot subvolumes
+  - /var/lib/machines (system internal)
+
+----------------------------------------
+  Next steps:
+----------------------------------------
+  To create a configuration based on these results:
+    btrfs-backup-ng config detect --wizard
+
+  Or create a configuration manually:
+    btrfs-backup-ng config init --interactive
+```
+
+The detection categorizes subvolumes as:
+- **Recommended**: User data directories like `/home` that should be backed up
+- **Optional**: System data that may or may not need backup
+- **Excluded**: Existing snapshots and system-internal subvolumes
 
 ## Legacy CLI Mode
 
@@ -1855,6 +1966,61 @@ sudo systemctl enable --now btrfs-backup-ng.timer
 # 5. Verify
 systemctl list-timers btrfs-backup-ng.timer
 sudo btrfs-backup-ng status
+```
+
+## Filesystem Checks
+
+btrfs-backup-ng performs filesystem verification checks to ensure sources are valid btrfs subvolumes and destinations are on btrfs filesystems. The `--fs-checks` option controls this behavior:
+
+| Mode | Behavior | Use Case |
+|------|----------|----------|
+| `auto` (default) | Warns about issues but continues | Normal operation - user-friendly |
+| `strict` | Errors out on any check failure | Production systems requiring validation |
+| `skip` | Bypasses all filesystem checks | Backup directories, special setups |
+
+### Usage
+
+```bash
+# Default auto mode - warns but continues
+btrfs-backup-ng estimate /mnt/snapshots /mnt/backup
+
+# Strict mode - fail on any check issue
+btrfs-backup-ng run --fs-checks=strict
+
+# Skip checks entirely (useful for listing backup directories)
+btrfs-backup-ng restore --list /mnt/backup/home --fs-checks=skip
+
+# Backwards-compatible aliases
+btrfs-backup-ng verify /mnt/backup --no-fs-checks    # Same as --fs-checks=skip
+```
+
+### When to Use Each Mode
+
+**Auto mode (default):**
+- Normal backup operations
+- When you want warnings but not hard failures
+- First-time setup to identify potential issues
+
+**Strict mode:**
+- Automated/unattended backups where failures should stop execution
+- Production environments with strict data integrity requirements
+- When you need to ensure all paths are valid btrfs subvolumes
+
+**Skip mode:**
+- Listing or restoring from backup directories (which are regular directories, not subvolumes)
+- Working with non-standard btrfs setups
+- When you've verified the setup manually
+
+### Example Messages
+
+In **auto mode**, you'll see warnings like:
+```
+WARNING: /mnt/backup/home does not seem to be a btrfs subvolume - continuing anyway (auto mode)
+```
+
+In **strict mode**, the same issue causes an error:
+```
+ERROR: /mnt/backup/home does not seem to be a btrfs subvolume. Use --no-fs-checks to override.
 ```
 
 ## Troubleshooting

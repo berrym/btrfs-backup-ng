@@ -58,8 +58,24 @@ Use sudo for btrfs commands on remote host.
 .BI \-\-ssh-key " " \fIFILE\fR
 SSH private key file for authentication.
 .TP
+.BI \-\-fs-checks " " \fIMODE\fR
+Filesystem verification mode. Valid values:
+.RS
+.TP
+.B auto
+(Default) Warn about issues but continue operation.
+.TP
+.B strict
+Error out on filesystem check failures.
+.TP
+.B skip
+Bypass all filesystem verification checks.
+.RE
+.TP
 .B \-\-no-fs-checks
-Skip btrfs subvolume verification checks.
+Skip btrfs subvolume verification checks. Alias for \fB\-\-fs-checks=skip\fR.
+Useful when verifying backup directories which are regular directories,
+not subvolumes.
 .TP
 .B \-\-json
 Output results in JSON format for scripting and automation.

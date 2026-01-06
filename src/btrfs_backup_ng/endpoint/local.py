@@ -109,25 +109,32 @@ class LocalEndpoint(Endpoint):
                 )
 
         # Validate filesystem and subvolume checks
-        if (
-            self.config["source"] is not None
-            and self.config["fs_checks"]
-            and not __util__.is_subvolume(self.config["source"])  # type: ignore[attr-defined]
-        ):
-            logger.error(
-                "%s does not seem to be a btrfs subvolume", self.config["source"]
-            )
-            raise __util__.AbortError(
-                f"Source {self.config['source']} is not a btrfs subvolume. Use --no-fs-checks to override."
-            )
+        # fs_checks can be: "strict" (error), "auto" (warn and continue), "skip" (no check)
+        fs_checks_mode = self.config["fs_checks"]
 
-        if self.config["fs_checks"] and not __util__.is_btrfs(self.config["path"]):  # type: ignore[attr-defined]
-            logger.error(
-                "%s does not seem to be on a btrfs filesystem", self.config["path"]
-            )
-            raise __util__.AbortError(
-                f"Destination {self.config['path']} is not on a btrfs filesystem. Use --no-fs-checks to override."
-            )
+        if fs_checks_mode != "skip" and self.config["source"] is not None:
+            if not __util__.is_subvolume(self.config["source"]):  # type: ignore[attr-defined]
+                msg = f"{self.config['source']} does not seem to be a btrfs subvolume"
+                if fs_checks_mode == "strict":
+                    logger.error(msg)
+                    raise __util__.AbortError(
+                        f"Source {self.config['source']} is not a btrfs subvolume. "
+                        "Use --no-fs-checks to override."
+                    )
+                else:  # auto mode
+                    logger.warning("%s - continuing anyway (auto mode)", msg)
+
+        if fs_checks_mode != "skip":
+            if not __util__.is_btrfs(self.config["path"]):  # type: ignore[attr-defined]
+                msg = f"{self.config['path']} does not seem to be on a btrfs filesystem"
+                if fs_checks_mode == "strict":
+                    logger.error(msg)
+                    raise __util__.AbortError(
+                        f"Destination {self.config['path']} is not on a btrfs filesystem. "
+                        "Use --no-fs-checks to override."
+                    )
+                else:  # auto mode
+                    logger.warning("%s - continuing anyway (auto mode)", msg)
 
         logger.debug("LocalEndpoint _prepare completed successfully")
 

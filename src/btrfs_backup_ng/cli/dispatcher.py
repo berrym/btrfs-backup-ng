@@ -8,7 +8,7 @@ import argparse
 import sys
 from typing import Callable
 
-from .common import add_progress_args, add_verbosity_args
+from .common import add_fs_checks_args, add_progress_args, add_verbosity_args
 
 # Known subcommands for the new CLI
 SUBCOMMANDS = frozenset(
@@ -137,6 +137,23 @@ def create_subcommand_parser() -> argparse.ArgumentParser:
         metavar="RATE",
         help="Bandwidth limit (e.g., '10M', '1G') (overrides config)",
     )
+    run_parser.add_argument(
+        "--no-check-space",
+        action="store_true",
+        help="Disable pre-flight space availability check",
+    )
+    run_parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Proceed with transfers even if space check fails",
+    )
+    run_parser.add_argument(
+        "--safety-margin",
+        metavar="PERCENT",
+        type=float,
+        default=10.0,
+        help="Safety margin percentage for space check (default: 10%%)",
+    )
     add_progress_args(run_parser)
 
     # snapshot command
@@ -184,6 +201,23 @@ def create_subcommand_parser() -> argparse.ArgumentParser:
         "--rate-limit",
         metavar="RATE",
         help="Bandwidth limit (e.g., '10M', '1G') (overrides config)",
+    )
+    transfer_parser.add_argument(
+        "--no-check-space",
+        action="store_true",
+        help="Disable pre-flight space availability check",
+    )
+    transfer_parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Proceed with transfers even if space check fails",
+    )
+    transfer_parser.add_argument(
+        "--safety-margin",
+        metavar="PERCENT",
+        type=float,
+        default=10.0,
+        help="Safety margin percentage for space check (default: 10%%)",
     )
     add_progress_args(transfer_parser)
 
@@ -459,11 +493,7 @@ Config-driven restore:
         metavar="RATE",
         help="Bandwidth limit (e.g., '10M', '1G')",
     )
-    restore_parser.add_argument(
-        "--no-fs-checks",
-        action="store_true",
-        help="Skip btrfs subvolume verification (for listing backups in regular directories)",
-    )
+    add_fs_checks_args(restore_parser)
 
     # Config-driven restore options
     config_group = restore_parser.add_argument_group(
@@ -593,11 +623,7 @@ Examples:
         metavar="FILE",
         help="SSH private key file",
     )
-    verify_parser.add_argument(
-        "--no-fs-checks",
-        action="store_true",
-        help="Skip btrfs subvolume verification",
-    )
+    add_fs_checks_args(verify_parser)
     verify_parser.add_argument(
         "--json",
         action="store_true",
@@ -686,6 +712,12 @@ Examples:
 
   # Estimate for specific target
   btrfs-backup-ng estimate --volume /home --target 1
+
+  # Check if destination has sufficient space
+  btrfs-backup-ng estimate --volume /home --check-space
+
+  # Check space with custom safety margin (20%)
+  btrfs-backup-ng estimate --volume /home --check-space --safety-margin 20
 """,
     )
     estimate_parser.add_argument(
@@ -732,15 +764,23 @@ Examples:
         metavar="FILE",
         help="SSH private key file",
     )
-    estimate_parser.add_argument(
-        "--no-fs-checks",
-        action="store_true",
-        help="Skip btrfs subvolume verification",
-    )
+    add_fs_checks_args(estimate_parser)
     estimate_parser.add_argument(
         "--json",
         action="store_true",
         help="Output results in JSON format",
+    )
+    estimate_parser.add_argument(
+        "--check-space",
+        action="store_true",
+        help="Check if destination has sufficient space for the transfer",
+    )
+    estimate_parser.add_argument(
+        "--safety-margin",
+        metavar="PERCENT",
+        type=float,
+        default=10.0,
+        help="Safety margin percentage for space check (default: 10%%)",
     )
 
     return parser

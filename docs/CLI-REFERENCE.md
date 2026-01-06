@@ -266,6 +266,37 @@ btrfs-backup-ng config import /etc/btrbk/btrbk.conf
 btrfs-backup-ng config import /etc/btrbk/btrbk.conf -o config.toml
 ```
 
+#### config detect
+
+Scan the system for btrfs subvolumes and suggest backup configurations.
+
+```bash
+btrfs-backup-ng config detect [OPTIONS]
+```
+
+**Options:**
+| Option | Description |
+|--------|-------------|
+| `--json` | Output in JSON format for scripting |
+| `-w, --wizard` | Launch interactive wizard with detected volumes |
+
+**Examples:**
+```bash
+# Scan for subvolumes (requires root for full access)
+sudo btrfs-backup-ng config detect
+
+# Output in JSON format
+sudo btrfs-backup-ng config detect --json
+
+# Launch wizard with detected volumes
+sudo btrfs-backup-ng config detect --wizard
+```
+
+The detect command categorizes subvolumes as:
+- **Recommended**: User data like `/home` that should be backed up
+- **Optional**: System data (`/opt`, `/var/log`) that may or may not need backup
+- **Excluded**: Existing snapshots and system-internal subvolumes
+
 ---
 
 ### install
@@ -351,6 +382,84 @@ btrfs-backup-ng uninstall
 
 ---
 
+### estimate
+
+Estimate backup transfer sizes and optionally check destination space.
+
+```bash
+btrfs-backup-ng estimate [OPTIONS] SOURCE DESTINATION
+btrfs-backup-ng estimate --volume PATH [--target INDEX] [--check-space]
+```
+
+**Options:**
+| Option | Description |
+|--------|-------------|
+| `--volume PATH` | Estimate for volume defined in config |
+| `--target INDEX` | Target index to estimate for (0-based) |
+| `--prefix PREFIX` | Snapshot prefix filter |
+| `--check-space` | Check if destination has sufficient space |
+| `--safety-margin PERCENT` | Safety margin percentage (default: 10%) |
+| `--ssh-sudo` | Use sudo on remote host |
+| `--ssh-key FILE` | SSH private key file |
+| `--fs-checks MODE` | Filesystem check mode: auto, strict, skip |
+| `--no-fs-checks` | Skip filesystem checks (alias for --fs-checks=skip) |
+| `--json` | Output in JSON format |
+
+**Examples:**
+```bash
+# Basic estimate
+btrfs-backup-ng estimate /mnt/snapshots /mnt/backup
+
+# Estimate for configured volume
+btrfs-backup-ng estimate --volume /home
+
+# Estimate with destination space check
+btrfs-backup-ng estimate --volume /home --check-space
+
+# Space check with custom safety margin
+btrfs-backup-ng estimate /mnt/snapshots /mnt/backup --check-space --safety-margin 20
+
+# JSON output for scripting
+btrfs-backup-ng estimate --volume /home --check-space --json
+```
+
+**Space Check Output:**
+
+When `--check-space` is enabled, the output includes destination space information:
+- Filesystem free space
+- Quota limits (if btrfs quotas are enabled)
+- Effective available space (the more restrictive of fs or quota)
+- Required space with safety margin
+- Status (OK or INSUFFICIENT)
+
+---
+
+## Filesystem Checks
+
+The `--fs-checks` option controls how btrfs-backup-ng validates source and destination paths:
+
+| Mode | Behavior |
+|------|----------|
+| `auto` (default) | Warn about issues but continue operation |
+| `strict` | Error out on any check failure |
+| `skip` | Bypass all filesystem checks |
+
+The `--no-fs-checks` flag is an alias for `--fs-checks=skip`.
+
+**Examples:**
+```bash
+# Default auto mode - warns but continues
+btrfs-backup-ng run
+
+# Strict mode for production
+btrfs-backup-ng run --fs-checks=strict
+
+# Skip checks for backup directories
+btrfs-backup-ng restore --list /mnt/backup --no-fs-checks
+```
+
+---
+
 ## Legacy Mode
 
 When the first argument is a path (not a subcommand), btrfs-backup-ng runs in legacy mode for backwards compatibility.
@@ -368,7 +477,11 @@ btrfs-backup-ng [OPTIONS] SOURCE DESTINATION
 | `--ssh-username USER` | SSH username |
 | `--ssh-identity-file FILE` | SSH private key |
 | `--convert-rw` | Convert to read-write before deletion |
-| `--no-fs-checks` | Skip filesystem checks |
+| `--fs-checks MODE` | Filesystem check mode: auto, strict, skip |
+| `--no-fs-checks` | Skip filesystem checks (alias for --fs-checks=skip) |
+| `--no-check-space` | Disable pre-flight space checking |
+| `--force` | Proceed despite insufficient space warnings |
+| `--safety-margin PERCENT` | Safety margin for space checks (default: 10%) |
 
 **Examples:**
 ```bash

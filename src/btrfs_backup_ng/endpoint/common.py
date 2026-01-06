@@ -14,6 +14,8 @@ from filelock import FileLock
 
 from btrfs_backup_ng import __util__
 from btrfs_backup_ng.__logger__ import logger
+from btrfs_backup_ng.core.space import SpaceInfo
+from btrfs_backup_ng.core.space import get_space_info as _get_space_info
 
 
 def require_source(method):
@@ -48,7 +50,13 @@ class Endpoint:
         self.config["convert_rw"] = config.get("convert_rw", False)
         self.config["subvolume_sync"] = config.get("subvolume_sync", False)
         self.config["btrfs_debug"] = config.get("btrfs_debug", False)
-        self.config["fs_checks"] = config.get("fs_checks", False)
+        # fs_checks can be: "strict", "auto", "skip", True (=strict), False (=skip)
+        fs_checks = config.get("fs_checks", "auto")
+        if fs_checks is True:
+            fs_checks = "strict"
+        elif fs_checks is False:
+            fs_checks = "skip"
+        self.config["fs_checks"] = fs_checks
         self.config["lock_file_name"] = config.get(
             "lock_file_name", ".btrfs-backup-ng.locks"
         )
@@ -276,8 +284,10 @@ class Endpoint:
                 try:
                     time_obj = __util__.str_to_date(date_part)
                 except Exception as e:
-                    logger.warning(
-                        "Could not parse date from: %r (%s)", item_path.name, e
+                    # Debug level - it's normal for directories to contain
+                    # files that don't match the snapshot naming pattern
+                    logger.debug(
+                        "Skipping non-snapshot item: %r (%s)", item_path.name, e
                     )
                     continue
                 snapshot = __util__.Snapshot(
@@ -379,6 +389,29 @@ class Endpoint:
         for snap in to_delete:
             logger.info("Deleting old snapshot: %s", snap)
             self.delete_snapshots([snap])
+
+    def get_space_info(self, path: Optional[str] = None) -> SpaceInfo:
+        """Get space information for the endpoint's destination path.
+
+        Queries filesystem space and btrfs quota information (if available)
+        for the specified path or the endpoint's configured path.
+
+        Args:
+            path: Optional path to check. If None, uses self.config['path'].
+
+        Returns:
+            SpaceInfo with filesystem and quota information.
+
+        Note:
+            Subclasses may override this for remote endpoints (e.g., SSH).
+        """
+        if path is None:
+            path = str(self.config["path"])
+        else:
+            path = str(path)
+
+        use_sudo = self.config.get("ssh_sudo", False) or os.geteuid() != 0
+        return _get_space_info(path, exec_func=None, use_sudo=use_sudo)
 
     # The following methods may be implemented by endpoints unless the
     # default behaviour is wanted.

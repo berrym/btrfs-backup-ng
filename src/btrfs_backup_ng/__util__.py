@@ -14,6 +14,7 @@ from .__logger__ import logger
 __all__ = [
     "AbortError",
     "SnapshotTransferError",
+    "InsufficientSpaceError",
     "Snapshot",
     "exec_subprocess",
     "log_heading",
@@ -40,6 +41,15 @@ class AbortError(Exception):
 
 class SnapshotTransferError(AbortError):
     """Error when transferring a snapshot."""
+
+
+class InsufficientSpaceError(AbortError):
+    """Destination has insufficient space for the transfer.
+
+    Raised when pre-flight space checks determine that the destination
+    does not have enough available space (including safety margin) to
+    complete the backup operation.
+    """
 
 
 @functools.total_ordering

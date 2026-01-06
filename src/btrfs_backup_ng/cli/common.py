@@ -106,3 +106,38 @@ def get_log_level(args: argparse.Namespace) -> str:
         return "DEBUG"
     else:
         return "INFO"
+
+
+def add_fs_checks_args(parser: argparse.ArgumentParser) -> None:
+    """Add filesystem check arguments to a parser.
+
+    Adds --fs-checks with choices (auto, strict, skip) and --no-fs-checks
+    as a convenience alias for --fs-checks=skip.
+    """
+    group = parser.add_argument_group("Filesystem check options")
+    group.add_argument(
+        "--fs-checks",
+        choices=["auto", "strict", "skip"],
+        default="auto",
+        help="Filesystem verification mode: 'auto' (warn and continue), "
+        "'strict' (error on failure), 'skip' (no checks). Default: auto",
+    )
+    group.add_argument(
+        "--no-fs-checks",
+        action="store_const",
+        const="skip",
+        dest="fs_checks",
+        help="Skip btrfs subvolume verification (alias for --fs-checks=skip)",
+    )
+
+
+def get_fs_checks_mode(args: argparse.Namespace) -> str:
+    """Get the filesystem checks mode from parsed arguments.
+
+    Args:
+        args: Parsed command line arguments
+
+    Returns:
+        One of "auto", "strict", or "skip"
+    """
+    return getattr(args, "fs_checks", "auto") or "auto"

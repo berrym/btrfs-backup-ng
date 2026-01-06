@@ -12,6 +12,11 @@ from .. import __util__
 from ..transaction import log_transaction
 from . import progress as progress_utils
 from . import transfer as transfer_utils
+from .space import (
+    DEFAULT_SAFETY_MARGIN_PERCENT,
+    check_space_availability,
+    format_space_check,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +44,12 @@ def send_snapshot(
 
     # Verify destination path is accessible
     _ensure_destination_exists(destination_endpoint)
+
+    # Pre-flight space check (enabled by default, can be disabled with options)
+    check_space = options.get("check_space", True)
+    force = options.get("force", False)
+    if check_space and not force:
+        _verify_destination_space(snapshot, destination_endpoint, parent, options)
 
     log_msg = (
         f"  Using parent: {parent}"
@@ -204,6 +215,67 @@ def send_snapshot(
 
     finally:
         _cleanup_processes(send_process, receive_process)
+
+
+def _verify_destination_space(snapshot, destination_endpoint, parent, options) -> None:
+    """Verify destination has sufficient space for the transfer.
+
+    Args:
+        snapshot: Source snapshot to send
+        destination_endpoint: Destination endpoint
+        parent: Parent snapshot for incremental (or None for full)
+        options: Options dict with safety_margin, etc.
+
+    Raises:
+        InsufficientSpaceError: If space is insufficient and force is not set
+    """
+    safety_margin = options.get("safety_margin", DEFAULT_SAFETY_MARGIN_PERCENT)
+
+    try:
+        # Get space info from destination
+        space_info = destination_endpoint.get_space_info()
+
+        # Estimate transfer size
+        snapshot_path = str(snapshot.get_path())
+        parent_path = str(parent.get_path()) if parent else None
+        estimated_size = progress_utils.estimate_snapshot_size(
+            snapshot_path, parent_path
+        )
+
+        if estimated_size is None:
+            # Can't estimate size, log warning and proceed
+            logger.warning(
+                "Could not estimate transfer size for space check, proceeding anyway"
+            )
+            return
+
+        # Check space availability
+        space_check = check_space_availability(
+            space_info, estimated_size, safety_margin_percent=safety_margin
+        )
+
+        if not space_check.sufficient:
+            logger.error("Destination space check failed:")
+            logger.error(format_space_check(space_check))
+            raise __util__.InsufficientSpaceError(
+                space_check.warning_message
+                or f"Insufficient space at destination: need {estimated_size} bytes"
+            )
+        else:
+            logger.debug(
+                "Space check passed: %d bytes available, %d bytes needed",
+                space_check.effective_limit,
+                space_check.required_with_margin,
+            )
+            if space_check.warning_message:
+                logger.warning(space_check.warning_message)
+
+    except __util__.InsufficientSpaceError:
+        raise
+    except Exception as e:
+        # Log warning but don't block the transfer
+        logger.warning("Could not verify destination space: %s", e)
+        logger.debug("Proceeding with transfer despite space check failure")
 
 
 def _ensure_destination_exists(destination_endpoint) -> None:

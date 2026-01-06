@@ -99,7 +99,7 @@ def execute_transfer(args: argparse.Namespace) -> int:
                 "convert_rw": False,
                 "subvolume_sync": False,
                 "btrfs_debug": False,
-                "fs_checks": True,
+                "fs_checks": "auto",
             }
 
             # Prepare source endpoint

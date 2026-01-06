@@ -2,10 +2,11 @@
 
 import time
 from pathlib import Path
-from typing import Optional, List, Any
+from typing import Any, List, Optional
 
 class AbortError(Exception): ...
 class SnapshotTransferError(AbortError): ...
+class InsufficientSpaceError(AbortError): ...
 
 class Snapshot:
     location: Path

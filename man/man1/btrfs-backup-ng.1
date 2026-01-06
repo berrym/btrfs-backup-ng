@@ -9,7 +9,8 @@ btrfs-backup-ng \- automated btrfs backup management with incremental transfers
 .B btrfs-backup-ng
 is a modern, feature-rich tool for automated BTRFS snapshot backup management.
 It supports TOML configuration files, time-based retention policies, parallel
-execution, stream compression, and robust SSH transfer support.
+execution, stream compression, space-aware operations with quota support,
+automatic subvolume detection, and robust SSH transfer support.
 .PP
 The tool can operate in two modes:
 .TP
@@ -67,7 +68,7 @@ Show job status, last run times, and statistics.
 See \fBbtrfs-backup-ng-status\fR(1).
 .TP
 .B config
-Configuration management (validate, init, import).
+Configuration management (validate, init, import, detect).
 See \fBbtrfs-backup-ng-config\fR(1).
 .TP
 .B install
@@ -204,6 +205,12 @@ Restore from backup:
 .TP
 Estimate backup sizes:
 .B btrfs-backup-ng estimate --volume /home
+.TP
+Estimate with space check:
+.B btrfs-backup-ng estimate --volume /home --check-space
+.TP
+Detect btrfs subvolumes:
+.B sudo btrfs-backup-ng config detect
 .SH FILES
 .TP
 .I ~/.config/btrfs-backup-ng/config.toml

@@ -101,7 +101,7 @@ def execute_prune(args: argparse.Namespace) -> int:
             "convert_rw": False,
             "subvolume_sync": False,
             "btrfs_debug": False,
-            "fs_checks": True,
+            "fs_checks": "auto",
         }
 
         prefix = volume.snapshot_prefix or f"{os.uname()[1]}-"

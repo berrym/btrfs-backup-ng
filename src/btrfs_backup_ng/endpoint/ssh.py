@@ -59,6 +59,7 @@ except ImportError:
 
 from btrfs_backup_ng import __util__  # noqa: E402
 from btrfs_backup_ng.__logger__ import logger  # noqa: E402
+from btrfs_backup_ng.core.space import SpaceInfo  # noqa: E402
 from btrfs_backup_ng.sshutil.master import SSHMasterManager  # noqa: E402
 
 from .common import Endpoint  # noqa: E402
@@ -877,6 +878,157 @@ class SSHEndpoint(Endpoint):
         username: str = self.config.get("username", "")
         username_part: str = f"{username}@" if username else ""
         return f"ssh://{username_part}{self.hostname}:{self.config['path']}"
+
+    def get_space_info(self, path: Optional[str] = None) -> SpaceInfo:
+        """Get space information for the remote endpoint's destination path.
+
+        Queries filesystem space and btrfs quota information on the remote host
+        via SSH, using a single compound command to minimize round trips.
+
+        Args:
+            path: Optional path to check. If None, uses self.config['path'].
+
+        Returns:
+            SpaceInfo with filesystem and quota information.
+        """
+        import json as _json
+
+        if path is None:
+            path = str(self.config["path"])
+        else:
+            path = str(path)
+
+        logger.debug("Getting space info for remote path: %s", path)
+
+        # Use a compound Python command to get both statvfs and quota info
+        # This minimizes SSH round trips
+        python_script = f"""
+import os, json, subprocess
+path = {path!r}
+result = {{"path": path, "error": None}}
+try:
+    s = os.statvfs(path)
+    result["total"] = s.f_blocks * s.f_frsize
+    result["used"] = (s.f_blocks - s.f_bfree) * s.f_frsize
+    result["available"] = s.f_bavail * s.f_frsize
+    result["source"] = "statvfs"
+except Exception as e:
+    result["error"] = str(e)
+    result["total"] = 0
+    result["used"] = 0
+    result["available"] = 0
+    result["source"] = "error"
+
+# Try to get quota info
+result["quota_enabled"] = False
+result["quota_limit"] = None
+result["quota_used"] = None
+try:
+    qgroup_cmd = ["btrfs", "qgroup", "show", "-reF", path]
+    proc = subprocess.run(qgroup_cmd, capture_output=True, text=True, timeout=30)
+    if proc.returncode == 0:
+        lines = proc.stdout.strip().splitlines()
+        for line in lines:
+            line = line.strip()
+            if not line or line.startswith("qgroupid") or line.startswith("-"):
+                continue
+            parts = line.split()
+            if len(parts) >= 5:
+                try:
+                    rfer = int(parts[1])
+                    max_rfer = parts[3]
+                    result["quota_enabled"] = True
+                    result["quota_used"] = rfer
+                    if max_rfer.lower() != "none":
+                        result["quota_limit"] = int(max_rfer)
+                    result["source"] = "statvfs+btrfs_qgroup"
+                    break
+                except (ValueError, IndexError):
+                    pass
+except Exception:
+    pass
+
+print(json.dumps(result))
+"""
+
+        try:
+            # Execute the compound command on remote host
+            result = self._exec_remote_command(
+                ["python3", "-c", python_script],
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+
+            if result.returncode == 0 and result.stdout:
+                output = result.stdout.decode("utf-8").strip()
+                data = _json.loads(output)
+
+                if data.get("error"):
+                    logger.warning("Remote space check error: %s", data["error"])
+
+                return SpaceInfo(
+                    path=data["path"],
+                    total_bytes=data["total"],
+                    used_bytes=data["used"],
+                    available_bytes=data["available"],
+                    quota_enabled=data.get("quota_enabled", False),
+                    quota_limit=data.get("quota_limit"),
+                    quota_used=data.get("quota_used"),
+                    source=data.get("source", "remote"),
+                )
+            else:
+                # Fallback to basic df command if Python approach fails
+                logger.debug("Python space check failed, falling back to df command")
+                return self._get_space_info_fallback(path)
+
+        except Exception as e:
+            logger.warning("Remote space check failed: %s", e)
+            return self._get_space_info_fallback(path)
+
+    def _get_space_info_fallback(self, path: str) -> SpaceInfo:
+        """Fallback space info using basic df command.
+
+        Used when the Python-based approach fails (e.g., Python not available
+        on remote host).
+        """
+        try:
+            # Use df with POSIX output format
+            result = self._exec_remote_command(
+                ["df", "-P", "-B1", path],
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+
+            if result.returncode == 0 and result.stdout:
+                lines = result.stdout.decode("utf-8").strip().splitlines()
+                if len(lines) >= 2:
+                    # Parse: Filesystem 1-blocks Used Available Capacity Mounted
+                    parts = lines[1].split()
+                    if len(parts) >= 4:
+                        total = int(parts[1])
+                        used = int(parts[2])
+                        available = int(parts[3])
+                        return SpaceInfo(
+                            path=path,
+                            total_bytes=total,
+                            used_bytes=used,
+                            available_bytes=available,
+                            source="df",
+                        )
+        except Exception as e:
+            logger.warning("Fallback df space check failed: %s", e)
+
+        # Return empty SpaceInfo if all methods fail
+        logger.error("Could not determine space info for remote path: %s", path)
+        return SpaceInfo(
+            path=path,
+            total_bytes=0,
+            used_bytes=0,
+            available_bytes=0,
+            source="error",
+        )
 
     def _build_remote_command(self, command: List[str]) -> List[str]:
         """Prepare a remote command with optional sudo."""
@@ -1749,8 +1901,10 @@ class SSHEndpoint(Endpoint):
                         )
                         snapshots.append(snapshot)
                     except Exception as e:
-                        logger.warning(
-                            "Could not parse date from: %r (%s)", snap_name, e
+                        # Debug level - it's normal for directories to contain
+                        # files that don't match the snapshot naming pattern
+                        logger.debug(
+                            "Skipping non-snapshot item: %r (%s)", snap_name, e
                         )
                         continue
 

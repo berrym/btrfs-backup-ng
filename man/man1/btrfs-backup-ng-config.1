@@ -11,9 +11,13 @@ btrfs-backup-ng-config \- configuration management commands
 .br
 .B btrfs-backup-ng config import
 [\fB\-o\fR \fIFILE\fR] \fIBTRBK_CONF\fR
+.br
+.B btrfs-backup-ng config detect
+[\fB\-\-json\fR]
+[\fB\-w\fR|\fB\-\-wizard\fR]
 .SH DESCRIPTION
 Manage btrfs-backup-ng configuration files. These commands help create,
-validate, and migrate configurations.
+validate, detect subvolumes, and migrate configurations.
 .SH SUBCOMMANDS
 .SS validate
 Validate the current configuration file. Checks for syntax errors, missing
@@ -104,6 +108,58 @@ Example:
 .nf
 btrfs-backup-ng config import /etc/btrbk/btrbk.conf
 btrfs-backup-ng config import /etc/btrbk/btrbk.conf -o config.toml
+.fi
+.RE
+.SS detect
+Scan the system for btrfs subvolumes and suggest backup configurations.
+This command helps discover what subvolumes exist on your system and
+categorizes them for backup purposes.
+.PP
+.RS
+.B btrfs-backup-ng config detect
+[\fB\-\-json\fR]
+[\fB\-w\fR|\fB\-\-wizard\fR]
+.RE
+.TP
+.B \-\-json
+Output results in JSON format for scripting and automation.
+.TP
+.BR \-w ", " \-\-wizard
+Launch the interactive configuration wizard with detected volumes
+pre-populated. Requires a terminal (TTY).
+.PP
+The detect command:
+.IP \(bu 2
+Scans all mounted btrfs filesystems
+.IP \(bu 2
+Lists all subvolumes found
+.IP \(bu 2
+Categorizes subvolumes as recommended, optional, or excluded
+.IP \(bu 2
+Suggests snapshot prefixes based on mount paths
+.IP \(bu 2
+Identifies existing snapshots and system-internal subvolumes
+.PP
+Subvolume categories:
+.IP \(bu 2
+\fBRecommended\fR: User data directories like /home that should be backed up
+.IP \(bu 2
+\fBOptional\fR: System data (/opt, /var/log) that may or may not need backup
+.IP \(bu 2
+\fBExcluded\fR: Existing snapshots and system-internal subvolumes
+.PP
+Example:
+.PP
+.RS
+.nf
+# Scan for subvolumes (requires root for full access)
+sudo btrfs-backup-ng config detect
+
+# Output in JSON format
+sudo btrfs-backup-ng config detect --json
+
+# Launch wizard with detected volumes
+sudo btrfs-backup-ng config detect --wizard
 .fi
 .RE
 .SH CONFIGURATION FORMAT

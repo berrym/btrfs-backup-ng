@@ -124,6 +124,18 @@ enabled = false    # Skip this volume during backups
 path = "/mnt/backup/data"
 
 
+# -----------------------------------------------------------------------------
+# Example 5: External drive backup with mount verification
+# -----------------------------------------------------------------------------
+[[volumes]]
+path = "/home"
+snapshot_prefix = "home-"
+
+[[volumes.targets]]
+path = "/mnt/usb-backup/home"
+require_mount = true    # Fail if drive is not mounted (safety check)
+
+
 # =============================================================================
 # SSH Target Options Reference
 # =============================================================================
@@ -137,3 +149,62 @@ path = "/mnt/backup/data"
 # ssh_password_auth = true           # Allow password authentication fallback
 # compress = "none"                  # Compression: none|gzip|zstd|lz4|pigz|lzop
 # rate_limit = "10M"                 # Bandwidth limit: number with K|M|G suffix
+# require_mount = false              # Require path to be a mount point (local only)
+
+
+# =============================================================================
+# Filesystem Check Options
+# =============================================================================
+# Controls how btrfs-backup-ng validates source and destination paths.
+# These can be set via command line: --fs-checks=auto|strict|skip
+#
+# Modes:
+#   auto   - (Default) Warn about issues but continue operation
+#   strict - Error out on any filesystem check failure
+#   skip   - Bypass all filesystem verification checks
+#
+# The default "auto" mode is user-friendly: it warns about potential issues
+# (like a source not being a btrfs subvolume) but continues anyway.
+#
+# Use "strict" for production/automated backups where you want failures
+# to stop execution.
+#
+# Use "skip" when working with backup directories (which are regular
+# directories, not subvolumes) or non-standard setups.
+
+
+# =============================================================================
+# Space Checking (Estimate Command)
+# =============================================================================
+# Before running large backups, you can check if there's enough space:
+#
+#   btrfs-backup-ng estimate --volume /home --check-space
+#
+# This checks both filesystem free space AND btrfs quota limits (if enabled),
+# using the more restrictive value. A safety margin (default 10%) is applied.
+#
+# Options:
+#   --check-space              Enable destination space verification
+#   --safety-margin PERCENT    Safety margin percentage (default: 10%)
+#
+# Example with custom safety margin:
+#   btrfs-backup-ng estimate --volume /home --check-space --safety-margin 20
+
+
+# =============================================================================
+# Subvolume Detection
+# =============================================================================
+# To discover btrfs subvolumes on your system:
+#
+#   sudo btrfs-backup-ng config detect
+#
+# This scans all btrfs filesystems and categorizes subvolumes as:
+#   - Recommended: User data like /home that should be backed up
+#   - Optional: System data that may or may not need backup
+#   - Excluded: Existing snapshots and system internals
+#
+# To launch an interactive wizard with detected volumes:
+#   sudo btrfs-backup-ng config detect --wizard
+#
+# For scripting, use JSON output:
+#   sudo btrfs-backup-ng config detect --json

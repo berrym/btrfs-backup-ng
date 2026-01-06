@@ -184,6 +184,25 @@ files is allowed as well."""
         help="Use advanced real-time monitoring system for SSH transfers.",
     )
 
+    group = parser.add_argument_group("Space checking options")
+    group.add_argument(
+        "--no-check-space",
+        action="store_true",
+        help="Disable pre-flight space availability check before transfers.",
+    )
+    group.add_argument(
+        "--force",
+        action="store_true",
+        help="Proceed with transfers even if space check fails.",
+    )
+    group.add_argument(
+        "--safety-margin",
+        type=float,
+        default=10.0,
+        metavar="PERCENT",
+        help="Safety margin percentage for space check (default: 10%%).",
+    )
+
     group = parser.add_argument_group("Miscellaneous options")
     group.add_argument(
         "-s",
@@ -203,9 +222,18 @@ files is allowed as well."""
         help="Remove locks for all given destinations from all snapshots.",
     )
     group.add_argument(
+        "--fs-checks",
+        choices=["auto", "strict", "skip"],
+        default="auto",
+        help="Filesystem verification mode: 'auto' (warn and continue), "
+        "'strict' (error on failure), 'skip' (no checks). Default: auto",
+    )
+    group.add_argument(
         "--skip-fs-checks",
-        action="store_true",
-        help="Don't check whether source / destination is a btrfs subvolume / filesystem.",
+        action="store_const",
+        const="skip",
+        dest="fs_checks",
+        help="Alias for --fs-checks=skip (deprecated, use --fs-checks instead).",
     )
 
     group = parser.add_argument_group("Source and destination")
@@ -237,6 +265,11 @@ files is allowed as well."""
     # Ensure retention options are integers
     options["num_snapshots"] = int(options.get("num_snapshots", 20))
     options["num_backups"] = int(options.get("num_backups", 0))
+
+    # Handle space checking options
+    # Convert --no-check-space to check_space (inverted)
+    options["check_space"] = not options.get("no_check_space", False)
+    # force and safety_margin are passed through as-is
 
     # Handle progress monitoring mode
     if options.get("advanced_progress", False):
@@ -456,7 +489,7 @@ def build_endpoint_kwargs(options):
         "convert_rw": options["convert_rw"],
         "subvolume_sync": options["sync"],
         "btrfs_debug": options["btrfs_debug"],
-        "fs_checks": not options["skip_fs_checks"],
+        "fs_checks": options.get("fs_checks", "auto"),
         "ssh_opts": options["ssh_opt"],
         "ssh_sudo": options["ssh_sudo"],
         "simple_progress": options.get("simple_progress", True),

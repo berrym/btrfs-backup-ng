@@ -2378,7 +2378,7 @@ class TestPrepareBackupEndpoint:
         mock_choose.return_value = mock_ep
 
         args = MagicMock()
-        args.no_fs_checks = False
+        args.fs_checks = "auto"
         args.prefix = "home-"
 
         _prepare_backup_endpoint(args, str(tmp_path))
@@ -2388,7 +2388,7 @@ class TestPrepareBackupEndpoint:
         # Check endpoint kwargs
         call_kwargs = mock_choose.call_args[0][1]
         assert call_kwargs["snap_prefix"] == "home-"
-        assert call_kwargs["fs_checks"] is True
+        assert call_kwargs["fs_checks"] == "auto"
 
     @patch("btrfs_backup_ng.cli.restore.endpoint.choose_endpoint")
     def test_ssh_endpoint(self, mock_choose):
@@ -2943,7 +2943,7 @@ class TestExecuteStatusDetailed:
 
         mock_prepare.side_effect = Exception("Connection failed")
 
-        args = argparse.Namespace(source="/mnt/backup", no_fs_checks=False, prefix="")
+        args = argparse.Namespace(source="/mnt/backup", fs_checks="auto", prefix="")
         result = _execute_status(args)
 
         assert result == 1
@@ -2964,7 +2964,7 @@ class TestExecuteStatusDetailed:
         mock_prepare.return_value = mock_ep
         mock_list.return_value = [MockSnapshot("snap-1"), MockSnapshot("snap-2")]
 
-        args = argparse.Namespace(source=str(tmp_path), no_fs_checks=True, prefix="")
+        args = argparse.Namespace(source=str(tmp_path), fs_checks="skip", prefix="")
         result = _execute_status(args)
 
         assert result == 0
@@ -2985,7 +2985,7 @@ class TestExecuteStatusDetailed:
 
         # Don't create lock file - reading will fail gracefully
 
-        args = argparse.Namespace(source=str(tmp_path), no_fs_checks=True, prefix="")
+        args = argparse.Namespace(source=str(tmp_path), fs_checks="skip", prefix="")
         result = _execute_status(args)
 
         assert result == 0
@@ -3003,7 +3003,7 @@ class TestExecuteUnlockDetailed:
 
         mock_prepare.side_effect = Exception("Connection failed")
 
-        args = argparse.Namespace(source="/mnt/backup", no_fs_checks=False, prefix="")
+        args = argparse.Namespace(source="/mnt/backup", fs_checks="auto", prefix="")
         result = _execute_unlock(args, "all")
 
         assert result == 1
@@ -3021,7 +3021,7 @@ class TestExecuteUnlockDetailed:
         mock_ep.config = {"path": tmp_path, "lock_file_name": ".btrfs-backup-ng.locks"}
         mock_prepare.return_value = mock_ep
 
-        args = argparse.Namespace(source=str(tmp_path), no_fs_checks=True, prefix="")
+        args = argparse.Namespace(source=str(tmp_path), fs_checks="skip", prefix="")
         result = _execute_unlock(args, "all")
 
         assert result == 1
@@ -3038,7 +3038,7 @@ class TestExecuteUnlockDetailed:
         mock_ep.config = {"path": tmp_path, "lock_file_name": ".btrfs-backup-ng.locks"}
         mock_prepare.return_value = mock_ep
 
-        args = argparse.Namespace(source=str(tmp_path), no_fs_checks=True, prefix="")
+        args = argparse.Namespace(source=str(tmp_path), fs_checks="skip", prefix="")
         result = _execute_unlock(args, "all")
 
         assert result == 0
@@ -3060,7 +3060,7 @@ class TestExecuteUnlockDetailed:
         mock_ep.config = {"path": tmp_path, "lock_file_name": ".btrfs-backup-ng.locks"}
         mock_prepare.return_value = mock_ep
 
-        args = argparse.Namespace(source=str(tmp_path), no_fs_checks=True, prefix="")
+        args = argparse.Namespace(source=str(tmp_path), fs_checks="skip", prefix="")
         result = _execute_unlock(args, "session123")
 
         assert result == 0
@@ -3085,7 +3085,7 @@ class TestExecuteUnlockDetailed:
         mock_ep.config = {"path": tmp_path, "lock_file_name": ".btrfs-backup-ng.locks"}
         mock_prepare.return_value = mock_ep
 
-        args = argparse.Namespace(source=str(tmp_path), no_fs_checks=True, prefix="")
+        args = argparse.Namespace(source=str(tmp_path), fs_checks="skip", prefix="")
         result = _execute_unlock(args, "all")
 
         assert result == 0
@@ -3340,7 +3340,7 @@ class TestExecuteMainRestoreExtended:
             destination=str(tmp_path),
             in_place=False,
             yes_i_know_what_i_am_doing=False,
-            no_fs_checks=False,
+            fs_checks="auto",
             prefix="",
             ssh_sudo=False,
             ssh_password_auth=True,
@@ -3367,7 +3367,7 @@ class TestExecuteMainRestoreExtended:
             destination=str(tmp_path),
             in_place=False,
             yes_i_know_what_i_am_doing=False,
-            no_fs_checks=False,
+            fs_checks="auto",
             prefix="",
             ssh_sudo=False,
             ssh_password_auth=True,
@@ -3394,7 +3394,7 @@ class TestExecuteMainRestoreExtended:
             destination=str(tmp_path),
             in_place=False,
             yes_i_know_what_i_am_doing=False,
-            no_fs_checks=False,
+            fs_checks="auto",
             prefix="",
             ssh_sudo=False,
             ssh_password_auth=True,

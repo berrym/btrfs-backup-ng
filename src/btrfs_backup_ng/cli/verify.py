@@ -14,6 +14,7 @@ from ..core.verify import (
     verify_metadata,
     verify_stream,
 )
+from .common import get_fs_checks_mode
 
 logger = logging.getLogger(__name__)
 console = Console()
@@ -32,13 +33,12 @@ def execute(args: argparse.Namespace) -> int:
     level = VerifyLevel(args.level)
 
     # Build endpoint kwargs
-    no_fs_checks = getattr(args, "no_fs_checks", False)
     endpoint_kwargs = {
         "snap_prefix": args.prefix or "",
         "convert_rw": False,
         "subvolume_sync": False,
         "btrfs_debug": False,
-        "fs_checks": not no_fs_checks,
+        "fs_checks": get_fs_checks_mode(args),
     }
 
     # SSH options

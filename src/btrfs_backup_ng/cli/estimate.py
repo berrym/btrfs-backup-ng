@@ -4,6 +4,7 @@ Provides pre-transfer size estimates to help with:
 - Bandwidth planning
 - Time estimation
 - Verification of expected transfers
+- Space availability checking (with --check-space)
 """
 
 import argparse
@@ -21,7 +22,12 @@ from ..core.estimate import (
     format_size,
     print_estimate,
 )
-from .common import get_log_level
+from ..core.space import (
+    DEFAULT_SAFETY_MARGIN_PERCENT,
+    check_space_availability,
+    format_space_check,
+)
+from .common import get_fs_checks_mode, get_log_level
 
 logger = logging.getLogger(__name__)
 
@@ -122,7 +128,7 @@ def _estimate_from_config(args: argparse.Namespace, volume_path: str) -> int:
             {
                 "path": snapshot_dir,
                 "snap_prefix": volume.snapshot_prefix,
-                "fs_checks": True,
+                "fs_checks": "auto",
             },
             source=True,
         )
@@ -133,9 +139,9 @@ def _estimate_from_config(args: argparse.Namespace, volume_path: str) -> int:
 
     # Prepare destination endpoint
     try:
-        dest_kwargs = {
+        dest_kwargs: dict[str, Any] = {
             "snap_prefix": volume.snapshot_prefix,
-            "fs_checks": True,
+            "fs_checks": "auto",
         }
         if target.ssh_sudo:
             dest_kwargs["ssh_sudo"] = True
@@ -161,9 +167,10 @@ def _estimate_from_config(args: argparse.Namespace, volume_path: str) -> int:
 
     # Output results
     if json_output:
-        _print_json(estimate, str(snapshot_dir), target.path)
+        _print_json(estimate, str(snapshot_dir), target.path, dest_ep, args)
     else:
         print_estimate(estimate, str(snapshot_dir), target.path)
+        _print_space_check(args, dest_ep, estimate)
 
     return 0
 
@@ -185,10 +192,12 @@ def _estimate_direct(args: argparse.Namespace, source: str, destination: str) ->
     ssh_key = getattr(args, "ssh_key", None)
 
     # Prepare source endpoint
+    fs_checks_mode = get_fs_checks_mode(args)
+
     try:
         source_kwargs = {
             "snap_prefix": prefix,
-            "fs_checks": not getattr(args, "no_fs_checks", False),
+            "fs_checks": fs_checks_mode,
         }
         if not source.startswith("ssh://"):
             source_kwargs["path"] = Path(source).resolve()
@@ -207,7 +216,7 @@ def _estimate_direct(args: argparse.Namespace, source: str, destination: str) ->
     try:
         dest_kwargs = {
             "snap_prefix": prefix,
-            "fs_checks": not getattr(args, "no_fs_checks", False),
+            "fs_checks": fs_checks_mode,
         }
         if ssh_sudo:
             dest_kwargs["ssh_sudo"] = True
@@ -235,20 +244,64 @@ def _estimate_direct(args: argparse.Namespace, source: str, destination: str) ->
 
     # Output results
     if json_output:
-        _print_json(estimate, source, destination)
+        _print_json(estimate, source, destination, dest_ep, args)
     else:
         print_estimate(estimate, source, destination)
+        _print_space_check(args, dest_ep, estimate)
 
     return 0
 
 
-def _print_json(estimate: TransferEstimate, source: str, destination: str) -> None:
+def _print_space_check(
+    args: argparse.Namespace,
+    dest_ep: Any,
+    estimate: TransferEstimate,
+) -> None:
+    """Print space availability check if requested.
+
+    Args:
+        args: Command arguments (check for --check-space flag)
+        dest_ep: Destination endpoint
+        estimate: Transfer estimate with size information
+    """
+    if not getattr(args, "check_space", False):
+        return
+
+    if estimate.total_incremental_size == 0:
+        print("\nNo data to transfer - skipping space check.")
+        return
+
+    safety_margin = getattr(args, "safety_margin", DEFAULT_SAFETY_MARGIN_PERCENT)
+
+    try:
+        space_info = dest_ep.get_space_info()
+        space_check = check_space_availability(
+            space_info,
+            estimate.total_incremental_size,
+            safety_margin_percent=safety_margin,
+        )
+        print()
+        print(format_space_check(space_check))
+    except Exception as e:
+        logger.warning("Could not check destination space: %s", e)
+        print(f"\nWarning: Could not check destination space: {e}")
+
+
+def _print_json(
+    estimate: TransferEstimate,
+    source: str,
+    destination: str,
+    dest_ep: Any = None,
+    args: argparse.Namespace | None = None,
+) -> None:
     """Print estimate as JSON.
 
     Args:
         estimate: The transfer estimate
         source: Source path for display
         destination: Destination path for display
+        dest_ep: Optional destination endpoint for space checking
+        args: Optional command arguments
     """
     data: dict[str, Any] = {
         "source": source,
@@ -278,5 +331,44 @@ def _print_json(estimate: TransferEstimate, source: str, destination: str) -> No
             snap_data["parent"] = snap.parent_name
 
         data["snapshots"].append(snap_data)
+
+    # Add space check if requested
+    if args and getattr(args, "check_space", False) and dest_ep:
+        safety_margin = getattr(args, "safety_margin", DEFAULT_SAFETY_MARGIN_PERCENT)
+        try:
+            space_info = dest_ep.get_space_info()
+            space_check = check_space_availability(
+                space_info,
+                estimate.total_incremental_size,
+                safety_margin_percent=safety_margin,
+            )
+            data["space_check"] = {
+                "path": space_info.path,
+                "total_bytes": space_info.total_bytes,
+                "total_human": format_size(space_info.total_bytes),
+                "available_bytes": space_info.available_bytes,
+                "available_human": format_size(space_info.available_bytes),
+                "quota_enabled": space_info.quota_enabled,
+                "quota_limit_bytes": space_info.quota_limit,
+                "quota_used_bytes": space_info.quota_used,
+                "effective_available_bytes": space_check.effective_limit,
+                "effective_available_human": format_size(space_check.effective_limit),
+                "required_with_margin_bytes": space_check.required_with_margin,
+                "required_with_margin_human": format_size(
+                    space_check.required_with_margin
+                ),
+                "safety_margin_percent": space_check.safety_margin_percent,
+                "sufficient": space_check.sufficient,
+                "available_after_bytes": space_check.available_after,
+                "available_after_human": format_size(space_check.available_after),
+                "source": space_info.source,
+            }
+            if space_check.warning_message:
+                data["space_check"]["warning"] = space_check.warning_message
+        except Exception as e:
+            data["space_check"] = {
+                "error": str(e),
+                "sufficient": None,
+            }
 
     print(json.dumps(data, indent=2))

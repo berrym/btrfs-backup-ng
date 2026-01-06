@@ -47,7 +47,7 @@ class TestLocalEndpointOperations:
                         config={
                             "source": str(source),
                             "path": str(dest),
-                            "fs_checks": True,
+                            "fs_checks": "auto",
                         }
                     )
                     endpoint.prepare()
@@ -492,7 +492,7 @@ class TestEndpointErrorHandling:
                     config={
                         "source": str(source),
                         "path": str(dest),
-                        "fs_checks": True,
+                        "fs_checks": "strict",  # Use strict mode to test error behavior
                     }
                 )
 
@@ -500,3 +500,63 @@ class TestEndpointErrorHandling:
 
                 with pytest.raises(AbortError, match="not a btrfs subvolume"):
                     endpoint.prepare()
+
+    def test_prepare_auto_mode_warns_but_continues(self, tmp_path, capsys):
+        """Test prepare in auto mode warns but doesn't error on fs check failure."""
+        source = tmp_path / "source"
+        dest = tmp_path / "dest"
+        source.mkdir()
+        dest.mkdir()
+
+        with patch("shutil.which", return_value="/usr/bin/btrfs"):
+            with patch("btrfs_backup_ng.__util__.is_subvolume", return_value=False):
+                with patch("btrfs_backup_ng.__util__.is_btrfs", return_value=True):
+                    endpoint = LocalEndpoint(
+                        config={
+                            "source": str(source),
+                            "path": str(dest),
+                            "fs_checks": "auto",  # Auto mode should warn but continue
+                        }
+                    )
+
+                    # Should NOT raise, just warn
+                    endpoint.prepare()
+
+                    # Check that a warning was logged to stderr
+                    captured = capsys.readouterr()
+                    assert "btrfs subvolume" in captured.err
+                    assert "auto mode" in captured.err
+
+    def test_prepare_skip_mode_no_checks(self, tmp_path, caplog):
+        """Test prepare in skip mode doesn't perform fs checks."""
+        import logging
+
+        source = tmp_path / "source"
+        dest = tmp_path / "dest"
+        source.mkdir()
+        dest.mkdir()
+
+        with patch("shutil.which", return_value="/usr/bin/btrfs"):
+            # is_subvolume returns False but with skip mode it shouldn't matter
+            with patch(
+                "btrfs_backup_ng.__util__.is_subvolume", return_value=False
+            ) as mock_is_subvol:
+                with patch("btrfs_backup_ng.__util__.is_btrfs", return_value=True):
+                    endpoint = LocalEndpoint(
+                        config={
+                            "source": str(source),
+                            "path": str(dest),
+                            "fs_checks": "skip",  # Skip mode should not check
+                        }
+                    )
+
+                    with caplog.at_level(logging.WARNING):
+                        endpoint.prepare()
+
+                    # is_subvolume should not have been called (checks skipped)
+                    mock_is_subvol.assert_not_called()
+
+                    # No warnings about subvolume should be logged
+                    assert not any(
+                        "subvolume" in record.message for record in caplog.records
+                    )
