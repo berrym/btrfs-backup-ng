@@ -854,3 +854,747 @@ class TestCLIIntegration:
         captured = capsys.readouterr()
         assert "Recommended for backup" in captured.out
         assert "/home" in captured.out
+
+
+class TestConfigDiffSummary:
+    """Tests for _show_config_diff_summary function."""
+
+    def test_show_added_volume(self, capsys):
+        """Test showing added volumes in diff summary."""
+        from btrfs_backup_ng.cli.config_cmd import _show_config_diff_summary
+
+        existing = """
+[global]
+snapshot_dir = ".snapshots"
+
+[[volumes]]
+path = "/home"
+snapshot_prefix = "home"
+"""
+        new = """
+[global]
+snapshot_dir = ".snapshots"
+
+[[volumes]]
+path = "/home"
+snapshot_prefix = "home"
+
+[[volumes]]
+path = "/"
+snapshot_prefix = "root"
+"""
+        config_data = {
+            "volumes": [
+                {"path": "/home", "snapshot_prefix": "home", "targets": []},
+                {"path": "/", "snapshot_prefix": "root", "targets": [{"path": "/mnt"}]},
+            ],
+            "retention": {},
+        }
+
+        _show_config_diff_summary(existing, new, config_data)
+
+        captured = capsys.readouterr()
+        assert "+ Add volume: /" in captured.out
+        assert "prefix: root" in captured.out
+
+    def test_show_removed_volume(self, capsys):
+        """Test showing removed volumes in diff summary."""
+        from btrfs_backup_ng.cli.config_cmd import _show_config_diff_summary
+
+        existing = """
+[global]
+snapshot_dir = ".snapshots"
+
+[[volumes]]
+path = "/home"
+snapshot_prefix = "home"
+
+[[volumes]]
+path = "/opt"
+snapshot_prefix = "opt"
+"""
+        new = """
+[global]
+snapshot_dir = ".snapshots"
+
+[[volumes]]
+path = "/home"
+snapshot_prefix = "home"
+"""
+        config_data = {
+            "volumes": [
+                {"path": "/home", "snapshot_prefix": "home", "targets": []},
+            ],
+            "retention": {},
+        }
+
+        _show_config_diff_summary(existing, new, config_data)
+
+        captured = capsys.readouterr()
+        assert "- Remove volume: /opt" in captured.out
+
+    def test_show_modified_volume(self, capsys):
+        """Test showing modified volumes in diff summary."""
+        from btrfs_backup_ng.cli.config_cmd import _show_config_diff_summary
+
+        existing = """
+[global]
+snapshot_dir = ".snapshots"
+
+[[volumes]]
+path = "/home"
+snapshot_prefix = "home"
+
+[[volumes.targets]]
+path = "/mnt/backup"
+"""
+        new = """
+[global]
+snapshot_dir = ".snapshots"
+
+[[volumes]]
+path = "/home"
+snapshot_prefix = "home-new"
+"""
+        config_data = {
+            "volumes": [
+                {
+                    "path": "/home",
+                    "snapshot_prefix": "home-new",
+                    "targets": [{"path": "/mnt/a"}, {"path": "/mnt/b"}],
+                },
+            ],
+            "retention": {},
+        }
+
+        _show_config_diff_summary(existing, new, config_data)
+
+        captured = capsys.readouterr()
+        assert "~ Modify volume: /home" in captured.out
+        assert "prefix: home -> home-new" in captured.out
+
+    def test_show_retention_changes(self, capsys):
+        """Test showing retention changes in diff summary."""
+        from btrfs_backup_ng.cli.config_cmd import _show_config_diff_summary
+
+        existing = """
+[global]
+snapshot_dir = ".snapshots"
+
+[global.retention]
+daily = 7
+weekly = 4
+"""
+        new = """
+[global]
+snapshot_dir = ".snapshots"
+
+[global.retention]
+daily = 14
+weekly = 4
+"""
+        config_data = {
+            "volumes": [],
+            "retention": {"daily": 14, "weekly": 4},
+        }
+
+        _show_config_diff_summary(existing, new, config_data)
+
+        captured = capsys.readouterr()
+        assert "~ Modify retention:" in captured.out
+        assert "daily: 7 -> 14" in captured.out
+
+    def test_show_added_email_notifications(self, capsys):
+        """Test showing added email notifications in diff summary."""
+        from btrfs_backup_ng.cli.config_cmd import _show_config_diff_summary
+
+        existing = """
+[global]
+snapshot_dir = ".snapshots"
+"""
+        new = """
+[global]
+snapshot_dir = ".snapshots"
+
+[global.notifications.email]
+enabled = true
+"""
+        config_data = {
+            "volumes": [],
+            "retention": {},
+            "email": {"enabled": True},
+        }
+
+        _show_config_diff_summary(existing, new, config_data)
+
+        captured = capsys.readouterr()
+        assert "+ Add email notifications" in captured.out
+
+    def test_show_added_webhook_notifications(self, capsys):
+        """Test showing added webhook notifications in diff summary."""
+        from btrfs_backup_ng.cli.config_cmd import _show_config_diff_summary
+
+        existing = """
+[global]
+snapshot_dir = ".snapshots"
+"""
+        new = """
+[global]
+snapshot_dir = ".snapshots"
+
+[global.notifications.webhook]
+enabled = true
+url = "https://example.com/hook"
+"""
+        config_data = {
+            "volumes": [],
+            "retention": {},
+            "webhook": {"enabled": True, "url": "https://example.com/hook"},
+        }
+
+        _show_config_diff_summary(existing, new, config_data)
+
+        captured = capsys.readouterr()
+        assert "+ Add webhook notifications" in captured.out
+
+    def test_invalid_existing_config(self, capsys):
+        """Test handling of invalid existing config in diff summary."""
+        from btrfs_backup_ng.cli.config_cmd import _show_config_diff_summary
+
+        existing = "this is not valid toml {{{"
+        new = "[global]\nsnapshot_dir = '.snapshots'"
+        config_data = {"volumes": [], "retention": {}}
+
+        _show_config_diff_summary(existing, new, config_data)
+
+        captured = capsys.readouterr()
+        assert "Could not parse existing config" in captured.out
+
+
+class TestConfigDiffText:
+    """Tests for _show_config_diff_text function."""
+
+    def test_show_text_diff_additions(self, capsys):
+        """Test showing text diff with additions."""
+        from btrfs_backup_ng.cli.config_cmd import _show_config_diff_text
+
+        existing = """[global]
+snapshot_dir = ".snapshots"
+"""
+        new = """[global]
+snapshot_dir = ".snapshots"
+incremental = true
+"""
+
+        _show_config_diff_text(existing, new)
+
+        captured = capsys.readouterr()
+        assert "+incremental = true" in captured.out
+
+    def test_show_text_diff_removals(self, capsys):
+        """Test showing text diff with removals."""
+        from btrfs_backup_ng.cli.config_cmd import _show_config_diff_text
+
+        existing = """[global]
+snapshot_dir = ".snapshots"
+old_setting = "value"
+"""
+        new = """[global]
+snapshot_dir = ".snapshots"
+"""
+
+        _show_config_diff_text(existing, new)
+
+        captured = capsys.readouterr()
+        assert '-old_setting = "value"' in captured.out
+
+    def test_show_text_diff_no_changes(self, capsys):
+        """Test showing text diff with no changes."""
+        from btrfs_backup_ng.cli.config_cmd import _show_config_diff_text
+
+        content = """[global]
+snapshot_dir = ".snapshots"
+"""
+
+        _show_config_diff_text(content, content)
+
+        captured = capsys.readouterr()
+        assert "No differences detected" in captured.out
+
+    def test_show_text_diff_headers(self, capsys):
+        """Test text diff includes proper headers."""
+        from btrfs_backup_ng.cli.config_cmd import _show_config_diff_text
+
+        existing = "line1\n"
+        new = "line2\n"
+
+        _show_config_diff_text(existing, new)
+
+        captured = capsys.readouterr()
+        assert "existing config" in captured.out
+        assert "new config" in captured.out
+
+
+class TestDetectionWizard:
+    """Tests for _run_detection_wizard function."""
+
+    def _create_mock_result(self):
+        """Create a mock detection result for testing."""
+        home_subvol = DetectedSubvolume(
+            id=256,
+            path="/home",
+            mount_point="/home",
+            classification=SubvolumeClass.USER_DATA,
+        )
+        root_subvol = DetectedSubvolume(
+            id=5,
+            path="/",
+            mount_point="/",
+            classification=SubvolumeClass.SYSTEM_ROOT,
+        )
+        return DetectionResult(
+            filesystems=[
+                BtrfsMountInfo(
+                    device="/dev/sda1",
+                    mount_point="/home",
+                    subvol_path="/home",
+                    subvol_id=256,
+                )
+            ],
+            subvolumes=[home_subvol, root_subvol],
+            suggestions=[
+                BackupSuggestion(
+                    subvolume=home_subvol,
+                    suggested_prefix="home",
+                    priority=1,
+                ),
+                BackupSuggestion(
+                    subvolume=root_subvol,
+                    suggested_prefix="root",
+                    priority=2,
+                ),
+            ],
+        )
+
+    @patch("btrfs_backup_ng.cli.config_cmd.find_config_file")
+    @patch("btrfs_backup_ng.cli.config_cmd._prompt_bool")
+    @patch("btrfs_backup_ng.cli.config_cmd._prompt_choice")
+    @patch("btrfs_backup_ng.cli.config_cmd._prompt")
+    def test_wizard_volume_selection_all(
+        self, mock_prompt, mock_choice, mock_bool, mock_find, capsys
+    ):
+        """Test wizard with 'all' volume selection."""
+        from btrfs_backup_ng.cli.config_cmd import _run_detection_wizard
+
+        mock_find.return_value = None  # No existing config
+
+        result = self._create_mock_result()
+
+        # Use /backup paths to avoid /mnt/ require_mount check
+        # Note: "add another target?" is _prompt_bool, not _prompt
+        mock_prompt.side_effect = [
+            "all",  # Select all volumes
+            "home",  # prefix for /home
+            "/backup/home",  # target for /home (not /mnt/ to avoid mount check)
+            "root",  # prefix for /
+            "/backup/root",  # target for /
+        ]
+        mock_bool.side_effect = [
+            False,  # add another target for home? no
+            False,  # add another target for root? no
+            False,  # configure global settings? no
+        ]
+        mock_choice.side_effect = [
+            "print",  # print config instead of save
+        ]
+
+        exit_code = _run_detection_wizard(result)
+
+        assert exit_code == 0
+        captured = capsys.readouterr()
+        assert "Generated Configuration" in captured.out
+        assert 'path = "/home"' in captured.out
+        assert 'path = "/"' in captured.out
+
+    @patch("btrfs_backup_ng.cli.config_cmd.find_config_file")
+    @patch("btrfs_backup_ng.cli.config_cmd._prompt_bool")
+    @patch("btrfs_backup_ng.cli.config_cmd._prompt_choice")
+    @patch("btrfs_backup_ng.cli.config_cmd._prompt")
+    def test_wizard_volume_selection_specific(
+        self, mock_prompt, mock_choice, mock_bool, mock_find, capsys
+    ):
+        """Test wizard with specific volume selection."""
+        from btrfs_backup_ng.cli.config_cmd import _run_detection_wizard
+
+        mock_find.return_value = None  # No existing config
+
+        result = self._create_mock_result()
+
+        # Select only volume 1 (/home), use /backup to avoid mount check
+        # Note: "add another target?" is _prompt_bool, not _prompt
+        mock_prompt.side_effect = [
+            "1",  # Select only first volume
+            "home",  # prefix
+            "/backup/home",  # target (not /mnt/)
+        ]
+        mock_bool.side_effect = [
+            False,  # add another target? no
+            False,  # configure global settings? no
+        ]
+        mock_choice.side_effect = [
+            "print",  # print config
+        ]
+
+        exit_code = _run_detection_wizard(result)
+
+        assert exit_code == 0
+        captured = capsys.readouterr()
+        assert 'path = "/home"' in captured.out
+
+    @patch("btrfs_backup_ng.cli.config_cmd.find_config_file")
+    @patch("btrfs_backup_ng.cli.config_cmd._prompt_bool")
+    @patch("btrfs_backup_ng.cli.config_cmd._prompt_choice")
+    @patch("btrfs_backup_ng.cli.config_cmd._prompt")
+    def test_wizard_cancel(
+        self, mock_prompt, mock_choice, mock_bool, mock_find, capsys
+    ):
+        """Test wizard cancellation."""
+        from btrfs_backup_ng.cli.config_cmd import _run_detection_wizard
+
+        mock_find.return_value = None  # No existing config
+
+        result = self._create_mock_result()
+
+        # Note: "add another target?" is _prompt_bool, not _prompt
+        mock_prompt.side_effect = [
+            "1",  # Select first volume
+            "home",  # prefix
+            "/backup",  # target (not /mnt/)
+        ]
+        mock_bool.side_effect = [
+            False,  # add another target? no
+            False,  # configure global settings? no
+        ]
+        mock_choice.side_effect = [
+            "cancel",  # cancel
+        ]
+
+        exit_code = _run_detection_wizard(result)
+
+        assert exit_code == 0
+        captured = capsys.readouterr()
+        assert "cancelled" in captured.out.lower()
+
+    @patch("btrfs_backup_ng.cli.config_cmd.find_config_file")
+    @patch("btrfs_backup_ng.cli.config_cmd._prompt_bool")
+    @patch("btrfs_backup_ng.cli.config_cmd._prompt_choice")
+    @patch("btrfs_backup_ng.cli.config_cmd._prompt")
+    def test_wizard_with_ssh_target(
+        self, mock_prompt, mock_choice, mock_bool, mock_find, capsys
+    ):
+        """Test wizard with SSH target."""
+        from btrfs_backup_ng.cli.config_cmd import _run_detection_wizard
+
+        mock_find.return_value = None  # No existing config
+
+        result = self._create_mock_result()
+
+        # Note: "add another target?" is _prompt_bool, not _prompt
+        mock_prompt.side_effect = [
+            "1",  # Select first volume
+            "home",  # prefix
+            "ssh://user@host:/backup/home",  # SSH target
+        ]
+        mock_bool.side_effect = [
+            True,  # use sudo on remote? yes
+            False,  # add another target? no
+            False,  # configure global settings? no
+        ]
+        mock_choice.side_effect = [
+            "print",  # print config
+        ]
+
+        exit_code = _run_detection_wizard(result)
+
+        assert exit_code == 0
+        captured = capsys.readouterr()
+        assert "ssh://user@host:/backup/home" in captured.out
+        assert "ssh_sudo = true" in captured.out
+
+    @patch("btrfs_backup_ng.cli.config_cmd.find_config_file")
+    @patch("btrfs_backup_ng.cli.config_cmd._prompt_bool")
+    @patch("btrfs_backup_ng.cli.config_cmd._prompt_choice")
+    @patch("btrfs_backup_ng.cli.config_cmd._prompt")
+    def test_wizard_with_mount_target(
+        self, mock_prompt, mock_choice, mock_bool, mock_find, capsys
+    ):
+        """Test wizard with mount point target."""
+        from btrfs_backup_ng.cli.config_cmd import _run_detection_wizard
+
+        mock_find.return_value = None  # No existing config
+
+        result = self._create_mock_result()
+
+        # Note: "add another target?" is _prompt_bool, not _prompt
+        mock_prompt.side_effect = [
+            "1",  # Select first volume
+            "home",  # prefix
+            "/mnt/usb-drive/backup",  # Mount point target triggers require_mount
+        ]
+        mock_bool.side_effect = [
+            True,  # require mount check? yes
+            False,  # add another target? no
+            False,  # configure global settings? no
+        ]
+        mock_choice.side_effect = [
+            "print",  # print config
+        ]
+
+        exit_code = _run_detection_wizard(result)
+
+        assert exit_code == 0
+        captured = capsys.readouterr()
+        assert "/mnt/usb-drive/backup" in captured.out
+        assert "require_mount = true" in captured.out
+
+    @patch("btrfs_backup_ng.cli.config_cmd.find_config_file")
+    @patch("btrfs_backup_ng.cli.config_cmd._prompt_bool")
+    @patch("btrfs_backup_ng.cli.config_cmd._prompt_choice")
+    @patch("btrfs_backup_ng.cli.config_cmd._prompt")
+    def test_wizard_invalid_selection_fallback(
+        self, mock_prompt, mock_choice, mock_bool, mock_find, capsys
+    ):
+        """Test wizard falls back to recommended on invalid selection."""
+        from btrfs_backup_ng.cli.config_cmd import _run_detection_wizard
+
+        mock_find.return_value = None  # No existing config
+
+        result = self._create_mock_result()
+
+        # Invalid selection -> falls back to recommended (both), use /backup paths
+        # Note: "add another target?" is _prompt_bool, not _prompt
+        mock_prompt.side_effect = [
+            "invalid",  # Invalid selection -> falls back to recommended
+            "home",  # prefix for /home
+            "/backup/home",  # target (not /mnt/)
+            "root",  # prefix for /
+            "/backup/root",  # target (not /mnt/)
+        ]
+        mock_bool.side_effect = [
+            False,  # add another target for home? no
+            False,  # add another target for root? no
+            False,  # configure global settings? no
+        ]
+        mock_choice.side_effect = [
+            "print",  # print config
+        ]
+
+        exit_code = _run_detection_wizard(result)
+
+        assert exit_code == 0
+        captured = capsys.readouterr()
+        assert "Invalid selection" in captured.out
+
+    @patch("btrfs_backup_ng.cli.config_cmd.find_config_file")
+    @patch("btrfs_backup_ng.cli.config_cmd._prompt_bool")
+    @patch("btrfs_backup_ng.cli.config_cmd._prompt_choice")
+    @patch("btrfs_backup_ng.cli.config_cmd._prompt")
+    @patch("btrfs_backup_ng.cli.config_cmd._prompt_int")
+    def test_wizard_with_global_settings(
+        self, mock_int, mock_prompt, mock_choice, mock_bool, mock_find, capsys
+    ):
+        """Test wizard with global settings configured."""
+        from btrfs_backup_ng.cli.config_cmd import _run_detection_wizard
+
+        mock_find.return_value = None  # No existing config
+
+        result = self._create_mock_result()
+
+        # Note: "add another target?" is _prompt_bool, not _prompt
+        mock_prompt.side_effect = [
+            "1",  # Select first volume
+            "home",  # prefix
+            "/backup",  # target (not /mnt/)
+            "2d",  # min retention
+        ]
+        mock_int.side_effect = [
+            48,  # hourly
+            14,  # daily
+            8,  # weekly
+            24,  # monthly
+            2,  # yearly
+        ]
+        mock_bool.side_effect = [
+            False,  # add another target? no
+            True,  # configure global settings? yes
+            False,  # configure email notifications? no
+        ]
+        mock_choice.side_effect = [
+            "print",  # print config
+        ]
+
+        exit_code = _run_detection_wizard(result)
+
+        assert exit_code == 0
+        captured = capsys.readouterr()
+        assert "hourly = 48" in captured.out
+        assert "daily = 14" in captured.out
+
+    def test_wizard_no_suggestions(self, capsys):
+        """Test wizard when no suggestions available."""
+        from btrfs_backup_ng.cli.config_cmd import _run_detection_wizard
+
+        result = DetectionResult(
+            filesystems=[
+                BtrfsMountInfo(
+                    device="/dev/sda1",
+                    mount_point="/",
+                    subvol_path="/",
+                    subvol_id=5,
+                )
+            ],
+            subvolumes=[],
+            suggestions=[],
+        )
+
+        exit_code = _run_detection_wizard(result)
+
+        assert exit_code == 1
+        captured = capsys.readouterr()
+        assert "No subvolumes suitable for backup" in captured.out
+
+    def test_wizard_partial_result(self, capsys):
+        """Test wizard shows partial result warning."""
+        from btrfs_backup_ng.cli.config_cmd import _run_detection_wizard
+
+        home_subvol = DetectedSubvolume(
+            id=256,
+            path="/home",
+            mount_point="/home",
+            classification=SubvolumeClass.USER_DATA,
+        )
+        result = DetectionResult(
+            filesystems=[
+                BtrfsMountInfo(
+                    device="/dev/sda1",
+                    mount_point="/home",
+                    subvol_path="/home",
+                    subvol_id=256,
+                )
+            ],
+            subvolumes=[home_subvol],
+            suggestions=[
+                BackupSuggestion(
+                    subvolume=home_subvol,
+                    suggested_prefix="home",
+                    priority=1,
+                )
+            ],
+            is_partial=True,
+            error_message="Limited detection due to permissions",
+        )
+
+        # This will print the warning but then need input
+        # We'll just verify the warning is shown
+        with patch("btrfs_backup_ng.cli.config_cmd._prompt") as mock_prompt:
+            mock_prompt.side_effect = KeyboardInterrupt
+
+            try:
+                _run_detection_wizard(result)
+            except KeyboardInterrupt:
+                pass
+
+        captured = capsys.readouterr()
+        assert "Limited detection due to permissions" in captured.out
+
+    @patch("btrfs_backup_ng.cli.config_cmd.find_config_file")
+    @patch("btrfs_backup_ng.cli.config_cmd._prompt_bool")
+    @patch("btrfs_backup_ng.cli.config_cmd._prompt_choice")
+    @patch("btrfs_backup_ng.cli.config_cmd._prompt")
+    def test_wizard_with_existing_config_diff(
+        self, mock_prompt, mock_choice, mock_bool, mock_find, capsys, tmp_path
+    ):
+        """Test wizard shows diff with existing config."""
+        from btrfs_backup_ng.cli.config_cmd import _run_detection_wizard
+
+        # Create existing config
+        existing_config = tmp_path / "config.toml"
+        existing_config.write_text("""[global]
+snapshot_dir = ".snapshots"
+
+[[volumes]]
+path = "/home"
+snapshot_prefix = "home"
+
+[[volumes.targets]]
+path = "/backup"
+""")
+
+        mock_find.return_value = str(existing_config)
+
+        result = self._create_mock_result()
+
+        # Note: "add another target?" is _prompt_bool, not _prompt
+        mock_prompt.side_effect = [
+            "1",  # Select first volume
+            "home-new",  # different prefix
+            "/backup/new",  # different target (not /mnt/)
+        ]
+        mock_bool.side_effect = [
+            False,  # add another target? no
+            False,  # configure global settings? no
+            True,  # view diff? yes
+        ]
+        mock_choice.side_effect = [
+            "summary",  # summary diff format
+            "cancel",  # cancel after seeing diff
+        ]
+
+        exit_code = _run_detection_wizard(result)
+
+        assert exit_code == 0
+        captured = capsys.readouterr()
+        assert "Existing Configuration Found" in captured.out
+
+    @patch("btrfs_backup_ng.cli.config_cmd.find_config_file")
+    @patch("btrfs_backup_ng.cli.config_cmd._prompt_bool")
+    @patch("btrfs_backup_ng.cli.config_cmd._prompt_choice")
+    @patch("btrfs_backup_ng.cli.config_cmd._prompt")
+    def test_wizard_save_to_file(
+        self, mock_prompt, mock_choice, mock_bool, mock_find, capsys, tmp_path
+    ):
+        """Test wizard saves config to file."""
+        from btrfs_backup_ng.cli.config_cmd import _run_detection_wizard
+
+        mock_find.return_value = None
+
+        # Use a subdirectory to avoid any file existence issues
+        save_dir = tmp_path / "config-dir"
+        save_path = save_dir / "new-config.toml"
+
+        result = self._create_mock_result()
+
+        # Only 4 _prompt calls needed:
+        # 1. Select volumes, 2. Snapshot prefix, 3. Target path, 4. Save path
+        # (the "add another target?" is a _prompt_bool, not _prompt)
+        mock_prompt.side_effect = [
+            "1",  # Select first volume
+            "home",  # prefix
+            "/backup",  # target (not /mnt/)
+            str(save_path),  # save path
+        ]
+        mock_bool.side_effect = [
+            False,  # add another target? no
+            False,  # configure global settings? no
+        ]
+        mock_choice.side_effect = [
+            "save",  # save config
+        ]
+
+        exit_code = _run_detection_wizard(result)
+
+        assert exit_code == 0
+        assert save_path.exists()
+        content = save_path.read_text()
+        assert 'path = "/home"' in content
+        assert 'snapshot_prefix = "home"' in content

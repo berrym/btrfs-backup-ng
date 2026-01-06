@@ -715,21 +715,417 @@ def _run_detection_wizard(result) -> int:
     Returns:
         Exit code
     """
-    # This will be implemented in Phase 4
-    # For now, just show the results and suggest using config init
+
     print()
     print("=" * 60)
     print("  Detection-based Configuration Wizard")
     print("=" * 60)
     print()
-    print("The full wizard integration is coming in a future update.")
-    print()
-    print("For now, you can:")
-    print("  1. Review the detected subvolumes below")
-    print("  2. Use 'btrfs-backup-ng config init --interactive' to create a config")
-    print("  3. Reference the detected paths when prompted")
+    print("This wizard will help you create a backup configuration")
+    print("based on detected btrfs subvolumes.")
+    print("Press Ctrl+C at any time to cancel.")
     print()
 
-    _display_detection_results(result)
+    if result.is_partial:
+        print(f"Note: {result.error_message}")
+        print("Results may be incomplete.")
+        print()
+
+    # Step 1: Select volumes to back up
+    print("-" * 40)
+    print("  Detected Subvolumes")
+    print("-" * 40)
+    print()
+
+    # Build list of selectable volumes (exclude snapshots and internal)
+    selectable = []
+    for suggestion in result.suggestions:
+        sv = suggestion.subvolume
+        selectable.append((suggestion, sv))
+
+    if not selectable:
+        print("No subvolumes suitable for backup were detected.")
+        print("You may need to run with sudo for complete detection.")
+        return 1
+
+    # Display with numbers
+    print("  Recommended for backup:")
+    recommended_indices = []
+    for i, (suggestion, sv) in enumerate(selectable, 1):
+        marker = "*" if suggestion.is_recommended else " "
+        classification = sv.classification.value.replace("_", " ")
+        print(f"  [{i}]{marker} {sv.display_path} ({classification})")
+        if suggestion.is_recommended:
+            recommended_indices.append(str(i))
+
+    print()
+    print("  * = recommended")
+    print()
+
+    # Let user select
+    default_selection = ",".join(recommended_indices) if recommended_indices else "1"
+    selection_str = _prompt(
+        "Select volumes to back up (comma-separated numbers, or 'all')",
+        default_selection,
+    )
+
+    # Parse selection
+    selected_volumes = []
+    if selection_str.lower() == "all":
+        selected_volumes = [s for s, _ in selectable]
+    else:
+        try:
+            indices = [int(x.strip()) for x in selection_str.split(",") if x.strip()]
+            for idx in indices:
+                if 1 <= idx <= len(selectable):
+                    selected_volumes.append(selectable[idx - 1][0])
+                else:
+                    print(f"  Warning: {idx} is not a valid selection, skipping")
+        except ValueError:
+            print("Invalid selection. Using recommended volumes.")
+            selected_volumes = [s for s, _ in selectable if s.is_recommended]
+
+    if not selected_volumes:
+        print("No volumes selected. Exiting.")
+        return 1
+
+    print()
+    print(f"Selected {len(selected_volumes)} volume(s) for backup.")
+    print()
+
+    # Step 2: Configure each volume
+    config_data: dict[str, Any] = {
+        "snapshot_dir": ".snapshots",
+        "timestamp_format": "%Y%m%d-%H%M%S",
+        "incremental": True,
+        "log_file": "",
+        "transaction_log": "",
+        "parallel_volumes": 2,
+        "parallel_targets": 3,
+        "retention": {
+            "min": "1d",
+            "hourly": 24,
+            "daily": 7,
+            "weekly": 4,
+            "monthly": 12,
+            "yearly": 0,
+        },
+        "volumes": [],
+    }
+
+    for suggestion in selected_volumes:
+        sv = suggestion.subvolume
+        print("-" * 40)
+        print(f"  Volume: {sv.display_path}")
+        print("-" * 40)
+
+        volume: dict[str, Any] = {
+            "path": sv.display_path,
+            "snapshot_prefix": _prompt("Snapshot prefix", suggestion.suggested_prefix),
+            "targets": [],
+        }
+
+        # Add targets
+        print()
+        print("  Add backup target(s) for this volume:")
+        add_target = True
+        while add_target:
+            target_path = _prompt(
+                "  Target path (local path or ssh://user@host:/path)", ""
+            )
+            if not target_path:
+                if not volume["targets"]:
+                    print("  At least one target is required per volume.")
+                    continue
+                break
+
+            target: dict[str, Any] = {"path": target_path}
+
+            if target_path.startswith("ssh://"):
+                target["ssh_sudo"] = _prompt_bool("  Use sudo on remote host?", False)
+            elif target_path.startswith("/mnt/") or "usb" in target_path.lower():
+                target["require_mount"] = _prompt_bool(
+                    "  Require mount check (for external drives)?", True
+                )
+
+            volume["targets"].append(target)
+            print(f"  Added target: {target_path}")
+            add_target = _prompt_bool("  Add another target?", False)
+
+        config_data["volumes"].append(volume)
+        print()
+
+    # Step 3: Global settings (optional)
+    print("-" * 40)
+    print("  Global Settings")
+    print("-" * 40)
+    print()
+
+    if _prompt_bool("Configure global settings (retention, notifications)?", False):
+        # Retention
+        print()
+        print("  Retention Policy:")
+        retention = config_data["retention"]
+        retention["min"] = _prompt("  Minimum retention period", "1d")
+        retention["hourly"] = _prompt_int("  Hourly snapshots to keep", 24, 0, 1000)
+        retention["daily"] = _prompt_int("  Daily snapshots to keep", 7, 0, 1000)
+        retention["weekly"] = _prompt_int("  Weekly snapshots to keep", 4, 0, 1000)
+        retention["monthly"] = _prompt_int("  Monthly snapshots to keep", 12, 0, 1000)
+        retention["yearly"] = _prompt_int("  Yearly snapshots to keep", 0, 0, 1000)
+
+        # Email notifications
+        print()
+        if _prompt_bool("  Configure email notifications?", False):
+            email: dict[str, Any] = {"enabled": True}
+            email["smtp_host"] = _prompt("  SMTP host", "smtp.example.com")
+            email["smtp_port"] = _prompt_int("  SMTP port", 587, 1, 65535)
+            email["smtp_tls"] = _prompt_choice(
+                "  SMTP security", ["starttls", "ssl", "none"], "starttls"
+            )
+            email["smtp_user"] = _prompt("  SMTP username (leave empty if none)", "")
+            if email["smtp_user"]:
+                email["smtp_password"] = _prompt("  SMTP password", "")
+            email["from_addr"] = _prompt("  From address", "")
+            to_addrs_str = _prompt("  To addresses (comma-separated)", "")
+            if to_addrs_str:
+                email["to_addrs"] = [
+                    a.strip() for a in to_addrs_str.split(",") if a.strip()
+                ]
+            email["on_success"] = _prompt_bool("  Notify on success?", False)
+            email["on_failure"] = _prompt_bool("  Notify on failure?", True)
+            config_data["email"] = email
+    else:
+        print("  Using default settings (can be changed later in config file).")
+
+    print()
+
+    # Step 4: Generate config
+    new_config = _generate_config_from_wizard(config_data)
+
+    # Step 5: Check for existing config and show diff if needed
+    existing_config_path = find_config_file(None)
+    existing_content = None
+
+    if existing_config_path:
+        try:
+            existing_content = Path(existing_config_path).read_text()
+        except OSError:
+            existing_content = None
+
+    if existing_content:
+        print("-" * 40)
+        print("  Existing Configuration Found")
+        print("-" * 40)
+        print()
+        print(f"  Found: {existing_config_path}")
+        print()
+
+        # Offer diff view
+        view_diff = _prompt_bool("View changes compared to existing config?", True)
+        if view_diff:
+            diff_format = _prompt_choice(
+                "Diff format",
+                ["summary", "text"],
+                "summary",
+            )
+            print()
+            if diff_format == "summary":
+                _show_config_diff_summary(existing_content, new_config, config_data)
+            else:
+                _show_config_diff_text(existing_content, new_config)
+            print()
+
+    # Step 6: Save options
+    print("-" * 40)
+    print("  Save Configuration")
+    print("-" * 40)
+    print()
+
+    save_choice = _prompt_choice(
+        "What would you like to do?",
+        ["save", "print", "cancel"],
+        "save",
+    )
+
+    if save_choice == "cancel":
+        print()
+        print("Configuration cancelled.")
+        return 0
+
+    if save_choice == "print":
+        print()
+        print("-" * 40)
+        print("  Generated Configuration")
+        print("-" * 40)
+        print()
+        print(new_config)
+        return 0
+
+    # Save to file
+    if existing_config_path:
+        default_path = str(existing_config_path)
+        print()
+        print(f"  Existing config: {existing_config_path}")
+        save_path = _prompt(
+            "Save to (enter new path to keep existing, or same to overwrite)",
+            default_path,
+        )
+    else:
+        default_path = str(Path.home() / ".config/btrfs-backup-ng/config.toml")
+        save_path = _prompt("Save configuration to", default_path)
+
+    # Create directory if needed
+    save_file = Path(save_path)
+    try:
+        save_file.parent.mkdir(parents=True, exist_ok=True)
+
+        # Check for overwrite
+        if save_file.exists():
+            if not _prompt_bool(f"Overwrite {save_path}?", False):
+                print("Save cancelled.")
+                return 0
+
+        save_file.write_text(new_config)
+        print()
+        print(f"Configuration saved to: {save_path}")
+        print()
+        print("Next steps:")
+        print(f"  1. Review: btrfs-backup-ng config validate -c {save_path}")
+        print(f"  2. Test:   btrfs-backup-ng run --dry-run -c {save_path}")
+        print(f"  3. Install timer: btrfs-backup-ng install -c {save_path}")
+
+    except OSError as e:
+        print(f"Error saving configuration: {e}")
+        return 1
 
     return 0
+
+
+def _show_config_diff_summary(
+    existing: str, new: str, config_data: dict[str, Any]
+) -> None:
+    """Show a human-friendly summary of config changes.
+
+    Args:
+        existing: Existing config content
+        new: New config content
+        config_data: Parsed config data from wizard
+    """
+    print("  Changes:")
+    print()
+
+    # Parse existing config to compare
+    try:
+        import tomllib
+
+        existing_parsed = tomllib.loads(existing)
+    except Exception:
+        print("  (Could not parse existing config for comparison)")
+        print("  New configuration will replace existing.")
+        return
+
+    # Compare volumes
+    existing_volumes = {v.get("path"): v for v in existing_parsed.get("volumes", [])}
+    new_volumes = {v["path"]: v for v in config_data.get("volumes", [])}
+
+    # Added volumes
+    for path in new_volumes:
+        if path not in existing_volumes:
+            prefix = new_volumes[path].get("snapshot_prefix", "")
+            targets = len(new_volumes[path].get("targets", []))
+            print(f"  + Add volume: {path}")
+            print(f"      prefix: {prefix}, targets: {targets}")
+
+    # Removed volumes
+    for path in existing_volumes:
+        if path not in new_volumes:
+            print(f"  - Remove volume: {path}")
+
+    # Modified volumes
+    for path in new_volumes:
+        if path in existing_volumes:
+            old = existing_volumes[path]
+            new_v = new_volumes[path]
+            changes = []
+
+            if old.get("snapshot_prefix") != new_v.get("snapshot_prefix"):
+                changes.append(
+                    f"prefix: {old.get('snapshot_prefix')} -> "
+                    f"{new_v.get('snapshot_prefix')}"
+                )
+
+            old_targets = len(old.get("targets", []))
+            new_targets = len(new_v.get("targets", []))
+            if old_targets != new_targets:
+                changes.append(f"targets: {old_targets} -> {new_targets}")
+
+            if changes:
+                print(f"  ~ Modify volume: {path}")
+                for change in changes:
+                    print(f"      {change}")
+
+    # Compare retention
+    old_retention = existing_parsed.get("global", {}).get("retention", {})
+    new_retention = config_data.get("retention", {})
+
+    retention_changes = []
+    for key in ["min", "hourly", "daily", "weekly", "monthly", "yearly"]:
+        old_val = old_retention.get(key)
+        new_val = new_retention.get(key)
+        if old_val != new_val and new_val is not None:
+            retention_changes.append(f"{key}: {old_val} -> {new_val}")
+
+    if retention_changes:
+        print("  ~ Modify retention:")
+        for change in retention_changes:
+            print(f"      {change}")
+
+    # Check for notification changes
+    if config_data.get("email") and not existing_parsed.get("global", {}).get(
+        "notifications", {}
+    ).get("email"):
+        print("  + Add email notifications")
+
+    if config_data.get("webhook") and not existing_parsed.get("global", {}).get(
+        "notifications", {}
+    ).get("webhook"):
+        print("  + Add webhook notifications")
+
+
+def _show_config_diff_text(existing: str, new: str) -> None:
+    """Show a text-based diff of config changes.
+
+    Args:
+        existing: Existing config content
+        new: New config content
+    """
+    import difflib
+
+    existing_lines = existing.splitlines(keepends=True)
+    new_lines = new.splitlines(keepends=True)
+
+    diff = difflib.unified_diff(
+        existing_lines,
+        new_lines,
+        fromfile="existing config",
+        tofile="new config",
+        lineterm="",
+    )
+
+    diff_output = list(diff)
+    if not diff_output:
+        print("  No differences detected.")
+        return
+
+    print("  " + "-" * 38)
+    for line in diff_output:
+        line = line.rstrip("\n")
+        if line.startswith("+") and not line.startswith("+++"):
+            print(f"  {line}")
+        elif line.startswith("-") and not line.startswith("---"):
+            print(f"  {line}")
+        elif line.startswith("@@"):
+            print(f"  {line}")
+        elif line.startswith("---") or line.startswith("+++"):
+            print(f"  {line}")
+    print("  " + "-" * 38)
