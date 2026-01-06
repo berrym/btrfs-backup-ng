@@ -284,6 +284,23 @@ def create_subcommand_parser() -> argparse.ArgumentParser:
         help="Output file (default: stdout)",
     )
 
+    detect_parser = config_subs.add_parser(
+        "detect",
+        help="Detect btrfs subvolumes on the system",
+        description="Scan for btrfs subvolumes and suggest backup configuration",
+    )
+    detect_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Output in JSON format for scripting",
+    )
+    detect_parser.add_argument(
+        "-w",
+        "--wizard",
+        action="store_true",
+        help="Launch interactive wizard with detected volumes",
+    )
+
     # install command
     install_parser = subparsers.add_parser(
         "install",

@@ -403,8 +403,10 @@ def execute_config(args: argparse.Namespace) -> int:
         return _init_config(args)
     elif action == "import":
         return _import_config(args)
+    elif action == "detect":
+        return _detect_subvolumes(args)
     else:
-        print("Usage: btrfs-backup-ng config <validate|init|import>")
+        print("Usage: btrfs-backup-ng config <validate|init|import|detect>")
         return 1
 
 
@@ -532,5 +534,202 @@ def _import_config(args: argparse.Namespace) -> int:
         print(
             "Review the warnings above and adjust the configuration.", file=sys.stderr
         )
+
+    return 0
+
+
+def _detect_subvolumes(args: argparse.Namespace) -> int:
+    """Detect btrfs subvolumes on the system.
+
+    Args:
+        args: Parsed command line arguments with:
+            - json: Output in JSON format
+            - wizard: Launch interactive wizard with detected volumes
+
+    Returns:
+        Exit code (0 for success, 1 for error)
+    """
+    import json as json_module
+
+    from ..detection import (
+        DetectionError,
+        PermissionDeniedError,
+        detect_subvolumes,
+    )
+
+    json_output = getattr(args, "json", False)
+    wizard = getattr(args, "wizard", False)
+
+    # Try full detection first
+    try:
+        result = detect_subvolumes(allow_partial=False)
+    except PermissionDeniedError:
+        # Offer fallback for non-root users
+        if json_output:
+            # In JSON mode, just do partial detection
+            result = detect_subvolumes(allow_partial=True)
+        else:
+            print("For complete subvolume detection, root privileges are required.")
+            print()
+            print("  Run: sudo btrfs-backup-ng config detect")
+            print()
+
+            if sys.stdin.isatty():
+                try:
+                    if _prompt_bool("Continue with limited detection?", False):
+                        result = detect_subvolumes(allow_partial=True)
+                    else:
+                        return 1
+                except KeyboardInterrupt:
+                    print("\nCancelled.")
+                    return 1
+            else:
+                # Non-interactive, just fail
+                return 1
+    except DetectionError as e:
+        print(f"Detection error: {e}")
+        return 1
+
+    # Handle no btrfs filesystems
+    if not result.filesystems:
+        if json_output:
+            print(json_module.dumps(result.to_dict(), indent=2))
+        else:
+            print("No btrfs filesystems found on this system.")
+            print()
+            print("btrfs-backup-ng requires btrfs subvolumes to back up.")
+            print("You can still create a configuration manually with:")
+            print("  btrfs-backup-ng config init")
+        return 1
+
+    # JSON output mode
+    if json_output:
+        print(json_module.dumps(result.to_dict(), indent=2))
+        return 0
+
+    # Wizard mode
+    if wizard:
+        if not sys.stdin.isatty():
+            print("Error: Wizard mode requires a terminal (TTY)")
+            return 1
+        return _run_detection_wizard(result)
+
+    # Default: Display detection results
+    _display_detection_results(result)
+    return 0
+
+
+def _display_detection_results(result) -> None:
+    """Display detection results in a human-readable format.
+
+    Args:
+        result: DetectionResult from detect_subvolumes()
+    """
+    from ..detection import SubvolumeClass
+
+    print()
+    print("=" * 60)
+    print("  Btrfs Subvolume Detection Results")
+    print("=" * 60)
+
+    if result.is_partial:
+        print()
+        print(f"  Note: {result.error_message}")
+        print("  Results may be incomplete.")
+
+    print()
+    print(f"Found {len(result.filesystems)} btrfs filesystem(s)")
+    print(f"Found {len(result.subvolumes)} subvolume(s)")
+    print()
+
+    # Recommended for backup
+    recommended = [s for s in result.suggestions if s.is_recommended]
+    if recommended:
+        print("-" * 40)
+        print("  Recommended for backup:")
+        print("-" * 40)
+        for i, suggestion in enumerate(recommended, 1):
+            sv = suggestion.subvolume
+            classification = sv.classification.value.replace("_", " ")
+            print(f"  [{i}] {sv.display_path}")
+            print(f"      Type: {classification}")
+            print(f"      Suggested prefix: {suggestion.suggested_prefix}")
+            print()
+
+    # Optional
+    optional = [s for s in result.suggestions if not s.is_recommended]
+    if optional:
+        print("-" * 40)
+        print("  Optional (lower priority):")
+        print("-" * 40)
+        for suggestion in optional:
+            sv = suggestion.subvolume
+            classification = sv.classification.value.replace("_", " ")
+            print(f"  - {sv.display_path} ({classification})")
+        print()
+
+    # Excluded
+    excluded = result.excluded_subvolumes
+    if excluded:
+        print("-" * 40)
+        print("  Excluded (snapshots/system):")
+        print("-" * 40)
+        # Group by classification
+        snapshots = [
+            sv for sv in excluded if sv.classification == SubvolumeClass.SNAPSHOT
+        ]
+        internal = [
+            sv for sv in excluded if sv.classification == SubvolumeClass.INTERNAL
+        ]
+
+        if snapshots:
+            if len(snapshots) <= 5:
+                for sv in snapshots:
+                    print(f"  - {sv.path} (snapshot)")
+            else:
+                print(f"  - {len(snapshots)} snapshot subvolumes")
+
+        if internal:
+            for sv in internal:
+                print(f"  - {sv.path} (system internal)")
+        print()
+
+    # Next steps
+    print("-" * 40)
+    print("  Next steps:")
+    print("-" * 40)
+    print("  To create a configuration based on these results:")
+    print("    btrfs-backup-ng config detect --wizard")
+    print()
+    print("  Or create a configuration manually:")
+    print("    btrfs-backup-ng config init --interactive")
+    print()
+
+
+def _run_detection_wizard(result) -> int:
+    """Run interactive wizard with pre-populated detection results.
+
+    Args:
+        result: DetectionResult from detect_subvolumes()
+
+    Returns:
+        Exit code
+    """
+    # This will be implemented in Phase 4
+    # For now, just show the results and suggest using config init
+    print()
+    print("=" * 60)
+    print("  Detection-based Configuration Wizard")
+    print("=" * 60)
+    print()
+    print("The full wizard integration is coming in a future update.")
+    print()
+    print("For now, you can:")
+    print("  1. Review the detected subvolumes below")
+    print("  2. Use 'btrfs-backup-ng config init --interactive' to create a config")
+    print("  3. Reference the detected paths when prompted")
+    print()
+
+    _display_detection_results(result)
 
     return 0
