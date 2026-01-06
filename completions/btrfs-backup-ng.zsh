@@ -41,6 +41,9 @@ _btrfs-backup-ng() {
     local -a timer_presets
     timer_presets=(hourly daily weekly)
 
+    local -a fs_checks_modes
+    fs_checks_modes=(auto strict skip)
+
     _arguments -C \
         $global_opts \
         '1: :->command' \
@@ -60,7 +63,11 @@ _btrfs-backup-ng() {
                         '--compress[Compression method for transfers]:method:(${compress_methods})' \
                         '--rate-limit[Bandwidth limit]:rate:' \
                         '(--progress --no-progress)'--progress'[Show progress bars]' \
-                        '(--progress --no-progress)'--no-progress'[Disable progress bars]'
+                        '(--progress --no-progress)'--no-progress'[Disable progress bars]' \
+                        '--check-space[Check destination space before transfer]' \
+                        '--no-check-space[Skip destination space check]' \
+                        '--force[Proceed despite insufficient space]' \
+                        '--fs-checks[Filesystem validation mode]:mode:(${fs_checks_modes})'
                     ;;
                 snapshot)
                     _arguments \
@@ -96,6 +103,7 @@ _btrfs-backup-ng() {
                         'validate:Validate configuration file'
                         'init:Generate example configuration'
                         'import:Import btrbk configuration'
+                        'detect:Detect btrfs subvolumes'
                     )
                     _arguments \
                         '1: :->config_cmd' \
@@ -118,6 +126,11 @@ _btrfs-backup-ng() {
                                     _arguments \
                                         '(-o --output)'{-o,--output}'[Output file]:file:_files' \
                                         '1:btrbk config file:_files -g "*.conf"'
+                                    ;;
+                                detect)
+                                    _arguments \
+                                        '--json[Output results in JSON format]' \
+                                        '1:path to scan:_directories'
                                     ;;
                             esac
                             ;;
@@ -149,7 +162,7 @@ _btrfs-backup-ng() {
                         '--ssh-key[SSH private key file]:key file:_files' \
                         '--compress[Compression method]:method:(${compress_methods})' \
                         '--rate-limit[Bandwidth limit]:rate:' \
-                        '--no-fs-checks[Skip btrfs subvolume verification]' \
+                        '--fs-checks[Filesystem validation mode]:mode:(${fs_checks_modes})' \
                         '--status[Show status of locks and incomplete restores]' \
                         '--unlock[Unlock stuck restore session]:lock id or all:' \
                         '--cleanup[Clean up partial/incomplete snapshot restores]' \
@@ -174,7 +187,7 @@ _btrfs-backup-ng() {
                         '--prefix[Snapshot prefix filter]:prefix:' \
                         '--ssh-sudo[Use sudo for btrfs commands on remote host]' \
                         '--ssh-key[SSH private key file]:key file:_files' \
-                        '--no-fs-checks[Skip btrfs subvolume verification]' \
+                        '--fs-checks[Filesystem validation mode]:mode:(${fs_checks_modes})' \
                         '--json[Output results in JSON format]' \
                         '(-q --quiet)'{-q,--quiet}'[Suppress progress output]' \
                         '1:backup location:_files -/'
@@ -187,7 +200,9 @@ _btrfs-backup-ng() {
                         '--prefix[Snapshot prefix filter]:prefix:' \
                         '--ssh-sudo[Use sudo for btrfs commands on remote host]' \
                         '--ssh-key[SSH private key file]:key file:_files' \
-                        '--no-fs-checks[Skip btrfs subvolume verification]' \
+                        '--fs-checks[Filesystem validation mode]:mode:(${fs_checks_modes})' \
+                        '--check-space[Check destination space availability]' \
+                        '--safety-margin[Safety margin percentage]:percent:' \
                         '--json[Output results in JSON format]' \
                         '1:source (snapshot location):_files -/' \
                         '2:destination (backup location):_files -/'

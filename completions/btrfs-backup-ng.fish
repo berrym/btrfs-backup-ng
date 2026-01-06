@@ -71,6 +71,9 @@ set -l compress_methods none zstd gzip lz4 pigz lzop
 # Timer presets
 set -l timer_presets hourly daily weekly
 
+# Filesystem check modes
+set -l fs_checks_modes auto strict skip
+
 # run command
 complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_using_command run' -l dry-run -d 'Show what would be done without making changes'
 complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_using_command run' -l parallel-volumes -d 'Max concurrent volume backups' -x
@@ -79,6 +82,10 @@ complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_using_command run' -l com
 complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_using_command run' -l rate-limit -d 'Bandwidth limit (e.g., 10M, 1G)' -x
 complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_using_command run' -l progress -d 'Show progress bars'
 complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_using_command run' -l no-progress -d 'Disable progress bars'
+complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_using_command run' -l check-space -d 'Check destination space before transfer'
+complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_using_command run' -l no-check-space -d 'Skip destination space check'
+complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_using_command run' -l force -d 'Proceed despite insufficient space'
+complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_using_command run' -l fs-checks -d 'Filesystem validation mode' -xa "$fs_checks_modes"
 
 # snapshot command
 complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_using_command snapshot' -l dry-run -d 'Show what would be done without making changes'
@@ -107,6 +114,7 @@ complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_using_command status' -s 
 complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_using_command config' -a validate -d 'Validate configuration file'
 complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_using_command config' -a init -d 'Generate example configuration'
 complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_using_command config' -a import -d 'Import btrbk configuration'
+complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_using_command config' -a detect -d 'Detect btrfs subvolumes'
 
 # config init
 complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_config_using_subcommand init' -s i -l interactive -d 'Run interactive configuration wizard'
@@ -115,6 +123,10 @@ complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_config_using_subcommand i
 # config import
 complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_config_using_subcommand import' -s o -l output -d 'Output file' -r -F
 complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_config_using_subcommand import' -a '(__fish_complete_suffix .conf)' -d 'btrbk config file'
+
+# config detect
+complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_config_using_subcommand detect' -l json -d 'Output results in JSON format'
+complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_config_using_subcommand detect' -a '(__fish_complete_directories)' -d 'Path to scan'
 
 # install command
 complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_using_command install' -l timer -d 'Use preset timer interval' -xa "$timer_presets"
@@ -137,7 +149,7 @@ complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_using_command restore' -l
 complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_using_command restore' -l ssh-key -d 'SSH private key file' -r -F
 complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_using_command restore' -l compress -d 'Compression method' -xa "$compress_methods"
 complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_using_command restore' -l rate-limit -d 'Bandwidth limit (e.g., 10M, 1G)' -x
-complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_using_command restore' -l no-fs-checks -d 'Skip btrfs subvolume verification'
+complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_using_command restore' -l fs-checks -d 'Filesystem validation mode' -xa "$fs_checks_modes"
 complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_using_command restore' -l status -d 'Show status of locks and incomplete restores'
 complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_using_command restore' -l unlock -d 'Unlock stuck restore session' -xa 'all'
 complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_using_command restore' -l cleanup -d 'Clean up partial/incomplete snapshot restores'
@@ -161,7 +173,7 @@ complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_using_command verify' -l 
 complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_using_command verify' -l prefix -d 'Snapshot prefix filter' -x
 complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_using_command verify' -l ssh-sudo -d 'Use sudo for btrfs commands on remote host'
 complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_using_command verify' -l ssh-key -d 'SSH private key file' -r -F
-complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_using_command verify' -l no-fs-checks -d 'Skip btrfs subvolume verification'
+complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_using_command verify' -l fs-checks -d 'Filesystem validation mode' -xa "$fs_checks_modes"
 complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_using_command verify' -l json -d 'Output results in JSON format'
 complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_using_command verify' -s q -l quiet -d 'Suppress progress output'
 # Enable path completion for verify positional argument
@@ -174,7 +186,9 @@ complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_using_command estimate' -
 complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_using_command estimate' -l prefix -d 'Snapshot prefix filter' -x
 complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_using_command estimate' -l ssh-sudo -d 'Use sudo for btrfs commands on remote host'
 complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_using_command estimate' -l ssh-key -d 'SSH private key file' -r -F
-complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_using_command estimate' -l no-fs-checks -d 'Skip btrfs subvolume verification'
+complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_using_command estimate' -l fs-checks -d 'Filesystem validation mode' -xa "$fs_checks_modes"
+complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_using_command estimate' -l check-space -d 'Check destination space availability'
+complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_using_command estimate' -l safety-margin -d 'Safety margin percentage (default 10)' -x
 complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_using_command estimate' -l json -d 'Output results in JSON format'
 # Enable path completion for estimate positional arguments
 complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_using_command estimate' -a '(__fish_complete_directories)'

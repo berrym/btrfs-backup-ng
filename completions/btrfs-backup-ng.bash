@@ -6,7 +6,7 @@ _btrfs_backup_ng() {
     _init_completion -s || return
 
     local commands="run snapshot transfer prune list status config install uninstall restore verify estimate completions manpages"
-    local config_subcommands="validate init import"
+    local config_subcommands="validate init import detect"
     local completions_subcommands="install path"
     local manpages_subcommands="install path"
 
@@ -14,7 +14,7 @@ _btrfs_backup_ng() {
     local global_opts="-h --help -v --verbose -q --quiet --debug -V --version -c --config"
 
     # Command-specific options
-    local run_opts="--dry-run --parallel-volumes --parallel-targets --compress --rate-limit --progress --no-progress"
+    local run_opts="--dry-run --parallel-volumes --parallel-targets --compress --rate-limit --progress --no-progress --check-space --no-check-space --force --fs-checks"
     local snapshot_opts="--dry-run --volume"
     local transfer_opts="--dry-run --volume --compress --rate-limit --progress --no-progress"
     local prune_opts="--dry-run"
@@ -22,16 +22,18 @@ _btrfs_backup_ng() {
     local status_opts="-t --transactions -n --limit"
     local install_opts="--timer --oncalendar --user"
     local uninstall_opts=""
-    local restore_opts="-l --list -s --snapshot --before -a --all -i --interactive --dry-run --no-incremental --overwrite --in-place --yes-i-know-what-i-am-doing --prefix --ssh-sudo --ssh-key --compress --rate-limit --no-fs-checks --status --unlock --cleanup --progress --no-progress -c --config --volume --target --list-volumes --to"
+    local restore_opts="-l --list -s --snapshot --before -a --all -i --interactive --dry-run --no-incremental --overwrite --in-place --yes-i-know-what-i-am-doing --prefix --ssh-sudo --ssh-key --compress --rate-limit --fs-checks --status --unlock --cleanup --progress --no-progress -c --config --volume --target --list-volumes --to"
     local config_validate_opts=""
     local config_init_opts="-i --interactive -o --output"
     local config_import_opts="-o --output"
-    local verify_opts="--level --snapshot --temp-dir --no-cleanup --prefix --ssh-sudo --ssh-key --no-fs-checks --json -q --quiet"
-    local estimate_opts="-c --config --volume --target --prefix --ssh-sudo --ssh-key --no-fs-checks --json"
+    local config_detect_opts="--json"
+    local verify_opts="--level --snapshot --temp-dir --no-cleanup --prefix --ssh-sudo --ssh-key --fs-checks --json -q --quiet"
+    local estimate_opts="-c --config --volume --target --prefix --ssh-sudo --ssh-key --fs-checks --check-space --safety-margin --json"
     local completions_install_opts="--shell --system"
     local manpages_install_opts="--system --prefix"
     local verify_levels="metadata stream full"
     local shell_types="bash zsh fish"
+    local fs_checks_modes="auto strict skip"
 
     # Compression methods
     local compress_methods="none zstd gzip lz4 pigz lzop"
@@ -107,6 +109,14 @@ _btrfs_backup_ng() {
             _filedir -d
             return
             ;;
+        --fs-checks)
+            COMPREPLY=($(compgen -W "$fs_checks_modes" -- "$cur"))
+            return
+            ;;
+        --safety-margin)
+            # Numeric percentage
+            return
+            ;;
     esac
 
     # Handle command completion
@@ -174,6 +184,13 @@ _btrfs_backup_ng() {
                             COMPREPLY=($(compgen -W "$config_import_opts" -- "$cur"))
                         else
                             _filedir conf
+                        fi
+                        ;;
+                    detect)
+                        if [[ "$cur" == -* ]]; then
+                            COMPREPLY=($(compgen -W "$config_detect_opts" -- "$cur"))
+                        else
+                            _filedir -d
                         fi
                         ;;
                 esac
