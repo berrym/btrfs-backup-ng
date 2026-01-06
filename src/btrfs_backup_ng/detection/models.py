@@ -115,17 +115,19 @@ class DetectedSubvolume:
     def suggested_prefix(self) -> str:
         """Generate a suggested snapshot prefix from the path.
 
+        The prefix includes a trailing dash for readable snapshot names.
+
         Examples:
-            /home -> home
-            / -> root
-            /var/log -> var-log
+            /home -> home-
+            / -> root-
+            /var/log -> var-log-
         """
         path = self.mount_point or self.path
         # Strip leading/trailing slashes and replace internal slashes with dashes
         clean = path.strip("/")
         if not clean:
-            return "root"
-        return clean.replace("/", "-")
+            return "root-"
+        return clean.replace("/", "-") + "-"
 
 
 @dataclass

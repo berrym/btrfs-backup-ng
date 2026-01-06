@@ -180,6 +180,103 @@ class SSHMasterManager:
         """Check if sshpass utility is available."""
         return shutil.which("sshpass") is not None
 
+    def _find_ssh_agent_socket(self, uid: int) -> Optional[str]:
+        """Find SSH agent socket for a given user.
+
+        Searches common locations for SSH agent sockets. This is useful when
+        running with sudo where SSH_AUTH_SOCK may not be preserved.
+
+        The search prioritizes sockets that are likely to have keys loaded:
+        1. Traditional ssh-agent sockets in /tmp (from ssh-agent or ssh -A)
+        2. GNOME Keyring socket
+        3. GPG agent with SSH support
+        4. systemd ssh-agent socket (often empty/unused)
+
+        Args:
+            uid: User ID to search for agent sockets
+
+        Returns:
+            Path to agent socket if found, None otherwise
+        """
+        import glob
+        import subprocess
+
+        # Common locations for ssh-agent sockets, ordered by likelihood of having keys
+        search_paths = [
+            # Traditional ssh-agent in /tmp - most likely to have keys from ssh-add
+            "/tmp/ssh-*/agent.*",
+            # GNOME Keyring - often has keys from login
+            f"/run/user/{uid}/keyring/ssh",
+            # gpg-agent with ssh support
+            f"/run/user/{uid}/gnupg/S.gpg-agent.ssh",
+            # systemd ssh-agent - often exists but may be empty
+            f"/run/user/{uid}/ssh-agent.socket",
+        ]
+
+        def socket_has_keys(sock_path: str) -> bool:
+            """Check if an agent socket has any keys loaded."""
+            try:
+                env = os.environ.copy()
+                env["SSH_AUTH_SOCK"] = sock_path
+                result = subprocess.run(
+                    ["ssh-add", "-l"],
+                    env=env,
+                    capture_output=True,
+                    timeout=5,
+                )
+                # Return code 0 means keys are loaded
+                # Return code 1 means "no identities"
+                return result.returncode == 0
+            except Exception:
+                return False
+
+        # First pass: find sockets with keys loaded
+        for pattern in search_paths:
+            if "*" in pattern:
+                # Glob pattern - find matching sockets owned by the user
+                for sock in glob.glob(pattern):
+                    try:
+                        stat = os.stat(sock)
+                        if stat.st_uid == uid and socket_has_keys(sock):
+                            logger.debug(f"Found agent socket with keys: {sock}")
+                            return sock
+                    except (OSError, IOError):
+                        continue
+            else:
+                # Exact path
+                if os.path.exists(pattern):
+                    try:
+                        stat = os.stat(pattern)
+                        if stat.st_uid == uid and socket_has_keys(pattern):
+                            logger.debug(f"Found agent socket with keys: {pattern}")
+                            return pattern
+                    except (OSError, IOError):
+                        continue
+
+        # Second pass: return any accessible socket (even without keys)
+        # This allows password auth fallback to work
+        for pattern in search_paths:
+            if "*" in pattern:
+                for sock in glob.glob(pattern):
+                    try:
+                        stat = os.stat(sock)
+                        if stat.st_uid == uid:
+                            logger.debug(f"Found agent socket (no keys): {sock}")
+                            return sock
+                    except (OSError, IOError):
+                        continue
+            else:
+                if os.path.exists(pattern):
+                    try:
+                        stat = os.stat(pattern)
+                        if stat.st_uid == uid:
+                            logger.debug(f"Found agent socket (no keys): {pattern}")
+                            return pattern
+                    except (OSError, IOError):
+                        continue
+
+        return None
+
     def _try_key_auth(self, env: dict) -> bool:
         """Try SSH connection with key-based authentication.
 
@@ -320,8 +417,20 @@ class SSHMasterManager:
 
             env = os.environ.copy()
             if self.running_as_sudo and self.sudo_user:
-                env["HOME"] = pwd.getpwnam(self.sudo_user).pw_dir
+                sudo_user_info = pwd.getpwnam(self.sudo_user)
+                env["HOME"] = sudo_user_info.pw_dir
                 env["USER"] = self.sudo_user
+
+                # Preserve SSH_AUTH_SOCK for ssh-agent access
+                # When running with sudo, the agent socket variable is often cleared
+                # but the socket itself may still be accessible
+                if "SSH_AUTH_SOCK" not in env or not os.path.exists(
+                    env.get("SSH_AUTH_SOCK", "")
+                ):
+                    agent_sock = self._find_ssh_agent_socket(sudo_user_info.pw_uid)
+                    if agent_sock:
+                        env["SSH_AUTH_SOCK"] = agent_sock
+                        logger.debug(f"Found SSH agent socket: {agent_sock}")
 
             # Try key-based auth first
             logger.debug("Attempting SSH key-based authentication...")

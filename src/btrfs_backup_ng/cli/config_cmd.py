@@ -334,8 +334,8 @@ def _run_interactive_wizard() -> str:
                 continue
             break
 
-        # Generate default prefix from path
-        default_prefix = Path(volume_path).name or "root"
+        # Generate default prefix from path (with trailing dash for readable snapshot names)
+        default_prefix = (Path(volume_path).name or "root") + "-"
         snapshot_prefix = _prompt("Snapshot prefix", default_prefix)
 
         volume: dict[str, Any] = {
@@ -472,6 +472,8 @@ def _init_config(args: argparse.Namespace) -> int:
                 return 1
 
         try:
+            # Create parent directory if needed
+            Path(output).parent.mkdir(parents=True, exist_ok=True)
             with open(output, "w") as f:
                 f.write(content)
             if interactive:
@@ -482,6 +484,48 @@ def _init_config(args: argparse.Namespace) -> int:
                 print(f"Example configuration written to: {output}")
         except OSError as e:
             print(f"Error writing file: {e}")
+            return 1
+    elif interactive:
+        # Interactive mode without explicit output - offer to save
+        default_path = str(Path.home() / ".config/btrfs-backup-ng/config.toml")
+        print()
+        save_choice = _prompt_choice(
+            "What would you like to do with this configuration?",
+            ["save", "print", "cancel"],
+            "save",
+        )
+
+        if save_choice == "cancel":
+            print("Configuration cancelled.")
+            return 0
+
+        if save_choice == "print":
+            print()
+            print(content)
+            return 0
+
+        # Save to file
+        save_path = _prompt("Save configuration to", default_path)
+        save_file = Path(save_path)
+
+        try:
+            save_file.parent.mkdir(parents=True, exist_ok=True)
+
+            if save_file.exists():
+                if not _prompt_bool(f"File {save_path} exists. Overwrite?", False):
+                    print("Aborted.")
+                    return 1
+
+            save_file.write_text(content)
+            print()
+            print(f"Configuration saved to: {save_path}")
+            print()
+            print("Next steps:")
+            print(f"  1. Review:  btrfs-backup-ng config validate -c {save_path}")
+            print(f"  2. Test:    sudo btrfs-backup-ng run --dry-run -c {save_path}")
+            print(f"  3. Install: sudo btrfs-backup-ng install -c {save_path}")
+        except OSError as e:
+            print(f"Error saving configuration: {e}")
             return 1
     else:
         print(content)

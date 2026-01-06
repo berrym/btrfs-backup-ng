@@ -89,19 +89,19 @@ class TestDetectedSubvolume:
         assert subvol.display_path == "/home"
 
     def test_suggested_prefix_home(self):
-        """Test suggested_prefix for /home."""
+        """Test suggested_prefix for /home (includes trailing dash)."""
         subvol = DetectedSubvolume(id=256, path="/home", mount_point="/home")
-        assert subvol.suggested_prefix == "home"
+        assert subvol.suggested_prefix == "home-"
 
     def test_suggested_prefix_root(self):
-        """Test suggested_prefix for /."""
+        """Test suggested_prefix for / (includes trailing dash)."""
         subvol = DetectedSubvolume(id=5, path="/", mount_point="/")
-        assert subvol.suggested_prefix == "root"
+        assert subvol.suggested_prefix == "root-"
 
     def test_suggested_prefix_nested(self):
-        """Test suggested_prefix for nested path."""
+        """Test suggested_prefix for nested path (includes trailing dash)."""
         subvol = DetectedSubvolume(id=260, path="/var/log", mount_point="/var/log")
-        assert subvol.suggested_prefix == "var-log"
+        assert subvol.suggested_prefix == "var-log-"
 
     def test_hash_and_equality(self):
         """Test hash and equality based on id and device."""

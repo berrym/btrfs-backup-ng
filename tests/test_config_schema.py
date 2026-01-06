@@ -93,15 +93,15 @@ class TestVolumeConfig:
         assert volume.enabled is True
 
     def test_auto_prefix_from_path(self):
-        """Test automatic snapshot prefix generation."""
+        """Test automatic snapshot prefix generation (includes trailing dash)."""
         volume = VolumeConfig(path="/home")
-        assert volume.snapshot_prefix == "home"
+        assert volume.snapshot_prefix == "home-"
 
         volume = VolumeConfig(path="/var/log")
-        assert volume.snapshot_prefix == "var-log"
+        assert volume.snapshot_prefix == "var-log-"
 
         volume = VolumeConfig(path="/")
-        assert volume.snapshot_prefix == "root"
+        assert volume.snapshot_prefix == "root-"
 
     def test_custom_prefix(self):
         """Test custom snapshot prefix."""

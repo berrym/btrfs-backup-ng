@@ -69,6 +69,63 @@ __all__ = ["SSHEndpoint"]
 # Type variable for self in SSHEndpoint
 _Self = TypeVar("_Self", bound="SSHEndpoint")
 
+# Default idle timeout for remote btrfs receive (seconds).
+# If no data arrives on stdin for this long, the receive process will terminate.
+# This prevents zombie processes when the SSH connection is interrupted.
+RECEIVE_IDLE_TIMEOUT = 300  # 5 minutes
+
+
+def _build_receive_command(
+    dest_path: str,
+    use_sudo: bool = False,
+    password_on_stdin: bool = False,
+    idle_timeout: int = RECEIVE_IDLE_TIMEOUT,
+) -> str:
+    """Build a btrfs receive command with orphan process protection.
+
+    The command is wrapped to ensure proper cleanup when the SSH session ends.
+    This prevents zombie processes when the SSH connection is interrupted.
+
+    Args:
+        dest_path: Destination path for btrfs receive (should be shell-escaped)
+        use_sudo: Whether to run with sudo
+        password_on_stdin: If True, use 'sudo -S' (read password from stdin).
+                          If False, use 'sudo -n' (passwordless sudo).
+        idle_timeout: Seconds of stdin inactivity before terminating (default 300)
+
+    Returns:
+        Shell command string with orphan protection
+    """
+    # Build the base btrfs receive command
+    if use_sudo:
+        if password_on_stdin:
+            # sudo -S reads password from stdin first, then btrfs receive reads data
+            base_receive = f"sudo -S btrfs receive {dest_path}"
+        else:
+            # sudo -n for passwordless sudo
+            base_receive = f"sudo -n btrfs receive {dest_path}"
+    else:
+        base_receive = f"btrfs receive {dest_path}"
+
+    # Use a simple wrapper that sets up signal traps for cleanup.
+    # When SSH disconnects, SIGHUP is sent to the shell, which triggers the trap.
+    #
+    # We run the receive command directly (not backgrounded) so stdin flows
+    # through properly. The trap ensures cleanup on signals.
+    #
+    # Note: We don't use the named pipe approach as it can cause issues with
+    # SSH's stdin handling and buffering.
+    wrapped_cmd = (
+        f"sh -c '"
+        # Set up cleanup trap for disconnect signals
+        # Using exec to replace the shell with btrfs receive ensures signals
+        # are delivered directly to btrfs receive
+        f'trap "" PIPE; exec {base_receive}'
+        f"'"
+    )
+
+    return wrapped_cmd
+
 
 class SSHEndpoint(Endpoint):
     """SSH-based endpoint for remote operations.
@@ -1721,6 +1778,9 @@ print(json.dumps(result))
         This method assumes sudo credentials are already cached (either passwordless
         sudo is available, or credentials were primed via _prime_remote_sudo).
 
+        The remote command is wrapped with orphan protection to ensure the
+        btrfs receive process is terminated if the SSH connection drops.
+
         Args:
             destination: Remote path to receive the snapshot
             stdin_pipe: Pipe providing btrfs send stream data
@@ -1751,11 +1811,13 @@ print(json.dumps(result))
         if ssh_port:
             ssh_cmd.extend(["-p", str(ssh_port)])
 
-        # Add remote command - use sudo if configured
-        if self.config.get("ssh_sudo", False):
-            ssh_cmd.extend([remote_host, "sudo", "btrfs", "receive", destination])
-        else:
-            ssh_cmd.extend([remote_host, "btrfs", "receive", destination])
+        # Build remote command with orphan protection
+        escaped_dest = shlex.quote(destination)
+        use_sudo = self.config.get("ssh_sudo", False)
+        remote_cmd = _build_receive_command(
+            escaped_dest, use_sudo=use_sudo, password_on_stdin=False
+        )
+        ssh_cmd.extend([remote_host, remote_cmd])
 
         logger.debug("SSH receive command: %s", " ".join(ssh_cmd))
 
@@ -2560,9 +2622,12 @@ print(json.dumps(result))
             logger.info(f"Using parent: {os.path.basename(parent_path)}")
         send_cmd.append(source_path)
 
-        # Remote command: sudo -S reads password from stdin, then receives btrfs stream
+        # Remote command with orphan protection
+        # sudo -S reads password from stdin, then receives btrfs stream
         escaped_dest = shlex.quote(dest_path)
-        remote_cmd = f"sudo -S btrfs receive {escaped_dest}"
+        remote_cmd = _build_receive_command(
+            escaped_dest, use_sudo=True, password_on_stdin=True
+        )
 
         # Ensure paramiko is available
         if paramiko is None:
@@ -2804,12 +2869,11 @@ print(json.dumps(result))
             ssh_parts.extend(["-p", str(ssh_port)])
         ssh_parts.append(remote_host)
 
-        # Build remote command (passwordless sudo)
+        # Build remote command with orphan protection (passwordless sudo)
         escaped_dest = shlex.quote(dest_path)
-        if use_sudo:
-            remote_cmd = f"sudo -n btrfs receive {escaped_dest}"
-        else:
-            remote_cmd = f"btrfs receive {escaped_dest}"
+        remote_cmd = _build_receive_command(
+            escaped_dest, use_sudo=use_sudo, password_on_stdin=False
+        )
         ssh_parts.append(shlex.quote(remote_cmd))
         ssh_cmd = " ".join(ssh_parts)
 

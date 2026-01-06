@@ -6,6 +6,7 @@ import pytest
 
 from btrfs_backup_ng.config.loader import (
     ConfigError,
+    _get_config_search_paths,
     find_config_file,
     load_config,
 )
@@ -55,6 +56,51 @@ class TestFindConfigFile:
         result = find_config_file(None)
         # Result may be None or an actual path depending on user's system
         assert result is None or isinstance(result, Path)
+
+    def test_sudo_user_config_priority(self, tmp_path, monkeypatch, sample_config_toml):
+        """Test that SUDO_USER config is checked first when running as root via sudo."""
+        # Create sudo user's config
+        sudo_user_home = tmp_path / "sudo_user_home"
+        sudo_user_config = sudo_user_home / ".config" / "btrfs-backup-ng"
+        sudo_user_config.mkdir(parents=True)
+        (sudo_user_config / "config.toml").write_text(sample_config_toml)
+
+        # Create root's config (should not be found first)
+        root_home = tmp_path / "root"
+        root_config = root_home / ".config" / "btrfs-backup-ng"
+        root_config.mkdir(parents=True)
+        (root_config / "config.toml").write_text("[global]\n")
+
+        # Mock sudo environment
+        monkeypatch.setenv("SUDO_USER", "testuser")
+        monkeypatch.setattr("os.geteuid", lambda: 0)  # Running as root
+        monkeypatch.setattr(Path, "home", staticmethod(lambda: root_home))
+
+        # Mock pwd.getpwnam to return our test user's home
+        import pwd
+
+        class MockPwnam:
+            pw_dir = str(sudo_user_home)
+
+        monkeypatch.setattr(pwd, "getpwnam", lambda x: MockPwnam())
+
+        # Get search paths and verify sudo user's config comes first
+        paths = _get_config_search_paths()
+        assert len(paths) >= 2
+        assert paths[0] == sudo_user_config / "config.toml"
+        assert paths[1] == root_config / "config.toml"
+
+    def test_non_sudo_config_paths(self, tmp_path, monkeypatch):
+        """Test config paths when not running under sudo."""
+        # Ensure SUDO_USER is not set
+        monkeypatch.delenv("SUDO_USER", raising=False)
+        monkeypatch.setattr(Path, "home", staticmethod(lambda: tmp_path))
+
+        paths = _get_config_search_paths()
+        # Should have user config and system config
+        assert len(paths) == 2
+        assert paths[0] == tmp_path / ".config" / "btrfs-backup-ng" / "config.toml"
+        assert paths[1] == Path("/etc/btrfs-backup-ng/config.toml")
 
 
 class TestLoadConfig:

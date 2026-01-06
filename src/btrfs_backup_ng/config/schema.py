@@ -147,8 +147,9 @@ class VolumeConfig:
     def __post_init__(self):
         # Generate default prefix from path if not specified
         if not self.snapshot_prefix:
-            # /home -> home, /var/log -> var-log
-            self.snapshot_prefix = self.path.strip("/").replace("/", "-") or "root"
+            # /home -> home-, /var/log -> var-log- (trailing dash for readable snapshot names)
+            base = self.path.strip("/").replace("/", "-") or "root"
+            self.snapshot_prefix = base + "-"
 
 
 @dataclass

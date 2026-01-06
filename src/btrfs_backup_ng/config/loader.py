@@ -3,6 +3,8 @@
 Handles config file discovery, parsing, and validation with helpful error messages.
 """
 
+import os
+import pwd
 import tomllib
 from pathlib import Path
 from typing import Any
@@ -25,11 +27,33 @@ class ConfigError(Exception):
     pass
 
 
-# Config file search paths in priority order
-CONFIG_PATHS = [
-    Path.home() / ".config" / "btrfs-backup-ng" / "config.toml",
-    Path("/etc/btrfs-backup-ng/config.toml"),
-]
+def _get_config_search_paths() -> list[Path]:
+    """Get config file search paths in priority order.
+
+    When running under sudo, prioritizes the original user's config
+    before falling back to root's config and system-wide config.
+    """
+    paths = []
+
+    # Check if running under sudo
+    sudo_user = os.environ.get("SUDO_USER")
+    if sudo_user and os.geteuid() == 0:
+        # Running as root via sudo - check original user's config first
+        try:
+            sudo_user_home = pwd.getpwnam(sudo_user).pw_dir
+            paths.append(
+                Path(sudo_user_home) / ".config" / "btrfs-backup-ng" / "config.toml"
+            )
+        except KeyError:
+            pass  # User not found, skip
+
+    # Current user's config (root's if running as root)
+    paths.append(Path.home() / ".config" / "btrfs-backup-ng" / "config.toml")
+
+    # System-wide config
+    paths.append(Path("/etc/btrfs-backup-ng/config.toml"))
+
+    return paths
 
 
 def find_config_file(explicit_path: str | None = None) -> Path | None:
@@ -40,6 +64,9 @@ def find_config_file(explicit_path: str | None = None) -> Path | None:
 
     Returns:
         Path to config file, or None if not found
+
+    When running under sudo, checks the original user's config directory
+    before falling back to root's config and system-wide config.
     """
     if explicit_path:
         path = Path(explicit_path)
@@ -47,7 +74,7 @@ def find_config_file(explicit_path: str | None = None) -> Path | None:
             return path
         raise ConfigError(f"Config file not found: {explicit_path}")
 
-    for path in CONFIG_PATHS:
+    for path in _get_config_search_paths():
         if path.exists():
             return path
 
@@ -298,7 +325,7 @@ yearly = 0          # Don't keep yearly (0 = disabled)
 # Home directory backup
 [[volumes]]
 path = "/home"
-snapshot_prefix = "home"
+snapshot_prefix = "home-"
 
 [[volumes.targets]]
 path = "/mnt/backup/home"
@@ -316,7 +343,7 @@ path = "/mnt/backup/home"
 # System logs backup with custom retention
 # [[volumes]]
 # path = "/var/log"
-# snapshot_prefix = "logs"
+# snapshot_prefix = "logs-"
 #
 # [volumes.retention]
 # daily = 14
