@@ -1211,3 +1211,254 @@ class TestCliDoctor:
 
         call_kwargs = mock_doctor.run_diagnostics.call_args[1]
         assert call_kwargs["volume_filter"] == "/home"
+
+
+class TestDoctorSSHTarget:
+    """Tests for SSH target reachability checks."""
+
+    @patch("btrfs_backup_ng.sshutil.diagnose.test_ssh_connection")
+    def test_check_ssh_target_success(self, mock_test_ssh):
+        """Test SSH target check when connection succeeds."""
+        mock_test_ssh.return_value = {"success": True}
+
+        mock_target = MagicMock()
+        mock_target.path = "ssh://user@host:/backup"
+        mock_target.parsed_url = MagicMock()
+        mock_target.parsed_url.scheme = "ssh"
+
+        doctor = Doctor()
+        findings = doctor._check_ssh_target(mock_target)
+
+        assert any(f.severity == DiagnosticSeverity.OK for f in findings)
+        assert any("reachable" in f.message for f in findings)
+
+    @patch("btrfs_backup_ng.sshutil.diagnose.test_ssh_connection")
+    def test_check_ssh_target_failure(self, mock_test_ssh):
+        """Test SSH target check when connection fails."""
+        mock_test_ssh.return_value = {"success": False, "error": "Connection refused"}
+
+        mock_target = MagicMock()
+        mock_target.path = "ssh://user@host:/backup"
+
+        doctor = Doctor()
+        findings = doctor._check_ssh_target(mock_target)
+
+        assert any(f.severity == DiagnosticSeverity.ERROR for f in findings)
+
+    @patch("btrfs_backup_ng.sshutil.diagnose.test_ssh_connection")
+    def test_check_ssh_target_exception(self, mock_test_ssh):
+        """Test SSH target check when exception occurs."""
+        mock_test_ssh.side_effect = Exception("Network error")
+
+        mock_target = MagicMock()
+        mock_target.path = "ssh://user@host:/backup"
+
+        doctor = Doctor()
+        findings = doctor._check_ssh_target(mock_target)
+
+        assert any(f.severity == DiagnosticSeverity.ERROR for f in findings)
+        assert any("failed" in f.message.lower() for f in findings)
+
+
+class TestDoctorStaleLocks:
+    """Tests for stale lock detection and fixing."""
+
+    def test_fix_stale_lock_success(self, tmp_path):
+        """Test successfully fixing a stale lock."""
+        # Create a mock lock file
+        lock_file = tmp_path / ".locks"
+        lock_content = '{"snapshot-1": {"locks": ["transfer:99999"]}}'
+        lock_file.write_text(lock_content)
+
+        doctor = Doctor()
+        result = doctor._fix_stale_lock(lock_file, "snapshot-1", "transfer:99999")
+
+        assert result is True
+        # Lock should be removed
+        new_content = lock_file.read_text()
+        assert "transfer:99999" not in new_content
+
+    def test_fix_stale_lock_file_not_found(self, tmp_path):
+        """Test fixing lock when file doesn't exist."""
+        lock_file = tmp_path / "nonexistent_locks"
+
+        doctor = Doctor()
+        result = doctor._fix_stale_lock(lock_file, "snapshot-1", "transfer:99999")
+
+        assert result is False
+
+    def test_fix_stale_lock_snapshot_not_in_locks(self, tmp_path):
+        """Test fixing lock when snapshot not in lock file."""
+        lock_file = tmp_path / ".locks"
+        lock_content = '{"other-snapshot": {"locks": ["transfer:12345"]}}'
+        lock_file.write_text(lock_content)
+
+        doctor = Doctor()
+        result = doctor._fix_stale_lock(lock_file, "snapshot-1", "transfer:99999")
+
+        assert result is False
+
+    def test_make_lock_fix_action(self, tmp_path):
+        """Test creating a lock fix action."""
+        lock_file = tmp_path / ".locks"
+        lock_content = '{"snapshot-1": {"locks": ["transfer:99999"]}}'
+        lock_file.write_text(lock_content)
+
+        doctor = Doctor()
+        fix_action = doctor._make_lock_fix_action(
+            lock_file, "snapshot-1", "transfer:99999"
+        )
+
+        # Should be callable and return True on success
+        assert callable(fix_action)
+        result = fix_action()
+        assert result is True
+
+
+class TestDoctorRecentFailures:
+    """Tests for recent failures check."""
+
+    def test_check_recent_failures_no_config(self):
+        """Test recent failures check without config."""
+        doctor = Doctor()
+        findings = doctor._check_recent_failures()
+        assert len(findings) == 0
+
+    def test_check_recent_failures_no_log_configured(self):
+        """Test recent failures when transaction log not configured."""
+        mock_config = MagicMock()
+        mock_config.global_config.transaction_log = None
+
+        doctor = Doctor(config=mock_config)
+        findings = doctor._check_recent_failures()
+
+        assert any(f.severity == DiagnosticSeverity.INFO for f in findings)
+        assert any("not enabled" in f.message for f in findings)
+
+    def test_check_recent_failures_log_not_exists(self, tmp_path):
+        """Test recent failures when log file doesn't exist yet."""
+        mock_config = MagicMock()
+        mock_config.global_config.transaction_log = str(tmp_path / "nonexistent.jsonl")
+
+        doctor = Doctor(config=mock_config)
+        findings = doctor._check_recent_failures()
+
+        assert any(f.severity == DiagnosticSeverity.OK for f in findings)
+        assert any("No transaction history" in f.message for f in findings)
+
+
+class TestDoctorInteractiveFix:
+    """Tests for interactive fix mode."""
+
+    def test_apply_fixes_interactive_skips(self):
+        """Test that interactive mode skips fixes (not implemented)."""
+        doctor = Doctor()
+        report = DiagnosticReport()
+
+        finding = DiagnosticFinding(
+            DiagnosticCategory.TRANSFERS,
+            DiagnosticSeverity.WARN,
+            "test",
+            "test finding",
+            fixable=True,
+        )
+        finding.fix_action = lambda: True
+        report.add_finding(finding)
+
+        # Interactive mode should skip all fixes
+        results = doctor.apply_fixes(report, interactive=True)
+        assert len(results) == 0
+
+    def test_apply_fixes_fix_returns_false(self):
+        """Test apply_fixes when fix action returns False."""
+        doctor = Doctor()
+        report = DiagnosticReport()
+
+        finding = DiagnosticFinding(
+            DiagnosticCategory.TRANSFERS,
+            DiagnosticSeverity.WARN,
+            "test",
+            "test finding",
+            fixable=True,
+        )
+        finding.fix_action = lambda: False
+        report.add_finding(finding)
+
+        results = doctor.apply_fixes(report, interactive=False)
+
+        assert len(results) == 1
+        assert results[0].success is False
+
+
+class TestDoctorCheckFailure:
+    """Tests for check failure handling."""
+
+    def test_run_diagnostics_check_exception(self):
+        """Test that exceptions in checks are handled gracefully."""
+        doctor = Doctor()
+
+        # Replace a check with one that throws
+        def failing_check():
+            raise RuntimeError("Check exploded")
+
+        # Find and replace a check
+        for check in doctor._checks:
+            if check.name == "config_exists":
+                check.check_func = failing_check
+                break
+
+        report = doctor.run_diagnostics(categories={DiagnosticCategory.CONFIG})
+
+        # Should have an error finding for the failed check
+        assert any(
+            f.severity == DiagnosticSeverity.ERROR and "failed" in f.message.lower()
+            for f in report.findings
+        )
+
+
+class TestDoctorLastBackupAge:
+    """Tests for last backup age check."""
+
+    def test_check_last_backup_age_no_transaction_log(self):
+        """Test last backup age when no transaction log configured."""
+        mock_config = MagicMock()
+        mock_config.global_config.transaction_log = None
+
+        doctor = Doctor(config=mock_config)
+        findings = doctor._check_last_backup_age()
+
+        assert any(f.severity == DiagnosticSeverity.INFO for f in findings)
+
+
+class TestDoctorSnapshotChecks:
+    """Tests for snapshot health checks."""
+
+    def test_check_parent_chains_no_config(self):
+        """Test parent chain check without config returns empty."""
+        doctor = Doctor()
+        findings = doctor._check_parent_chains()
+
+        # Returns empty when no config
+        assert len(findings) == 0
+
+    def test_check_parent_chains_with_config(self):
+        """Test parent chain check with config."""
+        mock_config = MagicMock()
+        mock_config.get_enabled_volumes.return_value = []
+
+        doctor = Doctor(config=mock_config)
+        findings = doctor._check_parent_chains()
+
+        # Should return stub/placeholder finding
+        assert len(findings) > 0
+
+    def test_check_snapshot_dates_with_config(self):
+        """Test snapshot dates check with config but no volumes."""
+        mock_config = MagicMock()
+        mock_config.get_enabled_volumes.return_value = []
+
+        doctor = Doctor(config=mock_config)
+        findings = doctor._check_snapshot_dates()
+
+        # Should return stub finding since no endpoint access
+        assert len(findings) > 0
