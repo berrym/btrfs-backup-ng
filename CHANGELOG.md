@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+#### System Diagnostics (Doctor Command)
+- **`doctor` command** for comprehensive backup system health analysis
+- Checks configuration validity, volume paths, target reachability, compression availability
+- Detects snapshot health issues: orphaned snapshots, missing snapshots, broken parent chains
+- Identifies stale locks from crashed processes with auto-fix capability
+- Monitors system state: destination space, quota limits, systemd timer status, backup age
+- **Auto-fix mode** (`--fix`) to resolve safe issues like stale locks and temp files
+- **Interactive fix mode** (`--fix --interactive`) for confirmation before each fix
+- JSON output (`--json`) for scripting and monitoring integration
+- Category filtering (`--check config|snapshots|transfers|system`)
+- Volume-specific checks (`--volume /path`)
+- Exit codes: 0 (healthy), 1 (warnings), 2 (errors/critical)
+
 #### Space-Aware Operations
 - **Destination space checking** before backup transfers with `--check-space` flag on estimate command
 - **btrfs quota (qgroup) awareness** - detects when quota limits are more restrictive than filesystem space

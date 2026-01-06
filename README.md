@@ -194,6 +194,7 @@ btrfs-backup-ng install --user --timer=daily
 | `restore` | Restore snapshots from backup location |
 | `verify` | Verify backup integrity (metadata, stream, or full test) |
 | `estimate` | Estimate backup transfer sizes (use `--check-space` for space verification) |
+| `doctor` | Diagnose backup system health and fix common issues |
 | `list` | Show snapshots and backups |
 | `status` | Show job status and statistics |
 | `config validate` | Validate configuration file |
@@ -1581,6 +1582,100 @@ fi
 | `--no-fs-checks` | Skip btrfs subvolume verification |
 | `--json` | Output in JSON format |
 | `-q, --quiet` | Suppress progress output |
+
+## System Diagnostics (Doctor)
+
+The `doctor` command analyzes your backup system and diagnoses potential problems. It checks configuration, snapshot health, transfer state, and system resources, with optional auto-fix capabilities.
+
+### Basic Usage
+
+```bash
+# Run full diagnostics
+btrfs-backup-ng doctor
+
+# JSON output for scripting/monitoring
+btrfs-backup-ng doctor --json
+
+# Check specific category only
+btrfs-backup-ng doctor --check config
+btrfs-backup-ng doctor --check snapshots
+btrfs-backup-ng doctor --check transfers
+btrfs-backup-ng doctor --check system
+
+# Only show problems (suppress OK messages)
+btrfs-backup-ng doctor --quiet
+
+# Check specific volume
+btrfs-backup-ng doctor --volume /home
+```
+
+### Auto-Fix Issues
+
+Some issues can be automatically fixed:
+
+```bash
+# Auto-fix safe issues (stale locks, temp files)
+btrfs-backup-ng doctor --fix
+
+# Interactive fix (confirm each fix)
+btrfs-backup-ng doctor --fix --interactive
+```
+
+### Example Output
+
+```
+btrfs-backup-ng Doctor
+=======================================================
+
+Configuration
+  [OK]    Config file valid
+  [OK]    Volume /home exists and is btrfs subvolume
+  [WARN]  Compression program 'pigz' not found
+
+Snapshots
+  [OK]    Volume /home: 24 snapshots, chain intact
+
+Transfers
+  [WARN]  Stale lock: home-20260110 (process 12345 not running)
+          [FIXABLE] Run with --fix to remove
+
+System
+  [OK]    Destination: 524 GiB available (52%)
+  [OK]    Systemd timer active, next: 2h 15m
+  [OK]    Last backup: 2h ago
+
+=======================================================
+Summary: 8 passed, 2 warnings, 0 errors
+Fixable: 1 issue (run with --fix)
+```
+
+### What Doctor Checks
+
+| Category | Checks |
+|----------|--------|
+| **config** | Config file exists and valid, volume paths exist, targets reachable, compression programs available |
+| **snapshots** | Orphaned snapshots, missing snapshots, broken parent chains |
+| **transfers** | Stale locks (dead processes), incomplete transfers, recent failures |
+| **system** | Destination space, quota limits, systemd timer status, backup age |
+
+### Exit Codes
+
+| Code | Meaning |
+|------|---------|
+| 0 | Healthy (all OK or INFO) |
+| 1 | Warnings present |
+| 2 | Errors or critical issues |
+
+### Doctor Options
+
+| Option | Description |
+|--------|-------------|
+| `--json` | Output in JSON format |
+| `--check CATEGORY` | Check specific category: config, snapshots, transfers, system |
+| `--fix` | Auto-fix safe issues |
+| `--interactive` | Confirm each fix before applying |
+| `--quiet` | Only show problems |
+| `--volume PATH` | Check specific volume only |
 
 ## Backup Size Estimation
 

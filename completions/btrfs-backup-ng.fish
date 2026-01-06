@@ -10,7 +10,7 @@ function __fish_btrfs_backup_ng_no_subcommand
     set -e cmd[1]
     for c in $cmd
         switch $c
-            case run snapshot transfer prune list status config install uninstall restore verify estimate completions
+            case run snapshot transfer prune list status config install uninstall restore verify estimate doctor completions manpages
                 return 1
         end
     end
@@ -62,6 +62,7 @@ complete -c btrfs-backup-ng -n __fish_btrfs_backup_ng_no_subcommand -a uninstall
 complete -c btrfs-backup-ng -n __fish_btrfs_backup_ng_no_subcommand -a restore -d 'Restore snapshots from backup location'
 complete -c btrfs-backup-ng -n __fish_btrfs_backup_ng_no_subcommand -a verify -d 'Verify backup integrity'
 complete -c btrfs-backup-ng -n __fish_btrfs_backup_ng_no_subcommand -a estimate -d 'Estimate backup transfer sizes'
+complete -c btrfs-backup-ng -n __fish_btrfs_backup_ng_no_subcommand -a doctor -d 'Diagnose backup system health and fix issues'
 complete -c btrfs-backup-ng -n __fish_btrfs_backup_ng_no_subcommand -a completions -d 'Install shell completion scripts'
 complete -c btrfs-backup-ng -n __fish_btrfs_backup_ng_no_subcommand -a manpages -d 'Install man pages'
 
@@ -192,6 +193,15 @@ complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_using_command estimate' -
 complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_using_command estimate' -l json -d 'Output results in JSON format'
 # Enable path completion for estimate positional arguments
 complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_using_command estimate' -a '(__fish_complete_directories)'
+
+# doctor command
+set -l doctor_categories config snapshots transfers system
+complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_using_command doctor' -l json -d 'Output results in JSON format'
+complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_using_command doctor' -l check -d 'Check specific category only' -xa "$doctor_categories"
+complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_using_command doctor' -l fix -d 'Auto-fix safe issues'
+complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_using_command doctor' -l interactive -d 'Confirm each fix before applying'
+complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_using_command doctor' -s q -l quiet -d 'Only show problems'
+complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_using_command doctor' -l volume -d 'Check specific volume only' -xa '(__fish_complete_directories)'
 
 # completions command subcommands
 complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_using_command completions' -a install -d 'Install completions for your shell'

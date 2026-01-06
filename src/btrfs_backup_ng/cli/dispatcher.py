@@ -27,6 +27,7 @@ SUBCOMMANDS = frozenset(
         "estimate",
         "completions",
         "manpages",
+        "doctor",
     }
 )
 
@@ -783,6 +784,69 @@ Examples:
         help="Safety margin percentage for space check (default: 10%%)",
     )
 
+    # doctor command
+    doctor_parser = subparsers.add_parser(
+        "doctor",
+        help="Diagnose backup system health",
+        description="Analyze and diagnose problems with the backup system",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Full system diagnosis
+  btrfs-backup-ng doctor
+
+  # JSON output for scripting
+  btrfs-backup-ng doctor --json
+
+  # Check specific category only
+  btrfs-backup-ng doctor --check config
+  btrfs-backup-ng doctor --check snapshots
+  btrfs-backup-ng doctor --check transfers
+  btrfs-backup-ng doctor --check system
+
+  # Auto-fix safe issues
+  btrfs-backup-ng doctor --fix
+
+  # Fix with confirmation prompts
+  btrfs-backup-ng doctor --fix --interactive
+""",
+    )
+    doctor_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Output results in JSON format",
+    )
+    doctor_parser.add_argument(
+        "--check",
+        choices=["config", "snapshots", "transfers", "system"],
+        action="append",
+        metavar="CATEGORY",
+        help="Check specific category only (can be repeated)",
+    )
+    doctor_parser.add_argument(
+        "--fix",
+        action="store_true",
+        help="Attempt to automatically fix safe issues",
+    )
+    doctor_parser.add_argument(
+        "-i",
+        "--interactive",
+        action="store_true",
+        help="Prompt for confirmation before each fix",
+    )
+    doctor_parser.add_argument(
+        "-q",
+        "--quiet",
+        action="store_true",
+        help="Only show warnings and errors",
+    )
+    doctor_parser.add_argument(
+        "--volume",
+        metavar="PATH",
+        action="append",
+        help="Only check specific volume(s)",
+    )
+
     return parser
 
 
@@ -874,6 +938,7 @@ def run_subcommand(args: argparse.Namespace) -> int:
         "estimate": cmd_estimate,
         "completions": cmd_completions,
         "manpages": cmd_manpages,
+        "doctor": cmd_doctor,
     }
 
     handler = handlers.get(args.command)
@@ -984,6 +1049,13 @@ def cmd_manpages(args: argparse.Namespace) -> int:
     from .manpages import execute_manpages
 
     return execute_manpages(args)
+
+
+def cmd_doctor(args: argparse.Namespace) -> int:
+    """Execute doctor command."""
+    from .doctor import execute_doctor
+
+    return execute_doctor(args)
 
 
 def main(argv: list[str] | None = None) -> int:

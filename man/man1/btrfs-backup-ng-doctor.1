@@ -1,0 +1,236 @@
+.\" Man page for btrfs-backup-ng doctor
+.TH BTRFS-BACKUP-NG-DOCTOR 1 "January 2026" "btrfs-backup-ng" "User Commands"
+.SH NAME
+btrfs-backup-ng-doctor \- diagnose backup system health and fix common issues
+.SH SYNOPSIS
+.B btrfs-backup-ng doctor
+[\fIOPTIONS\fR]
+.SH DESCRIPTION
+Analyze and diagnose problems with the backup system. The doctor command checks
+configuration, snapshot health, transfer state, and system resources, providing
+a comprehensive health report with optional auto-fix capabilities.
+.PP
+The command is designed for both interactive troubleshooting and automated
+monitoring. JSON output is available for integration with monitoring systems.
+.SH OPTIONS
+.TP
+.B \-\-json
+Output results in JSON format for scripting and monitoring integration.
+.TP
+.BI \-\-check " " \fICATEGORY\fR
+Check only the specified category. Valid categories:
+.RS
+.TP
+.B config
+Configuration checks: config file exists and valid, volume paths exist and are
+btrfs subvolumes, targets reachable, compression programs available.
+.TP
+.B snapshots
+Snapshot health checks: orphaned snapshots (on disk but not tracked), missing
+snapshots (tracked but not on disk), broken parent chains.
+.TP
+.B transfers
+Transfer and operation checks: stale locks (process not running), incomplete
+transfers, recent failures in transaction log.
+.TP
+.B system
+System state checks: destination space availability, quota limits approaching,
+systemd timer status, last backup age.
+.RE
+.TP
+.B \-\-fix
+Auto-fix safe issues. Currently fixes:
+.RS
+.IP \(bu 2
+Stale lock files from dead processes
+.IP \(bu 2
+Temporary files from incomplete operations
+.RE
+.TP
+.B \-\-interactive
+When used with \fB\-\-fix\fR, prompt for confirmation before applying each fix.
+Without this flag, all safe fixes are applied automatically.
+.TP
+.BR \-q ", " \-\-quiet
+Only show problems. Suppress OK and INFO findings in output.
+.TP
+.BI \-\-volume " " \fIPATH\fR
+Check only the specified volume. Can be used to focus diagnostics on a
+specific backup volume.
+.SH DIAGNOSTIC CATEGORIES
+.SS Configuration Checks
+.IP \(bu 2
+Configuration file exists and is valid TOML
+.IP \(bu 2
+All configured volume paths exist and are btrfs subvolumes
+.IP \(bu 2
+SSH targets are reachable (connection test)
+.IP \(bu 2
+Required compression programs are installed (zstd, gzip, etc.)
+.IP \(bu 2
+Retention policies are valid and reasonable
+.SS Snapshot Health Checks
+.IP \(bu 2
+Orphaned snapshots: exist on disk but not tracked in backup metadata
+.IP \(bu 2
+Missing snapshots: tracked in metadata but not present on disk
+.IP \(bu 2
+Broken parent chains: incremental backup parents are missing
+.IP \(bu 2
+Unparseable snapshot dates: naming convention issues
+.SS Transfer/Operation Checks
+.IP \(bu 2
+Stale locks: lock files where the owning process is no longer running
+.IP \(bu 2
+Incomplete transfers: partial backup data from interrupted operations
+.IP \(bu 2
+Recent failures: errors in transaction log from failed operations
+.IP \(bu 2
+Long-running operations: transfers that may be stuck
+.SS System State Checks
+.IP \(bu 2
+Destination space low: less than 20% free space (warning)
+.IP \(bu 2
+Destination space critical: less than 5% free space (error)
+.IP \(bu 2
+Quota limits approaching: btrfs qgroup limits nearly reached
+.IP \(bu 2
+Systemd timer not active: scheduled backups may not run
+.IP \(bu 2
+Last backup too old: more than 24 hours since last successful backup
+.SH SEVERITY LEVELS
+.TP
+.B OK
+Check passed, no issues found.
+.TP
+.B INFO
+Informational finding, no action required.
+.TP
+.B WARN
+Warning condition that should be addressed but is not critical.
+.TP
+.B ERROR
+Error condition that will likely cause backup failures.
+.TP
+.B CRITICAL
+Critical issue requiring immediate attention.
+.SH EXIT STATUS
+.TP
+.B 0
+Healthy \- all findings are OK or INFO level.
+.TP
+.B 1
+Warnings present \- one or more WARN findings.
+.TP
+.B 2
+Errors or critical issues \- one or more ERROR or CRITICAL findings.
+.SH EXAMPLES
+.TP
+Run full diagnostics:
+.B btrfs-backup-ng doctor
+.TP
+JSON output for monitoring:
+.B btrfs-backup-ng doctor --json
+.TP
+Check only configuration:
+.B btrfs-backup-ng doctor --check config
+.TP
+Check only snapshot health:
+.B btrfs-backup-ng doctor --check snapshots
+.TP
+Auto-fix safe issues:
+.B btrfs-backup-ng doctor --fix
+.TP
+Interactive fix with confirmation:
+.B btrfs-backup-ng doctor --fix --interactive
+.TP
+Only show problems:
+.B btrfs-backup-ng doctor --quiet
+.TP
+Check specific volume:
+.B btrfs-backup-ng doctor --volume /home
+.SH OUTPUT FORMAT
+.SS Human-Readable Output
+.PP
+.RS
+.nf
+btrfs-backup-ng Doctor
+=======================================================
+
+Configuration
+  [OK]    Config file valid
+  [OK]    Volume /home exists and is btrfs subvolume
+  [WARN]  Compression program 'pigz' not found
+
+Snapshots
+  [OK]    Volume /home: 24 snapshots, chain intact
+
+Transfers
+  [WARN]  Stale lock: home-20260110 (process 12345 not running)
+          [FIXABLE] Run with --fix to remove
+
+System
+  [OK]    Destination: 524 GiB available (52%)
+  [OK]    Systemd timer active, next: 2h 15m
+
+=======================================================
+Summary: 7 passed, 2 warnings, 0 errors
+Fixable: 1 issue (run with --fix)
+.fi
+.RE
+.SS JSON Output
+.PP
+When \fB\-\-json\fR is specified, output is a JSON object containing:
+.IP \(bu 2
+timestamp: ISO 8601 timestamp of the diagnostic run
+.IP \(bu 2
+duration_seconds: Time taken for diagnostics
+.IP \(bu 2
+summary: Counts of ok, warnings, errors, and fixable issues
+.IP \(bu 2
+findings: Array of diagnostic findings with category, severity, message, and details
+.SH AUTOMATION
+.SS Monitoring Integration
+.PP
+Use JSON output with monitoring systems:
+.PP
+.RS
+.nf
+#!/bin/bash
+result=$(btrfs-backup-ng doctor --json)
+exit_code=$?
+
+if [ $exit_code -ne 0 ]; then
+    echo "$result" | jq '.findings[] | select(.severity != "ok")'
+    # Send to monitoring system
+fi
+.fi
+.RE
+.SS Cron Job Health Check
+.PP
+.RS
+.nf
+# Check backup health daily
+0 8 * * * /usr/bin/btrfs-backup-ng doctor --quiet || \
+    mail -s "Backup health check failed" admin@example.com
+.fi
+.RE
+.SS Auto-Fix in Scripts
+.PP
+.RS
+.nf
+#!/bin/bash
+# Run doctor with auto-fix, alert on remaining issues
+btrfs-backup-ng doctor --fix --quiet
+if [ $? -ne 0 ]; then
+    btrfs-backup-ng doctor --json | \
+        jq '.findings[] | select(.severity == "error" or .severity == "critical")' | \
+        mail -s "Backup issues requiring attention" admin@example.com
+fi
+.fi
+.RE
+.SH SEE ALSO
+.BR btrfs-backup-ng (1),
+.BR btrfs-backup-ng-verify (1),
+.BR btrfs-backup-ng-status (1),
+.BR btrfs-backup-ng-config (1)

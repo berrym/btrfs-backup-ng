@@ -5,7 +5,7 @@ _btrfs_backup_ng() {
     local cur prev words cword split
     _init_completion -s || return
 
-    local commands="run snapshot transfer prune list status config install uninstall restore verify estimate completions manpages"
+    local commands="run snapshot transfer prune list status config install uninstall restore verify estimate doctor completions manpages"
     local config_subcommands="validate init import detect"
     local completions_subcommands="install path"
     local manpages_subcommands="install path"
@@ -29,6 +29,8 @@ _btrfs_backup_ng() {
     local config_detect_opts="--json"
     local verify_opts="--level --snapshot --temp-dir --no-cleanup --prefix --ssh-sudo --ssh-key --fs-checks --json -q --quiet"
     local estimate_opts="-c --config --volume --target --prefix --ssh-sudo --ssh-key --fs-checks --check-space --safety-margin --json"
+    local doctor_opts="--json --check --fix --interactive -q --quiet --volume"
+    local doctor_categories="config snapshots transfers system"
     local completions_install_opts="--shell --system"
     local manpages_install_opts="--system --prefix"
     local verify_levels="metadata stream full"
@@ -47,7 +49,7 @@ _btrfs_backup_ng() {
     local i
     for ((i=1; i < cword; i++)); do
         case "${words[i]}" in
-            run|snapshot|transfer|prune|list|status|config|install|uninstall|restore|verify|completions|manpages)
+            run|snapshot|transfer|prune|list|status|config|install|uninstall|restore|verify|estimate|doctor|completions|manpages)
                 cmd="${words[i]}"
                 ;;
             validate|init|import)
@@ -111,6 +113,10 @@ _btrfs_backup_ng() {
             ;;
         --fs-checks)
             COMPREPLY=($(compgen -W "$fs_checks_modes" -- "$cur"))
+            return
+            ;;
+        --check)
+            COMPREPLY=($(compgen -W "$doctor_categories" -- "$cur"))
             return
             ;;
         --safety-margin)
@@ -211,6 +217,9 @@ _btrfs_backup_ng() {
                 # Complete paths for SOURCE and DESTINATION
                 _filedir -d
             fi
+            ;;
+        doctor)
+            COMPREPLY=($(compgen -W "$doctor_opts" -- "$cur"))
             ;;
         completions)
             if [[ -z "$subcmd" ]]; then

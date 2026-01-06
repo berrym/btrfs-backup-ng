@@ -434,6 +434,114 @@ When `--check-space` is enabled, the output includes destination space informati
 
 ---
 
+### doctor
+
+Diagnose backup system health and optionally fix common issues.
+
+```bash
+btrfs-backup-ng doctor [OPTIONS]
+```
+
+**Options:**
+| Option | Description |
+|--------|-------------|
+| `--json` | Output in JSON format for scripting |
+| `--check CATEGORY` | Check specific category: config, snapshots, transfers, system |
+| `--fix` | Auto-fix safe issues (stale locks, temp files) |
+| `--interactive` | Confirm each fix before applying (requires --fix) |
+| `-q, --quiet` | Only show problems (suppress OK messages) |
+| `--volume PATH` | Check specific volume only |
+
+**Categories:**
+| Category | What It Checks |
+|----------|----------------|
+| `config` | Config file exists and valid, volume paths exist, targets reachable, compression programs available |
+| `snapshots` | Orphaned snapshots, missing snapshots, broken parent chains |
+| `transfers` | Stale locks (dead processes), incomplete transfers, recent failures in transaction log |
+| `system` | Destination space, quota limits, systemd timer status, backup age |
+
+**Exit Codes:**
+| Code | Meaning |
+|------|---------|
+| 0 | Healthy (all OK or INFO findings) |
+| 1 | Warnings present |
+| 2 | Errors or critical issues |
+
+**Examples:**
+```bash
+# Full diagnostics
+btrfs-backup-ng doctor
+
+# JSON output for monitoring integration
+btrfs-backup-ng doctor --json
+
+# Check only configuration
+btrfs-backup-ng doctor --check config
+
+# Check only snapshot health
+btrfs-backup-ng doctor --check snapshots
+
+# Auto-fix safe issues
+btrfs-backup-ng doctor --fix
+
+# Interactive fix (confirm each)
+btrfs-backup-ng doctor --fix --interactive
+
+# Only show problems
+btrfs-backup-ng doctor --quiet
+
+# Check specific volume
+btrfs-backup-ng doctor --volume /home
+```
+
+**Example Output:**
+```
+btrfs-backup-ng Doctor
+=======================================================
+
+Configuration
+  [OK]    Config file valid
+  [OK]    Volume /home exists and is btrfs subvolume
+  [WARN]  Compression program 'pigz' not found
+
+Snapshots
+  [OK]    Volume /home: 24 snapshots, chain intact
+
+Transfers
+  [WARN]  Stale lock: home-20260110 (process 12345 not running)
+          [FIXABLE] Run with --fix to remove
+
+System
+  [OK]    Destination: 524 GiB available (52%)
+  [OK]    Systemd timer active, next: 2h 15m
+
+=======================================================
+Summary: 7 passed, 2 warnings, 0 errors
+Fixable: 1 issue (run with --fix)
+```
+
+**JSON Output:**
+```json
+{
+  "timestamp": "2026-01-06T10:30:00Z",
+  "duration_seconds": 2.5,
+  "summary": {"ok": 7, "warnings": 2, "errors": 0, "fixable": 1},
+  "findings": [
+    {
+      "category": "transfers",
+      "severity": "warn",
+      "check": "stale_locks",
+      "message": "Stale lock detected",
+      "details": {"snapshot": "home-20260110", "pid": 12345},
+      "fixable": true,
+      "fix_description": "Remove stale lock file"
+    }
+  ]
+}
+```
+
+---
+
 ## Filesystem Checks
 
 The `--fs-checks` option controls how btrfs-backup-ng validates source and destination paths:

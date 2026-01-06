@@ -21,6 +21,7 @@ _btrfs-backup-ng() {
         'restore:Restore snapshots from backup location'
         'verify:Verify backup integrity'
         'estimate:Estimate backup transfer sizes'
+        'doctor:Diagnose backup system health and fix issues'
         'completions:Install shell completion scripts'
         'manpages:Install man pages'
     )
@@ -206,6 +207,17 @@ _btrfs-backup-ng() {
                         '--json[Output results in JSON format]' \
                         '1:source (snapshot location):_files -/' \
                         '2:destination (backup location):_files -/'
+                    ;;
+                doctor)
+                    local -a doctor_categories
+                    doctor_categories=(config snapshots transfers system)
+                    _arguments \
+                        '--json[Output results in JSON format]' \
+                        '--check[Check specific category only]:category:(${doctor_categories})' \
+                        '--fix[Auto-fix safe issues]' \
+                        '--interactive[Confirm each fix before applying]' \
+                        '(-q --quiet)'{-q,--quiet}'[Only show problems]' \
+                        '--volume[Check specific volume only]:volume path:_directories'
                     ;;
                 completions)
                     local -a completions_commands
