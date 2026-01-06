@@ -1,8 +1,16 @@
 """Tests for the doctor diagnostic module."""
 
+import argparse
 import time
 from unittest.mock import MagicMock, patch
 
+from btrfs_backup_ng.cli.doctor import (
+    _get_severity_prefix,
+    _print_fix_results,
+    _print_json,
+    _print_report,
+    execute_doctor,
+)
 from btrfs_backup_ng.core.doctor import (
     DiagnosticCategory,
     DiagnosticFinding,
@@ -666,3 +674,540 @@ class TestDoctorSystemChecks:
         doctor = Doctor()
         findings = doctor._check_last_backup_age()
         assert len(findings) == 0
+
+    @patch("btrfs_backup_ng.core.space.get_space_info")
+    @patch("btrfs_backup_ng.core.doctor.Path.exists")
+    def test_check_destination_space_with_config(self, mock_exists, mock_get_space):
+        """Test destination space check with config."""
+        mock_exists.return_value = True
+        mock_space = MagicMock()
+        mock_space.available_bytes = 50_000_000_000
+        mock_space.total_bytes = 100_000_000_000
+        mock_get_space.return_value = mock_space
+
+        mock_target = MagicMock()
+        mock_target.path = "/mnt/backup"
+        mock_target.parsed_url = None
+
+        mock_volume = MagicMock()
+        mock_volume.targets = [mock_target]
+
+        mock_config = MagicMock()
+        mock_config.get_enabled_volumes.return_value = [mock_volume]
+
+        doctor = Doctor(config=mock_config)
+        findings = doctor._check_destination_space()
+
+        assert len(findings) > 0
+        # Should have OK finding for space (50% free)
+        assert any(f.severity == DiagnosticSeverity.OK for f in findings)
+
+    @patch("btrfs_backup_ng.core.space.get_space_info")
+    @patch("btrfs_backup_ng.core.doctor.Path.exists")
+    def test_check_destination_space_low(self, mock_exists, mock_get_space):
+        """Test destination space check with low space."""
+        mock_exists.return_value = True
+        # 15% free (below 20% warning threshold)
+        mock_space = MagicMock()
+        mock_space.available_bytes = 15_000_000_000
+        mock_space.total_bytes = 100_000_000_000
+        mock_get_space.return_value = mock_space
+
+        mock_target = MagicMock()
+        mock_target.path = "/mnt/backup"
+        mock_target.parsed_url = None
+
+        mock_volume = MagicMock()
+        mock_volume.targets = [mock_target]
+
+        mock_config = MagicMock()
+        mock_config.get_enabled_volumes.return_value = [mock_volume]
+
+        doctor = Doctor(config=mock_config)
+        findings = doctor._check_destination_space()
+
+        assert any(f.severity == DiagnosticSeverity.WARN for f in findings)
+
+    @patch("btrfs_backup_ng.core.space.get_space_info")
+    @patch("btrfs_backup_ng.core.doctor.Path.exists")
+    def test_check_destination_space_critical(self, mock_exists, mock_get_space):
+        """Test destination space check with critical space."""
+        mock_exists.return_value = True
+        # 3% free (below 5% critical threshold)
+        mock_space = MagicMock()
+        mock_space.available_bytes = 3_000_000_000
+        mock_space.total_bytes = 100_000_000_000
+        mock_get_space.return_value = mock_space
+
+        mock_target = MagicMock()
+        mock_target.path = "/mnt/backup"
+        mock_target.parsed_url = None
+
+        mock_volume = MagicMock()
+        mock_volume.targets = [mock_target]
+
+        mock_config = MagicMock()
+        mock_config.get_enabled_volumes.return_value = [mock_volume]
+
+        doctor = Doctor(config=mock_config)
+        findings = doctor._check_destination_space()
+
+        assert any(f.severity == DiagnosticSeverity.ERROR for f in findings)
+
+
+class TestDoctorVolumePaths:
+    """Tests for Doctor volume path checks."""
+
+    def test_check_volume_paths_no_config(self):
+        """Test volume paths check without config."""
+        doctor = Doctor()
+        findings = doctor._check_volume_paths()
+        assert len(findings) == 0
+
+    @patch("btrfs_backup_ng.core.doctor.Path.exists")
+    @patch("btrfs_backup_ng.__util__.is_btrfs")
+    def test_check_volume_paths_valid(self, mock_is_btrfs, mock_exists):
+        """Test volume paths check with valid paths."""
+        mock_exists.return_value = True
+        mock_is_btrfs.return_value = True
+
+        mock_volume = MagicMock()
+        mock_volume.path = "/home"
+
+        mock_config = MagicMock()
+        mock_config.get_enabled_volumes.return_value = [mock_volume]
+
+        doctor = Doctor(config=mock_config)
+        findings = doctor._check_volume_paths()
+
+        assert any(f.severity == DiagnosticSeverity.OK for f in findings)
+
+    def test_check_volume_paths_missing(self):
+        """Test volume paths check with missing path."""
+        mock_volume = MagicMock()
+        mock_volume.path = "/nonexistent/path"
+
+        mock_config = MagicMock()
+        mock_config.get_enabled_volumes.return_value = [mock_volume]
+
+        doctor = Doctor(config=mock_config)
+        findings = doctor._check_volume_paths()
+
+        assert any(f.severity == DiagnosticSeverity.ERROR for f in findings)
+
+    @patch("btrfs_backup_ng.core.doctor.Path.exists")
+    @patch("btrfs_backup_ng.__util__.is_btrfs")
+    def test_check_volume_paths_not_btrfs(self, mock_is_btrfs, mock_exists):
+        """Test volume paths check when path is not btrfs."""
+        mock_exists.return_value = True
+        mock_is_btrfs.return_value = False
+
+        mock_volume = MagicMock()
+        mock_volume.path = "/home"
+
+        mock_config = MagicMock()
+        mock_config.get_enabled_volumes.return_value = [mock_volume]
+
+        doctor = Doctor(config=mock_config)
+        findings = doctor._check_volume_paths()
+
+        assert any(
+            f.severity == DiagnosticSeverity.ERROR and "not on btrfs" in f.message
+            for f in findings
+        )
+
+
+class TestDoctorTargetReachability:
+    """Tests for Doctor target reachability checks."""
+
+    def test_check_target_reachability_no_config(self):
+        """Test target reachability check without config."""
+        doctor = Doctor()
+        findings = doctor._check_target_reachability()
+        assert len(findings) == 0
+
+    def test_check_target_reachability_local_exists(self):
+        """Test target reachability with existing local path."""
+        mock_target = MagicMock()
+        mock_target.path = "/tmp"
+        mock_target.parsed_url = None
+
+        mock_volume = MagicMock()
+        mock_volume.targets = [mock_target]
+
+        mock_config = MagicMock()
+        mock_config.get_enabled_volumes.return_value = [mock_volume]
+
+        doctor = Doctor(config=mock_config)
+        findings = doctor._check_target_reachability()
+
+        assert any(f.severity == DiagnosticSeverity.OK for f in findings)
+
+    def test_check_target_reachability_local_missing(self):
+        """Test target reachability with missing local path."""
+        mock_target = MagicMock()
+        mock_target.path = "/nonexistent/target/path"
+        mock_target.parsed_url = None
+
+        mock_volume = MagicMock()
+        mock_volume.targets = [mock_target]
+
+        mock_config = MagicMock()
+        mock_config.get_enabled_volumes.return_value = [mock_volume]
+
+        doctor = Doctor(config=mock_config)
+        findings = doctor._check_target_reachability()
+
+        assert any(f.severity == DiagnosticSeverity.ERROR for f in findings)
+
+
+class TestCliDoctor:
+    """Tests for CLI doctor module."""
+
+    def test_get_severity_prefix(self):
+        """Test severity prefix formatting."""
+        assert _get_severity_prefix(DiagnosticSeverity.OK) == "[OK]"
+        assert _get_severity_prefix(DiagnosticSeverity.INFO) == "[INFO]"
+        assert _get_severity_prefix(DiagnosticSeverity.WARN) == "[WARN]"
+        assert _get_severity_prefix(DiagnosticSeverity.ERROR) == "[ERROR]"
+        assert _get_severity_prefix(DiagnosticSeverity.CRITICAL) == "[CRIT]"
+
+    def test_print_report_basic(self, capsys):
+        """Test basic report printing."""
+        report = DiagnosticReport()
+        report.config_path = "/etc/config.toml"
+        report.categories_checked = {DiagnosticCategory.CONFIG}
+        report.add_finding(
+            DiagnosticFinding(
+                DiagnosticCategory.CONFIG,
+                DiagnosticSeverity.OK,
+                "test",
+                "Test passed",
+            )
+        )
+        report.completed_at = report.started_at + 1.0
+
+        _print_report(report)
+        captured = capsys.readouterr()
+
+        assert "btrfs-backup-ng Doctor" in captured.out
+        assert "/etc/config.toml" in captured.out
+        assert "Configuration" in captured.out
+        assert "[OK]" in captured.out
+        assert "Test passed" in captured.out
+        assert "1 passed" in captured.out
+
+    def test_print_report_quiet_mode(self, capsys):
+        """Test report printing in quiet mode."""
+        report = DiagnosticReport()
+        report.categories_checked = {DiagnosticCategory.CONFIG}
+        report.add_finding(
+            DiagnosticFinding(
+                DiagnosticCategory.CONFIG,
+                DiagnosticSeverity.OK,
+                "ok_test",
+                "OK message",
+            )
+        )
+        report.add_finding(
+            DiagnosticFinding(
+                DiagnosticCategory.CONFIG,
+                DiagnosticSeverity.WARN,
+                "warn_test",
+                "Warning message",
+            )
+        )
+        report.completed_at = report.started_at + 1.0
+
+        _print_report(report, quiet=True)
+        captured = capsys.readouterr()
+
+        # OK message should be hidden in quiet mode
+        assert "OK message" not in captured.out
+        # Warning should still show
+        assert "Warning message" in captured.out
+
+    def test_print_report_with_fixable(self, capsys):
+        """Test report printing with fixable finding."""
+        report = DiagnosticReport()
+        report.categories_checked = {DiagnosticCategory.TRANSFERS}
+        report.add_finding(
+            DiagnosticFinding(
+                DiagnosticCategory.TRANSFERS,
+                DiagnosticSeverity.WARN,
+                "stale_lock",
+                "Stale lock found",
+                fixable=True,
+            )
+        )
+        report.completed_at = report.started_at + 1.0
+
+        _print_report(report)
+        captured = capsys.readouterr()
+
+        assert "[FIXABLE]" in captured.out
+        assert "run with --fix" in captured.out
+
+    def test_print_report_with_hint(self, capsys):
+        """Test report printing with hint in details."""
+        report = DiagnosticReport()
+        report.categories_checked = {DiagnosticCategory.SYSTEM}
+        report.add_finding(
+            DiagnosticFinding(
+                DiagnosticCategory.SYSTEM,
+                DiagnosticSeverity.INFO,
+                "timer_check",
+                "No timer installed",
+                details={"hint": "Install with: btrfs-backup-ng install"},
+            )
+        )
+        report.completed_at = report.started_at + 1.0
+
+        _print_report(report)
+        captured = capsys.readouterr()
+
+        assert "Hint:" in captured.out
+        assert "Install with:" in captured.out
+
+    def test_print_json(self, capsys):
+        """Test JSON output printing."""
+        report = DiagnosticReport()
+        report.config_path = "/etc/config.toml"
+        report.categories_checked = {DiagnosticCategory.CONFIG}
+        report.add_finding(
+            DiagnosticFinding(
+                DiagnosticCategory.CONFIG,
+                DiagnosticSeverity.OK,
+                "test",
+                "Test passed",
+            )
+        )
+        report.completed_at = report.started_at + 1.0
+
+        _print_json(report, [])
+        captured = capsys.readouterr()
+
+        import json
+
+        data = json.loads(captured.out)
+        assert data["config_path"] == "/etc/config.toml"
+        assert data["summary"]["ok"] == 1
+        assert len(data["findings"]) == 1
+
+    def test_print_json_with_fixes(self, capsys):
+        """Test JSON output with fix results."""
+        report = DiagnosticReport()
+        report.categories_checked = {DiagnosticCategory.TRANSFERS}
+
+        finding = DiagnosticFinding(
+            DiagnosticCategory.TRANSFERS,
+            DiagnosticSeverity.WARN,
+            "stale_lock",
+            "Stale lock found",
+            fixable=True,
+        )
+        report.add_finding(finding)
+        report.completed_at = report.started_at + 1.0
+
+        fix_result = FixResult(
+            finding=finding,
+            success=True,
+            message="Lock removed",
+        )
+
+        _print_json(report, [fix_result])
+        captured = capsys.readouterr()
+
+        import json
+
+        data = json.loads(captured.out)
+        assert "fixes" in data
+        assert len(data["fixes"]) == 1
+        assert data["fixes"][0]["success"] is True
+
+    def test_print_fix_results(self, capsys):
+        """Test fix results printing."""
+        finding = DiagnosticFinding(
+            DiagnosticCategory.TRANSFERS,
+            DiagnosticSeverity.WARN,
+            "stale_lock",
+            "Stale lock found",
+            fixable=True,
+        )
+
+        results = [
+            FixResult(finding=finding, success=True, message="Fixed"),
+            FixResult(finding=finding, success=False, message="Permission denied"),
+        ]
+
+        _print_fix_results(results)
+        captured = capsys.readouterr()
+
+        assert "Fix Results" in captured.out
+        assert "[OK]" in captured.out
+        assert "[FAILED]" in captured.out
+        assert "Permission denied" in captured.out
+
+    @patch("btrfs_backup_ng.cli.doctor.Doctor")
+    @patch("btrfs_backup_ng.cli.doctor.find_config_file")
+    def test_execute_doctor_basic(self, mock_find_config, mock_doctor_class):
+        """Test basic execute_doctor."""
+        mock_find_config.return_value = None
+
+        mock_report = DiagnosticReport()
+        mock_report.categories_checked = {DiagnosticCategory.CONFIG}
+        mock_report.completed_at = mock_report.started_at + 1.0
+
+        mock_doctor = MagicMock()
+        mock_doctor.run_diagnostics.return_value = mock_report
+        mock_doctor_class.return_value = mock_doctor
+
+        args = argparse.Namespace(
+            config=None,
+            check=None,
+            volume=None,
+            quiet=False,
+            json=False,
+            fix=False,
+            interactive=False,
+            verbose=0,
+            debug=False,
+        )
+
+        exit_code = execute_doctor(args)
+        assert exit_code == 0
+        mock_doctor.run_diagnostics.assert_called_once()
+
+    @patch("btrfs_backup_ng.cli.doctor.Doctor")
+    @patch("btrfs_backup_ng.cli.doctor.find_config_file")
+    def test_execute_doctor_json_output(
+        self, mock_find_config, mock_doctor_class, capsys
+    ):
+        """Test execute_doctor with JSON output."""
+        mock_find_config.return_value = None
+
+        mock_report = DiagnosticReport()
+        mock_report.categories_checked = {DiagnosticCategory.CONFIG}
+        mock_report.completed_at = mock_report.started_at + 1.0
+
+        mock_doctor = MagicMock()
+        mock_doctor.run_diagnostics.return_value = mock_report
+        mock_doctor_class.return_value = mock_doctor
+
+        args = argparse.Namespace(
+            config=None,
+            check=None,
+            volume=None,
+            quiet=False,
+            json=True,
+            fix=False,
+            interactive=False,
+            verbose=0,
+            debug=False,
+        )
+
+        exit_code = execute_doctor(args)
+        captured = capsys.readouterr()
+
+        assert exit_code == 0
+        import json
+
+        data = json.loads(captured.out)
+        assert "summary" in data
+
+    @patch("btrfs_backup_ng.cli.doctor.Doctor")
+    @patch("btrfs_backup_ng.cli.doctor.find_config_file")
+    def test_execute_doctor_with_category_filter(
+        self, mock_find_config, mock_doctor_class
+    ):
+        """Test execute_doctor with category filter."""
+        mock_find_config.return_value = None
+
+        mock_report = DiagnosticReport()
+        mock_report.categories_checked = {DiagnosticCategory.CONFIG}
+        mock_report.completed_at = mock_report.started_at + 1.0
+
+        mock_doctor = MagicMock()
+        mock_doctor.run_diagnostics.return_value = mock_report
+        mock_doctor_class.return_value = mock_doctor
+
+        args = argparse.Namespace(
+            config=None,
+            check=["config"],
+            volume=None,
+            quiet=False,
+            json=False,
+            fix=False,
+            interactive=False,
+            verbose=0,
+            debug=False,
+        )
+
+        execute_doctor(args)
+
+        # Verify categories were passed
+        call_kwargs = mock_doctor.run_diagnostics.call_args[1]
+        assert DiagnosticCategory.CONFIG in call_kwargs["categories"]
+
+    @patch("btrfs_backup_ng.cli.doctor.Doctor")
+    @patch("btrfs_backup_ng.cli.doctor.find_config_file")
+    def test_execute_doctor_with_fix(self, mock_find_config, mock_doctor_class):
+        """Test execute_doctor with fix flag."""
+        mock_find_config.return_value = None
+
+        mock_report = DiagnosticReport()
+        mock_report.categories_checked = {DiagnosticCategory.CONFIG}
+        mock_report.completed_at = mock_report.started_at + 1.0
+
+        mock_doctor = MagicMock()
+        mock_doctor.run_diagnostics.return_value = mock_report
+        mock_doctor.apply_fixes.return_value = []
+        mock_doctor_class.return_value = mock_doctor
+
+        args = argparse.Namespace(
+            config=None,
+            check=None,
+            volume=None,
+            quiet=False,
+            json=False,
+            fix=True,
+            interactive=False,
+            verbose=0,
+            debug=False,
+        )
+
+        execute_doctor(args)
+
+        mock_doctor.apply_fixes.assert_called_once()
+
+    @patch("btrfs_backup_ng.cli.doctor.Doctor")
+    @patch("btrfs_backup_ng.cli.doctor.find_config_file")
+    def test_execute_doctor_with_volume_filter(
+        self, mock_find_config, mock_doctor_class
+    ):
+        """Test execute_doctor with volume filter."""
+        mock_find_config.return_value = None
+
+        mock_report = DiagnosticReport()
+        mock_report.completed_at = mock_report.started_at + 1.0
+
+        mock_doctor = MagicMock()
+        mock_doctor.run_diagnostics.return_value = mock_report
+        mock_doctor_class.return_value = mock_doctor
+
+        args = argparse.Namespace(
+            config=None,
+            check=None,
+            volume=["/home"],
+            quiet=False,
+            json=False,
+            fix=False,
+            interactive=False,
+            verbose=0,
+            debug=False,
+        )
+
+        execute_doctor(args)
+
+        call_kwargs = mock_doctor.run_diagnostics.call_args[1]
+        assert call_kwargs["volume_filter"] == "/home"
