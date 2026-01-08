@@ -16,6 +16,7 @@ SUBCOMMANDS = frozenset(
         "run",
         "snapshot",
         "transfer",
+        "transfers",
         "prune",
         "list",
         "status",
@@ -784,6 +785,134 @@ Examples:
         help="Safety margin percentage for space check (default: 10%%)",
     )
 
+    # transfers command - manage chunked/resumable transfers
+    transfers_parser = subparsers.add_parser(
+        "transfers",
+        help="Manage chunked and resumable transfers",
+        description="List, resume, pause, and clean up chunked transfers",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # List all incomplete transfers
+  btrfs-backup-ng transfers list
+
+  # Show details of a specific transfer
+  btrfs-backup-ng transfers show abc12345
+
+  # Resume a failed transfer
+  btrfs-backup-ng transfers resume abc12345
+
+  # Clean up stale transfers (older than 48 hours)
+  btrfs-backup-ng transfers cleanup
+
+  # Clean up a specific transfer
+  btrfs-backup-ng transfers cleanup abc12345 --force
+
+  # List backup operations
+  btrfs-backup-ng transfers operations
+""",
+    )
+    transfers_subs = transfers_parser.add_subparsers(dest="transfers_action")
+
+    # transfers list
+    transfers_list = transfers_subs.add_parser(
+        "list",
+        help="List incomplete transfers",
+    )
+    transfers_list.add_argument(
+        "--json",
+        action="store_true",
+        help="Output in JSON format",
+    )
+
+    # transfers show
+    transfers_show = transfers_subs.add_parser(
+        "show",
+        help="Show details of a transfer",
+    )
+    transfers_show.add_argument(
+        "transfer_id",
+        metavar="ID",
+        help="Transfer ID to show",
+    )
+    transfers_show.add_argument(
+        "--json",
+        action="store_true",
+        help="Output in JSON format",
+    )
+
+    # transfers resume
+    transfers_resume = transfers_subs.add_parser(
+        "resume",
+        help="Resume a failed or paused transfer",
+    )
+    transfers_resume.add_argument(
+        "transfer_id",
+        metavar="ID",
+        help="Transfer ID to resume",
+    )
+    transfers_resume.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Show what would be done without making changes",
+    )
+
+    # transfers pause
+    transfers_pause = transfers_subs.add_parser(
+        "pause",
+        help="Pause an active transfer",
+    )
+    transfers_pause.add_argument(
+        "transfer_id",
+        metavar="ID",
+        help="Transfer ID to pause",
+    )
+
+    # transfers cleanup
+    transfers_cleanup = transfers_subs.add_parser(
+        "cleanup",
+        help="Clean up old or completed transfers",
+    )
+    transfers_cleanup.add_argument(
+        "transfer_id",
+        nargs="?",
+        metavar="ID",
+        help="Specific transfer ID to clean up (optional)",
+    )
+    transfers_cleanup.add_argument(
+        "--max-age",
+        type=int,
+        default=48,
+        metavar="HOURS",
+        help="Clean up transfers older than this (default: 48 hours)",
+    )
+    transfers_cleanup.add_argument(
+        "--force",
+        action="store_true",
+        help="Force cleanup of active transfers",
+    )
+    transfers_cleanup.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Show what would be cleaned up without making changes",
+    )
+
+    # transfers operations
+    transfers_ops = transfers_subs.add_parser(
+        "operations",
+        help="List backup operations",
+    )
+    transfers_ops.add_argument(
+        "--all",
+        action="store_true",
+        help="Include archived operations",
+    )
+    transfers_ops.add_argument(
+        "--json",
+        action="store_true",
+        help="Output in JSON format",
+    )
+
     # doctor command
     doctor_parser = subparsers.add_parser(
         "doctor",
@@ -927,6 +1056,7 @@ def run_subcommand(args: argparse.Namespace) -> int:
         "run": cmd_run,
         "snapshot": cmd_snapshot,
         "transfer": cmd_transfer,
+        "transfers": cmd_transfers,
         "prune": cmd_prune,
         "list": cmd_list,
         "status": cmd_status,
@@ -1056,6 +1186,13 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     from .doctor import execute_doctor
 
     return execute_doctor(args)
+
+
+def cmd_transfers(args: argparse.Namespace) -> int:
+    """Execute transfers command."""
+    from .transfers_cmd import execute_transfers
+
+    return execute_transfers(args)
 
 
 def main(argv: list[str] | None = None) -> int:
