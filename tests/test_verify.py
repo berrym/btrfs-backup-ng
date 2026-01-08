@@ -904,3 +904,350 @@ class TestVerifyReportDuration:
         # Duration should be calculated from now
         duration = report.duration
         assert duration >= 2.0
+
+
+# =============================================================================
+# Pre-Transfer Parent Validation Tests
+# =============================================================================
+
+from btrfs_backup_ng.core.verify import (
+    ParentViability,
+    ParentViabilityResult,
+    check_parent_viability,
+    find_viable_parent,
+    validate_transfer_chain,
+)
+
+
+class TestParentViabilityResult:
+    """Tests for ParentViabilityResult dataclass."""
+
+    def test_viable_result(self):
+        """Test a viable parent result."""
+        result = ParentViabilityResult(
+            status=ParentViability.VIABLE,
+            parent_name="root-20240101",
+            message="Parent is viable",
+        )
+        assert result.is_viable
+        assert not result.should_use_full_send
+        assert result.parent_name == "root-20240101"
+
+    def test_missing_result(self):
+        """Test a missing parent result."""
+        result = ParentViabilityResult(
+            status=ParentViability.MISSING,
+            parent_name="root-20240101",
+            message="Parent not found",
+            fallback_to_full=True,
+        )
+        assert not result.is_viable
+        assert result.should_use_full_send
+
+    def test_corrupted_result(self):
+        """Test a corrupted parent result."""
+        result = ParentViabilityResult(
+            status=ParentViability.CORRUPTED,
+            parent_name="root-20240101",
+            message="Send stream failed",
+            fallback_to_full=True,
+            details={"error": "checksum mismatch"},
+        )
+        assert not result.is_viable
+        assert result.should_use_full_send
+        assert "error" in result.details
+
+    def test_locked_result(self):
+        """Test a locked parent result - should not auto-fallback."""
+        result = ParentViabilityResult(
+            status=ParentViability.LOCKED,
+            parent_name="root-20240101",
+            message="Parent is locked",
+            fallback_to_full=False,
+        )
+        assert not result.is_viable
+        # Locked parents should NOT auto-fallback (wait for lock)
+        assert result.should_use_full_send  # still true because not viable
+
+
+class TestCheckParentViability:
+    """Tests for check_parent_viability function."""
+
+    def test_no_parent_returns_viable_with_fallback(self):
+        """When no parent is specified, return viable but fallback to full."""
+        source_ep = MagicMock()
+        dest_ep = MagicMock()
+        snapshot = MockSnapshot("root-20240102")
+
+        result = check_parent_viability(
+            snapshot, None, source_ep, dest_ep, check_level="quick"
+        )
+
+        assert result.status == ParentViability.VIABLE
+        assert result.parent_name is None
+        assert result.fallback_to_full
+
+    def test_check_level_none_skips_validation(self):
+        """check_level='none' skips all validation."""
+        source_ep = MagicMock()
+        dest_ep = MagicMock()
+        snapshot = MockSnapshot("root-20240102")
+        parent = MockSnapshot("root-20240101")
+
+        result = check_parent_viability(
+            snapshot, parent, source_ep, dest_ep, check_level="none"
+        )
+
+        assert result.status == ParentViability.VIABLE
+        assert result.parent_name == "root-20240101"
+        # Destination should not be called
+        dest_ep.list_snapshots.assert_not_called()
+
+    def test_parent_exists_at_destination(self):
+        """Parent found at destination passes quick check."""
+        source_ep = MagicMock()
+        dest_ep = MagicMock()
+        dest_ep.list_snapshots.return_value = [
+            MockSnapshot("root-20240101"),
+            MockSnapshot("root-20240102"),
+        ]
+        snapshot = MockSnapshot("root-20240103")
+        parent = MockSnapshot("root-20240101")
+
+        result = check_parent_viability(
+            snapshot, parent, source_ep, dest_ep, check_level="quick"
+        )
+
+        assert result.status == ParentViability.VIABLE
+        assert result.parent_name == "root-20240101"
+
+    def test_parent_missing_at_destination(self):
+        """Parent not found at destination returns MISSING."""
+        source_ep = MagicMock()
+        dest_ep = MagicMock()
+        dest_ep.list_snapshots.return_value = [
+            MockSnapshot("root-20240102"),
+        ]
+        snapshot = MockSnapshot("root-20240103")
+        parent = MockSnapshot("root-20240101")  # Not at destination
+
+        result = check_parent_viability(
+            snapshot, parent, source_ep, dest_ep, check_level="quick"
+        )
+
+        assert result.status == ParentViability.MISSING
+        assert result.fallback_to_full
+
+    def test_parent_locked(self):
+        """Locked parent returns LOCKED status."""
+        source_ep = MagicMock()
+        dest_ep = MagicMock()
+        dest_ep.list_snapshots.return_value = [MockSnapshot("root-20240101")]
+
+        snapshot = MockSnapshot("root-20240102")
+        parent = MockSnapshot("root-20240101")
+        parent.locks = {"backup_operation"}  # Parent is locked
+
+        result = check_parent_viability(
+            snapshot, parent, source_ep, dest_ep, check_level="quick"
+        )
+
+        assert result.status == ParentViability.LOCKED
+        assert not result.fallback_to_full  # Don't fallback, wait for lock
+
+    def test_destination_list_failure_continues(self):
+        """If listing destination fails, proceed cautiously."""
+        source_ep = MagicMock()
+        dest_ep = MagicMock()
+        dest_ep.list_snapshots.side_effect = Exception("Connection failed")
+
+        snapshot = MockSnapshot("root-20240102")
+        parent = MockSnapshot("root-20240101")
+
+        # Should not raise, should log warning and proceed
+        result = check_parent_viability(
+            snapshot, parent, source_ep, dest_ep, check_level="quick"
+        )
+
+        # Should assume viable since we can't verify
+        assert result.status == ParentViability.VIABLE
+
+    @patch("btrfs_backup_ng.core.verify._test_send_stream")
+    def test_stream_check_success(self, mock_send_stream):
+        """Stream-level check succeeds when send stream works."""
+        source_ep = MagicMock()
+        dest_ep = MagicMock()
+        dest_ep.list_snapshots.return_value = [MockSnapshot("root-20240101")]
+
+        snapshot = MockSnapshot("root-20240102")
+        parent = MockSnapshot("root-20240101")
+
+        result = check_parent_viability(
+            snapshot, parent, source_ep, dest_ep, check_level="stream"
+        )
+
+        mock_send_stream.assert_called_once()
+        assert result.status == ParentViability.VIABLE
+
+    @patch("btrfs_backup_ng.core.verify._test_send_stream")
+    def test_stream_check_failure(self, mock_send_stream):
+        """Stream-level check fails when send stream fails."""
+        mock_send_stream.side_effect = Exception("Send stream failed")
+
+        source_ep = MagicMock()
+        dest_ep = MagicMock()
+        dest_ep.list_snapshots.return_value = [MockSnapshot("root-20240101")]
+
+        snapshot = MockSnapshot("root-20240102")
+        parent = MockSnapshot("root-20240101")
+
+        result = check_parent_viability(
+            snapshot, parent, source_ep, dest_ep, check_level="stream"
+        )
+
+        assert result.status == ParentViability.CORRUPTED
+        assert result.fallback_to_full
+
+
+class TestFindViableParent:
+    """Tests for find_viable_parent function."""
+
+    def test_no_present_snapshots(self):
+        """Empty destination should recommend full send."""
+        source_ep = MagicMock()
+        dest_ep = MagicMock()
+        snapshot = MockSnapshot("root-20240101")
+
+        result = find_viable_parent(
+            snapshot, [], source_ep, dest_ep, check_level="quick"
+        )
+
+        assert result.status == ParentViability.MISSING
+        assert result.fallback_to_full
+        assert result.parent_name is None
+
+    def test_finds_best_parent(self):
+        """Should find the most recent viable parent."""
+        source_ep = MagicMock()
+        dest_ep = MagicMock()
+        dest_ep.list_snapshots.return_value = [
+            MockSnapshot("root-20240101", time.strptime("20240101-120000", "%Y%m%d-%H%M%S")),
+            MockSnapshot("root-20240102", time.strptime("20240102-120000", "%Y%m%d-%H%M%S")),
+        ]
+
+        present = [
+            MockSnapshot("root-20240101", time.strptime("20240101-120000", "%Y%m%d-%H%M%S")),
+            MockSnapshot("root-20240102", time.strptime("20240102-120000", "%Y%m%d-%H%M%S")),
+        ]
+        snapshot = MockSnapshot("root-20240103", time.strptime("20240103-120000", "%Y%m%d-%H%M%S"))
+
+        result = find_viable_parent(
+            snapshot, present, source_ep, dest_ep, check_level="quick"
+        )
+
+        assert result.status == ParentViability.VIABLE
+        # Should pick most recent (20240102)
+        assert result.parent_name == "root-20240102"
+
+    def test_no_older_candidates(self):
+        """No older snapshots should recommend full send."""
+        source_ep = MagicMock()
+        dest_ep = MagicMock()
+
+        # All present snapshots are newer
+        present = [
+            MockSnapshot("root-20240105", time.strptime("20240105-120000", "%Y%m%d-%H%M%S")),
+        ]
+        snapshot = MockSnapshot("root-20240101", time.strptime("20240101-120000", "%Y%m%d-%H%M%S"))
+
+        result = find_viable_parent(
+            snapshot, present, source_ep, dest_ep, check_level="quick"
+        )
+
+        assert result.status == ParentViability.MISSING
+        assert result.fallback_to_full
+
+    def test_fallback_to_older_parent(self):
+        """If best parent is missing, try older ones."""
+        source_ep = MagicMock()
+        dest_ep = MagicMock()
+
+        # Only the oldest parent exists at destination
+        dest_ep.list_snapshots.return_value = [
+            MockSnapshot("root-20240101", time.strptime("20240101-120000", "%Y%m%d-%H%M%S")),
+        ]
+
+        present = [
+            MockSnapshot("root-20240101", time.strptime("20240101-120000", "%Y%m%d-%H%M%S")),
+            MockSnapshot("root-20240102", time.strptime("20240102-120000", "%Y%m%d-%H%M%S")),
+        ]
+        snapshot = MockSnapshot("root-20240103", time.strptime("20240103-120000", "%Y%m%d-%H%M%S"))
+
+        result = find_viable_parent(
+            snapshot, present, source_ep, dest_ep, check_level="quick"
+        )
+
+        # Should fall back to 20240101 since 20240102 is missing at dest
+        assert result.status == ParentViability.VIABLE
+        assert result.parent_name == "root-20240101"
+
+
+class TestValidateTransferChain:
+    """Tests for validate_transfer_chain function."""
+
+    def test_validates_multiple_snapshots(self):
+        """Should validate parent for each snapshot in order."""
+        source_ep = MagicMock()
+        dest_ep = MagicMock()
+        dest_ep.list_snapshots.return_value = []
+
+        present = []
+        to_transfer = [
+            MockSnapshot("root-20240101", time.strptime("20240101-120000", "%Y%m%d-%H%M%S")),
+            MockSnapshot("root-20240102", time.strptime("20240102-120000", "%Y%m%d-%H%M%S")),
+            MockSnapshot("root-20240103", time.strptime("20240103-120000", "%Y%m%d-%H%M%S")),
+        ]
+
+        results = validate_transfer_chain(
+            to_transfer, present, source_ep, dest_ep, check_level="quick"
+        )
+
+        assert len(results) == 3
+
+        # First snapshot has no parent (full send)
+        snap1, result1 = results[0]
+        assert result1.fallback_to_full
+
+        # Subsequent snapshots can use previous as parent
+        # (they would be in will_be_present after simulated transfer)
+
+    def test_tracks_transferred_snapshots(self):
+        """Should track what will be present after each transfer."""
+        source_ep = MagicMock()
+        dest_ep = MagicMock()
+        # All snapshots will be "present" at dest after they're transferred
+        dest_ep.list_snapshots.return_value = [
+            MockSnapshot("root-20240101", time.strptime("20240101-120000", "%Y%m%d-%H%M%S")),
+            MockSnapshot("root-20240102", time.strptime("20240102-120000", "%Y%m%d-%H%M%S")),
+            MockSnapshot("root-20240103", time.strptime("20240103-120000", "%Y%m%d-%H%M%S")),
+        ]
+
+        present = [
+            MockSnapshot("root-20240101", time.strptime("20240101-120000", "%Y%m%d-%H%M%S")),
+        ]
+        to_transfer = [
+            MockSnapshot("root-20240102", time.strptime("20240102-120000", "%Y%m%d-%H%M%S")),
+            MockSnapshot("root-20240103", time.strptime("20240103-120000", "%Y%m%d-%H%M%S")),
+        ]
+
+        results = validate_transfer_chain(
+            to_transfer, present, source_ep, dest_ep, check_level="quick"
+        )
+
+        # First can use 20240101 as parent
+        _, result1 = results[0]
+        assert result1.parent_name == "root-20240101"
+
+        # Second can use 20240102 (which will be present after first transfer)
+        _, result2 = results[1]
+        assert result2.parent_name == "root-20240102"

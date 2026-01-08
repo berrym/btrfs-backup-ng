@@ -504,3 +504,281 @@ def _test_restore(backup_endpoint, local_endpoint, snapshot, parent=None):
         parent=parent,
         options={"show_progress": False},
     )
+
+
+# =============================================================================
+# Pre-Transfer Parent Validation
+# =============================================================================
+
+
+class ParentViability(Enum):
+    """Result of parent viability check."""
+
+    VIABLE = "viable"  # Parent is usable for incremental transfer
+    MISSING = "missing"  # Parent doesn't exist at destination
+    CORRUPTED = "corrupted"  # Parent exists but send stream fails
+    LOCKED = "locked"  # Parent is locked by another operation
+    MISMATCH = "mismatch"  # Parent exists but differs from source
+
+
+@dataclass
+class ParentViabilityResult:
+    """Result of a parent viability check."""
+
+    status: ParentViability
+    parent_name: str | None
+    message: str = ""
+    fallback_to_full: bool = False
+    details: dict = field(default_factory=dict)
+
+    @property
+    def is_viable(self) -> bool:
+        """Return True if the parent is usable."""
+        return self.status == ParentViability.VIABLE
+
+    @property
+    def should_use_full_send(self) -> bool:
+        """Return True if we should fall back to full send."""
+        return self.fallback_to_full or self.status != ParentViability.VIABLE
+
+
+def check_parent_viability(
+    snapshot,
+    parent,
+    source_endpoint,
+    destination_endpoint,
+    check_level: str = "quick",
+) -> ParentViabilityResult:
+    """Verify parent snapshot is usable for incremental transfer.
+
+    This function checks whether a parent snapshot can be used for
+    incremental btrfs send/receive. It verifies:
+    1. Parent exists at destination
+    2. Parent is not locked
+    3. (Optional) Parent send stream is valid
+
+    Args:
+        snapshot: The snapshot to be transferred
+        parent: The proposed parent snapshot for incremental transfer
+        source_endpoint: Source endpoint where snapshot/parent exist
+        destination_endpoint: Destination endpoint to verify parent
+        check_level: Validation depth - "none", "quick", "stream", "paranoid"
+            - none: Skip validation entirely
+            - quick: Check existence and locks only
+            - stream: Also test send stream with --no-data
+            - paranoid: Full verification (not recommended for routine use)
+
+    Returns:
+        ParentViabilityResult with status and recommendations
+    """
+    if parent is None:
+        return ParentViabilityResult(
+            status=ParentViability.VIABLE,
+            parent_name=None,
+            message="No parent specified, will use full send",
+            fallback_to_full=True,
+        )
+
+    parent_name = parent.get_name()
+    logger.debug("Checking parent viability for %s", parent_name)
+
+    if check_level == "none":
+        logger.debug("Skipping parent validation (check_level=none)")
+        return ParentViabilityResult(
+            status=ParentViability.VIABLE,
+            parent_name=parent_name,
+            message="Validation skipped",
+        )
+
+    # Check 1: Parent exists at destination
+    try:
+        dest_snapshots = destination_endpoint.list_snapshots()
+        dest_names = {s.get_name() for s in dest_snapshots}
+
+        if parent_name not in dest_names:
+            logger.warning("Parent %s not found at destination", parent_name)
+            return ParentViabilityResult(
+                status=ParentViability.MISSING,
+                parent_name=parent_name,
+                message=f"Parent snapshot '{parent_name}' not found at destination",
+                fallback_to_full=True,
+                details={"available_parents": sorted(dest_names)[-5:]},  # Last 5
+            )
+    except Exception as e:
+        logger.warning("Could not list destination snapshots: %s", e)
+        # Proceed cautiously - assume parent exists
+        logger.debug("Assuming parent exists, will fail at transfer time if not")
+
+    # Check 2: Parent is not locked
+    try:
+        if hasattr(parent, "locks") and parent.locks:
+            logger.warning("Parent %s is locked: %s", parent_name, parent.locks)
+            return ParentViabilityResult(
+                status=ParentViability.LOCKED,
+                parent_name=parent_name,
+                message=f"Parent snapshot '{parent_name}' is locked",
+                fallback_to_full=False,  # Don't auto-fallback, wait for lock
+                details={"locks": list(parent.locks)},
+            )
+    except Exception as e:
+        logger.debug("Could not check locks: %s", e)
+
+    if check_level == "quick":
+        logger.debug("Parent %s passed quick validation", parent_name)
+        return ParentViabilityResult(
+            status=ParentViability.VIABLE,
+            parent_name=parent_name,
+            message="Parent exists at destination",
+        )
+
+    # Check 3: Test send stream (for "stream" and "paranoid" levels)
+    if check_level in ("stream", "paranoid"):
+        try:
+            logger.debug("Testing send stream with parent %s", parent_name)
+            _test_send_stream(source_endpoint, snapshot, parent)
+            logger.debug("Send stream test passed")
+        except Exception as e:
+            logger.warning("Send stream test failed with parent %s: %s", parent_name, e)
+            return ParentViabilityResult(
+                status=ParentViability.CORRUPTED,
+                parent_name=parent_name,
+                message=f"Send stream test failed: {e}",
+                fallback_to_full=True,
+                details={"error": str(e)},
+            )
+
+    return ParentViabilityResult(
+        status=ParentViability.VIABLE,
+        parent_name=parent_name,
+        message=f"Parent '{parent_name}' is viable for incremental transfer",
+    )
+
+
+def find_viable_parent(
+    snapshot,
+    present_snapshots: list,
+    source_endpoint,
+    destination_endpoint,
+    check_level: str = "quick",
+    max_candidates: int = 3,
+) -> ParentViabilityResult:
+    """Find the best viable parent for incremental transfer.
+
+    If the ideal parent isn't viable, tries older snapshots as fallback
+    before giving up and recommending a full send.
+
+    Args:
+        snapshot: The snapshot to be transferred
+        present_snapshots: Snapshots present at destination
+        source_endpoint: Source endpoint
+        destination_endpoint: Destination endpoint
+        check_level: Validation depth (see check_parent_viability)
+        max_candidates: Maximum number of parent candidates to try
+
+    Returns:
+        ParentViabilityResult with the best viable parent or fallback recommendation
+    """
+    if not present_snapshots:
+        return ParentViabilityResult(
+            status=ParentViability.MISSING,
+            parent_name=None,
+            message="No snapshots present at destination, using full send",
+            fallback_to_full=True,
+        )
+
+    # Find candidate parents (older than snapshot)
+    candidates = []
+    for s in present_snapshots:
+        try:
+            if s < snapshot:
+                candidates.append(s)
+        except (TypeError, NotImplementedError):
+            # Can't compare, skip
+            continue
+
+    if not candidates:
+        return ParentViabilityResult(
+            status=ParentViability.MISSING,
+            parent_name=None,
+            message="No older snapshots available as parent",
+            fallback_to_full=True,
+        )
+
+    # Sort by time (most recent first)
+    candidates.sort(reverse=True)
+
+    # Try candidates in order
+    tried = []
+    for parent in candidates[:max_candidates]:
+        parent_name = parent.get_name()
+        tried.append(parent_name)
+
+        result = check_parent_viability(
+            snapshot,
+            parent,
+            source_endpoint,
+            destination_endpoint,
+            check_level,
+        )
+
+        if result.is_viable:
+            logger.debug("Found viable parent: %s", parent_name)
+            return result
+
+        logger.debug(
+            "Parent %s not viable (%s), trying next",
+            parent_name,
+            result.status.value,
+        )
+
+    # No viable parent found
+    return ParentViabilityResult(
+        status=ParentViability.MISSING,
+        parent_name=None,
+        message=f"No viable parent found after trying: {tried}",
+        fallback_to_full=True,
+        details={"tried_parents": tried},
+    )
+
+
+def validate_transfer_chain(
+    snapshots_to_transfer: list,
+    present_at_destination: list,
+    source_endpoint,
+    destination_endpoint,
+    check_level: str = "quick",
+) -> list[tuple[any, ParentViabilityResult]]:
+    """Validate parent chain for a series of transfers.
+
+    For each snapshot to transfer, determines the best parent and
+    validates it. Returns a list of (snapshot, parent_result) tuples
+    that can be used to plan the transfer order.
+
+    Args:
+        snapshots_to_transfer: Snapshots to be transferred (in order)
+        present_at_destination: Snapshots already at destination
+        source_endpoint: Source endpoint
+        destination_endpoint: Destination endpoint
+        check_level: Validation depth
+
+    Returns:
+        List of (snapshot, ParentViabilityResult) tuples
+    """
+    results = []
+    # Track what will be present after each transfer
+    will_be_present = list(present_at_destination)
+
+    for snapshot in snapshots_to_transfer:
+        result = find_viable_parent(
+            snapshot,
+            will_be_present,
+            source_endpoint,
+            destination_endpoint,
+            check_level,
+        )
+        results.append((snapshot, result))
+
+        # After this transfer, snapshot will be present
+        will_be_present.append(snapshot)
+
+    return results
