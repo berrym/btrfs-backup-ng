@@ -7,11 +7,18 @@ import logging
 import subprocess
 import time
 from pathlib import Path
+from typing import Optional
 
 from .. import __util__
 from ..transaction import log_transaction
 from . import progress as progress_utils
 from . import transfer as transfer_utils
+from .chunked_transfer import (
+    ChunkedTransferManager,
+    TransferConfig,
+    TransferManifest,
+    TransferStatus,
+)
 from .space import (
     DEFAULT_SAFETY_MARGIN_PERCENT,
     check_space_availability,
@@ -22,8 +29,14 @@ logger = logging.getLogger(__name__)
 
 
 def send_snapshot(
-    snapshot, destination_endpoint, parent=None, clones=None, options=None
-) -> None:
+    snapshot,
+    destination_endpoint,
+    parent=None,
+    clones=None,
+    options=None,
+    chunked_manager: Optional[ChunkedTransferManager] = None,
+    resume_transfer_id: Optional[str] = None,
+) -> Optional[str]:
     """Send a snapshot to destination endpoint using btrfs send/receive.
 
     Args:
@@ -31,7 +44,12 @@ def send_snapshot(
         destination_endpoint: Endpoint to receive the snapshot
         parent: Optional parent snapshot for incremental transfer
         clones: Optional clone sources
-        options: Additional options dict (ssh_sudo, etc.)
+        options: Additional options dict (ssh_sudo, use_chunked, etc.)
+        chunked_manager: Optional ChunkedTransferManager for chunked transfers
+        resume_transfer_id: Optional transfer ID to resume
+
+    Returns:
+        Transfer ID if chunked transfer was used, None otherwise
     """
     if options is None:
         options = {}
@@ -60,6 +78,25 @@ def send_snapshot(
     if clones:
         logger.info(f"  Using clones: {clones!r}")
 
+    # Check if chunked transfer is requested
+    use_chunked = options.get("use_chunked", False)
+    if use_chunked and chunked_manager is None:
+        # Create a default manager if not provided
+        chunked_manager = ChunkedTransferManager()
+
+    # Handle chunked transfer path
+    if use_chunked:
+        return _do_chunked_transfer(
+            snapshot=snapshot,
+            destination_endpoint=destination_endpoint,
+            parent=parent,
+            clones=clones,
+            options=options,
+            chunked_manager=chunked_manager,
+            resume_transfer_id=resume_transfer_id,
+        )
+
+    # Standard (non-chunked) transfer path
     send_process = None
     receive_process = None
     transfer_start = time.monotonic()
@@ -220,6 +257,365 @@ def send_snapshot(
 
     finally:
         _cleanup_processes(send_process, receive_process)
+
+    return None  # No chunked transfer ID for standard transfers
+
+
+def _do_chunked_transfer(
+    snapshot,
+    destination_endpoint,
+    parent,
+    clones,
+    options: dict,
+    chunked_manager: ChunkedTransferManager,
+    resume_transfer_id: Optional[str] = None,
+) -> str:
+    """Perform a chunked transfer with resume capability.
+
+    This function splits the btrfs send stream into checksummed chunks,
+    transfers them individually with verification, and reassembles them
+    at the destination for btrfs receive.
+
+    Args:
+        snapshot: Source snapshot to send
+        destination_endpoint: Endpoint to receive the snapshot
+        parent: Optional parent snapshot for incremental transfer
+        clones: Optional clone sources
+        options: Transfer options dict
+        chunked_manager: The ChunkedTransferManager instance
+        resume_transfer_id: Optional transfer ID to resume from
+
+    Returns:
+        The transfer ID for tracking/resume
+
+    Raises:
+        SnapshotTransferError: If transfer fails
+    """
+    transfer_start = time.monotonic()
+    source_path = str(snapshot.get_path())
+    dest_path = str(destination_endpoint.config.get("path", ""))
+    snapshot_name = str(snapshot)
+    parent_name = str(parent) if parent else None
+    show_progress = options.get("show_progress", False)
+
+    manifest: Optional[TransferManifest] = None
+
+    try:
+        # Check if we're resuming an existing transfer
+        if resume_transfer_id:
+            manifest = chunked_manager.resume_transfer(resume_transfer_id)
+            if manifest is None:
+                raise __util__.SnapshotTransferError(
+                    f"Cannot resume transfer {resume_transfer_id}: not found or not resumable"
+                )
+            logger.info(
+                "Resuming chunked transfer %s from chunk %d/%d",
+                manifest.transfer_id,
+                manifest.get_resume_point() or 0,
+                manifest.chunk_count,
+            )
+        else:
+            # Create a new chunked transfer
+            manifest = chunked_manager.create_transfer(
+                snapshot_path=source_path,
+                snapshot_name=snapshot_name,
+                destination=str(destination_endpoint),
+                parent_path=str(parent.get_path()) if parent else None,
+                parent_name=parent_name,
+            )
+
+            log_transaction(
+                action="chunked_transfer",
+                status="started",
+                source=source_path,
+                destination=dest_path,
+                snapshot=snapshot_name,
+                parent=parent_name,
+            )
+
+            # Start btrfs send and chunk the stream
+            logger.info("Starting chunked transfer %s", manifest.transfer_id)
+            send_process = snapshot.endpoint.send(snapshot, parent=parent, clones=clones)
+
+            if send_process is None:
+                raise __util__.SnapshotTransferError("Send process failed to start")
+
+            # Chunk the send stream
+            logger.info("Chunking btrfs send stream...")
+
+            def on_chunk_progress(chunk_num: int, total: int, bytes_done: int) -> None:
+                if show_progress:
+                    mb_done = bytes_done / (1024 * 1024)
+                    logger.info(
+                        "Chunking progress: chunk %d, %.1f MB written",
+                        chunk_num,
+                        mb_done,
+                    )
+
+            try:
+                manifest = chunked_manager.chunk_stream(
+                    manifest,
+                    send_process.stdout,
+                    on_progress=on_chunk_progress,
+                )
+            finally:
+                # Ensure send process is cleaned up
+                try:
+                    send_process.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    send_process.kill()
+                    send_process.wait()
+
+            logger.info(
+                "Chunking complete: %d chunks, %d bytes",
+                manifest.chunk_count,
+                manifest.total_size or 0,
+            )
+
+        # Now transfer chunks to destination
+        transfer_id = manifest.transfer_id
+        is_ssh_endpoint = (
+            hasattr(destination_endpoint, "_is_remote")
+            and destination_endpoint._is_remote
+        )
+
+        if is_ssh_endpoint:
+            # Use SSH chunked transfer
+            _transfer_chunks_ssh(
+                manifest=manifest,
+                destination_endpoint=destination_endpoint,
+                chunked_manager=chunked_manager,
+                options=options,
+                show_progress=show_progress,
+            )
+        else:
+            # Use local chunked transfer
+            _transfer_chunks_local(
+                manifest=manifest,
+                destination_endpoint=destination_endpoint,
+                chunked_manager=chunked_manager,
+                options=options,
+                show_progress=show_progress,
+            )
+
+        # Mark transfer as complete
+        chunked_manager.complete_transfer(manifest)
+
+        duration = time.monotonic() - transfer_start
+        log_transaction(
+            action="chunked_transfer",
+            status="completed",
+            source=source_path,
+            destination=dest_path,
+            snapshot=snapshot_name,
+            parent=parent_name,
+            duration_seconds=duration,
+            size_bytes=manifest.total_size,
+        )
+
+        logger.info(
+            "Chunked transfer %s completed successfully in %.1fs",
+            transfer_id,
+            duration,
+        )
+
+        return transfer_id
+
+    except __util__.SnapshotTransferError:
+        if manifest:
+            chunked_manager.fail_transfer(manifest, str(manifest.error_message or "Transfer failed"))
+        raise
+
+    except Exception as e:
+        logger.error("Error during chunked transfer: %s", e)
+        if manifest:
+            chunked_manager.fail_transfer(manifest, str(e))
+
+        duration = time.monotonic() - transfer_start
+        log_transaction(
+            action="chunked_transfer",
+            status="failed",
+            source=source_path,
+            destination=dest_path,
+            snapshot=snapshot_name,
+            parent=parent_name,
+            duration_seconds=duration,
+            error=str(e),
+        )
+
+        raise __util__.SnapshotTransferError(f"Chunked transfer failed: {e}") from e
+
+
+def _transfer_chunks_local(
+    manifest: TransferManifest,
+    destination_endpoint,
+    chunked_manager: ChunkedTransferManager,
+    options: dict,
+    show_progress: bool = False,
+) -> None:
+    """Transfer chunks to a local destination and reassemble.
+
+    For local transfers, we reassemble the chunks directly into btrfs receive.
+
+    Args:
+        manifest: Transfer manifest with chunk information
+        destination_endpoint: Local destination endpoint
+        chunked_manager: The ChunkedTransferManager
+        options: Transfer options
+        show_progress: Whether to show progress
+    """
+    logger.info("Reassembling %d chunks for local btrfs receive", manifest.chunk_count)
+
+    # Create a reader to reassemble chunks
+    reader = chunked_manager.create_reassembly_reader(manifest)
+
+    # Start btrfs receive
+    receive_process = destination_endpoint.receive(subprocess.PIPE)
+    if receive_process is None:
+        raise __util__.SnapshotTransferError("Receive process failed to start")
+
+    try:
+        # Pipe chunks to receive
+        total_bytes = reader.pipe_to_process(receive_process)
+
+        # Wait for receive to complete
+        return_code = receive_process.wait(timeout=3600)
+
+        if return_code != 0:
+            stderr = ""
+            if receive_process.stderr:
+                stderr = receive_process.stderr.read().decode("utf-8", errors="replace")
+            raise __util__.SnapshotTransferError(
+                f"btrfs receive failed with code {return_code}: {stderr}"
+            )
+
+        # Mark all chunks as transferred
+        for chunk in manifest.chunks:
+            chunked_manager.mark_chunk_transferred(manifest, chunk.sequence)
+
+        logger.info("Local reassembly complete: %d bytes", total_bytes)
+
+    except subprocess.TimeoutExpired:
+        receive_process.kill()
+        raise __util__.SnapshotTransferError("Timeout waiting for btrfs receive")
+
+    except Exception as e:
+        try:
+            receive_process.kill()
+        except Exception:
+            pass
+        raise
+
+
+def _transfer_chunks_ssh(
+    manifest: TransferManifest,
+    destination_endpoint,
+    chunked_manager: ChunkedTransferManager,
+    options: dict,
+    show_progress: bool = False,
+) -> None:
+    """Transfer chunks to an SSH destination.
+
+    For SSH transfers, we can either:
+    1. Transfer each chunk individually and reassemble remotely
+    2. Stream reassembled chunks through SSH pipe
+
+    This implementation uses option 2 for simplicity - streaming through
+    the existing SSH pipe mechanism but with resume capability.
+
+    Args:
+        manifest: Transfer manifest with chunk information
+        destination_endpoint: SSH destination endpoint
+        chunked_manager: The ChunkedTransferManager
+        options: Transfer options
+        show_progress: Whether to show progress
+    """
+    # Get pending chunks (for resume support)
+    pending_chunks = manifest.pending_chunks
+
+    if not pending_chunks:
+        logger.info("All chunks already transferred")
+        return
+
+    logger.info(
+        "Transferring %d chunks to SSH destination (resume point: %d/%d)",
+        len(pending_chunks),
+        manifest.completed_chunks,
+        manifest.chunk_count,
+    )
+
+    # For SSH, we stream the reassembled chunks through the SSH pipe
+    # The destination will receive them as a continuous btrfs send stream
+    reader = chunked_manager.create_reassembly_reader(manifest)
+
+    # Use the endpoint's send_receive if available for direct pipe
+    if hasattr(destination_endpoint, "receive_chunked"):
+        # Future: dedicated chunked receive method
+        success = destination_endpoint.receive_chunked(
+            reader,
+            manifest,
+            show_progress=show_progress,
+        )
+        if not success:
+            raise __util__.SnapshotTransferError("SSH chunked receive failed")
+    else:
+        # Fall back to streaming through regular receive
+        # Start btrfs receive on remote
+        receive_process = destination_endpoint.receive(subprocess.PIPE)
+        if receive_process is None:
+            raise __util__.SnapshotTransferError("SSH receive process failed to start")
+
+        try:
+            # Track chunk progress
+            chunks_sent = 0
+            for chunk_data in reader.read_chunks():
+                if receive_process.stdin:
+                    receive_process.stdin.write(chunk_data)
+
+                # Find and mark chunk as transferred
+                if chunks_sent < len(manifest.chunks):
+                    chunk = manifest.chunks[chunks_sent]
+                    chunked_manager.mark_chunk_transferred(manifest, chunk.sequence)
+                    chunks_sent += 1
+
+                    if show_progress:
+                        logger.info(
+                            "Chunk %d/%d transferred",
+                            chunks_sent,
+                            manifest.chunk_count,
+                        )
+
+            # Close stdin to signal end of stream
+            if receive_process.stdin:
+                receive_process.stdin.close()
+
+            # Wait for receive to complete
+            return_code = receive_process.wait(timeout=3600)
+
+            if return_code != 0:
+                stderr = ""
+                if receive_process.stderr:
+                    stderr = receive_process.stderr.read().decode("utf-8", errors="replace")
+                raise __util__.SnapshotTransferError(
+                    f"SSH btrfs receive failed with code {return_code}: {stderr}"
+                )
+
+            logger.info("SSH chunked transfer complete: %d chunks", chunks_sent)
+
+        except subprocess.TimeoutExpired:
+            receive_process.kill()
+            raise __util__.SnapshotTransferError("Timeout waiting for SSH btrfs receive")
+
+        except Exception as e:
+            try:
+                receive_process.kill()
+            except Exception:
+                pass
+            # Re-raise with context about which chunk failed
+            if chunks_sent < len(manifest.chunks):
+                chunk = manifest.chunks[chunks_sent]
+                chunked_manager.mark_chunk_failed(manifest, chunk.sequence, str(e))
+            raise
 
 
 def _verify_destination_space(snapshot, destination_endpoint, parent, options) -> None:

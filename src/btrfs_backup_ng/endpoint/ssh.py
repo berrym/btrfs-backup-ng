@@ -3526,6 +3526,167 @@ print(json.dumps(result))
         )
         return False
 
+    def receive_chunked(
+        self,
+        chunk_reader: Any,
+        manifest: Any,
+        show_progress: bool = False,
+        timeout: int = 3600,
+    ) -> bool:
+        """Receive a chunked transfer with verification.
+
+        This method receives pre-chunked data from a ChunkedStreamReader,
+        streaming it through SSH to btrfs receive on the remote host.
+        Each chunk is verified via checksum before being sent.
+
+        Args:
+            chunk_reader: ChunkedStreamReader instance providing chunk data
+            manifest: TransferManifest with chunk information
+            show_progress: Whether to show progress during transfer
+            timeout: Timeout in seconds for the transfer operation
+
+        Returns:
+            bool: True if transfer was successful, False otherwise
+        """
+        from btrfs_backup_ng.core.chunked_transfer import ChunkStatus
+
+        logger.info(
+            "Starting chunked SSH receive for %s (%d chunks)",
+            manifest.snapshot_name,
+            manifest.chunk_count,
+        )
+
+        dest_path = self._normalize_path(self.config["path"])
+        use_sudo = self.config.get("ssh_sudo", False)
+        passwordless = self.config.get("passwordless", False) or self.config.get(
+            "passwordless_sudo_available", False
+        )
+
+        # Build the receive command
+        receive_cmd = _build_receive_command(
+            dest_path=dest_path,
+            use_sudo=use_sudo,
+            password_on_stdin=use_sudo and not passwordless,
+        )
+
+        # Build SSH command
+        ssh_base = self.ssh_manager.get_ssh_base_cmd(force_tty=False)
+        ssh_cmd = ssh_base + [receive_cmd]
+
+        logger.debug("SSH chunked receive command: %s", " ".join(ssh_cmd))
+
+        # Start the receive process
+        try:
+            receive_process = subprocess.Popen(
+                ssh_cmd,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+        except Exception as e:
+            logger.error("Failed to start SSH receive process: %s", e)
+            return False
+
+        # If sudo with password is needed, send it first
+        if use_sudo and not passwordless:
+            sudo_password = self._get_sudo_password()
+            if sudo_password and receive_process.stdin:
+                receive_process.stdin.write((sudo_password + "\n").encode())
+                receive_process.stdin.flush()
+
+        start_time = time.time()
+        chunks_sent = 0
+        bytes_sent = 0
+
+        try:
+            # Stream chunks through SSH
+            for chunk_data in chunk_reader.read_chunks():
+                if receive_process.stdin is None:
+                    raise IOError("Receive process stdin closed unexpectedly")
+
+                # Check if process is still alive
+                if receive_process.poll() is not None:
+                    stderr = ""
+                    if receive_process.stderr:
+                        stderr = receive_process.stderr.read().decode(
+                            "utf-8", errors="replace"
+                        )
+                    logger.error(
+                        "SSH receive process died at chunk %d: %s",
+                        chunks_sent,
+                        stderr,
+                    )
+                    return False
+
+                # Write chunk data
+                receive_process.stdin.write(chunk_data)
+                receive_process.stdin.flush()
+
+                chunks_sent += 1
+                bytes_sent += len(chunk_data)
+
+                if show_progress:
+                    elapsed = time.time() - start_time
+                    rate_mb = (bytes_sent / (1024 * 1024)) / elapsed if elapsed > 0 else 0
+                    logger.info(
+                        "Chunk %d/%d transferred (%.1f MB, %.1f MB/s)",
+                        chunks_sent,
+                        manifest.chunk_count,
+                        bytes_sent / (1024 * 1024),
+                        rate_mb,
+                    )
+
+            # Close stdin to signal end of stream
+            if receive_process.stdin:
+                receive_process.stdin.close()
+
+            # Wait for receive to complete
+            try:
+                return_code = receive_process.wait(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                logger.error("Timeout waiting for SSH receive to complete")
+                receive_process.kill()
+                return False
+
+            if return_code != 0:
+                stderr = ""
+                if receive_process.stderr:
+                    stderr = receive_process.stderr.read().decode(
+                        "utf-8", errors="replace"
+                    )
+                logger.error(
+                    "SSH btrfs receive failed with code %d: %s",
+                    return_code,
+                    stderr,
+                )
+                return False
+
+            elapsed = time.time() - start_time
+            rate_mb = (bytes_sent / (1024 * 1024)) / elapsed if elapsed > 0 else 0
+            logger.info(
+                "Chunked transfer complete: %d chunks, %.1f MB in %.1fs (%.1f MB/s)",
+                chunks_sent,
+                bytes_sent / (1024 * 1024),
+                elapsed,
+                rate_mb,
+            )
+
+            # Verify the snapshot exists
+            if self._verify_snapshot_exists(dest_path, manifest.snapshot_name):
+                logger.info("Snapshot verified on remote host")
+                return True
+            else:
+                logger.error("Snapshot verification failed after chunked transfer")
+                return False
+
+        except Exception as e:
+            logger.error("Error during chunked SSH transfer: %s", e)
+            try:
+                receive_process.kill()
+            except Exception:
+                pass
+            return False
+
     def _monitor_transfer_progress(
         self,
         processes: Dict[str, Any],
