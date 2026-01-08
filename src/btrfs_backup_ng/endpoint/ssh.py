@@ -59,6 +59,19 @@ except ImportError:
 
 from btrfs_backup_ng import __util__  # noqa: E402
 from btrfs_backup_ng.__logger__ import logger  # noqa: E402
+from btrfs_backup_ng.core.errors import (  # noqa: E402
+    BackupError,
+    SnapshotTransferError,
+    TransientNetworkError,
+    TransientTimeoutError,
+    classify_error,
+    classify_ssh_error,
+)
+from btrfs_backup_ng.core.retry import (  # noqa: E402
+    DEFAULT_TRANSFER_POLICY,
+    RetryContext,
+    RetryPolicy,
+)
 from btrfs_backup_ng.core.space import SpaceInfo  # noqa: E402
 from btrfs_backup_ng.sshutil.master import SSHMasterManager  # noqa: E402
 
@@ -3364,11 +3377,13 @@ print(json.dumps(result))
         clones: Optional[List["__util__.Snapshot"]] = None,
         timeout: int = 3600,
         show_progress: bool = False,
+        retry_policy: Optional[RetryPolicy] = None,
     ) -> bool:
-        """Perform direct SSH pipe transfer with verification.
+        """Perform direct SSH pipe transfer with verification and retry.
 
         This method implements a direct SSH pipe for btrfs send/receive operations,
         providing better reliability and verification than traditional methods.
+        Transient network errors are automatically retried with exponential backoff.
 
         Args:
             snapshot: The snapshot object to transfer
@@ -3376,6 +3391,7 @@ print(json.dumps(result))
             clones: Optional clones for the transfer (not currently used)
             timeout: Timeout in seconds for the transfer operation
             show_progress: Whether to show progress bars during transfer
+            retry_policy: Optional retry policy (defaults to DEFAULT_TRANSFER_POLICY)
 
         Returns:
             bool: True if transfer was successful and verified, False otherwise
@@ -3442,27 +3458,73 @@ print(json.dumps(result))
             logger.error("Pre-transfer diagnostics failed")
             return False
 
-        # Use the existing _try_direct_transfer method which has all the logic
-        try:
-            success = self._try_direct_transfer(
-                source_path=snapshot_path,
-                dest_path=dest_path,
-                snapshot_name=snapshot_name,
-                parent_path=parent_path,
-                max_wait_time=timeout,
-                show_progress=show_progress,
-            )
+        # Use retry framework for the actual transfer
+        policy = retry_policy or DEFAULT_TRANSFER_POLICY
 
-            if success:
-                logger.debug("Direct SSH pipe transfer completed successfully")
-                return True
-            else:
-                logger.error("Direct SSH pipe transfer failed")
-                return False
+        with RetryContext(policy) as ctx:
+            while not ctx.exhausted:
+                try:
+                    success = self._try_direct_transfer(
+                        source_path=snapshot_path,
+                        dest_path=dest_path,
+                        snapshot_name=snapshot_name,
+                        parent_path=parent_path,
+                        max_wait_time=timeout,
+                        show_progress=show_progress,
+                    )
 
-        except Exception as e:
-            logger.error("Error during direct SSH pipe transfer: %s", e)
-            return False
+                    if success:
+                        logger.debug("Direct SSH pipe transfer completed successfully")
+                        ctx.succeed(True)
+                        return True
+                    else:
+                        # Transfer returned False - treat as transient error for retry
+                        error = TransientNetworkError(
+                            f"Transfer failed for {snapshot_name}",
+                            suggested_action="Check network connectivity and retry",
+                        )
+                        if not ctx.record_failure(error):
+                            logger.error(
+                                "Transfer failed after %d attempts", ctx.attempt_number
+                            )
+                            return False
+                        logger.warning(
+                            "Transfer attempt %d failed, retrying in %.1fs...",
+                            ctx.attempt_number,
+                            policy.calculate_delay(ctx.attempt_number - 1),
+                        )
+                        ctx.wait()
+
+                except Exception as e:
+                    # Classify the error to determine if it's retryable
+                    classified = classify_error(e)
+                    if not ctx.record_failure(classified):
+                        if classified.is_retryable:
+                            logger.error(
+                                "Transfer failed after %d attempts: %s",
+                                ctx.attempt_number,
+                                classified.message,
+                            )
+                        else:
+                            logger.error(
+                                "Non-retryable error during transfer: %s",
+                                classified.message,
+                            )
+                            logger.info("Suggested action: %s", classified.suggested_action)
+                        return False
+
+                    logger.warning(
+                        "Retryable error on attempt %d: %s",
+                        ctx.attempt_number,
+                        classified.message,
+                    )
+                    ctx.wait()
+
+        # All retries exhausted
+        logger.error(
+            "Transfer failed after exhausting all %d attempts", policy.max_attempts
+        )
+        return False
 
     def _monitor_transfer_progress(
         self,
