@@ -2499,6 +2499,7 @@ print(json.dumps(result))
         dest_path: str,
         snapshot_name: str,
         parent_path: Optional[str] = None,
+        show_progress: bool = False,
     ) -> bool:
         """Execute btrfs send | ssh btrfs receive transfer with progress.
 
@@ -2510,6 +2511,7 @@ print(json.dumps(result))
             dest_path: Destination path on remote
             snapshot_name: Name of the snapshot being transferred
             parent_path: Optional parent snapshot for incremental transfer
+            show_progress: Whether to show progress bars during transfer
 
         Returns:
             True if transfer succeeded, False otherwise
@@ -2541,6 +2543,7 @@ print(json.dumps(result))
                 snapshot_name=snapshot_name,
                 parent_path=parent_path,
                 sudo_password=sudo_password,
+                show_progress=show_progress,
             )
 
         # Fall back to shell pipeline for passwordless sudo or no-sudo cases
@@ -2549,6 +2552,7 @@ print(json.dumps(result))
             dest_path=dest_path,
             snapshot_name=snapshot_name,
             parent_path=parent_path,
+            show_progress=show_progress,
         )
 
     def _do_paramiko_transfer(
@@ -2558,6 +2562,7 @@ print(json.dumps(result))
         snapshot_name: str,
         parent_path: Optional[str],
         sudo_password: str,
+        show_progress: bool = False,
     ) -> bool:
         """Execute transfer using Paramiko for clean password handling.
 
@@ -2573,6 +2578,7 @@ print(json.dumps(result))
             snapshot_name: Name of the snapshot being transferred
             parent_path: Optional parent snapshot for incremental transfer
             sudo_password: The sudo password to use
+            show_progress: Whether to show progress bars during transfer
 
         Returns:
             True if transfer succeeded, False otherwise
@@ -2604,6 +2610,12 @@ print(json.dumps(result))
         # Estimate snapshot size for progress display (None for incremental)
         estimated_size = self._estimate_snapshot_size(source_path, parent_path)
         is_incremental = parent_path and os.path.exists(parent_path)
+
+        # Auto-enable progress for full transfers (they can take a long time)
+        if not is_incremental and not show_progress:
+            show_progress = True
+            logger.debug("Auto-enabling progress for full transfer")
+
         if estimated_size:
             size_mb = estimated_size / (1024 * 1024)
             logger.info(f"Estimated snapshot size: {size_mb:.1f} MiB")
@@ -2698,34 +2710,46 @@ print(json.dumps(result))
             # Give sudo a moment to process password
             time.sleep(0.1)
 
-            # Stream btrfs send output to remote with rich progress bar
-            from rich.progress import (
-                BarColumn,
-                DownloadColumn,
-                Progress,
-                TextColumn,
-                TimeRemainingColumn,
-                TransferSpeedColumn,
-            )
-
             bytes_sent = 0
             start_time = time.time()
             chunk_size = 65536
 
-            with Progress(
-                TextColumn("[bold blue]{task.description}"),
-                BarColumn(bar_width=40),
-                "[progress.percentage]{task.percentage:>3.1f}%",
-                DownloadColumn(),
-                TransferSpeedColumn(),
-                TimeRemainingColumn(),
-                transient=False,
-            ) as progress:
-                task = progress.add_task(
-                    f"Sending {snapshot_name}",
-                    total=estimated_size if estimated_size else None,
+            # Stream btrfs send output to remote, with optional progress bar
+            if show_progress:
+                from rich.progress import (
+                    BarColumn,
+                    DownloadColumn,
+                    Progress,
+                    TextColumn,
+                    TimeRemainingColumn,
+                    TransferSpeedColumn,
                 )
 
+                with Progress(
+                    TextColumn("[bold blue]{task.description}"),
+                    BarColumn(bar_width=40),
+                    "[progress.percentage]{task.percentage:>3.1f}%",
+                    DownloadColumn(),
+                    TransferSpeedColumn(),
+                    TimeRemainingColumn(),
+                    transient=False,
+                ) as progress:
+                    task = progress.add_task(
+                        f"Sending {snapshot_name}",
+                        total=estimated_size if estimated_size else None,
+                    )
+
+                    while True:
+                        if send_proc.stdout is None:
+                            break
+                        chunk = send_proc.stdout.read(chunk_size)
+                        if not chunk:
+                            break
+                        channel.sendall(chunk)
+                        bytes_sent += len(chunk)
+                        progress.update(task, advance=len(chunk))
+            else:
+                # No progress bar - just stream the data
                 while True:
                     if send_proc.stdout is None:
                         break
@@ -2734,7 +2758,6 @@ print(json.dumps(result))
                         break
                     channel.sendall(chunk)
                     bytes_sent += len(chunk)
-                    progress.update(task, advance=len(chunk))
 
             # Signal end of data
             channel.shutdown_write()
@@ -2811,6 +2834,7 @@ print(json.dumps(result))
         dest_path: str,
         snapshot_name: str,
         parent_path: Optional[str] = None,
+        show_progress: bool = False,
     ) -> bool:
         """Execute transfer using shell pipeline (for passwordless sudo).
 
@@ -2819,6 +2843,7 @@ print(json.dumps(result))
             dest_path: Destination path on remote
             snapshot_name: Name of the snapshot being transferred
             parent_path: Optional parent snapshot for incremental transfer
+            show_progress: Whether to show progress bars during transfer
 
         Returns:
             True if transfer succeeded, False otherwise
@@ -2834,6 +2859,12 @@ print(json.dumps(result))
         # Estimate snapshot size for progress display (None for incremental)
         estimated_size = self._estimate_snapshot_size(source_path, parent_path)
         is_incremental = parent_path and os.path.exists(parent_path)
+
+        # Auto-enable progress for full transfers (they can take a long time)
+        if not is_incremental and not show_progress:
+            show_progress = True
+            logger.debug("Auto-enabling progress for full transfer")
+
         if estimated_size:
             size_mb = estimated_size / (1024 * 1024)
             logger.info(f"Estimated snapshot size: {size_mb:.1f} MiB")
@@ -2850,16 +2881,19 @@ print(json.dumps(result))
         send_parts.append(shlex.quote(source_path))
         send_cmd = " ".join(send_parts)
 
-        # Build pv command for progress
-        has_pv = self._check_command_exists("pv")
-        if has_pv:
-            if estimated_size:
-                pv_cmd = f"pv -f -p -t -e -r -b -s {estimated_size}"
+        # Build pv command for progress (only if show_progress is enabled)
+        if show_progress:
+            has_pv = self._check_command_exists("pv")
+            if has_pv:
+                if estimated_size:
+                    pv_cmd = f"pv -f -p -t -e -r -b -s {estimated_size}"
+                else:
+                    pv_cmd = "pv -f -p -t -e -r -b"
             else:
-                pv_cmd = "pv -f -p -t -e -r -b"
+                pv_cmd = "cat"
+                logger.warning("pv not found - progress display unavailable")
         else:
             pv_cmd = "cat"
-            logger.warning("pv not found - progress display unavailable")
 
         # Build SSH command
         ssh_parts = ["ssh", "-o", f"ControlPath={shlex.quote(control_path)}"]
@@ -2937,6 +2971,7 @@ print(json.dumps(result))
         dest_path: str,
         snapshot_name: str,
         parent_path: Optional[str] = None,
+        show_progress: bool = False,
     ) -> bool:
         """Transfer using pre-fetched sudo password with pv for progress.
 
@@ -2954,6 +2989,7 @@ print(json.dumps(result))
             dest_path: Destination path on remote
             snapshot_name: Name of the snapshot being transferred
             parent_path: Optional parent snapshot for incremental transfer
+            show_progress: Whether to show progress bars during transfer
 
         Returns:
             True if transfer succeeded, False otherwise
@@ -3003,6 +3039,7 @@ print(json.dumps(result))
             dest_path=dest_path,
             snapshot_name=snapshot_name,
             parent_path=parent_path,
+            show_progress=show_progress,
         )
 
     def _try_direct_transfer(
@@ -3012,6 +3049,7 @@ print(json.dumps(result))
         snapshot_name: str,
         parent_path: Optional[str] = None,
         max_wait_time: int = 3600,
+        show_progress: bool = False,
         **kwargs: Any,
     ) -> bool:
         """Direct SSH transfer for btrfs-backup-ng, using robust logic and logging."""
@@ -3021,6 +3059,7 @@ print(json.dumps(result))
         logger.debug(f"Snapshot name: {snapshot_name}")
         logger.debug(f"Parent path: {parent_path}")
         logger.debug(f"SSH sudo: {self.config.get('ssh_sudo', False)}")
+        logger.debug(f"Show progress: {show_progress}")
 
         # Check if source path exists
         if not os.path.exists(source_path):
@@ -3051,6 +3090,7 @@ print(json.dumps(result))
                 dest_path=dest_path,
                 snapshot_name=snapshot_name,
                 parent_path=parent_path,
+                show_progress=show_progress,
             )
 
         # Find buffer program for progress display and reliability
@@ -3323,6 +3363,7 @@ print(json.dumps(result))
         parent: Optional["__util__.Snapshot"] = None,
         clones: Optional[List["__util__.Snapshot"]] = None,
         timeout: int = 3600,
+        show_progress: bool = False,
     ) -> bool:
         """Perform direct SSH pipe transfer with verification.
 
@@ -3334,6 +3375,7 @@ print(json.dumps(result))
             parent: Optional parent snapshot for incremental transfers
             clones: Optional clones for the transfer (not currently used)
             timeout: Timeout in seconds for the transfer operation
+            show_progress: Whether to show progress bars during transfer
 
         Returns:
             bool: True if transfer was successful and verified, False otherwise
@@ -3408,6 +3450,7 @@ print(json.dumps(result))
                 snapshot_name=snapshot_name,
                 parent_path=parent_path,
                 max_wait_time=timeout,
+                show_progress=show_progress,
             )
 
             if success:

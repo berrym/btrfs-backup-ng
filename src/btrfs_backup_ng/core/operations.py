@@ -143,7 +143,12 @@ def send_snapshot(
 
         if use_direct_pipe:
             return_codes = _do_direct_pipe_transfer(
-                snapshot, destination_endpoint, parent, clones, send_process
+                snapshot,
+                destination_endpoint,
+                parent,
+                clones,
+                send_process,
+                show_progress=show_progress,
             )
         else:
             return_codes = _do_process_transfer(
@@ -326,7 +331,12 @@ def _ensure_destination_exists(destination_endpoint) -> None:
 
 
 def _do_direct_pipe_transfer(
-    snapshot, destination_endpoint, parent, clones, send_process
+    snapshot,
+    destination_endpoint,
+    parent,
+    clones,
+    send_process,
+    show_progress: bool = False,
 ) -> list[int]:
     """Perform transfer using SSH direct pipe method."""
     try:
@@ -342,6 +352,7 @@ def _do_direct_pipe_transfer(
             parent=parent,
             clones=clones,
             timeout=3600,  # 1 hour timeout
+            show_progress=show_progress,
         )
 
         if not success:
