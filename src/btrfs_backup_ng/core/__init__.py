@@ -60,6 +60,17 @@ from .chunked_transfer import (
     estimate_chunk_count,
 )
 
+# Operation state persistence
+from .state import (
+    OperationContext,
+    OperationManager,
+    OperationRecord,
+    OperationState,
+    TargetState,
+    TransferCheckpoint,
+    TransferState,
+)
+
 __all__ = [
     # Operations
     "send_snapshot",
@@ -113,4 +124,12 @@ __all__ = [
     "TransferManifest",
     "TransferStatus",
     "estimate_chunk_count",
+    # State persistence
+    "OperationContext",
+    "OperationManager",
+    "OperationRecord",
+    "OperationState",
+    "TargetState",
+    "TransferCheckpoint",
+    "TransferState",
 ]
