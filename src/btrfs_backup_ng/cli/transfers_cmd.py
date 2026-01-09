@@ -8,17 +8,13 @@ import argparse
 import json
 import logging
 from datetime import datetime
-from pathlib import Path
-from typing import Optional
 
 from ..__logger__ import create_logger
 from ..core.chunked_transfer import (
     ChunkedTransferManager,
-    TransferConfig,
-    TransferManifest,
     TransferStatus,
 )
-from ..core.state import OperationManager, OperationState
+from ..core.state import OperationManager
 from .common import get_log_level
 
 logger = logging.getLogger(__name__)
@@ -124,9 +120,7 @@ def _list_transfers(args: argparse.Namespace) -> int:
 
     print("Incomplete Transfers")
     print("=" * 70)
-    print(
-        f"{'ID':<10} {'Status':<12} {'Snapshot':<25} {'Progress':<12} {'Age':<10}"
-    )
+    print(f"{'ID':<10} {'Status':<12} {'Snapshot':<25} {'Progress':<12} {'Age':<10}")
     print("-" * 70)
 
     for transfer in incomplete:
@@ -249,7 +243,9 @@ def _resume_transfer(args: argparse.Namespace) -> int:
         return 1
 
     if not manifest.is_resumable:
-        print(f"Transfer {transfer_id} is not resumable (status: {manifest.status.value})")
+        print(
+            f"Transfer {transfer_id} is not resumable (status: {manifest.status.value})"
+        )
         return 1
 
     dry_run = getattr(args, "dry_run", False)
@@ -257,7 +253,9 @@ def _resume_transfer(args: argparse.Namespace) -> int:
     if dry_run:
         print(f"Would resume transfer {transfer_id}")
         print(f"  Snapshot: {manifest.snapshot_name}")
-        print(f"  Resume from chunk: {manifest.get_resume_point()}/{manifest.chunk_count}")
+        print(
+            f"  Resume from chunk: {manifest.get_resume_point()}/{manifest.chunk_count}"
+        )
         return 0
 
     # Mark as ready to resume
@@ -273,7 +271,7 @@ def _resume_transfer(args: argparse.Namespace) -> int:
         print(f"  btrfs-backup-ng transfer --resume-id {transfer_id}")
         return 0
     else:
-        print(f"Failed to mark transfer for resume")
+        print("Failed to mark transfer for resume")
         return 1
 
 
@@ -296,7 +294,9 @@ def _pause_transfer(args: argparse.Namespace) -> int:
         return 1
 
     manager.pause_transfer(manifest)
-    print(f"Transfer {transfer_id} paused at chunk {manifest.completed_chunks}/{manifest.chunk_count}")
+    print(
+        f"Transfer {transfer_id} paused at chunk {manifest.completed_chunks}/{manifest.chunk_count}"
+    )
 
     return 0
 
@@ -327,13 +327,14 @@ def _cleanup_transfers(args: argparse.Namespace) -> int:
             print(f"Cleaned up transfer: {transfer_id}")
             return 0
         else:
-            print(f"Failed to clean up transfer (use --force for active transfers)")
+            print("Failed to clean up transfer (use --force for active transfers)")
             return 1
 
     # Clean up stale transfers
     if dry_run:
         stale = []
         import time
+
         cutoff = time.time() - (max_age_hours * 3600)
 
         for transfer in manager.get_incomplete_transfers():
@@ -344,7 +345,9 @@ def _cleanup_transfers(args: argparse.Namespace) -> int:
         if stale:
             print(f"Would clean up {len(stale)} stale transfer(s):")
             for t in stale:
-                print(f"  {t.transfer_id}: {t.snapshot_name} ({_format_age(t.created_at)})")
+                print(
+                    f"  {t.transfer_id}: {t.snapshot_name} ({_format_age(t.created_at)})"
+                )
         else:
             print("No stale transfers to clean up")
         return 0
@@ -379,9 +382,7 @@ def _list_operations(args: argparse.Namespace) -> int:
 
     print("Backup Operations")
     print("=" * 80)
-    print(
-        f"{'ID':<10} {'State':<14} {'Source':<20} {'Progress':<15} {'Updated':<12}"
-    )
+    print(f"{'ID':<10} {'State':<14} {'Source':<20} {'Progress':<15} {'Updated':<12}")
     print("-" * 80)
 
     for op in operations:
@@ -391,7 +392,9 @@ def _list_operations(args: argparse.Namespace) -> int:
             progress = f"{progress} ({pct:.0f}%)"
 
         updated = _format_age(op.updated_at)
-        source = op.source_volume[:20] if len(op.source_volume) > 20 else op.source_volume
+        source = (
+            op.source_volume[:20] if len(op.source_volume) > 20 else op.source_volume
+        )
 
         print(
             f"{op.operation_id:<10} "

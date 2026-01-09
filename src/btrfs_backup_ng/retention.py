@@ -203,10 +203,8 @@ def apply_retention(
     if now is None:
         now = datetime.now()
 
-    if get_name is None:
-
-        def get_name(s):
-            return str(s)
+    # Use provided get_name or default to str()
+    name_func: Callable[[Any], str] = get_name if get_name is not None else str
 
     # Parse minimum retention duration
     try:
@@ -220,7 +218,7 @@ def apply_retention(
     # Build snapshot info list with timestamps
     snapshot_infos: list[SnapshotInfo] = []
     for snap in snapshots:
-        name = get_name(snap)
+        name = name_func(snap)
         timestamp = extract_timestamp(name, prefix)
 
         if timestamp is None:
@@ -341,10 +339,8 @@ def format_retention_summary(
     Returns:
         Formatted summary string
     """
-    if get_name is None:
-
-        def get_name(s):
-            return str(s)
+    # Use provided get_name or default to str()
+    name_func: Callable[[object], str] = get_name if get_name is not None else str
 
     lines = [
         f"Retention: keeping {len(to_keep)}, deleting {len(to_delete)}",
@@ -353,7 +349,7 @@ def format_retention_summary(
     if to_delete:
         lines.append("To delete:")
         for snap in to_delete[:10]:
-            lines.append(f"  - {get_name(snap)}")
+            lines.append(f"  - {name_func(snap)}")
         if len(to_delete) > 10:
             lines.append(f"  ... and {len(to_delete) - 10} more")
 

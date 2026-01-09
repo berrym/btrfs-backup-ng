@@ -1,7 +1,5 @@
 """Tests for SSH endpoint utilities."""
 
-import pytest
-
 from btrfs_backup_ng.endpoint.ssh import RECEIVE_IDLE_TIMEOUT, _build_receive_command
 
 

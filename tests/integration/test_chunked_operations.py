@@ -5,17 +5,14 @@ into the operations.py send_snapshot function and works end-to-end.
 """
 
 import io
-import subprocess
 import tempfile
 from pathlib import Path
-from unittest.mock import MagicMock, patch, PropertyMock
+from unittest.mock import MagicMock, patch
 
-import pytest
 
 from btrfs_backup_ng.core.chunked_transfer import (
     ChunkedTransferManager,
     TransferConfig,
-    TransferManifest,
     TransferStatus,
     ChunkStatus,
 )
@@ -91,12 +88,8 @@ class TestSendSnapshotChunkedOption:
         mock_receive_process.stderr = None
 
         with patch.object(endpoint, "receive", return_value=mock_receive_process):
-            with patch(
-                "btrfs_backup_ng.core.operations._ensure_destination_exists"
-            ):
-                with patch(
-                    "btrfs_backup_ng.core.operations._verify_destination_space"
-                ):
+            with patch("btrfs_backup_ng.core.operations._ensure_destination_exists"):
+                with patch("btrfs_backup_ng.core.operations._verify_destination_space"):
                     result = send_snapshot(
                         snapshot,
                         endpoint,
@@ -116,12 +109,8 @@ class TestSendSnapshotChunkedOption:
         ) as mock_chunked:
             mock_chunked.return_value = "test-transfer-id"
 
-            with patch(
-                "btrfs_backup_ng.core.operations._ensure_destination_exists"
-            ):
-                with patch(
-                    "btrfs_backup_ng.core.operations._verify_destination_space"
-                ):
+            with patch("btrfs_backup_ng.core.operations._ensure_destination_exists"):
+                with patch("btrfs_backup_ng.core.operations._verify_destination_space"):
                     result = send_snapshot(
                         snapshot,
                         endpoint,
@@ -190,9 +179,7 @@ class TestDoChunkedTransfer:
             with patch(
                 "btrfs_backup_ng.core.operations._transfer_chunks_local"
             ) as mock_local:
-                with patch(
-                    "btrfs_backup_ng.core.operations.log_transaction"
-                ):
+                with patch("btrfs_backup_ng.core.operations.log_transaction"):
                     transfer_id = _do_chunked_transfer(
                         snapshot=snapshot,
                         destination_endpoint=endpoint,
@@ -228,12 +215,8 @@ class TestDoChunkedTransfer:
             manifest.status = TransferStatus.TRANSFERRING
             manifest.save(manager._get_manifest_path(manifest.transfer_id))
 
-            with patch(
-                "btrfs_backup_ng.core.operations._transfer_chunks_local"
-            ) as mock_local:
-                with patch(
-                    "btrfs_backup_ng.core.operations.log_transaction"
-                ):
+            with patch("btrfs_backup_ng.core.operations._transfer_chunks_local"):
+                with patch("btrfs_backup_ng.core.operations.log_transaction"):
                     result_id = _do_chunked_transfer(
                         snapshot=snapshot,
                         destination_endpoint=endpoint,
@@ -265,9 +248,7 @@ class TestDoChunkedTransfer:
             with patch(
                 "btrfs_backup_ng.core.operations._transfer_chunks_ssh"
             ) as mock_ssh:
-                with patch(
-                    "btrfs_backup_ng.core.operations.log_transaction"
-                ):
+                with patch("btrfs_backup_ng.core.operations.log_transaction"):
                     _do_chunked_transfer(
                         snapshot=snapshot,
                         destination_endpoint=endpoint,
@@ -328,9 +309,7 @@ class TestTransferChunksLocal:
             mock_process.stdin = MagicMock()
 
             with patch.object(endpoint, "receive", return_value=mock_process):
-                with patch.object(
-                    manager, "create_reassembly_reader"
-                ) as mock_reader:
+                with patch.object(manager, "create_reassembly_reader") as mock_reader:
                     mock_reader.return_value.pipe_to_process.return_value = 45
 
                     _transfer_chunks_local(
@@ -378,7 +357,7 @@ class TestTransferChunksSSH:
             endpoint._is_remote = True
             endpoint.receive_chunked.return_value = True
 
-            with patch.object(manager, "create_reassembly_reader") as mock_reader:
+            with patch.object(manager, "create_reassembly_reader"):
                 _transfer_chunks_ssh(
                     manifest=manifest,
                     destination_endpoint=endpoint,

@@ -47,10 +47,8 @@ Usage:
 import hashlib
 import json
 import logging
-import os
 import shutil
 import subprocess
-import tempfile
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -60,13 +58,9 @@ from pathlib import Path
 from typing import IO, Any, Callable, Iterator, Optional
 
 from .errors import (
-    BackupError,
     ChunkChecksumError,
-    ChunkTransferError,
     PermanentCorruptedError,
-    TransientNetworkError,
 )
-from .retry import RetryPolicy, with_retry
 
 logger = logging.getLogger(__name__)
 
@@ -174,7 +168,9 @@ class TransferManifest:
     def completed_chunks(self) -> int:
         """Number of successfully transferred chunks."""
         return sum(
-            1 for c in self.chunks if c.status in (ChunkStatus.VERIFIED, ChunkStatus.TRANSFERRED)
+            1
+            for c in self.chunks
+            if c.status in (ChunkStatus.VERIFIED, ChunkStatus.TRANSFERRED)
         )
 
     @property
@@ -626,7 +622,7 @@ class ChunkedTransferManager:
 
     def get_incomplete_transfers(self) -> list[TransferManifest]:
         """Get all incomplete transfers that can be resumed."""
-        incomplete = []
+        incomplete: list[TransferManifest] = []
 
         if not self.config.cache_dir.exists():
             return incomplete

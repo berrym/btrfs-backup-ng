@@ -15,6 +15,7 @@ from .schema import (
     GlobalConfig,
     NotificationConfig,
     RetentionConfig,
+    SnapperSourceConfig,
     TargetConfig,
     VolumeConfig,
     WebhookNotificationConfig,
@@ -116,6 +117,16 @@ def _parse_target(data: dict[str, Any]) -> TargetConfig:
     )
 
 
+def _parse_snapper_source(data: dict[str, Any]) -> SnapperSourceConfig:
+    """Parse snapper source configuration from dict."""
+    return SnapperSourceConfig(
+        config_name=data.get("config_name", "auto"),
+        include_types=data.get("include_types", ["single", "pre", "post"]),
+        exclude_cleanup=data.get("exclude_cleanup", []),
+        min_age=data.get("min_age", "0"),
+    )
+
+
 def _parse_volume(data: dict[str, Any], global_config: GlobalConfig) -> VolumeConfig:
     """Parse volume configuration from dict."""
     if "path" not in data:
@@ -127,6 +138,18 @@ def _parse_volume(data: dict[str, Any], global_config: GlobalConfig) -> VolumeCo
     if "retention" in data:
         retention = _parse_retention(data["retention"])
 
+    # Parse source type and snapper config
+    source = data.get("source", "native")
+    if source not in ("native", "snapper"):
+        raise ConfigError(f"Invalid source type: {source}. Valid: native, snapper")
+
+    snapper = None
+    if "snapper" in data:
+        snapper = _parse_snapper_source(data["snapper"])
+    elif source == "snapper":
+        # Auto-create snapper config with defaults if source is snapper
+        snapper = SnapperSourceConfig()
+
     return VolumeConfig(
         path=data["path"],
         snapshot_prefix=data.get("snapshot_prefix", ""),
@@ -134,6 +157,8 @@ def _parse_volume(data: dict[str, Any], global_config: GlobalConfig) -> VolumeCo
         targets=targets,
         retention=retention,
         enabled=data.get("enabled", True),
+        source=source,
+        snapper=snapper,
     )
 
 
@@ -227,6 +252,21 @@ def _validate_config(config: Config) -> list[str]:
                     warnings.append(
                         f"SSH target '{target.path}' may be missing path separator ':'"
                     )
+
+        # Validate snapper configuration
+        if volume.is_snapper_source():
+            if volume.snapper is None:
+                warnings.append(
+                    f"Volume '{volume.path}' has source='snapper' but no snapper config"
+                )
+            else:
+                # Validate include_types
+                valid_types = {"single", "pre", "post"}
+                for snap_type in volume.snapper.include_types:
+                    if snap_type not in valid_types:
+                        warnings.append(
+                            f"Volume '{volume.path}' has invalid snapper type: {snap_type}"
+                        )
 
     # Check for duplicate volume paths
     volume_paths = [v.path for v in config.volumes]
@@ -351,4 +391,22 @@ path = "/mnt/backup/home"
 #
 # [[volumes.targets]]
 # path = "ssh://backup@server:/backups/logs"
+
+# Snapper-managed root filesystem backup
+# Use this when snapper is managing local snapshots and you want
+# btrfs-backup-ng to back them up to remote targets
+# [[volumes]]
+# path = "/"
+# source = "snapper"              # Use snapper as snapshot source
+# snapshot_prefix = "root-"
+#
+# [volumes.snapper]
+# config_name = "root"            # Snapper config name, or "auto" to detect
+# include_types = ["single"]      # Only backup timeline/manual snapshots
+# exclude_cleanup = []            # Optionally exclude by cleanup algorithm
+# min_age = "1h"                  # Wait 1 hour before backing up
+#
+# [[volumes.targets]]
+# path = "ssh://backup@server:/backups/root"
+# ssh_sudo = true
 """

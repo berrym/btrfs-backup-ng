@@ -334,6 +334,9 @@ def verify_full(
 
     logger.info("Using temp directory: %s", temp_path)
 
+    # Initialize to_verify before try block to avoid "possibly unbound" in finally
+    to_verify: list[Any] = []
+
     try:
         backup_snapshots = backup_endpoint.list_snapshots()
 
@@ -747,7 +750,7 @@ def validate_transfer_chain(
     source_endpoint,
     destination_endpoint,
     check_level: str = "quick",
-) -> list[tuple[any, ParentViabilityResult]]:
+) -> list[tuple[Any, ParentViabilityResult]]:
     """Validate parent chain for a series of transfers.
 
     For each snapshot to transfer, determines the best parent and

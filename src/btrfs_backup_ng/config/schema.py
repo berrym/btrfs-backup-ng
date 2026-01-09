@@ -100,6 +100,27 @@ class RetentionConfig:
 
 
 @dataclass
+class SnapperSourceConfig:
+    """Snapper source configuration.
+
+    When a volume uses snapper as its snapshot source, this configures
+    how snapper snapshots are discovered and filtered.
+
+    Attributes:
+        config_name: Snapper config name (e.g., 'root', 'home') or 'auto' to detect
+        include_types: Snapshot types to include ('single', 'pre', 'post')
+        exclude_cleanup: Cleanup algorithms to exclude (e.g., 'number' for transient)
+        min_age: Minimum age before backing up (e.g., '1h', '30m') to avoid
+                 backing up incomplete pre/post pairs
+    """
+
+    config_name: str = "auto"
+    include_types: list[str] = field(default_factory=lambda: ["single", "pre", "post"])
+    exclude_cleanup: list[str] = field(default_factory=list)
+    min_age: str = "0"
+
+
+@dataclass
 class TargetConfig:
     """Backup target configuration.
 
@@ -135,6 +156,8 @@ class VolumeConfig:
         targets: List of backup targets for this volume
         retention: Volume-specific retention policy (overrides global)
         enabled: Whether this volume is enabled for backup
+        source: Snapshot source type: 'native' (btrfs-backup-ng managed) or 'snapper'
+        snapper: Snapper-specific configuration when source='snapper'
     """
 
     path: str
@@ -143,6 +166,8 @@ class VolumeConfig:
     targets: list[TargetConfig] = field(default_factory=list)
     retention: Optional[RetentionConfig] = None
     enabled: bool = True
+    source: str = "native"
+    snapper: Optional[SnapperSourceConfig] = None
 
     def __post_init__(self):
         # Generate default prefix from path if not specified
@@ -150,6 +175,10 @@ class VolumeConfig:
             # /home -> home-, /var/log -> var-log- (trailing dash for readable snapshot names)
             base = self.path.strip("/").replace("/", "-") or "root"
             self.snapshot_prefix = base + "-"
+
+    def is_snapper_source(self) -> bool:
+        """Check if this volume uses snapper as its snapshot source."""
+        return self.source == "snapper"
 
 
 @dataclass

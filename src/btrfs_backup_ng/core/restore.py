@@ -5,6 +5,7 @@ for disaster recovery, migration, or backup verification.
 """
 
 import logging
+import subprocess
 import time
 import uuid
 from pathlib import Path
@@ -13,6 +14,7 @@ from typing import Any, Callable
 from .. import __util__
 from ..__util__ import Snapshot
 from ..transaction import log_transaction
+from . import progress as progress_utils
 from .operations import send_snapshot
 
 logger = logging.getLogger(__name__)
@@ -322,8 +324,9 @@ def restore_snapshot(
             options=options,
         )
 
-        # Verify the restore
-        verify_restored_snapshot(local_endpoint, snapshot_name)
+        # Verify the restore (can be skipped for snapper restores that rename the subvolume)
+        if not options.get("skip_verify", False):
+            verify_restored_snapshot(local_endpoint, snapshot_name)
 
         duration = time.monotonic() - restore_start
         log_transaction(
@@ -487,9 +490,15 @@ def restore_snapshots(
     if dry_run:
         logger.info("Dry run - no changes made")
         for i, snap in enumerate(to_restore, 1):
-            parent = snap.find_parent(
-                [s for s in to_restore if s != snap] + local_snapshots
+            # Try UUID-based parent detection first
+            parent, _local_match = find_parent_by_uuid(
+                backup_snapshots, local_snapshots, snap, backup_endpoint
             )
+            if not parent:
+                # Fall back to traditional parent finding
+                parent = snap.find_parent(
+                    [s for s in to_restore if s != snap] + local_snapshots
+                )
             mode = "incremental" if parent else "full"
             parent_info = f" from {parent.get_name()}" if parent else ""
             logger.info(
@@ -511,11 +520,22 @@ def restore_snapshots(
         if on_progress:
             on_progress(i, len(to_restore), snap_name)
 
-        # Find parent (from already-restored or existing local)
-        if no_incremental:
-            parent = None
-        else:
-            parent = snap.find_parent(restored_snapshots)
+        # Find parent for incremental restore
+        # First try UUID-based matching (most reliable for cross-filesystem)
+        # Then fall back to name/time-based matching
+        parent = None
+        if not no_incremental:
+            # Try UUID-based parent detection first
+            parent, _local_match = find_parent_by_uuid(
+                backup_snapshots, restored_snapshots, snap, backup_endpoint
+            )
+            if parent:
+                logger.debug("Found UUID-matched parent: %s", parent.get_name())
+            else:
+                # Fall back to traditional parent finding
+                parent = snap.find_parent(restored_snapshots)
+                if parent:
+                    logger.debug("Found time-based parent: %s", parent.get_name())
 
         mode = "incremental" if parent else "full"
         parent_info = f" from {parent.get_name()}" if parent else ""
@@ -586,3 +606,495 @@ def list_remote_snapshots(
         snapshots = [s for s in snapshots if s.get_name().startswith(prefix_filter)]
 
     return snapshots
+
+
+def find_parent_by_uuid(
+    backup_snapshots: list,
+    local_snapshots: list,
+    target_backup,
+    backup_endpoint,
+) -> tuple:
+    """Find a parent backup whose Received UUID matches a local snapshot's UUID.
+
+    For btrfs incremental send/receive to work across filesystems:
+    1. The backup's "Received UUID" must match a local snapshot's UUID
+    2. We use -p with the backup that has this matching Received UUID
+
+    Args:
+        backup_snapshots: All snapshots at backup location
+        local_snapshots: Snapshots that exist locally
+        target_backup: The backup we want to restore
+        backup_endpoint: Endpoint where backups are stored
+
+    Returns:
+        Tuple of (parent_backup, matching_local_snapshot) or (None, None)
+    """
+    import subprocess
+
+    backup_path = Path(backup_endpoint.config["path"])
+
+    # Build map of local UUID -> snapshot
+    local_uuid_map = {}
+    for snap in local_snapshots:
+        try:
+            result = subprocess.run(
+                ["sudo", "btrfs", "subvolume", "show", str(snap.get_path())],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            for line in result.stdout.split("\n"):
+                if (
+                    "UUID:" in line
+                    and "Parent UUID" not in line
+                    and "Received UUID" not in line
+                ):
+                    uuid_val = line.split(":")[1].strip()
+                    if uuid_val and uuid_val != "-":
+                        local_uuid_map[uuid_val] = snap
+                    break
+        except Exception:
+            continue
+
+    if not local_uuid_map:
+        logger.debug("No local UUIDs found for parent matching")
+        return None, None
+
+    # Find a backup whose Received UUID matches a local snapshot's UUID
+    for backup in backup_snapshots:
+        if backup == target_backup:
+            continue
+
+        backup_snap_path = backup_path / backup.get_name()
+        try:
+            result = subprocess.run(
+                ["sudo", "btrfs", "subvolume", "show", str(backup_snap_path)],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            received_uuid = None
+            for line in result.stdout.split("\n"):
+                if "Received UUID:" in line:
+                    received_uuid = line.split(":")[1].strip()
+                    break
+
+            if (
+                received_uuid
+                and received_uuid != "-"
+                and received_uuid in local_uuid_map
+            ):
+                local_snap = local_uuid_map[received_uuid]
+                logger.debug(
+                    "Found UUID match: backup %s (Received UUID %s) matches local %s",
+                    backup.get_name(),
+                    received_uuid,
+                    local_snap.get_name(),
+                )
+                return backup, local_snap
+        except Exception:
+            continue
+
+    return None, None
+
+
+# =============================================================================
+# Snapper-specific Restore Operations
+# =============================================================================
+
+
+def list_snapper_backups(
+    backup_path: str,
+) -> list[dict]:
+    """List snapper backups at a backup location.
+
+    Looks for backups in the snapper directory structure:
+        {backup_path}/.snapshots/{num}/snapshot
+        {backup_path}/.snapshots/{num}/info.xml
+
+    Args:
+        backup_path: Path to backup location
+
+    Returns:
+        List of dicts with backup info:
+        [
+            {
+                'number': 558,
+                'snapshot_path': Path to snapshot subvolume,
+                'info_xml_path': Path to info.xml,
+                'metadata': SnapperMetadata or None,
+            },
+            ...
+        ]
+    """
+    from ..snapper.metadata import parse_info_xml
+
+    backup_base = Path(backup_path)
+    snapshots_dir = backup_base / ".snapshots"
+    backups: list[dict[str, Any]] = []
+
+    if not snapshots_dir.exists():
+        return backups
+
+    for item in snapshots_dir.iterdir():
+        if item.is_dir() and item.name.isdigit():
+            snapshot_path = item / "snapshot"
+            info_xml_path = item / "info.xml"
+
+            if snapshot_path.exists():
+                backup_info = {
+                    "number": int(item.name),
+                    "snapshot_path": snapshot_path,
+                    "info_xml_path": info_xml_path if info_xml_path.exists() else None,
+                }
+
+                # Parse info.xml if available
+                if info_xml_path.exists():
+                    try:
+                        metadata = parse_info_xml(info_xml_path)
+                        backup_info["metadata"] = metadata
+                    except Exception as e:
+                        logger.debug(
+                            "Could not parse info.xml for %s: %s", item.name, e
+                        )
+                        backup_info["metadata"] = None
+                else:
+                    backup_info["metadata"] = None
+
+                backups.append(backup_info)
+
+    # Sort by number
+    backups.sort(key=lambda b: int(str(b["number"])))
+    return backups
+
+
+def restore_snapper_snapshot(
+    backup_path: str,
+    backup_number: int,
+    snapper_config_name: str,
+    parent_backup_number: int | None = None,
+    options: dict | None = None,
+    dry_run: bool = False,
+) -> tuple[int, Path]:
+    """Restore a snapper backup to local snapper format.
+
+    Restores from:
+        {backup_path}/.snapshots/{backup_number}/snapshot
+    To local snapper:
+        {snapper_snapshots_dir}/{new_number}/snapshot
+
+    Uses Rich progress bar for transfers.
+
+    Args:
+        backup_path: Base path of backup (e.g., /backup/home)
+        backup_number: Snapshot number to restore from backup
+        snapper_config_name: Local snapper config to restore to
+        parent_backup_number: Parent snapshot number for incremental restore
+        options: Transfer options
+        dry_run: Show what would be done without doing it
+
+    Returns:
+        Tuple of (new snapshot number, path to restored snapshot)
+
+    Raises:
+        RestoreError: If restore fails
+    """
+    import os
+    import shutil
+
+    from ..snapper import SnapperScanner
+    from ..snapper.metadata import SnapperMetadata, generate_info_xml, parse_info_xml
+
+    if options is None:
+        options = {}
+
+    show_progress = options.get("show_progress", True)
+
+    # Find the snapper config
+    scanner = SnapperScanner()
+    local_config = scanner.get_config(snapper_config_name)
+    if local_config is None:
+        raise RestoreError(f"Local snapper config not found: {snapper_config_name}")
+
+    # Backup paths
+    backup_base = Path(backup_path)
+    backup_snapshot_dir = backup_base / ".snapshots" / str(backup_number)
+    backup_snapshot_path = backup_snapshot_dir / "snapshot"
+    backup_info_xml = backup_snapshot_dir / "info.xml"
+
+    if not backup_snapshot_path.exists():
+        raise RestoreError(f"Backup snapshot not found: {backup_snapshot_path}")
+
+    # Get next available snapshot number for restore
+    next_num = scanner.get_next_snapshot_number(local_config)
+
+    # Local destination paths
+    dest_snapshot_dir = local_config.snapshots_dir / str(next_num)
+    dest_snapshot_path = dest_snapshot_dir / "snapshot"
+
+    # Parent path for incremental
+    parent_path = None
+    if parent_backup_number:
+        parent_path = (
+            backup_base / ".snapshots" / str(parent_backup_number) / "snapshot"
+        )
+        if not parent_path.exists():
+            logger.warning(
+                "Parent snapshot %d not found, falling back to full restore",
+                parent_backup_number,
+            )
+            parent_path = None
+
+    if parent_path:
+        logger.info(
+            "Restoring snapshot %d -> %d (incremental from %d) ...",
+            backup_number,
+            next_num,
+            parent_backup_number,
+        )
+    else:
+        logger.info("Restoring snapshot %d -> %d (full) ...", backup_number, next_num)
+
+    if dry_run:
+        logger.info("Dry run - would restore as snapshot %d", next_num)
+        return next_num, Path("/dev/null")
+
+    transfer_start = time.monotonic()
+
+    log_transaction(
+        action="snapper_restore",
+        status="started",
+        source=str(backup_snapshot_path),
+        destination=str(dest_snapshot_path),
+        snapshot=str(backup_number),
+        parent=str(parent_backup_number) if parent_backup_number else None,
+    )
+
+    try:
+        # Create destination directory
+        if os.geteuid() != 0:
+            subprocess.run(
+                ["sudo", "mkdir", "-p", str(dest_snapshot_dir)],
+                check=True,
+                capture_output=True,
+            )
+        else:
+            dest_snapshot_dir.mkdir(parents=True, exist_ok=True)
+
+        # Build btrfs send command
+        send_cmd = ["btrfs", "send"]
+        if parent_path:
+            send_cmd.extend(["-p", str(parent_path)])
+        send_cmd.append(str(backup_snapshot_path))
+
+        # Build btrfs receive command
+        receive_cmd = ["btrfs", "receive", str(dest_snapshot_dir)]
+
+        # Add sudo if needed
+        if os.geteuid() != 0:
+            send_cmd = ["sudo"] + send_cmd
+            receive_cmd = ["sudo"] + receive_cmd
+
+        logger.debug("Send command: %s", " ".join(send_cmd))
+        logger.debug("Receive command: %s", " ".join(receive_cmd))
+
+        # Estimate size for progress bar (only for full transfers)
+        estimated_size = None
+        if show_progress and not parent_path:
+            estimated_size = progress_utils.estimate_snapshot_size(
+                str(backup_snapshot_path), str(parent_path) if parent_path else None
+            )
+
+        # Start send process
+        send_process = subprocess.Popen(
+            send_cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+
+        # Use Rich progress for local transfers
+        use_rich_progress = show_progress and progress_utils.is_interactive()
+
+        if use_rich_progress:
+            receive_process = subprocess.Popen(
+                receive_cmd,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+
+            send_rc, receive_rc = progress_utils.run_transfer_with_progress(
+                send_process=send_process,
+                receive_process=receive_process,
+                snapshot_name=f"snapshot {backup_number}",
+                estimated_size=estimated_size,
+            )
+
+            if send_rc != 0:
+                raise RestoreError(f"btrfs send failed with code {send_rc}")
+            if receive_rc != 0:
+                raise RestoreError(f"btrfs receive failed with code {receive_rc}")
+        else:
+            # Simple pipe without progress
+            receive_process = subprocess.Popen(
+                receive_cmd,
+                stdin=send_process.stdout,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+
+            if send_process.stdout:
+                send_process.stdout.close()
+
+            receive_stdout, receive_stderr = receive_process.communicate()
+            send_process.wait()
+
+            if send_process.returncode != 0:
+                raise RestoreError(
+                    f"btrfs send failed with code {send_process.returncode}"
+                )
+            if receive_process.returncode != 0:
+                raise RestoreError(
+                    f"btrfs receive failed: {receive_stderr.decode().strip()}"
+                )
+
+        # btrfs receive creates "snapshot" subvolume, which is exactly what we want
+        # No rename needed since snapper expects .snapshots/{num}/snapshot
+
+        # Copy or generate info.xml
+        dest_info_xml = dest_snapshot_dir / "info.xml"
+        if backup_info_xml.exists():
+            # Copy original info.xml but update the number
+            try:
+                metadata = parse_info_xml(backup_info_xml)
+                metadata.num = next_num
+                xml_content = generate_info_xml(metadata)
+            except Exception as e:
+                logger.warning("Could not parse backup info.xml, generating new: %s", e)
+                from datetime import datetime
+
+                metadata = SnapperMetadata(
+                    type="single",
+                    num=next_num,
+                    date=datetime.now(),
+                    description=f"Restored from backup {backup_number}",
+                    cleanup="",
+                )
+                xml_content = generate_info_xml(metadata)
+        else:
+            # Generate new info.xml
+            from datetime import datetime
+
+            metadata = SnapperMetadata(
+                type="single",
+                num=next_num,
+                date=datetime.now(),
+                description=f"Restored from backup {backup_number}",
+                cleanup="",
+            )
+            xml_content = generate_info_xml(metadata)
+
+        # Write info.xml
+        if os.geteuid() != 0:
+            subprocess.run(
+                ["sudo", "tee", str(dest_info_xml)],
+                input=xml_content.encode(),
+                check=True,
+                capture_output=True,
+            )
+            subprocess.run(
+                ["sudo", "chmod", "750", str(dest_snapshot_dir)],
+                check=True,
+                capture_output=True,
+            )
+        else:
+            dest_info_xml.write_text(xml_content)
+            dest_snapshot_dir.chmod(0o750)
+
+        duration = time.monotonic() - transfer_start
+
+        log_transaction(
+            action="snapper_restore",
+            status="completed",
+            source=str(backup_snapshot_path),
+            destination=str(dest_snapshot_path),
+            snapshot=str(backup_number),
+            parent=str(parent_backup_number) if parent_backup_number else None,
+            duration_seconds=duration,
+        )
+
+        logger.info(
+            "Restored snapshot %d -> %d successfully (%.1fs)",
+            backup_number,
+            next_num,
+            duration,
+        )
+        return next_num, dest_snapshot_path
+
+    except Exception as e:
+        duration = time.monotonic() - transfer_start
+        log_transaction(
+            action="snapper_restore",
+            status="failed",
+            source=str(backup_snapshot_path),
+            destination=str(dest_snapshot_path),
+            snapshot=str(backup_number),
+            parent=str(parent_backup_number) if parent_backup_number else None,
+            duration_seconds=duration,
+            error=str(e),
+        )
+
+        # Clean up partial restore
+        try:
+            if dest_snapshot_path.exists():
+                if os.geteuid() != 0:
+                    subprocess.run(
+                        [
+                            "sudo",
+                            "btrfs",
+                            "property",
+                            "set",
+                            "-f",
+                            str(dest_snapshot_path),
+                            "ro",
+                            "false",
+                        ],
+                        capture_output=True,
+                    )
+                    subprocess.run(
+                        [
+                            "sudo",
+                            "btrfs",
+                            "subvolume",
+                            "delete",
+                            str(dest_snapshot_path),
+                        ],
+                        capture_output=True,
+                    )
+                else:
+                    subprocess.run(
+                        [
+                            "btrfs",
+                            "property",
+                            "set",
+                            "-f",
+                            str(dest_snapshot_path),
+                            "ro",
+                            "false",
+                        ],
+                        capture_output=True,
+                    )
+                    __util__.delete_subvolume(dest_snapshot_path)  # type: ignore[attr-defined]
+            if dest_snapshot_dir.exists():
+                if os.geteuid() != 0:
+                    subprocess.run(
+                        ["sudo", "rm", "-rf", str(dest_snapshot_dir)],
+                        capture_output=True,
+                    )
+                else:
+                    shutil.rmtree(dest_snapshot_dir)
+        except Exception as cleanup_e:
+            logger.warning("Cleanup failed: %s", cleanup_e)
+
+        logger.error("Failed to restore snapshot %d: %s", backup_number, e)
+        raise RestoreError(f"Failed to restore snapshot {backup_number}: {e}") from e

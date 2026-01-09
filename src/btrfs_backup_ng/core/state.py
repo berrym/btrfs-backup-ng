@@ -35,14 +35,13 @@ Usage:
 
 import json
 import logging
-import os
 import time
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
-from typing import Any, Optional
+from typing import Optional
 
 logger = logging.getLogger(__name__)
 
@@ -504,7 +503,9 @@ class OperationManager:
             return False
 
         if not force and not operation.is_complete:
-            logger.warning("Cannot delete active operation %s (use force=True)", operation_id)
+            logger.warning(
+                "Cannot delete active operation %s (use force=True)", operation_id
+            )
             return False
 
         # Delete from operations or archive

@@ -1176,17 +1176,19 @@ class TestDetectionWizard:
             ],
         )
 
+    @patch("btrfs_backup_ng.snapper.SnapperScanner")
     @patch("btrfs_backup_ng.cli.config_cmd.find_config_file")
     @patch("btrfs_backup_ng.cli.config_cmd._prompt_bool")
     @patch("btrfs_backup_ng.cli.config_cmd._prompt_choice")
     @patch("btrfs_backup_ng.cli.config_cmd._prompt")
     def test_wizard_volume_selection_all(
-        self, mock_prompt, mock_choice, mock_bool, mock_find, capsys
+        self, mock_prompt, mock_choice, mock_bool, mock_find, mock_snapper, capsys
     ):
         """Test wizard with 'all' volume selection."""
         from btrfs_backup_ng.cli.config_cmd import _run_detection_wizard
 
         mock_find.return_value = None  # No existing config
+        mock_snapper.return_value.list_configs.return_value = []  # No snapper configs
 
         result = self._create_mock_result()
 
@@ -1216,17 +1218,19 @@ class TestDetectionWizard:
         assert 'path = "/home"' in captured.out
         assert 'path = "/"' in captured.out
 
+    @patch("btrfs_backup_ng.snapper.SnapperScanner")
     @patch("btrfs_backup_ng.cli.config_cmd.find_config_file")
     @patch("btrfs_backup_ng.cli.config_cmd._prompt_bool")
     @patch("btrfs_backup_ng.cli.config_cmd._prompt_choice")
     @patch("btrfs_backup_ng.cli.config_cmd._prompt")
     def test_wizard_volume_selection_specific(
-        self, mock_prompt, mock_choice, mock_bool, mock_find, capsys
+        self, mock_prompt, mock_choice, mock_bool, mock_find, mock_snapper, capsys
     ):
         """Test wizard with specific volume selection."""
         from btrfs_backup_ng.cli.config_cmd import _run_detection_wizard
 
         mock_find.return_value = None  # No existing config
+        mock_snapper.return_value.list_configs.return_value = []  # No snapper configs
 
         result = self._create_mock_result()
 
@@ -1251,17 +1255,19 @@ class TestDetectionWizard:
         captured = capsys.readouterr()
         assert 'path = "/home"' in captured.out
 
+    @patch("btrfs_backup_ng.snapper.SnapperScanner")
     @patch("btrfs_backup_ng.cli.config_cmd.find_config_file")
     @patch("btrfs_backup_ng.cli.config_cmd._prompt_bool")
     @patch("btrfs_backup_ng.cli.config_cmd._prompt_choice")
     @patch("btrfs_backup_ng.cli.config_cmd._prompt")
     def test_wizard_cancel(
-        self, mock_prompt, mock_choice, mock_bool, mock_find, capsys
+        self, mock_prompt, mock_choice, mock_bool, mock_find, mock_snapper, capsys
     ):
         """Test wizard cancellation."""
         from btrfs_backup_ng.cli.config_cmd import _run_detection_wizard
 
         mock_find.return_value = None  # No existing config
+        mock_snapper.return_value.list_configs.return_value = []  # No snapper configs
 
         result = self._create_mock_result()
 
@@ -1285,17 +1291,19 @@ class TestDetectionWizard:
         captured = capsys.readouterr()
         assert "cancelled" in captured.out.lower()
 
+    @patch("btrfs_backup_ng.snapper.SnapperScanner")
     @patch("btrfs_backup_ng.cli.config_cmd.find_config_file")
     @patch("btrfs_backup_ng.cli.config_cmd._prompt_bool")
     @patch("btrfs_backup_ng.cli.config_cmd._prompt_choice")
     @patch("btrfs_backup_ng.cli.config_cmd._prompt")
     def test_wizard_with_ssh_target(
-        self, mock_prompt, mock_choice, mock_bool, mock_find, capsys
+        self, mock_prompt, mock_choice, mock_bool, mock_find, mock_snapper, capsys
     ):
         """Test wizard with SSH target."""
         from btrfs_backup_ng.cli.config_cmd import _run_detection_wizard
 
         mock_find.return_value = None  # No existing config
+        mock_snapper.return_value.list_configs.return_value = []  # No snapper configs
 
         result = self._create_mock_result()
 
@@ -1321,17 +1329,19 @@ class TestDetectionWizard:
         assert "ssh://user@host:/backup/home" in captured.out
         assert "ssh_sudo = true" in captured.out
 
+    @patch("btrfs_backup_ng.snapper.SnapperScanner")
     @patch("btrfs_backup_ng.cli.config_cmd.find_config_file")
     @patch("btrfs_backup_ng.cli.config_cmd._prompt_bool")
     @patch("btrfs_backup_ng.cli.config_cmd._prompt_choice")
     @patch("btrfs_backup_ng.cli.config_cmd._prompt")
     def test_wizard_with_mount_target(
-        self, mock_prompt, mock_choice, mock_bool, mock_find, capsys
+        self, mock_prompt, mock_choice, mock_bool, mock_find, mock_snapper, capsys
     ):
         """Test wizard with mount point target."""
         from btrfs_backup_ng.cli.config_cmd import _run_detection_wizard
 
         mock_find.return_value = None  # No existing config
+        mock_snapper.return_value.list_configs.return_value = []  # No snapper configs
 
         result = self._create_mock_result()
 
@@ -1357,17 +1367,19 @@ class TestDetectionWizard:
         assert "/mnt/usb-drive/backup" in captured.out
         assert "require_mount = true" in captured.out
 
+    @patch("btrfs_backup_ng.snapper.SnapperScanner")
     @patch("btrfs_backup_ng.cli.config_cmd.find_config_file")
     @patch("btrfs_backup_ng.cli.config_cmd._prompt_bool")
     @patch("btrfs_backup_ng.cli.config_cmd._prompt_choice")
     @patch("btrfs_backup_ng.cli.config_cmd._prompt")
     def test_wizard_invalid_selection_fallback(
-        self, mock_prompt, mock_choice, mock_bool, mock_find, capsys
+        self, mock_prompt, mock_choice, mock_bool, mock_find, mock_snapper, capsys
     ):
         """Test wizard falls back to recommended on invalid selection."""
         from btrfs_backup_ng.cli.config_cmd import _run_detection_wizard
 
         mock_find.return_value = None  # No existing config
+        mock_snapper.return_value.list_configs.return_value = []  # No snapper configs
 
         result = self._create_mock_result()
 
@@ -1395,18 +1407,27 @@ class TestDetectionWizard:
         captured = capsys.readouterr()
         assert "Invalid selection" in captured.out
 
+    @patch("btrfs_backup_ng.snapper.SnapperScanner")
     @patch("btrfs_backup_ng.cli.config_cmd.find_config_file")
     @patch("btrfs_backup_ng.cli.config_cmd._prompt_bool")
     @patch("btrfs_backup_ng.cli.config_cmd._prompt_choice")
     @patch("btrfs_backup_ng.cli.config_cmd._prompt")
     @patch("btrfs_backup_ng.cli.config_cmd._prompt_int")
     def test_wizard_with_global_settings(
-        self, mock_int, mock_prompt, mock_choice, mock_bool, mock_find, capsys
+        self,
+        mock_int,
+        mock_prompt,
+        mock_choice,
+        mock_bool,
+        mock_find,
+        mock_snapper,
+        capsys,
     ):
         """Test wizard with global settings configured."""
         from btrfs_backup_ng.cli.config_cmd import _run_detection_wizard
 
         mock_find.return_value = None  # No existing config
+        mock_snapper.return_value.list_configs.return_value = []  # No snapper configs
 
         result = self._create_mock_result()
 
@@ -1507,15 +1528,25 @@ class TestDetectionWizard:
         captured = capsys.readouterr()
         assert "Limited detection due to permissions" in captured.out
 
+    @patch("btrfs_backup_ng.snapper.SnapperScanner")
     @patch("btrfs_backup_ng.cli.config_cmd.find_config_file")
     @patch("btrfs_backup_ng.cli.config_cmd._prompt_bool")
     @patch("btrfs_backup_ng.cli.config_cmd._prompt_choice")
     @patch("btrfs_backup_ng.cli.config_cmd._prompt")
     def test_wizard_with_existing_config_diff(
-        self, mock_prompt, mock_choice, mock_bool, mock_find, capsys, tmp_path
+        self,
+        mock_prompt,
+        mock_choice,
+        mock_bool,
+        mock_find,
+        mock_snapper,
+        capsys,
+        tmp_path,
     ):
         """Test wizard shows diff with existing config."""
         from btrfs_backup_ng.cli.config_cmd import _run_detection_wizard
+
+        mock_snapper.return_value.list_configs.return_value = []  # No snapper configs
 
         # Create existing config
         existing_config = tmp_path / "config.toml"
@@ -1556,17 +1587,26 @@ path = "/backup"
         captured = capsys.readouterr()
         assert "Existing Configuration Found" in captured.out
 
+    @patch("btrfs_backup_ng.snapper.SnapperScanner")
     @patch("btrfs_backup_ng.cli.config_cmd.find_config_file")
     @patch("btrfs_backup_ng.cli.config_cmd._prompt_bool")
     @patch("btrfs_backup_ng.cli.config_cmd._prompt_choice")
     @patch("btrfs_backup_ng.cli.config_cmd._prompt")
     def test_wizard_save_to_file(
-        self, mock_prompt, mock_choice, mock_bool, mock_find, capsys, tmp_path
+        self,
+        mock_prompt,
+        mock_choice,
+        mock_bool,
+        mock_find,
+        mock_snapper,
+        capsys,
+        tmp_path,
     ):
         """Test wizard saves config to file."""
         from btrfs_backup_ng.cli.config_cmd import _run_detection_wizard
 
         mock_find.return_value = None
+        mock_snapper.return_value.list_configs.return_value = []  # No snapper configs
 
         # Use a subdirectory to avoid any file existence issues
         save_dir = tmp_path / "config-dir"

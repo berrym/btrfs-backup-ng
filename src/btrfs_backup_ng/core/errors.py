@@ -484,17 +484,17 @@ def classify_error(
         text = f"{text} {stderr.lower()}"
 
     # Check transient patterns first (more likely in network operations)
-    for pattern, error_class in _TRANSIENT_PATTERNS:
+    for pattern, transient_class in _TRANSIENT_PATTERNS:
         if pattern in text:
-            return error_class(
+            return transient_class(
                 str(error),
                 original_error=error,
             )
 
     # Check permanent patterns
-    for pattern, error_class in _PERMANENT_PATTERNS:
+    for pattern, permanent_class in _PERMANENT_PATTERNS:
         if pattern in text:
-            return error_class(
+            return permanent_class(
                 str(error),
                 original_error=error,
             )

@@ -8,7 +8,7 @@ where = ["src"]
 [project]
 name = "btrfs-backup-ng"
 version = "0.8.1"
-description = "Swiss army knife cli tool for atomic, incremental, intelligent, feature-rich backups for btrfs"
+description = "Complete btrfs backup solution with automated snapshots, incremental transfers, restore functionality, snapper integration, and systemd scheduling"
 authors = [{ name = "Michael Berry", email = "trismegustis@gmail.com" }]
 license = { file = "LICENSE" }
 dependencies = ["filelock", "rich", "paramiko"]

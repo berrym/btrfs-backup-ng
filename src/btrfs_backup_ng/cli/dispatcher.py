@@ -29,6 +29,7 @@ SUBCOMMANDS = frozenset(
         "completions",
         "manpages",
         "doctor",
+        "snapper",
     }
 )
 
@@ -976,6 +977,294 @@ Examples:
         help="Only check specific volume(s)",
     )
 
+    # snapper command - manage snapper integration
+    snapper_parser = subparsers.add_parser(
+        "snapper",
+        help="Manage snapper-managed snapshots",
+        description="Discover, list, and backup snapper-managed snapshots",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Detect snapper configurations
+  btrfs-backup-ng snapper detect
+
+  # List all snapper snapshots
+  btrfs-backup-ng snapper list
+
+  # List snapshots for specific config
+  btrfs-backup-ng snapper list --config root
+
+  # List only timeline snapshots
+  btrfs-backup-ng snapper list --config root --type single
+
+  # Backup snapper snapshots to remote target
+  btrfs-backup-ng snapper backup root ssh://backup@server:/backups/root
+
+  # Backup specific snapshot
+  btrfs-backup-ng snapper backup root /mnt/backup --snapshot 1234
+
+  # Dry run backup
+  btrfs-backup-ng snapper backup root /mnt/backup --dry-run
+""",
+    )
+    snapper_subs = snapper_parser.add_subparsers(dest="snapper_action")
+
+    # snapper detect
+    snapper_detect = snapper_subs.add_parser(
+        "detect",
+        help="Detect snapper configurations on the system",
+    )
+    snapper_detect.add_argument(
+        "--json",
+        action="store_true",
+        help="Output in JSON format",
+    )
+
+    # snapper list
+    snapper_list = snapper_subs.add_parser(
+        "list",
+        help="List snapper configs and snapshots",
+    )
+    snapper_list.add_argument(
+        "-c",
+        "--config",
+        metavar="NAME",
+        help="Specific snapper config name",
+    )
+    snapper_list.add_argument(
+        "-t",
+        "--type",
+        choices=["single", "pre", "post"],
+        action="append",
+        metavar="TYPE",
+        help="Filter by snapshot type (can be repeated)",
+    )
+    snapper_list.add_argument(
+        "--json",
+        action="store_true",
+        help="Output in JSON format",
+    )
+
+    # snapper backup
+    snapper_backup = snapper_subs.add_parser(
+        "backup",
+        help="Backup snapper snapshots to target",
+    )
+    snapper_backup.add_argument(
+        "config",
+        metavar="CONFIG",
+        help="Snapper config name (e.g., root, home)",
+    )
+    snapper_backup.add_argument(
+        "target",
+        metavar="TARGET",
+        help="Backup target path (local path or ssh://user@host:/path)",
+    )
+    snapper_backup.add_argument(
+        "-s",
+        "--snapshot",
+        type=int,
+        metavar="NUM",
+        help="Backup specific snapshot number only",
+    )
+    snapper_backup.add_argument(
+        "-t",
+        "--type",
+        choices=["single", "pre", "post"],
+        action="append",
+        metavar="TYPE",
+        help="Filter by snapshot type (can be repeated)",
+    )
+    snapper_backup.add_argument(
+        "--min-age",
+        metavar="DURATION",
+        default="0",
+        help="Minimum snapshot age before backup (e.g., 1h, 30m)",
+    )
+    snapper_backup.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Show what would be done without making changes",
+    )
+    snapper_backup.add_argument(
+        "--ssh-sudo",
+        action="store_true",
+        help="Use sudo for btrfs commands on remote host",
+    )
+    snapper_backup.add_argument(
+        "--ssh-key",
+        metavar="FILE",
+        help="SSH private key file",
+    )
+    snapper_backup.add_argument(
+        "--compress",
+        metavar="METHOD",
+        choices=["none", "gzip", "zstd", "lz4", "pigz", "lzop"],
+        help="Compression method for transfers",
+    )
+    snapper_backup.add_argument(
+        "--rate-limit",
+        metavar="RATE",
+        help="Bandwidth limit (e.g., '10M', '1G')",
+    )
+    add_progress_args(snapper_backup)
+
+    # snapper status
+    snapper_status = snapper_subs.add_parser(
+        "status",
+        help="Show backup status for snapper configs",
+    )
+    snapper_status.add_argument(
+        "-c",
+        "--config",
+        metavar="NAME",
+        help="Specific snapper config name",
+    )
+    snapper_status.add_argument(
+        "target",
+        nargs="?",
+        metavar="TARGET",
+        help="Backup target to check status for",
+    )
+    snapper_status.add_argument(
+        "--json",
+        action="store_true",
+        help="Output in JSON format",
+    )
+
+    # snapper restore
+    snapper_restore = snapper_subs.add_parser(
+        "restore",
+        help="Restore snapper backups to local snapper format",
+    )
+    snapper_restore.add_argument(
+        "source",
+        metavar="SOURCE",
+        help="Backup source (local path or ssh://user@host:/path)",
+    )
+    snapper_restore.add_argument(
+        "config",
+        metavar="CONFIG",
+        help="Local snapper config to restore to (e.g., root, home)",
+    )
+    snapper_restore.add_argument(
+        "-s",
+        "--snapshot",
+        type=int,
+        action="append",
+        metavar="NUM",
+        help="Restore specific snapshot number(s) (can be repeated)",
+    )
+    snapper_restore.add_argument(
+        "-a",
+        "--all",
+        action="store_true",
+        help="Restore all snapper backups",
+    )
+    snapper_restore.add_argument(
+        "--from-config",
+        metavar="NAME",
+        help="Only restore from this snapper config in backup",
+    )
+    snapper_restore.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Show what would be done without making changes",
+    )
+    snapper_restore.add_argument(
+        "--ssh-sudo",
+        action="store_true",
+        help="Use sudo for btrfs commands on remote host",
+    )
+    snapper_restore.add_argument(
+        "--ssh-key",
+        metavar="FILE",
+        help="SSH private key file",
+    )
+    snapper_restore.add_argument(
+        "-l",
+        "--list",
+        action="store_true",
+        help="List available snapper backups at source",
+    )
+    snapper_restore.add_argument(
+        "--json",
+        action="store_true",
+        help="Output in JSON format (for --list)",
+    )
+
+    # snapper generate-config
+    snapper_genconfig = snapper_subs.add_parser(
+        "generate-config",
+        help="Generate TOML config for snapper volumes",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Generate config for all snapper configs
+  btrfs-backup-ng snapper generate-config
+
+  # Generate for specific snapper config
+  btrfs-backup-ng snapper generate-config --config root
+
+  # Specify a backup target
+  btrfs-backup-ng snapper generate-config --target ssh://backup@server:/backups
+
+  # Append to existing config file
+  btrfs-backup-ng snapper generate-config --append ~/.config/btrfs-backup-ng/config.toml
+
+  # Write to new file
+  btrfs-backup-ng snapper generate-config -o /etc/btrfs-backup-ng/snapper.toml
+""",
+    )
+    snapper_genconfig.add_argument(
+        "-c",
+        "--config",
+        metavar="NAME",
+        action="append",
+        help="Snapper config name to include (can be repeated, default: all)",
+    )
+    snapper_genconfig.add_argument(
+        "-t",
+        "--target",
+        metavar="PATH",
+        help="Default backup target path (local or ssh://user@host:/path)",
+    )
+    snapper_genconfig.add_argument(
+        "-o",
+        "--output",
+        metavar="FILE",
+        help="Write config to file (default: stdout)",
+    )
+    snapper_genconfig.add_argument(
+        "-a",
+        "--append",
+        metavar="FILE",
+        help="Append volume configs to existing TOML file",
+    )
+    snapper_genconfig.add_argument(
+        "--type",
+        choices=["single", "pre", "post"],
+        action="append",
+        metavar="TYPE",
+        help="Snapshot types to include (default: single)",
+    )
+    snapper_genconfig.add_argument(
+        "--min-age",
+        metavar="DURATION",
+        default="1h",
+        help="Minimum snapshot age (default: 1h)",
+    )
+    snapper_genconfig.add_argument(
+        "--ssh-sudo",
+        action="store_true",
+        help="Enable sudo for SSH targets",
+    )
+    snapper_genconfig.add_argument(
+        "--json",
+        action="store_true",
+        help="Output in JSON format instead of TOML",
+    )
+
     return parser
 
 
@@ -1069,6 +1358,7 @@ def run_subcommand(args: argparse.Namespace) -> int:
         "completions": cmd_completions,
         "manpages": cmd_manpages,
         "doctor": cmd_doctor,
+        "snapper": cmd_snapper,
     }
 
     handler = handlers.get(args.command)
@@ -1193,6 +1483,13 @@ def cmd_transfers(args: argparse.Namespace) -> int:
     from .transfers_cmd import execute_transfers
 
     return execute_transfers(args)
+
+
+def cmd_snapper(args: argparse.Namespace) -> int:
+    """Execute snapper command."""
+    from .snapper_cmd import execute_snapper
+
+    return execute_snapper(args)
 
 
 def main(argv: list[str] | None = None) -> int:

@@ -492,8 +492,8 @@ class RetryContext:
     def __enter__(self) -> "RetryContext":
         return self
 
-    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> bool:
-        return False
+    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        pass
 
     @property
     def exhausted(self) -> bool:

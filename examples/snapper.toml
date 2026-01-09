@@ -1,0 +1,175 @@
+# btrfs-backup-ng Snapper Integration Configuration
+#
+# This example demonstrates backing up snapper-managed snapshots.
+# With snapper integration, btrfs-backup-ng can:
+#   - Discover and back up existing snapper snapshots
+#   - Preserve snapper metadata (info.xml) in backups
+#   - Restore snapshots back into snapper format
+#   - Use incremental transfers for efficient backups
+#
+# Snapper must be installed and configured on the source system.
+# See: https://en.opensuse.org/Portal:Snapper
+
+# =============================================================================
+# Global Settings
+# =============================================================================
+
+[global]
+# Snapper volumes don't use snapshot_prefix (they use snapper's numbering)
+# But other settings still apply
+incremental = true
+parallel_volumes = 1    # Snapper backups are usually sequential
+parallel_targets = 2
+
+# =============================================================================
+# Snapper Volume Configurations
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Example 1: Root filesystem managed by snapper
+# -----------------------------------------------------------------------------
+# This backs up snapper snapshots from the 'root' config to a remote server.
+# The backup preserves snapper's directory structure:
+#   /backups/root/.snapshots/{num}/snapshot + info.xml
+
+[[volumes]]
+path = "/"
+source = "snapper"    # Use snapper as snapshot source instead of native
+
+[volumes.snapper]
+config_name = "root"                        # Snapper config name
+include_types = ["single", "pre", "post"]   # Snapshot types to back up
+min_age = "1h"                              # Skip snapshots less than 1 hour old
+
+[[volumes.targets]]
+path = "ssh://backup@nas.local:/backups/root"
+ssh_sudo = true
+compress = "zstd"
+
+
+# -----------------------------------------------------------------------------
+# Example 2: Home directory with selective backup
+# -----------------------------------------------------------------------------
+# Only back up 'single' snapshots (manual/timeline), skip pre/post pairs.
+# Excludes snapshots with 'number' cleanup algorithm (transient snapshots).
+
+[[volumes]]
+path = "/home"
+source = "snapper"
+
+[volumes.snapper]
+config_name = "home"
+include_types = ["single"]         # Only timeline/manual snapshots
+exclude_cleanup = ["number"]       # Skip transient snapshots
+min_age = "30m"
+
+[[volumes.targets]]
+path = "ssh://backup@nas.local:/backups/home"
+compress = "lz4"
+
+
+# -----------------------------------------------------------------------------
+# Example 3: Auto-detect snapper config
+# -----------------------------------------------------------------------------
+# When config_name is "auto", btrfs-backup-ng will find the snapper
+# configuration that manages the specified path.
+
+[[volumes]]
+path = "/srv/data"
+source = "snapper"
+
+[volumes.snapper]
+config_name = "auto"    # Auto-detect snapper config for /srv/data
+
+[[volumes.targets]]
+path = "/mnt/backup/data"
+
+
+# -----------------------------------------------------------------------------
+# Example 4: Local backup of snapper snapshots
+# -----------------------------------------------------------------------------
+# Back up to a local external drive (no SSH).
+
+[[volumes]]
+path = "/"
+source = "snapper"
+
+[volumes.snapper]
+config_name = "root"
+include_types = ["single", "pre", "post"]
+
+[[volumes.targets]]
+path = "/mnt/external-backup/root"
+require_mount = true    # Fail if drive not mounted
+
+
+# =============================================================================
+# Snapper Configuration Reference
+# =============================================================================
+#
+# [volumes.snapper] options:
+#
+#   config_name     - Snapper config name (from /etc/snapper/configs/)
+#                     Use "auto" to detect from volume path
+#
+#   include_types   - List of snapshot types to include:
+#                     - "single": Standalone snapshots (manual, timeline)
+#                     - "pre": Pre-action snapshots (before zypper/dnf)
+#                     - "post": Post-action snapshots (after zypper/dnf)
+#                     Default: ["single", "pre", "post"]
+#
+#   exclude_cleanup - List of cleanup algorithms to exclude:
+#                     - "number": Keep last N snapshots (transient)
+#                     - "timeline": Time-based retention
+#                     - "empty-pre-post": Remove empty pre/post pairs
+#                     Default: [] (include all)
+#
+#   min_age         - Minimum snapshot age before backing up
+#                     Useful to avoid backing up incomplete pre/post pairs
+#                     Format: "30m", "1h", "1d"
+#                     Default: "0" (no minimum)
+#
+# =============================================================================
+# Backup Directory Layout
+# =============================================================================
+#
+# Snapper backups preserve the native snapper directory structure:
+#
+#   /backups/root/.snapshots/
+#   ├── 559/
+#   │   ├── info.xml           # Snapper metadata
+#   │   └── snapshot/          # Btrfs subvolume (read-only)
+#   ├── 560/
+#   │   ├── info.xml
+#   │   └── snapshot/
+#   └── 561/
+#       ├── info.xml
+#       └── snapshot/
+#
+# This allows direct restoration back into a snapper-managed volume.
+#
+# =============================================================================
+# CLI Commands for Snapper
+# =============================================================================
+#
+# List snapper configurations and snapshots:
+#   btrfs-backup-ng snapper list
+#   btrfs-backup-ng snapper list --config root --json
+#
+# Detect snapper configurations:
+#   btrfs-backup-ng snapper detect
+#
+# Backup snapshots (standalone, without config file):
+#   btrfs-backup-ng snapper backup root /mnt/backup/root
+#   btrfs-backup-ng snapper backup root ssh://user@host:/backups
+#
+# List backups at a location:
+#   btrfs-backup-ng snapper restore --list /mnt/backup/root
+#   btrfs-backup-ng snapper restore --list ssh://user@host:/backups/root
+#
+# Restore a specific backup:
+#   btrfs-backup-ng snapper restore /mnt/backup/root 559 root
+#   btrfs-backup-ng snapper restore ssh://user@host:/backups/root 560 root
+#
+# Generate config from snapper setup:
+#   btrfs-backup-ng snapper generate-config root /mnt/backup

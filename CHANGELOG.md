@@ -5,6 +5,43 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+#### Snapper Integration
+- **Full Snapper integration** for backing up and restoring Snapper-managed snapshots
+- New `snapper` subcommand with dedicated operations:
+  - `snapper detect` - Discover Snapper configurations on the system
+  - `snapper list` - List snapshots for one or all Snapper configs
+  - `snapper backup` - Back up snapshots to local or remote targets
+  - `snapper restore` - Restore snapshots from backup locations
+  - `snapper status` - Show backup status for Snapper configurations
+  - `snapper generate-config` - Generate TOML configuration for Snapper volumes
+- **Native Snapper directory layout** - Backups use `.snapshots/{num}/snapshot` + `info.xml` structure
+- **Metadata preservation** - Snapper's `info.xml` is preserved in backups for proper restoration
+- **Incremental transfers** - Both backup and restore operations use `btrfs send -p` for efficient delta transfers
+- **Snapshot type filtering** - Back up specific types: `single` (timeline), `pre`, `post`
+- **Minimum age filtering** - Skip snapshots younger than a specified age with `--min-age`
+- **Rich progress bars** - Visual transfer progress for Snapper operations matching standard commands
+- **Configuration file integration** - Snapper volumes can be defined in `config.toml` with `source = "snapper"`
+- **Auto-detection in config wizard** - Interactive wizard now detects and offers Snapper configurations
+- New `SnapperSourceConfig` schema for TOML configuration:
+  - `config_name` - Snapper config name or "auto" to detect
+  - `include_types` - Snapshot types to include
+  - `exclude_cleanup` - Cleanup algorithms to skip
+  - `min_age` - Minimum snapshot age before backup
+
+#### Documentation
+- New `examples/snapper.toml` example configuration
+- Comprehensive Snapper integration section in README.md
+- New man page `btrfs-backup-ng-snapper.1`
+
+### Changed
+- `btrfs-backup-ng run` now handles Snapper volumes when configured with `source = "snapper"`
+- Config wizard shows Snapper volumes with `[snapper:name]` markers for easy identification
+- `get_next_snapshot_number()` in scanner now scans filesystem directly for accuracy after restores
+
 ## [0.8.1] - 2026-01-06
 
 ### Added

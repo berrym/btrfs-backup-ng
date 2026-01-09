@@ -2,10 +2,7 @@
 
 import json
 import tempfile
-import time
-from datetime import datetime
 from pathlib import Path
-from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -124,7 +121,11 @@ class TestOperationRecord:
         assert not operation.is_resumable
 
         # Resumable states
-        for state in [OperationState.TRANSFERRING, OperationState.FAILED, OperationState.PAUSED]:
+        for state in [
+            OperationState.TRANSFERRING,
+            OperationState.FAILED,
+            OperationState.PAUSED,
+        ]:
             operation.state = state
             assert operation.is_resumable
 
@@ -463,7 +464,9 @@ class TestOperationContext:
             ctx.pause_operation()
 
         # Resume the operation
-        with OperationContext(manager, "/mnt/btrfs", ["target1"], operation_id=original_id) as ctx:
+        with OperationContext(
+            manager, "/mnt/btrfs", ["target1"], operation_id=original_id
+        ) as ctx:
             assert ctx.operation_id == original_id
             assert ctx.operation.resume_count == 1
             assert ctx.operation.state == OperationState.TRANSFERRING

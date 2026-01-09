@@ -7,12 +7,17 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from btrfs_backup_ng.core.verify import (
+    ParentViability,
+    ParentViabilityResult,
     VerifyError,
     VerifyLevel,
     VerifyReport,
     VerifyResult,
     _find_parent_snapshot,
     _test_send_stream,
+    check_parent_viability,
+    find_viable_parent,
+    validate_transfer_chain,
     verify_full,
     verify_metadata,
     verify_stream,
@@ -910,14 +915,6 @@ class TestVerifyReportDuration:
 # Pre-Transfer Parent Validation Tests
 # =============================================================================
 
-from btrfs_backup_ng.core.verify import (
-    ParentViability,
-    ParentViabilityResult,
-    check_parent_viability,
-    find_viable_parent,
-    validate_transfer_chain,
-)
-
 
 class TestParentViabilityResult:
     """Tests for ParentViabilityResult dataclass."""
@@ -1131,15 +1128,25 @@ class TestFindViableParent:
         source_ep = MagicMock()
         dest_ep = MagicMock()
         dest_ep.list_snapshots.return_value = [
-            MockSnapshot("root-20240101", time.strptime("20240101-120000", "%Y%m%d-%H%M%S")),
-            MockSnapshot("root-20240102", time.strptime("20240102-120000", "%Y%m%d-%H%M%S")),
+            MockSnapshot(
+                "root-20240101", time.strptime("20240101-120000", "%Y%m%d-%H%M%S")
+            ),
+            MockSnapshot(
+                "root-20240102", time.strptime("20240102-120000", "%Y%m%d-%H%M%S")
+            ),
         ]
 
         present = [
-            MockSnapshot("root-20240101", time.strptime("20240101-120000", "%Y%m%d-%H%M%S")),
-            MockSnapshot("root-20240102", time.strptime("20240102-120000", "%Y%m%d-%H%M%S")),
+            MockSnapshot(
+                "root-20240101", time.strptime("20240101-120000", "%Y%m%d-%H%M%S")
+            ),
+            MockSnapshot(
+                "root-20240102", time.strptime("20240102-120000", "%Y%m%d-%H%M%S")
+            ),
         ]
-        snapshot = MockSnapshot("root-20240103", time.strptime("20240103-120000", "%Y%m%d-%H%M%S"))
+        snapshot = MockSnapshot(
+            "root-20240103", time.strptime("20240103-120000", "%Y%m%d-%H%M%S")
+        )
 
         result = find_viable_parent(
             snapshot, present, source_ep, dest_ep, check_level="quick"
@@ -1156,9 +1163,13 @@ class TestFindViableParent:
 
         # All present snapshots are newer
         present = [
-            MockSnapshot("root-20240105", time.strptime("20240105-120000", "%Y%m%d-%H%M%S")),
+            MockSnapshot(
+                "root-20240105", time.strptime("20240105-120000", "%Y%m%d-%H%M%S")
+            ),
         ]
-        snapshot = MockSnapshot("root-20240101", time.strptime("20240101-120000", "%Y%m%d-%H%M%S"))
+        snapshot = MockSnapshot(
+            "root-20240101", time.strptime("20240101-120000", "%Y%m%d-%H%M%S")
+        )
 
         result = find_viable_parent(
             snapshot, present, source_ep, dest_ep, check_level="quick"
@@ -1174,14 +1185,22 @@ class TestFindViableParent:
 
         # Only the oldest parent exists at destination
         dest_ep.list_snapshots.return_value = [
-            MockSnapshot("root-20240101", time.strptime("20240101-120000", "%Y%m%d-%H%M%S")),
+            MockSnapshot(
+                "root-20240101", time.strptime("20240101-120000", "%Y%m%d-%H%M%S")
+            ),
         ]
 
         present = [
-            MockSnapshot("root-20240101", time.strptime("20240101-120000", "%Y%m%d-%H%M%S")),
-            MockSnapshot("root-20240102", time.strptime("20240102-120000", "%Y%m%d-%H%M%S")),
+            MockSnapshot(
+                "root-20240101", time.strptime("20240101-120000", "%Y%m%d-%H%M%S")
+            ),
+            MockSnapshot(
+                "root-20240102", time.strptime("20240102-120000", "%Y%m%d-%H%M%S")
+            ),
         ]
-        snapshot = MockSnapshot("root-20240103", time.strptime("20240103-120000", "%Y%m%d-%H%M%S"))
+        snapshot = MockSnapshot(
+            "root-20240103", time.strptime("20240103-120000", "%Y%m%d-%H%M%S")
+        )
 
         result = find_viable_parent(
             snapshot, present, source_ep, dest_ep, check_level="quick"
@@ -1203,9 +1222,15 @@ class TestValidateTransferChain:
 
         present = []
         to_transfer = [
-            MockSnapshot("root-20240101", time.strptime("20240101-120000", "%Y%m%d-%H%M%S")),
-            MockSnapshot("root-20240102", time.strptime("20240102-120000", "%Y%m%d-%H%M%S")),
-            MockSnapshot("root-20240103", time.strptime("20240103-120000", "%Y%m%d-%H%M%S")),
+            MockSnapshot(
+                "root-20240101", time.strptime("20240101-120000", "%Y%m%d-%H%M%S")
+            ),
+            MockSnapshot(
+                "root-20240102", time.strptime("20240102-120000", "%Y%m%d-%H%M%S")
+            ),
+            MockSnapshot(
+                "root-20240103", time.strptime("20240103-120000", "%Y%m%d-%H%M%S")
+            ),
         ]
 
         results = validate_transfer_chain(
@@ -1227,17 +1252,29 @@ class TestValidateTransferChain:
         dest_ep = MagicMock()
         # All snapshots will be "present" at dest after they're transferred
         dest_ep.list_snapshots.return_value = [
-            MockSnapshot("root-20240101", time.strptime("20240101-120000", "%Y%m%d-%H%M%S")),
-            MockSnapshot("root-20240102", time.strptime("20240102-120000", "%Y%m%d-%H%M%S")),
-            MockSnapshot("root-20240103", time.strptime("20240103-120000", "%Y%m%d-%H%M%S")),
+            MockSnapshot(
+                "root-20240101", time.strptime("20240101-120000", "%Y%m%d-%H%M%S")
+            ),
+            MockSnapshot(
+                "root-20240102", time.strptime("20240102-120000", "%Y%m%d-%H%M%S")
+            ),
+            MockSnapshot(
+                "root-20240103", time.strptime("20240103-120000", "%Y%m%d-%H%M%S")
+            ),
         ]
 
         present = [
-            MockSnapshot("root-20240101", time.strptime("20240101-120000", "%Y%m%d-%H%M%S")),
+            MockSnapshot(
+                "root-20240101", time.strptime("20240101-120000", "%Y%m%d-%H%M%S")
+            ),
         ]
         to_transfer = [
-            MockSnapshot("root-20240102", time.strptime("20240102-120000", "%Y%m%d-%H%M%S")),
-            MockSnapshot("root-20240103", time.strptime("20240103-120000", "%Y%m%d-%H%M%S")),
+            MockSnapshot(
+                "root-20240102", time.strptime("20240102-120000", "%Y%m%d-%H%M%S")
+            ),
+            MockSnapshot(
+                "root-20240103", time.strptime("20240103-120000", "%Y%m%d-%H%M%S")
+            ),
         ]
 
         results = validate_transfer_chain(

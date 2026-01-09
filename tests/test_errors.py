@@ -1,7 +1,5 @@
 """Tests for the error classification module."""
 
-import pytest
-
 from btrfs_backup_ng.core.errors import (
     BackupError,
     ChunkChecksumError,
@@ -245,9 +243,9 @@ class TestClassifyError:
         for pattern in patterns:
             error = Exception(pattern)
             classified = classify_error(error)
-            assert isinstance(
-                classified, TransientNetworkError
-            ), f"'{pattern}' should be TransientNetworkError"
+            assert isinstance(classified, TransientNetworkError), (
+                f"'{pattern}' should be TransientNetworkError"
+            )
 
     def test_classify_timeout_errors(self):
         """Timeout errors should be classified as transient timeout."""
@@ -259,9 +257,9 @@ class TestClassifyError:
         for pattern in patterns:
             error = Exception(pattern)
             classified = classify_error(error)
-            assert isinstance(
-                classified, TransientTimeoutError
-            ), f"'{pattern}' should be TransientTimeoutError"
+            assert isinstance(classified, TransientTimeoutError), (
+                f"'{pattern}' should be TransientTimeoutError"
+            )
 
     def test_classify_permission_errors(self):
         """Permission errors should be classified as permanent permission."""
@@ -273,9 +271,9 @@ class TestClassifyError:
         for pattern in patterns:
             error = Exception(pattern)
             classified = classify_error(error)
-            assert isinstance(
-                classified, PermanentPermissionError
-            ), f"'{pattern}' should be PermanentPermissionError"
+            assert isinstance(classified, PermanentPermissionError), (
+                f"'{pattern}' should be PermanentPermissionError"
+            )
 
     def test_classify_not_found_errors(self):
         """Not found errors should be classified as permanent not found."""
@@ -287,9 +285,9 @@ class TestClassifyError:
         for pattern in patterns:
             error = Exception(pattern)
             classified = classify_error(error)
-            assert isinstance(
-                classified, PermanentNotFoundError
-            ), f"'{pattern}' should be PermanentNotFoundError"
+            assert isinstance(classified, PermanentNotFoundError), (
+                f"'{pattern}' should be PermanentNotFoundError"
+            )
 
     def test_classify_busy_errors(self):
         """Busy errors should be classified as transient busy."""
@@ -301,9 +299,9 @@ class TestClassifyError:
         for pattern in patterns:
             error = Exception(pattern)
             classified = classify_error(error)
-            assert isinstance(
-                classified, TransientBusyError
-            ), f"'{pattern}' should be TransientBusyError"
+            assert isinstance(classified, TransientBusyError), (
+                f"'{pattern}' should be TransientBusyError"
+            )
 
     def test_classify_space_errors(self):
         """Space errors should be classified as transient space."""
@@ -314,9 +312,9 @@ class TestClassifyError:
         for pattern in patterns:
             error = Exception(pattern)
             classified = classify_error(error)
-            assert isinstance(
-                classified, TransientSpaceError
-            ), f"'{pattern}' should be TransientSpaceError"
+            assert isinstance(classified, TransientSpaceError), (
+                f"'{pattern}' should be TransientSpaceError"
+            )
 
     def test_classify_with_stderr(self):
         """Classification should consider stderr in addition to error message."""

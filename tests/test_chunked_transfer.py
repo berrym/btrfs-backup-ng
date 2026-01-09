@@ -1,11 +1,9 @@
 """Tests for the chunked transfer module."""
 
 import io
-import json
-import os
 import tempfile
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -251,7 +249,9 @@ class TestTransferConfig:
     def test_cache_dir(self):
         """Test cache_dir property."""
         config = TransferConfig()
-        assert config.cache_dir == Path.home() / ".cache" / "btrfs-backup-ng" / "transfers"
+        assert (
+            config.cache_dir == Path.home() / ".cache" / "btrfs-backup-ng" / "transfers"
+        )
 
         custom_dir = Path("/custom/cache")
         config = TransferConfig(cache_directory=custom_dir)
@@ -325,7 +325,7 @@ class TestChunkedStreamWriter:
                 on_chunk_complete=callback,
             )
 
-            chunks = list(writer.write_chunks())
+            list(writer.write_chunks())
             assert callback.call_count == 2
 
 
@@ -391,7 +391,9 @@ class TestChunkedStreamReader:
                 checksum_algorithm="sha256",
             )
             manifest.chunks = [
-                ChunkInfo(0, len(chunk_data), correct_checksum, filename="chunk_000000.bin"),
+                ChunkInfo(
+                    0, len(chunk_data), correct_checksum, filename="chunk_000000.bin"
+                ),
             ]
 
             reader = ChunkedStreamReader(

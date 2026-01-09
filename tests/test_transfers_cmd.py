@@ -7,7 +7,6 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-import pytest
 
 from btrfs_backup_ng.cli.transfers_cmd import (
     _format_age,
@@ -23,14 +22,12 @@ from btrfs_backup_ng.cli.transfers_cmd import (
 from btrfs_backup_ng.core.chunked_transfer import (
     ChunkedTransferManager,
     TransferConfig,
-    TransferManifest,
     TransferStatus,
     ChunkInfo,
     ChunkStatus,
 )
 from btrfs_backup_ng.core.state import (
     OperationManager,
-    OperationRecord,
     OperationState,
 )
 
@@ -92,7 +89,7 @@ class TestListTransfers:
     def test_no_transfers(self, capsys):
         """Should show message when no transfers."""
         with tempfile.TemporaryDirectory() as tmpdir:
-            config = TransferConfig(cache_directory=Path(tmpdir))
+            TransferConfig(cache_directory=Path(tmpdir))
 
             with patch(
                 "btrfs_backup_ng.cli.transfers_cmd.ChunkedTransferManager"
@@ -123,7 +120,12 @@ class TestListTransfers:
             )
             manifest.status = TransferStatus.TRANSFERRING
             manifest.chunks.append(
-                ChunkInfo(sequence=0, size=1024, checksum="abc", status=ChunkStatus.TRANSFERRED)
+                ChunkInfo(
+                    sequence=0,
+                    size=1024,
+                    checksum="abc",
+                    status=ChunkStatus.TRANSFERRED,
+                )
             )
             manifest.save(manager._get_manifest_path(manifest.transfer_id))
 
@@ -210,7 +212,12 @@ class TestShowTransfer:
             manifest.status = TransferStatus.TRANSFERRING
             manifest.total_size = 1024 * 1024 * 100
             manifest.chunks.append(
-                ChunkInfo(sequence=0, size=64*1024*1024, checksum="abc123", status=ChunkStatus.TRANSFERRED)
+                ChunkInfo(
+                    sequence=0,
+                    size=64 * 1024 * 1024,
+                    checksum="abc123",
+                    status=ChunkStatus.TRANSFERRED,
+                )
             )
             manifest.save(manager._get_manifest_path(manifest.transfer_id))
 
@@ -287,7 +294,9 @@ class TestResumeTransfer:
             )
             manifest.status = TransferStatus.FAILED
             manifest.chunks.append(
-                ChunkInfo(sequence=0, size=1024, checksum="abc", status=ChunkStatus.WRITTEN)
+                ChunkInfo(
+                    sequence=0, size=1024, checksum="abc", status=ChunkStatus.WRITTEN
+                )
             )
             manifest.save(manager._get_manifest_path(manifest.transfer_id))
 
@@ -362,9 +371,7 @@ class TestListOperations:
 
     def test_no_operations(self, capsys):
         """Should show message when no operations."""
-        with patch(
-            "btrfs_backup_ng.cli.transfers_cmd.OperationManager"
-        ) as MockManager:
+        with patch("btrfs_backup_ng.cli.transfers_cmd.OperationManager") as MockManager:
             mock_manager = MagicMock()
             mock_manager.list_operations.return_value = []
             MockManager.return_value = mock_manager

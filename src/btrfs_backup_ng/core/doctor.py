@@ -705,11 +705,10 @@ class Doctor:
 
         # Collect all compression methods used
         compression_methods: set[str] = set()
-        if (
-            hasattr(self.config.global_config, "compress")
-            and self.config.global_config.compress
+        if hasattr(self.config.global_config, "compress") and getattr(
+            self.config.global_config, "compress", None
         ):
-            compression_methods.add(self.config.global_config.compress)
+            compression_methods.add(getattr(self.config.global_config, "compress"))
 
         for volume in self.config.get_enabled_volumes():
             for target in volume.targets:

@@ -2,6 +2,7 @@
 
 import argparse
 import logging
+from pathlib import Path
 
 from rich.console import Console
 from rich.table import Table
@@ -49,8 +50,6 @@ def execute(args: argparse.Namespace) -> int:
             endpoint_kwargs["ssh_identity_file"] = args.ssh_key
     else:
         # For local paths, set 'path' for LocalEndpoint
-        from pathlib import Path
-
         endpoint_kwargs["path"] = Path(args.location).resolve()
 
     # Create endpoint for backup location
@@ -72,6 +71,7 @@ def execute(args: argparse.Namespace) -> int:
             console.print(f"  [{current}/{total}] Verifying {name}...")
 
     # Run verification based on level
+    report: VerifyReport
     try:
         if not args.quiet:
             console.print(f"\n[bold]Verifying backups at:[/bold] {args.location}")
@@ -91,7 +91,7 @@ def execute(args: argparse.Namespace) -> int:
                 on_progress=on_progress if not args.quiet else None,
             )
 
-        elif level == VerifyLevel.FULL:
+        else:  # level == VerifyLevel.FULL
             if not args.temp_dir:
                 # For remote backups, temp-dir is required
                 if "://" in args.location or args.location.startswith("ssh:"):

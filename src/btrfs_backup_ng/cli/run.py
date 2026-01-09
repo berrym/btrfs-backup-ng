@@ -207,13 +207,22 @@ def _dry_run(config: Config) -> int:
 
     for volume in config.get_enabled_volumes():
         print(f"Volume: {volume.path}")
-        print(f"  Snapshot prefix: {volume.snapshot_prefix}")
-        print(f"  Snapshot dir: {volume.snapshot_dir}")
 
-        retention = config.get_effective_retention(volume)
-        print(
-            f"  Retention: min={retention.min}, hourly={retention.hourly}, daily={retention.daily}"
-        )
+        if volume.is_snapper_source():
+            print("  Source: snapper")
+            if volume.snapper:
+                print(f"  Snapper config: {volume.snapper.config_name}")
+                print(f"  Include types: {', '.join(volume.snapper.include_types)}")
+                print(f"  Min age: {volume.snapper.min_age}")
+        else:
+            print("  Source: native")
+            print(f"  Snapshot prefix: {volume.snapshot_prefix}")
+            print(f"  Snapshot dir: {volume.snapshot_dir}")
+
+            retention = config.get_effective_retention(volume)
+            print(
+                f"  Retention: min={retention.min}, hourly={retention.hourly}, daily={retention.daily}"
+            )
 
         if volume.targets:
             print("  Targets:")
@@ -251,6 +260,16 @@ def _backup_volume(
     stats = {"completed": 0, "failed": 0}
     errors = []
     logger.info(__util__.log_heading(f"Volume: {volume.path}"))
+
+    # Handle snapper-sourced volumes differently
+    if volume.is_snapper_source():
+        return _backup_snapper_volume(
+            volume,
+            config,
+            compress_override,
+            rate_limit_override,
+            show_progress,
+        )
 
     # Build endpoint kwargs
     endpoint_kwargs = {
@@ -407,6 +426,119 @@ def _backup_volume(
                 stats["failed"] += 1
                 errors.append(f"Transfer to {target_config.path}: {e}")
                 all_success = False
+
+    return all_success, stats, errors
+
+
+def _backup_snapper_volume(
+    volume: VolumeConfig,
+    config: Config,
+    compress_override: str | None = None,
+    rate_limit_override: str | None = None,
+    show_progress: bool = False,
+) -> tuple[bool, dict[str, int], list[str]]:
+    """Execute backup for a snapper-sourced volume.
+
+    Snapper volumes don't create new snapshots - they sync existing
+    snapper-managed snapshots to the backup targets.
+
+    Args:
+        volume: Volume configuration with snapper settings
+        config: Full configuration
+        compress_override: CLI override for compression method
+        rate_limit_override: CLI override for bandwidth limit
+        show_progress: Whether to show progress bars
+
+    Returns:
+        Tuple of (success, transfer_stats, error_messages)
+    """
+    from ..core.operations import sync_snapper_snapshots
+    from ..snapper import SnapperScanner
+    from ..snapper.scanner import SnapperNotFoundError
+
+    stats = {"completed": 0, "failed": 0}
+    errors = []
+
+    logger.info("Snapper-sourced volume: %s", volume.path)
+
+    # Get snapper config name
+    snapper_config = volume.snapper
+    if snapper_config is None:
+        logger.error("Snapper volume missing snapper configuration")
+        errors.append(f"Volume {volume.path}: missing snapper config")
+        return False, stats, errors
+
+    config_name = snapper_config.config_name
+
+    # Auto-detect config if set to "auto"
+    try:
+        scanner = SnapperScanner()
+        if config_name == "auto":
+            detected = scanner.find_config_for_path(volume.path)
+            if detected:
+                config_name = detected.name
+                logger.info("Auto-detected snapper config: %s", config_name)
+            else:
+                logger.error("Could not auto-detect snapper config for %s", volume.path)
+                errors.append(f"Volume {volume.path}: cannot detect snapper config")
+                return False, stats, errors
+    except SnapperNotFoundError as e:
+        logger.error("Snapper not available: %s", e)
+        errors.append(f"Snapper not found: {e}")
+        return False, stats, errors
+
+    # Process each target
+    if not volume.targets:
+        logger.info("No targets configured for snapper volume")
+        return True, stats, errors
+
+    all_success = True
+    for target in volume.targets:
+        try:
+            # Check mount requirement for local targets
+            if target.require_mount and not target.path.startswith("ssh://"):
+                target_path = Path(target.path).resolve()
+                if not __util__.is_mounted(target_path):  # type: ignore[attr-defined]
+                    raise __util__.AbortError(
+                        f"Target {target.path} is not mounted. "
+                        f"Ensure the drive is connected and mounted."
+                    )
+
+            # Build transfer options
+            # For local transfers, use no compression (Rich progress bar)
+            # For remote transfers, use zstd compression
+            is_remote = target.path.startswith("ssh://")
+            default_compress = "zstd" if is_remote else "none"
+
+            options = {
+                "compress": compress_override or target.compress or default_compress,
+                "rate_limit": rate_limit_override or target.rate_limit,
+                "show_progress": show_progress,
+            }
+
+            # Sync snapper snapshots to this target
+            logger.info("Syncing snapper config '%s' to %s", config_name, target.path)
+            transferred = sync_snapper_snapshots(
+                scanner,
+                config_name,
+                target.path,
+                snapper_config=snapper_config,
+                options=options,
+            )
+
+            stats["completed"] += transferred
+            logger.info("Transferred %d snapshot(s) to %s", transferred, target.path)
+
+        except __util__.AbortError as e:
+            logger.error("Backup to %s aborted: %s", target.path, e)
+            errors.append(f"Target {target.path}: {e}")
+            all_success = False
+            stats["failed"] += 1
+        except Exception as e:
+            logger.error("Backup to %s failed: %s", target.path, e)
+            errors.append(f"Target {target.path}: {e}")
+            all_success = False
+            stats["failed"] += 1
 
     return all_success, stats, errors
 

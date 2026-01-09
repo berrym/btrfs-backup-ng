@@ -196,9 +196,26 @@ def _generate_config_from_wizard(config_data: dict[str, Any]) -> str:
                 "",
                 "[[volumes]]",
                 f'path = "{volume["path"]}"',
-                f'snapshot_prefix = "{volume["snapshot_prefix"]}"',
             ]
         )
+
+        # Handle snapper-sourced volumes
+        if volume.get("source") == "snapper":
+            lines.append('source = "snapper"')
+            lines.append("")
+
+            # Snapper configuration
+            snapper = volume.get("snapper", {})
+            lines.append("[volumes.snapper]")
+            lines.append(f'config_name = "{snapper.get("config_name", "auto")}"')
+
+            include_types = snapper.get("include_types", ["single"])
+            types_str = ", ".join(f'"{t}"' for t in include_types)
+            lines.append(f"include_types = [{types_str}]")
+            lines.append(f'min_age = "{snapper.get("min_age", "0")}"')
+        else:
+            # Native volumes use snapshot_prefix
+            lines.append(f'snapshot_prefix = "{volume.get("snapshot_prefix", "")}"')
 
         for target in volume.get("targets", []):
             lines.extend(
@@ -759,6 +776,19 @@ def _run_detection_wizard(result) -> int:
     Returns:
         Exit code
     """
+    # Try to detect snapper configurations
+    snapper_configs = []
+    try:
+        from ..snapper import SnapperScanner
+        from ..snapper.scanner import SnapperNotFoundError
+
+        try:
+            scanner = SnapperScanner()
+            snapper_configs = scanner.list_configs()
+        except SnapperNotFoundError:
+            pass  # Snapper not installed
+    except ImportError:
+        pass  # Snapper module not available
 
     print()
     print("=" * 60)
@@ -775,6 +805,23 @@ def _run_detection_wizard(result) -> int:
         print("Results may be incomplete.")
         print()
 
+    # Show snapper detection results
+    if snapper_configs:
+        print("-" * 40)
+        print("  Detected Snapper Configurations")
+        print("-" * 40)
+        print()
+        for cfg in snapper_configs:
+            print(f"  - {cfg.name}: {cfg.subvolume}")
+        print()
+        print("  Snapper volumes will be offered for backup below.")
+        print()
+
+    # Build a mapping of paths to snapper configs for easy lookup
+    snapper_path_map = {}
+    for cfg in snapper_configs:
+        snapper_path_map[str(cfg.subvolume)] = cfg
+
     # Step 1: Select volumes to back up
     print("-" * 40)
     print("  Detected Subvolumes")
@@ -785,7 +832,9 @@ def _run_detection_wizard(result) -> int:
     selectable = []
     for suggestion in result.suggestions:
         sv = suggestion.subvolume
-        selectable.append((suggestion, sv))
+        # Check if this volume is managed by snapper
+        snapper_cfg = snapper_path_map.get(sv.display_path)
+        selectable.append((suggestion, sv, snapper_cfg))
 
     if not selectable:
         print("No subvolumes suitable for backup were detected.")
@@ -795,15 +844,18 @@ def _run_detection_wizard(result) -> int:
     # Display with numbers
     print("  Recommended for backup:")
     recommended_indices = []
-    for i, (suggestion, sv) in enumerate(selectable, 1):
+    for i, (suggestion, sv, snapper_cfg) in enumerate(selectable, 1):
         marker = "*" if suggestion.is_recommended else " "
         classification = sv.classification.value.replace("_", " ")
-        print(f"  [{i}]{marker} {sv.display_path} ({classification})")
+        snapper_marker = f" [snapper:{snapper_cfg.name}]" if snapper_cfg else ""
+        print(f"  [{i}]{marker} {sv.display_path} ({classification}){snapper_marker}")
         if suggestion.is_recommended:
             recommended_indices.append(str(i))
 
     print()
     print("  * = recommended")
+    if snapper_configs:
+        print("  [snapper:name] = managed by snapper")
     print()
 
     # Let user select
@@ -813,21 +865,24 @@ def _run_detection_wizard(result) -> int:
         default_selection,
     )
 
-    # Parse selection
+    # Parse selection - now returns tuples of (suggestion, snapper_cfg)
     selected_volumes = []
     if selection_str.lower() == "all":
-        selected_volumes = [s for s, _ in selectable]
+        selected_volumes = [(s, cfg) for s, _, cfg in selectable]
     else:
         try:
             indices = [int(x.strip()) for x in selection_str.split(",") if x.strip()]
             for idx in indices:
                 if 1 <= idx <= len(selectable):
-                    selected_volumes.append(selectable[idx - 1][0])
+                    suggestion, _, snapper_cfg = selectable[idx - 1]
+                    selected_volumes.append((suggestion, snapper_cfg))
                 else:
                     print(f"  Warning: {idx} is not a valid selection, skipping")
         except ValueError:
             print("Invalid selection. Using recommended volumes.")
-            selected_volumes = [s for s, _ in selectable if s.is_recommended]
+            selected_volumes = [
+                (s, cfg) for s, _, cfg in selectable if s.is_recommended
+            ]
 
     if not selected_volumes:
         print("No volumes selected. Exiting.")
@@ -857,17 +912,45 @@ def _run_detection_wizard(result) -> int:
         "volumes": [],
     }
 
-    for suggestion in selected_volumes:
+    for suggestion, snapper_cfg in selected_volumes:
         sv = suggestion.subvolume
         print("-" * 40)
-        print(f"  Volume: {sv.display_path}")
+        if snapper_cfg:
+            print(f"  Volume: {sv.display_path} (snapper: {snapper_cfg.name})")
+        else:
+            print(f"  Volume: {sv.display_path}")
         print("-" * 40)
 
         volume: dict[str, Any] = {
             "path": sv.display_path,
-            "snapshot_prefix": _prompt("Snapshot prefix", suggestion.suggested_prefix),
             "targets": [],
         }
+
+        # Configure based on whether this is a snapper volume
+        if snapper_cfg:
+            # Snapper-sourced volume
+            print()
+            print("  This volume is managed by snapper.")
+            use_snapper = _prompt_bool("  Use snapper as snapshot source?", True)
+
+            if use_snapper:
+                volume["source"] = "snapper"
+                volume["snapper"] = {
+                    "config_name": snapper_cfg.name,
+                    "include_types": ["single"],  # Default to single, skip pre/post
+                    "min_age": "0",
+                }
+                print(f"  Configured to use snapper config '{snapper_cfg.name}'")
+            else:
+                # User wants native management instead
+                volume["snapshot_prefix"] = _prompt(
+                    "Snapshot prefix", suggestion.suggested_prefix
+                )
+        else:
+            # Native volume
+            volume["snapshot_prefix"] = _prompt(
+                "Snapshot prefix", suggestion.suggested_prefix
+            )
 
         # Add targets
         print()

@@ -1,0 +1,347 @@
+.\" Man page for btrfs-backup-ng snapper
+.TH BTRFS-BACKUP-NG-SNAPPER 1 "January 2026" "btrfs-backup-ng" "User Commands"
+.SH NAME
+btrfs-backup-ng-snapper \- back up and restore snapper-managed snapshots
+.SH SYNOPSIS
+.B btrfs-backup-ng snapper detect
+[\fB\-\-json\fR]
+.br
+.B btrfs-backup-ng snapper list
+[\fB\-\-config\fR \fINAME\fR] [\fB\-\-type\fR \fITYPE\fR] [\fB\-\-json\fR]
+.br
+.B btrfs-backup-ng snapper backup
+\fICONFIG\fR \fITARGET\fR [\fIOPTIONS\fR]
+.br
+.B btrfs-backup-ng snapper restore
+\fISOURCE\fR [\fB\-\-list\fR | \fB\-\-snapshot\fR \fINUM\fR | \fB\-\-all\fR] \fICONFIG\fR
+.br
+.B btrfs-backup-ng snapper status
+[\fB\-\-config\fR \fINAME\fR] [\fB\-\-target\fR \fIPATH\fR] [\fB\-\-json\fR]
+.br
+.B btrfs-backup-ng snapper generate-config
+[\fICONFIG\fR...] [\fIOPTIONS\fR]
+.SH DESCRIPTION
+Back up and restore snapshots managed by Snapper. This integration enables
+btrfs-backup-ng to work with existing Snapper configurations, preserving
+Snapper's metadata (info.xml) and directory structure.
+.PP
+Snapper is a tool for managing btrfs snapshots, commonly used on openSUSE,
+Fedora, and Arch Linux. When you use Snapper for local snapshot management,
+this command allows you to replicate those snapshots to remote backup storage.
+.SH SUBCOMMANDS
+.SS detect
+Discover Snapper configurations on the system.
+.PP
+.RS
+.B btrfs-backup-ng snapper detect
+[\fB\-\-json\fR]
+.RE
+.PP
+Scans /etc/snapper/configs/ for Snapper configurations and displays their
+subvolumes, snapshot directories, and validity status.
+.TP
+.B \-\-json
+Output in JSON format for scripting.
+.SS list
+List snapshots for one or all Snapper configurations.
+.PP
+.RS
+.B btrfs-backup-ng snapper list
+[\fB\-\-config\fR \fINAME\fR] [\fB\-\-type\fR \fITYPE\fR] [\fB\-\-json\fR]
+.RE
+.TP
+.BI \-\-config " NAME"
+List snapshots only for the specified Snapper config. If omitted, lists
+snapshots for all configs.
+.TP
+.BI \-\-type " TYPE"
+Filter by snapshot type. Can be specified multiple times. Valid types:
+.B single
+(standalone/timeline),
+.B pre
+(before package operations),
+.B post
+(after package operations).
+.TP
+.B \-\-json
+Output in JSON format.
+.SS backup
+Back up Snapper snapshots to a target location.
+.PP
+.RS
+.B btrfs-backup-ng snapper backup
+\fICONFIG\fR \fITARGET\fR [\fIOPTIONS\fR]
+.RE
+.TP
+.I CONFIG
+Snapper configuration name (e.g., "root", "home").
+.TP
+.I TARGET
+Destination path. Can be local (e.g., /mnt/backup/root) or SSH
+(e.g., ssh://user@host:/backups/root).
+.PP
+Options:
+.TP
+.BI \-\-snapshot " NUM"
+Back up only the specified snapshot number.
+.TP
+.BI \-\-type " TYPE"
+Filter by snapshot type. Can be specified multiple times.
+.TP
+.BI \-\-min-age " DURATION"
+Skip snapshots younger than the specified age. Format: 30m, 1h, 1d.
+Useful to avoid backing up incomplete pre/post pairs.
+.TP
+.BI \-\-compress " METHOD"
+Compression for remote transfers. Valid: none, zstd, gzip, lz4, pigz, lzop.
+Default: zstd for SSH targets, none for local.
+.TP
+.BI \-\-rate-limit " RATE"
+Bandwidth limit for transfers. Examples: 10M, 1G, 500K.
+.TP
+.B \-\-dry-run
+Show what would be backed up without making changes.
+.TP
+.BR \-v ", " \-\-verbose
+Enable verbose output.
+.SS restore
+Restore Snapper snapshots from a backup location.
+.PP
+.RS
+.B btrfs-backup-ng snapper restore
+\fISOURCE\fR [\fIOPTIONS\fR] \fICONFIG\fR
+.RE
+.TP
+.I SOURCE
+Backup location to restore from. Can be local or SSH URL.
+.TP
+.I CONFIG
+Local Snapper configuration name to restore into.
+.PP
+Options:
+.TP
+.BR \-l ", " \-\-list
+List available backups at the source location.
+.TP
+.BI \-\-snapshot " NUM"
+Restore specific snapshot number. Can be specified multiple times.
+.TP
+.BR \-a ", " \-\-all
+Restore all available backups.
+.TP
+.B \-\-dry-run
+Show what would be restored without making changes.
+.TP
+.B \-\-json
+Output in JSON format (with \fB\-\-list\fR).
+.SS status
+Show backup status for Snapper configurations.
+.PP
+.RS
+.B btrfs-backup-ng snapper status
+[\fB\-\-config\fR \fINAME\fR] [\fB\-\-target\fR \fIPATH\fR] [\fB\-\-json\fR]
+.RE
+.TP
+.BI \-\-config " NAME"
+Show status for specific config only.
+.TP
+.BI \-\-target " PATH"
+Check backup status at the specified target. Shows which snapshots are
+backed up vs pending.
+.TP
+.B \-\-json
+Output in JSON format.
+.SS generate-config
+Generate TOML configuration for Snapper volumes.
+.PP
+.RS
+.B btrfs-backup-ng snapper generate-config
+[\fICONFIG\fR...] [\fIOPTIONS\fR]
+.RE
+.TP
+.I CONFIG
+Snapper configuration names to include. If omitted, generates for all configs.
+.PP
+Options:
+.TP
+.BI \-\-target " PATH"
+Target path for backups. The config name will be appended (e.g.,
+/mnt/backup becomes /mnt/backup/root for the root config).
+.TP
+.BI \-\-type " TYPE"
+Snapshot types to include. Can be specified multiple times.
+Default: single.
+.TP
+.BI \-\-min-age " DURATION"
+Minimum snapshot age. Default: 0.
+.TP
+.BR \-o ", " \-\-output " " \fIFILE\fR
+Write configuration to file.
+.TP
+.BI \-\-append " FILE"
+Append to existing configuration file.
+.TP
+.B \-\-ssh-sudo
+Add ssh_sudo = true to SSH targets.
+.TP
+.B \-\-json
+Output in JSON format.
+.SH BACKUP DIRECTORY LAYOUT
+Snapper backups preserve the native Snapper directory structure:
+.PP
+.RS
+.nf
+/backups/root/.snapshots/
+\[u251C]\[u2500]\[u2500] 559/
+\[u2502]   \[u251C]\[u2500]\[u2500] info.xml        # Snapper metadata
+\[u2502]   \[u2514]\[u2500]\[u2500] snapshot/       # btrfs subvolume
+\[u251C]\[u2500]\[u2500] 560/
+\[u2502]   \[u251C]\[u2500]\[u2500] info.xml
+\[u2502]   \[u2514]\[u2500]\[u2500] snapshot/
+\[u2514]\[u2500]\[u2500] 561/
+    \[u251C]\[u2500]\[u2500] info.xml
+    \[u2514]\[u2500]\[u2500] snapshot/
+.fi
+.RE
+.PP
+This layout enables direct restoration back into Snapper-managed volumes.
+.SH CONFIGURATION
+For automated backups, add Snapper volumes to your config.toml:
+.PP
+.RS
+.nf
+[[volumes]]
+path = "/"
+source = "snapper"
+
+[volumes.snapper]
+config_name = "root"
+include_types = ["single", "pre", "post"]
+min_age = "1h"
+
+[[volumes.targets]]
+path = "ssh://backup@server:/backups/root"
+ssh_sudo = true
+compress = "zstd"
+.fi
+.RE
+.PP
+Then run:
+.B btrfs-backup-ng run
+.SS Configuration Options
+.TP
+.B config_name
+Snapper config name (e.g., "root", "home") or "auto" to detect.
+.TP
+.B include_types
+Snapshot types to include: "single", "pre", "post".
+.TP
+.B exclude_cleanup
+Cleanup algorithms to skip: "number", "timeline", "empty-pre-post".
+.TP
+.B min_age
+Minimum snapshot age before backing up (e.g., "30m", "1h", "1d").
+.SH SNAPSHOT TYPES
+.TP
+.B single
+Standalone snapshots created manually or by timeline (e.g., hourly snapshots).
+.TP
+.B pre
+Snapshots created before package manager operations (zypper, dnf, etc.).
+.TP
+.B post
+Snapshots created after package manager operations.
+.SH EXAMPLES
+.TP
+Detect Snapper configurations:
+.B btrfs-backup-ng snapper detect
+.TP
+List all snapshots for root config:
+.B btrfs-backup-ng snapper list --config root
+.TP
+List only timeline snapshots:
+.B btrfs-backup-ng snapper list --type single
+.TP
+Backup root config to local drive:
+.B sudo btrfs-backup-ng snapper backup root /mnt/backup/root
+.TP
+Backup to remote server with compression:
+.B sudo btrfs-backup-ng snapper backup root ssh://backup@server:/backups/root
+.TP
+Backup specific snapshot:
+.B sudo btrfs-backup-ng snapper backup root /mnt/backup/root --snapshot 559
+.TP
+Backup only timeline snapshots older than 1 hour:
+.B sudo btrfs-backup-ng snapper backup root /mnt/backup --type single --min-age 1h
+.TP
+Dry run to see what would be backed up:
+.B sudo btrfs-backup-ng snapper backup root /mnt/backup --dry-run
+.TP
+List backups at a location:
+.B btrfs-backup-ng snapper restore --list /mnt/backup/root
+.TP
+Restore a specific snapshot:
+.B sudo btrfs-backup-ng snapper restore /mnt/backup/root --snapshot 559 root
+.TP
+Restore all backups:
+.B sudo btrfs-backup-ng snapper restore /mnt/backup/root --all root
+.TP
+Check backup status:
+.B btrfs-backup-ng snapper status --target /mnt/backup/root
+.TP
+Generate config for root:
+.B btrfs-backup-ng snapper generate-config root --target ssh://server:/backups
+.TP
+Generate and save config:
+.B btrfs-backup-ng snapper generate-config root --target /mnt/backup -o snapper.toml
+.TP
+Append to existing config:
+.B btrfs-backup-ng snapper generate-config root --append ~/.config/btrfs-backup-ng/config.toml
+.SH INCREMENTAL TRANSFERS
+Both backup and restore operations use incremental btrfs send/receive when
+possible. The commands automatically detect available parent snapshots and
+use the most efficient transfer method:
+.PP
+.RS
+.nf
+Snapshot 559: 2.1 GB (full, no parent available)
+Snapshot 560: 156 MB (incremental from 559)
+Snapshot 561:  89 MB (incremental from 560)
+.fi
+.RE
+.SH EXIT STATUS
+.TP
+.B 0
+Success
+.TP
+.B 1
+Failure (Snapper not found, config not found, transfer error, etc.)
+.SH FILES
+.TP
+.I /etc/snapper/configs/
+Snapper configuration files
+.TP
+.I /.snapshots/
+Default snapshot directory for root config
+.TP
+.I /home/.snapshots/
+Default snapshot directory for home config
+.TP
+.I .snapshots/{num}/info.xml
+Snapper metadata file for each snapshot
+.TP
+.I .snapshots/{num}/snapshot/
+The actual btrfs snapshot subvolume
+.SH SEE ALSO
+.BR btrfs-backup-ng (1),
+.BR btrfs-backup-ng-restore (1),
+.BR snapper (8),
+.BR btrfs-send (8),
+.BR btrfs-receive (8)
+.SH NOTES
+Snapper must be installed and configured on the source system. The backup
+destination can be any btrfs filesystem - Snapper is not required there.
+.PP
+Restored snapshots are assigned new snapshot numbers by Snapper on the
+destination system. The original metadata (type, description, date) is
+preserved in info.xml.

@@ -109,11 +109,16 @@ def choose_endpoint(spec, common_config=None, source=False, excluded_types=()):
 
         # Username will be fully resolved in the SSHEndpoint class
         # but we ensure it's documented in debug logs
+        # Note: config is guaranteed to be a dict (initialized from common_config or {})
+        # Check if username came from original common_config vs URL
+        had_username_in_config = (
+            common_config is not None and "username" in common_config
+        )
         username_source = (
             "command_line"
-            if "username" in common_config
+            if had_username_in_config
             else "url"
-            if parsed.username
+            if config.get("username")
             else "will use default"
         )
         logger.debug("Username source: %s", username_source)

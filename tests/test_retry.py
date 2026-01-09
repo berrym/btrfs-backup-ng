@@ -1,14 +1,12 @@
 """Tests for the retry framework module."""
 
-import time
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import pytest
 
 from btrfs_backup_ng.core.errors import (
     PermanentPermissionError,
     TransientNetworkError,
-    TransientTimeoutError,
 )
 from btrfs_backup_ng.core.retry import (
     DEFAULT_NETWORK_POLICY,
@@ -17,7 +15,6 @@ from btrfs_backup_ng.core.retry import (
     RetryAttempt,
     RetryContext,
     RetryPolicy,
-    RetryResult,
     retry_call,
     with_retry,
 )

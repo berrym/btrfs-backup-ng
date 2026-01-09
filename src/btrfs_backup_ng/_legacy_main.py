@@ -284,6 +284,7 @@ files is allowed as well."""
 
         if running_as_sudo:
             sudo_user = os.environ.get("SUDO_USER")
+            assert sudo_user is not None  # guaranteed by running_as_sudo check
             sudo_user_home = pwd.getpwnam(sudo_user).pw_dir
 
             if identity_file.startswith("~"):

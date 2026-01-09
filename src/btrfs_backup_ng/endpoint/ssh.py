@@ -60,12 +60,8 @@ except ImportError:
 from btrfs_backup_ng import __util__  # noqa: E402
 from btrfs_backup_ng.__logger__ import logger  # noqa: E402
 from btrfs_backup_ng.core.errors import (  # noqa: E402
-    BackupError,
-    SnapshotTransferError,
     TransientNetworkError,
-    TransientTimeoutError,
     classify_error,
-    classify_ssh_error,
 )
 from btrfs_backup_ng.core.retry import (  # noqa: E402
     DEFAULT_TRANSFER_POLICY,
@@ -2659,6 +2655,10 @@ print(json.dumps(result))
             logger.error("Paramiko is not available for SSH transfer")
             return False
 
+        # After the None check, paramiko is guaranteed to be available
+        assert paramiko is not None  # For type checker - we checked above
+        _paramiko = paramiko  # Local reference
+
         client: Optional[Any] = None
         send_proc: Optional[subprocess.Popen[bytes]] = None
 
@@ -2667,8 +2667,8 @@ print(json.dumps(result))
             # 1. Get username (from CLI/URL - already in ssh_user)
             # 2. Get password (via getpass - in ssh_password)
             # 3. Connect with those credentials
-            client = paramiko.SSHClient()
-            client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            client = _paramiko.SSHClient()  # type: ignore[union-attr]
+            client.set_missing_host_key_policy(_paramiko.AutoAddPolicy())  # type: ignore[union-attr]
 
             connect_kwargs: Dict[str, Any] = {
                 "hostname": self.hostname,
@@ -2697,11 +2697,11 @@ print(json.dumps(result))
                     f"Connecting to {ssh_user}@{self.hostname}:{ssh_port} with key auth"
                 )
 
-            client.connect(**connect_kwargs)
+            client.connect(**connect_kwargs)  # type: ignore[union-attr]
             logger.debug("Paramiko SSH connection established")
 
             # Open channel and execute remote command
-            transport = client.get_transport()
+            transport = client.get_transport()  # type: ignore[union-attr]
             if not transport:
                 logger.error("Failed to get SSH transport")
                 return False
@@ -3510,7 +3510,9 @@ print(json.dumps(result))
                                 "Non-retryable error during transfer: %s",
                                 classified.message,
                             )
-                            logger.info("Suggested action: %s", classified.suggested_action)
+                            logger.info(
+                                "Suggested action: %s", classified.suggested_action
+                            )
                         return False
 
                     logger.warning(
@@ -3548,7 +3550,6 @@ print(json.dumps(result))
         Returns:
             bool: True if transfer was successful, False otherwise
         """
-        from btrfs_backup_ng.core.chunked_transfer import ChunkStatus
 
         logger.info(
             "Starting chunked SSH receive for %s (%d chunks)",
@@ -3627,7 +3628,9 @@ print(json.dumps(result))
 
                 if show_progress:
                     elapsed = time.time() - start_time
-                    rate_mb = (bytes_sent / (1024 * 1024)) / elapsed if elapsed > 0 else 0
+                    rate_mb = (
+                        (bytes_sent / (1024 * 1024)) / elapsed if elapsed > 0 else 0
+                    )
                     logger.info(
                         "Chunk %d/%d transferred (%.1f MB, %.1f MB/s)",
                         chunks_sent,
