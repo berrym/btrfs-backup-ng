@@ -24,6 +24,8 @@ _btrfs-backup-ng() {
         'doctor:Diagnose backup system health and fix issues'
         'completions:Install shell completion scripts'
         'manpages:Install man pages'
+        'transfers:Manage chunked and resumable transfers (experimental)'
+        'snapper:Manage snapper-managed snapshots'
     )
 
     local -a global_opts
@@ -264,6 +266,124 @@ _btrfs-backup-ng() {
                                     _arguments \
                                         '--system[Install system-wide to /usr/local/share/man (requires root)]' \
                                         '--prefix[Install to PREFIX/share/man/man1]:prefix:_directories'
+                                    ;;
+                            esac
+                            ;;
+                    esac
+                    ;;
+                transfers)
+                    local -a transfers_commands
+                    transfers_commands=(
+                        'list:List incomplete transfers'
+                        'show:Show details of a transfer'
+                        'resume:Resume a failed or paused transfer'
+                        'pause:Pause an active transfer'
+                        'cleanup:Clean up old or completed transfers'
+                        'operations:List backup operations'
+                    )
+                    _arguments \
+                        '1: :->transfers_cmd' \
+                        '*:: :->transfers_args'
+
+                    case $state in
+                        transfers_cmd)
+                            _describe -t commands 'transfers command' transfers_commands
+                            ;;
+                        transfers_args)
+                            case $line[1] in
+                                list)
+                                    _arguments \
+                                        '--json[Output in JSON format]'
+                                    ;;
+                                show)
+                                    _arguments \
+                                        '--json[Output in JSON format]' \
+                                        '1:transfer ID:'
+                                    ;;
+                                resume)
+                                    _arguments \
+                                        '--dry-run[Show what would be done]' \
+                                        '1:transfer ID:'
+                                    ;;
+                                pause)
+                                    _arguments \
+                                        '1:transfer ID:'
+                                    ;;
+                                cleanup)
+                                    _arguments \
+                                        '--force[Force cleanup even for active transfers]' \
+                                        '--all[Clean up all transfers]' \
+                                        '--age[Clean up transfers older than hours]:hours:' \
+                                        '1:transfer ID:'
+                                    ;;
+                                operations)
+                                    _arguments
+                                    ;;
+                            esac
+                            ;;
+                    esac
+                    ;;
+                snapper)
+                    local -a snapper_commands
+                    snapper_commands=(
+                        'detect:Detect snapper configurations on the system'
+                        'list:List snapper configs and snapshots'
+                        'backup:Backup snapper snapshots to target'
+                        'status:Show backup status for snapper configs'
+                        'restore:Restore snapper backups to local snapper format'
+                        'generate-config:Generate TOML config for snapper volumes'
+                    )
+                    local -a snapper_types
+                    snapper_types=(single pre post)
+
+                    _arguments \
+                        '1: :->snapper_cmd' \
+                        '*:: :->snapper_args'
+
+                    case $state in
+                        snapper_cmd)
+                            _describe -t commands 'snapper command' snapper_commands
+                            ;;
+                        snapper_args)
+                            case $line[1] in
+                                detect)
+                                    _arguments \
+                                        '--json[Output in JSON format]'
+                                    ;;
+                                list)
+                                    _arguments \
+                                        '--config[Snapper config name]:config name:' \
+                                        '--type[Snapshot type filter]:type:(${snapper_types})' \
+                                        '--json[Output in JSON format]'
+                                    ;;
+                                backup)
+                                    _arguments \
+                                        '--snapshot[Backup specific snapshot number]:snapshot number:' \
+                                        '--dry-run[Show what would be done]' \
+                                        '--ssh-sudo[Use sudo on remote host]' \
+                                        '--ssh-key[SSH private key file]:key file:_files' \
+                                        '--compress[Compression method]:method:(${compress_methods})' \
+                                        '(--progress --no-progress)'--progress'[Show progress bars]' \
+                                        '(--progress --no-progress)'--no-progress'[Disable progress bars]' \
+                                        '1:snapper config name:' \
+                                        '2:target path:_files -/'
+                                    ;;
+                                status)
+                                    _arguments \
+                                        '--json[Output in JSON format]'
+                                    ;;
+                                restore)
+                                    _arguments \
+                                        '--snapshot[Restore specific snapshot number]:snapshot number:' \
+                                        '--dry-run[Show what would be done]' \
+                                        '--ssh-sudo[Use sudo on remote host]' \
+                                        '--ssh-key[SSH private key file]:key file:_files' \
+                                        '1:source (backup location):_files -/' \
+                                        '2:snapper config name:'
+                                    ;;
+                                generate-config)
+                                    _arguments \
+                                        '(-o --output)'{-o,--output}'[Output file]:file:_files'
                                     ;;
                             esac
                             ;;

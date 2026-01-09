@@ -10,7 +10,7 @@ function __fish_btrfs_backup_ng_no_subcommand
     set -e cmd[1]
     for c in $cmd
         switch $c
-            case run snapshot transfer prune list status config install uninstall restore verify estimate doctor completions manpages
+            case run snapshot transfer prune list status config install uninstall restore verify estimate doctor completions manpages transfers snapper
                 return 1
         end
     end
@@ -65,6 +65,8 @@ complete -c btrfs-backup-ng -n __fish_btrfs_backup_ng_no_subcommand -a estimate 
 complete -c btrfs-backup-ng -n __fish_btrfs_backup_ng_no_subcommand -a doctor -d 'Diagnose backup system health and fix issues'
 complete -c btrfs-backup-ng -n __fish_btrfs_backup_ng_no_subcommand -a completions -d 'Install shell completion scripts'
 complete -c btrfs-backup-ng -n __fish_btrfs_backup_ng_no_subcommand -a manpages -d 'Install man pages'
+complete -c btrfs-backup-ng -n __fish_btrfs_backup_ng_no_subcommand -a transfers -d 'Manage chunked and resumable transfers (experimental)'
+complete -c btrfs-backup-ng -n __fish_btrfs_backup_ng_no_subcommand -a snapper -d 'Manage snapper-managed snapshots'
 
 # Compression methods
 set -l compress_methods none zstd gzip lz4 pigz lzop
@@ -246,3 +248,102 @@ end
 # manpages install
 complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_manpages_using_subcommand install' -l system -d 'Install system-wide (requires root)'
 complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_manpages_using_subcommand install' -l prefix -d 'Install to PREFIX/share/man/man1' -xa '(__fish_complete_directories)'
+
+# transfers command subcommands (experimental)
+complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_using_command transfers' -a list -d 'List all transfer sessions'
+complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_using_command transfers' -a show -d 'Show details of a specific transfer'
+complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_using_command transfers' -a resume -d 'Resume an interrupted transfer'
+complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_using_command transfers' -a pause -d 'Pause an active transfer'
+complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_using_command transfers' -a cleanup -d 'Clean up stale or completed transfers'
+complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_using_command transfers' -a operations -d 'List transfer operations'
+
+# Helper for transfers subcommand
+function __fish_btrfs_backup_ng_transfers_using_subcommand
+    set -l cmd (commandline -opc)
+    set -e cmd[1]
+    if test (count $cmd) -gt 1
+        if test $cmd[1] = transfers
+            if test $argv[1] = $cmd[2]
+                return 0
+            end
+        end
+    end
+    return 1
+end
+
+# transfers list
+complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_transfers_using_subcommand list' -l json -d 'Output in JSON format'
+complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_transfers_using_subcommand list' -l all -d 'Include completed and failed transfers'
+
+# transfers show
+complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_transfers_using_subcommand show' -l json -d 'Output in JSON format'
+
+# transfers resume
+complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_transfers_using_subcommand resume' -l rate-limit -d 'Bandwidth limit (e.g., 10M, 1G)' -x
+complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_transfers_using_subcommand resume' -l progress -d 'Show progress bars'
+complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_transfers_using_subcommand resume' -l no-progress -d 'Disable progress bars'
+
+# transfers cleanup
+complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_transfers_using_subcommand cleanup' -l force -d 'Remove even active transfers'
+complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_transfers_using_subcommand cleanup' -l dry-run -d 'Show what would be cleaned without making changes'
+complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_transfers_using_subcommand cleanup' -l older-than -d 'Only cleanup transfers older than duration (e.g., 7d, 24h)' -x
+
+# transfers operations
+complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_transfers_using_subcommand operations' -l json -d 'Output in JSON format'
+
+# snapper command subcommands
+complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_using_command snapper' -a detect -d 'Detect snapper configurations'
+complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_using_command snapper' -a list -d 'List snapshots for a snapper config'
+complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_using_command snapper' -a backup -d 'Backup snapper snapshots to destination'
+complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_using_command snapper' -a status -d 'Show sync status between source and destination'
+complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_using_command snapper' -a restore -d 'Restore snapper snapshots from backup'
+complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_using_command snapper' -a generate-config -d 'Generate config.toml for snapper volume'
+
+# Helper for snapper subcommand
+function __fish_btrfs_backup_ng_snapper_using_subcommand
+    set -l cmd (commandline -opc)
+    set -e cmd[1]
+    if test (count $cmd) -gt 1
+        if test $cmd[1] = snapper
+            if test $argv[1] = $cmd[2]
+                return 0
+            end
+        end
+    end
+    return 1
+end
+
+# snapper detect
+complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_snapper_using_subcommand detect' -l json -d 'Output in JSON format'
+
+# snapper list
+complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_snapper_using_subcommand list' -l json -d 'Output in JSON format'
+complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_snapper_using_subcommand list' -l types -d 'Filter by snapshot types (comma-separated)' -x
+
+# snapper backup
+complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_snapper_using_subcommand backup' -l dry-run -d 'Show what would be done without making changes'
+complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_snapper_using_subcommand backup' -l compress -d 'Compression method' -xa "$compress_methods"
+complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_snapper_using_subcommand backup' -l rate-limit -d 'Bandwidth limit (e.g., 10M, 1G)' -x
+complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_snapper_using_subcommand backup' -l progress -d 'Show progress bars'
+complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_snapper_using_subcommand backup' -l no-progress -d 'Disable progress bars'
+complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_snapper_using_subcommand backup' -l types -d 'Filter by snapshot types (comma-separated)' -x
+complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_snapper_using_subcommand backup' -l min-age -d 'Only backup snapshots older than duration (e.g., 1h, 30m)' -x
+complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_snapper_using_subcommand backup' -l ssh-sudo -d 'Use sudo for btrfs commands on remote host'
+complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_snapper_using_subcommand backup' -l ssh-key -d 'SSH private key file' -r -F
+
+# snapper status
+complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_snapper_using_subcommand status' -l json -d 'Output in JSON format'
+
+# snapper restore
+complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_snapper_using_subcommand restore' -l dry-run -d 'Show what would be done without making changes'
+complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_snapper_using_subcommand restore' -l snapshot -d 'Restore specific snapshot by number' -x
+complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_snapper_using_subcommand restore' -l all -d 'Restore all snapshots'
+complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_snapper_using_subcommand restore' -l compress -d 'Compression method' -xa "$compress_methods"
+complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_snapper_using_subcommand restore' -l rate-limit -d 'Bandwidth limit (e.g., 10M, 1G)' -x
+complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_snapper_using_subcommand restore' -l progress -d 'Show progress bars'
+complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_snapper_using_subcommand restore' -l no-progress -d 'Disable progress bars'
+complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_snapper_using_subcommand restore' -l ssh-sudo -d 'Use sudo for btrfs commands on remote host'
+complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_snapper_using_subcommand restore' -l ssh-key -d 'SSH private key file' -r -F
+
+# snapper generate-config
+complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_snapper_using_subcommand generate-config' -s o -l output -d 'Output file' -r -F

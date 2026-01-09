@@ -542,6 +542,387 @@ Fixable: 1 issue (run with --fix)
 
 ---
 
+### transfers (Experimental)
+
+> **Note:** The chunked transfer feature is experimental. It provides resumable transfers for large snapshots but has not been extensively tested in production environments.
+
+Manage chunked and resumable transfers. This command allows you to list, inspect, resume, pause, and clean up incomplete transfers.
+
+```bash
+btrfs-backup-ng transfers [SUBCOMMAND] [OPTIONS]
+```
+
+#### transfers list
+
+List all incomplete transfer sessions.
+
+```bash
+btrfs-backup-ng transfers list [OPTIONS]
+```
+
+**Options:**
+| Option | Description |
+|--------|-------------|
+| `--json` | Output in JSON format |
+| `--all` | Include completed and failed transfers |
+
+**Example Output:**
+```
+Incomplete Transfers
+======================================================================
+ID         Status       Snapshot                  Progress     Age
+----------------------------------------------------------------------
+abc123     paused       home-20260108             5/10 (50%)   2h ago
+def456     failed       root-20260109             3/8 (37%)    1d ago
+----------------------------------------------------------------------
+Total: 2 incomplete transfer(s)
+```
+
+#### transfers show
+
+Show detailed information about a specific transfer.
+
+```bash
+btrfs-backup-ng transfers show TRANSFER_ID [OPTIONS]
+```
+
+**Options:**
+| Option | Description |
+|--------|-------------|
+| `--json` | Output in JSON format |
+
+**Example:**
+```bash
+btrfs-backup-ng transfers show abc123
+```
+
+#### transfers resume
+
+Resume a paused or failed transfer.
+
+```bash
+btrfs-backup-ng transfers resume TRANSFER_ID [OPTIONS]
+```
+
+**Options:**
+| Option | Description |
+|--------|-------------|
+| `--dry-run` | Show what would be done without resuming |
+| `--rate-limit RATE` | Bandwidth limit (e.g., '10M', '1G') |
+| `--progress` | Show progress bars |
+| `--no-progress` | Disable progress bars |
+
+**Example:**
+```bash
+btrfs-backup-ng transfers resume abc123
+```
+
+#### transfers pause
+
+Pause an active transfer.
+
+```bash
+btrfs-backup-ng transfers pause TRANSFER_ID
+```
+
+#### transfers cleanup
+
+Clean up stale, completed, or failed transfers.
+
+```bash
+btrfs-backup-ng transfers cleanup [OPTIONS]
+```
+
+**Options:**
+| Option | Description |
+|--------|-------------|
+| `--dry-run` | Show what would be cleaned without making changes |
+| `--force` | Remove even active transfers |
+| `--older-than DURATION` | Only cleanup transfers older than duration (e.g., '7d', '24h') |
+| `TRANSFER_ID` | Clean up a specific transfer |
+
+**Examples:**
+```bash
+# See what would be cleaned
+btrfs-backup-ng transfers cleanup --dry-run
+
+# Clean up stale transfers
+btrfs-backup-ng transfers cleanup
+
+# Clean up a specific transfer
+btrfs-backup-ng transfers cleanup abc123
+
+# Force cleanup of all transfers older than 7 days
+btrfs-backup-ng transfers cleanup --older-than 7d --force
+```
+
+#### transfers operations
+
+List backup operations and their status.
+
+```bash
+btrfs-backup-ng transfers operations [OPTIONS]
+```
+
+**Options:**
+| Option | Description |
+|--------|-------------|
+| `--json` | Output in JSON format |
+| `--all` | Include archived operations |
+
+---
+
+### snapper
+
+Manage snapper-managed snapshots. This command provides integration with snapper for discovering, backing up, and restoring snapper snapshots.
+
+```bash
+btrfs-backup-ng snapper SUBCOMMAND [OPTIONS]
+```
+
+#### snapper detect
+
+Detect snapper configurations on the system.
+
+```bash
+btrfs-backup-ng snapper detect [OPTIONS]
+```
+
+**Options:**
+| Option | Description |
+|--------|-------------|
+| `--json` | Output in JSON format |
+
+**Example Output:**
+```
+Found 2 snapper configuration(s):
+
+  root:
+    Subvolume:     /
+    Snapshots dir: /.snapshots
+    Status:        OK
+
+  home:
+    Subvolume:     /home
+    Snapshots dir: /home/.snapshots
+    Status:        OK
+```
+
+#### snapper list
+
+List snapshots for snapper configurations.
+
+```bash
+btrfs-backup-ng snapper list [OPTIONS]
+```
+
+**Options:**
+| Option | Description |
+|--------|-------------|
+| `--config NAME` | List snapshots for specific config only |
+| `--type TYPE` | Filter by snapshot type (single, pre, post) |
+| `--json` | Output in JSON format |
+
+**Examples:**
+```bash
+# List all snapshots
+btrfs-backup-ng snapper list
+
+# List only 'root' config snapshots
+btrfs-backup-ng snapper list --config root
+
+# List only 'single' type snapshots
+btrfs-backup-ng snapper list --type single
+```
+
+#### snapper backup
+
+Backup snapper snapshots to a destination.
+
+```bash
+btrfs-backup-ng snapper backup CONFIG TARGET [OPTIONS]
+```
+
+**Arguments:**
+| Argument | Description |
+|----------|-------------|
+| `CONFIG` | Snapper configuration name (e.g., 'root', 'home') |
+| `TARGET` | Destination path (local or ssh://user@host:/path) |
+
+**Options:**
+| Option | Description |
+|--------|-------------|
+| `--dry-run` | Show what would be done without making changes |
+| `--snapshot NUM` | Backup specific snapshot by number |
+| `--type TYPE` | Filter by snapshot type (can be repeated) |
+| `--min-age DURATION` | Only backup snapshots older than duration (e.g., '1h') |
+| `--compress METHOD` | Compression method (none, zstd, gzip, lz4) |
+| `--rate-limit RATE` | Bandwidth limit (e.g., '10M', '1G') |
+| `--ssh-sudo` | Use sudo on remote host |
+| `--ssh-key FILE` | SSH private key file |
+| `--progress` | Show progress bars |
+| `--no-progress` | Disable progress bars |
+
+**Examples:**
+```bash
+# Backup all snapshots for 'root' config to local path
+btrfs-backup-ng snapper backup root /mnt/backup/root
+
+# Backup to remote server
+btrfs-backup-ng snapper backup root ssh://backup@server:/backups/root
+
+# Backup only single-type snapshots with compression
+btrfs-backup-ng snapper backup root /mnt/backup --type single --compress zstd
+
+# Backup snapshots older than 1 hour
+btrfs-backup-ng snapper backup root /mnt/backup --min-age 1h
+
+# Dry run to see what would be backed up
+btrfs-backup-ng snapper backup root /mnt/backup --dry-run
+```
+
+**Backup Directory Layout:**
+
+Backups use snapper's native directory layout:
+```
+/mnt/backup/root/.snapshots/
+├── 559/
+│   ├── info.xml
+│   └── snapshot/     # btrfs subvolume
+├── 560/
+│   ├── info.xml
+│   └── snapshot/
+└── 561/
+    ├── info.xml
+    └── snapshot/
+```
+
+#### snapper status
+
+Show backup sync status between source and destination.
+
+```bash
+btrfs-backup-ng snapper status [OPTIONS]
+```
+
+**Options:**
+| Option | Description |
+|--------|-------------|
+| `--config NAME` | Check specific config only |
+| `--target PATH` | Check backup status at target |
+| `--json` | Output in JSON format |
+
+**Examples:**
+```bash
+# Show local snapshot counts
+btrfs-backup-ng snapper status
+
+# Show backup status for specific target
+btrfs-backup-ng snapper status --target /mnt/backup/root
+```
+
+#### snapper restore
+
+Restore snapper snapshots from backup.
+
+```bash
+btrfs-backup-ng snapper restore SOURCE --config NAME [OPTIONS]
+```
+
+**Arguments:**
+| Argument | Description |
+|----------|-------------|
+| `SOURCE` | Backup source path (local or ssh://user@host:/path) |
+
+**Options:**
+| Option | Description |
+|--------|-------------|
+| `--config NAME` | Local snapper config to restore into (required) |
+| `--list` | List available backups instead of restoring |
+| `--snapshot NUM` | Restore specific snapshot by number (can be repeated) |
+| `--all` | Restore all snapshots |
+| `--dry-run` | Show what would be done without making changes |
+| `--compress METHOD` | Compression method |
+| `--rate-limit RATE` | Bandwidth limit |
+| `--ssh-sudo` | Use sudo on remote host |
+| `--ssh-key FILE` | SSH private key file |
+| `--progress` | Show progress bars |
+| `--json` | Output in JSON format (for --list) |
+
+**Examples:**
+```bash
+# List available backups
+btrfs-backup-ng snapper restore /mnt/backup/root --config root --list
+
+# Restore specific snapshot
+btrfs-backup-ng snapper restore /mnt/backup/root --config root --snapshot 559
+
+# Restore multiple snapshots
+btrfs-backup-ng snapper restore /mnt/backup/root --config root --snapshot 559 --snapshot 560
+
+# Restore all snapshots
+btrfs-backup-ng snapper restore /mnt/backup/root --config root --all
+
+# Dry run
+btrfs-backup-ng snapper restore /mnt/backup/root --config root --all --dry-run
+```
+
+#### snapper generate-config
+
+Generate TOML configuration for snapper-managed volumes.
+
+```bash
+btrfs-backup-ng snapper generate-config [OPTIONS]
+```
+
+**Options:**
+| Option | Description |
+|--------|-------------|
+| `--config NAME` | Generate for specific config(s) (can be repeated) |
+| `--target PATH` | Include target in generated config |
+| `--type TYPE` | Snapshot types to include (default: single) |
+| `--min-age DURATION` | Minimum snapshot age (default: 1h) |
+| `--ssh-sudo` | Enable ssh_sudo in target config |
+| `-o, --output FILE` | Write to file instead of stdout |
+| `--append FILE` | Append to existing config file |
+| `--json` | Output in JSON format |
+
+**Examples:**
+```bash
+# Generate config for all snapper volumes
+btrfs-backup-ng snapper generate-config
+
+# Generate for specific config with target
+btrfs-backup-ng snapper generate-config --config root --target ssh://backup@server:/backups
+
+# Write to file
+btrfs-backup-ng snapper generate-config -o ~/.config/btrfs-backup-ng/snapper.toml
+
+# Append to existing config
+btrfs-backup-ng snapper generate-config --append ~/.config/btrfs-backup-ng/config.toml
+```
+
+**Example Output:**
+```toml
+# Snapper volume configuration
+# Generated by: btrfs-backup-ng snapper generate-config
+
+[[volumes]]
+path = "/"
+source = "snapper"
+
+[volumes.snapper]
+config_name = "root"
+include_types = ["single"]
+min_age = "1h"
+
+[[volumes.targets]]
+path = "ssh://backup@server:/backups/root"
+ssh_sudo = true
+```
+
+---
+
 ## Filesystem Checks
 
 The `--fs-checks` option controls how btrfs-backup-ng validates source and destination paths:

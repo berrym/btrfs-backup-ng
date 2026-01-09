@@ -786,11 +786,13 @@ Examples:
         help="Safety margin percentage for space check (default: 10%%)",
     )
 
-    # transfers command - manage chunked/resumable transfers
+    # transfers command - manage chunked/resumable transfers (experimental)
     transfers_parser = subparsers.add_parser(
         "transfers",
-        help="Manage chunked and resumable transfers",
-        description="List, resume, pause, and clean up chunked transfers",
+        help="Manage chunked and resumable transfers (experimental)",
+        description="[EXPERIMENTAL] List, resume, pause, and clean up chunked transfers.\n\n"
+        "Note: The chunked transfer feature is experimental and has not been\n"
+        "extensively tested in production environments.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:

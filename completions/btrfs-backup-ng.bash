@@ -5,10 +5,12 @@ _btrfs_backup_ng() {
     local cur prev words cword split
     _init_completion -s || return
 
-    local commands="run snapshot transfer prune list status config install uninstall restore verify estimate doctor completions manpages"
+    local commands="run snapshot transfer prune list status config install uninstall restore verify estimate doctor completions manpages transfers snapper"
     local config_subcommands="validate init import detect"
     local completions_subcommands="install path"
     local manpages_subcommands="install path"
+    local transfers_subcommands="list show resume pause cleanup operations"
+    local snapper_subcommands="detect list backup status restore generate-config"
 
     # Global options
     local global_opts="-h --help -v --verbose -q --quiet --debug -V --version -c --config"
@@ -33,6 +35,17 @@ _btrfs_backup_ng() {
     local doctor_categories="config snapshots transfers system"
     local completions_install_opts="--shell --system"
     local manpages_install_opts="--system --prefix"
+    local transfers_list_opts="--json"
+    local transfers_show_opts="--json"
+    local transfers_resume_opts="--dry-run"
+    local transfers_cleanup_opts="--force --all --age"
+    local snapper_detect_opts="--json"
+    local snapper_list_opts="--config --type --json"
+    local snapper_backup_opts="--snapshot --dry-run --ssh-sudo --ssh-key --compress --progress --no-progress"
+    local snapper_status_opts="--json"
+    local snapper_restore_opts="--snapshot --dry-run --ssh-sudo --ssh-key"
+    local snapper_generate_config_opts="-o --output"
+    local snapper_types="single pre post"
     local verify_levels="metadata stream full"
     local shell_types="bash zsh fish"
     local fs_checks_modes="auto strict skip"
@@ -49,15 +62,25 @@ _btrfs_backup_ng() {
     local i
     for ((i=1; i < cword; i++)); do
         case "${words[i]}" in
-            run|snapshot|transfer|prune|list|status|config|install|uninstall|restore|verify|estimate|doctor|completions|manpages)
+            run|snapshot|transfer|prune|list|status|config|install|uninstall|restore|verify|estimate|doctor|completions|manpages|transfers|snapper)
                 cmd="${words[i]}"
                 ;;
-            validate|init|import)
+            validate|init|import|detect)
                 if [[ "$cmd" == "config" ]]; then
                     subcmd="${words[i]}"
                 fi
                 ;;
-            path)
+            list|show|resume|pause|cleanup|operations)
+                if [[ "$cmd" == "transfers" ]]; then
+                    subcmd="${words[i]}"
+                fi
+                ;;
+            detect|backup|status|restore|generate-config)
+                if [[ "$cmd" == "snapper" ]]; then
+                    subcmd="${words[i]}"
+                fi
+                ;;
+            path|install)
                 if [[ "$cmd" == "completions" || "$cmd" == "manpages" ]]; then
                     subcmd="${words[i]}"
                 fi
@@ -253,6 +276,75 @@ _btrfs_backup_ng() {
                         ;;
                     path)
                         # No additional options
+                        ;;
+                esac
+            fi
+            ;;
+        transfers)
+            if [[ -z "$subcmd" ]]; then
+                if [[ "$cur" == -* ]]; then
+                    COMPREPLY=($(compgen -W "-h --help" -- "$cur"))
+                else
+                    COMPREPLY=($(compgen -W "$transfers_subcommands" -- "$cur"))
+                fi
+            else
+                case "$subcmd" in
+                    list)
+                        COMPREPLY=($(compgen -W "$transfers_list_opts" -- "$cur"))
+                        ;;
+                    show)
+                        COMPREPLY=($(compgen -W "$transfers_show_opts" -- "$cur"))
+                        ;;
+                    resume)
+                        COMPREPLY=($(compgen -W "$transfers_resume_opts" -- "$cur"))
+                        ;;
+                    cleanup)
+                        COMPREPLY=($(compgen -W "$transfers_cleanup_opts" -- "$cur"))
+                        ;;
+                    pause|operations)
+                        # No additional options
+                        ;;
+                esac
+            fi
+            ;;
+        snapper)
+            if [[ -z "$subcmd" ]]; then
+                if [[ "$cur" == -* ]]; then
+                    COMPREPLY=($(compgen -W "-h --help" -- "$cur"))
+                else
+                    COMPREPLY=($(compgen -W "$snapper_subcommands" -- "$cur"))
+                fi
+            else
+                case "$subcmd" in
+                    detect)
+                        COMPREPLY=($(compgen -W "$snapper_detect_opts" -- "$cur"))
+                        ;;
+                    list)
+                        if [[ "$prev" == "--type" ]]; then
+                            COMPREPLY=($(compgen -W "$snapper_types" -- "$cur"))
+                        else
+                            COMPREPLY=($(compgen -W "$snapper_list_opts" -- "$cur"))
+                        fi
+                        ;;
+                    backup)
+                        if [[ "$cur" == -* ]]; then
+                            COMPREPLY=($(compgen -W "$snapper_backup_opts" -- "$cur"))
+                        else
+                            _filedir -d
+                        fi
+                        ;;
+                    status)
+                        COMPREPLY=($(compgen -W "$snapper_status_opts" -- "$cur"))
+                        ;;
+                    restore)
+                        if [[ "$cur" == -* ]]; then
+                            COMPREPLY=($(compgen -W "$snapper_restore_opts" -- "$cur"))
+                        else
+                            _filedir -d
+                        fi
+                        ;;
+                    generate-config)
+                        COMPREPLY=($(compgen -W "$snapper_generate_config_opts" -- "$cur"))
                         ;;
                 esac
             fi
