@@ -1,6 +1,30 @@
 """Pytest configuration and shared fixtures."""
 
+import logging
+
 import pytest
+
+
+@pytest.fixture(autouse=True)
+def reset_logging():
+    """Reset logging handlers after each test to prevent pollution.
+
+    Some tests (especially those calling CLI entry points like execute_restore)
+    set up global logging handlers that can pollute stdout for subsequent tests.
+    """
+    yield
+    # Reset the root logger
+    root_logger = logging.getLogger()
+    root_logger.handlers.clear()
+
+    # Reset the btrfs_backup_ng logger specifically
+    try:
+        import btrfs_backup_ng.__logger__ as logger_module
+
+        if hasattr(logger_module, "logger"):
+            logger_module.logger.handlers.clear()
+    except ImportError:
+        pass
 
 
 @pytest.fixture

@@ -2,6 +2,7 @@
 
 import argparse
 import json
+from datetime import datetime
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -9,10 +10,14 @@ import pytest
 
 from btrfs_backup_ng.cli.snapper_cmd import (
     _generate_snapper_toml,
+    _handle_detect,
     _handle_generate_config,
+    _handle_list,
+    _handle_status,
     execute_snapper,
 )
 from btrfs_backup_ng.snapper.scanner import SnapperConfig, SnapperNotFoundError
+from btrfs_backup_ng.snapper.snapshot import SnapperSnapshot
 
 
 @pytest.fixture
@@ -35,6 +40,477 @@ def mock_snapper_configs():
     home_config.is_valid.return_value = True
 
     return [root_config, home_config]
+
+
+@pytest.fixture
+def mock_snapper_snapshots():
+    """Create mock snapper snapshots."""
+    snap1 = MagicMock(spec=SnapperSnapshot)
+    snap1.number = 559
+    snap1.snapshot_type = "single"
+    snap1.date = datetime(2026, 1, 8, 14, 30, 0)
+    snap1.description = "timeline"
+    snap1.cleanup = "timeline"
+    snap1.pre_num = None
+    snap1.get_backup_name.return_value = "559"
+
+    snap2 = MagicMock(spec=SnapperSnapshot)
+    snap2.number = 560
+    snap2.snapshot_type = "pre"
+    snap2.date = datetime(2026, 1, 8, 15, 0, 0)
+    snap2.description = "dnf install vim"
+    snap2.cleanup = "number"
+    snap2.pre_num = None
+    snap2.get_backup_name.return_value = "560"
+
+    snap3 = MagicMock(spec=SnapperSnapshot)
+    snap3.number = 561
+    snap3.snapshot_type = "post"
+    snap3.date = datetime(2026, 1, 8, 15, 1, 0)
+    snap3.description = "dnf install vim"
+    snap3.cleanup = "number"
+    snap3.pre_num = 560
+    snap3.get_backup_name.return_value = "561"
+
+    return [snap1, snap2, snap3]
+
+
+class TestHandleDetect:
+    """Tests for the detect command handler."""
+
+    def test_snapper_not_found(self, capsys):
+        """Test handling when snapper is not installed."""
+        args = argparse.Namespace(json=False)
+
+        with patch(
+            "btrfs_backup_ng.cli.snapper_cmd.SnapperScanner"
+        ) as mock_scanner_cls:
+            mock_scanner_cls.side_effect = SnapperNotFoundError("snapper not found")
+            result = _handle_detect(args)
+
+        assert result == 1
+        captured = capsys.readouterr()
+        assert "Snapper not found" in captured.out
+
+    def test_snapper_not_found_json(self, capsys):
+        """Test JSON output when snapper is not installed."""
+        args = argparse.Namespace(json=True)
+
+        with patch(
+            "btrfs_backup_ng.cli.snapper_cmd.SnapperScanner"
+        ) as mock_scanner_cls:
+            mock_scanner_cls.side_effect = SnapperNotFoundError("snapper not found")
+            result = _handle_detect(args)
+
+        assert result == 1
+        captured = capsys.readouterr()
+        output = json.loads(captured.out)
+        assert "error" in output
+        assert output["configs"] == []
+
+    def test_no_configs_found(self, capsys):
+        """Test when no snapper configs exist."""
+        args = argparse.Namespace(json=False)
+
+        with patch(
+            "btrfs_backup_ng.cli.snapper_cmd.SnapperScanner"
+        ) as mock_scanner_cls:
+            mock_scanner = MagicMock()
+            mock_scanner.list_configs.return_value = []
+            mock_scanner_cls.return_value = mock_scanner
+            result = _handle_detect(args)
+
+        assert result == 0
+        captured = capsys.readouterr()
+        assert "No snapper configurations found" in captured.out
+
+    def test_detect_configs(self, capsys, mock_snapper_configs):
+        """Test detecting snapper configurations."""
+        args = argparse.Namespace(json=False)
+
+        with patch(
+            "btrfs_backup_ng.cli.snapper_cmd.SnapperScanner"
+        ) as mock_scanner_cls:
+            mock_scanner = MagicMock()
+            mock_scanner.list_configs.return_value = mock_snapper_configs
+            mock_scanner_cls.return_value = mock_scanner
+            result = _handle_detect(args)
+
+        assert result == 0
+        captured = capsys.readouterr()
+        assert "Found 2 snapper configuration(s)" in captured.out
+        assert "root:" in captured.out
+        assert "home:" in captured.out
+        assert "Subvolume:" in captured.out
+        assert "Status:" in captured.out
+        assert "OK" in captured.out
+
+    def test_detect_configs_with_users(self, capsys, mock_snapper_configs):
+        """Test detecting configs that have allowed users."""
+        args = argparse.Namespace(json=False)
+
+        with patch(
+            "btrfs_backup_ng.cli.snapper_cmd.SnapperScanner"
+        ) as mock_scanner_cls:
+            mock_scanner = MagicMock()
+            mock_scanner.list_configs.return_value = mock_snapper_configs
+            mock_scanner_cls.return_value = mock_scanner
+            result = _handle_detect(args)
+
+        assert result == 0
+        captured = capsys.readouterr()
+        assert "Allowed users: user1" in captured.out
+
+    def test_detect_json_output(self, capsys, mock_snapper_configs):
+        """Test JSON output for detect command."""
+        args = argparse.Namespace(json=True)
+
+        with patch(
+            "btrfs_backup_ng.cli.snapper_cmd.SnapperScanner"
+        ) as mock_scanner_cls:
+            mock_scanner = MagicMock()
+            mock_scanner.list_configs.return_value = mock_snapper_configs
+            mock_scanner_cls.return_value = mock_scanner
+            result = _handle_detect(args)
+
+        assert result == 0
+        captured = capsys.readouterr()
+        output = json.loads(captured.out)
+        assert "configs" in output
+        assert len(output["configs"]) == 2
+        assert output["configs"][0]["name"] == "root"
+        assert output["configs"][0]["valid"] is True
+        assert output["configs"][1]["name"] == "home"
+
+
+class TestHandleList:
+    """Tests for the list command handler."""
+
+    def test_snapper_not_found(self, capsys):
+        """Test handling when snapper is not installed."""
+        args = argparse.Namespace(json=False, config=None, type=None)
+
+        with patch(
+            "btrfs_backup_ng.cli.snapper_cmd.SnapperScanner"
+        ) as mock_scanner_cls:
+            mock_scanner_cls.side_effect = SnapperNotFoundError("snapper not found")
+            result = _handle_list(args)
+
+        assert result == 1
+        captured = capsys.readouterr()
+        assert "Snapper not found" in captured.out
+
+    def test_snapper_not_found_json(self, capsys):
+        """Test JSON output when snapper is not installed."""
+        args = argparse.Namespace(json=True, config=None, type=None)
+
+        with patch(
+            "btrfs_backup_ng.cli.snapper_cmd.SnapperScanner"
+        ) as mock_scanner_cls:
+            mock_scanner_cls.side_effect = SnapperNotFoundError("snapper not found")
+            result = _handle_list(args)
+
+        assert result == 1
+        captured = capsys.readouterr()
+        output = json.loads(captured.out)
+        assert "error" in output
+
+    def test_no_configs_found(self, capsys):
+        """Test when no snapper configs exist."""
+        args = argparse.Namespace(json=False, config=None, type=None)
+
+        with patch(
+            "btrfs_backup_ng.cli.snapper_cmd.SnapperScanner"
+        ) as mock_scanner_cls:
+            mock_scanner = MagicMock()
+            mock_scanner.list_configs.return_value = []
+            mock_scanner_cls.return_value = mock_scanner
+            result = _handle_list(args)
+
+        assert result == 0
+        captured = capsys.readouterr()
+        assert "No snapper configurations found" in captured.out
+
+    def test_config_not_found(self, capsys, mock_snapper_configs):
+        """Test when specified config doesn't exist."""
+        args = argparse.Namespace(json=False, config="nonexistent", type=None)
+
+        with patch(
+            "btrfs_backup_ng.cli.snapper_cmd.SnapperScanner"
+        ) as mock_scanner_cls:
+            mock_scanner = MagicMock()
+            mock_scanner.get_config.return_value = None
+            mock_scanner_cls.return_value = mock_scanner
+            result = _handle_list(args)
+
+        assert result == 1
+        captured = capsys.readouterr()
+        assert "not found" in captured.out
+
+    def test_list_snapshots(self, capsys, mock_snapper_configs, mock_snapper_snapshots):
+        """Test listing snapshots for all configs."""
+        args = argparse.Namespace(json=False, config=None, type=None)
+
+        with patch(
+            "btrfs_backup_ng.cli.snapper_cmd.SnapperScanner"
+        ) as mock_scanner_cls:
+            mock_scanner = MagicMock()
+            mock_scanner.list_configs.return_value = mock_snapper_configs
+            mock_scanner.get_snapshots.return_value = mock_snapper_snapshots
+            mock_scanner_cls.return_value = mock_scanner
+            result = _handle_list(args)
+
+        assert result == 0
+        captured = capsys.readouterr()
+        assert "Config: root" in captured.out
+        assert "559" in captured.out
+        assert "single" in captured.out
+        assert "timeline" in captured.out
+
+    def test_list_specific_config(
+        self, capsys, mock_snapper_configs, mock_snapper_snapshots
+    ):
+        """Test listing snapshots for a specific config."""
+        args = argparse.Namespace(json=False, config="root", type=None)
+
+        with patch(
+            "btrfs_backup_ng.cli.snapper_cmd.SnapperScanner"
+        ) as mock_scanner_cls:
+            mock_scanner = MagicMock()
+            mock_scanner.get_config.return_value = mock_snapper_configs[0]
+            mock_scanner.get_snapshots.return_value = mock_snapper_snapshots
+            mock_scanner_cls.return_value = mock_scanner
+            result = _handle_list(args)
+
+        assert result == 0
+        captured = capsys.readouterr()
+        assert "Config: root" in captured.out
+
+    def test_list_with_type_filter(
+        self, capsys, mock_snapper_configs, mock_snapper_snapshots
+    ):
+        """Test listing snapshots with type filter."""
+        args = argparse.Namespace(json=False, config=None, type=["single"])
+
+        with patch(
+            "btrfs_backup_ng.cli.snapper_cmd.SnapperScanner"
+        ) as mock_scanner_cls:
+            mock_scanner = MagicMock()
+            mock_scanner.list_configs.return_value = mock_snapper_configs
+            mock_scanner.get_snapshots.return_value = [mock_snapper_snapshots[0]]
+            mock_scanner_cls.return_value = mock_scanner
+            result = _handle_list(args)
+
+        assert result == 0
+        # get_snapshots should be called with include_types
+        mock_scanner.get_snapshots.assert_called()
+
+    def test_list_no_snapshots(self, capsys, mock_snapper_configs):
+        """Test listing when no snapshots exist."""
+        args = argparse.Namespace(json=False, config=None, type=None)
+
+        with patch(
+            "btrfs_backup_ng.cli.snapper_cmd.SnapperScanner"
+        ) as mock_scanner_cls:
+            mock_scanner = MagicMock()
+            mock_scanner.list_configs.return_value = mock_snapper_configs
+            mock_scanner.get_snapshots.return_value = []
+            mock_scanner_cls.return_value = mock_scanner
+            result = _handle_list(args)
+
+        assert result == 0
+        captured = capsys.readouterr()
+        assert "No snapshots found" in captured.out
+
+    def test_list_json_output(
+        self, capsys, mock_snapper_configs, mock_snapper_snapshots
+    ):
+        """Test JSON output for list command."""
+        args = argparse.Namespace(json=True, config=None, type=None)
+
+        with patch(
+            "btrfs_backup_ng.cli.snapper_cmd.SnapperScanner"
+        ) as mock_scanner_cls:
+            mock_scanner = MagicMock()
+            mock_scanner.list_configs.return_value = mock_snapper_configs
+            mock_scanner.get_snapshots.return_value = mock_snapper_snapshots
+            mock_scanner_cls.return_value = mock_scanner
+            result = _handle_list(args)
+
+        assert result == 0
+        captured = capsys.readouterr()
+        output = json.loads(captured.out)
+        assert "configs" in output
+        assert len(output["configs"]) == 2
+        assert "snapshots" in output["configs"][0]
+
+    def test_list_handles_snapshot_exception(self, capsys, mock_snapper_configs):
+        """Test graceful handling of snapshot retrieval errors."""
+        args = argparse.Namespace(json=False, config=None, type=None)
+
+        with patch(
+            "btrfs_backup_ng.cli.snapper_cmd.SnapperScanner"
+        ) as mock_scanner_cls:
+            mock_scanner = MagicMock()
+            mock_scanner.list_configs.return_value = mock_snapper_configs
+            mock_scanner.get_snapshots.side_effect = Exception("Permission denied")
+            mock_scanner_cls.return_value = mock_scanner
+            result = _handle_list(args)
+
+        # Should still succeed, just with empty snapshots
+        assert result == 0
+
+
+class TestHandleStatus:
+    """Tests for the status command handler."""
+
+    def test_snapper_not_found(self, capsys):
+        """Test handling when snapper is not installed."""
+        args = argparse.Namespace(json=False, config=None, target=None)
+
+        with patch(
+            "btrfs_backup_ng.cli.snapper_cmd.SnapperScanner"
+        ) as mock_scanner_cls:
+            mock_scanner_cls.side_effect = SnapperNotFoundError("snapper not found")
+            result = _handle_status(args)
+
+        assert result == 1
+        captured = capsys.readouterr()
+        assert "Snapper not found" in captured.out
+
+    def test_no_configs_found(self, capsys):
+        """Test when no snapper configs exist."""
+        args = argparse.Namespace(json=False, config=None, target=None)
+
+        with patch(
+            "btrfs_backup_ng.cli.snapper_cmd.SnapperScanner"
+        ) as mock_scanner_cls:
+            mock_scanner = MagicMock()
+            mock_scanner.list_configs.return_value = []
+            mock_scanner_cls.return_value = mock_scanner
+            result = _handle_status(args)
+
+        assert result == 0
+        captured = capsys.readouterr()
+        assert "No snapper configurations found" in captured.out
+
+    def test_status_local_only(
+        self, capsys, mock_snapper_configs, mock_snapper_snapshots
+    ):
+        """Test status without target (local snapshot counts)."""
+        args = argparse.Namespace(json=False, config=None, target=None)
+
+        with patch(
+            "btrfs_backup_ng.cli.snapper_cmd.SnapperScanner"
+        ) as mock_scanner_cls:
+            mock_scanner = MagicMock()
+            mock_scanner.list_configs.return_value = mock_snapper_configs
+            mock_scanner.get_snapshots.return_value = mock_snapper_snapshots
+            mock_scanner_cls.return_value = mock_scanner
+            result = _handle_status(args)
+
+        assert result == 0
+        captured = capsys.readouterr()
+        assert "Snapper snapshot status" in captured.out
+        assert "Total snapshots:" in captured.out
+
+    def test_status_json_output(
+        self, capsys, mock_snapper_configs, mock_snapper_snapshots
+    ):
+        """Test JSON output for status command."""
+        args = argparse.Namespace(json=True, config=None, target=None)
+
+        with patch(
+            "btrfs_backup_ng.cli.snapper_cmd.SnapperScanner"
+        ) as mock_scanner_cls:
+            mock_scanner = MagicMock()
+            mock_scanner.list_configs.return_value = mock_snapper_configs
+            mock_scanner.get_snapshots.return_value = mock_snapper_snapshots
+            mock_scanner_cls.return_value = mock_scanner
+            result = _handle_status(args)
+
+        assert result == 0
+        captured = capsys.readouterr()
+        output = json.loads(captured.out)
+        assert "status" in output
+
+    def test_status_specific_config(
+        self, capsys, mock_snapper_configs, mock_snapper_snapshots
+    ):
+        """Test status for a specific config."""
+        args = argparse.Namespace(json=False, config="root", target=None)
+
+        with patch(
+            "btrfs_backup_ng.cli.snapper_cmd.SnapperScanner"
+        ) as mock_scanner_cls:
+            mock_scanner = MagicMock()
+            mock_scanner.get_config.return_value = mock_snapper_configs[0]
+            mock_scanner.get_snapshots.return_value = mock_snapper_snapshots
+            mock_scanner_cls.return_value = mock_scanner
+            result = _handle_status(args)
+
+        assert result == 0
+
+    def test_status_config_not_found(self, capsys):
+        """Test status when specified config doesn't exist."""
+        args = argparse.Namespace(json=False, config="nonexistent", target=None)
+
+        with patch(
+            "btrfs_backup_ng.cli.snapper_cmd.SnapperScanner"
+        ) as mock_scanner_cls:
+            mock_scanner = MagicMock()
+            mock_scanner.get_config.return_value = None
+            mock_scanner_cls.return_value = mock_scanner
+            result = _handle_status(args)
+
+        assert result == 1
+        captured = capsys.readouterr()
+        assert "not found" in captured.out
+
+    def test_status_with_target(
+        self, capsys, mock_snapper_configs, mock_snapper_snapshots
+    ):
+        """Test status with a backup target."""
+        args = argparse.Namespace(json=False, config=None, target="/mnt/backup")
+
+        with (
+            patch("btrfs_backup_ng.cli.snapper_cmd.SnapperScanner") as mock_scanner_cls,
+            patch(
+                "btrfs_backup_ng.core.operations._list_snapper_backups_at_destination"
+            ) as mock_list_backups,
+            patch("btrfs_backup_ng.endpoint.choose_endpoint") as mock_choose,
+        ):
+            mock_scanner = MagicMock()
+            mock_scanner.list_configs.return_value = mock_snapper_configs
+            mock_scanner.get_snapshots.return_value = mock_snapper_snapshots
+            mock_scanner_cls.return_value = mock_scanner
+            mock_list_backups.return_value = {"559", "560"}
+            mock_choose.return_value = MagicMock()
+            result = _handle_status(args)
+
+        assert result == 0
+        captured = capsys.readouterr()
+        assert "Backup status" in captured.out
+        assert "Backed up:" in captured.out
+        assert "Pending:" in captured.out
+
+    def test_status_target_access_error(self, capsys, mock_snapper_configs):
+        """Test status when target is inaccessible."""
+        args = argparse.Namespace(json=False, config=None, target="/mnt/backup")
+
+        with (
+            patch("btrfs_backup_ng.cli.snapper_cmd.SnapperScanner") as mock_scanner_cls,
+            patch("btrfs_backup_ng.endpoint.choose_endpoint") as mock_choose,
+        ):
+            mock_scanner = MagicMock()
+            mock_scanner.list_configs.return_value = mock_snapper_configs
+            mock_scanner_cls.return_value = mock_scanner
+            mock_choose.side_effect = Exception("Cannot access target")
+            result = _handle_status(args)
+
+        assert result == 1
+        captured = capsys.readouterr()
+        assert "Cannot access target" in captured.out
 
 
 class TestGenerateSnapperToml:

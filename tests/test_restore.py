@@ -2,6 +2,7 @@
 
 import argparse
 import time
+from pathlib import Path
 from unittest.mock import ANY, MagicMock, patch
 
 import pytest
@@ -3414,3 +3415,256 @@ class TestExecuteMainRestoreExtended:
         result = _execute_main_restore(args)
 
         assert result == 1
+
+
+class TestListSnapperBackups:
+    """Tests for list_snapper_backups function."""
+
+    def test_empty_directory(self, tmp_path):
+        """Should return empty list when no snapshots exist."""
+        from btrfs_backup_ng.core.restore import list_snapper_backups
+
+        result = list_snapper_backups(str(tmp_path))
+        assert result == []
+
+    def test_no_snapshots_dir(self, tmp_path):
+        """Should return empty list when .snapshots doesn't exist."""
+        from btrfs_backup_ng.core.restore import list_snapper_backups
+
+        result = list_snapper_backups(str(tmp_path))
+        assert result == []
+
+    def test_finds_numbered_snapshots(self, tmp_path):
+        """Should find snapshots in numbered directories."""
+        from btrfs_backup_ng.core.restore import list_snapper_backups
+
+        snapshots_dir = tmp_path / ".snapshots"
+        snapshots_dir.mkdir()
+
+        # Create snapshot directories with snapshot subdir
+        for num in [558, 559, 560]:
+            snap_dir = snapshots_dir / str(num)
+            snap_dir.mkdir()
+            (snap_dir / "snapshot").mkdir()
+
+        result = list_snapper_backups(str(tmp_path))
+
+        assert len(result) == 3
+        assert result[0]["number"] == 558
+        assert result[1]["number"] == 559
+        assert result[2]["number"] == 560
+
+    def test_ignores_non_numeric_directories(self, tmp_path):
+        """Should ignore directories that aren't numbered."""
+        from btrfs_backup_ng.core.restore import list_snapper_backups
+
+        snapshots_dir = tmp_path / ".snapshots"
+        snapshots_dir.mkdir()
+
+        # Create valid snapshot
+        snap_dir = snapshots_dir / "100"
+        snap_dir.mkdir()
+        (snap_dir / "snapshot").mkdir()
+
+        # Create invalid directories
+        (snapshots_dir / "current").mkdir()
+        (snapshots_dir / "temp").mkdir()
+        (snapshots_dir / "abc").mkdir()
+
+        result = list_snapper_backups(str(tmp_path))
+
+        assert len(result) == 1
+        assert result[0]["number"] == 100
+
+    def test_ignores_directories_without_snapshot_subdir(self, tmp_path):
+        """Should ignore numbered dirs that don't have snapshot subdir."""
+        from btrfs_backup_ng.core.restore import list_snapper_backups
+
+        snapshots_dir = tmp_path / ".snapshots"
+        snapshots_dir.mkdir()
+
+        # Create valid snapshot
+        valid_dir = snapshots_dir / "100"
+        valid_dir.mkdir()
+        (valid_dir / "snapshot").mkdir()
+
+        # Create invalid - no snapshot subdir
+        invalid_dir = snapshots_dir / "200"
+        invalid_dir.mkdir()
+
+        result = list_snapper_backups(str(tmp_path))
+
+        assert len(result) == 1
+        assert result[0]["number"] == 100
+
+    def test_parses_info_xml(self, tmp_path):
+        """Should parse info.xml when present."""
+        from btrfs_backup_ng.core.restore import list_snapper_backups
+
+        snapshots_dir = tmp_path / ".snapshots"
+        snapshots_dir.mkdir()
+
+        snap_dir = snapshots_dir / "123"
+        snap_dir.mkdir()
+        (snap_dir / "snapshot").mkdir()
+
+        # Create info.xml
+        info_xml = """<?xml version="1.0"?>
+<snapshot>
+  <type>single</type>
+  <num>123</num>
+  <date>2024-01-15 10:30:00</date>
+  <description>Test snapshot</description>
+  <cleanup>number</cleanup>
+</snapshot>"""
+        (snap_dir / "info.xml").write_text(info_xml)
+
+        result = list_snapper_backups(str(tmp_path))
+
+        assert len(result) == 1
+        assert result[0]["number"] == 123
+        assert result[0]["metadata"] is not None
+        assert result[0]["metadata"].description == "Test snapshot"
+
+    def test_handles_invalid_info_xml(self, tmp_path):
+        """Should handle invalid info.xml gracefully."""
+        from btrfs_backup_ng.core.restore import list_snapper_backups
+
+        snapshots_dir = tmp_path / ".snapshots"
+        snapshots_dir.mkdir()
+
+        snap_dir = snapshots_dir / "123"
+        snap_dir.mkdir()
+        (snap_dir / "snapshot").mkdir()
+
+        # Create invalid info.xml
+        (snap_dir / "info.xml").write_text("not valid xml")
+
+        result = list_snapper_backups(str(tmp_path))
+
+        assert len(result) == 1
+        assert result[0]["number"] == 123
+        assert result[0]["metadata"] is None
+
+    def test_returns_sorted_by_number(self, tmp_path):
+        """Should return snapshots sorted by number."""
+        from btrfs_backup_ng.core.restore import list_snapper_backups
+
+        snapshots_dir = tmp_path / ".snapshots"
+        snapshots_dir.mkdir()
+
+        # Create in random order
+        for num in [300, 100, 200]:
+            snap_dir = snapshots_dir / str(num)
+            snap_dir.mkdir()
+            (snap_dir / "snapshot").mkdir()
+
+        result = list_snapper_backups(str(tmp_path))
+
+        assert [r["number"] for r in result] == [100, 200, 300]
+
+
+class TestRestoreSnapperSnapshot:
+    """Tests for restore_snapper_snapshot function."""
+
+    def test_missing_snapper_config_raises_error(self, tmp_path):
+        """Should raise RestoreError when local snapper config not found."""
+        from btrfs_backup_ng.core.restore import RestoreError, restore_snapper_snapshot
+
+        # Create backup structure
+        snapshots_dir = tmp_path / ".snapshots" / "100"
+        snapshots_dir.mkdir(parents=True)
+        (snapshots_dir / "snapshot").mkdir()
+
+        with patch("btrfs_backup_ng.snapper.SnapperScanner") as mock_scanner:
+            mock_scanner.return_value.get_config.return_value = None
+
+            with pytest.raises(RestoreError) as exc_info:
+                restore_snapper_snapshot(
+                    backup_path=str(tmp_path),
+                    backup_number=100,
+                    snapper_config_name="nonexistent",
+                )
+
+            assert "Local snapper config not found" in str(exc_info.value)
+
+    def test_missing_backup_snapshot_raises_error(self, tmp_path):
+        """Should raise RestoreError when backup snapshot not found."""
+        from btrfs_backup_ng.core.restore import RestoreError, restore_snapper_snapshot
+        from btrfs_backup_ng.snapper import SnapperConfig
+
+        with patch("btrfs_backup_ng.snapper.SnapperScanner") as mock_scanner:
+            # Use tmp_path as subvolume - snapshots_dir is a property that returns subvolume/.snapshots
+            mock_config = SnapperConfig(
+                name="root",
+                subvolume=tmp_path,
+            )
+            mock_scanner.return_value.get_config.return_value = mock_config
+
+            with pytest.raises(RestoreError) as exc_info:
+                restore_snapper_snapshot(
+                    backup_path=str(tmp_path),
+                    backup_number=999,
+                    snapper_config_name="root",
+                )
+
+            assert "Backup snapshot not found" in str(exc_info.value)
+
+    def test_dry_run_returns_early(self, tmp_path):
+        """Should return without doing actual work in dry run mode."""
+        from btrfs_backup_ng.core.restore import restore_snapper_snapshot
+        from btrfs_backup_ng.snapper import SnapperConfig
+
+        # Create backup structure
+        snapshots_dir = tmp_path / "backup" / ".snapshots" / "100"
+        snapshots_dir.mkdir(parents=True)
+        (snapshots_dir / "snapshot").mkdir()
+
+        with patch("btrfs_backup_ng.snapper.SnapperScanner") as mock_scanner:
+            # subvolume is tmp_path/local, so snapshots_dir will be tmp_path/local/.snapshots
+            mock_config = SnapperConfig(
+                name="root",
+                subvolume=tmp_path / "local",
+            )
+            mock_scanner.return_value.get_config.return_value = mock_config
+            mock_scanner.return_value.get_next_snapshot_number.return_value = 1
+
+            next_num, path = restore_snapper_snapshot(
+                backup_path=str(tmp_path / "backup"),
+                backup_number=100,
+                snapper_config_name="root",
+                dry_run=True,
+            )
+
+            assert next_num == 1
+            assert path == Path("/dev/null")
+
+    def test_parent_not_found_falls_back_to_full(self, tmp_path, capsys, caplog):
+        """Should fall back to full restore when parent not found."""
+        from btrfs_backup_ng.core.restore import restore_snapper_snapshot
+        from btrfs_backup_ng.snapper import SnapperConfig
+
+        # Create backup structure (no parent)
+        snapshots_dir = tmp_path / "backup" / ".snapshots" / "100"
+        snapshots_dir.mkdir(parents=True)
+        (snapshots_dir / "snapshot").mkdir()
+
+        with patch("btrfs_backup_ng.snapper.SnapperScanner") as mock_scanner:
+            mock_config = SnapperConfig(
+                name="root",
+                subvolume=tmp_path / "local",
+            )
+            mock_scanner.return_value.get_config.return_value = mock_config
+            mock_scanner.return_value.get_next_snapshot_number.return_value = 1
+
+            # Use dry_run to avoid actual subprocess calls
+            restore_snapper_snapshot(
+                backup_path=str(tmp_path / "backup"),
+                backup_number=100,
+                snapper_config_name="root",
+                parent_backup_number=99,  # Parent doesn't exist
+                dry_run=True,
+            )
+
+            # Check warning was logged
+            assert "falling back to full restore" in caplog.text.lower()

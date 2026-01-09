@@ -7,24 +7,23 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-
 from btrfs_backup_ng.cli.transfers_cmd import (
+    _cleanup_transfers,
     _format_age,
     _format_bytes,
     _get_status_symbol,
-    _list_transfers,
-    _show_transfer,
-    _resume_transfer,
-    _cleanup_transfers,
     _list_operations,
+    _list_transfers,
+    _resume_transfer,
+    _show_transfer,
     execute_transfers,
 )
 from btrfs_backup_ng.core.chunked_transfer import (
     ChunkedTransferManager,
-    TransferConfig,
-    TransferStatus,
     ChunkInfo,
     ChunkStatus,
+    TransferConfig,
+    TransferStatus,
 )
 from btrfs_backup_ng.core.state import (
     OperationManager,
@@ -405,6 +404,329 @@ class TestListOperations:
         captured = capsys.readouterr()
         assert "Backup Operations" in captured.out
         assert op.operation_id in captured.out
+
+
+class TestPauseTransfer:
+    """Tests for _pause_transfer function."""
+
+    def test_no_transfer_id(self, capsys):
+        """Should error when no transfer ID provided."""
+        from btrfs_backup_ng.cli.transfers_cmd import _pause_transfer
+
+        args = argparse.Namespace(transfer_id=None)
+        result = _pause_transfer(args)
+        assert result == 1
+        captured = capsys.readouterr()
+        assert "Transfer ID required" in captured.out
+
+    def test_transfer_not_found(self, capsys):
+        """Should error when transfer not found."""
+        from btrfs_backup_ng.cli.transfers_cmd import _pause_transfer
+
+        with patch(
+            "btrfs_backup_ng.cli.transfers_cmd.ChunkedTransferManager"
+        ) as MockManager:
+            mock_manager = MagicMock()
+            mock_manager.get_transfer.return_value = None
+            MockManager.return_value = mock_manager
+
+            args = argparse.Namespace(transfer_id="nonexistent")
+            result = _pause_transfer(args)
+
+        assert result == 1
+        captured = capsys.readouterr()
+        assert "not found" in captured.out
+
+    def test_not_actively_transferring(self, capsys):
+        """Should error when transfer is not actively transferring."""
+        from btrfs_backup_ng.cli.transfers_cmd import _pause_transfer
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config = TransferConfig(cache_directory=Path(tmpdir))
+            manager = ChunkedTransferManager(config)
+
+            manifest = manager.create_transfer(
+                snapshot_path="/test/snap",
+                snapshot_name="test-snap",
+                destination="local",
+            )
+            manifest.status = TransferStatus.PAUSED  # Already paused
+            manifest.save(manager._get_manifest_path(manifest.transfer_id))
+
+            with patch(
+                "btrfs_backup_ng.cli.transfers_cmd.ChunkedTransferManager",
+                return_value=manager,
+            ):
+                args = argparse.Namespace(transfer_id=manifest.transfer_id)
+                result = _pause_transfer(args)
+
+        assert result == 1
+        captured = capsys.readouterr()
+        assert "not actively transferring" in captured.out
+
+    def test_pause_success(self, capsys):
+        """Should pause an active transfer."""
+        from btrfs_backup_ng.cli.transfers_cmd import _pause_transfer
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config = TransferConfig(cache_directory=Path(tmpdir))
+            manager = ChunkedTransferManager(config)
+
+            manifest = manager.create_transfer(
+                snapshot_path="/test/snap",
+                snapshot_name="test-snap",
+                destination="local",
+            )
+            manifest.status = TransferStatus.TRANSFERRING
+            manifest.chunks.append(
+                ChunkInfo(
+                    sequence=0,
+                    size=1024,
+                    checksum="abc",
+                    status=ChunkStatus.TRANSFERRED,
+                )
+            )
+            manifest.save(manager._get_manifest_path(manifest.transfer_id))
+
+            with patch(
+                "btrfs_backup_ng.cli.transfers_cmd.ChunkedTransferManager",
+                return_value=manager,
+            ):
+                args = argparse.Namespace(transfer_id=manifest.transfer_id)
+                result = _pause_transfer(args)
+
+        assert result == 0
+        captured = capsys.readouterr()
+        assert "paused" in captured.out
+
+
+class TestShowTransferEdgeCases:
+    """Additional tests for _show_transfer edge cases."""
+
+    def test_no_transfer_id(self, capsys):
+        """Should error when no transfer ID provided."""
+        args = argparse.Namespace(transfer_id=None, json=False, verbose=0)
+        result = _show_transfer(args)
+        assert result == 1
+        captured = capsys.readouterr()
+        assert "Transfer ID required" in captured.out
+
+    def test_json_output(self, capsys):
+        """Should output JSON when requested."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config = TransferConfig(cache_directory=Path(tmpdir))
+            manager = ChunkedTransferManager(config)
+
+            manifest = manager.create_transfer(
+                snapshot_path="/test/snap",
+                snapshot_name="test-snap",
+                destination="local",
+            )
+            manifest.save(manager._get_manifest_path(manifest.transfer_id))
+
+            with patch(
+                "btrfs_backup_ng.cli.transfers_cmd.ChunkedTransferManager",
+                return_value=manager,
+            ):
+                args = argparse.Namespace(
+                    transfer_id=manifest.transfer_id, json=True, verbose=0
+                )
+                result = _show_transfer(args)
+
+        assert result == 0
+        captured = capsys.readouterr()
+        data = json.loads(captured.out)
+        assert data["transfer_id"] == manifest.transfer_id
+
+    def test_verbose_shows_chunks(self, capsys):
+        """Should show chunks when verbose."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config = TransferConfig(cache_directory=Path(tmpdir))
+            manager = ChunkedTransferManager(config)
+
+            manifest = manager.create_transfer(
+                snapshot_path="/test/snap",
+                snapshot_name="test-snap",
+                destination="local",
+            )
+            manifest.chunks.append(
+                ChunkInfo(
+                    sequence=0, size=1024, checksum="abc123", status=ChunkStatus.WRITTEN
+                )
+            )
+            manifest.save(manager._get_manifest_path(manifest.transfer_id))
+
+            with patch(
+                "btrfs_backup_ng.cli.transfers_cmd.ChunkedTransferManager",
+                return_value=manager,
+            ):
+                args = argparse.Namespace(
+                    transfer_id=manifest.transfer_id, json=False, verbose=1
+                )
+                result = _show_transfer(args)
+
+        assert result == 0
+        captured = capsys.readouterr()
+        assert "Chunks:" in captured.out
+
+
+class TestResumeTransferEdgeCases:
+    """Additional tests for _resume_transfer edge cases."""
+
+    def test_no_transfer_id(self, capsys):
+        """Should error when no transfer ID provided."""
+        args = argparse.Namespace(transfer_id=None, dry_run=False)
+        result = _resume_transfer(args)
+        assert result == 1
+        captured = capsys.readouterr()
+        assert "Transfer ID required" in captured.out
+
+    def test_dry_run(self, capsys):
+        """Should show what would be done in dry run."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config = TransferConfig(cache_directory=Path(tmpdir))
+            manager = ChunkedTransferManager(config)
+
+            manifest = manager.create_transfer(
+                snapshot_path="/test/snap",
+                snapshot_name="test-snap",
+                destination="local",
+            )
+            manifest.status = TransferStatus.FAILED
+            manifest.chunks.append(
+                ChunkInfo(
+                    sequence=0, size=1024, checksum="abc", status=ChunkStatus.WRITTEN
+                )
+            )
+            manifest.save(manager._get_manifest_path(manifest.transfer_id))
+
+            with patch(
+                "btrfs_backup_ng.cli.transfers_cmd.ChunkedTransferManager",
+                return_value=manager,
+            ):
+                args = argparse.Namespace(
+                    transfer_id=manifest.transfer_id, dry_run=True
+                )
+                result = _resume_transfer(args)
+
+        assert result == 0
+        captured = capsys.readouterr()
+        assert "Would resume" in captured.out
+
+
+class TestCleanupTransfersEdgeCases:
+    """Additional tests for _cleanup_transfers edge cases."""
+
+    def test_cleanup_not_found(self, capsys):
+        """Should error when specific transfer not found."""
+        with patch(
+            "btrfs_backup_ng.cli.transfers_cmd.ChunkedTransferManager"
+        ) as MockManager:
+            mock_manager = MagicMock()
+            mock_manager.get_transfer.return_value = None
+            MockManager.return_value = mock_manager
+
+            args = argparse.Namespace(
+                transfer_id="nonexistent", force=False, max_age=48, dry_run=False
+            )
+            result = _cleanup_transfers(args)
+
+        assert result == 1
+        captured = capsys.readouterr()
+        assert "not found" in captured.out
+
+    def test_cleanup_specific_dry_run(self, capsys):
+        """Should show what would be cleaned in dry run."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config = TransferConfig(cache_directory=Path(tmpdir))
+            manager = ChunkedTransferManager(config)
+
+            manifest = manager.create_transfer(
+                snapshot_path="/test/snap",
+                snapshot_name="test-snap",
+                destination="local",
+            )
+            manifest.status = TransferStatus.COMPLETED
+            manifest.save(manager._get_manifest_path(manifest.transfer_id))
+
+            with patch(
+                "btrfs_backup_ng.cli.transfers_cmd.ChunkedTransferManager",
+                return_value=manager,
+            ):
+                args = argparse.Namespace(
+                    transfer_id=manifest.transfer_id,
+                    force=False,
+                    max_age=48,
+                    dry_run=True,
+                )
+                result = _cleanup_transfers(args)
+
+        assert result == 0
+        captured = capsys.readouterr()
+        assert "Would clean up" in captured.out
+
+    def test_cleanup_stale_dry_run(self, capsys):
+        """Should show stale transfers in dry run."""
+        with patch(
+            "btrfs_backup_ng.cli.transfers_cmd.ChunkedTransferManager"
+        ) as MockManager:
+            mock_manager = MagicMock()
+            mock_manager.get_incomplete_transfers.return_value = []
+            MockManager.return_value = mock_manager
+
+            args = argparse.Namespace(
+                transfer_id=None, force=False, max_age=48, dry_run=True
+            )
+            result = _cleanup_transfers(args)
+
+        assert result == 0
+        captured = capsys.readouterr()
+        assert "No stale transfers" in captured.out
+
+    def test_cleanup_no_stale(self, capsys):
+        """Should report no stale transfers."""
+        with patch(
+            "btrfs_backup_ng.cli.transfers_cmd.ChunkedTransferManager"
+        ) as MockManager:
+            mock_manager = MagicMock()
+            mock_manager.cleanup_stale_transfers.return_value = 0
+            MockManager.return_value = mock_manager
+
+            args = argparse.Namespace(
+                transfer_id=None, force=False, max_age=48, dry_run=False
+            )
+            result = _cleanup_transfers(args)
+
+        assert result == 0
+        captured = capsys.readouterr()
+        assert "No stale transfers" in captured.out
+
+
+class TestListOperationsEdgeCases:
+    """Additional tests for _list_operations edge cases."""
+
+    def test_json_output(self, capsys):
+        """Should output JSON when requested."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            op_manager = OperationManager(state_dir=Path(tmpdir))
+            op = op_manager.create_operation(
+                source_volume="/mnt/data",
+                targets=["local:/backups"],
+            )
+            op_manager.update_operation(op)
+
+            with patch(
+                "btrfs_backup_ng.cli.transfers_cmd.OperationManager",
+                return_value=op_manager,
+            ):
+                args = argparse.Namespace(all=False, json=True)
+                result = _list_operations(args)
+
+        assert result == 0
+        captured = capsys.readouterr()
+        data = json.loads(captured.out)
+        assert isinstance(data, list)
+        assert len(data) == 1
 
 
 class TestExecuteTransfers:
