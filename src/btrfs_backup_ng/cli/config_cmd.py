@@ -232,7 +232,7 @@ def _generate_config_from_wizard(config_data: dict[str, Any]) -> str:
             include_types = snapper.get("include_types", ["single"])
             types_str = ", ".join(f'"{t}"' for t in include_types)
             lines.append(f"include_types = [{types_str}]")
-            lines.append(f'min_age = "{snapper.get("min_age", "0")}"')
+            lines.append(f'min_age = "{snapper.get("min_age", "1h")}"')
         else:
             # Native volumes use snapshot_prefix
             lines.append(f'snapshot_prefix = "{volume.get("snapshot_prefix", "")}"')
@@ -1263,7 +1263,7 @@ def _run_detection_wizard(result) -> int:
                 volume["snapper"] = {
                     "config_name": snapper_cfg.name,
                     "include_types": ["single"],  # Default to single, skip pre/post
-                    "min_age": "0",
+                    "min_age": "1h",
                 }
                 console.print(
                     f"  [green]Configured to use snapper config '{snapper_cfg.name}'[/green]"

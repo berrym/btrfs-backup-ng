@@ -173,7 +173,7 @@ def _parse_snapper_source(data: dict[str, Any]) -> SnapperSourceConfig:
         config_name=data.get("config_name", "auto"),
         include_types=data.get("include_types", ["single", "pre", "post"]),
         exclude_cleanup=data.get("exclude_cleanup", []),
-        min_age=data.get("min_age", "0"),
+        min_age=data.get("min_age", "1h"),
     )
 
 

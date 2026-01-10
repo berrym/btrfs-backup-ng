@@ -117,7 +117,7 @@ class SnapperSourceConfig:
     config_name: str = "auto"
     include_types: list[str] = field(default_factory=lambda: ["single", "pre", "post"])
     exclude_cleanup: list[str] = field(default_factory=list)
-    min_age: str = "0"
+    min_age: str = "1h"
 
 
 @dataclass

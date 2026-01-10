@@ -1722,7 +1722,7 @@ def sync_snapper_snapshots(
     # Get filtering options from snapper_config or use defaults
     include_types = ["single", "pre", "post"]
     exclude_cleanup = []
-    min_age = "0"
+    min_age = "1h"
 
     if snapper_config:
         include_types = snapper_config.include_types
