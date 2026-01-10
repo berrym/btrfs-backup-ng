@@ -68,8 +68,8 @@ complete -c btrfs-backup-ng -n __fish_btrfs_backup_ng_no_subcommand -a manpages 
 complete -c btrfs-backup-ng -n __fish_btrfs_backup_ng_no_subcommand -a transfers -d 'Manage chunked and resumable transfers (experimental)'
 complete -c btrfs-backup-ng -n __fish_btrfs_backup_ng_no_subcommand -a snapper -d 'Manage snapper-managed snapshots'
 
-# Compression methods
-set -l compress_methods none zstd gzip lz4 pigz lzop
+# Compression methods (including raw target compression algorithms)
+set -l compress_methods none zstd gzip lz4 pigz lzop xz bzip2 pbzip2 lzo
 
 # Timer presets
 set -l timer_presets hourly daily weekly

@@ -39,7 +39,7 @@ _btrfs-backup-ng() {
     )
 
     local -a compress_methods
-    compress_methods=(none zstd gzip lz4 pigz lzop)
+    compress_methods=(none zstd gzip lz4 pigz lzop xz bzip2 pbzip2 lzo)
 
     local -a timer_presets
     timer_presets=(hourly daily weekly)

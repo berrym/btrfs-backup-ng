@@ -50,8 +50,8 @@ _btrfs_backup_ng() {
     local shell_types="bash zsh fish"
     local fs_checks_modes="auto strict skip"
 
-    # Compression methods
-    local compress_methods="none zstd gzip lz4 pigz lzop"
+    # Compression methods (including raw target compression algorithms)
+    local compress_methods="none zstd gzip lz4 pigz lzop xz bzip2 pbzip2 lzo"
 
     # Timer presets
     local timer_presets="hourly daily weekly"
