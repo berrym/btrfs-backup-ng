@@ -23,10 +23,12 @@ readme = "README.md"
 test = [
     "pytest>=7.0",
     "pytest-cov>=4.0",
+    "pytest-asyncio>=0.23.0",
 ]
 dev = [
     "pytest>=7.0",
     "pytest-cov>=4.0",
+    "pytest-asyncio>=0.23.0",
     "ruff>=0.1.0",
     "mypy>=1.0",
     "types-paramiko>=3.0",
@@ -43,6 +45,7 @@ testpaths = ["tests"]
 python_files = ["test_*.py"]
 python_functions = ["test_*"]
 addopts = "-v --tb=short -m 'not tier2'"
+asyncio_mode = "auto"
 markers = [
     "tier2: Tier 2 integration tests requiring real btrfs and root privileges",
 ]

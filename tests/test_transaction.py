@@ -429,6 +429,14 @@ class TestReadTransactionLog:
         assert records[1]["action"] == "second"
         assert records[2]["action"] == "first"
 
+    def test_read_handles_oserror(self, temp_log_dir):
+        """Test that OSError during read returns empty list."""
+        # Create a directory instead of a file - opening it will raise OSError
+        dir_path = temp_log_dir / "is_a_directory.jsonl"
+        dir_path.mkdir()
+        records = read_transaction_log(dir_path)
+        assert records == []
+
 
 class TestGetTransactionStats:
     """Tests for get_transaction_stats function."""

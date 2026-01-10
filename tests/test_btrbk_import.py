@@ -427,3 +427,83 @@ volume /mnt/pool
         toml_output, warnings = import_btrbk_config(config_path)
 
         assert 'path = "/mnt/backup/home"' in toml_output
+
+    def test_import_timestamp_format_short(self, tmp_path):
+        """Test converting btrbk 'short' timestamp format."""
+        config = """
+timestamp_format short
+volume /mnt/pool
+  subvolume home
+    target /mnt/backup
+"""
+        config_path = tmp_path / "btrbk.conf"
+        config_path.write_text(config)
+
+        toml_output, warnings = import_btrbk_config(config_path)
+
+        # short -> %Y%m%d
+        assert 'timestamp_format = "%Y%m%d"' in toml_output
+
+    def test_import_timestamp_format_long(self, tmp_path):
+        """Test converting btrbk 'long' timestamp format (default)."""
+        config = """
+timestamp_format long
+volume /mnt/pool
+  subvolume home
+    target /mnt/backup
+"""
+        config_path = tmp_path / "btrbk.conf"
+        config_path.write_text(config)
+
+        toml_output, warnings = import_btrbk_config(config_path)
+
+        # long -> %Y%m%dT%H%M
+        assert 'timestamp_format = "%Y%m%dT%H%M"' in toml_output
+
+    def test_import_timestamp_format_long_iso(self, tmp_path):
+        """Test converting btrbk 'long-iso' timestamp format."""
+        config = """
+timestamp_format long-iso
+volume /mnt/pool
+  subvolume home
+    target /mnt/backup
+"""
+        config_path = tmp_path / "btrbk.conf"
+        config_path.write_text(config)
+
+        toml_output, warnings = import_btrbk_config(config_path)
+
+        # long-iso -> %Y%m%dT%H%M%S%z
+        assert 'timestamp_format = "%Y%m%dT%H%M%S%z"' in toml_output
+
+    def test_import_timestamp_format_default(self, tmp_path):
+        """Test default timestamp format when not specified (btrbk >= 0.32 uses long)."""
+        config = """
+volume /mnt/pool
+  subvolume home
+    target /mnt/backup
+"""
+        config_path = tmp_path / "btrbk.conf"
+        config_path.write_text(config)
+
+        toml_output, warnings = import_btrbk_config(config_path)
+
+        # Default is 'long' -> %Y%m%dT%H%M
+        assert 'timestamp_format = "%Y%m%dT%H%M"' in toml_output
+
+    def test_import_timestamp_format_unknown(self, tmp_path):
+        """Test handling of unknown timestamp format."""
+        config = """
+timestamp_format custom_format
+volume /mnt/pool
+  subvolume home
+    target /mnt/backup
+"""
+        config_path = tmp_path / "btrbk.conf"
+        config_path.write_text(config)
+
+        toml_output, warnings = import_btrbk_config(config_path)
+
+        # Should fall back to 'long' and generate warning
+        assert 'timestamp_format = "%Y%m%dT%H%M"' in toml_output
+        assert any("custom_format" in w for w in warnings)

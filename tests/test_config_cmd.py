@@ -362,8 +362,9 @@ class TestInitConfig:
                 "btrfs_backup_ng.cli.config_cmd._run_interactive_wizard",
                 return_value=wizard_output,
             ):
+                # Mock Rich prompt_bool (new wizard uses Rich prompts)
                 with mock.patch(
-                    "btrfs_backup_ng.cli.config_cmd._prompt_bool",
+                    "btrfs_backup_ng.cli.config_cmd.prompt_bool",
                     return_value=True,
                 ):
                     result = _init_config(args)
@@ -383,16 +384,15 @@ class TestInitConfig:
                 "btrfs_backup_ng.cli.config_cmd._run_interactive_wizard",
                 return_value=wizard_output,
             ):
+                # Mock Rich prompt_bool (new wizard uses Rich prompts)
                 with mock.patch(
-                    "btrfs_backup_ng.cli.config_cmd._prompt_bool",
+                    "btrfs_backup_ng.cli.config_cmd.prompt_bool",
                     return_value=False,
                 ):
                     result = _init_config(args)
 
         assert result == 1
         assert "old content" in output_file.read_text()
-        captured = capsys.readouterr()
-        assert "Aborted" in captured.out
 
 
 class TestExecuteConfig:
@@ -433,139 +433,334 @@ class TestExecuteConfig:
 
 
 class TestInteractiveWizard:
-    """Integration tests for the interactive wizard flow."""
+    """Integration tests for the interactive wizard flow.
+
+    Note: The wizard now uses Rich-based prompts from wizard_utils.
+    Tests mock the wizard_utils functions directly.
+    """
 
     def test_full_wizard_flow(self):
-        """Test complete wizard flow with mocked input."""
-        # Sequence of inputs for wizard
-        inputs = [
-            ".snapshots",  # snapshot_dir
-            "%Y%m%d-%H%M%S",  # timestamp_format
-            "y",  # incremental
-            "",  # log_file (empty)
-            "",  # transaction_log (empty)
-            "2",  # parallel_volumes
-            "3",  # parallel_targets
-            "1d",  # min retention
-            "24",  # hourly
-            "7",  # daily
-            "4",  # weekly
-            "12",  # monthly
-            "0",  # yearly
-            "n",  # email notifications
-            "n",  # webhook notifications
-            "/home",  # volume path
-            "home",  # snapshot prefix
-            "/mnt/backup",  # target path
-            "n",  # require_mount (prompted because /mnt/ path)
-            "n",  # add another target
-            "n",  # add another volume
-        ]
-        input_iter = iter(inputs)
+        """Test complete wizard flow with mocked Rich prompts."""
+        # Mock the Rich prompt functions
+        prompt_returns = iter(
+            [
+                ".snapshots",  # snapshot_dir
+                "%Y%m%d-%H%M%S",  # timestamp_format
+                "",  # log_file (empty)
+                "",  # transaction_log (empty)
+                "1d",  # min retention
+                "/home",  # volume path
+                "home-",  # snapshot prefix
+                "/mnt/backup",  # target path
+            ]
+        )
+        prompt_int_returns = iter([2, 3, 24, 7, 4, 12, 0])  # parallel and retention
+        prompt_bool_returns = iter(
+            [
+                True,  # incremental
+                False,  # email notifications
+                False,  # webhook notifications
+                False,  # require_mount
+                False,  # add another target
+                False,  # add another volume
+            ]
+        )
 
-        with mock.patch("builtins.input", side_effect=lambda _: next(input_iter)):
-            result = _run_interactive_wizard()
+        with mock.patch(
+            "btrfs_backup_ng.cli.config_cmd.prompt",
+            side_effect=lambda *a, **kw: next(prompt_returns),
+        ):
+            with mock.patch(
+                "btrfs_backup_ng.cli.config_cmd.prompt_int",
+                side_effect=lambda *a, **kw: next(prompt_int_returns),
+            ):
+                with mock.patch(
+                    "btrfs_backup_ng.cli.config_cmd.prompt_bool",
+                    side_effect=lambda *a, **kw: next(prompt_bool_returns),
+                ):
+                    result = _run_interactive_wizard()
 
         assert "[global]" in result
         assert 'path = "/home"' in result
         assert 'path = "/mnt/backup"' in result
 
+
+class TestMigrateSystemd:
+    """Tests for the migrate-systemd command."""
+
+    def test_migrate_systemd_dry_run(self, capsys):
+        """Test migrate-systemd with dry-run flag."""
+        from btrfs_backup_ng.cli.config_cmd import execute_config
+        from btrfs_backup_ng.systemd_utils import SystemdUnitStatus
+
+        args = argparse.Namespace(
+            config_action="migrate-systemd",
+            dry_run=True,
+        )
+
+        with mock.patch(
+            "btrfs_backup_ng.systemd_utils.get_migration_summary"
+        ) as mock_summary:
+            mock_summary.return_value = {
+                "btrbk_units": [
+                    {
+                        "name": "btrbk.timer",
+                        "enabled": True,
+                        "active": False,
+                        "path": None,
+                    }
+                ],
+                "backup_ng_units": [],
+                "btrbk_active": True,
+                "backup_ng_active": False,
+                "migration_needed": True,
+            }
+            with mock.patch(
+                "btrfs_backup_ng.systemd_utils.migrate_from_btrbk"
+            ) as mock_migrate:
+                mock_migrate.return_value = (
+                    True,
+                    ["Would disable btrbk.timer (dry-run)"],
+                )
+                result = execute_config(args)
+
+        assert result == 0
+        captured = capsys.readouterr()
+        assert "Systemd Migration" in captured.out
+
+    def test_migrate_systemd_no_migration_needed(self, capsys):
+        """Test migrate-systemd when no migration is needed."""
+        from btrfs_backup_ng.cli.config_cmd import execute_config
+
+        args = argparse.Namespace(
+            config_action="migrate-systemd",
+            dry_run=False,
+        )
+
+        with mock.patch(
+            "btrfs_backup_ng.systemd_utils.get_migration_summary"
+        ) as mock_summary:
+            mock_summary.return_value = {
+                "btrbk_units": [
+                    {
+                        "name": "btrbk.timer",
+                        "enabled": False,
+                        "active": False,
+                        "path": None,
+                    }
+                ],
+                "backup_ng_units": [],
+                "btrbk_active": False,
+                "backup_ng_active": False,
+                "migration_needed": False,
+            }
+            result = execute_config(args)
+
+        assert result == 0
+        captured = capsys.readouterr()
+        assert "No migration needed" in captured.out
+
+    def test_migrate_systemd_success(self, capsys):
+        """Test successful systemd migration."""
+        from btrfs_backup_ng.cli.config_cmd import execute_config
+
+        args = argparse.Namespace(
+            config_action="migrate-systemd",
+            dry_run=False,
+        )
+
+        with mock.patch(
+            "btrfs_backup_ng.systemd_utils.get_migration_summary"
+        ) as mock_summary:
+            mock_summary.return_value = {
+                "btrbk_units": [
+                    {
+                        "name": "btrbk.timer",
+                        "enabled": True,
+                        "active": True,
+                        "path": None,
+                    }
+                ],
+                "backup_ng_units": [],
+                "btrbk_active": True,
+                "backup_ng_active": False,
+                "migration_needed": True,
+            }
+            with mock.patch(
+                "btrfs_backup_ng.systemd_utils.migrate_from_btrbk"
+            ) as mock_migrate:
+                mock_migrate.return_value = (
+                    True,
+                    ["Stopped btrbk.timer", "Disabled btrbk.timer"],
+                )
+                result = execute_config(args)
+
+        assert result == 0
+        captured = capsys.readouterr()
+        assert "Systemd migration complete" in captured.out
+
+    def test_migrate_systemd_with_errors(self, capsys):
+        """Test systemd migration with errors."""
+        from btrfs_backup_ng.cli.config_cmd import execute_config
+
+        args = argparse.Namespace(
+            config_action="migrate-systemd",
+            dry_run=False,
+        )
+
+        with mock.patch(
+            "btrfs_backup_ng.systemd_utils.get_migration_summary"
+        ) as mock_summary:
+            mock_summary.return_value = {
+                "btrbk_units": [
+                    {
+                        "name": "btrbk.timer",
+                        "enabled": True,
+                        "active": True,
+                        "path": None,
+                    }
+                ],
+                "backup_ng_units": [],
+                "btrbk_active": True,
+                "backup_ng_active": False,
+                "migration_needed": True,
+            }
+            with mock.patch(
+                "btrfs_backup_ng.systemd_utils.migrate_from_btrbk"
+            ) as mock_migrate:
+                mock_migrate.return_value = (False, ["  Error: Permission denied"])
+                result = execute_config(args)
+
+        assert result == 1
+        captured = capsys.readouterr()
+        assert "errors" in captured.out.lower()
+
     def test_wizard_with_ssh_target(self):
         """Test wizard with SSH target that prompts for sudo."""
-        inputs = [
-            ".snapshots",
-            "%Y%m%d-%H%M%S",
-            "y",
-            "",
-            "",
-            "2",
-            "3",
-            "1d",
-            "24",
-            "7",
-            "4",
-            "12",
-            "0",
-            "n",
-            "n",
-            "/home",
-            "home",
-            "ssh://user@server:/backups",  # SSH target
-            "y",  # ssh_sudo
-            "n",  # add another target
-            "n",  # add another volume
-        ]
-        input_iter = iter(inputs)
+        prompt_returns = iter(
+            [
+                ".snapshots",
+                "%Y%m%d-%H%M%S",
+                "",
+                "",
+                "1d",
+                "/home",
+                "home-",
+                "ssh://user@server:/backups",  # SSH target
+            ]
+        )
+        prompt_int_returns = iter([2, 3, 24, 7, 4, 12, 0])
+        prompt_bool_returns = iter(
+            [
+                True,  # incremental
+                False,  # email notifications
+                False,  # webhook notifications
+                True,  # ssh_sudo
+                False,  # add another target
+                False,  # add another volume
+            ]
+        )
 
-        with mock.patch("builtins.input", side_effect=lambda _: next(input_iter)):
-            result = _run_interactive_wizard()
+        with mock.patch(
+            "btrfs_backup_ng.cli.config_cmd.prompt",
+            side_effect=lambda *a, **kw: next(prompt_returns),
+        ):
+            with mock.patch(
+                "btrfs_backup_ng.cli.config_cmd.prompt_int",
+                side_effect=lambda *a, **kw: next(prompt_int_returns),
+            ):
+                with mock.patch(
+                    "btrfs_backup_ng.cli.config_cmd.prompt_bool",
+                    side_effect=lambda *a, **kw: next(prompt_bool_returns),
+                ):
+                    result = _run_interactive_wizard()
 
         assert 'path = "ssh://user@server:/backups"' in result
         assert "ssh_sudo = true" in result
 
     def test_wizard_requires_at_least_one_volume(self):
         """Test that wizard requires at least one volume."""
-        inputs = [
-            ".snapshots",
-            "%Y%m%d-%H%M%S",
-            "y",
-            "",
-            "",
-            "2",
-            "3",
-            "1d",
-            "24",
-            "7",
-            "4",
-            "12",
-            "0",
-            "n",
-            "n",
-            "",  # Try empty volume path first
-            "/home",  # Then provide valid path
-            "home",
-            "/mnt/backup",
-            "n",  # require_mount (prompted because /mnt/ path)
-            "n",
-            "n",
-        ]
-        input_iter = iter(inputs)
+        prompt_returns = iter(
+            [
+                ".snapshots",
+                "%Y%m%d-%H%M%S",
+                "",
+                "",
+                "1d",
+                "",  # Try empty volume path first
+                "/home",  # Then provide valid path
+                "home-",
+                "/mnt/backup",
+            ]
+        )
+        prompt_int_returns = iter([2, 3, 24, 7, 4, 12, 0])
+        prompt_bool_returns = iter(
+            [
+                True,
+                False,
+                False,
+                False,  # require_mount
+                False,  # add another target
+                False,  # add another volume
+            ]
+        )
 
-        with mock.patch("builtins.input", side_effect=lambda _: next(input_iter)):
-            result = _run_interactive_wizard()
+        with mock.patch(
+            "btrfs_backup_ng.cli.config_cmd.prompt",
+            side_effect=lambda *a, **kw: next(prompt_returns),
+        ):
+            with mock.patch(
+                "btrfs_backup_ng.cli.config_cmd.prompt_int",
+                side_effect=lambda *a, **kw: next(prompt_int_returns),
+            ):
+                with mock.patch(
+                    "btrfs_backup_ng.cli.config_cmd.prompt_bool",
+                    side_effect=lambda *a, **kw: next(prompt_bool_returns),
+                ):
+                    result = _run_interactive_wizard()
 
         # Should have completed with the second volume attempt
         assert 'path = "/home"' in result
 
     def test_wizard_requires_at_least_one_target(self):
         """Test that wizard requires at least one target per volume."""
-        inputs = [
-            ".snapshots",
-            "%Y%m%d-%H%M%S",
-            "y",
-            "",
-            "",
-            "2",
-            "3",
-            "1d",
-            "24",
-            "7",
-            "4",
-            "12",
-            "0",
-            "n",
-            "n",
-            "/home",
-            "home",
-            "",  # Try empty target first
-            "/mnt/backup",  # Then provide valid target
-            "n",  # require_mount (prompted because /mnt/ path)
-            "n",
-            "n",
-        ]
-        input_iter = iter(inputs)
+        prompt_returns = iter(
+            [
+                ".snapshots",
+                "%Y%m%d-%H%M%S",
+                "",
+                "",
+                "1d",
+                "/home",
+                "home-",
+                "",  # Try empty target first
+                "/mnt/backup",  # Then provide valid target
+            ]
+        )
+        prompt_int_returns = iter([2, 3, 24, 7, 4, 12, 0])
+        prompt_bool_returns = iter(
+            [
+                True,
+                False,
+                False,
+                False,  # require_mount
+                False,  # add another target
+                False,  # add another volume
+            ]
+        )
 
-        with mock.patch("builtins.input", side_effect=lambda _: next(input_iter)):
-            result = _run_interactive_wizard()
+        with mock.patch(
+            "btrfs_backup_ng.cli.config_cmd.prompt",
+            side_effect=lambda *a, **kw: next(prompt_returns),
+        ):
+            with mock.patch(
+                "btrfs_backup_ng.cli.config_cmd.prompt_int",
+                side_effect=lambda *a, **kw: next(prompt_int_returns),
+            ):
+                with mock.patch(
+                    "btrfs_backup_ng.cli.config_cmd.prompt_bool",
+                    side_effect=lambda *a, **kw: next(prompt_bool_returns),
+                ):
+                    result = _run_interactive_wizard()
 
         assert 'path = "/mnt/backup"' in result

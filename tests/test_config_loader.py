@@ -271,3 +271,222 @@ path = "/mnt/backup"
 
         config, warnings = load_config(config_path)
         assert config.volumes[0].enabled is False
+
+    def test_warning_for_duplicate_targets(self, tmp_config_dir):
+        """Test warning when volume has duplicate target paths."""
+        config_path = tmp_config_dir / "dup_targets.toml"
+        config_path.write_text("""
+[[volumes]]
+path = "/home"
+
+[[volumes.targets]]
+path = "/mnt/backup"
+
+[[volumes.targets]]
+path = "/mnt/backup"
+""")
+
+        config, warnings = load_config(config_path)
+        assert any("duplicate" in w.lower() for w in warnings)
+
+    def test_warning_for_duplicate_volumes(self, tmp_config_dir):
+        """Test warning when duplicate volume paths exist."""
+        config_path = tmp_config_dir / "dup_volumes.toml"
+        config_path.write_text("""
+[[volumes]]
+path = "/home"
+
+[[volumes.targets]]
+path = "/mnt/backup1"
+
+[[volumes]]
+path = "/home"
+
+[[volumes.targets]]
+path = "/mnt/backup2"
+""")
+
+        config, warnings = load_config(config_path)
+        assert any("duplicate" in w.lower() for w in warnings)
+
+    def test_warning_for_ssh_missing_path_separator(self, tmp_config_dir):
+        """Test warning when SSH URL may be missing path separator."""
+        config_path = tmp_config_dir / "bad_ssh.toml"
+        config_path.write_text("""
+[[volumes]]
+path = "/home"
+
+[[volumes.targets]]
+path = "ssh://user@server"
+""")
+
+        config, warnings = load_config(config_path)
+        assert any("path separator" in w.lower() for w in warnings)
+
+    def test_warning_for_invalid_snapper_type(self, tmp_config_dir):
+        """Test warning when snapper include_types has invalid type."""
+        config_path = tmp_config_dir / "bad_snapper_type.toml"
+        config_path.write_text("""
+[[volumes]]
+path = "/home"
+source = "snapper"
+
+[volumes.snapper]
+config_name = "root"
+include_types = ["invalid_type"]
+
+[[volumes.targets]]
+path = "/mnt/backup"
+""")
+
+        config, warnings = load_config(config_path)
+        assert any("invalid snapper type" in w.lower() for w in warnings)
+
+
+class TestSnapperSourceConfig:
+    """Tests for snapper source configuration."""
+
+    def test_snapper_source_with_config(self, tmp_config_dir):
+        """Test loading snapper source configuration."""
+        config_path = tmp_config_dir / "snapper.toml"
+        config_path.write_text("""
+[[volumes]]
+path = "/"
+source = "snapper"
+
+[volumes.snapper]
+config_name = "root"
+include_types = ["single", "pre"]
+exclude_cleanup = ["number"]
+min_age = "1h"
+
+[[volumes.targets]]
+path = "/mnt/backup"
+""")
+
+        config, warnings = load_config(config_path)
+        volume = config.volumes[0]
+        assert volume.source == "snapper"
+        assert volume.snapper is not None
+        assert volume.snapper.config_name == "root"
+        assert volume.snapper.include_types == ["single", "pre"]
+        assert volume.snapper.exclude_cleanup == ["number"]
+        assert volume.snapper.min_age == "1h"
+
+    def test_snapper_source_auto_creates_config(self, tmp_config_dir):
+        """Test that source=snapper auto-creates snapper config with defaults."""
+        config_path = tmp_config_dir / "snapper_auto.toml"
+        config_path.write_text("""
+[[volumes]]
+path = "/"
+source = "snapper"
+
+[[volumes.targets]]
+path = "/mnt/backup"
+""")
+
+        config, warnings = load_config(config_path)
+        volume = config.volumes[0]
+        assert volume.source == "snapper"
+        assert volume.snapper is not None
+        assert volume.snapper.config_name == "auto"
+
+    def test_invalid_source_type(self, tmp_config_dir):
+        """Test error when source type is invalid."""
+        config_path = tmp_config_dir / "bad_source.toml"
+        config_path.write_text("""
+[[volumes]]
+path = "/home"
+source = "invalid"
+
+[[volumes.targets]]
+path = "/mnt/backup"
+""")
+
+        with pytest.raises(ConfigError, match="source"):
+            load_config(config_path)
+
+
+class TestNotificationConfig:
+    """Tests for notification configuration."""
+
+    def test_email_notification_config(self, tmp_config_dir):
+        """Test loading email notification configuration."""
+        config_path = tmp_config_dir / "email_notify.toml"
+        config_path.write_text("""
+[global]
+
+[global.notifications.email]
+enabled = true
+smtp_host = "smtp.example.com"
+smtp_port = 587
+smtp_user = "user@example.com"
+smtp_password = "secret"
+smtp_tls = "starttls"
+from_addr = "backup@example.com"
+to_addrs = ["admin@example.com", "ops@example.com"]
+on_success = true
+on_failure = true
+""")
+
+        config, warnings = load_config(config_path)
+        email = config.global_config.notifications.email
+        assert email.enabled is True
+        assert email.smtp_host == "smtp.example.com"
+        assert email.smtp_port == 587
+        assert email.smtp_user == "user@example.com"
+        assert email.smtp_password == "secret"
+        assert email.smtp_tls == "starttls"
+        assert email.from_addr == "backup@example.com"
+        assert email.to_addrs == ["admin@example.com", "ops@example.com"]
+        assert email.on_success is True
+        assert email.on_failure is True
+
+    def test_webhook_notification_config(self, tmp_config_dir):
+        """Test loading webhook notification configuration."""
+        config_path = tmp_config_dir / "webhook_notify.toml"
+        config_path.write_text("""
+[global]
+
+[global.notifications.webhook]
+enabled = true
+url = "https://hooks.example.com/webhook"
+method = "POST"
+on_success = false
+on_failure = true
+timeout = 60
+
+[global.notifications.webhook.headers]
+Authorization = "Bearer token123"
+Content-Type = "application/json"
+""")
+
+        config, warnings = load_config(config_path)
+        webhook = config.global_config.notifications.webhook
+        assert webhook.enabled is True
+        assert webhook.url == "https://hooks.example.com/webhook"
+        assert webhook.method == "POST"
+        assert webhook.on_success is False
+        assert webhook.on_failure is True
+        assert webhook.timeout == 60
+        assert webhook.headers["Authorization"] == "Bearer token123"
+        assert webhook.headers["Content-Type"] == "application/json"
+
+
+class TestGenerateExampleConfig:
+    """Tests for example config generation."""
+
+    def test_generate_example_config(self):
+        """Test that generate_example_config returns valid TOML."""
+        import tomllib
+
+        from btrfs_backup_ng.config.loader import generate_example_config
+
+        example = generate_example_config()
+        assert example is not None
+        assert len(example) > 0
+
+        # Should be valid TOML (comments are fine)
+        data = tomllib.loads(example)
+        assert "global" in data
+        assert "volumes" in data

@@ -11,12 +11,32 @@ from ..__logger__ import create_logger
 from ..config import ConfigError, find_config_file, load_config
 from ..config.loader import generate_example_config
 from .common import get_log_level
+from .wizard_utils import (
+    console,
+    display_btrbk_detected,
+    display_btrbk_import,
+    display_config_preview,
+    display_next_steps,
+    display_section_header,
+    display_snapper_configs,
+    display_wizard_header,
+    find_btrbk_config,
+    prompt,
+    prompt_bool,
+    prompt_choice,
+    prompt_int,
+    prompt_selection,
+)
 
 logger = logging.getLogger(__name__)
 
 
 def _prompt(message: str, default: str = "") -> str:
-    """Prompt user for input with optional default value."""
+    """Prompt user for input with optional default value.
+
+    DEPRECATED: Use wizard_utils.prompt() instead.
+    Kept for backwards compatibility during migration.
+    """
     if default:
         prompt_text = f"{message} [{default}]: "
     else:
@@ -236,124 +256,109 @@ def _generate_config_from_wizard(config_data: dict[str, Any]) -> str:
 
 def _run_interactive_wizard() -> str:
     """Run interactive configuration wizard and return TOML content."""
-    print()
-    print("=" * 60)
-    print("  btrfs-backup-ng Configuration Wizard")
-    print("=" * 60)
-    print()
-    print("This wizard will help you create a configuration file.")
-    print("Press Ctrl+C at any time to cancel.")
-    print()
+    display_wizard_header(
+        "btrfs-backup-ng Configuration Wizard",
+        "This wizard will help you create a configuration file.\n"
+        "Press Ctrl+C at any time to cancel.",
+    )
 
     config_data: dict[str, Any] = {}
 
     # Global settings
-    print("-" * 40)
-    print("  Global Settings")
-    print("-" * 40)
+    display_section_header("Global Settings")
 
-    config_data["snapshot_dir"] = _prompt("Snapshot directory name", ".snapshots")
+    config_data["snapshot_dir"] = prompt("Snapshot directory name", ".snapshots")
 
-    config_data["timestamp_format"] = _prompt("Timestamp format", "%Y%m%d-%H%M%S")
+    config_data["timestamp_format"] = prompt("Timestamp format", "%Y%m%d-%H%M%S")
 
-    config_data["incremental"] = _prompt_bool(
+    config_data["incremental"] = prompt_bool(
         "Use incremental transfers by default?", True
     )
 
-    config_data["log_file"] = _prompt("Log file path (leave empty to disable)", "")
+    config_data["log_file"] = prompt("Log file path (leave empty to disable)", "")
 
-    config_data["transaction_log"] = _prompt(
+    config_data["transaction_log"] = prompt(
         "Transaction log path (leave empty to disable)", ""
     )
 
     # Parallelism
-    print()
-    print("-" * 40)
-    print("  Parallelism Settings")
-    print("-" * 40)
+    console.print()
+    display_section_header("Parallelism Settings")
 
-    config_data["parallel_volumes"] = _prompt_int("Max parallel volumes", 2, 1, 16)
+    config_data["parallel_volumes"] = prompt_int("Max parallel volumes", 2, 1, 16)
 
-    config_data["parallel_targets"] = _prompt_int(
+    config_data["parallel_targets"] = prompt_int(
         "Max parallel targets per volume", 3, 1, 16
     )
 
     # Retention policy
-    print()
-    print("-" * 40)
-    print("  Retention Policy")
-    print("-" * 40)
-    print()
-    print("Configure how long to keep snapshots. Set to 0 to disable.")
+    console.print()
+    display_section_header("Retention Policy")
+    console.print()
+    console.print("Configure how long to keep snapshots. Set to 0 to disable.")
 
     retention: dict[str, str | int] = {}
-    retention["min"] = _prompt("Minimum retention period", "1d")
-    retention["hourly"] = _prompt_int("Hourly snapshots to keep", 24, 0, 1000)
-    retention["daily"] = _prompt_int("Daily snapshots to keep", 7, 0, 1000)
-    retention["weekly"] = _prompt_int("Weekly snapshots to keep", 4, 0, 1000)
-    retention["monthly"] = _prompt_int("Monthly snapshots to keep", 12, 0, 1000)
-    retention["yearly"] = _prompt_int("Yearly snapshots to keep", 0, 0, 1000)
+    retention["min"] = prompt("Minimum retention period", "1d")
+    retention["hourly"] = prompt_int("Hourly snapshots to keep", 24, 0, 1000)
+    retention["daily"] = prompt_int("Daily snapshots to keep", 7, 0, 1000)
+    retention["weekly"] = prompt_int("Weekly snapshots to keep", 4, 0, 1000)
+    retention["monthly"] = prompt_int("Monthly snapshots to keep", 12, 0, 1000)
+    retention["yearly"] = prompt_int("Yearly snapshots to keep", 0, 0, 1000)
     config_data["retention"] = retention
 
     # Notifications
-    print()
-    print("-" * 40)
-    print("  Notifications")
-    print("-" * 40)
+    console.print()
+    display_section_header("Notifications")
 
-    if _prompt_bool("Configure email notifications?", False):
+    if prompt_bool("Configure email notifications?", False):
         email: dict[str, Any] = {"enabled": True}
-        email["smtp_host"] = _prompt("SMTP host", "smtp.example.com")
-        email["smtp_port"] = _prompt_int("SMTP port", 587, 1, 65535)
-        email["smtp_tls"] = _prompt_choice(
+        email["smtp_host"] = prompt("SMTP host", "smtp.example.com")
+        email["smtp_port"] = prompt_int("SMTP port", 587, 1, 65535)
+        email["smtp_tls"] = prompt_choice(
             "SMTP security", ["starttls", "ssl", "none"], "starttls"
         )
-        email["smtp_user"] = _prompt("SMTP username (leave empty if none)", "")
+        email["smtp_user"] = prompt("SMTP username (leave empty if none)", "")
         if email["smtp_user"]:
-            email["smtp_password"] = _prompt("SMTP password", "")
-        email["from_addr"] = _prompt("From address", "")
-        to_addrs_str = _prompt("To addresses (comma-separated)", "")
+            email["smtp_password"] = prompt("SMTP password", "")
+        email["from_addr"] = prompt("From address", "")
+        to_addrs_str = prompt("To addresses (comma-separated)", "")
         if to_addrs_str:
             email["to_addrs"] = [
                 a.strip() for a in to_addrs_str.split(",") if a.strip()
             ]
-        email["on_success"] = _prompt_bool("Notify on success?", False)
-        email["on_failure"] = _prompt_bool("Notify on failure?", True)
+        email["on_success"] = prompt_bool("Notify on success?", False)
+        email["on_failure"] = prompt_bool("Notify on failure?", True)
         config_data["email"] = email
 
-    if _prompt_bool("Configure webhook notifications?", False):
+    if prompt_bool("Configure webhook notifications?", False):
         webhook: dict[str, Any] = {"enabled": True}
-        webhook["url"] = _prompt("Webhook URL", "")
-        webhook["method"] = _prompt_choice(
-            "HTTP method", ["POST", "GET", "PUT"], "POST"
-        )
-        webhook["on_success"] = _prompt_bool("Notify on success?", False)
-        webhook["on_failure"] = _prompt_bool("Notify on failure?", True)
+        webhook["url"] = prompt("Webhook URL", "")
+        webhook["method"] = prompt_choice("HTTP method", ["POST", "GET", "PUT"], "POST")
+        webhook["on_success"] = prompt_bool("Notify on success?", False)
+        webhook["on_failure"] = prompt_bool("Notify on failure?", True)
         config_data["webhook"] = webhook
 
     # Volumes
-    print()
-    print("-" * 40)
-    print("  Volumes to Backup")
-    print("-" * 40)
+    console.print()
+    display_section_header("Volumes to Backup")
 
     volumes: list[dict[str, Any]] = []
     add_volume = True
 
     while add_volume:
-        print()
-        print(f"  Volume #{len(volumes) + 1}")
+        console.print()
+        console.print(f"  [bold]Volume #{len(volumes) + 1}[/bold]")
 
-        volume_path = _prompt("Volume path (e.g., /home)", "")
+        volume_path = prompt("Volume path (e.g., /home)", "")
         if not volume_path:
             if not volumes:
-                print("  At least one volume is required.")
+                console.print("  [yellow]At least one volume is required.[/yellow]")
                 continue
             break
 
         # Generate default prefix from path (with trailing dash for readable snapshot names)
         default_prefix = (Path(volume_path).name or "root") + "-"
-        snapshot_prefix = _prompt("Snapshot prefix", default_prefix)
+        snapshot_prefix = prompt("Snapshot prefix", default_prefix)
 
         volume: dict[str, Any] = {
             "path": volume_path,
@@ -362,40 +367,42 @@ def _run_interactive_wizard() -> str:
         }
 
         # Targets for this volume
-        print()
-        print("  Add backup targets for this volume:")
+        console.print()
+        console.print("  [bold]Add backup targets for this volume:[/bold]")
 
         add_target = True
         while add_target:
-            target_path = _prompt("  Target path (local or ssh://user@host:/path)", "")
+            target_path = prompt("  Target path (local or ssh://user@host:/path)", "")
             if not target_path:
                 if not volume["targets"]:
-                    print("  At least one target is required per volume.")
+                    console.print(
+                        "  [yellow]At least one target is required per volume.[/yellow]"
+                    )
                     continue
                 break
 
             target: dict[str, Any] = {"path": target_path}
 
             if target_path.startswith("ssh://"):
-                target["ssh_sudo"] = _prompt_bool("  Use sudo on remote host?", False)
+                target["ssh_sudo"] = prompt_bool("  Use sudo on remote host?", False)
             elif target_path.startswith("/mnt/") or "usb" in target_path.lower():
-                target["require_mount"] = _prompt_bool(
+                target["require_mount"] = prompt_bool(
                     "  Require mount check (for external drives)?", True
                 )
 
             volume["targets"].append(target)
-            add_target = _prompt_bool("  Add another target?", False)
+            console.print(f"  [green]Added target:[/green] {target_path}")
+            add_target = prompt_bool("  Add another target?", False)
 
         volumes.append(volume)
-        add_volume = _prompt_bool("Add another volume?", False)
+        console.print(f"  [green]Added volume:[/green] {volume_path}")
+        add_volume = prompt_bool("Add another volume?", False)
 
     config_data["volumes"] = volumes
 
     # Generate the config
-    print()
-    print("-" * 40)
-    print("  Configuration Complete")
-    print("-" * 40)
+    console.print()
+    display_section_header("Configuration Complete")
 
     return _generate_config_from_wizard(config_data)
 
@@ -422,8 +429,13 @@ def execute_config(args: argparse.Namespace) -> int:
         return _import_config(args)
     elif action == "detect":
         return _detect_subvolumes(args)
+    elif action == "migrate-systemd":
+        return _migrate_systemd(args)
     else:
-        print("Usage: btrfs-backup-ng config <validate|init|import|detect>")
+        print(
+            "Usage: btrfs-backup-ng config "
+            "<validate|init|import|detect|migrate-systemd>"
+        )
         return 1
 
 
@@ -484,8 +496,8 @@ def _init_config(args: argparse.Namespace) -> int:
     if output:
         # Check if file exists
         if os.path.exists(output) and interactive:
-            if not _prompt_bool(f"\nFile {output} exists. Overwrite?", False):
-                print("Aborted.")
+            if not prompt_bool(f"\nFile {output} exists. Overwrite?", False):
+                console.print("[yellow]Aborted.[/yellow]")
                 return 1
 
         try:
@@ -494,55 +506,68 @@ def _init_config(args: argparse.Namespace) -> int:
             with open(output, "w") as f:
                 f.write(content)
             if interactive:
-                print(f"\nConfiguration written to: {output}")
-                print("Review and adjust the configuration, then run:")
-                print(f"  btrfs-backup-ng config validate --config {output}")
+                console.print()
+                console.print(f"[green]Configuration written to:[/green] {output}")
+                console.print()
+                display_next_steps(
+                    [
+                        f"Review: btrfs-backup-ng config validate --config {output}",
+                    ]
+                )
             else:
                 print(f"Example configuration written to: {output}")
         except OSError as e:
-            print(f"Error writing file: {e}")
+            console.print(f"[red]Error writing file:[/red] {e}")
             return 1
     elif interactive:
         # Interactive mode without explicit output - offer to save
         default_path = str(Path.home() / ".config/btrfs-backup-ng/config.toml")
-        print()
-        save_choice = _prompt_choice(
+
+        # Show config preview
+        console.print()
+        display_config_preview(content)
+        console.print()
+
+        save_choice = prompt_choice(
             "What would you like to do with this configuration?",
             ["save", "print", "cancel"],
             "save",
         )
 
         if save_choice == "cancel":
-            print("Configuration cancelled.")
+            console.print("[yellow]Configuration cancelled.[/yellow]")
             return 0
 
         if save_choice == "print":
-            print()
-            print(content)
+            console.print()
+            console.print(content)
             return 0
 
         # Save to file
-        save_path = _prompt("Save configuration to", default_path)
+        save_path = prompt("Save configuration to", default_path)
         save_file = Path(save_path)
 
         try:
             save_file.parent.mkdir(parents=True, exist_ok=True)
 
             if save_file.exists():
-                if not _prompt_bool(f"File {save_path} exists. Overwrite?", False):
-                    print("Aborted.")
+                if not prompt_bool(f"File {save_path} exists. Overwrite?", False):
+                    console.print("[yellow]Aborted.[/yellow]")
                     return 1
 
             save_file.write_text(content)
-            print()
-            print(f"Configuration saved to: {save_path}")
-            print()
-            print("Next steps:")
-            print(f"  1. Review:  btrfs-backup-ng config validate -c {save_path}")
-            print(f"  2. Test:    sudo btrfs-backup-ng run --dry-run -c {save_path}")
-            print(f"  3. Install: sudo btrfs-backup-ng install -c {save_path}")
+            console.print()
+            console.print(f"[green]Configuration saved to:[/green] {save_path}")
+            console.print()
+            display_next_steps(
+                [
+                    f"Review:  btrfs-backup-ng config validate -c {save_path}",
+                    f"Test:    sudo btrfs-backup-ng run --dry-run -c {save_path}",
+                    f"Install: sudo btrfs-backup-ng install -c {save_path}",
+                ]
+            )
         except OSError as e:
-            print(f"Error saving configuration: {e}")
+            console.print(f"[red]Error saving configuration:[/red] {e}")
             return 1
     else:
         print(content)
@@ -630,25 +655,28 @@ def _detect_subvolumes(args: argparse.Namespace) -> int:
             # In JSON mode, just do partial detection
             result = detect_subvolumes(allow_partial=True)
         else:
-            print("For complete subvolume detection, root privileges are required.")
-            print()
-            print("  Run: sudo btrfs-backup-ng config detect")
-            print()
+            console.print(
+                "[yellow]For complete subvolume detection, "
+                "root privileges are required.[/yellow]"
+            )
+            console.print()
+            console.print("  Run: [cyan]sudo btrfs-backup-ng config detect[/cyan]")
+            console.print()
 
             if sys.stdin.isatty():
                 try:
-                    if _prompt_bool("Continue with limited detection?", False):
+                    if prompt_bool("Continue with limited detection?", False):
                         result = detect_subvolumes(allow_partial=True)
                     else:
                         return 1
                 except KeyboardInterrupt:
-                    print("\nCancelled.")
+                    console.print("\n[yellow]Cancelled.[/yellow]")
                     return 1
             else:
                 # Non-interactive, just fail
                 return 1
     except DetectionError as e:
-        print(f"Detection error: {e}")
+        console.print(f"[red]Detection error:[/red] {e}")
         return 1
 
     # Handle no btrfs filesystems
@@ -673,11 +701,102 @@ def _detect_subvolumes(args: argparse.Namespace) -> int:
         if not sys.stdin.isatty():
             print("Error: Wizard mode requires a terminal (TTY)")
             return 1
-        return _run_detection_wizard(result)
+        try:
+            return _run_detection_wizard(result)
+        except KeyboardInterrupt:
+            console.print("\n[yellow]Configuration cancelled.[/yellow]")
+            return 1
 
     # Default: Display detection results
     _display_detection_results(result)
     return 0
+
+
+def _migrate_systemd(args: argparse.Namespace) -> int:
+    """Migrate systemd integration from btrbk to btrfs-backup-ng.
+
+    Args:
+        args: Parsed command line arguments with:
+            - dry_run: If True, only show what would be done
+
+    Returns:
+        Exit code (0 for success, 1 for error)
+    """
+    from ..systemd_utils import get_migration_summary, migrate_from_btrbk
+
+    dry_run = getattr(args, "dry_run", False)
+
+    console.print()
+    display_section_header("Systemd Migration")
+
+    summary = get_migration_summary()
+
+    # Show current state
+    if summary["btrbk_units"]:
+        console.print("btrbk systemd units:")
+        for unit in summary["btrbk_units"]:
+            status = []
+            if unit["enabled"]:
+                status.append("enabled")
+            if unit["active"]:
+                status.append("active")
+            status_str = f" ({', '.join(status)})" if status else " (inactive)"
+            console.print(f"  [cyan]{unit['name']}[/cyan]{status_str}")
+    else:
+        console.print("[dim]No btrbk systemd units found.[/dim]")
+
+    console.print()
+
+    if summary["backup_ng_units"]:
+        console.print("btrfs-backup-ng systemd units:")
+        for unit in summary["backup_ng_units"]:
+            status = []
+            if unit["enabled"]:
+                status.append("enabled")
+            if unit["active"]:
+                status.append("active")
+            status_str = f" ({', '.join(status)})" if status else " (inactive)"
+            console.print(f"  [cyan]{unit['name']}[/cyan]{status_str}")
+    else:
+        console.print("[dim]No btrfs-backup-ng systemd units found.[/dim]")
+        console.print("[dim]Install with: btrfs-backup-ng systemd install[/dim]")
+
+    console.print()
+
+    if not summary["migration_needed"]:
+        console.print("[green]No migration needed.[/green]")
+        console.print("btrbk systemd units are not active.")
+        return 0
+
+    if dry_run:
+        console.print("[yellow]Dry run mode - no changes will be made.[/yellow]")
+        console.print()
+
+    success, messages = migrate_from_btrbk(dry_run=dry_run)
+
+    for msg in messages:
+        if msg.startswith("  Error"):
+            console.print(f"[red]{msg}[/red]")
+        elif msg.startswith("  "):
+            console.print(f"[green]{msg}[/green]")
+        else:
+            console.print(msg)
+
+    console.print()
+
+    if dry_run:
+        console.print("[dim]Run without --dry-run to apply changes.[/dim]")
+        return 0
+
+    if success:
+        console.print("[green]Systemd migration complete![/green]")
+        return 0
+    else:
+        console.print(
+            "[yellow]Migration completed with errors. "
+            "Check the messages above.[/yellow]"
+        )
+        return 1
 
 
 def _display_detection_results(result) -> None:
@@ -767,6 +886,191 @@ def _display_detection_results(result) -> None:
     print()
 
 
+def _save_wizard_config(content: str) -> int:
+    """Save wizard-generated configuration to file.
+
+    Args:
+        content: TOML configuration content
+
+    Returns:
+        Exit code
+    """
+    default_path = str(Path.home() / ".config/btrfs-backup-ng/config.toml")
+
+    # Show config preview
+    console.print()
+    display_config_preview(content)
+    console.print()
+
+    save_choice = prompt_choice(
+        "What would you like to do with this configuration?",
+        ["save", "print", "cancel"],
+        "save",
+    )
+
+    if save_choice == "cancel":
+        console.print("[yellow]Configuration cancelled.[/yellow]")
+        return 0
+
+    if save_choice == "print":
+        console.print()
+        console.print(content)
+        return 0
+
+    # Save to file
+    save_path = prompt("Save configuration to", default_path)
+    save_file = Path(save_path)
+
+    try:
+        save_file.parent.mkdir(parents=True, exist_ok=True)
+
+        if save_file.exists():
+            if not prompt_bool(f"File {save_path} exists. Overwrite?", False):
+                console.print("[yellow]Aborted.[/yellow]")
+                return 0
+
+        save_file.write_text(content)
+        console.print()
+        console.print(f"[green]Configuration saved to:[/green] {save_path}")
+        console.print()
+        display_next_steps(
+            [
+                f"Review:  btrfs-backup-ng config validate -c {save_path}",
+                f"Test:    sudo btrfs-backup-ng run --dry-run -c {save_path}",
+                f"Install: sudo btrfs-backup-ng install -c {save_path}",
+            ]
+        )
+    except OSError as e:
+        console.print(f"[red]Error saving configuration:[/red] {e}")
+        return 1
+
+    return 0
+
+
+def _run_btrbk_import_wizard(btrbk_path: Path) -> int:
+    """Run wizard to import and review btrbk configuration.
+
+    Args:
+        btrbk_path: Path to btrbk configuration file
+
+    Returns:
+        Exit code
+    """
+    from ..btrbk_import import import_btrbk_config
+
+    display_wizard_header(
+        "btrbk Configuration Import",
+        f"Importing from: {btrbk_path}\n"
+        "Review and customize the imported configuration.",
+    )
+
+    try:
+        toml_content, warnings = import_btrbk_config(str(btrbk_path))
+    except FileNotFoundError as e:
+        console.print(f"[red]Error:[/red] {e}")
+        return 1
+    except Exception as e:
+        console.print(f"[red]Error parsing btrbk config:[/red] {e}")
+        return 1
+
+    # Parse the imported config to display in table format
+    try:
+        import tomllib
+
+        parsed = tomllib.loads(toml_content)
+        volumes = parsed.get("volumes", [])
+
+        # Display imported volumes
+        display_btrbk_import(volumes, warnings)
+    except Exception:
+        # If parsing fails, just show raw content
+        if warnings:
+            console.print("[yellow]Import warnings:[/yellow]")
+            for w in warnings:
+                console.print(f"  [yellow]![/yellow] {w}")
+            console.print()
+
+    # Ask if user wants to edit
+    console.print()
+    if prompt_bool("Would you like to review/edit before saving?", True):
+        console.print()
+        console.print("[dim]The configuration will be shown in preview.[/dim]")
+        console.print("[dim]After saving, you can edit the file directly.[/dim]")
+        console.print()
+
+    # Save the config first
+    result = _save_wizard_config(toml_content)
+
+    if result != 0:
+        return result
+
+    # Offer systemd migration
+    console.print()
+    _offer_systemd_migration()
+
+    return 0
+
+
+def _offer_systemd_migration() -> None:
+    """Offer to migrate systemd integration from btrbk to btrfs-backup-ng."""
+    try:
+        from ..systemd_utils import get_migration_summary, migrate_from_btrbk
+    except ImportError:
+        return
+
+    summary = get_migration_summary()
+
+    if not summary["btrbk_active"]:
+        return
+
+    console.print()
+    display_section_header("Systemd Migration")
+
+    console.print("Active btrbk systemd units detected:")
+    for unit in summary["btrbk_units"]:
+        if unit["enabled"] or unit["active"]:
+            status = []
+            if unit["enabled"]:
+                status.append("enabled")
+            if unit["active"]:
+                status.append("active")
+            console.print(f"  [cyan]{unit['name']}[/cyan] ({', '.join(status)})")
+
+    console.print()
+    console.print(
+        "To complete the migration, btrbk's systemd timer should be disabled\n"
+        "to prevent both tools from running backups simultaneously."
+    )
+    console.print()
+
+    if prompt_bool("Disable btrbk systemd timer and enable btrfs-backup-ng?", True):
+        console.print()
+        success, messages = migrate_from_btrbk(dry_run=False)
+        for msg in messages:
+            if msg.startswith("  Error"):
+                console.print(f"[red]{msg}[/red]")
+            elif msg.startswith("  "):
+                console.print(f"[green]{msg}[/green]")
+            else:
+                console.print(msg)
+
+        if success:
+            console.print()
+            console.print("[green]Systemd migration complete![/green]")
+        else:
+            console.print()
+            console.print(
+                "[yellow]Some errors occurred. You may need to manually "
+                "disable btrbk timer.[/yellow]"
+            )
+            console.print("  Run: sudo systemctl disable --now btrbk.timer")
+    else:
+        console.print()
+        console.print("[dim]Skipping systemd migration.[/dim]")
+        console.print("[dim]You can migrate later with:[/dim]")
+        console.print("  btrfs-backup-ng config migrate-systemd")
+
+
 def _run_detection_wizard(result) -> int:
     """Run interactive wizard with pre-populated detection results.
 
@@ -776,8 +1080,26 @@ def _run_detection_wizard(result) -> int:
     Returns:
         Exit code
     """
+    # Check for btrbk config first - offer migration
+    btrbk_path = find_btrbk_config()
+    if btrbk_path:
+        choice = display_btrbk_detected(btrbk_path)
+
+        if choice == "import":
+            # Run btrbk import wizard
+            return _run_btrbk_import_wizard(btrbk_path)
+        elif choice == "manual":
+            # Fall through to manual interactive wizard
+            console.print()
+            console.print("[dim]Switching to manual configuration...[/dim]")
+            console.print()
+            content = _run_interactive_wizard()
+            return _save_wizard_config(content)
+        # else: "detect" - continue with auto-detection below
+
     # Try to detect snapper configurations
     snapper_configs = []
+    snapper_path_map: dict = {}
     try:
         from ..snapper import SnapperScanner
         from ..snapper.scanner import SnapperNotFoundError
@@ -790,107 +1112,111 @@ def _run_detection_wizard(result) -> int:
     except ImportError:
         pass  # Snapper module not available
 
-    print()
-    print("=" * 60)
-    print("  Detection-based Configuration Wizard")
-    print("=" * 60)
-    print()
-    print("This wizard will help you create a backup configuration")
-    print("based on detected btrfs subvolumes.")
-    print("Press Ctrl+C at any time to cancel.")
-    print()
+    # If we have snapper configs, use them to improve classification
+    if snapper_configs:
+        from ..detection import reclassify_with_snapper
+
+        snapper_path_map = reclassify_with_snapper(result, snapper_configs)
+
+    display_wizard_header(
+        "Detection-based Configuration Wizard",
+        "Create a backup configuration based on detected btrfs subvolumes.\n"
+        "Press Ctrl+C at any time to cancel.",
+    )
 
     if result.is_partial:
-        print(f"Note: {result.error_message}")
-        print("Results may be incomplete.")
-        print()
+        console.print(f"[yellow]Note:[/yellow] {result.error_message}")
+        console.print("[yellow]Results may be incomplete.[/yellow]")
+        console.print()
 
     # Show snapper detection results
     if snapper_configs:
-        print("-" * 40)
-        print("  Detected Snapper Configurations")
-        print("-" * 40)
-        print()
-        for cfg in snapper_configs:
-            print(f"  - {cfg.name}: {cfg.subvolume}")
-        print()
-        print("  Snapper volumes will be offered for backup below.")
-        print()
-
-    # Build a mapping of paths to snapper configs for easy lookup
-    snapper_path_map = {}
-    for cfg in snapper_configs:
-        snapper_path_map[str(cfg.subvolume)] = cfg
-
-    # Step 1: Select volumes to back up
-    print("-" * 40)
-    print("  Detected Subvolumes")
-    print("-" * 40)
-    print()
+        display_snapper_configs(snapper_configs)
+        console.print("  Snapper volumes will be offered for backup below.")
+        console.print()
 
     # Build list of selectable volumes (exclude snapshots and internal)
     selectable = []
     for suggestion in result.suggestions:
         sv = suggestion.subvolume
         # Check if this volume is managed by snapper
+        # Try display_path first, then mount_point as fallback
         snapper_cfg = snapper_path_map.get(sv.display_path)
+        if snapper_cfg is None and sv.mount_point:
+            snapper_cfg = snapper_path_map.get(sv.mount_point)
         selectable.append((suggestion, sv, snapper_cfg))
 
     if not selectable:
-        print("No subvolumes suitable for backup were detected.")
-        print("You may need to run with sudo for complete detection.")
+        console.print("[red]No subvolumes suitable for backup were detected.[/red]")
+        console.print("You may need to run with sudo for complete detection.")
         return 1
 
-    # Display with numbers
-    print("  Recommended for backup:")
+    # Build items for table selection
+    table_items = []
     recommended_indices = []
-    for i, (suggestion, sv, snapper_cfg) in enumerate(selectable, 1):
-        marker = "*" if suggestion.is_recommended else " "
+    for i, (suggestion, sv, snapper_cfg) in enumerate(selectable):
         classification = sv.classification.value.replace("_", " ")
-        snapper_marker = f" [snapper:{snapper_cfg.name}]" if snapper_cfg else ""
-        print(f"  [{i}]{marker} {sv.display_path} ({classification}){snapper_marker}")
+
+        # Build snapper column with indicator for virtual subvolumes
+        # (id=0 means detected via snapper, not directly from btrfs)
+        if snapper_cfg:
+            if sv.id == 0:
+                # Virtual subvolume detected via snapper config
+                snapper_name = f"{snapper_cfg.name} (rollback)"
+            else:
+                snapper_name = snapper_cfg.name
+        else:
+            snapper_name = ""
+
+        table_items.append(
+            {
+                "path": sv.display_path,
+                "type": classification,
+                "snapper": snapper_name,
+            }
+        )
         if suggestion.is_recommended:
-            recommended_indices.append(str(i))
+            recommended_indices.append(i)
 
-    print()
-    print("  * = recommended")
-    if snapper_configs:
-        print("  [snapper:name] = managed by snapper")
-    print()
+    # Check if any subvolumes are in rollback mode (virtual, id=0)
+    has_rollback_volumes = any(sv.id == 0 for _, sv, _ in selectable)
 
-    # Let user select
-    default_selection = ",".join(recommended_indices) if recommended_indices else "1"
-    selection_str = _prompt(
-        "Select volumes to back up (comma-separated numbers, or 'all')",
-        default_selection,
+    # Build footer notes
+    footer_notes = []
+    if has_rollback_volumes:
+        footer_notes.append(
+            "[dim](rollback)[/dim] = detected via snapper (system booted from snapshot)"
+        )
+
+    # Use Rich table selection
+    selected_indices = prompt_selection(
+        title="Detected Subvolumes",
+        items=table_items,
+        columns=[
+            ("path", "Path"),
+            ("type", "Type"),
+            ("snapper", "Snapper Config"),
+        ],
+        default_indices=recommended_indices,
+        recommended_indices=recommended_indices,
+        footer_notes=footer_notes if footer_notes else None,
     )
 
-    # Parse selection - now returns tuples of (suggestion, snapper_cfg)
+    # Build selected volumes list
     selected_volumes = []
-    if selection_str.lower() == "all":
-        selected_volumes = [(s, cfg) for s, _, cfg in selectable]
-    else:
-        try:
-            indices = [int(x.strip()) for x in selection_str.split(",") if x.strip()]
-            for idx in indices:
-                if 1 <= idx <= len(selectable):
-                    suggestion, _, snapper_cfg = selectable[idx - 1]
-                    selected_volumes.append((suggestion, snapper_cfg))
-                else:
-                    print(f"  Warning: {idx} is not a valid selection, skipping")
-        except ValueError:
-            print("Invalid selection. Using recommended volumes.")
-            selected_volumes = [
-                (s, cfg) for s, _, cfg in selectable if s.is_recommended
-            ]
+    for idx in selected_indices:
+        suggestion, _, snapper_cfg = selectable[idx]
+        selected_volumes.append((suggestion, snapper_cfg))
 
     if not selected_volumes:
-        print("No volumes selected. Exiting.")
+        console.print("[yellow]No volumes selected. Exiting.[/yellow]")
         return 1
 
-    print()
-    print(f"Selected {len(selected_volumes)} volume(s) for backup.")
-    print()
+    console.print()
+    console.print(
+        f"[green]Selected {len(selected_volumes)} volume(s) for backup.[/green]"
+    )
+    console.print()
 
     # Step 2: Configure each volume
     config_data: dict[str, Any] = {
@@ -914,12 +1240,12 @@ def _run_detection_wizard(result) -> int:
 
     for suggestion, snapper_cfg in selected_volumes:
         sv = suggestion.subvolume
-        print("-" * 40)
         if snapper_cfg:
-            print(f"  Volume: {sv.display_path} (snapper: {snapper_cfg.name})")
+            display_section_header(
+                f"Volume: {sv.display_path} (snapper: {snapper_cfg.name})"
+            )
         else:
-            print(f"  Volume: {sv.display_path}")
-        print("-" * 40)
+            display_section_header(f"Volume: {sv.display_path}")
 
         volume: dict[str, Any] = {
             "path": sv.display_path,
@@ -929,9 +1255,8 @@ def _run_detection_wizard(result) -> int:
         # Configure based on whether this is a snapper volume
         if snapper_cfg:
             # Snapper-sourced volume
-            print()
-            print("  This volume is managed by snapper.")
-            use_snapper = _prompt_bool("  Use snapper as snapshot source?", True)
+            console.print("  This volume is managed by snapper.")
+            use_snapper = prompt_bool("  Use snapper as snapshot source?", True)
 
             if use_snapper:
                 volume["source"] = "snapper"
@@ -940,91 +1265,94 @@ def _run_detection_wizard(result) -> int:
                     "include_types": ["single"],  # Default to single, skip pre/post
                     "min_age": "0",
                 }
-                print(f"  Configured to use snapper config '{snapper_cfg.name}'")
+                console.print(
+                    f"  [green]Configured to use snapper config '{snapper_cfg.name}'[/green]"
+                )
             else:
                 # User wants native management instead
-                volume["snapshot_prefix"] = _prompt(
+                volume["snapshot_prefix"] = prompt(
                     "Snapshot prefix", suggestion.suggested_prefix
                 )
         else:
             # Native volume
-            volume["snapshot_prefix"] = _prompt(
+            volume["snapshot_prefix"] = prompt(
                 "Snapshot prefix", suggestion.suggested_prefix
             )
 
         # Add targets
-        print()
-        print("  Add backup target(s) for this volume:")
+        console.print()
+        console.print("  [bold]Add backup target(s) for this volume:[/bold]")
         add_target = True
         while add_target:
-            target_path = _prompt(
+            target_path = prompt(
                 "  Target path (local path or ssh://user@host:/path)", ""
             )
             if not target_path:
                 if not volume["targets"]:
-                    print("  At least one target is required per volume.")
+                    console.print(
+                        "  [yellow]At least one target is required per volume.[/yellow]"
+                    )
                     continue
                 break
 
             target: dict[str, Any] = {"path": target_path}
 
             if target_path.startswith("ssh://"):
-                target["ssh_sudo"] = _prompt_bool("  Use sudo on remote host?", False)
+                target["ssh_sudo"] = prompt_bool("  Use sudo on remote host?", False)
             elif target_path.startswith("/mnt/") or "usb" in target_path.lower():
-                target["require_mount"] = _prompt_bool(
+                target["require_mount"] = prompt_bool(
                     "  Require mount check (for external drives)?", True
                 )
 
             volume["targets"].append(target)
-            print(f"  Added target: {target_path}")
-            add_target = _prompt_bool("  Add another target?", False)
+            console.print(f"  [green]Added target:[/green] {target_path}")
+            add_target = prompt_bool("  Add another target?", False)
 
         config_data["volumes"].append(volume)
-        print()
+        console.print()
 
     # Step 3: Global settings (optional)
-    print("-" * 40)
-    print("  Global Settings")
-    print("-" * 40)
-    print()
+    display_section_header("Global Settings")
 
-    if _prompt_bool("Configure global settings (retention, notifications)?", False):
+    if prompt_bool("Configure global settings (retention, notifications)?", False):
         # Retention
-        print()
-        print("  Retention Policy:")
+        console.print()
+        console.print("  [bold]Retention Policy:[/bold]")
         retention = config_data["retention"]
-        retention["min"] = _prompt("  Minimum retention period", "1d")
-        retention["hourly"] = _prompt_int("  Hourly snapshots to keep", 24, 0, 1000)
-        retention["daily"] = _prompt_int("  Daily snapshots to keep", 7, 0, 1000)
-        retention["weekly"] = _prompt_int("  Weekly snapshots to keep", 4, 0, 1000)
-        retention["monthly"] = _prompt_int("  Monthly snapshots to keep", 12, 0, 1000)
-        retention["yearly"] = _prompt_int("  Yearly snapshots to keep", 0, 0, 1000)
+        retention["min"] = prompt("  Minimum retention period", "1d")
+        retention["hourly"] = prompt_int("  Hourly snapshots to keep", 24, 0, 1000)
+        retention["daily"] = prompt_int("  Daily snapshots to keep", 7, 0, 1000)
+        retention["weekly"] = prompt_int("  Weekly snapshots to keep", 4, 0, 1000)
+        retention["monthly"] = prompt_int("  Monthly snapshots to keep", 12, 0, 1000)
+        retention["yearly"] = prompt_int("  Yearly snapshots to keep", 0, 0, 1000)
 
         # Email notifications
-        print()
-        if _prompt_bool("  Configure email notifications?", False):
+        console.print()
+        if prompt_bool("  Configure email notifications?", False):
             email: dict[str, Any] = {"enabled": True}
-            email["smtp_host"] = _prompt("  SMTP host", "smtp.example.com")
-            email["smtp_port"] = _prompt_int("  SMTP port", 587, 1, 65535)
-            email["smtp_tls"] = _prompt_choice(
+            email["smtp_host"] = prompt("  SMTP host", "smtp.example.com")
+            email["smtp_port"] = prompt_int("  SMTP port", 587, 1, 65535)
+            email["smtp_tls"] = prompt_choice(
                 "  SMTP security", ["starttls", "ssl", "none"], "starttls"
             )
-            email["smtp_user"] = _prompt("  SMTP username (leave empty if none)", "")
+            email["smtp_user"] = prompt("  SMTP username (leave empty if none)", "")
             if email["smtp_user"]:
-                email["smtp_password"] = _prompt("  SMTP password", "")
-            email["from_addr"] = _prompt("  From address", "")
-            to_addrs_str = _prompt("  To addresses (comma-separated)", "")
+                email["smtp_password"] = prompt("  SMTP password", "")
+            email["from_addr"] = prompt("  From address", "")
+            to_addrs_str = prompt("  To addresses (comma-separated)", "")
             if to_addrs_str:
                 email["to_addrs"] = [
                     a.strip() for a in to_addrs_str.split(",") if a.strip()
                 ]
-            email["on_success"] = _prompt_bool("  Notify on success?", False)
-            email["on_failure"] = _prompt_bool("  Notify on failure?", True)
+            email["on_success"] = prompt_bool("  Notify on success?", False)
+            email["on_failure"] = prompt_bool("  Notify on failure?", True)
             config_data["email"] = email
     else:
-        print("  Using default settings (can be changed later in config file).")
+        console.print(
+            "  [dim]Using default settings (can be changed later in config file).[/dim]"
+        )
 
-    print()
+    console.print()
 
     # Step 4: Generate config
     new_config = _generate_config_from_wizard(config_data)
@@ -1040,66 +1368,60 @@ def _run_detection_wizard(result) -> int:
             existing_content = None
 
     if existing_content:
-        print("-" * 40)
-        print("  Existing Configuration Found")
-        print("-" * 40)
-        print()
-        print(f"  Found: {existing_config_path}")
-        print()
+        display_section_header("Existing Configuration Found")
+        console.print(f"  Found: [cyan]{existing_config_path}[/cyan]")
+        console.print()
 
         # Offer diff view
-        view_diff = _prompt_bool("View changes compared to existing config?", True)
+        view_diff = prompt_bool("View changes compared to existing config?", True)
         if view_diff:
-            diff_format = _prompt_choice(
+            diff_format = prompt_choice(
                 "Diff format",
                 ["summary", "text"],
                 "summary",
             )
-            print()
+            console.print()
             if diff_format == "summary":
                 _show_config_diff_summary(existing_content, new_config, config_data)
             else:
                 _show_config_diff_text(existing_content, new_config)
-            print()
+            console.print()
 
     # Step 6: Save options
-    print("-" * 40)
-    print("  Save Configuration")
-    print("-" * 40)
-    print()
+    display_section_header("Save Configuration")
 
-    save_choice = _prompt_choice(
+    # Show config preview
+    display_config_preview(new_config)
+    console.print()
+
+    save_choice = prompt_choice(
         "What would you like to do?",
         ["save", "print", "cancel"],
         "save",
     )
 
     if save_choice == "cancel":
-        print()
-        print("Configuration cancelled.")
+        console.print()
+        console.print("[yellow]Configuration cancelled.[/yellow]")
         return 0
 
     if save_choice == "print":
-        print()
-        print("-" * 40)
-        print("  Generated Configuration")
-        print("-" * 40)
-        print()
-        print(new_config)
+        console.print()
+        console.print(new_config)
         return 0
 
     # Save to file
     if existing_config_path:
         default_path = str(existing_config_path)
-        print()
-        print(f"  Existing config: {existing_config_path}")
-        save_path = _prompt(
+        console.print()
+        console.print(f"  Existing config: [cyan]{existing_config_path}[/cyan]")
+        save_path = prompt(
             "Save to (enter new path to keep existing, or same to overwrite)",
             default_path,
         )
     else:
         default_path = str(Path.home() / ".config/btrfs-backup-ng/config.toml")
-        save_path = _prompt("Save configuration to", default_path)
+        save_path = prompt("Save configuration to", default_path)
 
     # Create directory if needed
     save_file = Path(save_path)
@@ -1108,21 +1430,25 @@ def _run_detection_wizard(result) -> int:
 
         # Check for overwrite
         if save_file.exists():
-            if not _prompt_bool(f"Overwrite {save_path}?", False):
-                print("Save cancelled.")
+            if not prompt_bool(f"Overwrite {save_path}?", False):
+                console.print("[yellow]Save cancelled.[/yellow]")
                 return 0
 
         save_file.write_text(new_config)
-        print()
-        print(f"Configuration saved to: {save_path}")
-        print()
-        print("Next steps:")
-        print(f"  1. Review: btrfs-backup-ng config validate -c {save_path}")
-        print(f"  2. Test:   btrfs-backup-ng run --dry-run -c {save_path}")
-        print(f"  3. Install timer: btrfs-backup-ng install -c {save_path}")
+        console.print()
+        console.print(f"[green]Configuration saved to:[/green] {save_path}")
+        console.print()
+
+        display_next_steps(
+            [
+                f"Review: btrfs-backup-ng config validate -c {save_path}",
+                f"Test:   btrfs-backup-ng run --dry-run -c {save_path}",
+                f"Install timer: btrfs-backup-ng install -c {save_path}",
+            ]
+        )
 
     except OSError as e:
-        print(f"Error saving configuration: {e}")
+        console.print(f"[red]Error saving configuration:[/red] {e}")
         return 1
 
     return 0

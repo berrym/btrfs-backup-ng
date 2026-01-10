@@ -409,3 +409,202 @@ class TestDefaultPolicies:
         assert DEFAULT_QUICK_POLICY.max_attempts == 3
         assert DEFAULT_QUICK_POLICY.initial_delay == 0.5
         assert DEFAULT_QUICK_POLICY.max_delay == 5.0
+
+
+class TestAsyncRetry:
+    """Tests for async retry functionality."""
+
+    @pytest.mark.asyncio
+    @patch("asyncio.sleep")
+    async def test_wait_async(self, mock_sleep):
+        """Test async wait."""
+        from btrfs_backup_ng.core.retry import RetryAttempt
+
+        policy = RetryPolicy(initial_delay=1.0, jitter=0.0)
+        attempt = RetryAttempt(attempt_number=0, max_attempts=3, policy=policy)
+        attempt.last_error = TransientNetworkError("Error")
+
+        delay = await attempt.wait_async()
+        assert delay == 1.0
+        mock_sleep.assert_called_once_with(1.0)
+
+    @pytest.mark.asyncio
+    async def test_wait_async_on_last_attempt(self):
+        """Test that async wait returns 0 on last attempt."""
+        from btrfs_backup_ng.core.retry import RetryAttempt
+
+        policy = RetryPolicy(max_attempts=3)
+        attempt = RetryAttempt(attempt_number=2, max_attempts=3, policy=policy)
+
+        delay = await attempt.wait_async()
+        assert delay == 0
+
+    @pytest.mark.asyncio
+    @patch("asyncio.sleep")
+    async def test_with_retry_async_success(self, mock_sleep):
+        """Test async retry decorator with success."""
+        from btrfs_backup_ng.core.retry import with_retry_async
+
+        call_count = 0
+
+        @with_retry_async(max_attempts=3)
+        async def async_function():
+            nonlocal call_count
+            call_count += 1
+            return "success"
+
+        result = await async_function()
+        assert result == "success"
+        assert call_count == 1
+
+    @pytest.mark.asyncio
+    @patch("asyncio.sleep")
+    async def test_with_retry_async_retries(self, mock_sleep):
+        """Test async retry decorator with retries."""
+        from btrfs_backup_ng.core.retry import with_retry_async
+
+        call_count = 0
+
+        @with_retry_async(max_attempts=3, initial_delay=1.0, jitter=0.0)
+        async def flaky_async():
+            nonlocal call_count
+            call_count += 1
+            if call_count < 3:
+                raise TransientNetworkError("Network error")
+            return "success"
+
+        result = await flaky_async()
+        assert result == "success"
+        assert call_count == 3
+
+    @pytest.mark.asyncio
+    @patch("asyncio.sleep")
+    async def test_with_retry_async_failure(self, mock_sleep):
+        """Test async retry decorator exhausting attempts."""
+        from btrfs_backup_ng.core.retry import with_retry_async
+
+        @with_retry_async(max_attempts=2)
+        async def always_fails():
+            raise TransientNetworkError("Error")
+
+        with pytest.raises(TransientNetworkError):
+            await always_fails()
+
+    @pytest.mark.asyncio
+    async def test_with_retry_async_permanent_error(self):
+        """Test async retry decorator with permanent error."""
+        from btrfs_backup_ng.core.retry import with_retry_async
+
+        call_count = 0
+
+        @with_retry_async(max_attempts=3)
+        async def permanent_fail():
+            nonlocal call_count
+            call_count += 1
+            raise PermanentPermissionError("No permission")
+
+        with pytest.raises(PermanentPermissionError):
+            await permanent_fail()
+
+        assert call_count == 1
+
+    @pytest.mark.asyncio
+    @patch("asyncio.sleep")
+    async def test_with_retry_async_with_policy(self, mock_sleep):
+        """Test async retry decorator with RetryPolicy object."""
+        from btrfs_backup_ng.core.retry import with_retry_async
+
+        policy = RetryPolicy(max_attempts=2, initial_delay=0.5, jitter=0.0)
+
+        @with_retry_async(policy)
+        async def func():
+            return 42
+
+        result = await func()
+        assert result == 42
+
+
+class TestOnRetryCallback:
+    """Tests for on_retry callback."""
+
+    @patch("time.sleep")
+    def test_on_retry_callback_called(self, mock_sleep):
+        """Test that on_retry callback is called."""
+        callback_calls = []
+
+        def on_retry_callback(attempt, error, delay):
+            callback_calls.append((attempt, str(error), delay))
+
+        policy = RetryPolicy(
+            max_attempts=3,
+            initial_delay=1.0,
+            jitter=0.0,
+            on_retry=on_retry_callback,
+        )
+
+        call_count = 0
+        for attempt in policy.attempts():
+            call_count += 1
+            if call_count < 3:
+                error = TransientNetworkError("Error")
+                attempt.should_retry(error)
+                attempt.wait()
+            else:
+                break
+
+        assert len(callback_calls) == 2
+        assert callback_calls[0][0] == 1  # First retry (attempt 1)
+        assert callback_calls[1][0] == 2  # Second retry (attempt 2)
+
+    @pytest.mark.asyncio
+    @patch("asyncio.sleep")
+    async def test_on_retry_callback_async(self, mock_sleep):
+        """Test on_retry callback in async context."""
+        callback_calls = []
+
+        def on_retry_callback(attempt, error, delay):
+            callback_calls.append(attempt)
+
+        policy = RetryPolicy(
+            max_attempts=3,
+            initial_delay=1.0,
+            jitter=0.0,
+            on_retry=on_retry_callback,
+        )
+
+        from btrfs_backup_ng.core.retry import RetryAttempt
+
+        attempt = RetryAttempt(attempt_number=0, max_attempts=3, policy=policy)
+        attempt.last_error = TransientNetworkError("Error")
+        await attempt.wait_async()
+
+        assert len(callback_calls) == 1
+        assert callback_calls[0] == 1
+
+
+class TestRetryResultUnwrap:
+    """Tests for RetryResult.unwrap edge cases."""
+
+    def test_unwrap_no_error_recorded(self):
+        """Test unwrap raises RuntimeError when no error recorded."""
+        from btrfs_backup_ng.core.retry import RetryResult
+
+        result = RetryResult(success=False, error=None)
+        with pytest.raises(RuntimeError, match="no error recorded"):
+            result.unwrap()
+
+
+class TestRetryContextEdgeCases:
+    """Tests for RetryContext edge cases."""
+
+    def test_context_with_none_policy(self):
+        """Test context manager with None policy uses default."""
+        with RetryContext(None) as ctx:
+            assert ctx.policy.max_attempts == 3  # Default
+
+    def test_wait_when_exhausted(self):
+        """Test wait returns 0 when exhausted."""
+        ctx = RetryContext(RetryPolicy(max_attempts=1))
+        ctx.record_failure(TransientNetworkError("Error"))
+        assert ctx.exhausted
+        assert ctx.wait() == 0

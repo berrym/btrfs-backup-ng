@@ -2,10 +2,13 @@
 
 from btrfs_backup_ng.config.schema import (
     Config,
+    EmailNotificationConfig,
     GlobalConfig,
+    NotificationConfig,
     RetentionConfig,
     TargetConfig,
     VolumeConfig,
+    WebhookNotificationConfig,
 )
 
 
@@ -38,6 +41,37 @@ class TestRetentionConfig:
         assert retention.weekly == 8
         assert retention.monthly == 6
         assert retention.yearly == 2
+
+
+class TestNotificationConfig:
+    """Tests for NotificationConfig dataclass."""
+
+    def test_is_enabled_default(self):
+        """Test is_enabled returns False by default."""
+        config = NotificationConfig()
+        assert config.is_enabled() is False
+
+    def test_is_enabled_with_email(self):
+        """Test is_enabled returns True when email is enabled."""
+        config = NotificationConfig(
+            email=EmailNotificationConfig(enabled=True, to_addrs=["test@example.com"])
+        )
+        assert config.is_enabled() is True
+
+    def test_is_enabled_with_webhook(self):
+        """Test is_enabled returns True when webhook is enabled."""
+        config = NotificationConfig(
+            webhook=WebhookNotificationConfig(enabled=True, url="http://example.com")
+        )
+        assert config.is_enabled() is True
+
+    def test_is_enabled_with_both(self):
+        """Test is_enabled returns True when both are enabled."""
+        config = NotificationConfig(
+            email=EmailNotificationConfig(enabled=True, to_addrs=["test@example.com"]),
+            webhook=WebhookNotificationConfig(enabled=True, url="http://example.com"),
+        )
+        assert config.is_enabled() is True
 
 
 class TestTargetConfig:

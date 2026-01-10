@@ -189,6 +189,12 @@ class TestGetBucketKey:
         bucket = get_bucket_key(dt, "yearly")
         assert "2024" in bucket
 
+    def test_unknown_bucket_type(self):
+        """Test that unknown bucket type raises ValueError."""
+        dt = datetime(2024, 1, 15, 14, 30, 22)
+        with pytest.raises(ValueError, match="Unknown bucket type"):
+            get_bucket_key(dt, "unknown_bucket")
+
 
 class TestApplyRetention:
     """Tests for apply_retention function."""

@@ -2,10 +2,12 @@
 
 import json
 import time
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
 
+from btrfs_backup_ng import encode_path_for_dir
 from btrfs_backup_ng.__util__ import (
     DATE_FORMAT,
     AbortError,
@@ -17,6 +19,30 @@ from btrfs_backup_ng.__util__ import (
     str_to_date,
     write_locks,
 )
+
+
+class TestEncodePathForDir:
+    """Tests for encode_path_for_dir function."""
+
+    def test_root_path(self):
+        """Test encoding root path."""
+        result = encode_path_for_dir(Path("/"))
+        assert result == ""
+
+    def test_simple_path(self):
+        """Test encoding a simple path."""
+        result = encode_path_for_dir(Path("/home"))
+        assert result == "home"
+
+    def test_nested_path(self):
+        """Test encoding a nested path."""
+        result = encode_path_for_dir(Path("/home/user/documents"))
+        assert result == "home_user_documents"
+
+    def test_var_log_path(self):
+        """Test encoding /var/log path."""
+        result = encode_path_for_dir(Path("/var/log"))
+        assert result == "var_log"
 
 
 class TestDateToStr:
@@ -565,3 +591,186 @@ class TestIsSubvolume:
         # Regular dir won't have inode 256
         result = is_subvolume(tmp_path)
         assert result is False  # tmp_path is not inode 256
+
+
+class TestDeleteSubvolume:
+    """Tests for delete_subvolume function."""
+
+    @patch("btrfs_backup_ng.__util__.is_subvolume")
+    def test_raises_if_not_subvolume(self, mock_is_subvolume, tmp_path):
+        """Test that delete_subvolume raises if path is not a subvolume."""
+        from btrfs_backup_ng.__util__ import delete_subvolume
+
+        mock_is_subvolume.return_value = False
+        with pytest.raises(AbortError, match="not a subvolume"):
+            delete_subvolume(tmp_path)
+
+    @patch("btrfs_backup_ng.__util__.exec_subprocess")
+    @patch("btrfs_backup_ng.__util__.is_subvolume")
+    def test_calls_btrfs_delete(self, mock_is_subvolume, mock_exec, tmp_path):
+        """Test that delete_subvolume calls btrfs subvolume delete."""
+        from btrfs_backup_ng.__util__ import delete_subvolume
+
+        mock_is_subvolume.return_value = True
+        delete_subvolume(tmp_path)
+
+        mock_exec.assert_called_once()
+        call_args = mock_exec.call_args[0][0]
+        assert call_args[0] == "btrfs"
+        assert call_args[1] == "subvolume"
+        assert call_args[2] == "delete"
+        assert str(tmp_path.resolve()) in call_args[3]
+
+
+class TestIsMounted:
+    """Tests for is_mounted function."""
+
+    def test_root_is_mounted(self, tmp_path):
+        """Test that root (/) is detected as mounted."""
+        from btrfs_backup_ng.__util__ import is_mounted
+
+        # Create a mock mounts file
+        mounts_content = """/dev/sda1 / btrfs rw,relatime 0 0
+/dev/sdb1 /home btrfs rw,relatime 0 0
+"""
+        mock_mounts = tmp_path / "mounts"
+        mock_mounts.write_text(mounts_content)
+
+        with patch("btrfs_backup_ng.__util__.MOUNTS_FILE", str(mock_mounts)):
+            assert is_mounted("/") is True
+            assert is_mounted("/home") is True
+
+    def test_non_mount_point(self, tmp_path):
+        """Test that non-mount points return False."""
+        from btrfs_backup_ng.__util__ import is_mounted
+
+        # Create a mock mounts file
+        mounts_content = """/dev/sda1 / btrfs rw,relatime 0 0
+"""
+        mock_mounts = tmp_path / "mounts"
+        mock_mounts.write_text(mounts_content)
+
+        with patch("btrfs_backup_ng.__util__.MOUNTS_FILE", str(mock_mounts)):
+            # /home is not a mount point in this case
+            assert is_mounted("/home") is False
+            # Subdirectories are not mount points
+            assert is_mounted("/var/log") is False
+
+    def test_handles_malformed_lines(self, tmp_path):
+        """Test that malformed lines are skipped."""
+        from btrfs_backup_ng.__util__ import is_mounted
+
+        mounts_content = """malformed
+/dev/sda1 / btrfs rw 0 0
+
+"""
+        mock_mounts = tmp_path / "mounts"
+        mock_mounts.write_text(mounts_content)
+
+        with patch("btrfs_backup_ng.__util__.MOUNTS_FILE", str(mock_mounts)):
+            assert is_mounted("/") is True
+
+
+class TestGetMountInfo:
+    """Tests for get_mount_info function."""
+
+    def test_get_mount_info_for_root(self, tmp_path):
+        """Test getting mount info for root filesystem."""
+        from btrfs_backup_ng.__util__ import get_mount_info
+
+        mounts_content = """/dev/sda1 / btrfs rw,relatime 0 0
+/dev/sdb1 /home ext4 rw,relatime 0 0
+"""
+        mock_mounts = tmp_path / "mounts"
+        mock_mounts.write_text(mounts_content)
+
+        with patch("btrfs_backup_ng.__util__.MOUNTS_FILE", str(mock_mounts)):
+            info = get_mount_info("/")
+            assert info is not None
+            assert info["mount_point"] == "/"
+            assert info["fs_type"] == "btrfs"
+            assert info["device"] == "/dev/sda1"
+
+    def test_get_mount_info_for_subpath(self, tmp_path):
+        """Test getting mount info for path under mount point."""
+        from btrfs_backup_ng.__util__ import get_mount_info
+
+        mounts_content = """/dev/sda1 / btrfs rw,relatime 0 0
+/dev/sdb1 /home ext4 rw,relatime 0 0
+"""
+        mock_mounts = tmp_path / "mounts"
+        mock_mounts.write_text(mounts_content)
+
+        with patch("btrfs_backup_ng.__util__.MOUNTS_FILE", str(mock_mounts)):
+            info = get_mount_info("/home/user/documents")
+            assert info is not None
+            assert info["mount_point"] == "/home"
+            assert info["fs_type"] == "ext4"
+
+    def test_get_mount_info_best_match(self, tmp_path):
+        """Test that longest matching mount point is selected."""
+        from btrfs_backup_ng.__util__ import get_mount_info
+
+        mounts_content = """/dev/sda1 / btrfs rw,relatime 0 0
+/dev/sdb1 /home ext4 rw,relatime 0 0
+/dev/sdc1 /home/user xfs rw,relatime 0 0
+"""
+        mock_mounts = tmp_path / "mounts"
+        mock_mounts.write_text(mounts_content)
+
+        with patch("btrfs_backup_ng.__util__.MOUNTS_FILE", str(mock_mounts)):
+            info = get_mount_info("/home/user/documents")
+            assert info is not None
+            assert info["mount_point"] == "/home/user"
+            assert info["fs_type"] == "xfs"
+
+    def test_get_mount_info_handles_malformed(self, tmp_path):
+        """Test that malformed lines are skipped."""
+        from btrfs_backup_ng.__util__ import get_mount_info
+
+        mounts_content = """malformed line
+/dev/sda1 / btrfs rw 0 0
+another bad
+"""
+        mock_mounts = tmp_path / "mounts"
+        mock_mounts.write_text(mounts_content)
+
+        with patch("btrfs_backup_ng.__util__.MOUNTS_FILE", str(mock_mounts)):
+            info = get_mount_info("/")
+            assert info is not None
+            assert info["mount_point"] == "/"
+
+    def test_get_mount_info_not_found(self, tmp_path):
+        """Test returning None when no match found."""
+        from btrfs_backup_ng.__util__ import get_mount_info
+
+        mounts_content = """/dev/sda1 /mnt/disk btrfs rw 0 0
+"""
+        mock_mounts = tmp_path / "mounts"
+        mock_mounts.write_text(mounts_content)
+
+        with patch("btrfs_backup_ng.__util__.MOUNTS_FILE", str(mock_mounts)):
+            # /other is not under any mount point in the file
+            info = get_mount_info("/other/path")
+            assert info is None
+
+
+class TestInsufficientSpaceError:
+    """Tests for InsufficientSpaceError exception."""
+
+    def test_inherits_from_abort_error(self):
+        """Test that InsufficientSpaceError inherits from AbortError."""
+        from btrfs_backup_ng.__util__ import InsufficientSpaceError
+
+        with pytest.raises(AbortError):
+            raise InsufficientSpaceError("Not enough space")
+
+    def test_error_message(self):
+        """Test error message is preserved."""
+        from btrfs_backup_ng.__util__ import InsufficientSpaceError
+
+        try:
+            raise InsufficientSpaceError("Need 10GB, only 5GB available")
+        except InsufficientSpaceError as e:
+            assert "10GB" in str(e)
+            assert "5GB" in str(e)

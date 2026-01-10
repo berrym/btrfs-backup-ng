@@ -15,9 +15,12 @@ btrfs-backup-ng-config \- configuration management commands
 .B btrfs-backup-ng config detect
 [\fB\-\-json\fR]
 [\fB\-w\fR|\fB\-\-wizard\fR]
+.br
+.B btrfs-backup-ng config migrate-systemd
+[\fB\-\-dry-run\fR]
 .SH DESCRIPTION
 Manage btrfs-backup-ng configuration files. These commands help create,
-validate, detect subvolumes, and migrate configurations.
+validate, detect subvolumes, migrate from btrbk, and manage systemd integration.
 .SH SUBCOMMANDS
 .SS validate
 Validate the current configuration file. Checks for syntax errors, missing
@@ -98,9 +101,21 @@ Resolves inheritance (options cascade down)
 .IP \(bu 2
 Converts retention policies
 .IP \(bu 2
+Maps timestamp formats (short, long, long-iso to strftime patterns)
+.IP \(bu 2
+Converts SSH sudo settings (backend btrfs-progs-sudo to ssh_sudo)
+.IP \(bu 2
 Warns about common btrbk pitfalls
 .IP \(bu 2
 Outputs valid TOML
+.PP
+Timestamp format mapping:
+.IP \(bu 2
+\fBshort\fR \(-> %Y%m%d (e.g., 20260109)
+.IP \(bu 2
+\fBlong\fR \(-> %Y%m%dT%H%M (e.g., 20260109T1430)
+.IP \(bu 2
+\fBlong-iso\fR \(-> %Y%m%dT%H%M%S%z (e.g., 20260109T143052+0000)
 .PP
 Example:
 .PP
@@ -160,6 +175,46 @@ sudo btrfs-backup-ng config detect --json
 
 # Launch wizard with detected volumes
 sudo btrfs-backup-ng config detect --wizard
+.fi
+.RE
+.SS migrate-systemd
+Migrate systemd integration from btrbk to btrfs-backup-ng. This command
+stops and disables btrbk's systemd timer and enables btrfs-backup-ng's timer.
+.PP
+.RS
+.B btrfs-backup-ng config migrate-systemd
+[\fB\-\-dry-run\fR]
+.RE
+.TP
+.B \-\-dry-run
+Show what would be done without making any changes. Use this to preview
+the migration before applying it.
+.PP
+The migrate-systemd command:
+.IP \(bu 2
+Detects active btrbk systemd units (btrbk.timer, btrbk.service)
+.IP \(bu 2
+Stops running btrbk timers
+.IP \(bu 2
+Disables btrbk.timer
+.IP \(bu 2
+Enables btrfs-backup-ng.timer (if installed)
+.IP \(bu 2
+Prevents both tools from running simultaneously
+.PP
+Example:
+.PP
+.RS
+.nf
+# Preview migration (recommended first step)
+btrfs-backup-ng config migrate-systemd --dry-run
+
+# Apply migration
+sudo btrfs-backup-ng config migrate-systemd
+
+# If btrfs-backup-ng timer not installed, install it first
+sudo btrfs-backup-ng install --timer=hourly
+sudo btrfs-backup-ng config migrate-systemd
 .fi
 .RE
 .SH CONFIGURATION FORMAT

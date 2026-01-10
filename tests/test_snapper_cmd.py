@@ -1010,6 +1010,343 @@ path = "/mnt/backup"
         assert "not found" in captured.out
 
 
+class TestHandleBackup:
+    """Tests for the backup command handler."""
+
+    def test_snapper_not_found(self, capsys):
+        """Test handling when snapper is not installed."""
+        from btrfs_backup_ng.cli.snapper_cmd import _handle_backup
+
+        args = argparse.Namespace(
+            config="root",
+            target="/mnt/backup",
+            snapshot=None,
+            type=None,
+            dry_run=False,
+            compress=None,
+            rate_limit=None,
+            verbose=False,
+            quiet=False,
+            log_level=None,
+        )
+
+        with patch(
+            "btrfs_backup_ng.cli.snapper_cmd.SnapperScanner"
+        ) as mock_scanner_cls:
+            mock_scanner_cls.side_effect = SnapperNotFoundError("snapper not found")
+            result = _handle_backup(args)
+
+        assert result == 1
+
+    def test_config_not_found(self, capsys):
+        """Test handling when specified config doesn't exist."""
+        from btrfs_backup_ng.cli.snapper_cmd import _handle_backup
+
+        args = argparse.Namespace(
+            config="nonexistent",
+            target="/mnt/backup",
+            snapshot=None,
+            type=None,
+            dry_run=False,
+            compress=None,
+            rate_limit=None,
+            verbose=False,
+            quiet=False,
+            log_level=None,
+        )
+
+        with patch(
+            "btrfs_backup_ng.cli.snapper_cmd.SnapperScanner"
+        ) as mock_scanner_cls:
+            mock_scanner = MagicMock()
+            mock_scanner.get_config.return_value = None
+            mock_scanner_cls.return_value = mock_scanner
+            result = _handle_backup(args)
+
+        assert result == 1
+
+    def test_dry_run_all_snapshots(
+        self, capsys, mock_snapper_configs, mock_snapper_snapshots
+    ):
+        """Test dry run mode for all snapshots."""
+        from btrfs_backup_ng.cli.snapper_cmd import _handle_backup
+
+        args = argparse.Namespace(
+            config="root",
+            target="/mnt/backup",
+            snapshot=None,
+            type=None,
+            dry_run=True,
+            compress=None,
+            rate_limit=None,
+            verbose=False,
+            quiet=False,
+            log_level=None,
+            min_age="0",
+        )
+
+        with (
+            patch("btrfs_backup_ng.cli.snapper_cmd.SnapperScanner") as mock_scanner_cls,
+            patch(
+                "btrfs_backup_ng.core.operations.get_snapper_snapshots_for_backup"
+            ) as mock_get_snaps,
+        ):
+            mock_scanner = MagicMock()
+            mock_scanner.get_config.return_value = mock_snapper_configs[0]
+            mock_scanner_cls.return_value = mock_scanner
+            mock_get_snaps.return_value = mock_snapper_snapshots
+            result = _handle_backup(args)
+
+        assert result == 0
+
+    def test_dry_run_specific_snapshot(
+        self, capsys, mock_snapper_configs, mock_snapper_snapshots
+    ):
+        """Test dry run mode for a specific snapshot."""
+        from btrfs_backup_ng.cli.snapper_cmd import _handle_backup
+
+        args = argparse.Namespace(
+            config="root",
+            target="/mnt/backup",
+            snapshot=559,
+            type=None,
+            dry_run=True,
+            compress=None,
+            rate_limit=None,
+            verbose=False,
+            quiet=False,
+            log_level=None,
+        )
+
+        with patch(
+            "btrfs_backup_ng.cli.snapper_cmd.SnapperScanner"
+        ) as mock_scanner_cls:
+            mock_scanner = MagicMock()
+            mock_scanner.get_config.return_value = mock_snapper_configs[0]
+            mock_scanner.get_snapshot.return_value = mock_snapper_snapshots[0]
+            mock_scanner_cls.return_value = mock_scanner
+            result = _handle_backup(args)
+
+        assert result == 0
+
+    def test_snapshot_not_found(self, capsys, mock_snapper_configs):
+        """Test when specified snapshot doesn't exist."""
+        from btrfs_backup_ng.cli.snapper_cmd import _handle_backup
+
+        args = argparse.Namespace(
+            config="root",
+            target="/mnt/backup",
+            snapshot=999,
+            type=None,
+            dry_run=False,
+            compress=None,
+            rate_limit=None,
+            verbose=False,
+            quiet=False,
+            log_level=None,
+        )
+
+        with patch(
+            "btrfs_backup_ng.cli.snapper_cmd.SnapperScanner"
+        ) as mock_scanner_cls:
+            mock_scanner = MagicMock()
+            mock_scanner.get_config.return_value = mock_snapper_configs[0]
+            mock_scanner.get_snapshot.return_value = None
+            mock_scanner_cls.return_value = mock_scanner
+            result = _handle_backup(args)
+
+        assert result == 1
+
+
+class TestHandleRestore:
+    """Tests for the restore command handler."""
+
+    def test_list_mode(self, capsys):
+        """Test listing available backups."""
+        from btrfs_backup_ng.cli.snapper_cmd import _handle_restore
+
+        args = argparse.Namespace(
+            source="/mnt/backup",
+            config="root",
+            snapshot=None,
+            list=True,
+            dry_run=False,
+            json=False,
+            verbose=False,
+            quiet=False,
+            log_level=None,
+        )
+
+        mock_backup = {
+            "number": 559,
+            "metadata": MagicMock(
+                type="single", date=datetime(2026, 1, 8), description="test"
+            ),
+        }
+
+        with patch("btrfs_backup_ng.core.restore.list_snapper_backups") as mock_list:
+            mock_list.return_value = [mock_backup]
+            result = _handle_restore(args)
+
+        assert result == 0
+        captured = capsys.readouterr()
+        assert "559" in captured.out
+
+    def test_list_mode_json(self, capsys):
+        """Test JSON output for listing backups."""
+        from btrfs_backup_ng.cli.snapper_cmd import _handle_restore
+
+        args = argparse.Namespace(
+            source="/mnt/backup",
+            config="root",
+            snapshot=None,
+            list=True,
+            dry_run=False,
+            json=True,
+            verbose=False,
+            quiet=False,
+            log_level=None,
+        )
+
+        mock_backup = {
+            "number": 559,
+            "metadata": MagicMock(
+                type="single", date=datetime(2026, 1, 8), description="test"
+            ),
+        }
+
+        with patch("btrfs_backup_ng.core.restore.list_snapper_backups") as mock_list:
+            mock_list.return_value = [mock_backup]
+            result = _handle_restore(args)
+
+        assert result == 0
+        captured = capsys.readouterr()
+        output = json.loads(captured.out)
+        assert "backups" in output
+
+    def test_list_mode_no_backups(self, capsys):
+        """Test listing when no backups exist."""
+        from btrfs_backup_ng.cli.snapper_cmd import _handle_restore
+
+        args = argparse.Namespace(
+            source="/mnt/backup",
+            config="root",
+            snapshot=None,
+            list=True,
+            dry_run=False,
+            json=False,
+            verbose=False,
+            quiet=False,
+            log_level=None,
+        )
+
+        with patch("btrfs_backup_ng.core.restore.list_snapper_backups") as mock_list:
+            mock_list.return_value = []
+            result = _handle_restore(args)
+
+        assert result == 0
+
+    def test_list_mode_error(self, capsys):
+        """Test error handling for list mode."""
+        from btrfs_backup_ng.cli.snapper_cmd import _handle_restore
+
+        args = argparse.Namespace(
+            source="/mnt/backup",
+            config="root",
+            snapshot=None,
+            list=True,
+            dry_run=False,
+            json=False,
+            verbose=False,
+            quiet=False,
+            log_level=None,
+        )
+
+        with patch("btrfs_backup_ng.core.restore.list_snapper_backups") as mock_list:
+            mock_list.side_effect = Exception("Access denied")
+            result = _handle_restore(args)
+
+        assert result == 1
+
+    def test_snapper_not_found(self, capsys):
+        """Test handling when snapper is not installed."""
+        from btrfs_backup_ng.cli.snapper_cmd import _handle_restore
+
+        args = argparse.Namespace(
+            source="/mnt/backup",
+            config="root",
+            snapshot=[559],
+            list=False,
+            dry_run=False,
+            json=False,
+            verbose=False,
+            quiet=False,
+            log_level=None,
+        )
+
+        with patch(
+            "btrfs_backup_ng.cli.snapper_cmd.SnapperScanner"
+        ) as mock_scanner_cls:
+            mock_scanner_cls.side_effect = SnapperNotFoundError("snapper not found")
+            result = _handle_restore(args)
+
+        assert result == 1
+
+    def test_config_not_found(self, capsys):
+        """Test handling when local snapper config doesn't exist."""
+        from btrfs_backup_ng.cli.snapper_cmd import _handle_restore
+
+        args = argparse.Namespace(
+            source="/mnt/backup",
+            config="nonexistent",
+            snapshot=[559],
+            list=False,
+            dry_run=False,
+            json=False,
+            verbose=False,
+            quiet=False,
+            log_level=None,
+        )
+
+        with patch(
+            "btrfs_backup_ng.cli.snapper_cmd.SnapperScanner"
+        ) as mock_scanner_cls:
+            mock_scanner = MagicMock()
+            mock_scanner.get_config.return_value = None
+            mock_scanner_cls.return_value = mock_scanner
+            result = _handle_restore(args)
+
+        assert result == 1
+
+    def test_no_snapshot_specified(self, capsys, mock_snapper_configs):
+        """Test error when no snapshot or --all specified."""
+        from btrfs_backup_ng.cli.snapper_cmd import _handle_restore
+
+        args = argparse.Namespace(
+            source="/mnt/backup",
+            config="root",
+            snapshot=None,
+            list=False,
+            dry_run=False,
+            json=False,
+            verbose=False,
+            quiet=False,
+            log_level=None,
+        )
+        # Ensure 'all' attribute doesn't exist or is False
+        args.all = False
+
+        with patch(
+            "btrfs_backup_ng.cli.snapper_cmd.SnapperScanner"
+        ) as mock_scanner_cls:
+            mock_scanner = MagicMock()
+            mock_scanner.get_config.return_value = mock_snapper_configs[0]
+            mock_scanner_cls.return_value = mock_scanner
+            result = _handle_restore(args)
+
+        assert result == 1
+
+
 class TestExecuteSnapper:
     """Tests for the main snapper command dispatcher."""
 

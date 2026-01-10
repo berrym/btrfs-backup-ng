@@ -10,6 +10,11 @@ btrbk config structure:
 - target sections (can be at any level)
 
 Options inherit down: global -> volume -> subvolume -> target
+
+Timestamp format mapping (btrbk -> strftime):
+- short: YYYYMMDD -> %Y%m%d
+- long: YYYYMMDDThhmm -> %Y%m%dT%H%M (default in btrbk >= 0.32)
+- long-iso: YYYYMMDDThhmmss±hhmm -> %Y%m%dT%H%M%S%z
 """
 
 import logging
@@ -18,6 +23,17 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
+
+
+# btrbk timestamp format to strftime mapping
+BTRBK_TIMESTAMP_FORMATS = {
+    "short": "%Y%m%d",
+    "long": "%Y%m%dT%H%M",
+    "long-iso": "%Y%m%dT%H%M%S%z",
+}
+
+# Default timestamp format (btrbk >= 0.32 uses 'long')
+BTRBK_DEFAULT_TIMESTAMP_FORMAT = "long"
 
 
 # Token types
@@ -476,9 +492,20 @@ def convert_to_toml(btrbk_config: BtrbkConfig) -> tuple[str, list[str]]:
     else:
         lines.append('snapshot_dir = ".snapshots"')
 
-    if "timestamp_format" in btrbk_config.global_options:
-        # btrbk uses 'long', 'short', etc. - we use strftime
-        lines.append('timestamp_format = "%Y%m%d-%H%M%S"')
+    # Map btrbk timestamp format to strftime format
+    btrbk_ts_format = btrbk_config.global_options.get(
+        "timestamp_format", BTRBK_DEFAULT_TIMESTAMP_FORMAT
+    )
+    if btrbk_ts_format in BTRBK_TIMESTAMP_FORMATS:
+        strftime_format = BTRBK_TIMESTAMP_FORMATS[btrbk_ts_format]
+        lines.append(f'timestamp_format = "{strftime_format}"')
+    else:
+        # Unknown format, use btrbk's default (long)
+        warnings.append(
+            f"Unknown btrbk timestamp_format '{btrbk_ts_format}', "
+            f"using 'long' format for compatibility"
+        )
+        lines.append(f'timestamp_format = "{BTRBK_TIMESTAMP_FORMATS["long"]}"')
 
     incremental = btrbk_config.global_options.get("incremental", "yes")
     lines.append(f"incremental = {str(incremental != 'no').lower()}")

@@ -519,6 +519,131 @@ class TestSnapperScannerCommand:
         assert snapshots[1].pre_num == 1
 
 
+class TestSnapperScannerEdgeCases:
+    """Tests for edge cases in SnapperScanner."""
+
+    def test_list_configs_skips_directories(self, tmp_path):
+        """Test that directories in configs dir are skipped."""
+        # Create a config file
+        (tmp_path / "root").write_text('SUBVOLUME="/"\nFSTYPE="btrfs"')
+        # Create a subdirectory (should be skipped)
+        (tmp_path / "subdir").mkdir()
+
+        scanner = SnapperScanner(configs_dir=tmp_path)
+        configs = scanner.list_configs()
+
+        assert len(configs) == 1
+        assert configs[0].name == "root"
+
+    def test_list_configs_handles_parse_error(self, tmp_path):
+        """Test that parse errors in config files are handled."""
+        # Create a valid config
+        (tmp_path / "valid").write_text('SUBVOLUME="/"\nFSTYPE="btrfs"')
+        # Create an invalid config that will cause parsing issues
+        (tmp_path / "invalid").write_text("not valid config syntax\x00\x01")
+
+        scanner = SnapperScanner(configs_dir=tmp_path)
+        configs = scanner.list_configs()
+
+        # Should return valid config, skip invalid
+        assert len(configs) >= 1
+        assert any(c.name == "valid" for c in configs)
+
+    def test_get_config_handles_parse_error(self, tmp_path):
+        """Test get_config handles parse errors gracefully."""
+        # Create a config file that will cause an encoding error
+        config_file = tmp_path / "broken"
+        # Writing invalid UTF-8 bytes that will cause UnicodeDecodeError
+        config_file.write_bytes(b"\xff\xfe invalid utf-8 \x80\x81")
+
+        scanner = SnapperScanner(configs_dir=tmp_path)
+        config = scanner.get_config("broken")
+
+        # Should return None on parse error (UnicodeDecodeError)
+        assert config is None
+
+    def test_get_snapshots_invalid_config_name(self, tmp_path):
+        """Test get_snapshots with invalid config name."""
+        scanner = SnapperScanner(configs_dir=tmp_path)
+
+        with pytest.raises(ValueError, match="not found"):
+            scanner.get_snapshots("nonexistent")
+
+    def test_get_snapshots_command_fallback(self, tmp_path):
+        """Test fallback to filesystem when command fails."""
+        configs_dir = tmp_path / "configs"
+        configs_dir.mkdir()
+        subvol = tmp_path / "subvol"
+        subvol.mkdir()
+        snapshots_dir = subvol / ".snapshots"
+        snapshots_dir.mkdir()
+        (configs_dir / "root").write_text(f'SUBVOLUME="{subvol}"\nFSTYPE="btrfs"')
+
+        # Create a snapshot
+        snap_dir = snapshots_dir / "1"
+        snap_dir.mkdir()
+        (snap_dir / "snapshot").mkdir()
+        (snap_dir / "info.xml").write_text("""<?xml version="1.0"?>
+<snapshot>
+  <type>single</type>
+  <num>1</num>
+  <date>2025-01-01 12:00:00</date>
+  <description>test</description>
+  <cleanup>timeline</cleanup>
+</snapshot>""")
+
+        scanner = SnapperScanner(configs_dir=configs_dir, use_snapper_command=True)
+        scanner._snapper_available = True
+
+        # Mock command failure to trigger fallback
+        with patch("subprocess.run", side_effect=Exception("command failed")):
+            snapshots = scanner.get_snapshots("root")
+
+        # Should fall back to filesystem and find the snapshot
+        assert len(snapshots) == 1
+        assert snapshots[0].number == 1
+
+    def test_parse_config_invalid_space_limit(self, tmp_path):
+        """Test parsing config with invalid SPACE_LIMIT."""
+        config_file = tmp_path / "test"
+        config_file.write_text("""
+SUBVOLUME="/"
+FSTYPE="btrfs"
+SPACE_LIMIT="not_a_number"
+""")
+        scanner = SnapperScanner(configs_dir=tmp_path)
+        config = scanner.get_config("test")
+
+        # Should use default 0.5
+        assert config is not None
+        assert config.space_limit == 0.5
+
+    def test_parse_config_invalid_free_limit(self, tmp_path):
+        """Test parsing config with invalid FREE_LIMIT."""
+        config_file = tmp_path / "test"
+        config_file.write_text("""
+SUBVOLUME="/"
+FSTYPE="btrfs"
+FREE_LIMIT="invalid"
+""")
+        scanner = SnapperScanner(configs_dir=tmp_path)
+        config = scanner.get_config("test")
+
+        # Should use default 0.2
+        assert config is not None
+        assert config.free_limit == 0.2
+
+    def test_find_config_for_path_no_match(self, tmp_path):
+        """Test find_config_for_path when no config matches."""
+        (tmp_path / "home").write_text('SUBVOLUME="/home"\nFSTYPE="btrfs"')
+
+        scanner = SnapperScanner(configs_dir=tmp_path)
+        # Path that doesn't match any config subvolume
+        config = scanner.find_config_for_path("/var/log")
+
+        assert config is None
+
+
 class TestSnapperSnapshot:
     """Tests for SnapperSnapshot class."""
 
@@ -640,3 +765,90 @@ class TestSnapperSnapshot:
         # Should be usable in a set
         snapshot_set = {s1, s2}
         assert len(snapshot_set) == 1  # They're equal, so only one in set
+
+    def test_snapshot_exists(self, tmp_path):
+        """Test snapshot exists method."""
+        from btrfs_backup_ng.snapper.metadata import SnapperMetadata
+
+        # Create an actual path
+        snap_path = tmp_path / "snapshot"
+        snap_path.mkdir()
+
+        meta = SnapperMetadata(
+            type="single", num=100, date=datetime(2025, 1, 1, 0, 0, 0)
+        )
+        s1 = SnapperSnapshot(
+            config_name="root",
+            number=100,
+            metadata=meta,
+            subvolume_path=snap_path,
+            info_xml_path=tmp_path / "info.xml",
+        )
+        assert s1.exists() is True
+
+        # Non-existent path
+        s2 = SnapperSnapshot(
+            config_name="root",
+            number=101,
+            metadata=meta,
+            subvolume_path=tmp_path / "nonexistent",
+            info_xml_path=tmp_path / "info2.xml",
+        )
+        assert s2.exists() is False
+
+    def test_snapshot_repr(self):
+        """Test snapshot string representation."""
+        from btrfs_backup_ng.snapper.metadata import SnapperMetadata
+
+        meta = SnapperMetadata(
+            type="single", num=100, date=datetime(2025, 6, 15, 14, 30, 0)
+        )
+        s = SnapperSnapshot(
+            config_name="root",
+            number=100,
+            metadata=meta,
+            subvolume_path=Path("/a"),
+            info_xml_path=Path("/b"),
+        )
+        repr_str = repr(s)
+        assert "SnapperSnapshot" in repr_str
+        assert "root" in repr_str
+        assert "100" in repr_str
+        assert "single" in repr_str
+        assert "2025-06-15" in repr_str
+
+    def test_snapshot_lt_not_implemented(self):
+        """Test that comparing with non-SnapperSnapshot returns NotImplemented."""
+        from btrfs_backup_ng.snapper.metadata import SnapperMetadata
+
+        meta = SnapperMetadata(
+            type="single", num=100, date=datetime(2025, 1, 1, 0, 0, 0)
+        )
+        s = SnapperSnapshot(
+            config_name="root",
+            number=100,
+            metadata=meta,
+            subvolume_path=Path("/a"),
+            info_xml_path=Path("/b"),
+        )
+        # Comparing with non-SnapperSnapshot should return NotImplemented
+        result = s.__lt__("not a snapshot")
+        assert result is NotImplemented
+
+    def test_snapshot_eq_with_non_snapshot(self):
+        """Test that equality with non-SnapperSnapshot returns False."""
+        from btrfs_backup_ng.snapper.metadata import SnapperMetadata
+
+        meta = SnapperMetadata(
+            type="single", num=100, date=datetime(2025, 1, 1, 0, 0, 0)
+        )
+        s = SnapperSnapshot(
+            config_name="root",
+            number=100,
+            metadata=meta,
+            subvolume_path=Path("/a"),
+            info_xml_path=Path("/b"),
+        )
+        assert s != "not a snapshot"
+        assert s != 100
+        assert s != None

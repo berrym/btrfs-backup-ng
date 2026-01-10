@@ -338,6 +338,17 @@ def create_subcommand_parser() -> argparse.ArgumentParser:
         help="Launch interactive wizard with detected volumes",
     )
 
+    migrate_parser = config_subs.add_parser(
+        "migrate-systemd",
+        help="Migrate systemd integration from btrbk",
+        description="Disable btrbk systemd timer and enable btrfs-backup-ng timer",
+    )
+    migrate_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Show what would be done without making changes",
+    )
+
     # install command
     install_parser = subparsers.add_parser(
         "install",

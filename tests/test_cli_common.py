@@ -1,12 +1,17 @@
 """Tests for CLI common utilities."""
 
 import argparse
-
+from unittest.mock import patch
 
 from btrfs_backup_ng.cli.common import (
+    add_fs_checks_args,
+    add_progress_args,
     add_verbosity_args,
     create_global_parser,
+    get_fs_checks_mode,
     get_log_level,
+    is_interactive,
+    should_show_progress,
 )
 
 
@@ -122,3 +127,159 @@ class TestGetLogLevel:
 
         args = argparse.Namespace(quiet=True)
         assert get_log_level(args) == "WARNING"
+
+
+class TestIsInteractive:
+    """Tests for is_interactive function."""
+
+    def test_is_interactive_tty(self):
+        """Test is_interactive when stdout is a TTY."""
+        with patch("sys.stdout.isatty", return_value=True):
+            assert is_interactive() is True
+
+    def test_is_interactive_not_tty(self):
+        """Test is_interactive when stdout is not a TTY."""
+        with patch("sys.stdout.isatty", return_value=False):
+            assert is_interactive() is False
+
+
+class TestShouldShowProgress:
+    """Tests for should_show_progress function."""
+
+    def test_explicit_progress_flag(self):
+        """Test that --progress always shows progress."""
+        args = argparse.Namespace(progress=True, no_progress=False, quiet=False)
+        assert should_show_progress(args) is True
+
+    def test_explicit_no_progress_flag(self):
+        """Test that --no-progress never shows progress."""
+        args = argparse.Namespace(progress=False, no_progress=True, quiet=False)
+        assert should_show_progress(args) is False
+
+    def test_quiet_mode_no_progress(self):
+        """Test that quiet mode implies no progress."""
+        args = argparse.Namespace(progress=False, no_progress=False, quiet=True)
+        assert should_show_progress(args) is False
+
+    def test_auto_detect_tty(self):
+        """Test auto-detection based on TTY."""
+        args = argparse.Namespace(progress=False, no_progress=False, quiet=False)
+        with patch("btrfs_backup_ng.cli.common.is_interactive", return_value=True):
+            assert should_show_progress(args) is True
+
+    def test_auto_detect_not_tty(self):
+        """Test auto-detection when not TTY."""
+        args = argparse.Namespace(progress=False, no_progress=False, quiet=False)
+        with patch("btrfs_backup_ng.cli.common.is_interactive", return_value=False):
+            assert should_show_progress(args) is False
+
+    def test_missing_attributes(self):
+        """Test handling of missing attributes."""
+        args = argparse.Namespace()
+        with patch("btrfs_backup_ng.cli.common.is_interactive", return_value=True):
+            assert should_show_progress(args) is True
+
+
+class TestAddProgressArgs:
+    """Tests for add_progress_args function."""
+
+    def test_adds_progress_flag(self):
+        """Test that --progress is added."""
+        parser = argparse.ArgumentParser()
+        add_progress_args(parser)
+        args = parser.parse_args(["--progress"])
+        assert args.progress is True
+
+    def test_adds_no_progress_flag(self):
+        """Test that --no-progress is added."""
+        parser = argparse.ArgumentParser()
+        add_progress_args(parser)
+        args = parser.parse_args(["--no-progress"])
+        assert args.no_progress is True
+
+    def test_defaults_are_false(self):
+        """Test that defaults are False."""
+        parser = argparse.ArgumentParser()
+        add_progress_args(parser)
+        args = parser.parse_args([])
+        assert args.progress is False
+        assert args.no_progress is False
+
+    def test_mutual_exclusion(self):
+        """Test that --progress and --no-progress are mutually exclusive."""
+        parser = argparse.ArgumentParser()
+        add_progress_args(parser)
+        # This should raise an error
+        try:
+            parser.parse_args(["--progress", "--no-progress"])
+            assert False, "Should have raised an error"
+        except SystemExit:
+            pass  # Expected behavior
+
+
+class TestAddFsChecksArgs:
+    """Tests for add_fs_checks_args function."""
+
+    def test_adds_fs_checks_auto(self):
+        """Test that --fs-checks=auto works."""
+        parser = argparse.ArgumentParser()
+        add_fs_checks_args(parser)
+        args = parser.parse_args(["--fs-checks", "auto"])
+        assert args.fs_checks == "auto"
+
+    def test_adds_fs_checks_strict(self):
+        """Test that --fs-checks=strict works."""
+        parser = argparse.ArgumentParser()
+        add_fs_checks_args(parser)
+        args = parser.parse_args(["--fs-checks", "strict"])
+        assert args.fs_checks == "strict"
+
+    def test_adds_fs_checks_skip(self):
+        """Test that --fs-checks=skip works."""
+        parser = argparse.ArgumentParser()
+        add_fs_checks_args(parser)
+        args = parser.parse_args(["--fs-checks", "skip"])
+        assert args.fs_checks == "skip"
+
+    def test_no_fs_checks_alias(self):
+        """Test that --no-fs-checks is alias for skip."""
+        parser = argparse.ArgumentParser()
+        add_fs_checks_args(parser)
+        args = parser.parse_args(["--no-fs-checks"])
+        assert args.fs_checks == "skip"
+
+    def test_default_is_auto(self):
+        """Test that default is auto."""
+        parser = argparse.ArgumentParser()
+        add_fs_checks_args(parser)
+        args = parser.parse_args([])
+        assert args.fs_checks == "auto"
+
+
+class TestGetFsChecksMode:
+    """Tests for get_fs_checks_mode function."""
+
+    def test_returns_auto(self):
+        """Test that it returns auto."""
+        args = argparse.Namespace(fs_checks="auto")
+        assert get_fs_checks_mode(args) == "auto"
+
+    def test_returns_strict(self):
+        """Test that it returns strict."""
+        args = argparse.Namespace(fs_checks="strict")
+        assert get_fs_checks_mode(args) == "strict"
+
+    def test_returns_skip(self):
+        """Test that it returns skip."""
+        args = argparse.Namespace(fs_checks="skip")
+        assert get_fs_checks_mode(args) == "skip"
+
+    def test_missing_attribute_defaults_to_auto(self):
+        """Test that missing attribute defaults to auto."""
+        args = argparse.Namespace()
+        assert get_fs_checks_mode(args) == "auto"
+
+    def test_none_value_defaults_to_auto(self):
+        """Test that None value defaults to auto."""
+        args = argparse.Namespace(fs_checks=None)
+        assert get_fs_checks_mode(args) == "auto"

@@ -1182,6 +1182,51 @@ class TestCliDoctor:
 
     @patch("btrfs_backup_ng.cli.doctor.Doctor")
     @patch("btrfs_backup_ng.cli.doctor.find_config_file")
+    def test_execute_doctor_with_fix_results(
+        self, mock_find_config, mock_doctor_class, capsys
+    ):
+        """Test execute_doctor prints fix results when fixes are applied."""
+        mock_find_config.return_value = None
+
+        mock_report = DiagnosticReport()
+        mock_report.categories_checked = {DiagnosticCategory.CONFIG}
+        mock_report.completed_at = mock_report.started_at + 1.0
+
+        # Create a finding and fix result
+        finding = DiagnosticFinding(
+            DiagnosticCategory.TRANSFERS,
+            DiagnosticSeverity.WARN,
+            "stale_lock",
+            "Stale lock found",
+            fixable=True,
+        )
+        fix_result = FixResult(finding=finding, success=True, message="Lock removed")
+
+        mock_doctor = MagicMock()
+        mock_doctor.run_diagnostics.return_value = mock_report
+        mock_doctor.apply_fixes.return_value = [fix_result]
+        mock_doctor_class.return_value = mock_doctor
+
+        args = argparse.Namespace(
+            config=None,
+            check=None,
+            volume=None,
+            quiet=False,
+            json=False,
+            fix=True,
+            interactive=False,
+            verbose=0,
+            debug=False,
+        )
+
+        execute_doctor(args)
+
+        captured = capsys.readouterr()
+        assert "Fix Results" in captured.out
+        assert "[OK]" in captured.out
+
+    @patch("btrfs_backup_ng.cli.doctor.Doctor")
+    @patch("btrfs_backup_ng.cli.doctor.find_config_file")
     def test_execute_doctor_with_volume_filter(
         self, mock_find_config, mock_doctor_class
     ):

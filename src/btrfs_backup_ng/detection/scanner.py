@@ -31,15 +31,43 @@ class PermissionDeniedError(DetectionError):
     pass
 
 
+# Mount points that indicate removable/external media (not backup sources)
+REMOVABLE_MEDIA_PREFIXES = (
+    "/run/media/",  # systemd/udisks2 automount for removable media
+    "/media/",  # Traditional automount location
+    "/mnt/",  # Manual mount point (often used for external drives)
+)
+
+
+def is_removable_media(mount_point: str) -> bool:
+    """Check if a mount point is likely removable/external media.
+
+    Removable media are typically backup targets, not sources, and should
+    be excluded from detection to avoid confusion (e.g., an external drive's
+    top-level subvolume has path "/" which conflicts with the system root).
+
+    Args:
+        mount_point: The filesystem mount point path.
+
+    Returns:
+        True if the mount point appears to be removable media.
+    """
+    return mount_point.startswith(REMOVABLE_MEDIA_PREFIXES)
+
+
 def parse_proc_mounts(
     content: str | None = None,
     mounts_file: str = MOUNTS_FILE,
+    *,
+    exclude_removable: bool = True,
 ) -> list[BtrfsMountInfo]:
     """Parse /proc/mounts for btrfs filesystems.
 
     Args:
         content: Optional mount file content (for testing).
         mounts_file: Path to mounts file (default: /proc/mounts).
+        exclude_removable: If True (default), exclude removable/external media
+                          mounts (under /run/media/, /media/, /mnt/).
 
     Returns:
         List of BtrfsMountInfo for each btrfs mount.
@@ -61,6 +89,11 @@ def parse_proc_mounts(
         device, mount_point, fs_type, options_str = parts[:4]
 
         if fs_type != "btrfs":
+            continue
+
+        # Skip removable/external media if requested
+        if exclude_removable and is_removable_media(mount_point):
+            logger.debug("Skipping removable media mount: %s", mount_point)
             continue
 
         # Parse mount options
@@ -249,6 +282,8 @@ def correlate_mounts_and_subvolumes(
     """Correlate mount points with detected subvolumes.
 
     Updates subvolumes with mount_point and device information.
+    Also adds mounted subvolumes that weren't detected by 'btrfs subvolume list'
+    (e.g., the top-level subvolume ID 5 which is often the root filesystem).
 
     Args:
         mounts: List of btrfs mount info.
@@ -272,6 +307,9 @@ def correlate_mounts_and_subvolumes(
                 normalized = "/" + normalized
             mount_by_path[normalized] = mount
 
+    # Track which subvol IDs we've seen
+    seen_ids: set[int] = {subvol.id for subvol in subvolumes}
+
     # Update subvolumes
     for subvol in subvolumes:
         # Try by ID first
@@ -284,6 +322,33 @@ def correlate_mounts_and_subvolumes(
             mount = mount_by_path[subvol.path]
             subvol.mount_point = mount.mount_point
             subvol.device = mount.device
+
+    # Add mounted subvolumes that weren't in the btrfs subvolume list
+    # This is important for the top-level subvolume (ID 5) which is typically
+    # not shown by 'btrfs subvolume list' but may be mounted as /
+    for mount in mounts:
+        if mount.subvol_id not in seen_ids:
+            # Determine path from mount info
+            path = mount.subvol_path or mount.mount_point
+            if not path.startswith("/"):
+                path = "/" + path
+
+            subvolumes.append(
+                DetectedSubvolume(
+                    id=mount.subvol_id,
+                    path=path,
+                    mount_point=mount.mount_point,
+                    device=mount.device,
+                    top_level=0,  # Top-level subvolumes have no parent
+                )
+            )
+            seen_ids.add(mount.subvol_id)
+            logger.debug(
+                "Added mounted subvolume not in list: id=%d path=%s mount=%s",
+                mount.subvol_id,
+                path,
+                mount.mount_point,
+            )
 
     # Set device for unmounted subvolumes from any mount on same filesystem
     if mounts:

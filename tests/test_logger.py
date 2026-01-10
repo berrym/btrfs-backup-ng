@@ -1,12 +1,15 @@
 """Tests for logger module."""
 
 import logging
-
+import tempfile
+from pathlib import Path
 
 from btrfs_backup_ng.__logger__ import (
     RichLogger,
+    add_file_handler,
     create_logger,
     logger,
+    remove_file_handler,
     set_level,
 )
 
@@ -171,3 +174,104 @@ class TestLoggerBasicUsage:
         # At ERROR level, INFO messages should be filtered
         # This is hard to test without capturing output, but we verify the level
         assert logger.level == logging.ERROR
+
+
+class TestFileLogging:
+    """Tests for file logging functionality."""
+
+    def test_add_file_handler_creates_file(self):
+        """Test that add_file_handler creates the log file."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            log_file = Path(tmpdir) / "test.log"
+            add_file_handler(str(log_file))
+
+            # Write a log message
+            logger.info("test message")
+
+            # File should exist
+            assert log_file.exists()
+
+            # Clean up
+            remove_file_handler()
+
+    def test_add_file_handler_with_level_string(self):
+        """Test add_file_handler with level as string."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            log_file = Path(tmpdir) / "test.log"
+            add_file_handler(str(log_file), level="WARNING")
+
+            # Clean up
+            remove_file_handler()
+
+    def test_add_file_handler_with_level_constant(self):
+        """Test add_file_handler with level as constant."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            log_file = Path(tmpdir) / "test.log"
+            add_file_handler(str(log_file), level=logging.ERROR)
+
+            # Clean up
+            remove_file_handler()
+
+    def test_add_file_handler_creates_parent_dirs(self):
+        """Test that add_file_handler creates parent directories."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            log_file = Path(tmpdir) / "subdir" / "nested" / "test.log"
+            add_file_handler(str(log_file))
+
+            # Parent dirs should exist
+            assert log_file.parent.exists()
+
+            # Clean up
+            remove_file_handler()
+
+    def test_add_file_handler_replaces_existing_handler(self):
+        """Test that add_file_handler replaces existing file handler."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            log_file1 = Path(tmpdir) / "test1.log"
+            log_file2 = Path(tmpdir) / "test2.log"
+
+            add_file_handler(str(log_file1))
+            add_file_handler(str(log_file2))
+
+            # Should only have one file handler
+            file_handlers = [
+                h
+                for h in logger.handlers
+                if isinstance(h, logging.handlers.RotatingFileHandler)
+            ]
+            assert len(file_handlers) == 1
+
+            # Clean up
+            remove_file_handler()
+
+    def test_remove_file_handler(self):
+        """Test that remove_file_handler removes the handler."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            log_file = Path(tmpdir) / "test.log"
+            add_file_handler(str(log_file))
+
+            # Should have a file handler
+            file_handlers_before = [
+                h
+                for h in logger.handlers
+                if isinstance(h, logging.handlers.RotatingFileHandler)
+            ]
+            assert len(file_handlers_before) == 1
+
+            remove_file_handler()
+
+            # Should have no file handlers
+            file_handlers_after = [
+                h
+                for h in logger.handlers
+                if isinstance(h, logging.handlers.RotatingFileHandler)
+            ]
+            assert len(file_handlers_after) == 0
+
+    def test_remove_file_handler_when_none(self):
+        """Test that remove_file_handler is safe when no handler exists."""
+        # Ensure no file handler
+        remove_file_handler()
+
+        # Should not raise
+        remove_file_handler()

@@ -22,22 +22,49 @@ See the [LICENSE](LICENSE) file for full copyright attribution.
 
 ## Features
 
+### Core Functionality
 - **TOML Configuration**: Clean, validated configuration files (no custom syntax)
 - **Subcommand CLI**: Modern interface with `run`, `snapshot`, `transfer`, `prune`, `restore`, `verify`, `estimate`, `list`, `status`
 - **Disaster Recovery**: Built-in restore command to pull backups back to local systems
 - **Backup Verification**: Multi-level integrity checks (metadata, stream, full restore test)
 - **Space-Aware Operations**: Pre-flight destination space checking with btrfs quota support
-- **Subvolume Detection**: Automatic discovery of btrfs subvolumes for easy configuration
 - **Time-based Retention**: Intuitive policies (hourly, daily, weekly, monthly, yearly)
+
+### Interactive Configuration Wizard
+- **Guided Setup**: Step-by-step configuration with Rich-formatted tables and prompts
+- **Auto-Detection**: Automatically discovers btrfs subvolumes and snapper configurations
+- **Smart Recommendations**: Suggests which volumes to back up based on classification
+- **Rollback Detection**: Identifies systems booted from snapper snapshots
+- **Real-time Preview**: Shows configuration as you build it
+
+### Snapper Integration
+- **Full Snapper Support**: Back up and restore Snapper-managed snapshots
+- **Metadata Preservation**: Preserves `info.xml` for seamless Snapper restoration
+- **Pre/Post Pairs**: Supports single, pre, and post snapshot types
+- **Incremental Transfers**: Efficient delta-based transfers between snapshots
+- **Generate Config**: Auto-generate TOML config from existing Snapper setup
+
+### btrbk Migration
+- **Configuration Import**: Convert btrbk.conf to TOML with full syntax support
+- **Timestamp Format Mapping**: Correctly maps `short`, `long`, and `long-iso` formats
+- **Systemd Migration**: One-command migration from btrbk timer to btrfs-backup-ng
+- **Seamless Transition**: Continue incremental backups from existing btrbk snapshots
+- **Wizard Integration**: Detect and offer btrbk import in the interactive wizard
+
+### Transfer & Performance
 - **Rich Progress Bars**: Real-time transfer progress with speed, ETA, and percentage
 - **Parallel Execution**: Concurrent volume and target transfers
 - **Stream Compression**: zstd, gzip, lz4, pigz, lzop support
 - **Bandwidth Throttling**: Rate limiting for remote transfers
+- **Robust SSH**: Password fallback, sudo support, Paramiko integration
+
+### Monitoring & Automation
 - **Transaction Logging**: Structured JSON logs for auditing and automation
 - **Email & Webhook Notifications**: Alerts on backup success/failure
 - **Systemd Integration**: Built-in timer/service installation
-- **btrbk Migration**: Import existing btrbk configurations
-- **Robust SSH**: Password fallback, sudo support, Paramiko integration
+- **Doctor Command**: Diagnose backup system health and auto-fix issues
+
+### Compatibility
 - **User-Friendly Defaults**: Auto-mode for filesystem checks warns but continues
 - **Legacy Compatibility**: Original CLI still works
 
@@ -719,7 +746,28 @@ systemctl list-timers btrfs-backup-ng.timer
 
 ## Migrating from btrbk
 
-Import your existing btrbk configuration:
+btrfs-backup-ng provides comprehensive migration support from btrbk, including configuration import with proper timestamp format handling and systemd timer migration.
+
+### Quick Migration
+
+```bash
+# 1. Import your btrbk configuration
+btrfs-backup-ng config import /etc/btrbk/btrbk.conf -o ~/.config/btrfs-backup-ng/config.toml
+
+# 2. Review the generated config
+cat ~/.config/btrfs-backup-ng/config.toml
+
+# 3. Migrate systemd timers (disable btrbk, optionally enable btrfs-backup-ng)
+sudo btrfs-backup-ng config migrate-systemd --dry-run  # Preview changes
+sudo btrfs-backup-ng config migrate-systemd            # Apply changes
+
+# 4. Test the new configuration
+sudo btrfs-backup-ng run --dry-run
+```
+
+### Configuration Import
+
+The importer handles btrbk's configuration syntax and converts it to TOML:
 
 ```bash
 btrfs-backup-ng config import /etc/btrbk/btrbk.conf -o config.toml
@@ -727,9 +775,71 @@ btrfs-backup-ng config import /etc/btrbk/btrbk.conf -o config.toml
 
 The importer will:
 - Convert btrbk's custom syntax to TOML
+- **Map timestamp formats correctly** (`short` → `%Y%m%d`, `long` → `%Y%m%dT%H%M`, `long-iso` → `%Y%m%dT%H%M%S%z`)
 - Translate retention policies
+- Convert SSH targets (including `backend btrfs-progs-sudo` → `ssh_sudo = true`)
 - Warn about common btrbk pitfalls
 - Suggest improvements
+
+### Systemd Timer Migration
+
+If you're using btrbk's systemd timer for scheduled backups, migrate to btrfs-backup-ng's timer:
+
+```bash
+# Check current systemd status
+btrfs-backup-ng config migrate-systemd --dry-run
+
+# Output shows:
+#   btrbk.timer (enabled) - will be disabled
+#   btrfs-backup-ng.timer - will be enabled (if installed)
+
+# Apply the migration
+sudo btrfs-backup-ng config migrate-systemd
+```
+
+This command:
+- Stops and disables btrbk.timer
+- Enables btrfs-backup-ng.timer (if installed)
+- Prevents both tools from running simultaneously
+
+If btrfs-backup-ng's timer isn't installed yet:
+```bash
+# Install the systemd timer first
+sudo btrfs-backup-ng install --timer=hourly
+
+# Then migrate
+sudo btrfs-backup-ng config migrate-systemd
+```
+
+### Interactive Wizard Migration
+
+The detection wizard also offers btrbk migration when a btrbk config is found:
+
+```bash
+sudo btrfs-backup-ng config detect --wizard
+```
+
+The wizard will:
+1. Detect existing btrbk configuration
+2. Offer to import it (or start fresh)
+3. Display imported volumes in a table for review
+4. Allow customization before saving
+5. Offer to migrate systemd timers after saving
+
+### Seamless Transition
+
+For a seamless transition that continues using btrbk's existing snapshots:
+
+1. **Import with matching timestamp format**: The importer preserves btrbk's timestamp format so existing snapshots are recognized
+2. **Keep the same snapshot directory**: By default, btrbk and btrfs-backup-ng both use `.snapshots`
+3. **Incremental transfers continue**: Existing snapshots serve as parents for new transfers
+
+```toml
+# Imported config preserves btrbk's timestamp format
+[global]
+timestamp_format = "%Y%m%dT%H%M"  # Matches btrbk's "long" format
+snapshot_dir = ".snapshots"       # Same as btrbk default
+```
 
 ### Key Differences from btrbk
 
@@ -738,9 +848,13 @@ The importer will:
 | Config format | Custom syntax | TOML (standard) |
 | Config validation | Runtime errors | Pre-flight validation |
 | Indentation | Ignored (confusing) | TOML is explicit |
+| Timestamp formats | short/long/long-iso | strftime patterns |
 | Language | Perl | Python |
 | CLI output | Plain text | Rich formatting |
 | SSH handling | External ssh | Native Paramiko option |
+| Systemd integration | Manual setup | Built-in install/migrate |
+
+For detailed migration information, see [docs/MIGRATING-FROM-BTRBK.md](docs/MIGRATING-FROM-BTRBK.md).
 
 ## SSH Remote Backup Setup
 

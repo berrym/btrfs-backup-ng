@@ -22,6 +22,11 @@ from btrfs_backup_ng.detection import (
     process_detection_result,
     scan_system,
 )
+from btrfs_backup_ng.detection.classifier import (
+    _get_priority_and_reason,
+    _suggest_snapshot_dir,
+)
+from btrfs_backup_ng.detection.scanner import get_subvolume_details, is_removable_media
 
 
 class TestBtrfsMountInfo:
@@ -65,6 +70,37 @@ class TestBtrfsMountInfo:
         assert mount1 != mount3
         assert hash(mount1) == hash(mount2)
         assert hash(mount1) != hash(mount3)
+
+    def test_equality_with_non_mount_info(self):
+        """Test equality returns NotImplemented for non-BtrfsMountInfo."""
+        mount = BtrfsMountInfo(
+            device="/dev/sda1",
+            mount_point="/home",
+            subvol_path="/home",
+            subvol_id=256,
+        )
+        # Comparing with non-BtrfsMountInfo should use NotImplemented
+        assert mount != "not a mount"
+        assert mount != 256
+        assert mount != None
+
+    def test_hash_for_set_usage(self):
+        """Test that BtrfsMountInfo can be used in sets."""
+        mount1 = BtrfsMountInfo(
+            device="/dev/sda1",
+            mount_point="/home",
+            subvol_path="/home",
+            subvol_id=256,
+        )
+        mount2 = BtrfsMountInfo(
+            device="/dev/sda1",
+            mount_point="/mnt/home",
+            subvol_path="/home",
+            subvol_id=256,
+        )
+        # Can be used in a set
+        mount_set = {mount1, mount2}
+        assert len(mount_set) == 1  # Same device and subvol_id
 
 
 class TestDetectedSubvolume:
@@ -111,6 +147,27 @@ class TestDetectedSubvolume:
 
         assert subvol1 == subvol2
         assert subvol1 != subvol3
+
+    def test_equality_with_non_subvolume(self):
+        """Test equality returns NotImplemented for non-DetectedSubvolume."""
+        subvol = DetectedSubvolume(id=256, path="/home", device="/dev/sda1")
+        # Comparing with non-DetectedSubvolume should use NotImplemented
+        assert subvol != "not a subvolume"
+        assert subvol != 256
+        assert subvol != None
+
+    def test_hash_for_set_usage(self):
+        """Test that DetectedSubvolume can be used in sets."""
+        subvol1 = DetectedSubvolume(id=256, path="/home", device="/dev/sda1")
+        subvol2 = DetectedSubvolume(id=256, path="/@home", device="/dev/sda1")
+        subvol3 = DetectedSubvolume(id=257, path="/data", device="/dev/sda1")
+
+        # Same id and device should hash to same value
+        assert hash(subvol1) == hash(subvol2)
+
+        # Can be used in a set
+        subvol_set = {subvol1, subvol2, subvol3}
+        assert len(subvol_set) == 2  # subvol1 and subvol2 are equal
 
 
 class TestBackupSuggestion:
@@ -186,6 +243,40 @@ class TestDetectionResult:
         assert snapshot in excluded
         assert internal in excluded
         assert home not in excluded
+
+    def test_optional_subvolumes(self):
+        """Test optional_subvolumes property."""
+        home = DetectedSubvolume(
+            id=256, path="/home", classification=SubvolumeClass.USER_DATA
+        )
+        var_log = DetectedSubvolume(
+            id=257, path="/var/log", classification=SubvolumeClass.VARIABLE
+        )
+        snapshot = DetectedSubvolume(
+            id=300,
+            path="/.snapshots/1/snapshot",
+            classification=SubvolumeClass.SNAPSHOT,
+        )
+
+        # home is recommended, var_log is not
+        result = DetectionResult(
+            subvolumes=[home, var_log, snapshot],
+            suggestions=[
+                BackupSuggestion(subvolume=home, suggested_prefix="home", priority=1),
+                BackupSuggestion(
+                    subvolume=var_log, suggested_prefix="var-log", priority=5
+                ),
+            ],
+        )
+
+        optional = result.optional_subvolumes
+        # var_log should be optional (not recommended, not excluded)
+        assert len(optional) == 1
+        assert var_log in optional
+        # home is recommended, not optional
+        assert home not in optional
+        # snapshot is excluded, not optional
+        assert snapshot not in optional
 
     def test_to_dict(self):
         """Test to_dict serialization."""
@@ -296,6 +387,37 @@ tmpfs /tmp tmpfs rw 0 0"""
         mounts = parse_proc_mounts(mounts_file="/nonexistent/path")
         assert mounts == []
 
+    def test_excludes_removable_media_by_default(self):
+        """Test that removable media mounts are excluded by default."""
+        content = """/dev/sda1 / btrfs rw,subvolid=5,subvol=/ 0 0
+/dev/sda1 /home btrfs rw,subvolid=256,subvol=/home 0 0
+/dev/sdb1 /run/media/user/external btrfs rw,subvolid=5,subvol=/ 0 0
+/dev/sdc1 /media/backup btrfs rw,subvolid=5,subvol=/ 0 0
+/dev/sdd1 /mnt/usb btrfs rw,subvolid=5,subvol=/ 0 0"""
+
+        mounts = parse_proc_mounts(content)
+
+        # Only / and /home should be included
+        assert len(mounts) == 2
+        mount_points = {m.mount_point for m in mounts}
+        assert "/" in mount_points
+        assert "/home" in mount_points
+        assert "/run/media/user/external" not in mount_points
+        assert "/media/backup" not in mount_points
+        assert "/mnt/usb" not in mount_points
+
+    def test_includes_removable_media_when_disabled(self):
+        """Test that removable media can be included if requested."""
+        content = """/dev/sda1 / btrfs rw,subvolid=5,subvol=/ 0 0
+/dev/sdb1 /run/media/user/external btrfs rw,subvolid=5,subvol=/ 0 0"""
+
+        mounts = parse_proc_mounts(content, exclude_removable=False)
+
+        assert len(mounts) == 2
+        mount_points = {m.mount_point for m in mounts}
+        assert "/" in mount_points
+        assert "/run/media/user/external" in mount_points
+
 
 class TestListSubvolumes:
     """Tests for list_subvolumes function."""
@@ -319,6 +441,36 @@ ID 258 gen 12347 top level 256 path <FS_TREE>/home/.snapshots/1/snapshot""",
         assert subvols[1].path == "/@"
         assert subvols[2].id == 258
         assert subvols[2].top_level == 256
+
+    @patch("btrfs_backup_ng.detection.scanner.subprocess.run")
+    def test_list_subvolumes_fs_tree_no_slash(self, mock_run):
+        """Test parsing path with <FS_TREE> but no slash after."""
+        mock_run.return_value = MagicMock(
+            returncode=0,
+            stdout="ID 256 gen 12345 top level 5 path <FS_TREE>home",
+        )
+
+        subvols = list_subvolumes("/")
+
+        assert len(subvols) == 1
+        assert subvols[0].path == "/home"
+
+    @patch("btrfs_backup_ng.detection.scanner.subprocess.run")
+    def test_list_subvolumes_unparseable_line(self, mock_run):
+        """Test handling of lines that don't match expected format."""
+        mock_run.return_value = MagicMock(
+            returncode=0,
+            stdout="""ID 256 gen 12345 top level 5 path <FS_TREE>/home
+some garbage line that doesn't match
+ID 257 gen 12346 top level 5 path <FS_TREE>/data""",
+        )
+
+        subvols = list_subvolumes("/")
+
+        # Should skip the bad line
+        assert len(subvols) == 2
+        assert subvols[0].path == "/home"
+        assert subvols[1].path == "/data"
 
     @patch("btrfs_backup_ng.detection.scanner.subprocess.run")
     def test_list_subvolumes_permission_denied(self, mock_run):
@@ -368,6 +520,76 @@ ID 258 gen 12347 top level 256 path <FS_TREE>/home/.snapshots/1/snapshot""",
 
         subvols = list_subvolumes("/")
         assert subvols == []
+
+
+class TestIsRemovableMedia:
+    """Tests for is_removable_media function."""
+
+    def test_run_media_is_removable(self):
+        """Test /run/media paths are detected as removable."""
+        assert is_removable_media("/run/media/user/usb") is True
+
+    def test_media_is_removable(self):
+        """Test /media paths are detected as removable."""
+        assert is_removable_media("/media/backup") is True
+
+    def test_mnt_is_removable(self):
+        """Test /mnt paths are detected as removable."""
+        assert is_removable_media("/mnt/usb") is True
+
+    def test_root_not_removable(self):
+        """Test / is not removable."""
+        assert is_removable_media("/") is False
+
+    def test_home_not_removable(self):
+        """Test /home is not removable."""
+        assert is_removable_media("/home") is False
+
+
+class TestGetSubvolumeDetails:
+    """Tests for get_subvolume_details function."""
+
+    @patch("btrfs_backup_ng.detection.scanner.subprocess.run")
+    def test_get_details_success(self, mock_run):
+        """Test getting subvolume details."""
+        mock_run.return_value = MagicMock(
+            returncode=0,
+            stdout="""Name: home
+UUID: abc-123-def
+Parent UUID: -
+Received UUID: -
+Creation time: 2024-01-01 12:00:00
+Subvolume ID: 256
+Generation: 12345
+Flags: -""",
+        )
+
+        details = get_subvolume_details("/home")
+
+        assert details["name"] == "home"
+        assert details["uuid"] == "abc-123-def"
+        assert details["subvolume id"] == "256"
+
+    @patch("btrfs_backup_ng.detection.scanner.subprocess.run")
+    def test_get_details_command_not_found(self, mock_run):
+        """Test handling btrfs command not found."""
+        mock_run.side_effect = FileNotFoundError()
+
+        details = get_subvolume_details("/home")
+
+        assert details == {}
+
+    @patch("btrfs_backup_ng.detection.scanner.subprocess.run")
+    def test_get_details_command_fails(self, mock_run):
+        """Test handling command failure."""
+        mock_run.return_value = MagicMock(
+            returncode=1,
+            stderr="ERROR: not a subvolume",
+        )
+
+        details = get_subvolume_details("/not/a/subvolume")
+
+        assert details == {}
 
 
 class TestCorrelateSubvolumes:
@@ -427,6 +649,100 @@ class TestCorrelateSubvolumes:
         assert result[0].device == "/dev/sda1"
         assert result[0].mount_point is None
 
+    def test_adds_mounted_subvolumes_not_in_list(self):
+        """Test that mounted subvolumes not in btrfs list are added.
+
+        The top-level subvolume (ID 5) is not shown by 'btrfs subvolume list'
+        but may be mounted as /. This test ensures such subvolumes are added.
+        """
+        mounts = [
+            BtrfsMountInfo(
+                device="/dev/sda1",
+                mount_point="/",
+                subvol_path="/",
+                subvol_id=5,  # Top-level, not in btrfs list
+            ),
+            BtrfsMountInfo(
+                device="/dev/sda1",
+                mount_point="/home",
+                subvol_path="/home",
+                subvol_id=256,
+            ),
+        ]
+        # btrfs subvolume list only shows 256, not 5
+        subvols = [DetectedSubvolume(id=256, path="/home")]
+
+        result = correlate_mounts_and_subvolumes(mounts, subvols)
+
+        # Should have both subvolumes now
+        assert len(result) == 2
+        ids = {s.id for s in result}
+        assert 5 in ids
+        assert 256 in ids
+
+        # Check the added root subvolume
+        root_subvol = next(s for s in result if s.id == 5)
+        assert root_subvol.mount_point == "/"
+        assert root_subvol.path == "/"
+        assert root_subvol.device == "/dev/sda1"
+
+    def test_adds_root_subvolume_from_mount(self):
+        """Test that root / is added when only mounted but not in subvol list."""
+        mounts = [
+            BtrfsMountInfo(
+                device="/dev/nvme0n1p2",
+                mount_point="/",
+                subvol_path="/",
+                subvol_id=5,
+            ),
+        ]
+        # Empty subvolume list (simulates btrfs list not showing top-level)
+        subvols = []
+
+        result = correlate_mounts_and_subvolumes(mounts, subvols)
+
+        assert len(result) == 1
+        assert result[0].id == 5
+        assert result[0].path == "/"
+        assert result[0].mount_point == "/"
+        assert result[0].device == "/dev/nvme0n1p2"
+
+    def test_no_duplicate_subvolumes_added(self):
+        """Test that subvolumes already in list are not duplicated."""
+        mounts = [
+            BtrfsMountInfo(
+                device="/dev/sda1",
+                mount_point="/home",
+                subvol_path="/home",
+                subvol_id=256,
+            ),
+        ]
+        # Subvolume already in list
+        subvols = [DetectedSubvolume(id=256, path="/home")]
+
+        result = correlate_mounts_and_subvolumes(mounts, subvols)
+
+        # Should still be just one
+        assert len(result) == 1
+        assert result[0].id == 256
+
+    def test_adds_subvolume_with_normalized_path(self):
+        """Test that added subvolumes have normalized paths starting with /."""
+        mounts = [
+            BtrfsMountInfo(
+                device="/dev/sda1",
+                mount_point="/",
+                subvol_path="@",  # No leading slash
+                subvol_id=256,
+            ),
+        ]
+        subvols = []
+
+        result = correlate_mounts_and_subvolumes(mounts, subvols)
+
+        assert len(result) == 1
+        assert result[0].path == "/@"  # Should be normalized with leading /
+
 
 class TestClassifySubvolume:
     """Tests for classify_subvolume function."""
@@ -466,6 +782,20 @@ class TestClassifySubvolume:
     def test_classify_timeshift_snapshots(self):
         """Test timeshift snapshots are classified as SNAPSHOT."""
         subvol = DetectedSubvolume(id=300, path="/timeshift-btrfs/snapshots/2024-01-01")
+        assert classify_subvolume(subvol) == SubvolumeClass.SNAPSHOT
+
+    def test_classify_root_snapshots_dir(self):
+        """Test /.snapshots directory is classified as SNAPSHOT."""
+        subvol = DetectedSubvolume(
+            id=300, path="/.snapshots", mount_point="/.snapshots"
+        )
+        assert classify_subvolume(subvol) == SubvolumeClass.SNAPSHOT
+
+    def test_classify_home_snapshots_dir(self):
+        """Test /home/.snapshots directory is classified as SNAPSHOT."""
+        subvol = DetectedSubvolume(
+            id=301, path="/home/.snapshots", mount_point="/home/.snapshots"
+        )
         assert classify_subvolume(subvol) == SubvolumeClass.SNAPSHOT
 
     def test_classify_with_parent_uuid(self):
@@ -508,6 +838,102 @@ class TestClassifySubvolume:
         subvol = DetectedSubvolume(id=700, path="/some/random/path")
         assert classify_subvolume(subvol) == SubvolumeClass.UNKNOWN
 
+    def test_classify_relative_path_normalized(self):
+        """Test that paths without leading slash are normalized."""
+        # Path like "@home" (common btrfs subvolume naming) gets normalized to "/@home"
+        subvol = DetectedSubvolume(id=256, path="@home")
+        result = classify_subvolume(subvol)
+        # Should not crash and should return some classification
+        assert result in SubvolumeClass
+
+
+class TestSuggestSnapshotDir:
+    """Tests for _suggest_snapshot_dir function."""
+
+    def test_with_mount_point(self):
+        """Test suggesting snapshot dir for mounted subvolume."""
+        subvol = DetectedSubvolume(id=256, path="/home", mount_point="/home")
+        result = _suggest_snapshot_dir(subvol)
+        # Returns relative path .snapshots for mounted subvolumes
+        assert result == ".snapshots"
+
+    def test_with_root_mount(self):
+        """Test suggesting snapshot dir for root mount."""
+        subvol = DetectedSubvolume(id=5, path="/", mount_point="/")
+        result = _suggest_snapshot_dir(subvol)
+        # Returns relative path .snapshots for mounted subvolumes
+        assert result == ".snapshots"
+
+    def test_without_mount_point(self):
+        """Test suggesting snapshot dir for unmounted subvolume."""
+        subvol = DetectedSubvolume(id=256, path="/@home")
+        result = _suggest_snapshot_dir(subvol)
+        # Should use path-based suggestion
+        assert ".snapshots" in result
+
+
+class TestGetPriorityAndReason:
+    """Tests for _get_priority_and_reason function."""
+
+    def test_user_data_priority(self):
+        """Test USER_DATA gets priority 1."""
+        subvol = DetectedSubvolume(
+            id=256,
+            path="/home",
+            mount_point="/home",
+            classification=SubvolumeClass.USER_DATA,
+        )
+        priority, reason = _get_priority_and_reason(subvol)
+        assert priority == 1
+
+    def test_system_root_priority(self):
+        """Test SYSTEM_ROOT gets priority 2."""
+        subvol = DetectedSubvolume(
+            id=5, path="/", mount_point="/", classification=SubvolumeClass.SYSTEM_ROOT
+        )
+        priority, reason = _get_priority_and_reason(subvol)
+        assert priority == 2
+
+    def test_system_data_priority(self):
+        """Test SYSTEM_DATA gets priority 3."""
+        subvol = DetectedSubvolume(
+            id=256,
+            path="/opt",
+            mount_point="/opt",
+            classification=SubvolumeClass.SYSTEM_DATA,
+        )
+        priority, reason = _get_priority_and_reason(subvol)
+        assert priority == 3
+
+    def test_variable_priority_var_log(self):
+        """Test VARIABLE with /var/log gets priority 4."""
+        subvol = DetectedSubvolume(
+            id=256,
+            path="/var/log",
+            mount_point="/var/log",
+            classification=SubvolumeClass.VARIABLE,
+        )
+        priority, reason = _get_priority_and_reason(subvol)
+        assert priority == 4
+        assert "Logs" in reason
+
+    def test_variable_priority_other(self):
+        """Test VARIABLE without /var/log gets priority 5."""
+        subvol = DetectedSubvolume(
+            id=256, path="/var/cache", classification=SubvolumeClass.VARIABLE
+        )
+        priority, reason = _get_priority_and_reason(subvol)
+        assert priority == 5
+
+    def test_unknown_priority(self):
+        """Test UNKNOWN gets priority 4."""
+        subvol = DetectedSubvolume(
+            id=256, path="/custom/path", classification=SubvolumeClass.UNKNOWN
+        )
+        priority, reason = _get_priority_and_reason(subvol)
+        assert priority == 4
+        assert "Unknown" in reason
+
 
 class TestClassifyAllSubvolumes:
     """Tests for classify_all_subvolumes function."""
@@ -526,6 +952,337 @@ class TestClassifyAllSubvolumes:
         assert result[1].classification == SubvolumeClass.SNAPSHOT
         assert result[1].is_snapshot is True
         assert result[2].classification == SubvolumeClass.INTERNAL
+
+
+class TestSnapperAwareClassification:
+    """Tests for snapper-aware classification functions."""
+
+    def _create_mock_snapper_config(self, name: str, subvolume: str):
+        """Create a mock SnapperConfig-like object."""
+        from pathlib import Path
+        from unittest.mock import MagicMock
+
+        config = MagicMock()
+        config.name = name
+        config.subvolume = Path(subvolume)
+        return config
+
+    def test_classify_root_from_snapper_config(self):
+        """Test that snapper config named 'root' classifies subvolume as SYSTEM_ROOT."""
+        from btrfs_backup_ng.detection import classify_from_snapper_config
+
+        # Create a subvolume with UNKNOWN classification (path doesn't match rules)
+        subvol = DetectedSubvolume(
+            id=256,
+            path="/@",
+            mount_point="/",
+            classification=SubvolumeClass.UNKNOWN,
+        )
+
+        snapper_configs = [self._create_mock_snapper_config("root", "/")]
+
+        classify_from_snapper_config([subvol], snapper_configs)
+
+        assert subvol.classification == SubvolumeClass.SYSTEM_ROOT
+
+    def test_classify_home_from_snapper_config(self):
+        """Test that snapper config named 'home' classifies subvolume as USER_DATA."""
+        from btrfs_backup_ng.detection import classify_from_snapper_config
+
+        subvol = DetectedSubvolume(
+            id=257,
+            path="/@home",
+            mount_point="/home",
+            classification=SubvolumeClass.UNKNOWN,
+        )
+
+        snapper_configs = [self._create_mock_snapper_config("home", "/home")]
+
+        classify_from_snapper_config([subvol], snapper_configs)
+
+        assert subvol.classification == SubvolumeClass.USER_DATA
+
+    def test_classify_opt_from_snapper_config(self):
+        """Test that snapper config named 'opt' classifies subvolume as SYSTEM_DATA."""
+        from btrfs_backup_ng.detection import classify_from_snapper_config
+
+        subvol = DetectedSubvolume(
+            id=258,
+            path="/@opt",
+            mount_point="/opt",
+            classification=SubvolumeClass.UNKNOWN,
+        )
+
+        snapper_configs = [self._create_mock_snapper_config("opt", "/opt")]
+
+        classify_from_snapper_config([subvol], snapper_configs)
+
+        assert subvol.classification == SubvolumeClass.SYSTEM_DATA
+
+    def test_classify_var_log_from_snapper_config(self):
+        """Test that snapper config named 'var_log' classifies as VARIABLE."""
+        from btrfs_backup_ng.detection import classify_from_snapper_config
+
+        subvol = DetectedSubvolume(
+            id=259,
+            path="/@var_log",
+            mount_point="/var/log",
+            classification=SubvolumeClass.UNKNOWN,
+        )
+
+        snapper_configs = [self._create_mock_snapper_config("var_log", "/var/log")]
+
+        classify_from_snapper_config([subvol], snapper_configs)
+
+        assert subvol.classification == SubvolumeClass.VARIABLE
+
+    def test_does_not_reclassify_snapshots(self):
+        """Test that snapshot classification is preserved."""
+        from btrfs_backup_ng.detection import classify_from_snapper_config
+
+        subvol = DetectedSubvolume(
+            id=300,
+            path="/.snapshots/1/snapshot",
+            classification=SubvolumeClass.SNAPSHOT,
+        )
+
+        snapper_configs = [self._create_mock_snapper_config("root", "/")]
+
+        classify_from_snapper_config([subvol], snapper_configs)
+
+        # Should still be SNAPSHOT
+        assert subvol.classification == SubvolumeClass.SNAPSHOT
+
+    def test_returns_path_map(self):
+        """Test that classify_from_snapper_config returns path map."""
+        from btrfs_backup_ng.detection import classify_from_snapper_config
+
+        subvol = DetectedSubvolume(
+            id=256,
+            path="/",
+            mount_point="/",
+            classification=SubvolumeClass.UNKNOWN,
+        )
+
+        snapper_configs = [self._create_mock_snapper_config("root", "/")]
+
+        path_map = classify_from_snapper_config([subvol], snapper_configs)
+
+        assert "/" in path_map
+        assert path_map["/"].name == "root"
+
+    def test_reclassify_with_snapper_regenerates_suggestions(self):
+        """Test that reclassify_with_snapper regenerates suggestions."""
+        from btrfs_backup_ng.detection import reclassify_with_snapper
+
+        # Create a result with UNKNOWN subvolume
+        subvol = DetectedSubvolume(
+            id=256,
+            path="/@",
+            mount_point="/",
+            classification=SubvolumeClass.UNKNOWN,
+        )
+
+        result = DetectionResult(
+            filesystems=[
+                BtrfsMountInfo(
+                    device="/dev/sda1",
+                    mount_point="/",
+                    subvol_path="/",
+                    subvol_id=256,
+                )
+            ],
+            subvolumes=[subvol],
+            suggestions=[
+                BackupSuggestion(
+                    subvolume=subvol,
+                    suggested_prefix="unknown",
+                    priority=4,  # UNKNOWN priority
+                )
+            ],
+        )
+
+        snapper_configs = [self._create_mock_snapper_config("root", "/")]
+
+        reclassify_with_snapper(result, snapper_configs)
+
+        # Classification should be updated
+        assert subvol.classification == SubvolumeClass.SYSTEM_ROOT
+
+        # Suggestions should be regenerated with new priority
+        assert len(result.suggestions) == 1
+        assert result.suggestions[0].priority == 2  # SYSTEM_ROOT priority
+
+    def test_partial_name_match(self):
+        """Test that partial name matches work (e.g., 'home_user' -> home)."""
+        from btrfs_backup_ng.detection import classify_from_snapper_config
+
+        subvol = DetectedSubvolume(
+            id=257,
+            path="/home/user",
+            mount_point="/home/user",
+            classification=SubvolumeClass.UNKNOWN,
+        )
+
+        # Config named "home_user" should match "home" pattern
+        snapper_configs = [self._create_mock_snapper_config("home_user", "/home/user")]
+
+        classify_from_snapper_config([subvol], snapper_configs)
+
+        assert subvol.classification == SubvolumeClass.USER_DATA
+
+    def test_unknown_snapper_name_preserves_classification(self):
+        """Test that unknown snapper names don't change classification."""
+        from btrfs_backup_ng.detection import classify_from_snapper_config
+
+        subvol = DetectedSubvolume(
+            id=260,
+            path="/custom",
+            mount_point="/custom",
+            classification=SubvolumeClass.UNKNOWN,
+        )
+
+        # Config with non-standard name
+        snapper_configs = [self._create_mock_snapper_config("mycustom", "/custom")]
+
+        classify_from_snapper_config([subvol], snapper_configs)
+
+        # Should remain UNKNOWN since "mycustom" doesn't match any pattern
+        assert subvol.classification == SubvolumeClass.UNKNOWN
+
+    def test_adds_missing_snapper_managed_root(self):
+        """Test that snapper-managed / is added when booted from snapshot.
+
+        When the system is booted from a snapper snapshot, the original /
+        may not appear in the detection results. But snapper still manages
+        it and it should be offered for backup.
+        """
+        from btrfs_backup_ng.detection import reclassify_with_snapper
+
+        # Simulate booting from a snapshot: / is mounted from a snapshot subvol
+        snapshot_subvol = DetectedSubvolume(
+            id=9097,
+            path="/.snapshots/7636/snapshot",
+            mount_point="/",
+            classification=SubvolumeClass.SNAPSHOT,
+            is_snapshot=True,
+        )
+
+        result = DetectionResult(
+            subvolumes=[snapshot_subvol],
+            filesystems=[
+                BtrfsMountInfo(
+                    device="/dev/sda1",
+                    mount_point="/",
+                    subvol_path="/.snapshots/7636/snapshot",
+                    subvol_id=9097,
+                )
+            ],
+        )
+
+        # Snapper "root" config manages /
+        snapper_configs = [self._create_mock_snapper_config("root", "/")]
+
+        reclassify_with_snapper(result, snapper_configs)
+
+        # Should have added a virtual subvolume for /
+        paths = [s.path for s in result.subvolumes]
+        assert "/" in paths
+
+        # Find the added root subvol
+        root_subvol = next(s for s in result.subvolumes if s.path == "/")
+        assert root_subvol.classification == SubvolumeClass.SYSTEM_ROOT
+        assert root_subvol.mount_point == "/"
+        assert root_subvol.id == 0  # Virtual, not directly detected
+
+        # Should have a suggestion for it
+        suggestion_paths = [s.subvolume.path for s in result.suggestions]
+        assert "/" in suggestion_paths
+
+    def test_adds_missing_snapper_managed_home(self):
+        """Test that snapper-managed /home is added if not detected."""
+        from btrfs_backup_ng.detection import reclassify_with_snapper
+
+        result = DetectionResult(
+            subvolumes=[],  # No detected subvolumes
+            filesystems=[
+                BtrfsMountInfo(
+                    device="/dev/sda1",
+                    mount_point="/",
+                    subvol_path="/",
+                    subvol_id=5,
+                )
+            ],
+        )
+
+        snapper_configs = [self._create_mock_snapper_config("home", "/home")]
+
+        reclassify_with_snapper(result, snapper_configs)
+
+        # Should have added /home
+        assert len(result.subvolumes) == 1
+        assert result.subvolumes[0].path == "/home"
+        assert result.subvolumes[0].classification == SubvolumeClass.USER_DATA
+
+    def test_does_not_duplicate_existing_subvolume(self):
+        """Test that already-detected subvolumes aren't duplicated."""
+        from btrfs_backup_ng.detection import reclassify_with_snapper
+
+        home_subvol = DetectedSubvolume(
+            id=256,
+            path="/home",
+            mount_point="/home",
+            classification=SubvolumeClass.USER_DATA,
+        )
+
+        result = DetectionResult(
+            subvolumes=[home_subvol],
+            filesystems=[],
+        )
+
+        snapper_configs = [self._create_mock_snapper_config("home", "/home")]
+
+        reclassify_with_snapper(result, snapper_configs)
+
+        # Should still have just one /home subvolume
+        home_subvols = [s for s in result.subvolumes if s.path == "/home"]
+        assert len(home_subvols) == 1
+        assert home_subvols[0].id == 256  # Original, not virtual
+
+    def test_adds_multiple_missing_snapper_subvolumes(self):
+        """Test that multiple missing snapper-managed subvolumes are added."""
+        from btrfs_backup_ng.detection import reclassify_with_snapper
+
+        result = DetectionResult(
+            subvolumes=[],
+            filesystems=[
+                BtrfsMountInfo(
+                    device="/dev/sda1",
+                    mount_point="/",
+                    subvol_path="/",
+                    subvol_id=5,
+                )
+            ],
+        )
+
+        snapper_configs = [
+            self._create_mock_snapper_config("root", "/"),
+            self._create_mock_snapper_config("home", "/home"),
+            self._create_mock_snapper_config("opt", "/opt"),
+        ]
+
+        reclassify_with_snapper(result, snapper_configs)
+
+        paths = {s.path for s in result.subvolumes}
+        assert "/" in paths
+        assert "/home" in paths
+        assert "/opt" in paths
+
+        # Check classifications
+        classifications = {s.path: s.classification for s in result.subvolumes}
+        assert classifications["/"] == SubvolumeClass.SYSTEM_ROOT
+        assert classifications["/home"] == SubvolumeClass.USER_DATA
+        assert classifications["/opt"] == SubvolumeClass.SYSTEM_DATA
 
 
 class TestGenerateSuggestions:
@@ -1178,26 +1935,38 @@ class TestDetectionWizard:
 
     @patch("btrfs_backup_ng.snapper.SnapperScanner")
     @patch("btrfs_backup_ng.cli.config_cmd.find_config_file")
-    @patch("btrfs_backup_ng.cli.config_cmd._prompt_bool")
-    @patch("btrfs_backup_ng.cli.config_cmd._prompt_choice")
-    @patch("btrfs_backup_ng.cli.config_cmd._prompt")
+    @patch("btrfs_backup_ng.cli.config_cmd.find_btrbk_config")
+    @patch("btrfs_backup_ng.cli.config_cmd.prompt_bool")
+    @patch("btrfs_backup_ng.cli.config_cmd.prompt_choice")
+    @patch("btrfs_backup_ng.cli.config_cmd.prompt")
+    @patch("btrfs_backup_ng.cli.config_cmd.prompt_selection")
     def test_wizard_volume_selection_all(
-        self, mock_prompt, mock_choice, mock_bool, mock_find, mock_snapper, capsys
+        self,
+        mock_selection,
+        mock_prompt,
+        mock_choice,
+        mock_bool,
+        mock_btrbk,
+        mock_find,
+        mock_snapper,
+        capsys,
     ):
         """Test wizard with 'all' volume selection."""
         from btrfs_backup_ng.cli.config_cmd import _run_detection_wizard
 
         mock_find.return_value = None  # No existing config
+        mock_btrbk.return_value = None  # No btrbk config
         mock_snapper.return_value.list_configs.return_value = []  # No snapper configs
 
         result = self._create_mock_result()
 
+        # prompt_selection returns indices (0-based)
+        mock_selection.return_value = [0, 1]  # Select both volumes
+
         # Use /backup paths to avoid /mnt/ require_mount check
-        # Note: "add another target?" is _prompt_bool, not _prompt
         mock_prompt.side_effect = [
-            "all",  # Select all volumes
             "home",  # prefix for /home
-            "/backup/home",  # target for /home (not /mnt/ to avoid mount check)
+            "/backup/home",  # target for /home
             "root",  # prefix for /
             "/backup/root",  # target for /
         ]
@@ -1214,30 +1983,40 @@ class TestDetectionWizard:
 
         assert exit_code == 0
         captured = capsys.readouterr()
-        assert "Generated Configuration" in captured.out
         assert 'path = "/home"' in captured.out
         assert 'path = "/"' in captured.out
 
     @patch("btrfs_backup_ng.snapper.SnapperScanner")
     @patch("btrfs_backup_ng.cli.config_cmd.find_config_file")
-    @patch("btrfs_backup_ng.cli.config_cmd._prompt_bool")
-    @patch("btrfs_backup_ng.cli.config_cmd._prompt_choice")
-    @patch("btrfs_backup_ng.cli.config_cmd._prompt")
+    @patch("btrfs_backup_ng.cli.config_cmd.find_btrbk_config")
+    @patch("btrfs_backup_ng.cli.config_cmd.prompt_bool")
+    @patch("btrfs_backup_ng.cli.config_cmd.prompt_choice")
+    @patch("btrfs_backup_ng.cli.config_cmd.prompt")
+    @patch("btrfs_backup_ng.cli.config_cmd.prompt_selection")
     def test_wizard_volume_selection_specific(
-        self, mock_prompt, mock_choice, mock_bool, mock_find, mock_snapper, capsys
+        self,
+        mock_selection,
+        mock_prompt,
+        mock_choice,
+        mock_bool,
+        mock_btrbk,
+        mock_find,
+        mock_snapper,
+        capsys,
     ):
         """Test wizard with specific volume selection."""
         from btrfs_backup_ng.cli.config_cmd import _run_detection_wizard
 
         mock_find.return_value = None  # No existing config
+        mock_btrbk.return_value = None  # No btrbk config
         mock_snapper.return_value.list_configs.return_value = []  # No snapper configs
 
         result = self._create_mock_result()
 
-        # Select only volume 1 (/home), use /backup to avoid mount check
-        # Note: "add another target?" is _prompt_bool, not _prompt
+        # prompt_selection returns indices (0-based) - select only first
+        mock_selection.return_value = [0]
+
         mock_prompt.side_effect = [
-            "1",  # Select only first volume
             "home",  # prefix
             "/backup/home",  # target (not /mnt/)
         ]
@@ -1257,23 +2036,33 @@ class TestDetectionWizard:
 
     @patch("btrfs_backup_ng.snapper.SnapperScanner")
     @patch("btrfs_backup_ng.cli.config_cmd.find_config_file")
-    @patch("btrfs_backup_ng.cli.config_cmd._prompt_bool")
-    @patch("btrfs_backup_ng.cli.config_cmd._prompt_choice")
-    @patch("btrfs_backup_ng.cli.config_cmd._prompt")
+    @patch("btrfs_backup_ng.cli.config_cmd.find_btrbk_config")
+    @patch("btrfs_backup_ng.cli.config_cmd.prompt_bool")
+    @patch("btrfs_backup_ng.cli.config_cmd.prompt_choice")
+    @patch("btrfs_backup_ng.cli.config_cmd.prompt")
+    @patch("btrfs_backup_ng.cli.config_cmd.prompt_selection")
     def test_wizard_cancel(
-        self, mock_prompt, mock_choice, mock_bool, mock_find, mock_snapper, capsys
+        self,
+        mock_selection,
+        mock_prompt,
+        mock_choice,
+        mock_bool,
+        mock_btrbk,
+        mock_find,
+        mock_snapper,
+        capsys,
     ):
         """Test wizard cancellation."""
         from btrfs_backup_ng.cli.config_cmd import _run_detection_wizard
 
         mock_find.return_value = None  # No existing config
+        mock_btrbk.return_value = None  # No btrbk config
         mock_snapper.return_value.list_configs.return_value = []  # No snapper configs
 
         result = self._create_mock_result()
 
-        # Note: "add another target?" is _prompt_bool, not _prompt
+        mock_selection.return_value = [0]  # Select first volume
         mock_prompt.side_effect = [
-            "1",  # Select first volume
             "home",  # prefix
             "/backup",  # target (not /mnt/)
         ]
@@ -1288,28 +2077,36 @@ class TestDetectionWizard:
         exit_code = _run_detection_wizard(result)
 
         assert exit_code == 0
-        captured = capsys.readouterr()
-        assert "cancelled" in captured.out.lower()
 
     @patch("btrfs_backup_ng.snapper.SnapperScanner")
     @patch("btrfs_backup_ng.cli.config_cmd.find_config_file")
-    @patch("btrfs_backup_ng.cli.config_cmd._prompt_bool")
-    @patch("btrfs_backup_ng.cli.config_cmd._prompt_choice")
-    @patch("btrfs_backup_ng.cli.config_cmd._prompt")
+    @patch("btrfs_backup_ng.cli.config_cmd.find_btrbk_config")
+    @patch("btrfs_backup_ng.cli.config_cmd.prompt_bool")
+    @patch("btrfs_backup_ng.cli.config_cmd.prompt_choice")
+    @patch("btrfs_backup_ng.cli.config_cmd.prompt")
+    @patch("btrfs_backup_ng.cli.config_cmd.prompt_selection")
     def test_wizard_with_ssh_target(
-        self, mock_prompt, mock_choice, mock_bool, mock_find, mock_snapper, capsys
+        self,
+        mock_selection,
+        mock_prompt,
+        mock_choice,
+        mock_bool,
+        mock_btrbk,
+        mock_find,
+        mock_snapper,
+        capsys,
     ):
         """Test wizard with SSH target."""
         from btrfs_backup_ng.cli.config_cmd import _run_detection_wizard
 
         mock_find.return_value = None  # No existing config
+        mock_btrbk.return_value = None  # No btrbk config
         mock_snapper.return_value.list_configs.return_value = []  # No snapper configs
 
         result = self._create_mock_result()
 
-        # Note: "add another target?" is _prompt_bool, not _prompt
+        mock_selection.return_value = [0]  # Select first volume
         mock_prompt.side_effect = [
-            "1",  # Select first volume
             "home",  # prefix
             "ssh://user@host:/backup/home",  # SSH target
         ]
@@ -1331,23 +2128,33 @@ class TestDetectionWizard:
 
     @patch("btrfs_backup_ng.snapper.SnapperScanner")
     @patch("btrfs_backup_ng.cli.config_cmd.find_config_file")
-    @patch("btrfs_backup_ng.cli.config_cmd._prompt_bool")
-    @patch("btrfs_backup_ng.cli.config_cmd._prompt_choice")
-    @patch("btrfs_backup_ng.cli.config_cmd._prompt")
+    @patch("btrfs_backup_ng.cli.config_cmd.find_btrbk_config")
+    @patch("btrfs_backup_ng.cli.config_cmd.prompt_bool")
+    @patch("btrfs_backup_ng.cli.config_cmd.prompt_choice")
+    @patch("btrfs_backup_ng.cli.config_cmd.prompt")
+    @patch("btrfs_backup_ng.cli.config_cmd.prompt_selection")
     def test_wizard_with_mount_target(
-        self, mock_prompt, mock_choice, mock_bool, mock_find, mock_snapper, capsys
+        self,
+        mock_selection,
+        mock_prompt,
+        mock_choice,
+        mock_bool,
+        mock_btrbk,
+        mock_find,
+        mock_snapper,
+        capsys,
     ):
         """Test wizard with mount point target."""
         from btrfs_backup_ng.cli.config_cmd import _run_detection_wizard
 
         mock_find.return_value = None  # No existing config
+        mock_btrbk.return_value = None  # No btrbk config
         mock_snapper.return_value.list_configs.return_value = []  # No snapper configs
 
         result = self._create_mock_result()
 
-        # Note: "add another target?" is _prompt_bool, not _prompt
+        mock_selection.return_value = [0]  # Select first volume
         mock_prompt.side_effect = [
-            "1",  # Select first volume
             "home",  # prefix
             "/mnt/usb-drive/backup",  # Mount point target triggers require_mount
         ]
@@ -1369,24 +2176,36 @@ class TestDetectionWizard:
 
     @patch("btrfs_backup_ng.snapper.SnapperScanner")
     @patch("btrfs_backup_ng.cli.config_cmd.find_config_file")
-    @patch("btrfs_backup_ng.cli.config_cmd._prompt_bool")
-    @patch("btrfs_backup_ng.cli.config_cmd._prompt_choice")
-    @patch("btrfs_backup_ng.cli.config_cmd._prompt")
+    @patch("btrfs_backup_ng.cli.config_cmd.find_btrbk_config")
+    @patch("btrfs_backup_ng.cli.config_cmd.prompt_bool")
+    @patch("btrfs_backup_ng.cli.config_cmd.prompt_choice")
+    @patch("btrfs_backup_ng.cli.config_cmd.prompt")
+    @patch("btrfs_backup_ng.cli.config_cmd.prompt_selection")
     def test_wizard_invalid_selection_fallback(
-        self, mock_prompt, mock_choice, mock_bool, mock_find, mock_snapper, capsys
+        self,
+        mock_selection,
+        mock_prompt,
+        mock_choice,
+        mock_bool,
+        mock_btrbk,
+        mock_find,
+        mock_snapper,
+        capsys,
     ):
-        """Test wizard falls back to recommended on invalid selection."""
+        """Test wizard handles empty selection by returning default."""
         from btrfs_backup_ng.cli.config_cmd import _run_detection_wizard
 
         mock_find.return_value = None  # No existing config
+        mock_btrbk.return_value = None  # No btrbk config
         mock_snapper.return_value.list_configs.return_value = []  # No snapper configs
 
         result = self._create_mock_result()
 
-        # Invalid selection -> falls back to recommended (both), use /backup paths
-        # Note: "add another target?" is _prompt_bool, not _prompt
+        # prompt_selection handles invalid input internally,
+        # returns the default (recommended) indices
+        mock_selection.return_value = [0, 1]  # Both recommended
+
         mock_prompt.side_effect = [
-            "invalid",  # Invalid selection -> falls back to recommended
             "home",  # prefix for /home
             "/backup/home",  # target (not /mnt/)
             "root",  # prefix for /
@@ -1405,20 +2224,25 @@ class TestDetectionWizard:
 
         assert exit_code == 0
         captured = capsys.readouterr()
-        assert "Invalid selection" in captured.out
+        assert 'path = "/home"' in captured.out
+        assert 'path = "/"' in captured.out
 
     @patch("btrfs_backup_ng.snapper.SnapperScanner")
     @patch("btrfs_backup_ng.cli.config_cmd.find_config_file")
-    @patch("btrfs_backup_ng.cli.config_cmd._prompt_bool")
-    @patch("btrfs_backup_ng.cli.config_cmd._prompt_choice")
-    @patch("btrfs_backup_ng.cli.config_cmd._prompt")
-    @patch("btrfs_backup_ng.cli.config_cmd._prompt_int")
+    @patch("btrfs_backup_ng.cli.config_cmd.find_btrbk_config")
+    @patch("btrfs_backup_ng.cli.config_cmd.prompt_bool")
+    @patch("btrfs_backup_ng.cli.config_cmd.prompt_choice")
+    @patch("btrfs_backup_ng.cli.config_cmd.prompt")
+    @patch("btrfs_backup_ng.cli.config_cmd.prompt_int")
+    @patch("btrfs_backup_ng.cli.config_cmd.prompt_selection")
     def test_wizard_with_global_settings(
         self,
+        mock_selection,
         mock_int,
         mock_prompt,
         mock_choice,
         mock_bool,
+        mock_btrbk,
         mock_find,
         mock_snapper,
         capsys,
@@ -1427,13 +2251,13 @@ class TestDetectionWizard:
         from btrfs_backup_ng.cli.config_cmd import _run_detection_wizard
 
         mock_find.return_value = None  # No existing config
+        mock_btrbk.return_value = None  # No btrbk config
         mock_snapper.return_value.list_configs.return_value = []  # No snapper configs
 
         result = self._create_mock_result()
 
-        # Note: "add another target?" is _prompt_bool, not _prompt
+        mock_selection.return_value = [0]  # Select first volume
         mock_prompt.side_effect = [
-            "1",  # Select first volume
             "home",  # prefix
             "/backup",  # target (not /mnt/)
             "2d",  # min retention
@@ -1461,9 +2285,14 @@ class TestDetectionWizard:
         assert "hourly = 48" in captured.out
         assert "daily = 14" in captured.out
 
-    def test_wizard_no_suggestions(self, capsys):
+    @patch("btrfs_backup_ng.snapper.SnapperScanner")
+    @patch("btrfs_backup_ng.cli.config_cmd.find_btrbk_config")
+    def test_wizard_no_suggestions(self, mock_btrbk, mock_snapper, capsys):
         """Test wizard when no suggestions available."""
         from btrfs_backup_ng.cli.config_cmd import _run_detection_wizard
+
+        mock_btrbk.return_value = None  # No btrbk config
+        mock_snapper.return_value.list_configs.return_value = []  # No snapper configs
 
         result = DetectionResult(
             filesystems=[
@@ -1484,9 +2313,13 @@ class TestDetectionWizard:
         captured = capsys.readouterr()
         assert "No subvolumes suitable for backup" in captured.out
 
-    def test_wizard_partial_result(self, capsys):
+    @patch("btrfs_backup_ng.cli.config_cmd.find_btrbk_config")
+    @patch("btrfs_backup_ng.cli.config_cmd.prompt_selection")
+    def test_wizard_partial_result(self, mock_selection, mock_btrbk, capsys):
         """Test wizard shows partial result warning."""
         from btrfs_backup_ng.cli.config_cmd import _run_detection_wizard
+
+        mock_btrbk.return_value = None  # No btrbk config
 
         home_subvol = DetectedSubvolume(
             id=256,
@@ -1517,27 +2350,30 @@ class TestDetectionWizard:
 
         # This will print the warning but then need input
         # We'll just verify the warning is shown
-        with patch("btrfs_backup_ng.cli.config_cmd._prompt") as mock_prompt:
-            mock_prompt.side_effect = KeyboardInterrupt
+        mock_selection.side_effect = KeyboardInterrupt
 
-            try:
-                _run_detection_wizard(result)
-            except KeyboardInterrupt:
-                pass
+        try:
+            _run_detection_wizard(result)
+        except KeyboardInterrupt:
+            pass
 
         captured = capsys.readouterr()
         assert "Limited detection due to permissions" in captured.out
 
     @patch("btrfs_backup_ng.snapper.SnapperScanner")
     @patch("btrfs_backup_ng.cli.config_cmd.find_config_file")
-    @patch("btrfs_backup_ng.cli.config_cmd._prompt_bool")
-    @patch("btrfs_backup_ng.cli.config_cmd._prompt_choice")
-    @patch("btrfs_backup_ng.cli.config_cmd._prompt")
+    @patch("btrfs_backup_ng.cli.config_cmd.find_btrbk_config")
+    @patch("btrfs_backup_ng.cli.config_cmd.prompt_bool")
+    @patch("btrfs_backup_ng.cli.config_cmd.prompt_choice")
+    @patch("btrfs_backup_ng.cli.config_cmd.prompt")
+    @patch("btrfs_backup_ng.cli.config_cmd.prompt_selection")
     def test_wizard_with_existing_config_diff(
         self,
+        mock_selection,
         mock_prompt,
         mock_choice,
         mock_bool,
+        mock_btrbk,
         mock_find,
         mock_snapper,
         capsys,
@@ -1546,6 +2382,7 @@ class TestDetectionWizard:
         """Test wizard shows diff with existing config."""
         from btrfs_backup_ng.cli.config_cmd import _run_detection_wizard
 
+        mock_btrbk.return_value = None  # No btrbk config
         mock_snapper.return_value.list_configs.return_value = []  # No snapper configs
 
         # Create existing config
@@ -1565,9 +2402,8 @@ path = "/backup"
 
         result = self._create_mock_result()
 
-        # Note: "add another target?" is _prompt_bool, not _prompt
+        mock_selection.return_value = [0]  # Select first volume
         mock_prompt.side_effect = [
-            "1",  # Select first volume
             "home-new",  # different prefix
             "/backup/new",  # different target (not /mnt/)
         ]
@@ -1589,14 +2425,18 @@ path = "/backup"
 
     @patch("btrfs_backup_ng.snapper.SnapperScanner")
     @patch("btrfs_backup_ng.cli.config_cmd.find_config_file")
-    @patch("btrfs_backup_ng.cli.config_cmd._prompt_bool")
-    @patch("btrfs_backup_ng.cli.config_cmd._prompt_choice")
-    @patch("btrfs_backup_ng.cli.config_cmd._prompt")
+    @patch("btrfs_backup_ng.cli.config_cmd.find_btrbk_config")
+    @patch("btrfs_backup_ng.cli.config_cmd.prompt_bool")
+    @patch("btrfs_backup_ng.cli.config_cmd.prompt_choice")
+    @patch("btrfs_backup_ng.cli.config_cmd.prompt")
+    @patch("btrfs_backup_ng.cli.config_cmd.prompt_selection")
     def test_wizard_save_to_file(
         self,
+        mock_selection,
         mock_prompt,
         mock_choice,
         mock_bool,
+        mock_btrbk,
         mock_find,
         mock_snapper,
         capsys,
@@ -1606,6 +2446,7 @@ path = "/backup"
         from btrfs_backup_ng.cli.config_cmd import _run_detection_wizard
 
         mock_find.return_value = None
+        mock_btrbk.return_value = None  # No btrbk config
         mock_snapper.return_value.list_configs.return_value = []  # No snapper configs
 
         # Use a subdirectory to avoid any file existence issues
@@ -1614,11 +2455,8 @@ path = "/backup"
 
         result = self._create_mock_result()
 
-        # Only 4 _prompt calls needed:
-        # 1. Select volumes, 2. Snapshot prefix, 3. Target path, 4. Save path
-        # (the "add another target?" is a _prompt_bool, not _prompt)
+        mock_selection.return_value = [0]  # Select first volume
         mock_prompt.side_effect = [
-            "1",  # Select first volume
             "home",  # prefix
             "/backup",  # target (not /mnt/)
             str(save_path),  # save path

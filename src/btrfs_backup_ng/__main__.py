@@ -17,7 +17,12 @@ from .cli import main as cli_main
 
 def main() -> None:
     """Main entry point for btrfs-backup-ng."""
-    sys.exit(cli_main())
+    try:
+        sys.exit(cli_main())
+    except KeyboardInterrupt:
+        # Graceful exit on Ctrl+C without printing traceback
+        print("\nInterrupted.")
+        sys.exit(130)  # Standard exit code for SIGINT
 
 
 if __name__ == "__main__":

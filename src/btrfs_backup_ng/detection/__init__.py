@@ -18,9 +18,11 @@ Example usage:
 
 from .classifier import (
     classify_all_subvolumes,
+    classify_from_snapper_config,
     classify_subvolume,
     generate_suggestions,
     process_detection_result,
+    reclassify_with_snapper,
 )
 from .models import (
     BackupSuggestion,
@@ -54,9 +56,11 @@ __all__ = [
     "scan_system",
     # Classifier
     "classify_all_subvolumes",
+    "classify_from_snapper_config",
     "classify_subvolume",
     "generate_suggestions",
     "process_detection_result",
+    "reclassify_with_snapper",
     # High-level API
     "detect_subvolumes",
 ]

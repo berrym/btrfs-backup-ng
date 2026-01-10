@@ -338,6 +338,12 @@ class TestClassifySSHError:
         classified = classify_ssh_error(error, exit_code=255)
         assert isinstance(classified, (SSHConnectionError, TransientNetworkError))
 
+    def test_exit_code_1(self):
+        """Exit code 1 indicates general error."""
+        error = Exception("SSH command failed")
+        classified = classify_ssh_error(error, exit_code=1)
+        assert isinstance(classified, BackupError)
+
     def test_authentication_failure(self):
         """Authentication failures should be permanent."""
         error = Exception("Authentication failed")

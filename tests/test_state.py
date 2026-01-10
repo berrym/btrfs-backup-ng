@@ -394,6 +394,79 @@ class TestOperationManager:
         assert len(stale) == 1
         assert stale[0].operation_id == operation.operation_id
 
+    def test_cleanup_old_operations(self, manager):
+        """Test cleaning up old archived operations."""
+        # Create and archive an operation
+        operation = manager.create_operation("/mnt/btrfs", ["target"])
+        operation.state = OperationState.SUCCESS
+        operation.completed_at = "2020-01-01T00:00:00"  # Old date
+        manager.update_operation(operation)
+        manager.archive_operation(operation.operation_id)
+
+        # Verify archive exists
+        archive_dir = manager.state_dir / "archive"
+        assert archive_dir.exists()
+        archived_files = list(archive_dir.glob("*.json"))
+        assert len(archived_files) == 1
+
+        # Cleanup should delete old operations
+        deleted = manager.cleanup_old_operations(max_age_days=1)
+        assert deleted == 1
+
+        # Archive should be empty now
+        archived_files = list(archive_dir.glob("*.json"))
+        assert len(archived_files) == 0
+
+    def test_cleanup_old_operations_no_archive(self, manager):
+        """Test cleanup when no archive directory exists."""
+        deleted = manager.cleanup_old_operations(max_age_days=30)
+        assert deleted == 0
+
+    def test_cleanup_old_operations_keeps_recent(self, manager):
+        """Test that cleanup keeps recent operations."""
+        from datetime import datetime
+
+        # Create and archive an operation with recent completed_at
+        operation = manager.create_operation("/mnt/btrfs", ["target"])
+        operation.state = OperationState.SUCCESS
+        operation.completed_at = datetime.now().isoformat()
+        manager.update_operation(operation)
+        manager.archive_operation(operation.operation_id)
+
+        # Cleanup should not delete recent operations
+        deleted = manager.cleanup_old_operations(max_age_days=30)
+        assert deleted == 0
+
+        # Archive should still have the file
+        archive_dir = manager.state_dir / "archive"
+        archived_files = list(archive_dir.glob("*.json"))
+        assert len(archived_files) == 1
+
+    def test_get_operation_from_archive(self, manager):
+        """Test getting operation from archive."""
+        operation = manager.create_operation("/mnt/btrfs", ["target"])
+        operation.state = OperationState.SUCCESS
+        manager.update_operation(operation)
+        op_id = operation.operation_id
+
+        # Archive the operation
+        manager.archive_operation(op_id)
+
+        # Should still be able to get it
+        loaded = manager.get_operation(op_id)
+        assert loaded is not None
+        assert loaded.operation_id == op_id
+
+    def test_archive_nonexistent_operation(self, manager):
+        """Test archiving non-existent operation returns False."""
+        result = manager.archive_operation("nonexistent-id")
+        assert result is False
+
+    def test_delete_nonexistent_operation(self, manager):
+        """Test deleting non-existent operation returns False."""
+        result = manager.delete_operation("nonexistent-id")
+        assert result is False
+
 
 class TestOperationContext:
     """Tests for OperationContext context manager."""
