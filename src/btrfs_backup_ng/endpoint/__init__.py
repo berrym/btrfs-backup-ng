@@ -5,6 +5,7 @@ from pathlib import Path
 
 from ..__logger__ import logger
 from .local import LocalEndpoint
+from .raw import RawEndpoint, SSHRawEndpoint
 from .shell import ShellEndpoint
 from .ssh import SSHEndpoint  # type: ignore[attr-defined]
 
@@ -46,6 +47,44 @@ def choose_endpoint(spec, common_config=None, source=False, excluded_types=()):
         endpoint_class = ShellEndpoint
         config["cmd"] = spec[8:]
         config["source"] = True
+    elif RawEndpoint not in excluded_types and (
+        spec.startswith("raw://") or spec.startswith("raw+ssh://")
+    ):
+        # Raw target endpoint (writes btrfs send streams to files)
+        is_ssh = spec.startswith("raw+ssh://")
+        endpoint_class = SSHRawEndpoint if is_ssh else RawEndpoint
+
+        # Parse URL - normalize raw+ssh:// to ssh:// for urlparse
+        parse_spec = (
+            spec.replace("raw+ssh://", "ssh://")
+            if is_ssh
+            else spec.replace("raw://", "file://")
+        )
+        parsed = urllib.parse.urlparse(parse_spec)
+
+        if is_ssh:
+            if not parsed.hostname:
+                raise ValueError("No hostname specified for raw+ssh:// endpoint")
+            config["hostname"] = parsed.hostname
+            config["port"] = parsed.port or 22
+            if parsed.username:
+                config["username"] = parsed.username
+            config["path"] = parsed.path or "/"
+            logger.debug(
+                "Parsed raw+ssh URL: host=%s, path=%s", parsed.hostname, parsed.path
+            )
+        else:
+            # Local raw target
+            config["path"] = Path(parsed.path)
+            logger.debug("Parsed raw URL: path=%s", parsed.path)
+
+        # Raw-specific config from common_config
+        for key in ("compress", "encrypt", "gpg_recipient", "gpg_keyring"):
+            if common_config is not None and key in common_config:
+                config[key] = common_config[key]
+
+        logger.debug("Creating raw endpoint: %s", endpoint_class.__name__)
+        return endpoint_class(config=config)
     elif SSHEndpoint not in excluded_types and (
         spec.startswith("ssh://") or _is_ssh_pattern(spec)
     ):

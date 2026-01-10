@@ -9,6 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+#### Raw Target Support
+- **Raw targets** for writing btrfs send streams to files instead of `btrfs receive`
+- Enables backups to non-btrfs filesystems (NFS, SMB, cloud storage)
+- New URL schemes: `raw:///path` (local) and `raw+ssh://user@host/path` (remote via SSH)
+- **Compression support**: gzip, pigz, zstd, lz4, xz, lzo, bzip2, pbzip2
+- **Encryption options**:
+  - GPG (public-key): `encrypt = "gpg"` with `gpg_recipient`
+  - OpenSSL (symmetric): `encrypt = "openssl_enc"` with passphrase via `BTRFS_BACKUP_PASSPHRASE` or `BTRBK_PASSPHRASE` environment variable
+- **Metadata sidecar files** (`.meta`) for tracking incremental chains and restore information
+- **Restore from raw backups** back to btrfs filesystems
+- **btrbk migration support**: `config import` now converts `raw_target_compress` and `raw_target_encrypt` settings
+- **Doctor command integration**: checks for raw target tool availability (compression, GPG, OpenSSL)
+- New `RawEndpoint` and `SSHRawEndpoint` classes in endpoint module
+- New `RawTargetConfig` schema for TOML configuration
+
 #### Snapper Integration
 - **Full Snapper integration** for backing up and restoring Snapper-managed snapshots
 - New `snapper` subcommand with dedicated operations:

@@ -209,6 +209,8 @@ class BtrbkLexer:
             "group",
             "raw_target_compress",
             "raw_target_encrypt",
+            "gpg_keyring",
+            "gpg_recipient",
         }
 
         if word in keywords:
@@ -594,6 +596,23 @@ def convert_to_toml(btrbk_config: BtrbkConfig) -> tuple[str, list[str]]:
             for target in all_targets:
                 lines.append("[[volumes.targets]]")
 
+                # Check for raw target options (inherited from subvolume -> volume -> global)
+                raw_compress = (
+                    target.options.get("raw_target_compress")
+                    or subvolume.options.get("raw_target_compress")
+                    or volume.options.get("raw_target_compress")
+                    or btrbk_config.global_options.get("raw_target_compress")
+                )
+                raw_encrypt = (
+                    target.options.get("raw_target_encrypt")
+                    or subvolume.options.get("raw_target_encrypt")
+                    or volume.options.get("raw_target_encrypt")
+                    or btrbk_config.global_options.get("raw_target_encrypt")
+                )
+
+                # Determine if this is a raw target
+                is_raw_target = bool(raw_compress or raw_encrypt)
+
                 # Convert btrbk target path format
                 target_path = target.path
                 if ":" in target_path and not target_path.startswith("ssh://"):
@@ -601,19 +620,89 @@ def convert_to_toml(btrbk_config: BtrbkConfig) -> tuple[str, list[str]]:
                     host, path = target_path.split(":", 1)
                     if "@" in host:
                         user, hostname = host.split("@", 1)
-                        target_path = f"ssh://{user}@{hostname}:{path}"
+                        if is_raw_target:
+                            target_path = f"raw+ssh://{user}@{hostname}:{path}"
+                        else:
+                            target_path = f"ssh://{user}@{hostname}:{path}"
                     else:
-                        target_path = f"ssh://{host}:{path}"
+                        if is_raw_target:
+                            target_path = f"raw+ssh://{host}:{path}"
+                        else:
+                            target_path = f"ssh://{host}:{path}"
                     warnings.append(
                         f"Line {target.line}: Converted '{target.path}' to '{target_path}'"
                     )
+                elif is_raw_target and not target_path.startswith("raw://"):
+                    # Local raw target
+                    if target_path.startswith("/"):
+                        target_path = f"raw://{target_path}"
+                    else:
+                        target_path = f"raw:///{target_path}"
 
                 lines.append(f'path = "{target_path}"')
 
+                # Raw target options
+                if is_raw_target:
+                    if raw_compress and raw_compress != "no":
+                        # Map btrbk compression names
+                        compress_map = {
+                            "gzip": "gzip",
+                            "pigz": "pigz",
+                            "bzip2": "bzip2",
+                            "pbzip2": "pbzip2",
+                            "xz": "xz",
+                            "lzo": "lzo",
+                            "lz4": "lz4",
+                            "zstd": "zstd",
+                        }
+                        compress = compress_map.get(raw_compress, raw_compress)
+                        lines.append(f'compress = "{compress}"')
+
+                    if raw_encrypt and raw_encrypt != "no":
+                        if raw_encrypt == "gpg":
+                            lines.append('encrypt = "gpg"')
+                            # Get GPG recipient (inherited)
+                            gpg_recipient = (
+                                target.options.get("gpg_recipient")
+                                or subvolume.options.get("gpg_recipient")
+                                or volume.options.get("gpg_recipient")
+                                or btrbk_config.global_options.get("gpg_recipient")
+                            )
+                            if gpg_recipient:
+                                lines.append(f'gpg_recipient = "{gpg_recipient}"')
+                            else:
+                                warnings.append(
+                                    f"Line {target.line}: GPG encryption enabled but no gpg_recipient found"
+                                )
+                            # Optional keyring
+                            gpg_keyring = (
+                                target.options.get("gpg_keyring")
+                                or subvolume.options.get("gpg_keyring")
+                                or volume.options.get("gpg_keyring")
+                                or btrbk_config.global_options.get("gpg_keyring")
+                            )
+                            if gpg_keyring:
+                                lines.append(f'gpg_keyring = "{gpg_keyring}"')
+                        elif raw_encrypt == "openssl_enc":
+                            lines.append('encrypt = "openssl_enc"')
+                            warnings.append(
+                                f"Line {target.line}: openssl_enc uses symmetric encryption. "
+                                "Set BTRFS_BACKUP_PASSPHRASE environment variable with your passphrase."
+                            )
+                        else:
+                            warnings.append(
+                                f"Line {target.line}: Unknown encryption method '{raw_encrypt}'"
+                            )
+
                 # SSH options
-                if target_path.startswith("ssh://"):
+                if target_path.startswith("ssh://") or target_path.startswith(
+                    "raw+ssh://"
+                ):
                     # Check if sudo might be needed
-                    lines.append("ssh_sudo = true  # May be required for btrfs receive")
+                    if not is_raw_target:
+                        lines.append(
+                            "ssh_sudo = true  # May be required for btrfs receive"
+                        )
 
                 lines.append("")
 

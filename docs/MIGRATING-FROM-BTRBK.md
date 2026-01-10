@@ -181,6 +181,112 @@ path = "ssh://backup@server:/backups/home"
 | `ssh_port 2222` | `ssh_port = 2222` |
 | `backend btrfs-progs-sudo` | `ssh_sudo = true` |
 
+### Raw Target Migration
+
+btrbk's "raw targets" write btrfs send streams to files instead of using `btrfs receive`. This enables backups to non-btrfs filesystems (NFS, SMB, cloud storage) with optional compression and encryption.
+
+btrfs-backup-ng fully supports raw targets for seamless migration:
+
+| btrbk | btrfs-backup-ng |
+|-------|-----------------|
+| `raw_target_compress zstd` | `compress = "zstd"` |
+| `raw_target_compress gzip` | `compress = "gzip"` |
+| `raw_target_encrypt gpg` | `encrypt = "gpg"` |
+| `raw_target_encrypt openssl_enc` | `encrypt = "openssl_enc"` |
+| `gpg_recipient user@example.com` | `gpg_recipient = "user@example.com"` |
+| `gpg_keyring /path/to/keyring` | `gpg_keyring = "/path/to/keyring"` |
+
+**btrbk raw target example:**
+```
+volume /mnt/pool
+  subvolume home
+    raw_target_compress zstd
+    raw_target_encrypt gpg
+    gpg_recipient backup@example.com
+    target /mnt/nas/backups/home
+    target ssh://backup@server/backups/home
+```
+
+**btrfs-backup-ng equivalent:**
+```toml
+[[volumes]]
+path = "/mnt/pool/home"
+
+[[volumes.targets]]
+path = "raw:///mnt/nas/backups/home"
+compress = "zstd"
+encrypt = "gpg"
+gpg_recipient = "backup@example.com"
+
+[[volumes.targets]]
+path = "raw+ssh://backup@server/backups/home"
+compress = "zstd"
+encrypt = "gpg"
+gpg_recipient = "backup@example.com"
+```
+
+The importer automatically:
+- Detects `raw_target_compress` and `raw_target_encrypt` options
+- Converts local targets to `raw://` URLs
+- Converts SSH targets to `raw+ssh://` URLs
+- Preserves GPG recipient and keyring settings
+
+#### Supported Compression Algorithms
+
+All btrbk compression algorithms are supported:
+
+| Algorithm | Extension | Notes |
+|-----------|-----------|-------|
+| `gzip` | `.gz` | Standard, widely available |
+| `pigz` | `.gz` | Parallel gzip, faster on multi-core |
+| `zstd` | `.zst` | Best balance of speed and ratio |
+| `lz4` | `.lz4` | Fastest, lower compression ratio |
+| `xz` | `.xz` | Best ratio, slowest |
+| `lzo` | `.lzo` | Fast compression |
+| `bzip2` | `.bz2` | Good ratio, slower |
+| `pbzip2` | `.bz2` | Parallel bzip2 |
+
+#### Encryption Methods
+
+**GPG (recommended for new setups):**
+```toml
+[[volumes.targets]]
+path = "raw:///mnt/backup"
+encrypt = "gpg"
+gpg_recipient = "backup@example.com"
+```
+
+**OpenSSL (for btrbk migration compatibility):**
+```toml
+[[volumes.targets]]
+path = "raw:///mnt/backup"
+encrypt = "openssl_enc"
+```
+
+For OpenSSL encryption, set the passphrase via environment variable:
+```bash
+# Compatible with btrbk's BTRBK_PASSPHRASE
+export BTRFS_BACKUP_PASSPHRASE="your_passphrase"
+# or
+export BTRBK_PASSPHRASE="your_passphrase"
+```
+
+#### Raw Backup File Format
+
+Raw backups create files with predictable naming:
+```
+/mnt/backup/home.20260110T120000.btrfs.zst.gpg      # Stream file
+/mnt/backup/home.20260110T120000.btrfs.zst.gpg.meta # Metadata (JSON)
+```
+
+The metadata file tracks:
+- Snapshot UUID for incremental chain validation
+- Parent snapshot reference
+- Compression and encryption settings
+- Creation timestamp and file size
+
+This format is compatible with btrbk's raw backups, allowing you to continue incremental chains from existing btrbk backups.
+
 **btrbk:**
 ```
 ssh_identity /root/.ssh/backup_key

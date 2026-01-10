@@ -146,6 +146,64 @@ class TargetConfig:
 
 
 @dataclass
+class RawTargetConfig:
+    """Raw file target configuration for non-btrfs destinations.
+
+    Raw targets write btrfs send streams directly to files instead of using
+    'btrfs receive'. This enables backups to non-btrfs filesystems (NFS, SMB,
+    cloud storage) with optional compression and GPG encryption.
+
+    Compatible with btrbk's "raw target" feature for migration.
+
+    Attributes:
+        path: Output directory for stream files (local path or ssh://user@host:/path)
+        compress: Compression algorithm (gzip, zstd, lz4, xz, lzo, pigz, pbzip2, or none)
+        encrypt: Encryption method (gpg or none)
+        gpg_recipient: GPG key recipient (required when encrypt=gpg)
+        gpg_keyring: Optional path to GPG keyring file
+        ssh_sudo: Whether to use sudo on remote SSH targets
+        ssh_port: SSH port for remote targets
+        ssh_key: Path to SSH private key
+    """
+
+    path: str
+    compress: str = "none"
+    encrypt: str = "none"
+    gpg_recipient: Optional[str] = None
+    gpg_keyring: Optional[str] = None
+    ssh_sudo: bool = False
+    ssh_port: int = 22
+    ssh_key: Optional[str] = None
+
+    def __post_init__(self):
+        """Validate configuration after initialization."""
+        if self.encrypt == "gpg" and not self.gpg_recipient:
+            raise ValueError("gpg_recipient is required when encrypt=gpg")
+
+        valid_compress = {
+            "none",
+            "gzip",
+            "zstd",
+            "lz4",
+            "xz",
+            "lzo",
+            "pigz",
+            "pbzip2",
+            "bzip2",
+        }
+        if self.compress not in valid_compress:
+            raise ValueError(
+                f"Invalid compression: {self.compress}. Valid: {sorted(valid_compress)}"
+            )
+
+        valid_encrypt = {"none", "gpg"}
+        if self.encrypt not in valid_encrypt:
+            raise ValueError(
+                f"Invalid encryption: {self.encrypt}. Valid: {sorted(valid_encrypt)}"
+            )
+
+
+@dataclass
 class VolumeConfig:
     """Volume backup configuration.
 

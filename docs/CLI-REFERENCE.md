@@ -1136,6 +1136,86 @@ btrfs-backup-ng config validate
 
 ---
 
+## Raw Targets
+
+Raw targets write btrfs send streams directly to files instead of using `btrfs receive`. This enables backups to non-btrfs filesystems (NFS, SMB, cloud storage) with optional compression and encryption.
+
+### URL Schemes
+
+| Scheme | Description |
+|--------|-------------|
+| `raw:///path` | Local raw target |
+| `raw+ssh://user@host/path` | Remote raw target via SSH |
+
+### Configuration Options
+
+| Option | Description |
+|--------|-------------|
+| `compress` | Compression: gzip, pigz, zstd, lz4, xz, lzo, bzip2, pbzip2 |
+| `encrypt` | Encryption: gpg, openssl_enc |
+| `gpg_recipient` | GPG key recipient (required for gpg) |
+| `gpg_keyring` | Optional GPG keyring path |
+| `openssl_cipher` | OpenSSL cipher (default: aes-256-cbc) |
+
+### Example Configuration
+
+```toml
+[[volumes]]
+path = "/home"
+
+# Raw target with compression and GPG encryption
+[[volumes.targets]]
+path = "raw:///mnt/nas/backups/home"
+compress = "zstd"
+encrypt = "gpg"
+gpg_recipient = "backup@example.com"
+
+# Raw target over SSH
+[[volumes.targets]]
+path = "raw+ssh://backup@server/backups/home"
+compress = "zstd"
+```
+
+### Encryption Methods
+
+**GPG (public-key, recommended):**
+```toml
+[[volumes.targets]]
+path = "raw:///mnt/backup"
+encrypt = "gpg"
+gpg_recipient = "backup@example.com"
+```
+
+**OpenSSL (symmetric, for btrbk migration):**
+```toml
+[[volumes.targets]]
+path = "raw:///mnt/backup"
+encrypt = "openssl_enc"
+```
+
+For OpenSSL encryption, set the passphrase via environment variable:
+```bash
+export BTRFS_BACKUP_PASSPHRASE="your_passphrase"
+# or (btrbk compatible)
+export BTRBK_PASSPHRASE="your_passphrase"
+```
+
+### File Naming
+
+Raw backups create predictable filenames:
+```
+snapshot-name.btrfs                    # No compression/encryption
+snapshot-name.btrfs.zst                # Compressed with zstd
+snapshot-name.btrfs.gpg                # GPG encrypted
+snapshot-name.btrfs.zst.gpg            # Compressed + GPG encrypted
+snapshot-name.btrfs.enc                # OpenSSL encrypted
+snapshot-name.btrfs.zst.enc            # Compressed + OpenSSL encrypted
+```
+
+Each stream file has a companion `.meta` file with JSON metadata for incremental chain tracking.
+
+---
+
 ## Rate Limit Format
 
 Bandwidth limits use a number with optional suffix:

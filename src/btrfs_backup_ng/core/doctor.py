@@ -256,6 +256,14 @@ class Doctor:
                 check_func=self._check_compression_programs,
             )
         )
+        self._register_check(
+            DiagnosticCheck(
+                name="raw_target_tools",
+                category=DiagnosticCategory.CONFIG,
+                description="Raw target tools (GPG, compression) are available",
+                check_func=self._check_raw_target_tools,
+            )
+        )
 
         # Snapshot health checks
         self._register_check(
@@ -760,6 +768,187 @@ class Doctor:
                     message="No compression configured",
                 )
             )
+
+        return findings
+
+    def _check_raw_target_tools(self) -> list[DiagnosticFinding]:
+        """Check that tools required for raw targets are available."""
+        import shutil
+        import subprocess
+
+        findings: list[DiagnosticFinding] = []
+
+        if not self.config:
+            return findings
+
+        # Collect raw target requirements from config
+        raw_targets: list[dict[str, Any]] = []
+        for volume in self.config.get_enabled_volumes():
+            for target in volume.targets:
+                path = getattr(target, "path", "")
+                if path.startswith("raw://") or path.startswith("raw+ssh://"):
+                    raw_targets.append(
+                        {
+                            "path": path,
+                            "compress": getattr(target, "compress", None),
+                            "encrypt": getattr(target, "encrypt", None),
+                            "gpg_recipient": getattr(target, "gpg_recipient", None),
+                        }
+                    )
+
+        if not raw_targets:
+            findings.append(
+                DiagnosticFinding(
+                    category=DiagnosticCategory.CONFIG,
+                    severity=DiagnosticSeverity.OK,
+                    check_name="raw_target_tools",
+                    message="No raw targets configured",
+                )
+            )
+            return findings
+
+        # Compression tool mapping for raw targets
+        from ..endpoint.raw_metadata import COMPRESSION_CONFIG
+
+        checked_tools: set[str] = set()
+
+        for target in raw_targets:
+            compress = target.get("compress")
+            encrypt = target.get("encrypt")
+            gpg_recipient = target.get("gpg_recipient")
+
+            # Check compression tool
+            if compress and compress != "none" and compress not in checked_tools:
+                checked_tools.add(compress)
+                config = COMPRESSION_CONFIG.get(compress, {})
+                cmd = config.get("compress_cmd", [])
+                tool = cmd[0] if cmd else compress
+
+                if shutil.which(tool):
+                    findings.append(
+                        DiagnosticFinding(
+                            category=DiagnosticCategory.CONFIG,
+                            severity=DiagnosticSeverity.OK,
+                            check_name="raw_target_tools",
+                            message=f"Raw compression tool available: {tool}",
+                        )
+                    )
+                else:
+                    findings.append(
+                        DiagnosticFinding(
+                            category=DiagnosticCategory.CONFIG,
+                            severity=DiagnosticSeverity.ERROR,
+                            check_name="raw_target_tools",
+                            message=f"Raw compression tool not found: {tool}",
+                            details={
+                                "target": target.get("path"),
+                                "hint": f"Install {tool} package",
+                            },
+                        )
+                    )
+
+            # Check GPG
+            if encrypt == "gpg" and "gpg" not in checked_tools:
+                checked_tools.add("gpg")
+                if shutil.which("gpg"):
+                    findings.append(
+                        DiagnosticFinding(
+                            category=DiagnosticCategory.CONFIG,
+                            severity=DiagnosticSeverity.OK,
+                            check_name="raw_target_tools",
+                            message="GPG encryption tool available",
+                        )
+                    )
+
+                    # Check if recipient key exists
+                    if gpg_recipient:
+                        try:
+                            result = subprocess.run(
+                                ["gpg", "--list-keys", gpg_recipient],
+                                capture_output=True,
+                                timeout=10,
+                            )
+                            if result.returncode == 0:
+                                findings.append(
+                                    DiagnosticFinding(
+                                        category=DiagnosticCategory.CONFIG,
+                                        severity=DiagnosticSeverity.OK,
+                                        check_name="raw_target_tools",
+                                        message=f"GPG key found for: {gpg_recipient}",
+                                    )
+                                )
+                            else:
+                                findings.append(
+                                    DiagnosticFinding(
+                                        category=DiagnosticCategory.CONFIG,
+                                        severity=DiagnosticSeverity.ERROR,
+                                        check_name="raw_target_tools",
+                                        message=f"GPG key not found: {gpg_recipient}",
+                                        details={
+                                            "hint": "Import the public key: gpg --import <keyfile>",
+                                        },
+                                    )
+                                )
+                        except (subprocess.TimeoutExpired, OSError) as e:
+                            findings.append(
+                                DiagnosticFinding(
+                                    category=DiagnosticCategory.CONFIG,
+                                    severity=DiagnosticSeverity.WARN,
+                                    check_name="raw_target_tools",
+                                    message=f"Could not verify GPG key: {e}",
+                                )
+                            )
+                else:
+                    findings.append(
+                        DiagnosticFinding(
+                            category=DiagnosticCategory.CONFIG,
+                            severity=DiagnosticSeverity.ERROR,
+                            check_name="raw_target_tools",
+                            message="GPG not found (required for encrypted raw targets)",
+                            details={"hint": "Install gnupg package"},
+                        )
+                    )
+
+            # Check OpenSSL
+            if encrypt == "openssl_enc" and "openssl" not in checked_tools:
+                checked_tools.add("openssl")
+                if shutil.which("openssl"):
+                    findings.append(
+                        DiagnosticFinding(
+                            category=DiagnosticCategory.CONFIG,
+                            severity=DiagnosticSeverity.OK,
+                            check_name="raw_target_tools",
+                            message="OpenSSL encryption tool available",
+                        )
+                    )
+                    # Check for passphrase environment variable
+                    import os
+
+                    if not (
+                        os.environ.get("BTRFS_BACKUP_PASSPHRASE")
+                        or os.environ.get("BTRBK_PASSPHRASE")
+                    ):
+                        findings.append(
+                            DiagnosticFinding(
+                                category=DiagnosticCategory.CONFIG,
+                                severity=DiagnosticSeverity.WARN,
+                                check_name="raw_target_tools",
+                                message="OpenSSL passphrase not set in environment",
+                                details={
+                                    "hint": "Set BTRFS_BACKUP_PASSPHRASE or BTRBK_PASSPHRASE environment variable",
+                                },
+                            )
+                        )
+                else:
+                    findings.append(
+                        DiagnosticFinding(
+                            category=DiagnosticCategory.CONFIG,
+                            severity=DiagnosticSeverity.ERROR,
+                            check_name="raw_target_tools",
+                            message="OpenSSL not found (required for openssl_enc encryption)",
+                            details={"hint": "Install openssl package"},
+                        )
+                    )
 
         return findings
 

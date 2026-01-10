@@ -58,6 +58,13 @@ See the [LICENSE](LICENSE) file for full copyright attribution.
 - **Bandwidth Throttling**: Rate limiting for remote transfers
 - **Robust SSH**: Password fallback, sudo support, Paramiko integration
 
+### Raw Targets (Non-btrfs Destinations)
+- **Write to Files**: Store btrfs send streams as files on any filesystem (NFS, SMB, cloud storage)
+- **Compression**: gzip, pigz, zstd, lz4, xz, lzo, bzip2, pbzip2
+- **Encryption**: GPG (public-key) or OpenSSL (symmetric, btrbk-compatible)
+- **Restore Support**: Restore from raw backups back to btrfs
+- **btrbk Compatibility**: Migrate raw_target_compress and raw_target_encrypt settings
+
 ### Monitoring & Automation
 - **Transaction Logging**: Structured JSON logs for auditing and automation
 - **Email & Webhook Notifications**: Alerts on backup success/failure
@@ -535,6 +542,60 @@ compress = "zstd"                      # Compression (none|gzip|zstd|lz4|pigz|lz
 rate_limit = "10M"                     # Bandwidth limit (K|M|G suffix)
 require_mount = false                  # Require path to be a mount point (safety check)
 ```
+
+### Raw Target Configuration
+
+Raw targets write btrfs send streams directly to files instead of using `btrfs receive`. This enables backups to non-btrfs filesystems (NFS, SMB, cloud storage) with optional compression and encryption.
+
+```toml
+[[volumes.targets]]
+path = "raw:///mnt/nas/backups/home"       # Local raw target
+compress = "zstd"                           # Optional compression
+encrypt = "gpg"                             # GPG encryption
+gpg_recipient = "backup@example.com"        # GPG key recipient
+
+[[volumes.targets]]
+path = "raw+ssh://backup@server/backups"   # Remote raw target via SSH
+compress = "zstd"
+
+# OpenSSL encryption (btrbk compatible)
+[[volumes.targets]]
+path = "raw:///mnt/backup"
+compress = "gzip"
+encrypt = "openssl_enc"
+openssl_cipher = "aes-256-cbc"             # Default cipher
+```
+
+**Raw target options:**
+
+| Option | Description |
+|--------|-------------|
+| `compress` | Compression: gzip, pigz, zstd, lz4, xz, lzo, bzip2, pbzip2 |
+| `encrypt` | Encryption: gpg, openssl_enc |
+| `gpg_recipient` | GPG key recipient (required for gpg) |
+| `gpg_keyring` | Optional GPG keyring path |
+| `openssl_cipher` | OpenSSL cipher (default: aes-256-cbc) |
+
+**For OpenSSL encryption, set the passphrase via environment variable:**
+
+```bash
+export BTRFS_BACKUP_PASSPHRASE="your_passphrase"
+# or (btrbk compatible)
+export BTRBK_PASSPHRASE="your_passphrase"
+```
+
+**File naming convention:**
+
+| Settings | Filename Extension |
+|----------|-------------------|
+| No compression/encryption | `.btrfs` |
+| Compressed with zstd | `.btrfs.zst` |
+| GPG encrypted | `.btrfs.gpg` |
+| Compressed + GPG | `.btrfs.zst.gpg` |
+| OpenSSL encrypted | `.btrfs.enc` |
+| Compressed + OpenSSL | `.btrfs.zst.enc` |
+
+Each stream file has a companion `.meta` file with JSON metadata for incremental chain tracking.
 
 ### Mount Verification (External Drive Safety)
 

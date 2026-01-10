@@ -105,6 +105,8 @@ Maps timestamp formats (short, long, long-iso to strftime patterns)
 .IP \(bu 2
 Converts SSH sudo settings (backend btrfs-progs-sudo to ssh_sudo)
 .IP \(bu 2
+Converts raw_target_compress and raw_target_encrypt settings
+.IP \(bu 2
 Warns about common btrbk pitfalls
 .IP \(bu 2
 Outputs valid TOML
@@ -270,6 +272,53 @@ rate_limit = "50M"
 daily = 14
 .fi
 .RE
+.SS Raw targets
+Raw targets write btrfs send streams to files instead of using btrfs receive.
+This enables backups to non-btrfs filesystems with optional compression and
+encryption.
+.PP
+.RS
+.nf
+# Raw target to local path with compression and GPG encryption
+[[volumes.targets]]
+path = "raw:///mnt/nas/backups/home"
+compress = "zstd"
+encrypt = "gpg"
+gpg_recipient = "backup@example.com"
+
+# Raw target over SSH
+[[volumes.targets]]
+path = "raw+ssh://backup@server/backups/home"
+compress = "zstd"
+
+# Raw target with OpenSSL encryption (btrbk compatible)
+[[volumes.targets]]
+path = "raw:///mnt/backup"
+compress = "gzip"
+encrypt = "openssl_enc"
+openssl_cipher = "aes-256-cbc"
+.fi
+.RE
+.PP
+Configuration options for raw targets:
+.TP
+.B compress
+Compression method: gzip, pigz, zstd, lz4, xz, lzo, bzip2, pbzip2.
+.TP
+.B encrypt
+Encryption method: gpg or openssl_enc.
+.TP
+.B gpg_recipient
+GPG key recipient (required for gpg encryption).
+.TP
+.B gpg_keyring
+Optional path to GPG keyring file.
+.TP
+.B openssl_cipher
+OpenSSL cipher (default: aes-256-cbc).
+.PP
+For OpenSSL encryption, set the passphrase via environment variable
+BTRFS_BACKUP_PASSPHRASE or BTRBK_PASSPHRASE (for btrbk compatibility).
 .SS [notifications]
 Optional notification settings.
 .PP

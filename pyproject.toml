@@ -57,7 +57,10 @@ omit = [
     # Integration-only modules requiring actual btrfs operations
     "src/btrfs_backup_ng/_legacy_main.py",
     "src/btrfs_backup_ng/__main__.py",
-    "src/btrfs_backup_ng/endpoint/*",
+    "src/btrfs_backup_ng/endpoint/common.py",
+    "src/btrfs_backup_ng/endpoint/local.py",
+    "src/btrfs_backup_ng/endpoint/shell.py",
+    "src/btrfs_backup_ng/endpoint/ssh.py",
     "src/btrfs_backup_ng/ssh_transfer.py",
     "src/btrfs_backup_ng/sshutil/*",
     # CLI subcommand implementations (require config + btrfs)

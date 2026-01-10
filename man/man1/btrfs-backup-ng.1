@@ -180,6 +180,70 @@ Use sudo for btrfs commands on remote host.
 .TP
 .B ssh_key
 Path to SSH private key file.
+.SH RAW TARGETS
+Raw targets write btrfs send streams directly to files instead of using
+\fBbtrfs receive\fR. This enables backups to non-btrfs filesystems (NFS, SMB,
+cloud storage) with optional compression and encryption.
+.PP
+URL schemes:
+.TP
+.B raw:///path
+Local raw target.
+.TP
+.B raw+ssh://user@host/path
+Remote raw target via SSH.
+.PP
+Configuration options:
+.TP
+.B compress
+Compression method: gzip, pigz, zstd, lz4, xz, lzo, bzip2, pbzip2.
+.TP
+.B encrypt
+Encryption method: gpg, openssl_enc.
+.TP
+.B gpg_recipient
+GPG key recipient (required for gpg encryption).
+.TP
+.B gpg_keyring
+Optional GPG keyring path.
+.TP
+.B openssl_cipher
+OpenSSL cipher (default: aes-256-cbc).
+.PP
+Example raw target configuration:
+.PP
+.RS
+.nf
+[[volumes.targets]]
+path = "raw:///mnt/nas/backups/home"
+compress = "zstd"
+encrypt = "gpg"
+gpg_recipient = "backup@example.com"
+.fi
+.RE
+.PP
+For OpenSSL encryption, set the passphrase via environment variable:
+.PP
+.RS
+.nf
+export BTRFS_BACKUP_PASSPHRASE="your_passphrase"
+# or (btrbk compatible)
+export BTRBK_PASSPHRASE="your_passphrase"
+.fi
+.RE
+.PP
+File naming convention:
+.PP
+.RS
+.nf
+snapshot-name.btrfs                    # No compression/encryption
+snapshot-name.btrfs.zst                # Compressed with zstd
+snapshot-name.btrfs.gpg                # GPG encrypted
+snapshot-name.btrfs.zst.gpg            # Compressed + GPG encrypted
+snapshot-name.btrfs.enc                # OpenSSL encrypted
+snapshot-name.btrfs.zst.enc            # Compressed + OpenSSL encrypted
+.fi
+.RE
 .SH EXAMPLES
 .TP
 Run all backup jobs:
