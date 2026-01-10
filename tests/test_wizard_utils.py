@@ -6,7 +6,6 @@ from unittest import mock
 import pytest
 
 from btrfs_backup_ng.cli.wizard_utils import (
-    console,
     display_btrbk_detected,
     display_btrbk_import,
     display_config_preview,

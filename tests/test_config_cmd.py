@@ -491,7 +491,6 @@ class TestMigrateSystemd:
     def test_migrate_systemd_dry_run(self, capsys):
         """Test migrate-systemd with dry-run flag."""
         from btrfs_backup_ng.cli.config_cmd import execute_config
-        from btrfs_backup_ng.systemd_utils import SystemdUnitStatus
 
         args = argparse.Namespace(
             config_action="migrate-systemd",

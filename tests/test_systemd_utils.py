@@ -3,8 +3,6 @@
 import subprocess
 from unittest.mock import MagicMock, patch
 
-import pytest
-
 from btrfs_backup_ng.systemd_utils import (
     BACKUP_NG_UNIT_NAMES,
     BTRBK_UNIT_NAMES,
@@ -431,8 +429,6 @@ class TestFindBtrbkInstanceUnits:
 
     def test_find_btrbk_instance_units(self):
         """Test finding btrbk instance units via glob."""
-        from pathlib import Path
-
         with patch("btrfs_backup_ng.systemd_utils.get_unit_status") as mock_status:
             # Regular units don't exist
             def status_side_effect(name):

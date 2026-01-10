@@ -851,4 +851,4 @@ class TestSnapperSnapshot:
         )
         assert s != "not a snapshot"
         assert s != 100
-        assert s != None
+        assert s is not None

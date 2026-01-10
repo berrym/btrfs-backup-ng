@@ -82,7 +82,7 @@ class TestBtrfsMountInfo:
         # Comparing with non-BtrfsMountInfo should use NotImplemented
         assert mount != "not a mount"
         assert mount != 256
-        assert mount != None
+        assert mount is not None
 
     def test_hash_for_set_usage(self):
         """Test that BtrfsMountInfo can be used in sets."""
@@ -154,7 +154,7 @@ class TestDetectedSubvolume:
         # Comparing with non-DetectedSubvolume should use NotImplemented
         assert subvol != "not a subvolume"
         assert subvol != 256
-        assert subvol != None
+        assert subvol is not None
 
     def test_hash_for_set_usage(self):
         """Test that DetectedSubvolume can be used in sets."""
