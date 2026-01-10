@@ -7,7 +7,7 @@ prioritized backup suggestions for the init wizard.
 from __future__ import annotations
 
 import re
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 from .models import (
     BackupSuggestion,
@@ -15,9 +15,6 @@ from .models import (
     DetectionResult,
     SubvolumeClass,
 )
-
-if TYPE_CHECKING:
-    from pathlib import Path
 
 # Patterns for snapshot detection
 SNAPSHOT_PATTERNS = [

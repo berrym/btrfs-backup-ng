@@ -12,7 +12,6 @@ from rich.panel import Panel
 from rich.prompt import Confirm, IntPrompt, Prompt
 from rich.style import Style
 from rich.table import Table
-from rich.text import Text
 
 # Shared console instance
 console = Console()
@@ -125,8 +124,10 @@ def prompt_choice(message: str, choices: list[str], default: str = "") -> str:
             console.print()
             raise KeyboardInterrupt
 
-        if not value and default:
-            return default
+        if not value:
+            if default:
+                return default
+            continue
 
         # Try as number
         try:
