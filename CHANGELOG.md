@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.8.2] - 2026-01-10
 
 ### Added
 
@@ -46,6 +46,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `include_types` - Snapshot types to include
   - `exclude_cleanup` - Cleanup algorithms to skip
   - `min_age` - Minimum snapshot age before backup
+- **Sudo-aware config paths** - Helper functions `get_user_home()`, `get_user_config_dir()`, and `get_default_config_path()` for correct XDG directory handling when running under sudo
 
 #### Documentation
 - New `examples/snapper.toml` example configuration
@@ -56,6 +57,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `btrfs-backup-ng run` now handles Snapper volumes when configured with `source = "snapper"`
 - Config wizard shows Snapper volumes with `[snapper:name]` markers for easy identification
 - `get_next_snapshot_number()` in scanner now scans filesystem directly for accuracy after restores
+- **Default `min_age` changed from `"0"` to `"1h"`** for snapper sources to avoid backing up incomplete pre/post pairs
+- Shell completions updated with all raw target compression methods (xz, bzip2, pbzip2, lzo)
+
+### Fixed
+- **Config wizard saves to sudo user's home** - When running under sudo, config files are now saved to the original user's XDG config directory instead of `/root`
+- **Snapper min_age default** - Changed from `"0"` to `"1h"` to prevent backing up snapshots during active package operations
 
 ## [0.8.1] - 2026-01-06
 
@@ -194,6 +201,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 Previous release. See git history for details.
 
+[0.8.2]: https://github.com/berrym/btrfs-backup-ng/compare/v0.8.1...v0.8.2
 [0.8.1]: https://github.com/berrym/btrfs-backup-ng/compare/v0.8.0...v0.8.1
 [0.8.0]: https://github.com/berrym/btrfs-backup-ng/compare/v0.6.8...v0.8.0
 [0.6.8]: https://github.com/berrym/btrfs-backup-ng/releases/tag/v0.6.8
