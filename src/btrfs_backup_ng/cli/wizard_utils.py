@@ -330,9 +330,14 @@ def display_config_preview(config_toml: str) -> None:
     Args:
         config_toml: TOML configuration content
     """
+    from rich.text import Text
+
+    # Use Text object to avoid Rich markup interpretation of brackets
+    # (TOML uses [[section]] which Rich would interpret as markup)
+    text = Text(config_toml)
     console.print(
         Panel(
-            config_toml,
+            text,
             title="Configuration Preview",
             border_style="blue",
             expand=False,
