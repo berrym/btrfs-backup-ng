@@ -8,6 +8,9 @@ from btrfs_backup_ng.config.loader import (
     ConfigError,
     _get_config_search_paths,
     find_config_file,
+    get_default_config_path,
+    get_user_config_dir,
+    get_user_home,
     load_config,
 )
 
@@ -490,3 +493,124 @@ class TestGenerateExampleConfig:
         data = tomllib.loads(example)
         assert "global" in data
         assert "volumes" in data
+
+
+class TestGetUserHome:
+    """Tests for get_user_home function."""
+
+    def test_regular_user(self, tmp_path, monkeypatch):
+        """Test get_user_home returns Path.home() for regular user."""
+        monkeypatch.delenv("SUDO_USER", raising=False)
+        monkeypatch.setattr(Path, "home", staticmethod(lambda: tmp_path))
+
+        result = get_user_home()
+        assert result == tmp_path
+
+    def test_sudo_user(self, tmp_path, monkeypatch):
+        """Test get_user_home returns sudo user's home when running as root via sudo."""
+        sudo_user_home = tmp_path / "sudo_user"
+        sudo_user_home.mkdir()
+
+        monkeypatch.setenv("SUDO_USER", "testuser")
+        monkeypatch.setattr("os.geteuid", lambda: 0)
+
+        import pwd
+
+        class MockPwnam:
+            pw_dir = str(sudo_user_home)
+
+        monkeypatch.setattr(pwd, "getpwnam", lambda x: MockPwnam())
+
+        result = get_user_home()
+        assert result == sudo_user_home
+
+    def test_sudo_user_not_found(self, tmp_path, monkeypatch):
+        """Test fallback when sudo user is not found in passwd."""
+        monkeypatch.setenv("SUDO_USER", "nonexistent_user")
+        monkeypatch.setattr("os.geteuid", lambda: 0)
+        monkeypatch.setattr(Path, "home", staticmethod(lambda: tmp_path))
+
+        import pwd
+
+        def raise_keyerror(name):
+            raise KeyError(f"User {name} not found")
+
+        monkeypatch.setattr(pwd, "getpwnam", raise_keyerror)
+
+        # Should fall back to Path.home()
+        result = get_user_home()
+        assert result == tmp_path
+
+
+class TestGetUserConfigDir:
+    """Tests for get_user_config_dir function."""
+
+    def test_regular_user_default(self, tmp_path, monkeypatch):
+        """Test config dir defaults to ~/.config/btrfs-backup-ng."""
+        monkeypatch.delenv("SUDO_USER", raising=False)
+        monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+        monkeypatch.setattr(Path, "home", staticmethod(lambda: tmp_path))
+
+        result = get_user_config_dir()
+        assert result == tmp_path / ".config" / "btrfs-backup-ng"
+
+    def test_xdg_config_home(self, tmp_path, monkeypatch):
+        """Test config dir respects XDG_CONFIG_HOME for regular user."""
+        xdg_config = tmp_path / "custom_config"
+        monkeypatch.delenv("SUDO_USER", raising=False)
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(xdg_config))
+
+        result = get_user_config_dir()
+        assert result == xdg_config / "btrfs-backup-ng"
+
+    def test_sudo_ignores_xdg(self, tmp_path, monkeypatch):
+        """Test that XDG_CONFIG_HOME is ignored when running as sudo."""
+        sudo_user_home = tmp_path / "sudo_user"
+        sudo_user_home.mkdir()
+        xdg_config = tmp_path / "root_xdg_config"
+
+        monkeypatch.setenv("SUDO_USER", "testuser")
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(xdg_config))
+        monkeypatch.setattr("os.geteuid", lambda: 0)
+
+        import pwd
+
+        class MockPwnam:
+            pw_dir = str(sudo_user_home)
+
+        monkeypatch.setattr(pwd, "getpwnam", lambda x: MockPwnam())
+
+        result = get_user_config_dir()
+        # Should use sudo user's home, not XDG_CONFIG_HOME
+        assert result == sudo_user_home / ".config" / "btrfs-backup-ng"
+
+
+class TestGetDefaultConfigPath:
+    """Tests for get_default_config_path function."""
+
+    def test_default_path(self, tmp_path, monkeypatch):
+        """Test default config path is in user config dir."""
+        monkeypatch.delenv("SUDO_USER", raising=False)
+        monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+        monkeypatch.setattr(Path, "home", staticmethod(lambda: tmp_path))
+
+        result = get_default_config_path()
+        assert result == tmp_path / ".config" / "btrfs-backup-ng" / "config.toml"
+
+    def test_sudo_user_path(self, tmp_path, monkeypatch):
+        """Test default config path uses sudo user's home."""
+        sudo_user_home = tmp_path / "sudo_user"
+        sudo_user_home.mkdir()
+
+        monkeypatch.setenv("SUDO_USER", "testuser")
+        monkeypatch.setattr("os.geteuid", lambda: 0)
+
+        import pwd
+
+        class MockPwnam:
+            pw_dir = str(sudo_user_home)
+
+        monkeypatch.setattr(pwd, "getpwnam", lambda x: MockPwnam())
+
+        result = get_default_config_path()
+        assert result == sudo_user_home / ".config" / "btrfs-backup-ng" / "config.toml"

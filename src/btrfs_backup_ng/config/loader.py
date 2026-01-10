@@ -28,6 +28,56 @@ class ConfigError(Exception):
     pass
 
 
+def get_user_home() -> Path:
+    """Get the appropriate user home directory.
+
+    When running under sudo, returns the original user's home directory
+    instead of root's. This ensures config files are saved to the
+    correct XDG location.
+
+    Returns:
+        Path to user's home directory
+    """
+    sudo_user = os.environ.get("SUDO_USER")
+    if sudo_user and os.geteuid() == 0:
+        # Running as root via sudo - use original user's home
+        try:
+            return Path(pwd.getpwnam(sudo_user).pw_dir)
+        except KeyError:
+            pass  # User not found, fall back to default
+    return Path.home()
+
+
+def get_user_config_dir() -> Path:
+    """Get the appropriate user config directory for btrfs-backup-ng.
+
+    Follows XDG Base Directory Specification, using $XDG_CONFIG_HOME
+    or ~/.config as the base. When running under sudo, uses the
+    original user's config directory.
+
+    Returns:
+        Path to btrfs-backup-ng config directory
+    """
+    # Check XDG_CONFIG_HOME first (but not if running as root via sudo)
+    sudo_user = os.environ.get("SUDO_USER")
+    if not (sudo_user and os.geteuid() == 0):
+        xdg_config = os.environ.get("XDG_CONFIG_HOME")
+        if xdg_config:
+            return Path(xdg_config) / "btrfs-backup-ng"
+
+    # Fall back to ~/.config
+    return get_user_home() / ".config" / "btrfs-backup-ng"
+
+
+def get_default_config_path() -> Path:
+    """Get the default path for saving configuration files.
+
+    Returns:
+        Path to default config.toml location
+    """
+    return get_user_config_dir() / "config.toml"
+
+
 def _get_config_search_paths() -> list[Path]:
     """Get config file search paths in priority order.
 

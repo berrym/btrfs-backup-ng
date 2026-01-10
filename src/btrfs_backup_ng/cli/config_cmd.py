@@ -9,7 +9,7 @@ from typing import Any
 
 from ..__logger__ import create_logger
 from ..config import ConfigError, find_config_file, load_config
-from ..config.loader import generate_example_config
+from ..config.loader import generate_example_config, get_default_config_path
 from .common import get_log_level
 from .wizard_utils import (
     console,
@@ -521,7 +521,7 @@ def _init_config(args: argparse.Namespace) -> int:
             return 1
     elif interactive:
         # Interactive mode without explicit output - offer to save
-        default_path = str(Path.home() / ".config/btrfs-backup-ng/config.toml")
+        default_path = str(get_default_config_path())
 
         # Show config preview
         console.print()
@@ -895,7 +895,7 @@ def _save_wizard_config(content: str) -> int:
     Returns:
         Exit code
     """
-    default_path = str(Path.home() / ".config/btrfs-backup-ng/config.toml")
+    default_path = str(get_default_config_path())
 
     # Show config preview
     console.print()
@@ -1420,7 +1420,7 @@ def _run_detection_wizard(result) -> int:
             default_path,
         )
     else:
-        default_path = str(Path.home() / ".config/btrfs-backup-ng/config.toml")
+        default_path = str(get_default_config_path())
         save_path = prompt("Save configuration to", default_path)
 
     # Create directory if needed
