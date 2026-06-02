@@ -852,7 +852,8 @@ def _do_process_transfer(
             )
 
         # Start receive process with potentially modified input stream
-        receive_process = destination_endpoint.receive(current_stdout)
+        receive_process = destination_endpoint.receive(
+            current_stdout, snapshot_name)
         if receive_process is None:
             logger.error("Failed to start receive process")
             if is_ssh_endpoint and not destination_endpoint.config.get(
