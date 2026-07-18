@@ -1301,6 +1301,7 @@ def _place_info_xml(snapper_snapshot, destination_endpoint) -> None:
                 ["tee", f"{dest_dir}/info.xml"],
                 input=info_xml_src.read_bytes(),
                 check=True,
+                stdout=subprocess.DEVNULL,
             )
         else:
             dst = Path(dest_dir) / "info.xml"
@@ -1611,6 +1612,7 @@ def _write_remote_metadata(endpoint, meta_path: Path, metadata) -> None:
                 cmd,
                 input=json_content.encode("utf-8"),
                 check=True,
+                stdout=subprocess.DEVNULL,
             )
             logger.debug("Wrote remote snapper metadata to %s", meta_path)
         except Exception as e:
