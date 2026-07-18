@@ -210,12 +210,20 @@ def _handle_backup(args: argparse.Namespace) -> int:
         logger.error("Snapper config not found: %s", args.config)
         return 1
 
-    # Destination path - now just a path, not an endpoint
+    # Destination path
     # Backup layout: {target}/.snapshots/{num}/snapshot
     target_path = args.target
 
+    # Route the destination through the endpoint layer so ssh:// and raw
+    # targets are parsed correctly instead of being treated as local paths.
+    from ..endpoint import choose_endpoint
+
+    destination_endpoint = choose_endpoint(
+        target_path, {"path": target_path, "snap_prefix": ""}
+    )
+
     # Determine if this is a local or remote transfer
-    is_remote = target_path.startswith("ssh://")
+    is_remote = getattr(destination_endpoint, "_is_remote", False)
 
     # Build transfer options
     # For local transfers: no compression (Rich progress bar)
@@ -275,7 +283,10 @@ def _handle_backup(args: argparse.Namespace) -> int:
                                 break
 
             send_snapper_snapshot(
-                snapshot, target_path, parent_snapper_snapshot=parent, options=options
+                snapshot,
+                destination_endpoint,
+                parent_snapper_snapshot=parent,
+                options=options,
             )
             return 0
         except Exception as e:
@@ -306,7 +317,7 @@ def _handle_backup(args: argparse.Namespace) -> int:
         sync_snapper_snapshots(
             scanner,
             args.config,
-            target_path,
+            destination_endpoint,
             snapper_config=SnapperFilterConfig(),
             options=options,
         )
