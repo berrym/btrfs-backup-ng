@@ -19,6 +19,7 @@ from btrfs_backup_ng.cli.wizard_utils import (
     prompt_choice,
     prompt_int,
     prompt_selection,
+    prompt_snapshot_prefix,
 )
 
 
@@ -44,6 +45,25 @@ class TestPrompt:
         with mock.patch("rich.prompt.Prompt.ask", side_effect=KeyboardInterrupt):
             with pytest.raises(KeyboardInterrupt):
                 prompt("Enter value")
+
+
+class TestPromptSnapshotPrefix:
+    """Tests for prompt_snapshot_prefix (explicit empty prefix support)."""
+
+    def test_no_prefix_returns_empty(self):
+        # Answering "no" to the prefix question yields an explicit empty prefix.
+        with mock.patch("rich.prompt.Confirm.ask", return_value=False):
+            assert prompt_snapshot_prefix("home-") == ""
+
+    def test_yes_accepts_default_prefix(self):
+        with mock.patch("rich.prompt.Confirm.ask", return_value=True):
+            with mock.patch("rich.prompt.Prompt.ask", return_value="home-"):
+                assert prompt_snapshot_prefix("home-") == "home-"
+
+    def test_yes_accepts_custom_prefix(self):
+        with mock.patch("rich.prompt.Confirm.ask", return_value=True):
+            with mock.patch("rich.prompt.Prompt.ask", return_value="custom-"):
+                assert prompt_snapshot_prefix("home-") == "custom-"
 
 
 class TestPromptBool:

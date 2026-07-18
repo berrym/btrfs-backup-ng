@@ -516,7 +516,11 @@ Duration format: `30m` (minutes), `2h` (hours), `1d` (days), `1w` (weeks)
 ```toml
 [[volumes]]
 path = "/home"                    # Path to BTRFS subvolume
-snapshot_prefix = "home-"         # Prefix for snapshot names
+# snapshot_prefix: prefix for snapshot names. Omit to auto-derive from the path
+# (/home -> "home-"). Set to "" for bare-timestamp names -- if you do, pair it
+# with a strict timestamp_format and a dedicated snapshot_dir so unrelated
+# subvolumes are not mistaken for snapshots.
+snapshot_prefix = "home-"
 snapshot_dir = ".snapshots"       # Override global snapshot_dir
 enabled = true                    # Enable/disable this volume
 

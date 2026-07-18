@@ -2,7 +2,6 @@
 
 import argparse
 import logging
-import os
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -273,7 +272,7 @@ def _backup_volume(
 
     # Build endpoint kwargs
     endpoint_kwargs = {
-        "snap_prefix": volume.snapshot_prefix or f"{os.uname()[1]}-",
+        "snap_prefix": volume.snapshot_prefix,
         "convert_rw": False,
         "subvolume_sync": False,
         "btrfs_debug": False,

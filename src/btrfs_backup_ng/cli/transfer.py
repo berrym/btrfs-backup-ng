@@ -2,7 +2,6 @@
 
 import argparse
 import logging
-import os
 import time
 from pathlib import Path
 
@@ -95,7 +94,7 @@ def execute_transfer(args: argparse.Namespace) -> int:
         try:
             # Build endpoint kwargs
             endpoint_kwargs = {
-                "snap_prefix": volume.snapshot_prefix or f"{os.uname()[1]}-",
+                "snap_prefix": volume.snapshot_prefix,
                 "convert_rw": False,
                 "subvolume_sync": False,
                 "btrfs_debug": False,

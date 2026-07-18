@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.8.3] - 2026-07-18
 
+### Added
+
+- **Explicit empty `snapshot_prefix`** is now honored — set `snapshot_prefix = ""` for bare-timestamp snapshot names. An omitted/unset prefix still auto-derives from the volume path (`/home` → `home-`) as before. Pair an empty prefix with a strict `timestamp_format` and a dedicated `snapshot_dir` so unrelated subvolumes are not mistaken for snapshots.
+  - *Migration note:* an existing config that sets `snapshot_prefix = ""` (rather than omitting the key) now yields bare-timestamp names instead of the previously auto-derived default. Omit the key to keep the derived prefix.
+
 ### Fixed
 
 #### Snapper Backup to Remote and Raw Targets

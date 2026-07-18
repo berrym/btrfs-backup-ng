@@ -57,6 +57,25 @@ def prompt_bool(message: str, default: bool = True) -> bool:
         raise KeyboardInterrupt
 
 
+def prompt_snapshot_prefix(default_prefix: str) -> str:
+    """Prompt for a snapshot name prefix, allowing an explicit empty prefix.
+
+    A plain text prompt cannot express "empty" (pressing Enter returns the
+    default), so gate on a yes/no first: answering "no" selects an empty prefix
+    (bare-timestamp snapshot names); otherwise prompt for the prefix with the
+    path-derived default.
+
+    Args:
+        default_prefix: Path-derived default prefix (e.g. "home-")
+
+    Returns:
+        The chosen prefix ("" for no prefix)
+    """
+    if not prompt_bool("Use a snapshot name prefix?", default=True):
+        return ""
+    return prompt("Snapshot prefix", default_prefix)
+
+
 def prompt_int(message: str, default: int, min_val: int = 0, max_val: int = 100) -> int:
     """Prompt user for integer input with validation.
 

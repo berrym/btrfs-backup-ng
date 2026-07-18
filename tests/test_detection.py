@@ -1965,9 +1965,7 @@ class TestDetectionWizard:
 
         # Use /backup paths to avoid /mnt/ require_mount check
         mock_prompt.side_effect = [
-            "home",  # prefix for /home
             "/backup/home",  # target for /home
-            "root",  # prefix for /
             "/backup/root",  # target for /
         ]
         mock_bool.side_effect = [
@@ -1979,7 +1977,11 @@ class TestDetectionWizard:
             "print",  # print config instead of save
         ]
 
-        exit_code = _run_detection_wizard(result)
+        with patch(
+            "btrfs_backup_ng.cli.config_cmd.prompt_snapshot_prefix",
+            side_effect=["home", "root"],  # prefix for /home, prefix for /
+        ):
+            exit_code = _run_detection_wizard(result)
 
         assert exit_code == 0
         captured = capsys.readouterr()
@@ -2017,7 +2019,6 @@ class TestDetectionWizard:
         mock_selection.return_value = [0]
 
         mock_prompt.side_effect = [
-            "home",  # prefix
             "/backup/home",  # target (not /mnt/)
         ]
         mock_bool.side_effect = [
@@ -2028,7 +2029,11 @@ class TestDetectionWizard:
             "print",  # print config
         ]
 
-        exit_code = _run_detection_wizard(result)
+        with patch(
+            "btrfs_backup_ng.cli.config_cmd.prompt_snapshot_prefix",
+            side_effect=["home"],  # prefix
+        ):
+            exit_code = _run_detection_wizard(result)
 
         assert exit_code == 0
         captured = capsys.readouterr()
@@ -2063,7 +2068,6 @@ class TestDetectionWizard:
 
         mock_selection.return_value = [0]  # Select first volume
         mock_prompt.side_effect = [
-            "home",  # prefix
             "/backup",  # target (not /mnt/)
         ]
         mock_bool.side_effect = [
@@ -2074,7 +2078,11 @@ class TestDetectionWizard:
             "cancel",  # cancel
         ]
 
-        exit_code = _run_detection_wizard(result)
+        with patch(
+            "btrfs_backup_ng.cli.config_cmd.prompt_snapshot_prefix",
+            side_effect=["home"],  # prefix
+        ):
+            exit_code = _run_detection_wizard(result)
 
         assert exit_code == 0
 
@@ -2107,7 +2115,6 @@ class TestDetectionWizard:
 
         mock_selection.return_value = [0]  # Select first volume
         mock_prompt.side_effect = [
-            "home",  # prefix
             "ssh://user@host:/backup/home",  # SSH target
         ]
         mock_bool.side_effect = [
@@ -2119,7 +2126,11 @@ class TestDetectionWizard:
             "print",  # print config
         ]
 
-        exit_code = _run_detection_wizard(result)
+        with patch(
+            "btrfs_backup_ng.cli.config_cmd.prompt_snapshot_prefix",
+            side_effect=["home"],  # prefix
+        ):
+            exit_code = _run_detection_wizard(result)
 
         assert exit_code == 0
         captured = capsys.readouterr()
@@ -2155,7 +2166,6 @@ class TestDetectionWizard:
 
         mock_selection.return_value = [0]  # Select first volume
         mock_prompt.side_effect = [
-            "home",  # prefix
             "/mnt/usb-drive/backup",  # Mount point target triggers require_mount
         ]
         mock_bool.side_effect = [
@@ -2167,7 +2177,11 @@ class TestDetectionWizard:
             "print",  # print config
         ]
 
-        exit_code = _run_detection_wizard(result)
+        with patch(
+            "btrfs_backup_ng.cli.config_cmd.prompt_snapshot_prefix",
+            side_effect=["home"],  # prefix
+        ):
+            exit_code = _run_detection_wizard(result)
 
         assert exit_code == 0
         captured = capsys.readouterr()
@@ -2206,9 +2220,7 @@ class TestDetectionWizard:
         mock_selection.return_value = [0, 1]  # Both recommended
 
         mock_prompt.side_effect = [
-            "home",  # prefix for /home
             "/backup/home",  # target (not /mnt/)
-            "root",  # prefix for /
             "/backup/root",  # target (not /mnt/)
         ]
         mock_bool.side_effect = [
@@ -2220,7 +2232,11 @@ class TestDetectionWizard:
             "print",  # print config
         ]
 
-        exit_code = _run_detection_wizard(result)
+        with patch(
+            "btrfs_backup_ng.cli.config_cmd.prompt_snapshot_prefix",
+            side_effect=["home", "root"],  # prefix for /home, prefix for /
+        ):
+            exit_code = _run_detection_wizard(result)
 
         assert exit_code == 0
         captured = capsys.readouterr()
@@ -2258,7 +2274,6 @@ class TestDetectionWizard:
 
         mock_selection.return_value = [0]  # Select first volume
         mock_prompt.side_effect = [
-            "home",  # prefix
             "/backup",  # target (not /mnt/)
             "2d",  # min retention
         ]
@@ -2278,7 +2293,11 @@ class TestDetectionWizard:
             "print",  # print config
         ]
 
-        exit_code = _run_detection_wizard(result)
+        with patch(
+            "btrfs_backup_ng.cli.config_cmd.prompt_snapshot_prefix",
+            side_effect=["home"],  # prefix
+        ):
+            exit_code = _run_detection_wizard(result)
 
         assert exit_code == 0
         captured = capsys.readouterr()
@@ -2404,7 +2423,6 @@ path = "/backup"
 
         mock_selection.return_value = [0]  # Select first volume
         mock_prompt.side_effect = [
-            "home-new",  # different prefix
             "/backup/new",  # different target (not /mnt/)
         ]
         mock_bool.side_effect = [
@@ -2417,7 +2435,11 @@ path = "/backup"
             "cancel",  # cancel after seeing diff
         ]
 
-        exit_code = _run_detection_wizard(result)
+        with patch(
+            "btrfs_backup_ng.cli.config_cmd.prompt_snapshot_prefix",
+            side_effect=["home-new"],  # different prefix
+        ):
+            exit_code = _run_detection_wizard(result)
 
         assert exit_code == 0
         captured = capsys.readouterr()
@@ -2457,7 +2479,6 @@ path = "/backup"
 
         mock_selection.return_value = [0]  # Select first volume
         mock_prompt.side_effect = [
-            "home",  # prefix
             "/backup",  # target (not /mnt/)
             str(save_path),  # save path
         ]
@@ -2469,7 +2490,11 @@ path = "/backup"
             "save",  # save config
         ]
 
-        exit_code = _run_detection_wizard(result)
+        with patch(
+            "btrfs_backup_ng.cli.config_cmd.prompt_snapshot_prefix",
+            side_effect=["home"],  # prefix
+        ):
+            exit_code = _run_detection_wizard(result)
 
         assert exit_code == 0
         assert save_path.exists()

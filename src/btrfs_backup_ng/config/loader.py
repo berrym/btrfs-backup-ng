@@ -202,7 +202,10 @@ def _parse_volume(data: dict[str, Any], global_config: GlobalConfig) -> VolumeCo
 
     return VolumeConfig(
         path=data["path"],
-        snapshot_prefix=data.get("snapshot_prefix", ""),
+        # Absent -> None so the schema auto-derives from the path; an explicit
+        # value (including "") is passed through and honored. None is the
+        # documented sentinel here, hence the arg-type ignore.
+        snapshot_prefix=data.get("snapshot_prefix"),  # type: ignore[arg-type]
         snapshot_dir=data.get("snapshot_dir", global_config.snapshot_dir),
         targets=targets,
         retention=retention,

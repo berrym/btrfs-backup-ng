@@ -450,7 +450,6 @@ class TestInteractiveWizard:
                 "",  # transaction_log (empty)
                 "1d",  # min retention
                 "/home",  # volume path
-                "home-",  # snapshot prefix
                 "/mnt/backup",  # target path
             ]
         )
@@ -478,7 +477,11 @@ class TestInteractiveWizard:
                     "btrfs_backup_ng.cli.config_cmd.prompt_bool",
                     side_effect=lambda *a, **kw: next(prompt_bool_returns),
                 ):
-                    result = _run_interactive_wizard()
+                    with mock.patch(
+                        "btrfs_backup_ng.cli.config_cmd.prompt_snapshot_prefix",
+                        side_effect=["home-"],  # snapshot prefix
+                    ):
+                        result = _run_interactive_wizard()
 
         assert "[global]" in result
         assert 'path = "/home"' in result
@@ -644,7 +647,6 @@ class TestMigrateSystemd:
                 "",
                 "1d",
                 "/home",
-                "home-",
                 "ssh://user@server:/backups",  # SSH target
             ]
         )
@@ -672,7 +674,11 @@ class TestMigrateSystemd:
                     "btrfs_backup_ng.cli.config_cmd.prompt_bool",
                     side_effect=lambda *a, **kw: next(prompt_bool_returns),
                 ):
-                    result = _run_interactive_wizard()
+                    with mock.patch(
+                        "btrfs_backup_ng.cli.config_cmd.prompt_snapshot_prefix",
+                        side_effect=["home-"],  # snapshot prefix
+                    ):
+                        result = _run_interactive_wizard()
 
         assert 'path = "ssh://user@server:/backups"' in result
         assert "ssh_sudo = true" in result
@@ -688,7 +694,6 @@ class TestMigrateSystemd:
                 "1d",
                 "",  # Try empty volume path first
                 "/home",  # Then provide valid path
-                "home-",
                 "/mnt/backup",
             ]
         )
@@ -716,7 +721,11 @@ class TestMigrateSystemd:
                     "btrfs_backup_ng.cli.config_cmd.prompt_bool",
                     side_effect=lambda *a, **kw: next(prompt_bool_returns),
                 ):
-                    result = _run_interactive_wizard()
+                    with mock.patch(
+                        "btrfs_backup_ng.cli.config_cmd.prompt_snapshot_prefix",
+                        side_effect=["home-"],  # snapshot prefix
+                    ):
+                        result = _run_interactive_wizard()
 
         # Should have completed with the second volume attempt
         assert 'path = "/home"' in result
@@ -731,7 +740,6 @@ class TestMigrateSystemd:
                 "",
                 "1d",
                 "/home",
-                "home-",
                 "",  # Try empty target first
                 "/mnt/backup",  # Then provide valid target
             ]
@@ -760,6 +768,10 @@ class TestMigrateSystemd:
                     "btrfs_backup_ng.cli.config_cmd.prompt_bool",
                     side_effect=lambda *a, **kw: next(prompt_bool_returns),
                 ):
-                    result = _run_interactive_wizard()
+                    with mock.patch(
+                        "btrfs_backup_ng.cli.config_cmd.prompt_snapshot_prefix",
+                        side_effect=["home-"],  # snapshot prefix
+                    ):
+                        result = _run_interactive_wizard()
 
         assert 'path = "/mnt/backup"' in result
