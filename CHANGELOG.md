@@ -5,6 +5,25 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.3] - 2026-07-18
+
+### Fixed
+
+#### Snapper Backup to Remote and Raw Targets
+- **`snapper backup` now honors `ssh://`, `raw://`, and `raw+ssh://` destinations** instead of always writing locally; snapper backups are routed through the endpoint layer like regular backups
+- **Native snapper layout on remote btrfs targets** — each snapshot is received into `.snapshots/{num}/snapshot` alongside its `info.xml`; raw targets get a numbered stream plus a metadata sidecar
+
+#### SSH Transfers
+- **SSH config keys are preserved through endpoint construction** — a `ssh://user@host` username, `--ssh-sudo`, and `--ssh-key` are no longer dropped (the username previously fell back to `$SUDO_USER`)
+- **Transfer verification checks the exact received subvolume path** (`btrfs subvolume show`) instead of a filesystem-wide name search, which previously reported good snapper backups as failed and deleted them, and could otherwise match a sibling snapshot
+- **Endpoint construction no longer fails when `~/.ssh` does not exist** (fresh accounts, containers, CI) — the ControlMaster directory is created with its parents
+- **`timestamp_format` is now honored** for backup naming (was silently ignored)
+
+#### Other
+- Raw send streams are written to the target file rather than the current directory
+- Remote `raw+ssh` metadata sidecars are written correctly; snapper cleanup uses `btrfs subvolume delete` for read-only received subvolumes
+- Removed stray terminal output (info.xml/metadata `tee` echo) and a dead receive-log diagnostic that logged a spurious warning after every successful transfer
+
 ## [0.8.2] - 2026-01-10
 
 ### Added

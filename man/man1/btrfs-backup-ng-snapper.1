@@ -77,8 +77,10 @@ Back up Snapper snapshots to a target location.
 Snapper configuration name (e.g., "root", "home").
 .TP
 .I TARGET
-Destination path. Can be local (e.g., /mnt/backup/root) or SSH
-(e.g., ssh://user@host:/backups/root).
+Destination path. For btrfs destinations, use a local path
+(e.g., /mnt/backup/root) or SSH (e.g., ssh://user@host:/backups/root).
+For non-btrfs destinations, use a raw target that writes a btrfs send
+stream to a file: raw:///path (local) or raw+ssh://user@host/path (remote).
 .PP
 Options:
 .TP
