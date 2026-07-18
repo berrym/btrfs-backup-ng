@@ -2,7 +2,6 @@
 
 import argparse
 import logging
-import os
 import time
 from pathlib import Path
 
@@ -71,7 +70,7 @@ def execute_snapshot(args: argparse.Namespace) -> int:
         print("")
         print("Would create snapshots for:")
         for volume in volumes:
-            prefix = volume.snapshot_prefix or f"{os.uname()[1]}-"
+            prefix = volume.snapshot_prefix
             print(f"  {volume.path} (prefix: {prefix})")
         return 0
 
@@ -86,7 +85,7 @@ def execute_snapshot(args: argparse.Namespace) -> int:
         try:
             # Build endpoint kwargs
             endpoint_kwargs = {
-                "snap_prefix": volume.snapshot_prefix or f"{os.uname()[1]}-",
+                "snap_prefix": volume.snapshot_prefix,
                 "convert_rw": False,
                 "subvolume_sync": False,
                 "btrfs_debug": False,

@@ -2,7 +2,6 @@
 
 import argparse
 import logging
-import os
 import time
 from pathlib import Path
 from typing import Literal
@@ -97,7 +96,7 @@ def execute_prune(args: argparse.Namespace) -> int:
 
         # Build endpoint kwargs
         endpoint_kwargs = {
-            "snap_prefix": volume.snapshot_prefix or f"{os.uname()[1]}-",
+            "snap_prefix": volume.snapshot_prefix,
             "convert_rw": False,
             "subvolume_sync": False,
             "btrfs_debug": False,
@@ -105,7 +104,7 @@ def execute_prune(args: argparse.Namespace) -> int:
             "timestamp_format": get_timestamp_format(config),
         }
 
-        prefix = volume.snapshot_prefix or f"{os.uname()[1]}-"
+        prefix = volume.snapshot_prefix
 
         # Prune source snapshots
         try:

@@ -219,7 +219,10 @@ class VolumeConfig:
     """
 
     path: str
-    snapshot_prefix: str = ""
+    # Defaults to None so __post_init__ can distinguish "unset" (auto-derive from
+    # path) from an explicit "" (bare-timestamp names). Always a concrete str after
+    # __post_init__, so it is typed str for consumers.
+    snapshot_prefix: str = None  # type: ignore[assignment]
     snapshot_dir: str = ".snapshots"
     targets: list[TargetConfig] = field(default_factory=list)
     retention: Optional[RetentionConfig] = None
@@ -228,8 +231,10 @@ class VolumeConfig:
     snapper: Optional[SnapperSourceConfig] = None
 
     def __post_init__(self):
-        # Generate default prefix from path if not specified
-        if not self.snapshot_prefix:
+        # Auto-derive a prefix from the path only when unset (None). An explicit
+        # empty string is a valid, intentional choice (bare-timestamp names) and
+        # must be preserved.
+        if self.snapshot_prefix is None:
             # /home -> home-, /var/log -> var-log- (trailing dash for readable snapshot names)
             base = self.path.strip("/").replace("/", "-") or "root"
             self.snapshot_prefix = base + "-"

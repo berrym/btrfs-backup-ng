@@ -142,6 +142,17 @@ class TestVolumeConfig:
         volume = VolumeConfig(path="/home", snapshot_prefix="my-prefix-")
         assert volume.snapshot_prefix == "my-prefix-"
 
+    def test_explicit_empty_prefix_is_preserved(self):
+        """An explicit empty prefix is honored (not replaced by the auto-derived
+        default), giving bare-timestamp snapshot names."""
+        volume = VolumeConfig(path="/home", snapshot_prefix="")
+        assert volume.snapshot_prefix == ""
+
+    def test_unset_prefix_auto_derives(self):
+        """Omitting snapshot_prefix (None) still auto-derives from the path."""
+        volume = VolumeConfig(path="/home", snapshot_prefix=None)
+        assert volume.snapshot_prefix == "home-"
+
     def test_with_targets(self):
         """Test volume with targets."""
         targets = [

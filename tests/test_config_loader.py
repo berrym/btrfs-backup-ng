@@ -189,6 +189,34 @@ path = "/mnt/backup"
         with pytest.raises(ConfigError, match="path"):
             load_config(bad_config)
 
+    def test_load_explicit_empty_snapshot_prefix(self, tmp_config_dir):
+        """An explicit empty snapshot_prefix in TOML is preserved, not replaced
+        by the auto-derived default."""
+        cfg = tmp_config_dir / "empty_prefix.toml"
+        cfg.write_text("""
+[[volumes]]
+path = "/home"
+snapshot_prefix = ""
+
+[[volumes.targets]]
+path = "/mnt/backup"
+""")
+        config, _ = load_config(cfg)
+        assert config.volumes[0].snapshot_prefix == ""
+
+    def test_load_absent_snapshot_prefix_auto_derives(self, tmp_config_dir):
+        """Omitting snapshot_prefix auto-derives it from the volume path."""
+        cfg = tmp_config_dir / "no_prefix.toml"
+        cfg.write_text("""
+[[volumes]]
+path = "/home"
+
+[[volumes.targets]]
+path = "/mnt/backup"
+""")
+        config, _ = load_config(cfg)
+        assert config.volumes[0].snapshot_prefix == "home-"
+
     def test_load_missing_target_path(self, tmp_config_dir):
         """Test error when target is missing path."""
         bad_config = tmp_config_dir / "no_target_path.toml"

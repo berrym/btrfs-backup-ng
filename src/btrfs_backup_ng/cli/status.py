@@ -2,7 +2,6 @@
 
 import argparse
 import logging
-import os
 from pathlib import Path
 
 from .. import endpoint
@@ -86,7 +85,7 @@ def execute_status(args: argparse.Namespace) -> int:
 
         # Build endpoint kwargs
         endpoint_kwargs = {
-            "snap_prefix": volume.snapshot_prefix or f"{os.uname()[1]}-",
+            "snap_prefix": volume.snapshot_prefix,
             "convert_rw": False,
             "subvolume_sync": False,
             "btrfs_debug": False,

@@ -26,6 +26,7 @@ from .wizard_utils import (
     prompt_choice,
     prompt_int,
     prompt_selection,
+    prompt_snapshot_prefix,
 )
 
 logger = logging.getLogger(__name__)
@@ -234,8 +235,11 @@ def _generate_config_from_wizard(config_data: dict[str, Any]) -> str:
             lines.append(f"include_types = [{types_str}]")
             lines.append(f'min_age = "{snapper.get("min_age", "1h")}"')
         else:
-            # Native volumes use snapshot_prefix
-            lines.append(f'snapshot_prefix = "{volume.get("snapshot_prefix", "")}"')
+            # Native volumes use snapshot_prefix. Only emit it when explicitly
+            # set, so an unset prefix round-trips to auto-derive on load; an
+            # explicit "" is preserved and honored.
+            if volume.get("snapshot_prefix") is not None:
+                lines.append(f'snapshot_prefix = "{volume["snapshot_prefix"]}"')
 
         for target in volume.get("targets", []):
             lines.extend(
@@ -358,7 +362,7 @@ def _run_interactive_wizard() -> str:
 
         # Generate default prefix from path (with trailing dash for readable snapshot names)
         default_prefix = (Path(volume_path).name or "root") + "-"
-        snapshot_prefix = prompt("Snapshot prefix", default_prefix)
+        snapshot_prefix = prompt_snapshot_prefix(default_prefix)
 
         volume: dict[str, Any] = {
             "path": volume_path,
@@ -1270,13 +1274,13 @@ def _run_detection_wizard(result) -> int:
                 )
             else:
                 # User wants native management instead
-                volume["snapshot_prefix"] = prompt(
-                    "Snapshot prefix", suggestion.suggested_prefix
+                volume["snapshot_prefix"] = prompt_snapshot_prefix(
+                    suggestion.suggested_prefix
                 )
         else:
             # Native volume
-            volume["snapshot_prefix"] = prompt(
-                "Snapshot prefix", suggestion.suggested_prefix
+            volume["snapshot_prefix"] = prompt_snapshot_prefix(
+                suggestion.suggested_prefix
             )
 
         # Add targets
