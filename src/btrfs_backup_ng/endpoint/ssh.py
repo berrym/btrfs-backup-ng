@@ -210,6 +210,25 @@ class SSHEndpoint(Endpoint):
         # Call parent init with both config and kwargs
         super().__init__(config=self.config, **kwargs)
 
+        # The base Endpoint.__init__ rebuilds self.config from a fixed key
+        # whitelist, which drops SSH-specific keys. Restore them from the
+        # passed-in config so ssh://user@host URLs and --ssh-sudo / --ssh-key
+        # are honored; otherwise the username falls back to SUDO_USER/current
+        # user and ssh_sudo / identity file are silently lost.
+        for _ssh_key in (
+            "username",
+            "port",
+            "ssh_opts",
+            "agent_forwarding",
+            "ssh_sudo",
+            "passwordless",
+            "ssh_identity_file",
+            "ssh_key",
+            "ssh_password_fallback",
+        ):
+            if config.get(_ssh_key) is not None:
+                self.config[_ssh_key] = config[_ssh_key]
+
         self.hostname = hostname
         logger.debug("SSHEndpoint initialized with hostname: %s", self.hostname)
         logger.debug("SSHEndpoint: kwargs provided: %s", list(kwargs.keys()))
