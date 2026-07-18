@@ -214,11 +214,10 @@ class RawEndpoint(Endpoint):
 
         logger.info("Writing raw stream to: %s", output_path)
 
-        # Build and execute the pipeline
-        pipeline = self._build_receive_pipeline(output_path)
-        proc = self._execute_pipeline(pipeline, stdin_pipe)
-
-        # Store metadata for later (will be saved after transfer completes)
+        # Record metadata BEFORE executing: _execute_pipeline reads
+        # _pending_metadata["stream_path"] to know where to write. Setting it
+        # afterwards left the default Path() ('.') in place, so the pipeline
+        # tried to open the current directory as the output file.
         self._pending_metadata = {
             "name": snapshot_name,
             "stream_path": output_path,
@@ -227,6 +226,10 @@ class RawEndpoint(Endpoint):
             "encrypt": self.encrypt,
             "gpg_recipient": self.gpg_recipient,
         }
+
+        # Build and execute the pipeline
+        pipeline = self._build_receive_pipeline(output_path)
+        proc = self._execute_pipeline(pipeline, stdin_pipe)
 
         return proc
 
