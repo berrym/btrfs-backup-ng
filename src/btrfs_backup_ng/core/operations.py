@@ -1239,7 +1239,7 @@ def get_snapper_snapshots_for_backup(
 
 def send_snapper_snapshot(
     snapper_snapshot,
-    destination_path: str,
+    destination_endpoint,
     parent_snapper_snapshot=None,
     options: dict | None = None,
 ) -> None:
@@ -1253,7 +1253,7 @@ def send_snapper_snapshot(
 
     Args:
         snapper_snapshot: SnapperSnapshot object to send
-        destination_path: Base path for backup (e.g., /backup/home)
+        destination_endpoint: Destination Endpoint (its config["path"] is the backup base)
         parent_snapper_snapshot: Optional parent for incremental transfer
         options: Transfer options (compress, show_progress, rate_limit)
 
@@ -1265,6 +1265,8 @@ def send_snapper_snapshot(
 
     if options is None:
         options = {}
+
+    destination_path = str(destination_endpoint.config["path"])
 
     snapshot_num = snapper_snapshot.number
     source_path = snapper_snapshot.subvolume_path
@@ -1694,7 +1696,7 @@ def _write_remote_metadata(endpoint, meta_path: Path, metadata) -> None:
 def sync_snapper_snapshots(
     scanner,
     config_name: str,
-    destination_path: str,
+    destination_endpoint,
     snapper_config=None,
     options: dict | None = None,
 ) -> int:
@@ -1711,7 +1713,7 @@ def sync_snapper_snapshots(
     Args:
         scanner: SnapperScanner instance
         config_name: Snapper config name
-        destination_path: Path to backup destination (e.g., /backup/home)
+        destination_endpoint: Destination Endpoint (its config["path"] is the backup base)
         snapper_config: Optional SnapperSourceConfig with filtering options
         options: Additional transfer options
 
@@ -1720,6 +1722,8 @@ def sync_snapper_snapshots(
     """
     if options is None:
         options = {}
+
+    destination_path = str(destination_endpoint.config["path"])
 
     logger.info(__util__.log_heading(f"Syncing snapper config '{config_name}'"))
 
@@ -1802,7 +1806,7 @@ def sync_snapper_snapshots(
             logger.info("[%d/%d] Snapshot %d", i, len(to_transfer), snap.number)
             send_snapper_snapshot(
                 snap,
-                destination_path,
+                destination_endpoint,
                 parent_snapper_snapshot=parent,
                 options=options,
             )

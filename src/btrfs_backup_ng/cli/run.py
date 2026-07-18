@@ -517,12 +517,17 @@ def _backup_snapper_volume(
                 "show_progress": show_progress,
             }
 
+            # Route the destination through the endpoint layer (local/ssh/raw)
+            destination_endpoint = endpoint.choose_endpoint(
+                target.path, {"path": target.path, "snap_prefix": ""}
+            )
+
             # Sync snapper snapshots to this target
             logger.info("Syncing snapper config '%s' to %s", config_name, target.path)
             transferred = sync_snapper_snapshots(
                 scanner,
                 config_name,
-                target.path,
+                destination_endpoint,
                 snapper_config=snapper_config,
                 options=options,
             )
