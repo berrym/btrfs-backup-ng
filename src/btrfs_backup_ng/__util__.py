@@ -29,6 +29,7 @@ __all__ = [
     "delete_subvolume",
     "DATE_FORMAT",
     "MOUNTS_FILE",
+    "parse_snapshot_time",
 ]
 
 DATE_FORMAT = "%Y%m%d-%H%M%S"
@@ -52,17 +53,35 @@ class InsufficientSpaceError(AbortError):
     """
 
 
+def _endpoint_timestamp_format(endpoint):
+    """Return the timestamp format configured on an endpoint, or the default."""
+    config = getattr(endpoint, "config", None)
+    if isinstance(config, dict):
+        fmt = config.get("timestamp_format")
+        if fmt:
+            return fmt
+    return DATE_FORMAT
+
+
 @functools.total_ordering
 class Snapshot:
     """Represents a snapshot with comparison by prefix and time_obj."""
 
-    def __init__(self, location, prefix, endpoint, time_obj=None) -> None:
+    def __init__(
+        self, location, prefix, endpoint, time_obj=None, time_format=None
+    ) -> None:
         self.location = Path(location)
         self.prefix = prefix
         self.endpoint = endpoint
         if time_obj is None:
             time_obj = str_to_date()
         self.time_obj = time_obj
+        # The format used to render/parse this snapshot's timestamp. Stored per
+        # instance so a snapshot parsed under a legacy format regenerates the
+        # exact on-disk name even when a different timestamp_format is configured.
+        if time_format is None:
+            time_format = _endpoint_timestamp_format(endpoint)
+        self.time_format = time_format
         self.locks = set()
         self.parent_locks = set()
 
@@ -82,7 +101,7 @@ class Snapshot:
 
     def get_name(self):
         """Return a snapshot's name."""
-        return self.prefix + date_to_str(self.time_obj)
+        return self.prefix + date_to_str(self.time_obj, fmt=self.time_format)
 
     def get_path(self):
         """Return full path to a snapshot."""
@@ -184,6 +203,30 @@ def str_to_date(time_string=None, fmt=None):
     if fmt is None:
         fmt = DATE_FORMAT
     return time.strptime(time_string, fmt)
+
+
+def parse_snapshot_time(time_string, preferred_fmt=None):
+    """Parse a snapshot timestamp into a ``(time_obj, matched_fmt)`` pair.
+
+    ``preferred_fmt`` (a configured ``timestamp_format``) is tried first when
+    given, then the built-in ``DATE_FORMAT`` is tried as a fallback so snapshots
+    created under a previous format stay readable after the format changes.
+    ``matched_fmt`` is the format that actually parsed the string, so the caller
+    can regenerate the identical on-disk name. Raises ``ValueError`` if no
+    candidate format matches.
+    """
+    formats = []
+    if preferred_fmt:
+        formats.append(preferred_fmt)
+    if DATE_FORMAT not in formats:
+        formats.append(DATE_FORMAT)
+    last_error = None
+    for fmt in formats:
+        try:
+            return time.strptime(time_string, fmt), fmt
+        except ValueError as e:
+            last_error = e
+    raise last_error or ValueError(f"unparseable snapshot timestamp: {time_string!r}")
 
 
 def is_btrfs(path):

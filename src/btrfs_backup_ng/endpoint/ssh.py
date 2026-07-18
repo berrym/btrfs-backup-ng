@@ -1963,12 +1963,15 @@ print(json.dumps(result))
                 if snap_name.startswith(snap_prefix):
                     date_part = snap_name[len(snap_prefix) :]
                     try:
-                        time_obj = __util__.str_to_date(date_part)
+                        time_obj, matched_fmt = __util__.parse_snapshot_time(
+                            date_part, self.config.get("timestamp_format")
+                        )
                         snapshot = __util__.Snapshot(
                             self.config["path"],
                             snap_prefix,
                             self,
                             time_obj=time_obj,
+                            time_format=matched_fmt,
                         )
                         snapshots.append(snapshot)
                     except Exception as e:

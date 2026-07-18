@@ -9,7 +9,7 @@ from .. import endpoint
 from ..__logger__ import create_logger
 from ..config import ConfigError, find_config_file, load_config
 from ..transaction import get_transaction_stats, read_transaction_log
-from .common import get_log_level
+from .common import get_log_level, get_timestamp_format
 
 logger = logging.getLogger(__name__)
 
@@ -91,6 +91,7 @@ def execute_status(args: argparse.Namespace) -> int:
             "subvolume_sync": False,
             "btrfs_debug": False,
             "fs_checks": "auto",
+            "timestamp_format": get_timestamp_format(config),
         }
 
         # Check source

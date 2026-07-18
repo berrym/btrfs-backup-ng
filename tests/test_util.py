@@ -15,6 +15,7 @@ from btrfs_backup_ng.__util__ import (
     SnapshotTransferError,
     date_to_str,
     log_heading,
+    parse_snapshot_time,
     read_locks,
     str_to_date,
     write_locks,
@@ -774,3 +775,87 @@ class TestInsufficientSpaceError:
         except InsufficientSpaceError as e:
             assert "10GB" in str(e)
             assert "5GB" in str(e)
+
+
+class TestParseSnapshotTime:
+    """Tests for parse_snapshot_time (preferred format with legacy fallback)."""
+
+    def test_preferred_format_matches(self):
+        """A name in the preferred format parses under that format."""
+        time_obj, fmt = parse_snapshot_time("20240115T143022", "%Y%m%dT%H%M%S")
+        assert fmt == "%Y%m%dT%H%M%S"
+        assert time.strftime("%Y%m%dT%H%M%S", time_obj) == "20240115T143022"
+
+    def test_falls_back_to_default(self):
+        """A legacy default-format name still parses when a custom format is preferred."""
+        time_obj, fmt = parse_snapshot_time("20240115-143022", "%Y%m%dT%H%M%S")
+        assert fmt == DATE_FORMAT
+        assert time.strftime(DATE_FORMAT, time_obj) == "20240115-143022"
+
+    def test_default_when_no_preferred(self):
+        """With no preferred format, the built-in default is used."""
+        time_obj, fmt = parse_snapshot_time("20240115-143022")
+        assert fmt == DATE_FORMAT
+
+    def test_preferred_equal_to_default_not_duplicated(self):
+        """Passing the default as preferred still parses (no duplicate/degenerate case)."""
+        time_obj, fmt = parse_snapshot_time("20240115-143022", DATE_FORMAT)
+        assert fmt == DATE_FORMAT
+
+    def test_raises_when_nothing_matches(self):
+        """An unparseable string raises ValueError."""
+        with pytest.raises(ValueError):
+            parse_snapshot_time("not-a-date", "%Y%m%dT%H%M%S")
+
+
+class TestSnapshotTimeFormat:
+    """Tests for per-snapshot timestamp_format handling."""
+
+    def test_default_format_from_plain_endpoint(self):
+        """A MagicMock endpoint (no dict config) yields the built-in default format."""
+        endpoint = MagicMock()
+        snap = Snapshot("/snap", "home-", endpoint, str_to_date("20240115-143022"))
+        assert snap.time_format == DATE_FORMAT
+        assert snap.get_name() == "home-20240115-143022"
+
+    def test_new_snapshot_uses_configured_format(self):
+        """A new snapshot inherits the endpoint config's timestamp_format."""
+        endpoint = MagicMock()
+        endpoint.config = {"timestamp_format": "%Y%m%dT%H%M%S"}
+        snap = Snapshot("/snap", "home-", endpoint, str_to_date("20240115-143022"))
+        assert snap.time_format == "%Y%m%dT%H%M%S"
+        assert snap.get_name() == "home-20240115T143022"
+
+    def test_explicit_time_format_overrides_endpoint(self):
+        """An explicit time_format is preserved regardless of endpoint config."""
+        endpoint = MagicMock()
+        endpoint.config = {"timestamp_format": "%Y%m%dT%H%M%S"}
+        snap = Snapshot(
+            "/snap",
+            "home-",
+            endpoint,
+            str_to_date("20240115-143022"),
+            time_format=DATE_FORMAT,
+        )
+        assert snap.get_name() == "home-20240115-143022"
+
+    def test_legacy_snapshot_regenerates_legacy_name(self):
+        """A legacy-named snapshot regenerates its exact on-disk name even when a
+        different format is configured (round-trip safety for existing chains)."""
+        endpoint = MagicMock()
+        endpoint.config = {"timestamp_format": "%Y%m%dT%H%M%S"}
+        # Simulate the list_snapshots parse path: preferred format tried, fell back.
+        time_obj, matched = parse_snapshot_time(
+            "20240115-143022", endpoint.config["timestamp_format"]
+        )
+        snap = Snapshot(
+            "/snap", "home-", endpoint, time_obj=time_obj, time_format=matched
+        )
+        assert snap.get_name() == "home-20240115-143022"
+
+    def test_empty_config_format_uses_default(self):
+        """An endpoint config with an empty timestamp_format falls back to default."""
+        endpoint = MagicMock()
+        endpoint.config = {"timestamp_format": ""}
+        snap = Snapshot("/snap", "home-", endpoint, str_to_date("20240115-143022"))
+        assert snap.time_format == DATE_FORMAT

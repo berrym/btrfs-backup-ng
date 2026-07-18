@@ -61,6 +61,9 @@ class Endpoint:
             "lock_file_name", ".btrfs-backup-ng.locks"
         )
         self.config["snapshot_folder"] = config.get("snapshot_folder", ".snapshots")
+        # Snapshot timestamp format (from [global] timestamp_format). None means the
+        # built-in default is used when naming/parsing snapshots for this endpoint.
+        self.config["timestamp_format"] = config.get("timestamp_format")
 
         self.btrfs_flags = ["-vv"] if self.config["btrfs_debug"] else []
         self.__cached_snapshots = None
@@ -282,7 +285,9 @@ class Endpoint:
                 date_part = item_path.name[len(snap_prefix) :]
                 logger.debug("Parsing date from: %r", date_part)
                 try:
-                    time_obj = __util__.str_to_date(date_part)
+                    time_obj, matched_fmt = __util__.parse_snapshot_time(
+                        date_part, self.config.get("timestamp_format")
+                    )
                 except Exception as e:
                     # Debug level - it's normal for directories to contain
                     # files that don't match the snapshot naming pattern
@@ -291,7 +296,11 @@ class Endpoint:
                     )
                     continue
                 snapshot = __util__.Snapshot(
-                    snapshot_dir, snap_prefix, self, time_obj=time_obj
+                    snapshot_dir,
+                    snap_prefix,
+                    self,
+                    time_obj=time_obj,
+                    time_format=matched_fmt,
                 )
                 snapshots.append(snapshot)
         snapshots.sort()
@@ -334,7 +343,11 @@ class Endpoint:
             return
         if rewrite:
             snapshot = __util__.Snapshot(
-                self.config["path"], snapshot.prefix, self, time_obj=snapshot.time_obj
+                self.config["path"],
+                snapshot.prefix,
+                self,
+                time_obj=snapshot.time_obj,
+                time_format=snapshot.time_format,
             )
         self.__cached_snapshots.append(snapshot)
         self.__cached_snapshots.sort()
