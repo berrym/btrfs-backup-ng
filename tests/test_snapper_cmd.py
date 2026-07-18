@@ -1556,3 +1556,45 @@ class TestSnapperEndpointRouting:
 
         subvol = str(base / ".snapshots" / "7" / "snapshot")
         assert ["btrfs", "subvolume", "delete", subvol] in calls
+
+    def test_handle_backup_threads_ssh_options(self, tmp_path, monkeypatch):
+        """--ssh-sudo / --ssh-key reach the endpoint config for ssh targets."""
+        from btrfs_backup_ng.cli import snapper_cmd
+
+        args = argparse.Namespace(
+            config="root",
+            target="ssh://backup@host:/b",
+            snapshot=None,
+            type=None,
+            dry_run=False,
+            compress=None,
+            rate_limit=None,
+            verbose=False,
+            quiet=False,
+            log_level=None,
+            min_age="0",
+            ssh_sudo=True,
+            ssh_key="/home/u/.ssh/id",
+        )
+        monkeypatch.chdir(tmp_path)
+
+        mock_scanner = MagicMock()
+        mock_scanner.get_config.return_value = MagicMock()
+
+        with (
+            patch(
+                "btrfs_backup_ng.cli.snapper_cmd.SnapperScanner",
+                return_value=mock_scanner,
+            ),
+            patch("btrfs_backup_ng.endpoint.choose_endpoint") as mock_choose,
+            patch(
+                "btrfs_backup_ng.core.operations.sync_snapper_snapshots",
+                return_value=0,
+            ),
+        ):
+            mock_choose.return_value = MagicMock(_is_remote=True)
+            snapper_cmd._handle_backup(args)
+
+        cfg = mock_choose.call_args[0][1]
+        assert cfg.get("ssh_sudo") is True
+        assert cfg.get("ssh_identity_file") == "/home/u/.ssh/id"
