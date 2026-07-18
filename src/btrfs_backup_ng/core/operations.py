@@ -1318,9 +1318,13 @@ def _place_info_xml(snapper_snapshot, destination_endpoint) -> None:
 
 
 def _cleanup_snapper_backup(destination_endpoint, snapshot_num, is_raw) -> None:
-    """Best-effort removal of a partial snapper backup after a failed transfer."""
+    """Best-effort removal of a partial snapper backup after a failed transfer.
+
+    A received btrfs subvolume is read-only and cannot be removed with ``rm``, so
+    the ``.snapshots/{num}/snapshot`` subvolume is deleted with
+    ``btrfs subvolume delete`` before the numbered directory is removed.
+    """
     import os
-    import shutil
 
     if is_raw:
         # Raw partial files are overwritten on the next attempt; nothing to undo.
@@ -1328,23 +1332,26 @@ def _cleanup_snapper_backup(destination_endpoint, snapshot_num, is_raw) -> None:
 
     base = str(destination_endpoint.config["path"]).rstrip("/")
     snap_dir = f"{base}/.snapshots/{snapshot_num}"
+    subvol = f"{snap_dir}/snapshot"
     is_remote = getattr(destination_endpoint, "_is_remote", False)
 
     try:
         if is_remote and hasattr(destination_endpoint, "_exec_remote_command"):
             destination_endpoint._exec_remote_command(
+                ["btrfs", "subvolume", "delete", subvol], check=False
+            )
+            destination_endpoint._exec_remote_command(
                 ["rm", "-rf", snap_dir], check=False
             )
         else:
-            snap_path = Path(snap_dir)
-            snap_subvol = snap_path / "snapshot"
-            if snap_subvol.exists():
-                if os.geteuid() != 0:
-                    subprocess.run(
-                        ["sudo", "rm", "-rf", str(snap_path)], capture_output=True
-                    )
-                else:
-                    shutil.rmtree(snap_path, ignore_errors=True)
+            sudo = [] if os.geteuid() == 0 else ["sudo"]
+            if Path(subvol).exists():
+                subprocess.run(
+                    [*sudo, "btrfs", "subvolume", "delete", subvol],
+                    capture_output=True,
+                )
+            if Path(snap_dir).exists():
+                subprocess.run([*sudo, "rm", "-rf", snap_dir], capture_output=True)
     except Exception as cleanup_e:
         logger.warning("Cleanup failed: %s", cleanup_e)
 

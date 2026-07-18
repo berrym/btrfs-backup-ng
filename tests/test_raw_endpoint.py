@@ -1153,3 +1153,31 @@ class TestAllCompressionMethods:
         config = COMPRESSION_CONFIG[compress]
         expected_cmd = config["decompress_cmd"]
         assert pipeline[0] == list(expected_cmd)
+
+
+class TestSSHRawEndpointRemoteExec:
+    """SSHRawEndpoint can run remote commands (needed for the metadata sidecar)."""
+
+    def test_exec_remote_command_builds_ssh(self):
+        ep = SSHRawEndpoint(
+            config={
+                "path": "/remote/backup",
+                "hostname": "host",
+                "username": "user",
+            }
+        )
+
+        with patch("btrfs_backup_ng.endpoint.raw.subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0)
+            ep._exec_remote_command(
+                ["tee", "/remote/backup/x.snapper-meta.json"],
+                input=b"data",
+                check=True,
+            )
+
+        full_cmd = mock_run.call_args[0][0]
+        assert full_cmd[0] == "ssh"
+        assert "user@host" in full_cmd
+        # The remote command is the final (shell-quoted) argument.
+        assert "tee" in full_cmd[-1]
+        assert mock_run.call_args[1]["input"] == b"data"

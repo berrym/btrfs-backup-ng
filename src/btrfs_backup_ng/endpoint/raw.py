@@ -635,6 +635,23 @@ class SSHRawEndpoint(RawEndpoint):
 
         return cmd
 
+    def _exec_remote_command(
+        self, command: list[str], input: bytes | None = None, check: bool = True
+    ) -> subprocess.CompletedProcess:
+        """Run a command on the remote host over SSH.
+
+        Provides the same interface the snapper helpers use on SSHEndpoint
+        (metadata sidecar writes, directory listing, cleanup): accepts a command
+        as a list plus optional stdin bytes, and returns the CompletedProcess.
+        """
+        import shlex
+
+        remote = " ".join(shlex.quote(str(c)) for c in command)
+        if self.ssh_sudo:
+            remote = f"sudo {remote}"
+        full_cmd = self._build_ssh_command() + [remote]
+        return subprocess.run(full_cmd, input=input, capture_output=True, check=check)
+
     def _prepare(self) -> None:
         """Prepare the endpoint by creating the remote directory."""
         path = self.config["path"]
