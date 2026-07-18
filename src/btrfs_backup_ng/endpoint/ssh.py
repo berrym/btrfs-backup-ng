@@ -200,7 +200,6 @@ class SSHEndpoint(Endpoint):
         self.hostname: str = hostname
         self._instance_id: str = f"{os.getpid()}_{uuid.uuid4().hex[:8]}"
         self._lock: Lock = Lock()
-        self._last_receive_log: Optional[str] = None
         self._last_transfer_snapshot: Optional[bool] = None
         logger.debug(
             "SSHEndpoint: Config keys before parent init: %s", list(config.keys())
@@ -238,7 +237,6 @@ class SSHEndpoint(Endpoint):
         self.config["agent_forwarding"] = self.config.get("agent_forwarding", False)
 
         # Initialize tracking variables for verification
-        self._last_receive_log = None
         self._last_transfer_snapshot = None
 
         # Cache for diagnostics to avoid redundant testing
@@ -3184,61 +3182,6 @@ print(json.dumps(result))
 
             except Exception as e:
                 logger.error(f"Exception during verification: {e}")
-
-            # Check log files for diagnostic purposes, but don't let exit codes override actual success
-            logger.debug("=== LOG FILE DIAGNOSTICS ===")
-            if hasattr(self, "_last_receive_log"):
-                try:
-                    logger.debug(
-                        f"Checking log files for diagnostics: {self._last_receive_log}"
-                    )
-                    # Check exit code file
-                    exitcode_cmd = ["cat", f"{self._last_receive_log}.exitcode"]
-                    exitcode_result = self._exec_remote_command(
-                        exitcode_cmd, check=False, stdout=subprocess.PIPE
-                    )
-
-                    if exitcode_result.returncode == 0 and exitcode_result.stdout:
-                        actual_exitcode = exitcode_result.stdout.decode(
-                            errors="replace"
-                        ).strip()
-                        logger.debug(f"Process exit code: {actual_exitcode}")
-
-                        if actual_exitcode != "0":
-                            # Read the error log for diagnostics
-                            log_cmd = ["cat", self._last_receive_log]
-                            log_result = self._exec_remote_command(
-                                log_cmd, check=False, stdout=subprocess.PIPE
-                            )
-                            if log_result.returncode == 0 and log_result.stdout:
-                                log_content = log_result.stdout.decode(errors="replace")
-
-                                if transfer_actually_succeeded:
-                                    logger.warning(
-                                        f"Process reported error (exit code {actual_exitcode}) but transfer succeeded"
-                                    )
-                                    logger.warning(
-                                        f"Error details (informational): {log_content}"
-                                    )
-                                    logger.debug(
-                                        "This may indicate timing issues or benign process termination"
-                                    )
-                                else:
-                                    logger.error(
-                                        f"Process failed with exit code {actual_exitcode} and no snapshot found"
-                                    )
-                                    logger.error(f"Error details: {log_content}")
-                                    return False
-                        else:
-                            logger.debug("Process completed cleanly (exit code 0)")
-                    else:
-                        logger.warning(
-                            f"Could not read exit code file - command returned {exitcode_result.returncode}"
-                        )
-                except Exception as e:
-                    logger.warning(f"Could not check receive log files: {e}")
-            else:
-                logger.warning("No log files available for diagnostics")
 
             # Final decision based on actual transfer success
             if transfer_actually_succeeded:
