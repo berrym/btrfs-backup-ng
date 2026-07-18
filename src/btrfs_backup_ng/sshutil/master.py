@@ -68,7 +68,9 @@ class SSHMasterManager:
             else:
                 self.control_dir = self.ssh_config_dir / "controlmasters"
 
-        self.control_dir.mkdir(mode=0o700, exist_ok=True)
+        # parents=True so a missing ~/.ssh (fresh account, CI, container) does not
+        # break endpoint construction with FileNotFoundError.
+        self.control_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
         self._instance_id = f"{os.getpid()}_{threading.get_ident()}"
         self.control_path = (
             self.control_dir

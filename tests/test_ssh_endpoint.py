@@ -3,6 +3,8 @@
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+import pytest
+
 from btrfs_backup_ng.endpoint.ssh import (
     RECEIVE_IDLE_TIMEOUT,
     SSHEndpoint,
@@ -81,6 +83,14 @@ class TestSSHEndpointConfigPreservation:
     so ssh://user@host and --ssh-sudo / --ssh-key were silently lost (the username
     fell back to SUDO_USER/current user).
     """
+
+    @pytest.fixture(autouse=True)
+    def _isolated_home(self, tmp_path, monkeypatch):
+        # Constructing a real SSHEndpoint sets up an SSH ControlMaster dir under
+        # ~/.ssh; point HOME at a temp dir so tests never touch the real one (and
+        # so they run on a fresh account/CI runner with no ~/.ssh).
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.delenv("SUDO_USER", raising=False)
 
     def test_username_from_url_is_preserved(self):
         from btrfs_backup_ng.endpoint import choose_endpoint
