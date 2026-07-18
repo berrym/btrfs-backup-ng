@@ -770,10 +770,6 @@ def _do_direct_pipe_transfer(
 
     except Exception as e:
         logger.error("Error during SSH direct pipe transfer: %s", e)
-        if hasattr(destination_endpoint, "_last_receive_log"):
-            logger.error(
-                "Check remote log file: %s", destination_endpoint._last_receive_log
-            )
         raise __util__.SnapshotTransferError(f"SSH direct pipe transfer failed: {e}")
 
 
