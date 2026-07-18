@@ -200,8 +200,16 @@ class Endpoint:
             stderr=subprocess.DEVNULL,
         )
 
-    def receive(self, stdin: Any) -> Any:
-        """Call 'btrfs receive', setting the given pipe as its stdin."""
+    def receive(
+        self, stdin: Any, snapshot_name: str = "", parent_name: str | None = None
+    ) -> Any:
+        """Call 'btrfs receive', setting the given pipe as its stdin.
+
+        ``snapshot_name`` and ``parent_name`` are accepted for a uniform endpoint
+        interface -- RawEndpoint overrides receive() and uses them to name the
+        output file and record metadata. For a real btrfs receive the subvolume
+        name comes from the stream itself, so they are ignored here.
+        """
         # Make sure we use the raw path without local resolution
         path = self.config["path"]
         # Ensure path is properly normalized for this endpoint type
