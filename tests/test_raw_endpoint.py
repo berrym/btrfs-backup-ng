@@ -553,6 +553,27 @@ class TestRawEndpointReceive:
         assert endpoint._pending_metadata["compress"] is None
         assert endpoint._pending_metadata["encrypt"] is None
 
+    def test_receive_writes_stream_to_output_file(self, tmp_path):
+        """receive() writes the stream to the named file, not the cwd.
+
+        Regression: _execute_pipeline reads stream_path from _pending_metadata,
+        which receive() previously set only AFTER executing, so the default
+        Path() ('.') was used and the pipeline opened the current directory
+        (IsADirectoryError). This runs the real pipeline (no mocks).
+        """
+        endpoint = RawEndpoint(config={"path": str(tmp_path)})
+        src = tmp_path / "src.bin"
+        src.write_bytes(b"hello-raw-stream")
+
+        with open(src, "rb") as stdin:
+            proc = endpoint.receive(stdin, snapshot_name="snap-1")
+            proc.communicate()
+
+        assert proc.returncode == 0
+        out = tmp_path / "snap-1.btrfs"
+        assert out.exists()
+        assert out.read_bytes() == b"hello-raw-stream"
+
     def test_receive_with_compression(self, tmp_path):
         """Test receive with compression enabled."""
         endpoint = RawEndpoint(config={"path": tmp_path, "compress": "gzip"})
