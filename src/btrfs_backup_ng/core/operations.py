@@ -474,7 +474,9 @@ def _transfer_chunks_local(
     reader = chunked_manager.create_reassembly_reader(manifest)
 
     # Start btrfs receive
-    receive_process = destination_endpoint.receive(subprocess.PIPE)
+    receive_process = destination_endpoint.receive(
+        subprocess.PIPE, manifest.snapshot_name
+    )
     if receive_process is None:
         raise __util__.SnapshotTransferError("Receive process failed to start")
 
@@ -565,7 +567,9 @@ def _transfer_chunks_ssh(
     else:
         # Fall back to streaming through regular receive
         # Start btrfs receive on remote
-        receive_process = destination_endpoint.receive(subprocess.PIPE)
+        receive_process = destination_endpoint.receive(
+            subprocess.PIPE, manifest.snapshot_name
+        )
         if receive_process is None:
             raise __util__.SnapshotTransferError("SSH receive process failed to start")
 
@@ -919,7 +923,7 @@ def _do_rich_progress_transfer(
     logger.debug("Using Rich progress bar for transfer")
 
     # Start receive process (stderr is suppressed at the endpoint level)
-    receive_process = destination_endpoint.receive(subprocess.PIPE)
+    receive_process = destination_endpoint.receive(subprocess.PIPE, snapshot_name)
     if receive_process is None:
         logger.error("Failed to start receive process")
         if is_ssh_endpoint and not destination_endpoint.config.get("ssh_sudo", False):

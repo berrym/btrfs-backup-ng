@@ -68,6 +68,27 @@ class TestLocalEndpointOperations:
 
         assert endpoint.get_id() == str(dest)
 
+    def test_receive_accepts_snapshot_name(self, tmp_path):
+        """The base receive() accepts snapshot_name/parent_name so raw and non-raw
+        endpoints share one call signature. Guards against the positional-argument
+        TypeError that a non-raw receive() would raise when called with a name."""
+        dest = tmp_path / "dest"
+        dest.mkdir()
+
+        endpoint = LocalEndpoint(config={"path": str(dest), "snap_prefix": "test-"})
+        sentinel = object()
+
+        with patch.object(
+            endpoint, "_build_receive_command", return_value=["btrfs", "receive"]
+        ):
+            with patch.object(
+                endpoint, "_exec_command", return_value=sentinel
+            ) as mock_exec:
+                result = endpoint.receive(MagicMock(), "test-20240115-120000")
+
+        assert result is sentinel
+        mock_exec.assert_called_once()
+
     def test_list_snapshots_empty(self, tmp_path):
         """Test listing snapshots when none exist."""
         dest = tmp_path / "dest"

@@ -580,3 +580,107 @@ class TestCleanupPipelineExceptions:
         cleanup_pipeline([("test", mock_proc)])
 
         mock_proc.kill.assert_called_once()
+
+
+class TestReceivePassesSnapshotName:
+    """The transfer paths pass snapshot_name to endpoint.receive().
+
+    Raw endpoints require snapshot_name to name their output file; passing it on
+    every transfer path is what makes raw and raw+ssh targets work end to end.
+    These would fail on the pre-fix code where receive() was called without it.
+    """
+
+    def _mock_process(self, returncode=0):
+        proc = MagicMock()
+        proc.wait.return_value = returncode
+        proc.stderr = None
+        return proc
+
+    def test_process_transfer_passes_snapshot_name(self):
+        """The standard (non-progress) process path forwards snapshot_name."""
+        from btrfs_backup_ng.core import operations
+
+        send_process = self._mock_process()
+        send_process.stdout = MagicMock()
+        dest = MagicMock()
+        dest.receive.return_value = self._mock_process()
+
+        operations._do_process_transfer(
+            send_process,
+            dest,
+            None,
+            is_ssh_endpoint=False,
+            snapshot_name="host-20240115-120000",
+            estimated_size=None,
+            show_progress=False,
+        )
+
+        dest.receive.assert_called_once_with(
+            send_process.stdout, "host-20240115-120000"
+        )
+
+    def test_rich_progress_transfer_passes_snapshot_name(self):
+        """The Rich-progress path forwards snapshot_name."""
+        from btrfs_backup_ng.core import operations
+
+        send_process = self._mock_process()
+        dest = MagicMock()
+        dest.receive.return_value = self._mock_process()
+
+        with patch.object(
+            operations.progress_utils,
+            "run_transfer_with_progress",
+            return_value=(0, 0),
+        ):
+            operations._do_rich_progress_transfer(
+                send_process,
+                dest,
+                False,
+                "host-20240115-120000",
+                1000,
+            )
+
+        dest.receive.assert_called_once_with(subprocess.PIPE, "host-20240115-120000")
+
+    def test_chunked_local_passes_snapshot_name(self):
+        """The chunked local reassembly path forwards manifest.snapshot_name."""
+        from btrfs_backup_ng.core import operations
+
+        manifest = MagicMock()
+        manifest.snapshot_name = "host-20240115-120000"
+        manifest.chunk_count = 1
+        manifest.chunks = []
+        dest = MagicMock()
+        dest.receive.return_value = self._mock_process()
+        chunked_manager = MagicMock()
+        reader = MagicMock()
+        reader.pipe_to_process.return_value = 100
+        chunked_manager.create_reassembly_reader.return_value = reader
+
+        operations._transfer_chunks_local(manifest, dest, chunked_manager, {})
+
+        dest.receive.assert_called_once_with(subprocess.PIPE, "host-20240115-120000")
+
+    def test_chunked_ssh_passes_snapshot_name(self):
+        """The chunked SSH fallback (non-receive_chunked) path forwards the name."""
+        from btrfs_backup_ng.core import operations
+
+        manifest = MagicMock()
+        manifest.snapshot_name = "host-20240115-120000"
+        manifest.pending_chunks = [MagicMock()]
+        manifest.completed_chunks = 0
+        manifest.chunk_count = 1
+        manifest.chunks = []
+        # spec excludes receive_chunked so the fallback receive() branch is taken
+        dest = MagicMock(spec=["receive", "config", "_is_remote"])
+        recv = self._mock_process()
+        recv.stdin = MagicMock()
+        dest.receive.return_value = recv
+        chunked_manager = MagicMock()
+        reader = MagicMock()
+        reader.read_chunks.return_value = []
+        chunked_manager.create_reassembly_reader.return_value = reader
+
+        operations._transfer_chunks_ssh(manifest, dest, chunked_manager, {})
+
+        dest.receive.assert_called_once_with(subprocess.PIPE, "host-20240115-120000")
