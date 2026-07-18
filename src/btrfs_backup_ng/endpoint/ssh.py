@@ -2007,217 +2007,63 @@ print(json.dumps(result))
         return snapshots
 
     def _verify_snapshot_exists(self, dest_path: str, snapshot_name: str) -> bool:
-        """Verify a snapshot exists on the remote host.
+        """Verify a snapshot exists on the remote host at its exact path.
+
+        The received subvolume must exist at exactly ``{dest_path}/{snapshot_name}``.
+        Verification is deliberately scoped to that precise path rather than
+        searching the destination filesystem for a subvolume of the given name:
+        snapper snapshots are all named ``snapshot`` (the source subvolume's
+        basename), so a name-only search would match a same-named subvolume
+        elsewhere on the destination (e.g. a sibling ``.snapshots/<other>/snapshot``)
+        and report success for a transfer that actually failed. An exact-path check
+        is correct for native backups (whose names are unique anyway) and safe for
+        snapper.
 
         Args:
-            dest_path: Remote destination path
-            snapshot_name: Name of the snapshot to verify
+            dest_path: Remote directory the snapshot was received into
+            snapshot_name: Name of the received subvolume within dest_path
 
         Returns:
-            True if the snapshot exists, False otherwise
+            True if a subvolume/directory exists at the exact expected path.
         """
-        logger.debug(
-            f"Starting snapshot verification for '{snapshot_name}' in '{dest_path}'"
-        )
-        logger.debug(f"SSH sudo enabled: {self.config.get('ssh_sudo', False)}")
+        expected_path = f"{dest_path.rstrip('/')}/{snapshot_name}"
+        logger.debug(f"Verifying received snapshot at exact path: {expected_path}")
+        use_sudo = self.config.get("ssh_sudo", False)
 
-        # Try direct subvolume list first
-        # Don't call _build_remote_command here - _exec_remote_command does it internally
-        list_cmd = ["btrfs", "subvolume", "list", "-o", dest_path]
-
-        logger.debug(f"Verifying snapshot existence with command: {list_cmd}")
+        def _run(cmd: List[str]) -> Any:
+            # _exec_remote_command* wrap the command for SSH (and sudo) internally.
+            if use_sudo:
+                return self._exec_remote_command_with_retry(
+                    cmd,
+                    max_retries=2,
+                    check=False,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                )
+            return self._exec_remote_command(
+                cmd,
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
 
         try:
-            logger.debug("Executing subvolume list command...")
-
-            # Use retry mechanism for commands that may require authentication
-            use_sudo = self.config.get("ssh_sudo", False)
-            if use_sudo:
-                list_result = self._exec_remote_command_with_retry(
-                    list_cmd,
-                    max_retries=2,
-                    check=False,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                )
-            else:
-                list_result = self._exec_remote_command(
-                    list_cmd,
-                    check=False,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                )
-
-            logger.debug(f"Subvolume list command exit code: {list_result.returncode}")
-            if list_result.stdout:
-                stdout_content = list_result.stdout.decode(errors="replace")
-                logger.debug(f"Subvolume list output:\n{stdout_content}")
-            if list_result.stderr:
-                stderr_content = list_result.stderr.decode(errors="replace")
-                logger.debug(f"Subvolume list stderr:\n{stderr_content}")
-            if list_result.returncode != 0:
-                stderr_text = (
-                    list_result.stderr.decode(errors="replace")
-                    if list_result.stderr
-                    else ""
-                )
-                logger.warning(
-                    f"Failed to list subvolumes (exit code {list_result.returncode}): {stderr_text}"
-                )
-                logger.debug("Falling back to simple path check")
-
-                # Fall back to simple path check
-                check_cmd = [
-                    "test",
-                    "-d",
-                    f"{dest_path}/{snapshot_name}",
-                    "&&",
-                    "echo",
-                    "EXISTS",
-                ]
-                # Apply proper authentication handling to the fallback command too
-                check_cmd = self._build_remote_command(check_cmd)
-                logger.debug(f"Fallback verification command: {' '.join(check_cmd)}")
-
-                # Check if we need to provide password input for sudo
-                fallback_input = None
-                if "sudo" in check_cmd and "-S" in check_cmd:
-                    sudo_password = self._get_sudo_password()
-                    if sudo_password:
-                        fallback_input = sudo_password.encode() + b"\n"
-                        logger.debug(
-                            "Providing sudo password for fallback verification command"
-                        )
-
-                # Use retry mechanism for fallback verification commands with authentication
-                check_result = self._exec_remote_command_with_retry(
-                    check_cmd,
-                    max_retries=2,
-                    check=False,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    input=fallback_input,
-                )
-
-                logger.debug(f"Path check exit code: {check_result.returncode}")
-                if check_result.stdout and b"EXISTS" in check_result.stdout:
-                    logger.debug(
-                        f"Snapshot exists at path: {dest_path}/{snapshot_name}"
-                    )
-                    logger.debug("Path-based verification successful")
-                    return True
-                else:
-                    logger.error(
-                        f"Snapshot not found at path: {dest_path}/{snapshot_name}"
-                    )
-                    logger.debug(
-                        f"Path check stdout: {check_result.stdout.decode() if check_result.stdout else 'None'}"
-                    )
-                    logger.debug(
-                        f"Path check stderr: {check_result.stderr.decode() if check_result.stderr else 'None'}"
-                    )
-                    return False
-
-            # Check if the snapshot appears in the subvolume list
-            stdout_text = (
-                list_result.stdout.decode(errors="replace")
-                if list_result.stdout
-                else ""
-            )
-            logger.debug(f"Subvolume list output length: {len(stdout_text)} characters")
-            logger.debug(
-                f"Searching for snapshot '{snapshot_name}' at path '{dest_path}'"
-            )
-
-            # Look for the snapshot in the subvolume list output
-            # The output format is typically: "ID xxx gen xxx top level xxx path <path>"
-            # We need to check if our snapshot path appears in any of these lines
-            snapshot_found = False
-            expected_path = f"{dest_path.rstrip('/')}/{snapshot_name}"
-
-            if stdout_text:
-                lines = stdout_text.splitlines()
-                logger.debug(f"Subvolume list has {len(lines)} lines:")
-                for i, line in enumerate(lines):
-                    if i < 10:  # Log first 10 lines for debugging
-                        logger.debug(f"  Line {i + 1}: {line}")
-
-                    # Look for "path" keyword and check if our snapshot path is there
-                    if "path " in line:
-                        # Extract the path part after "path "
-                        path_part = line.split("path ", 1)[-1].strip()
-
-                        # More flexible matching - check if the snapshot name appears in the path
-                        # and if the path is within our destination directory
-                        if snapshot_name in path_part:
-                            # Check if this path is within our destination directory
-                            if (
-                                path_part == expected_path  # Exact match
-                                or path_part.startswith(
-                                    dest_path.rstrip("/") + "/"
-                                )  # Under dest_path
-                                or expected_path in path_part
-                            ):  # Expected path is contained
-                                logger.debug(
-                                    f"Snapshot found in subvolume list: {snapshot_name}"
-                                )
-                                logger.debug(f"  Found in path: {path_part}")
-                                logger.debug(f"  Expected path: {expected_path}")
-                                snapshot_found = True
-                                break
-
-                        # Also check if the path ends with our snapshot name (handles nested paths)
-                        if path_part.endswith(f"/{snapshot_name}"):
-                            logger.debug(
-                                f"Snapshot found by suffix match: {snapshot_name}"
-                            )
-                            logger.debug(f"  Found in path: {path_part}")
-                            snapshot_found = True
-                            break
-
-                if len(lines) > 10:
-                    logger.debug(f"  ... and {len(lines) - 10} more lines")
-
-            if snapshot_found:
-                logger.debug("Subvolume-based verification successful")
+            # Authoritative check: confirm a real subvolume exists at exactly the
+            # expected path (not merely a same-named subvolume elsewhere).
+            show_result = _run(["btrfs", "subvolume", "show", expected_path])
+            if show_result.returncode == 0:
+                logger.debug(f"Snapshot verified via subvolume show: {expected_path}")
                 return True
-            else:
-                logger.error("Snapshot not found in subvolume list")
-                logger.debug(f"Expected path: {expected_path}")
-                logger.debug(f"Full subvolume list output:\n{stdout_text}")
 
-                # Try simple path existence check as fallback
-                logger.debug("Trying simple path existence check as fallback")
-                simple_check_cmd = ["test", "-d", expected_path]
-                # Apply proper authentication handling to the final fallback command too
-                simple_check_cmd = self._build_remote_command(simple_check_cmd)
+            # Fallback: exact directory existence at the expected path. Still scoped
+            # to the precise location, so it cannot match a sibling snapshot.
+            test_result = _run(["test", "-d", expected_path])
+            if test_result.returncode == 0:
+                logger.debug(f"Snapshot verified via path check: {expected_path}")
+                return True
 
-                # Check if we need to provide password input for sudo
-                final_input = None
-                if "sudo" in simple_check_cmd and "-S" in simple_check_cmd:
-                    sudo_password = self._get_sudo_password()
-                    if sudo_password:
-                        final_input = sudo_password.encode() + b"\n"
-                        logger.debug(
-                            "Providing sudo password for final fallback verification command"
-                        )
-
-                # Use retry mechanism for simple path check with authentication
-                simple_result = self._exec_remote_command_with_retry(
-                    simple_check_cmd,
-                    max_retries=2,
-                    check=False,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    input=final_input,
-                )
-                if simple_result.returncode == 0:
-                    logger.debug(f"Snapshot exists via path check: {expected_path}")
-                    return True
-                else:
-                    logger.debug(f"Path check also failed for: {expected_path}")
-
-                return False
+            logger.error(f"Snapshot not found at expected path: {expected_path}")
+            return False
 
         except Exception as e:
             logger.error(f"Error verifying snapshot: {e}")
@@ -2836,9 +2682,12 @@ print(json.dumps(result))
                 f"({rate / (1024 * 1024):.1f} MiB/s)"
             )
 
-            # Verify snapshot exists on remote
-            if self._verify_snapshot_exists(dest_path, snapshot_name):
-                logger.info(f"Snapshot {snapshot_name} verified on remote")
+            # Verify snapshot exists on remote. btrfs receive names the received
+            # subvolume after the source basename (== snapshot_name for native
+            # backups, "snapshot" for snapper), so verify by that real name.
+            received_name = Path(source_path).name
+            if self._verify_snapshot_exists(dest_path, received_name):
+                logger.info(f"Snapshot {received_name} verified on remote")
                 return True
             else:
                 logger.error(
@@ -2987,8 +2836,11 @@ print(json.dumps(result))
 
             logger.info("Transfer completed successfully")
 
-            if self._verify_snapshot_exists(dest_path, snapshot_name):
-                logger.info(f"Snapshot {snapshot_name} verified on remote")
+            # The received subvolume is named after the source basename
+            # (== snapshot_name for native, "snapshot" for snapper).
+            received_name = Path(source_path).name
+            if self._verify_snapshot_exists(dest_path, received_name):
+                logger.info(f"Snapshot {received_name} verified on remote")
                 return True
             else:
                 logger.error(
@@ -3095,6 +2947,15 @@ print(json.dumps(result))
         logger.debug(f"Parent path: {parent_path}")
         logger.debug(f"SSH sudo: {self.config.get('ssh_sudo', False)}")
         logger.debug(f"Show progress: {show_progress}")
+
+        # `btrfs receive` names the received subvolume after the *source* subvolume's
+        # basename, not after snapshot_name. For native backups these are identical
+        # (the snapshot dir is named snapshot_name), but for snapper the source is
+        # <config>/.snapshots/<N>/snapshot, so the received subvol is always named
+        # "snapshot". Verification must look for this real name or it will wrongly
+        # report failure and delete a backup that transferred correctly.
+        received_name = Path(source_path).name
+        logger.debug(f"Received subvolume name (for verification): {received_name}")
 
         # Check if source path exists
         if not os.path.exists(source_path):
@@ -3213,6 +3074,7 @@ print(json.dumps(result))
                     dest_path=dest_path,
                     snapshot_name=snapshot_name,
                     max_wait_time=max_wait_time,
+                    received_name=received_name,
                 )
             else:
                 logger.debug(
@@ -3224,6 +3086,7 @@ print(json.dumps(result))
                     dest_path=dest_path,
                     snapshot_name=snapshot_name,
                     max_wait_time=max_wait_time,
+                    received_name=received_name,
                 )
 
             # Final verification if we timed out
@@ -3232,7 +3095,7 @@ print(json.dumps(result))
                     "Reached maximum wait time, performing final verification..."
                 )
                 try:
-                    if self._verify_snapshot_exists(dest_path, snapshot_name):
+                    if self._verify_snapshot_exists(dest_path, received_name):
                         logger.info(
                             "SUCCESS: Transfer completed successfully (final check)"
                         )
@@ -3292,7 +3155,7 @@ print(json.dumps(result))
             transfer_actually_succeeded = False
             try:
                 verification_result = self._verify_snapshot_exists(
-                    dest_path, snapshot_name
+                    dest_path, received_name
                 )
                 logger.debug(f"Snapshot existence verification: {verification_result}")
 
@@ -3313,7 +3176,7 @@ print(json.dumps(result))
                     if ls_result.returncode == 0 and ls_result.stdout:
                         ls_output = ls_result.stdout.decode(errors="replace")
                         logger.debug(f"Directory listing: {ls_output}")
-                        if snapshot_name in ls_output:
+                        if received_name in ls_output:
                             logger.info(
                                 "SUCCESS: TRANSFER ACTUALLY SUCCEEDED - Snapshot found in directory listing"
                             )
@@ -3696,8 +3559,11 @@ print(json.dumps(result))
                 rate_mb,
             )
 
-            # Verify the snapshot exists
-            if self._verify_snapshot_exists(dest_path, manifest.snapshot_name):
+            # Verify the snapshot exists. btrfs receive names the received subvolume
+            # after the source basename (== snapshot_name for native, "snapshot" for
+            # snapper), so verify by that real name, consistent with send_receive.
+            received_name = Path(manifest.snapshot_path).name
+            if self._verify_snapshot_exists(dest_path, received_name):
                 logger.info("Snapshot verified on remote host")
                 return True
             else:
@@ -3719,6 +3585,7 @@ print(json.dumps(result))
         dest_path: str,
         snapshot_name: str,
         max_wait_time: int = 3600,
+        received_name: Optional[str] = None,
     ) -> bool:
         """Enhanced transfer monitoring with real-time progress feedback.
 
@@ -3777,7 +3644,9 @@ print(json.dumps(result))
             if current_time - last_verification_time >= verification_interval:
                 logger.debug("Performing verification check...")
                 try:
-                    if self._verify_snapshot_exists(dest_path, snapshot_name):
+                    if self._verify_snapshot_exists(
+                        dest_path, received_name or snapshot_name
+                    ):
                         logger.info("SUCCESS: Transfer verification successful!")
                         return True
                     else:
@@ -3815,7 +3684,9 @@ print(json.dumps(result))
             "COMPLETE: Transfer monitoring complete, performing final verification..."
         )
         try:
-            transfer_succeeded = self._verify_snapshot_exists(dest_path, snapshot_name)
+            transfer_succeeded = self._verify_snapshot_exists(
+                dest_path, received_name or snapshot_name
+            )
             if transfer_succeeded:
                 elapsed_final = time.time() - start_time
                 logger.info(
@@ -3873,6 +3744,7 @@ print(json.dumps(result))
         dest_path: str,
         snapshot_name: str,
         max_wait_time: int = 3600,
+        received_name: Optional[str] = None,
     ) -> bool:
         """Simplified transfer monitoring with basic process tracking.
 
@@ -3962,7 +3834,7 @@ print(json.dumps(result))
         # Final verification
         logger.debug("STATUS: Performing final verification...")
         try:
-            if self._verify_snapshot_exists(dest_path, snapshot_name):
+            if self._verify_snapshot_exists(dest_path, received_name or snapshot_name):
                 logger.info(
                     f"SUCCESS: Transfer completed successfully in {elapsed_final:.1f}s"
                 )
