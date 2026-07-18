@@ -1529,3 +1529,30 @@ class TestSnapperEndpointRouting:
         assert mock_sync.call_args[0][2] is mock_choose.return_value
         # Regression: the ssh URL is not turned into a local directory.
         assert not (tmp_path / "ssh:").exists()
+
+    def test_cleanup_uses_btrfs_subvolume_delete(self, tmp_path):
+        """Cleanup removes the read-only received subvolume via btrfs, not rm -rf
+        (a received subvolume is read-only and cannot be rm'd)."""
+        from btrfs_backup_ng.core import operations
+
+        base = tmp_path / "backup"
+        (base / ".snapshots" / "7" / "snapshot").mkdir(parents=True)
+
+        ep = MagicMock()
+        ep.config = {"path": str(base)}
+        ep._is_remote = False
+
+        calls = []
+
+        def record(cmd, *a, **k):
+            calls.append(list(cmd))
+            return MagicMock(returncode=0)
+
+        with (
+            patch("btrfs_backup_ng.core.operations.subprocess.run", side_effect=record),
+            patch("os.geteuid", return_value=0),
+        ):
+            operations._cleanup_snapper_backup(ep, 7, is_raw=False)
+
+        subvol = str(base / ".snapshots" / "7" / "snapshot")
+        assert ["btrfs", "subvolume", "delete", subvol] in calls

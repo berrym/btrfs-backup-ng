@@ -335,7 +335,9 @@ def _backup_volume(
     for target in volume.targets:
         try:
             # Check mount requirement for local targets
-            if target.require_mount and not target.path.startswith("ssh://"):
+            if target.require_mount and not target.path.startswith(
+                ("ssh://", "raw://", "raw+ssh://")
+            ):
                 target_path = Path(target.path).resolve()
                 if not __util__.is_mounted(target_path):  # type: ignore[attr-defined]
                     raise __util__.AbortError(
@@ -497,7 +499,9 @@ def _backup_snapper_volume(
     for target in volume.targets:
         try:
             # Check mount requirement for local targets
-            if target.require_mount and not target.path.startswith("ssh://"):
+            if target.require_mount and not target.path.startswith(
+                ("ssh://", "raw://", "raw+ssh://")
+            ):
                 target_path = Path(target.path).resolve()
                 if not __util__.is_mounted(target_path):  # type: ignore[attr-defined]
                     raise __util__.AbortError(
@@ -508,7 +512,7 @@ def _backup_snapper_volume(
             # Build transfer options
             # For local transfers, use no compression (Rich progress bar)
             # For remote transfers, use zstd compression
-            is_remote = target.path.startswith("ssh://")
+            is_remote = target.path.startswith(("ssh://", "raw+ssh://"))
             default_compress = "zstd" if is_remote else "none"
 
             options = {
