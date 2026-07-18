@@ -108,6 +108,90 @@ class TestLocalEndpointOperations:
         assert "test-20240116-120000" in names
         assert "other-20240117-120000" not in names
 
+    def test_timestamp_format_preserved_through_init(self, tmp_path):
+        """timestamp_format survives Endpoint.__init__ (it was whitelisted out before)."""
+        dest = tmp_path / "dest"
+        dest.mkdir()
+
+        endpoint = LocalEndpoint(
+            config={
+                "path": str(dest),
+                "snap_prefix": "test-",
+                "timestamp_format": "%Y%m%dT%H%M%S",
+            }
+        )
+
+        assert endpoint.config.get("timestamp_format") == "%Y%m%dT%H%M%S"
+
+    def test_timestamp_format_preserved_via_choose_endpoint(self, tmp_path):
+        """timestamp_format survives the real CLI construction path (choose_endpoint)."""
+        from btrfs_backup_ng.endpoint import choose_endpoint
+
+        dest = tmp_path / "dest"
+        dest.mkdir()
+
+        endpoint = choose_endpoint(
+            str(dest),
+            {
+                "path": dest,
+                "snap_prefix": "test-",
+                "timestamp_format": "%Y%m%dT%H%M%S",
+            },
+        )
+
+        assert endpoint.config.get("timestamp_format") == "%Y%m%dT%H%M%S"
+
+    def test_list_snapshots_finds_custom_format(self, tmp_path):
+        """A configured custom format lets list_snapshots discover custom-named snapshots,
+        and each regenerates its exact on-disk name (round-trip integrity)."""
+        dest = tmp_path / "dest"
+        dest.mkdir()
+        (dest / "test-20240115T143022").mkdir()
+        (dest / "test-20240116T091500").mkdir()
+
+        endpoint = LocalEndpoint(
+            config={
+                "path": str(dest),
+                "snap_prefix": "test-",
+                "timestamp_format": "%Y%m%dT%H%M%S",
+            }
+        )
+
+        snapshots = endpoint.list_snapshots()
+        names = [s.get_name() for s in snapshots]
+
+        assert len(snapshots) == 2
+        assert "test-20240115T143022" in names
+        assert "test-20240116T091500" in names
+        # Round-trip: the regenerated name maps back to the real directory on disk.
+        for snap in snapshots:
+            assert (dest / snap.get_name()).is_dir()
+
+    def test_list_snapshots_mixed_legacy_and_custom_format(self, tmp_path):
+        """With a custom format configured, legacy default-format snapshots still parse
+        (fallback) and regenerate their legacy name, so existing chains are not orphaned."""
+        dest = tmp_path / "dest"
+        dest.mkdir()
+        (dest / "test-20240115T143022").mkdir()  # configured custom format
+        (dest / "test-20240110-120000").mkdir()  # legacy default format
+
+        endpoint = LocalEndpoint(
+            config={
+                "path": str(dest),
+                "snap_prefix": "test-",
+                "timestamp_format": "%Y%m%dT%H%M%S",
+            }
+        )
+
+        snapshots = endpoint.list_snapshots()
+        names = [s.get_name() for s in snapshots]
+
+        assert len(snapshots) == 2
+        assert "test-20240115T143022" in names
+        assert "test-20240110-120000" in names
+        for snap in snapshots:
+            assert (dest / snap.get_name()).is_dir()
+
     def test_snapshot_cache_behavior(self, tmp_path):
         """Test snapshot listing cache is used correctly."""
         dest = tmp_path / "dest"

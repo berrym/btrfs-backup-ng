@@ -29,7 +29,7 @@ from ..notifications import (
     NotificationConfig as NotifConfig,
 )
 from ..transaction import set_transaction_log
-from .common import get_log_level, should_show_progress
+from .common import get_log_level, get_timestamp_format, should_show_progress
 
 logger = logging.getLogger(__name__)
 
@@ -278,6 +278,7 @@ def _backup_volume(
         "subvolume_sync": False,
         "btrfs_debug": False,
         "fs_checks": "auto",
+        "timestamp_format": get_timestamp_format(config),
     }
 
     # Prepare source endpoint

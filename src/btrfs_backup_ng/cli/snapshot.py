@@ -9,7 +9,7 @@ from pathlib import Path
 from .. import __util__, endpoint
 from ..__logger__ import add_file_handler, create_logger
 from ..config import ConfigError, find_config_file, load_config
-from .common import get_log_level
+from .common import get_log_level, get_timestamp_format
 
 logger = logging.getLogger(__name__)
 
@@ -91,6 +91,7 @@ def execute_snapshot(args: argparse.Namespace) -> int:
                 "subvolume_sync": False,
                 "btrfs_debug": False,
                 "fs_checks": "auto",
+                "timestamp_format": get_timestamp_format(config),
             }
 
             # Prepare source endpoint

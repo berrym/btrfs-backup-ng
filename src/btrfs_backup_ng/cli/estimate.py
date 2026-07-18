@@ -27,7 +27,7 @@ from ..core.space import (
     check_space_availability,
     format_space_check,
 )
-from .common import get_fs_checks_mode, get_log_level
+from .common import get_fs_checks_mode, get_log_level, get_timestamp_format
 
 logger = logging.getLogger(__name__)
 
@@ -129,6 +129,7 @@ def _estimate_from_config(args: argparse.Namespace, volume_path: str) -> int:
                 "path": snapshot_dir,
                 "snap_prefix": volume.snapshot_prefix,
                 "fs_checks": "auto",
+                "timestamp_format": get_timestamp_format(config),
             },
             source=True,
         )
@@ -142,6 +143,7 @@ def _estimate_from_config(args: argparse.Namespace, volume_path: str) -> int:
         dest_kwargs: dict[str, Any] = {
             "snap_prefix": volume.snapshot_prefix,
             "fs_checks": "auto",
+            "timestamp_format": get_timestamp_format(config),
         }
         if target.ssh_sudo:
             dest_kwargs["ssh_sudo"] = True

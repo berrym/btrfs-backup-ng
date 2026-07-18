@@ -3,6 +3,8 @@
 import argparse
 import sys
 
+from .. import __util__
+
 
 def is_interactive() -> bool:
     """Check if we're running in an interactive terminal.
@@ -141,3 +143,21 @@ def get_fs_checks_mode(args: argparse.Namespace) -> str:
         One of "auto", "strict", or "skip"
     """
     return getattr(args, "fs_checks", "auto") or "auto"
+
+
+def get_timestamp_format(config=None) -> str:
+    """Return the configured snapshot ``timestamp_format`` or the built-in default.
+
+    Endpoints consume this through their config dict so snapshot naming and
+    parsing honor the user's ``[global] timestamp_format``. When no config (or
+    no global section) is available, the built-in ``DATE_FORMAT`` is used.
+
+    Args:
+        config: A loaded ``Config`` object, or ``None``.
+
+    Returns:
+        A strftime format string.
+    """
+    global_config = getattr(config, "global_config", None)
+    fmt = getattr(global_config, "timestamp_format", None)
+    return fmt or __util__.DATE_FORMAT

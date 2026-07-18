@@ -1,8 +1,9 @@
 """Tests for CLI common utilities."""
 
 import argparse
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
+from btrfs_backup_ng.__util__ import DATE_FORMAT
 from btrfs_backup_ng.cli.common import (
     add_fs_checks_args,
     add_progress_args,
@@ -10,9 +11,30 @@ from btrfs_backup_ng.cli.common import (
     create_global_parser,
     get_fs_checks_mode,
     get_log_level,
+    get_timestamp_format,
     is_interactive,
     should_show_progress,
 )
+
+
+class TestGetTimestampFormat:
+    """Tests for get_timestamp_format helper."""
+
+    def test_none_config_returns_default(self):
+        """No config falls back to the built-in default format."""
+        assert get_timestamp_format(None) == DATE_FORMAT
+
+    def test_reads_from_global_config(self):
+        """A configured timestamp_format is returned."""
+        config = MagicMock()
+        config.global_config.timestamp_format = "%Y%m%dT%H%M%S"
+        assert get_timestamp_format(config) == "%Y%m%dT%H%M%S"
+
+    def test_empty_format_falls_back_to_default(self):
+        """An empty configured format falls back to the built-in default."""
+        config = MagicMock()
+        config.global_config.timestamp_format = ""
+        assert get_timestamp_format(config) == DATE_FORMAT
 
 
 class TestCreateGlobalParser:
