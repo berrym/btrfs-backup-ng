@@ -1237,61 +1237,156 @@ def get_snapper_snapshots_for_backup(
     return snapshots
 
 
+def _list_backed_up_snapper_numbers(destination_endpoint) -> set[int]:
+    """Return snapper snapshot numbers already present at the destination.
+
+    btrfs targets: numbered subdirs under ``{base}/.snapshots`` that contain a
+    ``snapshot`` subvolume. Raw targets have no numbered layout, so this returns
+    an empty set (the caller re-sends; raw skip-detection is a follow-up).
+    """
+    from ..endpoint.raw import RawEndpoint
+
+    if isinstance(destination_endpoint, RawEndpoint):
+        return set()
+
+    numbers: set[int] = set()
+    base = str(destination_endpoint.config["path"]).rstrip("/")
+    snap_dir = f"{base}/.snapshots"
+    is_remote = getattr(destination_endpoint, "_is_remote", False)
+
+    if is_remote and hasattr(destination_endpoint, "_exec_remote_command"):
+        try:
+            result = destination_endpoint._exec_remote_command(
+                ["ls", "-1", snap_dir], check=False
+            )
+            if result.returncode == 0:
+                for name in result.stdout.decode().split():
+                    if name.isdigit():
+                        numbers.add(int(name))
+        except Exception as e:
+            logger.debug("Could not list remote snapper backups: %s", e)
+    else:
+        snap_path = Path(snap_dir)
+        if snap_path.exists():
+            for item in snap_path.iterdir():
+                if (
+                    item.is_dir()
+                    and item.name.isdigit()
+                    and (item / "snapshot").exists()
+                ):
+                    numbers.add(int(item.name))
+
+    return numbers
+
+
+def _place_info_xml(snapper_snapshot, destination_endpoint) -> None:
+    """Copy the snapper info.xml into the current destination directory.
+
+    ``destination_endpoint.config["path"]`` is the ``.snapshots/{num}`` directory
+    at call time (btrfs targets only; raw folds info.xml into the metadata sidecar).
+    """
+    import os
+    import shutil
+
+    info_xml_src = snapper_snapshot.info_xml_path
+    if not info_xml_src.exists():
+        return
+
+    dest_dir = str(destination_endpoint.config["path"])
+    is_remote = getattr(destination_endpoint, "_is_remote", False)
+
+    try:
+        if is_remote and hasattr(destination_endpoint, "_exec_remote_command"):
+            destination_endpoint._exec_remote_command(
+                ["tee", f"{dest_dir}/info.xml"],
+                input=info_xml_src.read_bytes(),
+                check=True,
+            )
+        else:
+            dst = Path(dest_dir) / "info.xml"
+            if os.geteuid() != 0:
+                subprocess.run(
+                    ["sudo", "cp", str(info_xml_src), str(dst)],
+                    check=True,
+                    capture_output=True,
+                )
+            else:
+                shutil.copy2(info_xml_src, dst)
+        logger.debug("Placed info.xml at %s", dest_dir)
+    except Exception as e:
+        logger.warning("Failed to place info.xml: %s", e)
+
+
+def _cleanup_snapper_backup(destination_endpoint, snapshot_num, is_raw) -> None:
+    """Best-effort removal of a partial snapper backup after a failed transfer."""
+    import os
+    import shutil
+
+    if is_raw:
+        # Raw partial files are overwritten on the next attempt; nothing to undo.
+        return
+
+    base = str(destination_endpoint.config["path"]).rstrip("/")
+    snap_dir = f"{base}/.snapshots/{snapshot_num}"
+    is_remote = getattr(destination_endpoint, "_is_remote", False)
+
+    try:
+        if is_remote and hasattr(destination_endpoint, "_exec_remote_command"):
+            destination_endpoint._exec_remote_command(
+                ["rm", "-rf", snap_dir], check=False
+            )
+        else:
+            snap_path = Path(snap_dir)
+            snap_subvol = snap_path / "snapshot"
+            if snap_subvol.exists():
+                if os.geteuid() != 0:
+                    subprocess.run(
+                        ["sudo", "rm", "-rf", str(snap_path)], capture_output=True
+                    )
+                else:
+                    shutil.rmtree(snap_path, ignore_errors=True)
+    except Exception as cleanup_e:
+        logger.warning("Cleanup failed: %s", cleanup_e)
+
+
 def send_snapper_snapshot(
     snapper_snapshot,
     destination_endpoint,
     parent_snapper_snapshot=None,
     options: dict | None = None,
 ) -> None:
-    """Send a snapper snapshot to destination, mirroring snapper directory layout.
+    """Send a snapper snapshot to a destination endpoint.
 
-    Creates the same directory structure as snapper on the backup:
-        {destination}/.snapshots/{num}/snapshot
-        {destination}/.snapshots/{num}/info.xml
-
-    Uses the same Rich progress bar as regular btrfs-backup-ng transfers.
+    btrfs targets receive into ``{base}/.snapshots/{num}`` so the sent
+    ``snapshot`` subvolume lands as ``.snapshots/{num}/snapshot`` alongside an
+    ``info.xml``, matching snapper's on-disk layout. Raw targets write a single
+    stream file named by the backup name. Both route through the standard
+    ``send_snapshot`` pipeline, so ssh:// and raw+ssh:// work transparently.
 
     Args:
         snapper_snapshot: SnapperSnapshot object to send
-        destination_endpoint: Destination Endpoint (its config["path"] is the backup base)
+        destination_endpoint: Destination Endpoint (its config["path"] is the base)
         parent_snapper_snapshot: Optional parent for incremental transfer
         options: Transfer options (compress, show_progress, rate_limit)
 
     Raises:
         SnapshotTransferError: If transfer fails
     """
-    import os
-    import shutil
+    from ..endpoint.raw import RawEndpoint
 
     if options is None:
         options = {}
 
-    destination_path = str(destination_endpoint.config["path"])
-
     snapshot_num = snapper_snapshot.number
-    source_path = snapper_snapshot.subvolume_path
+    is_raw = isinstance(destination_endpoint, RawEndpoint)
+    base_path = str(destination_endpoint.config["path"])
 
-    # Set defaults for snapper transfers
-    compress = options.get("compress", "none")  # No compression for local transfers
-    show_progress = options.get("show_progress", True)
-    rate_limit = options.get("rate_limit")
-
-    # Create destination directory structure: .snapshots/{num}/
-    dest_base = Path(destination_path)
-    dest_snapshot_dir = dest_base / ".snapshots" / str(snapshot_num)
-    dest_snapshot_path = dest_snapshot_dir / "snapshot"
-
-    # Check if already backed up
-    if dest_snapshot_path.exists():
+    # Skip if this snapshot number is already present at the destination.
+    if snapshot_num in _list_backed_up_snapper_numbers(destination_endpoint):
         logger.info("Snapshot %d already exists at destination, skipping", snapshot_num)
         return
 
-    # Log transfer start
     parent_num = parent_snapper_snapshot.number if parent_snapper_snapshot else None
-    parent_path = (
-        parent_snapper_snapshot.subvolume_path if parent_snapper_snapshot else None
-    )
-
     if parent_snapper_snapshot:
         logger.info(
             "Sending snapshot %d (incremental from %d) ...", snapshot_num, parent_num
@@ -1300,192 +1395,68 @@ def send_snapper_snapshot(
         logger.info("Sending snapshot %d (full) ...", snapshot_num)
 
     transfer_start = time.monotonic()
-
-    # Log transaction
     log_transaction(
         action="snapper_backup",
         status="started",
-        source=str(source_path),
-        destination=str(dest_snapshot_path),
+        source=str(snapper_snapshot.subvolume_path),
+        destination=base_path,
         snapshot=str(snapshot_num),
         parent=str(parent_num) if parent_num else None,
     )
 
+    # Wrap the snapper snapshots so the standard send/receive pipeline can carry
+    # them (the wrapper's source is a LocalEndpoint on the snapper subvolume).
+    source_wrapper = _create_snapper_snapshot_wrapper(snapper_snapshot)
+    parent_wrapper = (
+        _create_snapper_snapshot_wrapper(parent_snapper_snapshot)
+        if parent_snapper_snapshot
+        else None
+    )
+
     try:
-        # Create destination directory
-        if os.geteuid() != 0:
-            subprocess.run(
-                ["sudo", "mkdir", "-p", str(dest_snapshot_dir)],
-                check=True,
-                capture_output=True,
+        if is_raw:
+            # Raw targets have no subvolumes: write one stream file named by the
+            # backup name. Compression/encryption are intrinsic to the raw
+            # endpoint, so avoid double-compressing in the pipeline.
+            raw_options = dict(options)
+            raw_options["compress"] = "none"
+            send_snapshot(
+                source_wrapper,
+                destination_endpoint,
+                parent=parent_wrapper,
+                options=raw_options,
             )
         else:
-            dest_snapshot_dir.mkdir(parents=True, exist_ok=True)
-
-        # Build btrfs send command
-        send_cmd = ["btrfs", "send"]
-        if parent_path:
-            send_cmd.extend(["-p", str(parent_path)])
-        send_cmd.append(str(source_path))
-
-        # Build btrfs receive command
-        receive_cmd = ["btrfs", "receive", str(dest_snapshot_dir)]
-
-        # Add sudo if needed
-        if os.geteuid() != 0:
-            send_cmd = ["sudo"] + send_cmd
-            receive_cmd = ["sudo"] + receive_cmd
-
-        logger.debug("Send command: %s", " ".join(send_cmd))
-        logger.debug("Receive command: %s", " ".join(receive_cmd))
-
-        # Estimate size for progress bar (only for full transfers)
-        estimated_size = None
-        if show_progress and not parent_path:
-            estimated_size = progress_utils.estimate_snapshot_size(
-                str(source_path), str(parent_path) if parent_path else None
-            )
-            if estimated_size:
-                logger.debug(
-                    "Estimated transfer size: %.2f MB", estimated_size / (1024 * 1024)
-                )
-
-        # Start send process
-        send_process = subprocess.Popen(
-            send_cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
-
-        # Determine if we can use Rich progress
-        # Use Rich progress for full transfers without compression
-        use_rich_progress = (
-            show_progress
-            and progress_utils.is_interactive()
-            and (compress == "none" or not compress)
-            and not rate_limit
-        )
-
-        if use_rich_progress:
-            # Start receive with stdin=PIPE for Rich progress
-            receive_process = subprocess.Popen(
-                receive_cmd,
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-            )
-
-            # Run transfer with Rich progress bar
-            send_rc, receive_rc = progress_utils.run_transfer_with_progress(
-                send_process=send_process,
-                receive_process=receive_process,
-                snapshot_name=f"snapshot {snapshot_num}",
-                estimated_size=estimated_size,
-            )
-
-            if send_rc != 0:
-                raise __util__.SnapshotTransferError(
-                    f"btrfs send failed with code {send_rc}"
-                )
-            if receive_rc != 0:
-                raise __util__.SnapshotTransferError(
-                    f"btrfs receive failed with code {receive_rc}"
-                )
-        else:
-            # Fall back to pipeline transfer (with compression/rate limiting)
-            pipeline_processes = []
-            current_stdout = send_process.stdout
-
+            # btrfs targets: temporarily point the same endpoint (reusing its SSH
+            # connection) at .snapshots/{num} so receive lands
+            # .snapshots/{num}/snapshot, then place info.xml beside it.
+            snap_path = f"{base_path.rstrip('/')}/.snapshots/{snapshot_num}"
+            saved_path = destination_endpoint.config["path"]
+            destination_endpoint.config["path"] = snap_path
             try:
-                # Build transfer pipeline (compression + progress)
-                if compress != "none" or rate_limit or show_progress:
-                    current_stdout, pipeline_processes = (
-                        transfer_utils.build_transfer_pipeline(
-                            send_stdout=send_process.stdout,
-                            compress=compress,
-                            rate_limit=rate_limit,
-                            show_progress=show_progress,
-                        )
-                    )
-
-                # Build receive-side decompression if needed
-                if compress and compress != "none":
-                    current_stdout, decompress_processes = (
-                        transfer_utils.build_receive_pipeline(
-                            input_stdout=current_stdout,
-                            compress=compress,
-                        )
-                    )
-                    pipeline_processes.extend(decompress_processes)
-
-                # Start receive process
-                receive_process = subprocess.Popen(
-                    receive_cmd,
-                    stdin=current_stdout,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
+                send_snapshot(
+                    source_wrapper,
+                    destination_endpoint,
+                    parent=parent_wrapper,
+                    options=options,
                 )
+                _place_info_xml(snapper_snapshot, destination_endpoint)
+            finally:
+                destination_endpoint.config["path"] = saved_path
 
-                # Close our reference to send stdout
-                if send_process.stdout:
-                    send_process.stdout.close()
-
-                # Wait for completion
-                receive_stdout, receive_stderr = receive_process.communicate()
-                send_process.wait()
-
-                # Wait for pipeline
-                pipeline_return_codes = transfer_utils.wait_for_pipeline(
-                    pipeline_processes, timeout=3600
-                )
-
-                # Check for errors
-                if send_process.returncode != 0:
-                    raise __util__.SnapshotTransferError(
-                        f"btrfs send failed with code {send_process.returncode}"
-                    )
-
-                if receive_process.returncode != 0:
-                    raise __util__.SnapshotTransferError(
-                        f"btrfs receive failed: {receive_stderr.decode().strip()}"
-                    )
-
-                for rc in pipeline_return_codes:
-                    if rc != 0:
-                        raise __util__.SnapshotTransferError(
-                            f"Transfer pipeline failed with code {rc}"
-                        )
-
-            except Exception:
-                transfer_utils.cleanup_pipeline(pipeline_processes)
-                raise
-
-        # Copy info.xml to destination
-        info_xml_src = snapper_snapshot.info_xml_path
-        info_xml_dst = dest_snapshot_dir / "info.xml"
-        if info_xml_src.exists():
-            if os.geteuid() != 0:
-                subprocess.run(
-                    ["sudo", "cp", str(info_xml_src), str(info_xml_dst)],
-                    check=True,
-                    capture_output=True,
-                )
-            else:
-                shutil.copy2(info_xml_src, info_xml_dst)
-            logger.debug("Copied info.xml to %s", info_xml_dst)
+        # Metadata sidecar (endpoint-aware; carries original_xml for restore).
+        _write_snapper_metadata(snapper_snapshot, destination_endpoint)
 
         duration = time.monotonic() - transfer_start
-
         log_transaction(
             action="snapper_backup",
             status="completed",
-            source=str(source_path),
-            destination=str(dest_snapshot_path),
+            source=str(snapper_snapshot.subvolume_path),
+            destination=base_path,
             snapshot=str(snapshot_num),
             parent=str(parent_num) if parent_num else None,
             duration_seconds=duration,
         )
-
         logger.info(
             "Snapshot %d transferred successfully (%.1fs)", snapshot_num, duration
         )
@@ -1495,66 +1466,14 @@ def send_snapper_snapshot(
         log_transaction(
             action="snapper_backup",
             status="failed",
-            source=str(source_path),
-            destination=str(dest_snapshot_path),
+            source=str(snapper_snapshot.subvolume_path),
+            destination=base_path,
             snapshot=str(snapshot_num),
             parent=str(parent_num) if parent_num else None,
             duration_seconds=duration,
             error=str(e),
         )
-        # Clean up partial transfer
-        try:
-            if dest_snapshot_path.exists():
-                # Received snapshots are read-only, make writable before delete
-                if os.geteuid() != 0:
-                    subprocess.run(
-                        [
-                            "sudo",
-                            "btrfs",
-                            "property",
-                            "set",
-                            "-f",
-                            str(dest_snapshot_path),
-                            "ro",
-                            "false",
-                        ],
-                        capture_output=True,
-                    )
-                    subprocess.run(
-                        [
-                            "sudo",
-                            "btrfs",
-                            "subvolume",
-                            "delete",
-                            str(dest_snapshot_path),
-                        ],
-                        capture_output=True,
-                    )
-                else:
-                    subprocess.run(
-                        [
-                            "btrfs",
-                            "property",
-                            "set",
-                            "-f",
-                            str(dest_snapshot_path),
-                            "ro",
-                            "false",
-                        ],
-                        capture_output=True,
-                    )
-                    __util__.delete_subvolume(dest_snapshot_path)  # type: ignore[attr-defined]
-            if dest_snapshot_dir.exists():
-                if os.geteuid() != 0:
-                    subprocess.run(
-                        ["sudo", "rm", "-rf", str(dest_snapshot_dir)],
-                        capture_output=True,
-                    )
-                else:
-                    shutil.rmtree(dest_snapshot_dir)
-        except Exception as cleanup_e:
-            logger.warning("Cleanup failed: %s", cleanup_e)
-
+        _cleanup_snapper_backup(destination_endpoint, snapshot_num, is_raw)
         logger.error("Failed to transfer snapshot %d: %s", snapshot_num, e)
         raise __util__.SnapshotTransferError(
             f"Failed to transfer snapshot {snapshot_num}: {e}"
@@ -1723,8 +1642,6 @@ def sync_snapper_snapshots(
     if options is None:
         options = {}
 
-    destination_path = str(destination_endpoint.config["path"])
-
     logger.info(__util__.log_heading(f"Syncing snapper config '{config_name}'"))
 
     # Get filtering options from snapper_config or use defaults
@@ -1752,17 +1669,8 @@ def sync_snapper_snapshots(
 
     logger.info("Found %d snapper snapshot(s) to consider", len(snapper_snapshots))
 
-    # Get existing backup snapshot numbers at destination
-    dest_base = Path(destination_path)
-    dest_snapshots_dir = dest_base / ".snapshots"
-    backed_up_numbers = set()
-
-    if dest_snapshots_dir.exists():
-        for item in dest_snapshots_dir.iterdir():
-            if item.is_dir() and item.name.isdigit():
-                snapshot_path = item / "snapshot"
-                if snapshot_path.exists():
-                    backed_up_numbers.add(int(item.name))
+    # Get existing backup snapshot numbers at destination (endpoint-aware)
+    backed_up_numbers = _list_backed_up_snapper_numbers(destination_endpoint)
 
     logger.debug("Already backed up: %s", sorted(backed_up_numbers))
 

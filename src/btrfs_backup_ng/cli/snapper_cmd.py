@@ -252,35 +252,22 @@ def _handle_backup(args: argparse.Namespace) -> int:
             return 0
 
         try:
-            # Find a parent for incremental transfer
-            # Look for backed up snapshots that exist locally
-            parent = None
-            dest_snapshots_dir = Path(target_path) / ".snapshots"
-            if dest_snapshots_dir.exists():
-                # Get all local snapshots
-                all_snapshots = scanner.get_snapshots(config)
-                all_by_num = {s.number: s for s in all_snapshots}
+            # Find a parent for incremental transfer: the highest already-backed-up
+            # snapshot number below the target. Uses the endpoint layer so remote
+            # and raw destinations are handled the same as local ones.
+            from ..core.operations import _list_backed_up_snapper_numbers
 
-                # Find highest numbered backup that's lower than our target
-                for item in sorted(
-                    dest_snapshots_dir.iterdir(),
-                    key=lambda x: int(x.name) if x.name.isdigit() else 0,
-                    reverse=True,
-                ):
-                    if item.is_dir() and item.name.isdigit():
-                        backup_num = int(item.name)
-                        if (
-                            backup_num < snapshot.number
-                            and (item / "snapshot").exists()
-                        ):
-                            # Check if this snapshot still exists locally
-                            if backup_num in all_by_num:
-                                parent = all_by_num[backup_num]
-                                logger.debug(
-                                    "Found parent snapshot %d for incremental",
-                                    backup_num,
-                                )
-                                break
+            parent = None
+            backed_up = _list_backed_up_snapper_numbers(destination_endpoint)
+            if backed_up:
+                all_by_num = {s.number: s for s in scanner.get_snapshots(config)}
+                for backup_num in sorted(backed_up, reverse=True):
+                    if backup_num < snapshot.number and backup_num in all_by_num:
+                        parent = all_by_num[backup_num]
+                        logger.debug(
+                            "Found parent snapshot %d for incremental", backup_num
+                        )
+                        break
 
             send_snapper_snapshot(
                 snapshot,

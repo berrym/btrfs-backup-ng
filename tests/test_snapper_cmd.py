@@ -1391,3 +1391,141 @@ class TestExecuteSnapper:
         assert result == 0
         captured = capsys.readouterr()
         assert "[[volumes]]" in captured.out
+
+
+class TestSnapperEndpointRouting:
+    """Snapper backup routes through the endpoint layer (issue #1)."""
+
+    def test_list_backed_up_numbers_btrfs_local(self, tmp_path):
+        """btrfs targets report numbers from .snapshots/{num}/snapshot dirs."""
+        from btrfs_backup_ng.core.operations import _list_backed_up_snapper_numbers
+
+        base = tmp_path / "backup"
+        for num in (1, 2):
+            (base / ".snapshots" / str(num) / "snapshot").mkdir(parents=True)
+        # A numbered dir with no 'snapshot' subvolume is not counted.
+        (base / ".snapshots" / "3").mkdir(parents=True)
+
+        ep = MagicMock()
+        ep.config = {"path": str(base)}
+        ep._is_remote = False
+
+        assert _list_backed_up_snapper_numbers(ep) == {1, 2}
+
+    def test_list_backed_up_numbers_raw_is_empty(self, tmp_path):
+        """Raw targets have no numbered layout, so the set is empty (re-send)."""
+        from btrfs_backup_ng.core.operations import _list_backed_up_snapper_numbers
+        from btrfs_backup_ng.endpoint.raw import RawEndpoint
+
+        ep = RawEndpoint(config={"path": str(tmp_path)})
+        assert _list_backed_up_snapper_numbers(ep) == set()
+
+    def test_send_snapper_btrfs_receives_into_per_snapshot_dir(self):
+        """btrfs dispatch points the endpoint at .snapshots/{num} then restores it."""
+        from btrfs_backup_ng.core import operations
+
+        ep = MagicMock()
+        ep.config = {"path": "/backup/home"}
+        ep._is_remote = False
+
+        snap = MagicMock()
+        snap.number = 5
+        snap.get_backup_name.return_value = "home-5-20240115-120000"
+        snap.subvolume_path = Path("/.snapshots/5/snapshot")
+
+        captured = {}
+
+        def fake_send_snapshot(src, dest, parent=None, options=None):
+            captured["path"] = dest.config["path"]
+
+        with (
+            patch.object(
+                operations, "_list_backed_up_snapper_numbers", return_value=set()
+            ),
+            patch.object(
+                operations, "_create_snapper_snapshot_wrapper", return_value=MagicMock()
+            ),
+            patch.object(operations, "send_snapshot", side_effect=fake_send_snapshot),
+            patch.object(operations, "_place_info_xml"),
+            patch.object(operations, "_write_snapper_metadata"),
+        ):
+            operations.send_snapper_snapshot(snap, ep)
+
+        assert captured["path"] == "/backup/home/.snapshots/5"
+        # The endpoint's base path is restored after the transfer.
+        assert ep.config["path"] == "/backup/home"
+
+    def test_send_snapper_raw_forces_no_compression(self, tmp_path):
+        """Raw dispatch sends on the base endpoint with compression disabled."""
+        from btrfs_backup_ng.core import operations
+        from btrfs_backup_ng.endpoint.raw import RawEndpoint
+
+        ep = RawEndpoint(config={"path": str(tmp_path)})
+        snap = MagicMock()
+        snap.number = 5
+        snap.get_backup_name.return_value = "home-5-20240115-120000"
+        snap.subvolume_path = Path("/.snapshots/5/snapshot")
+
+        captured = {}
+
+        def fake_send_snapshot(src, dest, parent=None, options=None):
+            captured["options"] = options
+            captured["dest"] = dest
+
+        with (
+            patch.object(
+                operations, "_create_snapper_snapshot_wrapper", return_value=MagicMock()
+            ),
+            patch.object(operations, "send_snapshot", side_effect=fake_send_snapshot),
+            patch.object(operations, "_write_snapper_metadata"),
+        ):
+            operations.send_snapper_snapshot(snap, ep, options={"compress": "zstd"})
+
+        assert captured["options"]["compress"] == "none"
+        assert captured["dest"] is ep
+
+    def test_handle_backup_routes_ssh_through_choose_endpoint(
+        self, tmp_path, monkeypatch
+    ):
+        """`snapper backup <cfg> ssh://...` parses the URL via choose_endpoint and
+        passes an endpoint (not a raw string) downstream -- no local 'ssh:' dir."""
+        from btrfs_backup_ng.cli import snapper_cmd
+
+        args = argparse.Namespace(
+            config="root",
+            target="ssh://backup@host:/share/Backups",
+            snapshot=None,
+            type=None,
+            dry_run=False,
+            compress=None,
+            rate_limit=None,
+            verbose=False,
+            quiet=False,
+            log_level=None,
+            min_age="0",
+        )
+        monkeypatch.chdir(tmp_path)
+
+        mock_scanner = MagicMock()
+        mock_scanner.get_config.return_value = MagicMock()
+
+        with (
+            patch(
+                "btrfs_backup_ng.cli.snapper_cmd.SnapperScanner",
+                return_value=mock_scanner,
+            ),
+            patch("btrfs_backup_ng.endpoint.choose_endpoint") as mock_choose,
+            patch(
+                "btrfs_backup_ng.core.operations.sync_snapper_snapshots",
+                return_value=0,
+            ) as mock_sync,
+        ):
+            mock_choose.return_value = MagicMock(_is_remote=True)
+            snapper_cmd._handle_backup(args)
+
+        mock_choose.assert_called_once()
+        assert mock_choose.call_args[0][0] == "ssh://backup@host:/share/Backups"
+        # sync received the endpoint object, not the raw target string.
+        assert mock_sync.call_args[0][2] is mock_choose.return_value
+        # Regression: the ssh URL is not turned into a local directory.
+        assert not (tmp_path / "ssh:").exists()
