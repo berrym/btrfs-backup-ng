@@ -1,6 +1,13 @@
 """Tests for SSH endpoint utilities."""
 
-from btrfs_backup_ng.endpoint.ssh import RECEIVE_IDLE_TIMEOUT, _build_receive_command
+from types import SimpleNamespace
+from unittest.mock import MagicMock
+
+from btrfs_backup_ng.endpoint.ssh import (
+    RECEIVE_IDLE_TIMEOUT,
+    SSHEndpoint,
+    _build_receive_command,
+)
 
 
 class TestBuildReceiveCommand:
@@ -99,3 +106,57 @@ class TestSSHEndpointConfigPreservation:
         assert ep.config.get("username") == "u"
         assert ep.config.get("ssh_sudo") is True
         assert ep.config.get("ssh_identity_file") == "/key"
+
+
+class TestVerifySnapshotUsesExactPath:
+    """`_verify_snapshot_exists` checks the exact received path, not a bare name.
+
+    `btrfs receive` names the received subvolume after the source subvol's
+    basename. For snapper that is always "snapshot" (source is
+    <config>/.snapshots/<N>/snapshot), so verification must be scoped to exactly
+    {dest_path}/snapshot. A filesystem-wide name search would match a same-named
+    subvolume elsewhere on the destination (e.g. a sibling .snapshots/<other>/
+    snapshot) and report a FAILED transfer as succeeded -- a silent phantom
+    backup.
+    """
+
+    @staticmethod
+    def _endpoint(existing_paths: set[str]) -> SSHEndpoint:
+        # Build a bare endpoint without opening any SSH connection. The fake exec
+        # reports success only when a command targets a path that "exists" -- the
+        # target path is always the last argument (`subvolume show <p>` / `test -d <p>`).
+        ep = SSHEndpoint.__new__(SSHEndpoint)
+        ep.config = {"ssh_sudo": False}
+
+        def fake_exec(cmd, **kwargs):
+            target = cmd[-1]
+            rc = 0 if target in existing_paths else 1
+            return SimpleNamespace(returncode=rc, stdout=b"", stderr=b"")
+
+        ep._exec_remote_command = MagicMock(side_effect=fake_exec)  # type: ignore[method-assign]
+        ep._exec_remote_command_with_retry = MagicMock(side_effect=fake_exec)  # type: ignore[method-assign]
+        return ep
+
+    def test_exact_received_path_is_verified(self):
+        ep = self._endpoint({"/root/dest/.snapshots/5/snapshot"})
+        assert ep._verify_snapshot_exists("/root/dest/.snapshots/5", "snapshot") is True
+
+    def test_sibling_snapshot_is_not_a_false_positive(self):
+        # The transfer into .snapshots/5 failed (no .snapshots/5/snapshot), but a
+        # prior .snapshots/4/snapshot exists on the destination. Verification must
+        # NOT report success off the sibling.
+        ep = self._endpoint({"/root/dest/.snapshots/4/snapshot"})
+        assert (
+            ep._verify_snapshot_exists("/root/dest/.snapshots/5", "snapshot") is False
+        )
+
+    def test_missing_path_is_false(self):
+        ep = self._endpoint(set())
+        assert (
+            ep._verify_snapshot_exists("/root/dest/.snapshots/5", "snapshot") is False
+        )
+
+    def test_native_unique_name_verified(self):
+        # Native backups pass a globally unique name; exact-path check still works.
+        ep = self._endpoint({"/mnt/backup/host-20260718-1200"})
+        assert ep._verify_snapshot_exists("/mnt/backup", "host-20260718-1200") is True
