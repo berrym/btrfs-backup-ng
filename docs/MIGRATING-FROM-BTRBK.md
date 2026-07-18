@@ -231,6 +231,11 @@ The importer automatically:
 - Converts SSH targets to `raw+ssh://` URLs
 - Preserves GPG recipient and keyring settings
 
+> **Note:** Raw targets are not limited to the regular `backup` command. The
+> `snapper backup` subcommand accepts the same `raw://` and `raw+ssh://`
+> destinations, so Snapper snapshots can be backed up to non-btrfs storage too.
+> See [Snapper Integration](SNAPPER-INTEGRATION.md#raw-non-btrfs-targets).
+
 #### Supported Compression Algorithms
 
 All btrbk compression algorithms are supported:

@@ -1071,7 +1071,10 @@ Examples:
     snapper_backup.add_argument(
         "target",
         metavar="TARGET",
-        help="Backup target path (local path or ssh://user@host:/path)",
+        help=(
+            "Backup target: local path or ssh://user@host:/path (btrfs), "
+            "or raw:///path / raw+ssh://user@host/path (non-btrfs)"
+        ),
     )
     snapper_backup.add_argument(
         "-s",

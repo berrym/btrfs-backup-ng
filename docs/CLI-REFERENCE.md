@@ -747,7 +747,7 @@ btrfs-backup-ng snapper backup CONFIG TARGET [OPTIONS]
 | Argument | Description |
 |----------|-------------|
 | `CONFIG` | Snapper configuration name (e.g., 'root', 'home') |
-| `TARGET` | Destination path (local or ssh://user@host:/path) |
+| `TARGET` | Destination: a local path or `ssh://user@host:/path` for btrfs destinations, or a raw target (`raw:///path`, `raw+ssh://user@host/path`) for non-btrfs destinations. See [Raw Targets](#raw-targets). |
 
 **Options:**
 | Option | Description |
@@ -776,6 +776,12 @@ btrfs-backup-ng snapper backup root /mnt/backup --type single --compress zstd
 
 # Backup snapshots older than 1 hour
 btrfs-backup-ng snapper backup root /mnt/backup --min-age 1h
+
+# Backup to a raw target on a non-btrfs destination (USB, NFS, SMB)
+btrfs-backup-ng snapper backup root raw:///mnt/usb/backups/root --compress zstd
+
+# Backup to a remote raw target over SSH
+btrfs-backup-ng snapper backup root raw+ssh://backup@server/mnt/nas/root --compress zstd
 
 # Dry run to see what would be backed up
 btrfs-backup-ng snapper backup root /mnt/backup --dry-run

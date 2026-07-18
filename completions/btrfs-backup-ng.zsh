@@ -359,10 +359,13 @@ _btrfs-backup-ng() {
                                 backup)
                                     _arguments \
                                         '--snapshot[Backup specific snapshot number]:snapshot number:' \
+                                        '--type[Filter by snapshot type]:type:(${snapper_types})' \
+                                        '--min-age[Only snapshots older than duration]:duration:' \
                                         '--dry-run[Show what would be done]' \
                                         '--ssh-sudo[Use sudo on remote host]' \
                                         '--ssh-key[SSH private key file]:key file:_files' \
                                         '--compress[Compression method]:method:(${compress_methods})' \
+                                        '--rate-limit[Bandwidth limit]:rate:' \
                                         '(--progress --no-progress)'--progress'[Show progress bars]' \
                                         '(--progress --no-progress)'--no-progress'[Disable progress bars]' \
                                         '1:snapper config name:' \

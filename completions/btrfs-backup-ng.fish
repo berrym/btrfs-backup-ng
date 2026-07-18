@@ -326,7 +326,8 @@ complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_snapper_using_subcommand 
 complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_snapper_using_subcommand backup' -l rate-limit -d 'Bandwidth limit (e.g., 10M, 1G)' -x
 complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_snapper_using_subcommand backup' -l progress -d 'Show progress bars'
 complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_snapper_using_subcommand backup' -l no-progress -d 'Disable progress bars'
-complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_snapper_using_subcommand backup' -l types -d 'Filter by snapshot types (comma-separated)' -x
+complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_snapper_using_subcommand backup' -s t -l type -d 'Filter by snapshot type (single, pre, post; repeatable)' -xa 'single pre post'
+complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_snapper_using_subcommand backup' -s s -l snapshot -d 'Backup specific snapshot number only' -x
 complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_snapper_using_subcommand backup' -l min-age -d 'Only backup snapshots older than duration (e.g., 1h, 30m)' -x
 complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_snapper_using_subcommand backup' -l ssh-sudo -d 'Use sudo for btrfs commands on remote host'
 complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_snapper_using_subcommand backup' -l ssh-key -d 'SSH private key file' -r -F

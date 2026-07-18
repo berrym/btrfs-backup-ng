@@ -68,12 +68,22 @@ Config: root (/)
 ### 3. Backup Snapshots
 
 ```bash
-# Local backup
+# Local backup (btrfs destination)
 btrfs-backup-ng snapper backup root /mnt/backup/root
 
-# Remote backup via SSH
+# Remote backup via SSH (btrfs destination)
 btrfs-backup-ng snapper backup root ssh://backup@server:/backups/root --ssh-sudo
+
+# Raw stream to a local non-btrfs destination (USB, NFS, SMB)
+btrfs-backup-ng snapper backup root raw:///mnt/usb/backups/root --compress zstd
+
+# Raw stream to a remote non-btrfs destination over SSH
+btrfs-backup-ng snapper backup root raw+ssh://backup@server/mnt/nas/root --compress zstd
 ```
+
+`snapper backup` accepts the same destination schemes as the regular `backup`
+command: a local path or `ssh://` for btrfs destinations, and `raw://` /
+`raw+ssh://` for non-btrfs destinations (see [Raw Targets](CLI-REFERENCE.md#raw-targets)).
 
 ### 4. Check Backup Status
 
@@ -318,6 +328,25 @@ When running with sudo locally, preserve SSH agent:
 ```bash
 sudo -E btrfs-backup-ng snapper backup root ssh://backup@server:/backups/root
 ```
+
+### Raw (Non-btrfs) Targets
+
+To back up snapper snapshots to a destination that is not btrfs (a USB drive,
+NFS/SMB share, or cloud-mounted storage), use a raw target. The snapshot is
+written as a `btrfs send` stream to a file, with optional compression, rather
+than received into a subvolume:
+
+```bash
+# Local raw target
+btrfs-backup-ng snapper backup root raw:///mnt/usb/backups/root --compress zstd
+
+# Remote raw target over SSH
+btrfs-backup-ng snapper backup root raw+ssh://backup@server/mnt/nas/root \
+    --compress zstd --ssh-sudo
+```
+
+Raw targets support the same compression and encryption options as regular
+backups; see [Raw Targets](CLI-REFERENCE.md#raw-targets) for the full list.
 
 ## Automated Backups
 

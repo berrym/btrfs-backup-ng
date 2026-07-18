@@ -1880,7 +1880,18 @@ sudo btrfs-backup-ng snapper backup root /mnt/backup/root --dry-run
 # With compression and rate limiting
 sudo btrfs-backup-ng snapper backup root ssh://server:/backups \
     --compress zstd --rate-limit 50M
+
+# Raw stream to a non-btrfs destination (USB, NFS, SMB), local or over SSH
+sudo btrfs-backup-ng snapper backup root raw:///mnt/usb/backups/root --compress zstd
+sudo btrfs-backup-ng snapper backup root raw+ssh://backup@server/mnt/nas/root \
+    --compress zstd --ssh-sudo
 ```
+
+The `TARGET` accepts the same destination schemes as the regular `backup`
+command: a local path or `ssh://` for btrfs destinations, and `raw://` /
+`raw+ssh://` for non-btrfs destinations (see
+[Raw Targets](docs/CLI-REFERENCE.md#raw-targets) and
+[SSH Remote Backups](docs/CLI-REFERENCE.md#ssh-remote-backups) for setup).
 
 #### Restore Snapshots
 
