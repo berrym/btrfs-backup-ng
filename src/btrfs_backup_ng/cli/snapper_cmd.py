@@ -218,9 +218,15 @@ def _handle_backup(args: argparse.Namespace) -> int:
     # targets are parsed correctly instead of being treated as local paths.
     from ..endpoint import choose_endpoint
 
-    destination_endpoint = choose_endpoint(
-        target_path, {"path": target_path, "snap_prefix": ""}
-    )
+    endpoint_config: dict[str, Any] = {"path": target_path, "snap_prefix": ""}
+    # Thread SSH options so ssh:// (remote btrfs receive) and raw+ssh:// targets
+    # honor --ssh-sudo / --ssh-key.
+    if getattr(args, "ssh_sudo", False):
+        endpoint_config["ssh_sudo"] = True
+    if getattr(args, "ssh_key", None):
+        endpoint_config["ssh_identity_file"] = args.ssh_key
+        endpoint_config["ssh_key"] = args.ssh_key
+    destination_endpoint = choose_endpoint(target_path, endpoint_config)
 
     # Determine if this is a local or remote transfer
     is_remote = getattr(destination_endpoint, "_is_remote", False)

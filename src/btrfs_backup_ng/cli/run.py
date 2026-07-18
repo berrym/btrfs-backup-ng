@@ -6,7 +6,7 @@ import os
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 from .. import __util__, endpoint
 from ..__logger__ import add_file_handler, create_logger
@@ -521,9 +521,19 @@ def _backup_snapper_volume(
                 "show_progress": show_progress,
             }
 
-            # Route the destination through the endpoint layer (local/ssh/raw)
+            # Route the destination through the endpoint layer (local/ssh/raw),
+            # threading the target's SSH options so ssh:// / raw+ssh:// honor them.
+            snapper_endpoint_config: dict[str, Any] = {
+                "path": target.path,
+                "snap_prefix": "",
+            }
+            if target.ssh_sudo:
+                snapper_endpoint_config["ssh_sudo"] = True
+            if target.ssh_key:
+                snapper_endpoint_config["ssh_identity_file"] = target.ssh_key
+                snapper_endpoint_config["ssh_key"] = target.ssh_key
             destination_endpoint = endpoint.choose_endpoint(
-                target.path, {"path": target.path, "snap_prefix": ""}
+                target.path, snapper_endpoint_config
             )
 
             # Sync snapper snapshots to this target
