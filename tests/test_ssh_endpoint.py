@@ -65,3 +65,37 @@ class TestBuildReceiveCommand:
         )
         assert "sudo -S" in cmd
         assert "sudo -n" not in cmd
+
+
+class TestSSHEndpointConfigPreservation:
+    """SSH-specific config keys survive the base Endpoint.__init__ whitelist.
+
+    Regression: the base rebuilds config from a fixed key set, dropping SSH keys,
+    so ssh://user@host and --ssh-sudo / --ssh-key were silently lost (the username
+    fell back to SUDO_USER/current user).
+    """
+
+    def test_username_from_url_is_preserved(self):
+        from btrfs_backup_ng.endpoint import choose_endpoint
+
+        ep = choose_endpoint(
+            "ssh://root@host/path",
+            {"path": "ssh://root@host/path", "snap_prefix": ""},
+        )
+        assert ep.config.get("username") == "root"
+
+    def test_ssh_sudo_and_identity_are_preserved(self):
+        from btrfs_backup_ng.endpoint import choose_endpoint
+
+        ep = choose_endpoint(
+            "ssh://u@host/p",
+            {
+                "path": "ssh://u@host/p",
+                "snap_prefix": "",
+                "ssh_sudo": True,
+                "ssh_identity_file": "/key",
+            },
+        )
+        assert ep.config.get("username") == "u"
+        assert ep.config.get("ssh_sudo") is True
+        assert ep.config.get("ssh_identity_file") == "/key"
