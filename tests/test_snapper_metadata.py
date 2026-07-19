@@ -15,6 +15,78 @@ from btrfs_backup_ng.snapper.metadata import (
 )
 
 
+class TestSnapperSnapshotBackupName:
+    """SnapperSnapshot.get_backup_name honors the configured timestamp_format (#7)."""
+
+    @staticmethod
+    def _snapshot():
+        from pathlib import Path
+        from unittest.mock import MagicMock
+
+        from btrfs_backup_ng.snapper.snapshot import SnapperSnapshot
+
+        meta = MagicMock()
+        meta.date = datetime(2024, 1, 15, 14, 30, 22)
+        return SnapperSnapshot(
+            config_name="root",
+            number=7,
+            metadata=meta,
+            subvolume_path=Path("/snap"),
+            info_xml_path=Path("/snap/info.xml"),
+        )
+
+    def test_default_format(self):
+        assert self._snapshot().get_backup_name() == "root-7-20240115-143022"
+
+    def test_honors_configured_format(self):
+        assert (
+            self._snapshot().get_backup_name("%Y%m%dT%H%M%S")
+            == "root-7-20240115T143022"
+        )
+
+
+class TestCreateSnapperSnapshotWrapper:
+    """The real wrapper is null-safe and honors the endpoint's timestamp_format.
+
+    Regression guard for the #7 blocker: the wrapper dereferenced a None
+    destination_endpoint, crashing every snapper backup. The snapper_cmd tests
+    mock the wrapper out, so this exercises the REAL function.
+    """
+
+    @staticmethod
+    def _snap(tmp_path):
+        from unittest.mock import MagicMock
+
+        from btrfs_backup_ng.snapper.snapshot import SnapperSnapshot
+
+        meta = MagicMock()
+        meta.date = datetime(2024, 1, 15, 14, 30, 22)
+        sub = tmp_path / "snapshot"
+        sub.mkdir()
+        return SnapperSnapshot(
+            config_name="root",
+            number=7,
+            metadata=meta,
+            subvolume_path=sub,
+            info_xml_path=sub.parent / "info.xml",
+        )
+
+    def test_none_endpoint_does_not_crash(self, tmp_path):
+        from btrfs_backup_ng.core.operations import _create_snapper_snapshot_wrapper
+
+        wrapper = _create_snapper_snapshot_wrapper(self._snap(tmp_path))
+        assert wrapper.get_name() == "root-7-20240115-143022"
+
+    def test_honors_endpoint_timestamp_format(self, tmp_path):
+        from types import SimpleNamespace
+
+        from btrfs_backup_ng.core.operations import _create_snapper_snapshot_wrapper
+
+        ep = SimpleNamespace(config={"timestamp_format": "%Y%m%dT%H%M%S"})
+        wrapper = _create_snapper_snapshot_wrapper(self._snap(tmp_path), ep)
+        assert wrapper.get_name() == "root-7-20240115T143022"
+
+
 class TestSnapperMetadata:
     """Tests for SnapperMetadata dataclass."""
 

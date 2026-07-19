@@ -143,6 +143,7 @@ def execute_prune(args: argparse.Namespace) -> int:
                     retention,
                     get_name=lambda s: s.get_name(),
                     prefix=prefix,
+                    timestamp_format=get_timestamp_format(config),
                 )
 
                 logger.info("  Keeping %d, deleting %d", len(to_keep), len(to_delete))
@@ -196,6 +197,7 @@ def execute_prune(args: argparse.Namespace) -> int:
                         retention,
                         get_name=lambda s: s.get_name(),
                         prefix=prefix,
+                        timestamp_format=get_timestamp_format(config),
                     )
 
                     logger.info(

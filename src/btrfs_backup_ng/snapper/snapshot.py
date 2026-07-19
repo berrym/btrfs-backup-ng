@@ -57,18 +57,19 @@ class SnapperSnapshot:
         """For 'post' snapshots, the paired 'pre' snapshot number."""
         return self.metadata.pre_num
 
-    def get_backup_name(self, date_format: str = "%Y%m%d-%H%M%S") -> str:
+    def get_backup_name(self, date_format: str | None = None) -> str:
         """Generate backup name for this snapshot.
 
         Format: {config_name}-{number}-{date}
 
         Args:
-            date_format: strftime format for the date portion
+            date_format: strftime format for the date portion; the configured
+                timestamp_format, or the built-in default when None
 
         Returns:
             Backup name string
         """
-        date_str = self.metadata.date.strftime(date_format)
+        date_str = self.metadata.date.strftime(date_format or "%Y%m%d-%H%M%S")
         return f"{self.config_name}-{self.number}-{date_str}"
 
     def exists(self) -> bool:

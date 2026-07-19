@@ -1410,9 +1410,11 @@ def send_snapper_snapshot(
 
     # Wrap the snapper snapshots so the standard send/receive pipeline can carry
     # them (the wrapper's source is a LocalEndpoint on the snapper subvolume).
-    source_wrapper = _create_snapper_snapshot_wrapper(snapper_snapshot)
+    source_wrapper = _create_snapper_snapshot_wrapper(
+        snapper_snapshot, destination_endpoint
+    )
     parent_wrapper = (
-        _create_snapper_snapshot_wrapper(parent_snapper_snapshot)
+        _create_snapper_snapshot_wrapper(parent_snapper_snapshot, destination_endpoint)
         if parent_snapper_snapshot
         else None
     )
@@ -1493,15 +1495,22 @@ def _create_snapper_snapshot_wrapper(snapper_snapshot, destination_endpoint=None
 
     Args:
         snapper_snapshot: SnapperSnapshot object
-        destination_endpoint: Optional destination endpoint (not used for source)
+        destination_endpoint: Destination endpoint; its configured
+            timestamp_format is applied to the backup name (default when None)
 
     Returns:
         __util__.Snapshot wrapper object with a local source endpoint
     """
     from ..endpoint.local import LocalEndpoint
 
-    # The backup name follows the format: {config}-{number}-{date}
-    backup_name = snapper_snapshot.get_backup_name()
+    # The backup name follows the format: {config}-{number}-{date}, honoring the
+    # destination's configured timestamp_format (default when no endpoint given).
+    date_format = (
+        destination_endpoint.config.get("timestamp_format")
+        if destination_endpoint is not None
+        else None
+    )
+    backup_name = snapper_snapshot.get_backup_name(date_format)
 
     # Parse the date from snapper snapshot
     time_obj = snapper_snapshot.date.timetuple()
@@ -1567,7 +1576,9 @@ def _write_snapper_metadata(snapper_snapshot, destination_endpoint) -> None:
     )
 
     # Determine metadata file path at destination
-    backup_name = snapper_snapshot.get_backup_name()
+    backup_name = snapper_snapshot.get_backup_name(
+        destination_endpoint.config.get("timestamp_format")
+    )
     dest_path = Path(destination_endpoint.config["path"])
     meta_file = dest_path / f"{backup_name}.snapper-meta.json"
 
@@ -1776,34 +1787,3 @@ def _list_snapper_backups_at_destination(endpoint) -> set[str]:
             logger.warning("Could not list local backups: %s", e)
 
     return backup_names
-
-
-def _find_snapper_parent(
-    snapshot,
-    all_snapshots: list,
-    backed_up_names: set[str],
-):
-    """Find the best parent snapshot for incremental transfer.
-
-    Args:
-        snapshot: SnapperSnapshot to find parent for
-        all_snapshots: All available snapper snapshots
-        backed_up_names: Names of snapshots already at destination
-
-    Returns:
-        SnapperSnapshot to use as parent, or None
-    """
-    # Find snapshots that are both older than target and already backed up
-    candidates = [
-        s
-        for s in all_snapshots
-        if s.number < snapshot.number
-        and s.config_name == snapshot.config_name
-        and s.get_backup_name() in backed_up_names
-    ]
-
-    if not candidates:
-        return None
-
-    # Return the most recent candidate (highest number)
-    return max(candidates, key=lambda s: s.number)

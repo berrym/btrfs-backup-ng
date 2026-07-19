@@ -15,7 +15,7 @@ from ..core.verify import (
     verify_metadata,
     verify_stream,
 )
-from .common import get_fs_checks_mode
+from .common import get_fs_checks_mode, resolve_timestamp_format
 
 logger = logging.getLogger(__name__)
 console = Console()
@@ -33,13 +33,17 @@ def execute(args: argparse.Namespace) -> int:
     # Determine verification level
     level = VerifyLevel(args.level)
 
-    # Build endpoint kwargs
+    # Build endpoint kwargs. Thread timestamp_format so custom-named snapshots
+    # are parsed (otherwise verify silently skips them and can report success).
     endpoint_kwargs = {
         "snap_prefix": args.prefix or "",
         "convert_rw": False,
         "subvolume_sync": False,
         "btrfs_debug": False,
         "fs_checks": get_fs_checks_mode(args),
+        "timestamp_format": resolve_timestamp_format(
+            getattr(args, "timestamp_format", None)
+        ),
     }
 
     # SSH options

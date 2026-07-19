@@ -122,6 +122,23 @@ class TestExtractTimestamp:
         result = extract_timestamp("snapshot-without-date")
         assert result is None
 
+    def test_preferred_format_parses_custom_names(self):
+        """A custom timestamp_format not in the built-in list is honored when
+        passed as preferred_fmt, so retention buckets it instead of keeping it
+        forever."""
+        # Custom format with a 'T' separator and no seconds -> not in the fallbacks.
+        name = "home-2024-01-15T1430"
+        assert extract_timestamp(name, prefix="home-") is None
+        result = extract_timestamp(name, prefix="home-", preferred_fmt="%Y-%m-%dT%H%M")
+        assert result is not None
+        assert (result.year, result.month, result.day, result.hour, result.minute) == (
+            2024,
+            1,
+            15,
+            14,
+            30,
+        )
+
     def test_extract_invalid_timestamp(self):
         """Test extracting invalid timestamp."""
         result = extract_timestamp("home-99999999-999999")

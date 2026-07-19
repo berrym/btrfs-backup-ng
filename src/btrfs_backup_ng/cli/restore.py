@@ -20,7 +20,12 @@ from ..core.restore import (
     restore_snapshots,
     validate_restore_destination,
 )
-from .common import get_fs_checks_mode, get_log_level, should_show_progress
+from .common import (
+    get_fs_checks_mode,
+    get_log_level,
+    resolve_timestamp_format,
+    should_show_progress,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -291,9 +296,14 @@ def _execute_main_restore(args: argparse.Namespace) -> int:
         logger.error("Failed to prepare backup endpoint: %s", e)
         return 1
 
-    # Prepare local endpoint (destination)
+    # Prepare local endpoint (destination). Resolve the SAME timestamp_format the
+    # backup (source) endpoint uses so already-restored custom-named snapshots are
+    # recognized (skip-existing + incremental-base detection).
     try:
-        local_endpoint = _prepare_local_endpoint(dest_path)
+        local_endpoint = _prepare_local_endpoint(
+            dest_path,
+            resolve_timestamp_format(getattr(args, "timestamp_format", None)),
+        )
     except Exception as e:
         logger.error("Failed to prepare local endpoint: %s", e)
         return 1
@@ -421,13 +431,17 @@ def _prepare_backup_endpoint(args: argparse.Namespace, source: str):
     Returns:
         Configured endpoint
     """
-    # Build endpoint kwargs
+    # Build endpoint kwargs. Thread timestamp_format so custom-named snapshots
+    # are parsed rather than silently skipped when listing/matching backups.
     endpoint_kwargs = {
         "snap_prefix": getattr(args, "prefix", "") or "",
         "convert_rw": False,
         "subvolume_sync": False,
         "btrfs_debug": False,
         "fs_checks": get_fs_checks_mode(args),
+        "timestamp_format": resolve_timestamp_format(
+            getattr(args, "timestamp_format", None)
+        ),
     }
 
     # SSH options
@@ -457,11 +471,15 @@ def _prepare_backup_endpoint(args: argparse.Namespace, source: str):
     return backup_ep
 
 
-def _prepare_local_endpoint(dest_path: Path):
+def _prepare_local_endpoint(dest_path: Path, timestamp_format: str | None = None):
     """Prepare the local endpoint for receiving restored snapshots.
 
     Args:
         dest_path: Local destination path
+        timestamp_format: Format for parsing names of snapshots already at the
+            destination, so skip-existing and incremental-base detection see
+            custom-named snapshots instead of silently dropping them. Must match
+            the format the backup (source) endpoint uses.
 
     Returns:
         Configured local endpoint
@@ -479,6 +497,7 @@ def _prepare_local_endpoint(dest_path: Path):
         "subvolume_sync": False,
         "btrfs_debug": False,
         "fs_checks": "auto",
+        "timestamp_format": timestamp_format,
     }
 
     local_ep = LocalEndpoint(config=endpoint_kwargs)

@@ -2429,6 +2429,18 @@ class TestPrepareLocalEndpoint:
         assert dest.exists()
 
     @patch("btrfs_backup_ng.endpoint.local.LocalEndpoint")
+    def test_threads_timestamp_format(self, mock_local_ep, tmp_path):
+        """The timestamp_format is threaded into the destination endpoint config so
+        already-restored custom-named snapshots are recognized (skip-existing and
+        incremental-base detection) instead of silently dropped."""
+        from btrfs_backup_ng.cli.restore import _prepare_local_endpoint
+
+        _prepare_local_endpoint(tmp_path / "dest", "%Y%m%dT%H%M%S")
+
+        config = mock_local_ep.call_args.kwargs["config"]
+        assert config["timestamp_format"] == "%Y%m%dT%H%M%S"
+
+    @patch("btrfs_backup_ng.endpoint.local.LocalEndpoint")
     def test_calls_prepare(self, mock_local_ep, tmp_path):
         """Test local endpoint prepare is called."""
         from btrfs_backup_ng.cli.restore import _prepare_local_endpoint

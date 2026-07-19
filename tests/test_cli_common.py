@@ -13,6 +13,7 @@ from btrfs_backup_ng.cli.common import (
     get_log_level,
     get_timestamp_format,
     is_interactive,
+    resolve_timestamp_format,
     should_show_progress,
 )
 
@@ -35,6 +36,29 @@ class TestGetTimestampFormat:
         config = MagicMock()
         config.global_config.timestamp_format = ""
         assert get_timestamp_format(config) == DATE_FORMAT
+
+
+class TestResolveTimestampFormat:
+    """Tests for resolve_timestamp_format (verify/restore direct mode)."""
+
+    def test_explicit_wins(self):
+        """An explicit format is returned as-is without touching config."""
+        assert resolve_timestamp_format("%Y/%m/%d") == "%Y/%m/%d"
+
+    def test_no_config_falls_back_to_default(self):
+        """With no discoverable config, the built-in default is used."""
+        with patch("btrfs_backup_ng.config.find_config_file", return_value=None):
+            assert resolve_timestamp_format(None) == DATE_FORMAT
+
+    def test_falls_back_to_global_config(self):
+        """With no explicit flag, the config's [global] timestamp_format is used."""
+        cfg = MagicMock()
+        cfg.global_config.timestamp_format = "%Y%m%dT%H%M%S"
+        with (
+            patch("btrfs_backup_ng.config.find_config_file", return_value="/cfg.toml"),
+            patch("btrfs_backup_ng.config.load_config", return_value=(cfg, [])),
+        ):
+            assert resolve_timestamp_format(None) == "%Y%m%dT%H%M%S"
 
 
 class TestCreateGlobalParser:

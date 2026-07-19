@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.4] - 2026-07-19
+
+### Fixed
+
+#### timestamp_format honored across all commands
+- The configured `timestamp_format` is now applied consistently everywhere a snapshot name is generated or parsed, completing the work started in 0.8.3:
+  - **snapper backup** names (raw stream filenames and metadata sidecars) use the configured format on both entry paths (config-driven `run` and standalone `snapper backup`).
+  - **verify** and **restore** direct mode parse custom-named snapshots instead of silently skipping them (`verify` could otherwise report "all verified" while skipping); restore threads the same resolved format into both the source and destination endpoints, so skip-existing and incremental-base detection work on re-restore.
+  - **retention/prune** parse custom-format snapshot times, so custom-named snapshots are pruned instead of kept forever.
+  - **estimate** direct mode, **snapper status** (backed-up/pending counts), and **snapper list** (previewed name) honor the format.
+- New `--timestamp-format` flag on `snapper backup`/`list`/`status`, `verify`, `restore`, and `estimate`; otherwise the `[global] timestamp_format` is used.
+
+### Added
+- Mutation-verified enforcement tests that assert every command threads the configured `timestamp_format`, so a regression fails CI.
+
 ## [0.8.3] - 2026-07-18
 
 ### Added
