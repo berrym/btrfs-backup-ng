@@ -152,11 +152,25 @@ def _parse_target(data: dict[str, Any]) -> TargetConfig:
     path = data["path"]
     is_raw = str(path).startswith(("raw://", "raw+ssh://"))
 
-    # Validate compression algorithm
+    # Validate compression against what the target's transport ACTUALLY supports.
+    # Raw endpoints and the btrfs/ssh transfer pipeline support different sets
+    # (raw adds xz/lzo/bzip2/pbzip2; the transfer path uses lzop). Source the sets
+    # from the authoritative maps so this can never drift again -- a hardcoded list
+    # previously rejected xz/lzo/bzip2/pbzip2, which raw targets run and btrbk
+    # migration emits, so a migrated config failed to load.
+    from ..core.transfer import COMPRESSION_PROGRAMS
+    from ..endpoint.raw_metadata import COMPRESSION_CONFIG
+
     compress = data.get("compress", "none")
-    valid_compress = {"none", "gzip", "zstd", "lz4", "pigz", "lzop"}
+    if is_raw:
+        valid_compress = {"none", *COMPRESSION_CONFIG.keys()}
+    else:
+        valid_compress = {"none", *COMPRESSION_PROGRAMS.keys()}
     if compress not in valid_compress:
-        raise ConfigError(f"Invalid compression: {compress}. Valid: {valid_compress}")
+        raise ConfigError(
+            f"Invalid compression '{compress}' for target {path}. "
+            f"Valid: {sorted(valid_compress)}"
+        )
 
     # Encryption is a raw-target-only feature. Validate at load time and FAIL
     # CLOSED: a requested encryption that cannot be honored must refuse to run
