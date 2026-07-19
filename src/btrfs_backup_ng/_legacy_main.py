@@ -333,6 +333,7 @@ def run_task(options):
     else:
         snapshot = None
 
+    any_failed = False
     for destination_endpoint in destination_endpoints:
         try:
             sync_snapshots(
@@ -344,11 +345,16 @@ def run_task(options):
                 options=options,
             )
         except __util__.AbortError as e:
+            # A failed transfer (SnapshotTransferError subclasses AbortError) must
+            # not be reported as overall success. Record it, continue to the other
+            # destinations, then signal failure so the exit code is non-zero.
             logger.error("Aborting snapshot transfer to %s", destination_endpoint)
             logger.debug("Exception was: %s", e)
+            any_failed = True
 
     time.sleep(1)
     cleanup_snapshots(source_endpoint, destination_endpoints, options)
+    return not any_failed
 
 
 def log_initial_settings(options):
@@ -585,12 +591,17 @@ def legacy_main(argv: list[str] | None = None) -> int:
     logger.debug("Logger initialized")
 
     try:
+        all_ok = True
         for n, options in enumerate(task_options):
             logger.debug(f"Starting task {n + 1}/{len(task_options)}")
-            run_task(options)
+            if not run_task(options):
+                all_ok = False
             logger.debug(f"Completed task {n + 1}/{len(task_options)}")
-        logger.info("All tasks completed successfully")
-        return 0
+        if all_ok:
+            logger.info("All tasks completed successfully")
+            return 0
+        logger.error("One or more transfers failed")
+        return 1
     except (__util__.AbortError, KeyboardInterrupt):
         logger.error("Process aborted by user or error")
         return 1
