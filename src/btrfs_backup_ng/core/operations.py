@@ -959,7 +959,10 @@ def _do_process_transfer(
     )
 
     try:
-        return_code_receive = receive_process.wait(timeout=300)
+        # Match the send timeout: applying a large received stream can legitimately
+        # take well over the old 300s, and killing it here manufactures exactly the
+        # partial subvolume this path must avoid.
+        return_code_receive = receive_process.wait(timeout=timeout_seconds)
         logger.debug(
             "Receive process completed with return code: %d", return_code_receive
         )
@@ -1163,6 +1166,56 @@ def sync_snapshots(
     return result
 
 
+def _cleanup_partial_local_subvolume(destination_endpoint, snapshot) -> None:
+    """Best-effort removal of a partial received subvolume after a failed transfer.
+
+    A killed or failed local ``btrfs receive`` leaves an incomplete subvolume at
+    ``{dest}/{name}`` (named after the source basename, == ``snapshot.get_name()``),
+    which the next run's skip-detection would enumerate and mistake for a completed
+    backup -- silently skipping the real transfer. Remove it so a re-run starts
+    clean.
+
+    Safety (the received subvolume is never a good backup here):
+      * only called on the failure path, so a successful transfer never triggers it;
+      * skip-detection already excluded any snapshot whose name is present at the
+        destination BEFORE the transfer was attempted, so anything now at the exact
+        path is this failed run's partial, not a prior good backup;
+      * scoped to the EXACT single path via ``Path.exists()`` -- never a
+        filesystem-wide name search -- so siblings are untouched.
+
+    Only handles LOCAL btrfs destinations: SSH endpoints clean their own partials
+    during the transfer, and raw destinations are handled by the raw cleanup path.
+    """
+    import os
+
+    from ..endpoint.raw import RawEndpoint
+
+    if getattr(destination_endpoint, "_is_remote", False):
+        return
+    if isinstance(destination_endpoint, RawEndpoint):
+        return
+
+    name = snapshot.get_name()
+    base = str(destination_endpoint.config["path"]).rstrip("/")
+    expected = f"{base}/{name}"
+    try:
+        if not Path(expected).exists():
+            return
+        logger.warning("Cleaning up partial local transfer artifact at %s", expected)
+        sudo = [] if os.geteuid() == 0 else ["sudo"]
+        deleted = subprocess.run(
+            [*sudo, "btrfs", "subvolume", "delete", expected],
+            capture_output=True,
+        )
+        if deleted.returncode != 0:
+            # A killed receive can leave a plain directory rather than a subvolume.
+            subprocess.run([*sudo, "rm", "-rf", expected], capture_output=True)
+    except Exception as cleanup_e:
+        logger.debug(
+            "Partial local-subvolume cleanup failed for %s: %s", expected, cleanup_e
+        )
+
+
 def _execute_transfers(
     source_endpoint,
     destination_endpoint,
@@ -1238,6 +1291,10 @@ def _execute_transfers(
             logger.error("Snapshot transfer failed for %s: %s", best_snapshot, e)
             logger.info("Keeping %s locked to prevent deletion.", best_snapshot)
             result.failed.append((best_snapshot, e))
+            # Remove any partial received subvolume the failed transfer left at the
+            # destination so the next run's skip-detection cannot mistake it for a
+            # completed backup (local btrfs only; SSH/raw clean their own).
+            _cleanup_partial_local_subvolume(destination_endpoint, best_snapshot)
 
         to_transfer.remove(best_snapshot)
         logger.debug("%d snapshots left to transfer", len(to_transfer))
