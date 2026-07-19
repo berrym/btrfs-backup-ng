@@ -174,3 +174,161 @@ class TestChooseEndpointThreadsEncryption:
         assert ep.encrypt == "gpg"
         assert ep.gpg_recipient == "KEYID"
         assert ep.openssl_cipher == "aes-128-cbc"
+
+    def test_encrypt_none_string_is_plaintext_not_rejected(self):
+        # thread_raw_encryption sets encrypt="none" for plaintext raw targets;
+        # the endpoint must treat the string "none" as plaintext (== None), not
+        # reject it -- otherwise every plaintext raw backup breaks.
+        from btrfs_backup_ng.endpoint.raw import RawEndpoint
+
+        ep = RawEndpoint(
+            config={"path": "/tmp/r6-x", "snap_prefix": "", "encrypt": "none"}
+        )
+        assert ep.encrypt is None
+
+
+# --- Real encryption pipeline validation (runs the actual gpg/openssl pipeline)
+
+
+def _make_raw_endpoint(dest, **enc):
+    from btrfs_backup_ng.endpoint.raw import RawEndpoint
+
+    cfg = {"path": str(dest), "snap_prefix": ""}
+    cfg.update(enc)
+    return RawEndpoint(config=cfg)
+
+
+def _feed(plaintext: bytes):
+    import subprocess
+
+    return subprocess.Popen(
+        ["cat"], stdin=subprocess.PIPE, stdout=subprocess.PIPE
+    ), plaintext
+
+
+@pytest.mark.skipif(__import__("shutil").which("gpg") is None, reason="gpg required")
+class TestRealGpgPipeline:
+    """Prove the raw pipeline produces genuine, decryptable GPG ciphertext -- and
+    that a plaintext control is NOT encrypted. This is the end-to-end security
+    guarantee: encrypt=gpg must never yield readable cleartext."""
+
+    PLAINTEXT = b"BTRFS-SEND-STREAM-TOP-SECRET-CONTENTS-abcdef0123456789"
+
+    @staticmethod
+    def _gpg_key(gnupghome):
+        import subprocess
+
+        subprocess.run(
+            [
+                "gpg",
+                "--batch",
+                "--pinentry-mode",
+                "loopback",
+                "--passphrase",
+                "",
+                "--quick-generate-key",
+                "R6 Test <r6-test@example.invalid>",
+                "default",
+                "default",
+                "never",
+            ],
+            check=True,
+            capture_output=True,
+            env={**__import__("os").environ, "GNUPGHOME": str(gnupghome)},
+        )
+        return "r6-test@example.invalid"
+
+    def _run_receive(self, dest, plaintext, **enc):
+        import subprocess
+
+        ep = _make_raw_endpoint(dest, **enc)
+        feeder = subprocess.Popen(
+            ["printf", "%s", plaintext.decode()], stdout=subprocess.PIPE
+        )
+        proc = ep.receive(feeder.stdout, "r6snap")
+        if feeder.stdout:
+            feeder.stdout.close()
+        proc.wait()
+        feeder.wait()
+        assert proc.returncode == 0, "pipeline should succeed"
+        out = next(p for p in dest.iterdir() if p.name.startswith("r6snap"))
+        return out
+
+    def test_gpg_output_is_real_ciphertext_and_decrypts(self, tmp_path, monkeypatch):
+        import subprocess
+
+        gnupghome = tmp_path / "gnupg"
+        gnupghome.mkdir(mode=0o700)
+        monkeypatch.setenv("GNUPGHOME", str(gnupghome))
+        recipient = self._gpg_key(gnupghome)
+
+        dest = tmp_path / "dest"
+        dest.mkdir()
+        out = self._run_receive(
+            dest, self.PLAINTEXT, encrypt="gpg", gpg_recipient=recipient
+        )
+
+        data = out.read_bytes()
+        assert self.PLAINTEXT not in data, "output must NOT contain the plaintext"
+        lp = subprocess.run(
+            ["gpg", "--list-packets", str(out)], capture_output=True, text=True
+        )
+        assert (
+            "encrypted data" in lp.stdout.lower() or "pubkey enc" in lp.stdout.lower()
+        )
+        dec = subprocess.run(
+            ["gpg", "--batch", "--yes", "--decrypt", str(out)], capture_output=True
+        )
+        assert dec.stdout == self.PLAINTEXT, "must decrypt back to the original stream"
+
+    def test_plaintext_control_is_not_encrypted(self, tmp_path):
+        # encrypt=none writes the raw stream; confirms the test would catch a
+        # silent plaintext downgrade (the whole bug).
+        dest = tmp_path / "dest"
+        dest.mkdir()
+        out = self._run_receive(dest, self.PLAINTEXT, encrypt="none")
+        assert self.PLAINTEXT in out.read_bytes()
+
+
+@pytest.mark.skipif(
+    __import__("shutil").which("openssl") is None, reason="openssl required"
+)
+class TestRealOpensslPipeline:
+    PLAINTEXT = b"BTRFS-SEND-STREAM-OPENSSL-SECRET-9876543210"
+
+    def test_openssl_output_is_encrypted_and_decrypts(self, tmp_path, monkeypatch):
+        import subprocess
+
+        monkeypatch.setenv("BTRFS_BACKUP_PASSPHRASE", "test-passphrase-r6")
+        dest = tmp_path / "dest"
+        dest.mkdir()
+        ep = _make_raw_endpoint(dest, encrypt="openssl_enc")
+        feeder = subprocess.Popen(
+            ["printf", "%s", self.PLAINTEXT.decode()], stdout=subprocess.PIPE
+        )
+        proc = ep.receive(feeder.stdout, "r6snap")
+        if feeder.stdout:
+            feeder.stdout.close()
+        proc.wait()
+        feeder.wait()
+        assert proc.returncode == 0
+        out = next(p for p in dest.iterdir() if p.name.startswith("r6snap"))
+        data = out.read_bytes()
+        assert self.PLAINTEXT not in data
+        assert data[:8] == b"Salted__", "OpenSSL salted magic expected"
+        dec = subprocess.run(
+            [
+                "openssl",
+                "enc",
+                "-d",
+                "-aes-256-cbc",
+                "-salt",
+                "-pbkdf2",
+                "-pass",
+                "env:BTRFS_BACKUP_PASSPHRASE",
+                "-in",
+                str(out),
+            ],
+            capture_output=True,
+        )
+        assert dec.stdout == self.PLAINTEXT
