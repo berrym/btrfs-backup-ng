@@ -332,3 +332,128 @@ class TestRealOpensslPipeline:
             capture_output=True,
         )
         assert dec.stdout == self.PLAINTEXT
+
+
+class TestSSHRawEndpointEncryption:
+    """raw+ssh:// must encrypt the stream LOCALLY before shipping it to the remote.
+
+    SSHRawEndpoint inherits _build_receive_pipeline unchanged and only overrides
+    the ssh shipping, so the encryption stage runs in the shared local pipeline.
+    These prove the SSHRawEndpoint path actually builds that stage -- catching the
+    audit's mutation that gated encryption on `not _is_remote` (shipping plaintext
+    over SSH), which the whole raw suite otherwise missed.
+    """
+
+    @staticmethod
+    def _ssh_raw(**enc):
+        from pathlib import Path as _P
+
+        from btrfs_backup_ng.endpoint.raw import SSHRawEndpoint
+
+        ep = SSHRawEndpoint.__new__(SSHRawEndpoint)
+        ep.compress = enc.get("compress")
+        ep.encrypt = enc.get("encrypt")
+        ep.gpg_recipient = enc.get("gpg_recipient")
+        ep.gpg_keyring = enc.get("gpg_keyring")
+        ep.openssl_cipher = enc.get("openssl_cipher", "aes-256-cbc")
+        ep._is_remote = True  # SSHRawEndpoint is remote; the mutation gated on this
+        return ep._build_receive_pipeline(_P("/tmp/r6-out"))
+
+    def test_ssh_raw_pipeline_includes_gpg_stage(self):
+        pipeline = self._ssh_raw(encrypt="gpg", gpg_recipient="KEYID")
+        gpg = [s for s in pipeline if s and s[0] == "gpg"]
+        assert gpg, "raw+ssh gpg config must build a gpg encryption stage"
+        assert "--encrypt" in gpg[0] and "KEYID" in gpg[0]
+
+    def test_ssh_raw_pipeline_includes_openssl_stage(self):
+        pipeline = self._ssh_raw(encrypt="openssl_enc")
+        enc = [s for s in pipeline if s and s[0] == "openssl"]
+        assert enc, "raw+ssh openssl config must build an openssl encryption stage"
+        assert "enc" in enc[0]
+
+    def test_ssh_raw_plaintext_pipeline_has_no_encryption_stage(self):
+        # Control: no encryption requested -> no gpg/openssl stage (the negative).
+        pipeline = self._ssh_raw(encrypt=None)
+        assert not [s for s in pipeline if s and s[0] in ("gpg", "openssl")]
+
+
+def _ssh_localhost_works() -> bool:
+    import subprocess
+
+    try:
+        r = subprocess.run(
+            [
+                "ssh",
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                "ConnectTimeout=3",
+                "localhost",
+                "true",
+            ],
+            capture_output=True,
+            timeout=8,
+        )
+        return r.returncode == 0
+    except Exception:
+        return False
+
+
+@pytest.mark.skipif(
+    __import__("shutil").which("gpg") is None or not _ssh_localhost_works(),
+    reason="gpg + working passwordless ssh to localhost required",
+)
+class TestSSHRawRealRoundTrip:
+    """Definitive: a real raw+ssh://localhost backup with encrypt=gpg produces a
+    file on the (local)host that is genuine ciphertext and decrypts back."""
+
+    def test_raw_ssh_localhost_gpg_roundtrip(self, tmp_path, monkeypatch):
+        import subprocess
+
+        gnupghome = tmp_path / "gnupg"
+        gnupghome.mkdir(mode=0o700)
+        monkeypatch.setenv("GNUPGHOME", str(gnupghome))
+        subprocess.run(
+            [
+                "gpg",
+                "--batch",
+                "--pinentry-mode",
+                "loopback",
+                "--passphrase",
+                "",
+                "--quick-generate-key",
+                "R6 SSH <r6-ssh@example.invalid>",
+                "default",
+                "default",
+                "never",
+            ],
+            check=True,
+            capture_output=True,
+        )
+        recipient = "r6-ssh@example.invalid"
+
+        dest = tmp_path / "dest"
+        dest.mkdir()
+        from btrfs_backup_ng.endpoint import choose_endpoint
+
+        ep = choose_endpoint(
+            f"raw+ssh://localhost{dest}",
+            {"path": str(dest), "encrypt": "gpg", "gpg_recipient": recipient},
+        )
+        plaintext = b"RAW-SSH-STREAM-SECRET-0xdeadbeef"
+        feeder = subprocess.Popen(
+            ["printf", "%s", plaintext.decode()], stdout=subprocess.PIPE
+        )
+        proc = ep.receive(feeder.stdout, "r6snap")
+        if feeder.stdout:
+            feeder.stdout.close()
+        proc.wait()
+        feeder.wait()
+        assert proc.returncode == 0
+        out = next(p for p in dest.iterdir() if p.name.startswith("r6snap"))
+        data = out.read_bytes()
+        assert plaintext not in data, "raw+ssh output must NOT contain plaintext"
+        dec = subprocess.run(
+            ["gpg", "--batch", "--yes", "--decrypt", str(out)], capture_output=True
+        )
+        assert dec.stdout == plaintext
