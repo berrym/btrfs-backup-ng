@@ -108,6 +108,10 @@ class RawEndpoint(Endpoint):
         # Raw-specific configuration
         self.compress = config.get("compress")
         self.encrypt = config.get("encrypt")
+        # "none" (the documented string) and None both mean plaintext; normalize
+        # so callers threading encrypt="none" do not trip the method validation.
+        if self.encrypt == "none":
+            self.encrypt = None
         self.gpg_recipient = config.get("gpg_recipient")
         self.gpg_keyring = config.get("gpg_keyring")
         self.openssl_cipher = config.get("openssl_cipher", "aes-256-cbc")
