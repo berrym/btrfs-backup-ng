@@ -1243,6 +1243,47 @@ def _cleanup_partial_remote_subvolume(destination_endpoint, manifest) -> None:
         logger.debug("Partial remote-subvolume cleanup failed: %s", e)
 
 
+def _cleanup_partial_raw_stream(destination_endpoint) -> None:
+    """Best-effort removal of the exact raw stream file a failed raw transfer wrote.
+
+    Raw backups use a distinct timestamped filename each run, and a generic raw
+    backup carries no ``.meta`` sidecar (``finalize_receive`` is unused), so a
+    failed partial is NOT overwritten by the next run and cannot be distinguished
+    from a complete backup by "missing .meta". ``discover_raw_snapshots``' filename
+    fallback would therefore re-list the partial as a phantom backup.
+
+    Delete ONLY the exact ``_pending_metadata['stream_path']`` this run wrote --
+    never a name pattern or a "no .meta" heuristic (which would destroy a good
+    generic raw backup). Called only on the failure path where the transfer
+    pipeline exited nonzero, so the stream file is genuinely incomplete.
+    """
+    from ..endpoint.raw import RawEndpoint, SSHRawEndpoint
+
+    if not isinstance(destination_endpoint, RawEndpoint):
+        return
+    pending = getattr(destination_endpoint, "_pending_metadata", None)
+    if not pending:
+        return
+    stream_path = pending.get("stream_path")
+    if not stream_path:
+        return
+    try:
+        if isinstance(destination_endpoint, SSHRawEndpoint):
+            logger.warning(
+                "Cleaning up partial remote raw stream file at %s", stream_path
+            )
+            destination_endpoint._exec_remote_command(
+                ["rm", "-f", str(stream_path)], check=False
+            )
+        else:
+            p = Path(stream_path)
+            if p.exists():
+                logger.warning("Cleaning up partial raw stream file at %s", p)
+                p.unlink()
+    except Exception as e:
+        logger.debug("Partial raw-stream cleanup failed for %s: %s", stream_path, e)
+
+
 def _execute_transfers(
     source_endpoint,
     destination_endpoint,
@@ -1320,10 +1361,13 @@ def _execute_transfers(
             result.failed.append((best_snapshot, e))
             # Remove any partial received subvolume the failed transfer left at the
             # destination so the next run's skip-detection cannot mistake it for a
-            # completed backup (local btrfs only; SSH/raw clean their own).
+            # completed backup. Local btrfs and raw (whose distinct-per-run stream
+            # file would otherwise be re-listed as a phantom backup) are cleaned
+            # here; SSH btrfs endpoints clean their own partials during transfer.
             _cleanup_partial_local_subvolume(
                 destination_endpoint, best_snapshot.get_name()
             )
+            _cleanup_partial_raw_stream(destination_endpoint)
 
         to_transfer.remove(best_snapshot)
         logger.debug("%d snapshots left to transfer", len(to_transfer))
