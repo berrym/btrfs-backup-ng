@@ -133,6 +133,10 @@ class TargetConfig:
         compress: Compression algorithm for transfers (none, gzip, zstd, lz4)
         rate_limit: Bandwidth limit for transfers (e.g., "10M", "1G", "500K")
         require_mount: Require path to be an active mount point (safety check for external drives)
+        encrypt: Encryption method for raw targets only (none, gpg, openssl_enc)
+        gpg_recipient: GPG key recipient (required when encrypt=gpg)
+        gpg_keyring: Optional path to a GPG keyring file
+        openssl_cipher: OpenSSL cipher for encrypt=openssl_enc (default aes-256-cbc)
     """
 
     path: str
@@ -143,6 +147,13 @@ class TargetConfig:
     compress: str = "none"
     rate_limit: Optional[str] = None
     require_mount: bool = False
+    # Encryption applies only to raw (raw:// / raw+ssh://) targets. The loader
+    # rejects these on non-raw targets so a misplaced setting fails loudly rather
+    # than being silently ignored (which would write plaintext).
+    encrypt: str = "none"
+    gpg_recipient: Optional[str] = None
+    gpg_keyring: Optional[str] = None
+    openssl_cipher: Optional[str] = None
 
 
 @dataclass
@@ -196,7 +207,9 @@ class RawTargetConfig:
                 f"Invalid compression: {self.compress}. Valid: {sorted(valid_compress)}"
             )
 
-        valid_encrypt = {"none", "gpg"}
+        # openssl_enc is a supported method (the raw endpoint applies it, btrbk
+        # import emits it, and it is documented); it must not be rejected here.
+        valid_encrypt = {"none", "gpg", "openssl_enc"}
         if self.encrypt not in valid_encrypt:
             raise ValueError(
                 f"Invalid encryption: {self.encrypt}. Valid: {sorted(valid_encrypt)}"
