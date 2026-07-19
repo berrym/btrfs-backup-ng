@@ -154,3 +154,61 @@ class TestTransferThreadsEncryption:
         # never a silent plaintext transfer.
         rc, _captured = self._run(tmp_path, monkeypatch, drop_thread=True)
         assert rc != 0
+
+
+class TestSnapperBackupThreadsEncryption:
+    """`snapper backup --encrypt gpg` to a raw target must reach a real encrypting
+    endpoint (the third CLI dispatch path). _handle_backup uses local imports, so
+    patch at the source modules."""
+
+    def test_encryption_reaches_endpoint_via_snapper_backup(
+        self, tmp_path, monkeypatch
+    ):
+        from types import SimpleNamespace
+
+        import btrfs_backup_ng.cli.snapper_cmd as snap_mod
+        import btrfs_backup_ng.core.operations as ops_mod
+
+        dest = tmp_path / "dest"
+        dest.mkdir()
+
+        captured: dict = {}
+        real_choose = ep_pkg.choose_endpoint
+
+        def spy(spec, common_config=None, source=False, **kw):
+            ep = real_choose(spec, common_config, source=source, **kw)
+            captured["config"] = dict(common_config or {})
+            captured["endpoint"] = ep
+            return ep
+
+        monkeypatch.setattr(ep_pkg, "choose_endpoint", spy)
+
+        scanner = MagicMock()
+        scanner.get_config.return_value = MagicMock()  # config found
+        monkeypatch.setattr(snap_mod, "SnapperScanner", lambda: scanner)
+        # No real transfer.
+        monkeypatch.setattr(ops_mod, "sync_snapper_snapshots", lambda *a, **k: 0)
+
+        args = SimpleNamespace(
+            config="root",
+            target=f"raw://{dest}",
+            encrypt="gpg",
+            gpg_recipient="KEYID",
+            gpg_keyring=None,
+            openssl_cipher=None,
+            dry_run=False,
+            snapshot=None,
+            min_age="1h",
+            type=None,
+            ssh_key=None,
+            ssh_sudo=False,
+            compress=None,
+            rate_limit=None,
+            timestamp_format=None,
+        )
+
+        rc = snap_mod._handle_backup(args)
+
+        assert rc == 0
+        assert captured.get("config", {}).get("encrypt") == "gpg"
+        assert captured["endpoint"].encrypt == "gpg"
