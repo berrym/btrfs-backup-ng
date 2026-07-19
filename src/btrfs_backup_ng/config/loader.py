@@ -149,14 +149,36 @@ def _parse_target(data: dict[str, Any]) -> TargetConfig:
     if "path" not in data:
         raise ConfigError("Target missing required 'path' field")
 
+    path = data["path"]
+    is_raw = str(path).startswith(("raw://", "raw+ssh://"))
+
     # Validate compression algorithm
     compress = data.get("compress", "none")
     valid_compress = {"none", "gzip", "zstd", "lz4", "pigz", "lzop"}
     if compress not in valid_compress:
         raise ConfigError(f"Invalid compression: {compress}. Valid: {valid_compress}")
 
+    # Encryption is a raw-target-only feature. Validate at load time and FAIL
+    # CLOSED: a requested encryption that cannot be honored must refuse to run
+    # rather than silently writing plaintext to (often offsite) destinations.
+    encrypt = data.get("encrypt", "none")
+    gpg_recipient = data.get("gpg_recipient")
+    valid_encrypt = {"none", "gpg", "openssl_enc"}
+    if encrypt not in valid_encrypt:
+        raise ConfigError(
+            f"Invalid encryption '{encrypt}' for target {path}. "
+            f"Valid: {sorted(valid_encrypt)}"
+        )
+    if encrypt != "none" and not is_raw:
+        raise ConfigError(
+            f"Encryption (encrypt={encrypt!r}) is only supported on raw targets "
+            f"(raw:// / raw+ssh://), not {path}"
+        )
+    if encrypt == "gpg" and not gpg_recipient:
+        raise ConfigError(f"gpg_recipient is required when encrypt=gpg (target {path})")
+
     return TargetConfig(
-        path=data["path"],
+        path=path,
         ssh_sudo=data.get("ssh_sudo", False),
         ssh_port=data.get("ssh_port", 22),
         ssh_key=data.get("ssh_key"),
@@ -164,6 +186,10 @@ def _parse_target(data: dict[str, Any]) -> TargetConfig:
         compress=compress,
         rate_limit=data.get("rate_limit"),
         require_mount=data.get("require_mount", False),
+        encrypt=encrypt,
+        gpg_recipient=gpg_recipient,
+        gpg_keyring=data.get("gpg_keyring"),
+        openssl_cipher=data.get("openssl_cipher"),
     )
 
 
