@@ -9,9 +9,14 @@ encryption that cannot be honored refuses to load rather than writing plaintext.
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 
+from btrfs_backup_ng import __util__
+from btrfs_backup_ng.cli.common import thread_raw_encryption
 from btrfs_backup_ng.config.loader import ConfigError, _parse_target, load_config
+from btrfs_backup_ng.endpoint import assert_encryption_applied, choose_endpoint
 
 
 class TestParseTargetEncryption:
@@ -116,3 +121,56 @@ class TestLoadConfigRoundTrip:
         p = self._write(tmp_path, 'path = "raw:///mnt/backup/home"\nencrypt = "gpg"')
         with pytest.raises(ConfigError):
             load_config(str(p))
+
+
+class TestThreadRawEncryption:
+    def test_copies_all_encryption_fields(self):
+        target = SimpleNamespace(
+            encrypt="gpg",
+            gpg_recipient="KEYID",
+            gpg_keyring="/k.gpg",
+            openssl_cipher="aes-128-cbc",
+        )
+        kw: dict = {}
+        thread_raw_encryption(kw, target)
+        assert kw["encrypt"] == "gpg"
+        assert kw["gpg_recipient"] == "KEYID"
+        assert kw["gpg_keyring"] == "/k.gpg"
+        assert kw["openssl_cipher"] == "aes-128-cbc"
+
+
+class TestAssertEncryptionApplied:
+    def test_noop_when_not_requested(self):
+        # none / None must never raise (plaintext raw + all non-raw targets).
+        assert_encryption_applied("none", SimpleNamespace(encrypt=None))
+        assert_encryption_applied(None, SimpleNamespace(encrypt=None))
+
+    def test_noop_when_applied(self):
+        assert_encryption_applied("gpg", SimpleNamespace(encrypt="gpg"))
+
+    def test_raises_when_requested_but_endpoint_lacks_it(self):
+        # The whole point: encryption requested but not on the endpoint -> abort.
+        with pytest.raises(__util__.AbortError, match="PLAINTEXT"):
+            assert_encryption_applied("gpg", SimpleNamespace(encrypt=None))
+
+    def test_raises_when_endpoint_encrypt_is_none_string(self):
+        with pytest.raises(__util__.AbortError):
+            assert_encryption_applied("openssl_enc", SimpleNamespace(encrypt="none"))
+
+
+class TestChooseEndpointThreadsEncryption:
+    def test_raw_endpoint_receives_encryption_config(self):
+        # End-to-end through choose_endpoint's raw whitelist (incl. openssl_cipher).
+        ep = choose_endpoint(
+            "raw:///tmp/r6-nonexistent-dest",
+            {
+                "path": "raw:///tmp/r6-nonexistent-dest",
+                "encrypt": "gpg",
+                "gpg_recipient": "KEYID",
+                "gpg_keyring": "/k.gpg",
+                "openssl_cipher": "aes-128-cbc",
+            },
+        )
+        assert ep.encrypt == "gpg"
+        assert ep.gpg_recipient == "KEYID"
+        assert ep.openssl_cipher == "aes-128-cbc"

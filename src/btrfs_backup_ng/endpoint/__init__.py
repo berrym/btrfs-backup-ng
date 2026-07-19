@@ -10,6 +10,31 @@ from .shell import ShellEndpoint
 from .ssh import SSHEndpoint  # type: ignore[attr-defined]
 
 
+def assert_encryption_applied(requested_encrypt, endpoint) -> None:
+    """Fail closed if requested encryption did not reach the destination endpoint.
+
+    Defense-in-depth for the raw-target plaintext bug: even if some config-threading
+    site is missed or a key is mistyped, refuse to write rather than silently
+    producing a plaintext backup when the user asked for encryption. Call this
+    after building a destination endpoint and before transferring.
+
+    Raises:
+        AbortError: if ``requested_encrypt`` is a real method (gpg/openssl_enc)
+            but the endpoint did not receive it.
+    """
+    if requested_encrypt in (None, "none"):
+        return
+    effective = getattr(endpoint, "encrypt", None)
+    if effective in (None, "none"):
+        from .. import __util__
+
+        raise __util__.AbortError(
+            f"Encryption '{requested_encrypt}' was requested but the destination "
+            f"endpoint did not receive it (this would write a PLAINTEXT backup); "
+            f"aborting instead of writing unencrypted data."
+        )
+
+
 def choose_endpoint(spec, common_config=None, source=False, excluded_types=()):
     """
     Chooses a suitable endpoint based on the specification given.
@@ -79,7 +104,13 @@ def choose_endpoint(spec, common_config=None, source=False, excluded_types=()):
             logger.debug("Parsed raw URL: path=%s", parsed.path)
 
         # Raw-specific config from common_config
-        for key in ("compress", "encrypt", "gpg_recipient", "gpg_keyring"):
+        for key in (
+            "compress",
+            "encrypt",
+            "gpg_recipient",
+            "gpg_keyring",
+            "openssl_cipher",
+        ):
             if common_config is not None and key in common_config:
                 config[key] = common_config[key]
 

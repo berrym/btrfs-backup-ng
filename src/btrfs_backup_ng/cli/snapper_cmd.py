@@ -237,7 +237,18 @@ def _handle_backup(args: argparse.Namespace) -> int:
     if getattr(args, "ssh_key", None):
         endpoint_config["ssh_identity_file"] = args.ssh_key
         endpoint_config["ssh_key"] = args.ssh_key
+    # Encryption for raw targets. Threaded from the CLI flags; fail closed below so
+    # this path can never silently write plaintext when encryption was requested.
+    encrypt = getattr(args, "encrypt", None) or "none"
+    if encrypt != "none":
+        endpoint_config["encrypt"] = encrypt
+        endpoint_config["gpg_recipient"] = getattr(args, "gpg_recipient", None)
+        endpoint_config["gpg_keyring"] = getattr(args, "gpg_keyring", None)
+        endpoint_config["openssl_cipher"] = getattr(args, "openssl_cipher", None)
     destination_endpoint = choose_endpoint(target_path, endpoint_config)
+    from ..endpoint import assert_encryption_applied
+
+    assert_encryption_applied(encrypt, destination_endpoint)
 
     # Determine if this is a local or remote transfer
     is_remote = getattr(destination_endpoint, "_is_remote", False)
