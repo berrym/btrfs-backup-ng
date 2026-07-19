@@ -8,8 +8,11 @@ deleted (the R1 false-negative guard, extended to the local/standard path).
 
 from __future__ import annotations
 
+import io
 from types import SimpleNamespace
 from unittest.mock import MagicMock
+
+import pytest
 
 import btrfs_backup_ng.core.operations as ops
 from btrfs_backup_ng import __util__
@@ -33,7 +36,6 @@ class TestCleanupPartialLocalSubvolume:
     def test_deletes_exact_local_path_when_present(self, monkeypatch, tmp_path):
         (tmp_path / "snap-1").mkdir()  # the partial artifact this failed run left
         ep = self._local_endpoint(tmp_path)
-        snap = _fake_snap("snap-1")
 
         calls: list[list[str]] = []
 
@@ -42,7 +44,7 @@ class TestCleanupPartialLocalSubvolume:
             return SimpleNamespace(returncode=0)
 
         monkeypatch.setattr(ops.subprocess, "run", fake_run)
-        ops._cleanup_partial_local_subvolume(ep, snap)
+        ops._cleanup_partial_local_subvolume(ep, "snap-1")
 
         deletes = [c for c in calls if c[-3:-1] == ["subvolume", "delete"]]
         assert deletes, "expected a btrfs subvolume delete of the partial"
@@ -50,10 +52,9 @@ class TestCleanupPartialLocalSubvolume:
 
     def test_noop_when_nothing_present(self, monkeypatch, tmp_path):
         ep = self._local_endpoint(tmp_path)
-        snap = _fake_snap("absent")
         called: list[int] = []
         monkeypatch.setattr(ops.subprocess, "run", lambda *a, **k: called.append(1))
-        ops._cleanup_partial_local_subvolume(ep, snap)
+        ops._cleanup_partial_local_subvolume(ep, "absent")
         assert not called
 
     def test_skips_remote_endpoint(self, monkeypatch, tmp_path):
@@ -61,10 +62,9 @@ class TestCleanupPartialLocalSubvolume:
         ep = MagicMock()
         ep._is_remote = True  # SSH cleans its own partials during the transfer
         ep.config = {"path": str(tmp_path)}
-        snap = _fake_snap("snap-1")
         called: list[int] = []
         monkeypatch.setattr(ops.subprocess, "run", lambda *a, **k: called.append(1))
-        ops._cleanup_partial_local_subvolume(ep, snap)
+        ops._cleanup_partial_local_subvolume(ep, "snap-1")
         assert not called
 
     def test_skips_raw_endpoint(self, monkeypatch, tmp_path):
@@ -74,10 +74,9 @@ class TestCleanupPartialLocalSubvolume:
         ep = RawEndpoint.__new__(RawEndpoint)
         ep._is_remote = False  # local raw: handled by the raw cleanup path, not here
         ep.config = {"path": str(tmp_path)}
-        snap = _fake_snap("snap-1")
         called: list[int] = []
         monkeypatch.setattr(ops.subprocess, "run", lambda *a, **k: called.append(1))
-        ops._cleanup_partial_local_subvolume(ep, snap)
+        ops._cleanup_partial_local_subvolume(ep, "snap-1")
         assert not called
 
 
@@ -100,8 +99,8 @@ class TestExecuteTransfersCleansPartialOnFailure:
         ops._execute_transfers(src, dst, [snap], [], [snap], True, {})
 
         spy.assert_called_once()
-        # cleanup targets the exact snapshot that failed
-        assert spy.call_args[0][1] is snap
+        # cleanup targets the exact received name of the snapshot that failed
+        assert spy.call_args[0][1] == "s1"
 
     def test_success_does_not_trigger_cleanup(self, monkeypatch):
         snap = _fake_snap("s1")
@@ -116,3 +115,50 @@ class TestExecuteTransfersCleansPartialOnFailure:
 
         ops._execute_transfers(src, dst, [snap], [], [snap], True, {})
         spy.assert_not_called()
+
+
+class TestChunkedPartialCleanup:
+    def test_local_chunked_failure_cleans_exact_partial(self, monkeypatch):
+        manifest = SimpleNamespace(
+            snapshot_path="/src/snapshot",
+            snapshot_name="snap",
+            chunk_count=1,
+            chunks=[SimpleNamespace(sequence=0)],
+        )
+        dst = MagicMock()
+        dst._is_remote = False
+        recv = MagicMock()
+        recv.wait.return_value = 1  # btrfs receive fails
+        recv.stderr = io.BytesIO(b"boom")
+        dst.receive.return_value = recv
+
+        mgr = MagicMock()
+        reader = MagicMock()
+        reader.pipe_to_process.return_value = 100
+        mgr.create_reassembly_reader.return_value = reader
+
+        spy = MagicMock()
+        monkeypatch.setattr(ops, "_cleanup_partial_local_subvolume", spy)
+
+        with pytest.raises(__util__.SnapshotTransferError):
+            ops._transfer_chunks_local(manifest, dst, mgr, {})
+
+        spy.assert_called_once()
+        # cleanup uses the source basename, NOT manifest.snapshot_name
+        assert spy.call_args[0][1] == "snapshot"
+
+    def test_remote_cleanup_calls_endpoint_cleaner(self):
+        manifest = SimpleNamespace(snapshot_path="/src/snapshot")
+        ep = MagicMock()
+        ep.config = {"path": "/remote/dest"}
+        ops._cleanup_partial_remote_subvolume(ep, manifest)
+        ep._cleanup_partial_subvolume.assert_called_once_with(
+            "/remote/dest", "snapshot"
+        )
+
+    def test_remote_cleanup_noop_without_cleaner(self):
+        manifest = SimpleNamespace(snapshot_path="/src/snapshot")
+        ep = MagicMock(spec=["config"])  # no _cleanup_partial_subvolume
+        ep.config = {"path": "/remote/dest"}
+        # must not raise
+        ops._cleanup_partial_remote_subvolume(ep, manifest)
