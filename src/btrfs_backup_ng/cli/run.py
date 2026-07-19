@@ -28,7 +28,12 @@ from ..notifications import (
     NotificationConfig as NotifConfig,
 )
 from ..transaction import set_transaction_log
-from .common import get_log_level, get_timestamp_format, should_show_progress
+from .common import (
+    get_log_level,
+    get_timestamp_format,
+    should_show_progress,
+    thread_raw_encryption,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -352,11 +357,13 @@ def _backup_volume(
             if target.ssh_key:
                 dest_kwargs["ssh_identity_file"] = target.ssh_key
 
+            thread_raw_encryption(dest_kwargs, target)
             dest_endpoint = endpoint.choose_endpoint(
                 target.path,
                 dest_kwargs,
                 source=False,
             )
+            endpoint.assert_encryption_applied(target.encrypt, dest_endpoint)
             dest_endpoint.prepare()
             # Store endpoint with its target config for compression/throttle options
             destination_endpoints.append((dest_endpoint, target))
@@ -532,9 +539,11 @@ def _backup_snapper_volume(
             if target.ssh_key:
                 snapper_endpoint_config["ssh_identity_file"] = target.ssh_key
                 snapper_endpoint_config["ssh_key"] = target.ssh_key
+            thread_raw_encryption(snapper_endpoint_config, target)
             destination_endpoint = endpoint.choose_endpoint(
                 target.path, snapper_endpoint_config
             )
+            endpoint.assert_encryption_applied(target.encrypt, destination_endpoint)
 
             # Sync snapper snapshots to this target
             logger.info("Syncing snapper config '%s' to %s", config_name, target.path)

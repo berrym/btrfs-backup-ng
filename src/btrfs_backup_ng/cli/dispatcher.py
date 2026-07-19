@@ -1153,6 +1153,27 @@ Examples:
         help="strftime format for the timestamp in backup names "
         "(default: %%Y%%m%%d-%%H%%M%%S)",
     )
+    snapper_backup.add_argument(
+        "--encrypt",
+        metavar="METHOD",
+        choices=["none", "gpg", "openssl_enc"],
+        help="Encrypt the backup (raw:// / raw+ssh:// targets only)",
+    )
+    snapper_backup.add_argument(
+        "--gpg-recipient",
+        metavar="KEYID",
+        help="GPG recipient key (required with --encrypt gpg)",
+    )
+    snapper_backup.add_argument(
+        "--gpg-keyring",
+        metavar="PATH",
+        help="Optional GPG keyring file",
+    )
+    snapper_backup.add_argument(
+        "--openssl-cipher",
+        metavar="CIPHER",
+        help="OpenSSL cipher for --encrypt openssl_enc (default aes-256-cbc)",
+    )
     add_progress_args(snapper_backup)
 
     # snapper status

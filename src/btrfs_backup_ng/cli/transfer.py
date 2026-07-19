@@ -9,7 +9,7 @@ from .. import __util__, endpoint
 from ..__logger__ import add_file_handler, create_logger
 from ..config import ConfigError, find_config_file, load_config
 from ..core.operations import sync_snapshots
-from .common import get_log_level, get_timestamp_format
+from .common import get_log_level, get_timestamp_format, thread_raw_encryption
 
 logger = logging.getLogger(__name__)
 
@@ -158,11 +158,13 @@ def execute_transfer(args: argparse.Namespace) -> int:
                     if target.ssh_key:
                         dest_kwargs["ssh_identity_file"] = target.ssh_key
 
+                    thread_raw_encryption(dest_kwargs, target)
                     dest_endpoint = endpoint.choose_endpoint(
                         target.path,
                         dest_kwargs,
                         source=False,
                     )
+                    endpoint.assert_encryption_applied(target.encrypt, dest_endpoint)
                     dest_endpoint.prepare()
 
                     # Build transfer options with compression and throttling

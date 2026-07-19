@@ -184,3 +184,19 @@ def resolve_timestamp_format(explicit: str | None = None) -> str:
     except Exception:
         pass
     return __util__.DATE_FORMAT
+
+
+def thread_raw_encryption(kwargs: dict, target) -> None:
+    """Copy a target's raw-encryption settings into an endpoint config dict.
+
+    Ensures ``choose_endpoint`` can pass encrypt/gpg_recipient/gpg_keyring/
+    openssl_cipher to a raw endpoint. Without this the fields are dropped and a
+    raw target configured for encryption writes plaintext. Harmless for non-raw
+    targets: the values default to none/None and are only consumed by raw
+    endpoints. Pair with ``endpoint.assert_encryption_applied`` after building the
+    endpoint for a fail-closed guarantee.
+    """
+    kwargs["encrypt"] = getattr(target, "encrypt", "none")
+    kwargs["gpg_recipient"] = getattr(target, "gpg_recipient", None)
+    kwargs["gpg_keyring"] = getattr(target, "gpg_keyring", None)
+    kwargs["openssl_cipher"] = getattr(target, "openssl_cipher", None)
