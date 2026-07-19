@@ -3411,6 +3411,10 @@ print(json.dumps(result))
         )
 
         dest_path = self._normalize_path(self.config["path"])
+        # btrfs receive names the received subvolume after the source basename
+        # (== snapshot_name for native, "snapshot" for snapper). Compute it up front
+        # so partial-cleanup on the failure paths can target the exact path.
+        received_name = Path(manifest.snapshot_path).name
         use_sudo = self.config.get("ssh_sudo", False)
         passwordless = self.config.get("passwordless", False) or self.config.get(
             "passwordless_sudo_available", False
@@ -3470,6 +3474,7 @@ print(json.dumps(result))
                         chunks_sent,
                         stderr,
                     )
+                    self._cleanup_partial_subvolume(dest_path, received_name)
                     return False
 
                 # Write chunk data
@@ -3502,6 +3507,7 @@ print(json.dumps(result))
             except subprocess.TimeoutExpired:
                 logger.error("Timeout waiting for SSH receive to complete")
                 receive_process.kill()
+                self._cleanup_partial_subvolume(dest_path, received_name)
                 return False
 
             if return_code != 0:
@@ -3515,6 +3521,7 @@ print(json.dumps(result))
                     return_code,
                     stderr,
                 )
+                self._cleanup_partial_subvolume(dest_path, received_name)
                 return False
 
             elapsed = time.time() - start_time
@@ -3527,15 +3534,19 @@ print(json.dumps(result))
                 rate_mb,
             )
 
-            # Verify the snapshot exists. btrfs receive names the received subvolume
-            # after the source basename (== snapshot_name for native, "snapshot" for
-            # snapper), so verify by that real name, consistent with send_receive.
-            received_name = Path(manifest.snapshot_path).name
+            # Secondary confirmation only after the receive exited 0. Because the
+            # receive succeeded, a failed verification is inconclusive: report
+            # failure but do NOT delete the received subvolume (it may be a good
+            # backup and only the verify step failed).
             if self._verify_snapshot_exists(dest_path, received_name):
                 logger.info("Snapshot verified on remote host")
                 return True
             else:
-                logger.error("Snapshot verification failed after chunked transfer")
+                logger.error(
+                    "Chunked transfer verification inconclusive - leaving received "
+                    "subvolume in place at %s for reconciliation",
+                    dest_path,
+                )
                 return False
 
         except Exception as e:
@@ -3544,6 +3555,8 @@ print(json.dumps(result))
                 receive_process.kill()
             except Exception:
                 pass
+            # The stream did not complete normally: remove any partial subvolume.
+            self._cleanup_partial_subvolume(dest_path, received_name)
             return False
 
     def _monitor_transfer_progress(

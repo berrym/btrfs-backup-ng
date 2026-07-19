@@ -13,6 +13,7 @@ fail. They guard the SSH point-of-truth layer (commit A1).
 
 from __future__ import annotations
 
+import io
 import time
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -385,5 +386,59 @@ class TestDirectTransferCleanupGating:
         result, cleanup = self._run(
             monkeypatch, monitor_result=True, send_rc=0, recv_rc=0
         )
+        assert result is True
+        cleanup.assert_not_called()
+
+
+class TestReceiveChunkedCleanupGating:
+    """`receive_chunked` cleans a partial only when the receive genuinely failed.
+
+    Same false-negative discipline as the direct SSH path: a nonzero receive is
+    cleaned, but a receive that exited 0 followed by an inconclusive verification
+    must NOT delete the received subvolume.
+    """
+
+    @staticmethod
+    def _run(monkeypatch, *, return_code, verify_result):
+        ep = _bare_endpoint({"path": "/d/5"})
+        ep._normalize_path = lambda p: p  # type: ignore[method-assign]
+        ep.ssh_manager = SimpleNamespace(  # type: ignore[attr-defined]
+            get_ssh_base_cmd=lambda force_tty=False: ["ssh", "host"]
+        )
+        ep._verify_snapshot_exists = MagicMock(return_value=verify_result)  # type: ignore[method-assign]
+        ep._cleanup_partial_subvolume = MagicMock()  # type: ignore[method-assign]
+
+        recv = MagicMock()
+        recv.stdin = MagicMock()
+        recv.stderr = io.BytesIO(b"err")
+        recv.poll.return_value = None  # alive during the streaming loop
+        recv.wait.return_value = return_code
+        recv.returncode = return_code
+        monkeypatch.setattr(ssh_mod.subprocess, "Popen", lambda *a, **k: recv)
+
+        manifest = SimpleNamespace(
+            snapshot_name="snap",
+            snapshot_path="/src/snapshot",
+            chunk_count=1,
+        )
+        reader = MagicMock()
+        reader.read_chunks.return_value = iter([b"data"])
+
+        result = ep.receive_chunked(reader, manifest, show_progress=False, timeout=3600)
+        return result, ep._cleanup_partial_subvolume
+
+    def test_nonzero_receive_cleans_up(self, monkeypatch):
+        result, cleanup = self._run(monkeypatch, return_code=1, verify_result=True)
+        assert result is False
+        cleanup.assert_called_once()
+
+    def test_inconclusive_verify_after_good_receive_keeps_backup(self, monkeypatch):
+        # receive exited 0 but verification failed -> inconclusive -> keep artifact.
+        result, cleanup = self._run(monkeypatch, return_code=0, verify_result=False)
+        assert result is False
+        cleanup.assert_not_called()
+
+    def test_success_returns_true_without_cleanup(self, monkeypatch):
+        result, cleanup = self._run(monkeypatch, return_code=0, verify_result=True)
         assert result is True
         cleanup.assert_not_called()
