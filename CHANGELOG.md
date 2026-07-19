@@ -7,7 +7,60 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.8.4] - 2026-07-19
 
+### Security
+
+#### CRITICAL: raw-target encryption was silently ignored — backups written in plaintext
+
+A raw target (`raw://` or `raw+ssh://`) configured with `encrypt = "gpg"` or
+`encrypt = "openssl_enc"` silently wrote **unencrypted** backups. The config
+loader dropped the `encrypt` / `gpg_recipient` / `gpg_keyring` / `openssl_cipher`
+settings, so the raw endpoint received no encryption method and produced plaintext
+stream files — with no error and no warning. This affects all prior releases that
+advertised raw-target encryption.
+
+- **Impact:** anyone who configured GPG or OpenSSL encryption for a raw target has
+  backups stored in cleartext, potentially on offsite or untrusted destinations.
+- **Fix:** the loader now carries the encryption settings and threads them to the
+  endpoint, and the entire path **fails closed** — if encryption is requested but
+  cannot be applied, the backup aborts with an error instead of writing plaintext.
+  Encryption is validated at config load (`encrypt = "gpg"` requires a
+  `gpg_recipient`; encryption is rejected on non-raw targets). Verified end to end
+  against real gpg and openssl: the output is genuine, decryptable ciphertext that
+  contains no plaintext.
+- **Action required — the fix protects future backups only.** It cannot
+  retroactively encrypt, nor un-expose, backups already written in cleartext. If
+  you used raw-target encryption:
+  - Treat existing raw "encrypted" backups as **cleartext that may already have
+    been exposed** — they may have been replicated, synced to cloud storage,
+    snapshotted by the destination filesystem, or written to media that cannot be
+    reliably wiped. At-rest re-encryption reduces future exposure but cannot undo
+    prior exposure.
+  - Where practical, **recreate the affected backups from source** with this
+    version.
+  - A utility to encrypt existing raw backups in place (and securely remove the
+    plaintext) is planned for the next release, for cases where recreating from
+    source is impractical — with the same caveat that prior exposure cannot be
+    undone.
+
 ### Fixed
+
+#### Failed transfers can no longer be reported as successful backups
+- Transfer success is now determined by a verified result — every process must
+  exit 0 and a post-completion check must confirm the received subvolume/stream —
+  instead of by subvolume existence or a warn-only exit code. A failed or partial
+  `btrfs send`/`receive` (SSH, raw, and chunked paths) is no longer reported as
+  success with a zero exit code; the orchestration layer raises on any failure so
+  `run`/`transfer`/`snapper backup`/the legacy path exit non-zero and notifications
+  reflect the real outcome. Partial-subvolume cleanup on failure is gated so a good
+  backup is never deleted on an inconclusive verification.
+
+#### Failed transfers no longer poison future runs
+- A killed or failed transfer left a partial subvolume (local/SSH/chunked) or raw
+  stream file at the destination that the next run's skip-detection mistook for a
+  completed backup, silently skipping the real transfer. Partials are now removed
+  by their exact path, on the failure path only. The standard receive timeout was
+  raised from 300s to match the 3600s send timeout so a legitimately slow receive
+  is not killed into a partial.
 
 #### timestamp_format honored across all commands
 - The configured `timestamp_format` is now applied consistently everywhere a snapshot name is generated or parsed, completing the work started in 0.8.3:
