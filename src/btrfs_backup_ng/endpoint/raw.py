@@ -46,6 +46,34 @@ OPENSSL_PASSPHRASE_ENV = "BTRFS_BACKUP_PASSPHRASE"
 BTRBK_PASSPHRASE_ENV = "BTRBK_PASSPHRASE"
 
 
+def _popen_pipeline_pipefail(shell_cmd: str, **popen_kwargs: Any) -> subprocess.Popen:
+    """Run a multi-stage shell pipeline with ``pipefail``.
+
+    Without ``pipefail`` a shell pipeline's exit status is that of its LAST stage
+    only, so a failure of an upstream stage -- ``btrfs send`` dying, or a
+    compressor/``gpg`` erroring mid-stream -- is masked by the final redirect/ssh
+    exiting 0, and a truncated or empty stream file is reported as a successful
+    backup. ``set -o pipefail`` makes any stage's failure fail the whole pipeline
+    so the returncode the caller checks is honest.
+
+    Uses bash (which supports ``pipefail``); falls back to plain ``sh`` with a
+    warning only when bash is unavailable.
+    """
+    bash_path = shutil.which("bash")
+    if bash_path:
+        return subprocess.Popen(
+            "set -o pipefail; " + shell_cmd,
+            shell=True,
+            executable=bash_path,
+            **popen_kwargs,
+        )
+    logger.warning(
+        "bash not found; running raw pipeline without pipefail (a mid-pipe "
+        "failure may be masked and produce a truncated backup)"
+    )
+    return subprocess.Popen(shell_cmd, shell=True, **popen_kwargs)
+
+
 class RawEndpoint(Endpoint):
     """Endpoint that writes btrfs send streams to files.
 
@@ -317,9 +345,8 @@ class RawEndpoint(Endpoint):
 
         logger.debug("Executing pipeline: %s", shell_cmd)
 
-        proc = subprocess.Popen(
+        proc = _popen_pipeline_pipefail(
             shell_cmd,
-            shell=True,
             stdin=stdin,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
@@ -718,9 +745,8 @@ class SSHRawEndpoint(RawEndpoint):
 
         logger.debug("Executing SSH pipeline: %s", shell_cmd)
 
-        proc = subprocess.Popen(
+        proc = _popen_pipeline_pipefail(
             shell_cmd,
-            shell=True,
             stdin=stdin,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
