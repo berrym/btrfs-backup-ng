@@ -573,6 +573,9 @@ def _transfer_chunks_local(
 
     except subprocess.TimeoutExpired:
         receive_process.kill()
+        _cleanup_partial_local_subvolume(
+            destination_endpoint, Path(manifest.snapshot_path).name
+        )
         raise __util__.SnapshotTransferError("Timeout waiting for btrfs receive")
 
     except Exception:
@@ -580,6 +583,9 @@ def _transfer_chunks_local(
             receive_process.kill()
         except Exception:
             pass
+        _cleanup_partial_local_subvolume(
+            destination_endpoint, Path(manifest.snapshot_path).name
+        )
         raise
 
 
@@ -688,6 +694,7 @@ def _transfer_chunks_ssh(
 
         except subprocess.TimeoutExpired:
             receive_process.kill()
+            _cleanup_partial_remote_subvolume(destination_endpoint, manifest)
             raise __util__.SnapshotTransferError(
                 "Timeout waiting for SSH btrfs receive"
             )
@@ -697,6 +704,7 @@ def _transfer_chunks_ssh(
                 receive_process.kill()
             except Exception:
                 pass
+            _cleanup_partial_remote_subvolume(destination_endpoint, manifest)
             # Re-raise with context about which chunk failed
             if chunks_sent < len(manifest.chunks):
                 chunk = manifest.chunks[chunks_sent]
@@ -1166,14 +1174,14 @@ def sync_snapshots(
     return result
 
 
-def _cleanup_partial_local_subvolume(destination_endpoint, snapshot) -> None:
+def _cleanup_partial_local_subvolume(destination_endpoint, name: str) -> None:
     """Best-effort removal of a partial received subvolume after a failed transfer.
 
     A killed or failed local ``btrfs receive`` leaves an incomplete subvolume at
-    ``{dest}/{name}`` (named after the source basename, == ``snapshot.get_name()``),
-    which the next run's skip-detection would enumerate and mistake for a completed
-    backup -- silently skipping the real transfer. Remove it so a re-run starts
-    clean.
+    ``{dest}/{name}`` (``name`` is the received subvolume's on-disk name, i.e. the
+    SOURCE basename), which the next run's skip-detection would enumerate and
+    mistake for a completed backup -- silently skipping the real transfer. Remove
+    it so a re-run starts clean.
 
     Safety (the received subvolume is never a good backup here):
       * only called on the failure path, so a successful transfer never triggers it;
@@ -1195,7 +1203,6 @@ def _cleanup_partial_local_subvolume(destination_endpoint, snapshot) -> None:
     if isinstance(destination_endpoint, RawEndpoint):
         return
 
-    name = snapshot.get_name()
     base = str(destination_endpoint.config["path"]).rstrip("/")
     expected = f"{base}/{name}"
     try:
@@ -1214,6 +1221,26 @@ def _cleanup_partial_local_subvolume(destination_endpoint, snapshot) -> None:
         logger.debug(
             "Partial local-subvolume cleanup failed for %s: %s", expected, cleanup_e
         )
+
+
+def _cleanup_partial_remote_subvolume(destination_endpoint, manifest) -> None:
+    """Best-effort removal of a partial REMOTE subvolume after a failed chunked
+    SSH transfer, using the endpoint's own exact-path cleaner when present.
+
+    Scoped to the exact received path (``{dest}/{source_basename}``) by the
+    underlying ``_cleanup_partial_subvolume``, which guards on existence and never
+    searches by name -- so a good backup is never deleted. A no-op for endpoints
+    that do not expose the cleaner.
+    """
+    cleaner = getattr(destination_endpoint, "_cleanup_partial_subvolume", None)
+    if cleaner is None:
+        return
+    try:
+        dest_path = str(destination_endpoint.config["path"])
+        received_name = Path(manifest.snapshot_path).name
+        cleaner(dest_path, received_name)
+    except Exception as e:
+        logger.debug("Partial remote-subvolume cleanup failed: %s", e)
 
 
 def _execute_transfers(
@@ -1294,7 +1321,9 @@ def _execute_transfers(
             # Remove any partial received subvolume the failed transfer left at the
             # destination so the next run's skip-detection cannot mistake it for a
             # completed backup (local btrfs only; SSH/raw clean their own).
-            _cleanup_partial_local_subvolume(destination_endpoint, best_snapshot)
+            _cleanup_partial_local_subvolume(
+                destination_endpoint, best_snapshot.get_name()
+            )
 
         to_transfer.remove(best_snapshot)
         logger.debug("%d snapshots left to transfer", len(to_transfer))
