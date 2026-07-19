@@ -162,3 +162,56 @@ class TestChunkedPartialCleanup:
         ep.config = {"path": "/remote/dest"}
         # must not raise
         ops._cleanup_partial_remote_subvolume(ep, manifest)
+
+
+class TestRawPartialCleanup:
+    """A failed raw transfer's partial stream file must be removed by its EXACT
+    path (never by a 'missing .meta' heuristic -- a complete generic raw backup
+    also lacks .meta, so that would delete good backups)."""
+
+    def test_local_raw_deletes_exact_stream_file(self, tmp_path):
+        from btrfs_backup_ng.endpoint.raw import RawEndpoint
+
+        f = tmp_path / "host-20260719.btrfs"
+        f.write_bytes(b"partial stream")
+        ep = RawEndpoint.__new__(RawEndpoint)
+        ep._pending_metadata = {"stream_path": f}
+        ops._cleanup_partial_raw_stream(ep)
+        assert not f.exists()
+
+    def test_ssh_raw_deletes_via_remote_command(self):
+        from btrfs_backup_ng.endpoint.raw import SSHRawEndpoint
+
+        ep = SSHRawEndpoint.__new__(SSHRawEndpoint)
+        ep._pending_metadata = {"stream_path": "/remote/host-20260719.btrfs"}
+        ep._exec_remote_command = MagicMock()
+        ops._cleanup_partial_raw_stream(ep)
+        ep._exec_remote_command.assert_called_once_with(
+            ["rm", "-f", "/remote/host-20260719.btrfs"], check=False
+        )
+
+    def test_non_raw_endpoint_is_noop(self):
+        ep = MagicMock()  # not a RawEndpoint
+        ops._cleanup_partial_raw_stream(ep)  # must not raise
+
+    def test_no_pending_metadata_is_noop(self):
+        from btrfs_backup_ng.endpoint.raw import RawEndpoint
+
+        ep = RawEndpoint.__new__(RawEndpoint)  # no _pending_metadata set
+        ops._cleanup_partial_raw_stream(ep)  # must not raise
+
+    def test_funnel_cleans_raw_stream_on_failure(self, monkeypatch):
+        snap = _fake_snap("s1")
+        src = MagicMock()
+        dst = MagicMock()
+        dst.get_id.return_value = "d"
+        monkeypatch.setattr(
+            ops,
+            "send_snapshot",
+            MagicMock(side_effect=__util__.SnapshotTransferError("boom")),
+        )
+        monkeypatch.setattr(ops, "_cleanup_partial_local_subvolume", MagicMock())
+        spy = MagicMock()
+        monkeypatch.setattr(ops, "_cleanup_partial_raw_stream", spy)
+        ops._execute_transfers(src, dst, [snap], [], [snap], True, {})
+        spy.assert_called_once_with(dst)
