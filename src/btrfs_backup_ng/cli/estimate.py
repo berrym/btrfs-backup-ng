@@ -27,7 +27,12 @@ from ..core.space import (
     check_space_availability,
     format_space_check,
 )
-from .common import get_fs_checks_mode, get_log_level, get_timestamp_format
+from .common import (
+    get_fs_checks_mode,
+    get_log_level,
+    get_timestamp_format,
+    resolve_timestamp_format,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -195,11 +200,15 @@ def _estimate_direct(args: argparse.Namespace, source: str, destination: str) ->
 
     # Prepare source endpoint
     fs_checks_mode = get_fs_checks_mode(args)
+    # Thread timestamp_format so custom-named snapshots are counted, not skipped
+    # (which would undercount and hide an existing incremental parent).
+    ts_fmt = resolve_timestamp_format(getattr(args, "timestamp_format", None))
 
     try:
         source_kwargs = {
             "snap_prefix": prefix,
             "fs_checks": fs_checks_mode,
+            "timestamp_format": ts_fmt,
         }
         if not source.startswith("ssh://"):
             source_kwargs["path"] = Path(source).resolve()
@@ -219,6 +228,7 @@ def _estimate_direct(args: argparse.Namespace, source: str, destination: str) ->
         dest_kwargs = {
             "snap_prefix": prefix,
             "fs_checks": fs_checks_mode,
+            "timestamp_format": ts_fmt,
         }
         if ssh_sudo:
             dest_kwargs["ssh_sudo"] = True

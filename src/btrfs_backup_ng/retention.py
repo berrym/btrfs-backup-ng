@@ -100,14 +100,19 @@ class SnapshotInfo:
     keep_reason: str = ""
 
 
-def extract_timestamp(snapshot_name: str, prefix: str = "") -> datetime | None:
+def extract_timestamp(
+    snapshot_name: str, prefix: str = "", preferred_fmt: str | None = None
+) -> datetime | None:
     """Extract timestamp from snapshot name.
 
-    Tries multiple common timestamp formats.
+    ``preferred_fmt`` (the configured ``timestamp_format``) is tried first when
+    given, so snapshots named with a custom format parse correctly; a list of
+    common formats is tried as a fallback.
 
     Args:
         snapshot_name: Name of the snapshot
         prefix: Optional prefix to strip
+        preferred_fmt: Configured timestamp_format to try before the fallbacks
 
     Returns:
         datetime if parsed successfully, None otherwise
@@ -116,7 +121,7 @@ def extract_timestamp(snapshot_name: str, prefix: str = "") -> datetime | None:
     if prefix and name.startswith(prefix):
         name = name[len(prefix) :]
 
-    # Common timestamp formats
+    # Common timestamp formats (fallbacks).
     formats = [
         "%Y%m%d-%H%M%S",  # 20240115-143022
         "%Y-%m-%d_%H%M%S",  # 2024-01-15_143022
@@ -124,6 +129,9 @@ def extract_timestamp(snapshot_name: str, prefix: str = "") -> datetime | None:
         "%Y%m%d%H%M%S",  # 20240115143022
         "%Y-%m-%dT%H:%M:%S",  # 2024-01-15T14:30:22
     ]
+    # Configured format takes precedence so custom-named snapshots parse.
+    if preferred_fmt and preferred_fmt not in formats:
+        formats.insert(0, preferred_fmt)
 
     for fmt in formats:
         try:
@@ -184,6 +192,7 @@ def apply_retention(
     get_name: Callable[[Any], str] | None = None,
     prefix: str = "",
     now: datetime | None = None,
+    timestamp_format: str | None = None,
 ) -> tuple[list, list]:
     """Apply retention policy to a list of snapshots.
 
@@ -193,6 +202,8 @@ def apply_retention(
         get_name: Function to get name from snapshot (default: str(snapshot))
         prefix: Snapshot name prefix to strip for timestamp parsing
         now: Current time (default: datetime.now())
+        timestamp_format: Configured timestamp_format, tried first when parsing
+            snapshot times so custom-named snapshots are bucketed (not kept forever)
 
     Returns:
         Tuple of (snapshots_to_keep, snapshots_to_delete)
@@ -219,7 +230,7 @@ def apply_retention(
     snapshot_infos: list[SnapshotInfo] = []
     for snap in snapshots:
         name = name_func(snap)
-        timestamp = extract_timestamp(name, prefix)
+        timestamp = extract_timestamp(name, prefix, timestamp_format)
 
         if timestamp is None:
             # Can't parse timestamp, keep it to be safe

@@ -525,6 +525,7 @@ def _backup_snapper_volume(
             snapper_endpoint_config: dict[str, Any] = {
                 "path": target.path,
                 "snap_prefix": "",
+                "timestamp_format": get_timestamp_format(config),
             }
             if target.ssh_sudo:
                 snapper_endpoint_config["ssh_sudo"] = True

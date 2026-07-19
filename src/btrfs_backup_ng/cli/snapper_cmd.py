@@ -13,7 +13,7 @@ from typing import Any, cast
 from ..__logger__ import create_logger
 from ..snapper import SnapperScanner
 from ..snapper.scanner import SnapperNotFoundError
-from .common import get_log_level
+from .common import get_log_level, resolve_timestamp_format
 
 logger = logging.getLogger(__name__)
 
@@ -130,6 +130,10 @@ def _handle_list(args: argparse.Namespace) -> int:
     # Get type filter
     include_types = args.type if args.type else None
 
+    # Backup names honor --timestamp-format (else [global] config) so the
+    # displayed name matches what a backup would write on disk.
+    backup_fmt = resolve_timestamp_format(getattr(args, "timestamp_format", None))
+
     all_data: list[dict[str, Any]] = []
 
     for config in configs:
@@ -150,7 +154,7 @@ def _handle_list(args: argparse.Namespace) -> int:
                     "description": s.description,
                     "cleanup": s.cleanup,
                     "pre_num": s.pre_num,
-                    "backup_name": s.get_backup_name(),
+                    "backup_name": s.get_backup_name(backup_fmt),
                 }
                 for s in snapshots
             ],
@@ -218,7 +222,14 @@ def _handle_backup(args: argparse.Namespace) -> int:
     # targets are parsed correctly instead of being treated as local paths.
     from ..endpoint import choose_endpoint
 
-    endpoint_config: dict[str, Any] = {"path": target_path, "snap_prefix": ""}
+    endpoint_config: dict[str, Any] = {
+        "path": target_path,
+        "snap_prefix": "",
+        # Honor --timestamp-format, else [global] config, else the default.
+        "timestamp_format": resolve_timestamp_format(
+            getattr(args, "timestamp_format", None)
+        ),
+    }
     # Thread SSH options so ssh:// (remote btrfs receive) and raw+ssh:// targets
     # honor --ssh-sudo / --ssh-key.
     if getattr(args, "ssh_sudo", False):
@@ -360,8 +371,16 @@ def _handle_status(args: argparse.Namespace) -> int:
 
     # If target specified, check backup status there
     if args.target:
+        # Resolve the format the same way `snapper backup` does, so the local
+        # names we recompute match the on-disk backup filenames (else the
+        # backed-up/pending counts are wrong under a custom timestamp_format).
+        status_fmt = resolve_timestamp_format(getattr(args, "timestamp_format", None))
         try:
-            endpoint_config = {"path": args.target, "snap_prefix": ""}
+            endpoint_config = {
+                "path": args.target,
+                "snap_prefix": "",
+                "timestamp_format": status_fmt,
+            }
             endpoint = choose_endpoint(endpoint_config["path"], endpoint_config)
             backed_up = _list_snapper_backups_at_destination(endpoint)
         except Exception as e:
@@ -379,7 +398,7 @@ def _handle_status(args: argparse.Namespace) -> int:
                 snapshots = []
 
             # Count backed up vs not backed up
-            snapshot_names = {s.get_backup_name() for s in snapshots}
+            snapshot_names = {s.get_backup_name(status_fmt) for s in snapshots}
             backed_up_count = len(snapshot_names & backed_up)
             not_backed_up = len(snapshot_names) - backed_up_count
 

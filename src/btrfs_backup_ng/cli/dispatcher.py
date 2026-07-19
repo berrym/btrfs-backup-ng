@@ -487,6 +487,12 @@ Config-driven restore:
         help="Snapshot prefix filter",
     )
     restore_parser.add_argument(
+        "--timestamp-format",
+        metavar="FMT",
+        help="strftime format for parsing snapshot timestamps in direct mode "
+        "(defaults to the config's [global] timestamp_format, else the built-in)",
+    )
+    restore_parser.add_argument(
         "--ssh-sudo",
         action="store_true",
         help="Use sudo for btrfs commands on remote host",
@@ -626,6 +632,12 @@ Examples:
         "--prefix",
         metavar="PREFIX",
         help="Snapshot prefix filter",
+    )
+    verify_parser.add_argument(
+        "--timestamp-format",
+        metavar="FMT",
+        help="strftime format for parsing snapshot timestamps in direct mode "
+        "(defaults to the config's [global] timestamp_format, else the built-in)",
     )
     verify_parser.add_argument(
         "--ssh-sudo",
@@ -777,6 +789,12 @@ Examples:
         "--ssh-key",
         metavar="FILE",
         help="SSH private key file",
+    )
+    estimate_parser.add_argument(
+        "--timestamp-format",
+        metavar="FMT",
+        help="strftime format for parsing snapshot timestamps in direct mode "
+        "(defaults to the config's [global] timestamp_format, else the built-in)",
     )
     add_fs_checks_args(estimate_parser)
     estimate_parser.add_argument(
@@ -1057,6 +1075,12 @@ Examples:
         action="store_true",
         help="Output in JSON format",
     )
+    snapper_list.add_argument(
+        "--timestamp-format",
+        metavar="FMT",
+        help="strftime format for the previewed backup_name "
+        "(defaults to the config's [global] timestamp_format)",
+    )
 
     # snapper backup
     snapper_backup = snapper_subs.add_parser(
@@ -1123,6 +1147,12 @@ Examples:
         metavar="RATE",
         help="Bandwidth limit (e.g., '10M', '1G')",
     )
+    snapper_backup.add_argument(
+        "--timestamp-format",
+        metavar="FMT",
+        help="strftime format for the timestamp in backup names "
+        "(default: %%Y%%m%%d-%%H%%M%%S)",
+    )
     add_progress_args(snapper_backup)
 
     # snapper status
@@ -1146,6 +1176,12 @@ Examples:
         "--json",
         action="store_true",
         help="Output in JSON format",
+    )
+    snapper_status.add_argument(
+        "--timestamp-format",
+        metavar="FMT",
+        help="strftime format used when the backups were written, so status "
+        "counts match (defaults to the config's [global] timestamp_format)",
     )
 
     # snapper restore

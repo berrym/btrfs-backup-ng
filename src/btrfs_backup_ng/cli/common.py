@@ -161,3 +161,26 @@ def get_timestamp_format(config=None) -> str:
     global_config = getattr(config, "global_config", None)
     fmt = getattr(global_config, "timestamp_format", None)
     return fmt or __util__.DATE_FORMAT
+
+
+def resolve_timestamp_format(explicit: str | None = None) -> str:
+    """Resolve the snapshot timestamp_format for direct-mode commands.
+
+    ``verify`` and ``restore`` operate on a location argument and may have no
+    config object, so without this they parse snapshot names with only the
+    default format and silently skip custom-named snapshots. An explicit
+    ``--timestamp-format`` wins; otherwise honor ``[global] timestamp_format``
+    from a discoverable config; else the built-in default.
+    """
+    if explicit:
+        return explicit
+    try:
+        from ..config import find_config_file, load_config
+
+        path = find_config_file(None)
+        if path is not None:
+            config, _ = load_config(path)
+            return get_timestamp_format(config)
+    except Exception:
+        pass
+    return __util__.DATE_FORMAT
