@@ -278,3 +278,53 @@ volume /mnt/data
             btrbk_config.volumes[0].subvolumes[1].options.get("raw_target_compress")
             is None
         )
+
+
+class TestBtrbkRawImportRoundTrip:
+    """Non-theater: a migrated btrbk config must actually LOAD to a target that
+    CARRIES its encryption -- not merely contain the right string in the emitted
+    TOML. String-only assertions stayed green while the config loader silently
+    dropped `encrypt`, so a migrated GPG backup became plaintext. These tests
+    load the migrated TOML and assert the semantic outcome, and would have caught
+    that (R6) plaintext-downgrade bug.
+    """
+
+    def _migrate_and_load(self, tmp_path, config_content):
+        from btrfs_backup_ng.config.loader import load_config
+
+        btrbk_config = parse_btrbk_config(config_content)
+        toml_content, _ = convert_to_toml(btrbk_config)
+        p = tmp_path / "config.toml"
+        p.write_text(toml_content)
+        config, _ = load_config(str(p))
+        return config
+
+    def test_migrated_gpg_config_loads_with_encryption(self, tmp_path):
+        config = self._migrate_and_load(
+            tmp_path,
+            """
+volume /mnt/data
+  subvolume home
+    raw_target_encrypt gpg
+    gpg_recipient backup@example.com
+    target /mnt/backup/home
+""",
+        )
+        target = config.volumes[0].targets[0]
+        assert target.path == "raw:///mnt/backup/home"
+        # The semantic that was silently dropped -- NOT a string in the TOML.
+        assert target.encrypt == "gpg"
+        assert target.gpg_recipient == "backup@example.com"
+
+    def test_migrated_openssl_config_loads_with_encryption(self, tmp_path):
+        config = self._migrate_and_load(
+            tmp_path,
+            """
+volume /mnt/data
+  subvolume home
+    raw_target_encrypt openssl_enc
+    target /mnt/backup/home
+""",
+        )
+        target = config.volumes[0].targets[0]
+        assert target.encrypt == "openssl_enc"
