@@ -206,6 +206,49 @@ def _feed(plaintext: bytes):
     ), plaintext
 
 
+@pytest.fixture
+def isolated_gpg(tmp_path, monkeypatch):
+    """A throwaway GPG identity in an isolated, unique GNUPGHOME.
+
+    Kills the gpg-agent for that home on teardown so agent/keyring state can never
+    leak between tests -- a real-crypto security gate must be deterministic, not
+    flaky (a flaky security test is barely a gate). Yields the recipient uid.
+    """
+    import os
+    import subprocess
+
+    gnupghome = tmp_path / "gnupg"
+    gnupghome.mkdir(mode=0o700)
+    monkeypatch.setenv("GNUPGHOME", str(gnupghome))
+    env = {**os.environ, "GNUPGHOME": str(gnupghome)}
+    subprocess.run(
+        [
+            "gpg",
+            "--batch",
+            "--pinentry-mode",
+            "loopback",
+            "--passphrase",
+            "",
+            "--quick-generate-key",
+            "R6 Test <r6-test@example.invalid>",
+            "default",
+            "default",
+            "never",
+        ],
+        check=True,
+        capture_output=True,
+        env=env,
+    )
+    try:
+        yield "r6-test@example.invalid"
+    finally:
+        subprocess.run(
+            ["gpgconf", "--homedir", str(gnupghome), "--kill", "all"],
+            capture_output=True,
+            env=env,
+        )
+
+
 @pytest.mark.skipif(__import__("shutil").which("gpg") is None, reason="gpg required")
 class TestRealGpgPipeline:
     """Prove the raw pipeline produces genuine, decryptable GPG ciphertext -- and
@@ -213,30 +256,6 @@ class TestRealGpgPipeline:
     guarantee: encrypt=gpg must never yield readable cleartext."""
 
     PLAINTEXT = b"BTRFS-SEND-STREAM-TOP-SECRET-CONTENTS-abcdef0123456789"
-
-    @staticmethod
-    def _gpg_key(gnupghome):
-        import subprocess
-
-        subprocess.run(
-            [
-                "gpg",
-                "--batch",
-                "--pinentry-mode",
-                "loopback",
-                "--passphrase",
-                "",
-                "--quick-generate-key",
-                "R6 Test <r6-test@example.invalid>",
-                "default",
-                "default",
-                "never",
-            ],
-            check=True,
-            capture_output=True,
-            env={**__import__("os").environ, "GNUPGHOME": str(gnupghome)},
-        )
-        return "r6-test@example.invalid"
 
     def _run_receive(self, dest, plaintext, **enc):
         import subprocess
@@ -254,14 +273,10 @@ class TestRealGpgPipeline:
         out = next(p for p in dest.iterdir() if p.name.startswith("r6snap"))
         return out
 
-    def test_gpg_output_is_real_ciphertext_and_decrypts(self, tmp_path, monkeypatch):
+    def test_gpg_output_is_real_ciphertext_and_decrypts(self, tmp_path, isolated_gpg):
         import subprocess
 
-        gnupghome = tmp_path / "gnupg"
-        gnupghome.mkdir(mode=0o700)
-        monkeypatch.setenv("GNUPGHOME", str(gnupghome))
-        recipient = self._gpg_key(gnupghome)
-
+        recipient = isolated_gpg
         dest = tmp_path / "dest"
         dest.mkdir()
         out = self._run_receive(
@@ -407,30 +422,10 @@ class TestSSHRawRealRoundTrip:
     """Definitive: a real raw+ssh://localhost backup with encrypt=gpg produces a
     file on the (local)host that is genuine ciphertext and decrypts back."""
 
-    def test_raw_ssh_localhost_gpg_roundtrip(self, tmp_path, monkeypatch):
+    def test_raw_ssh_localhost_gpg_roundtrip(self, tmp_path, isolated_gpg):
         import subprocess
 
-        gnupghome = tmp_path / "gnupg"
-        gnupghome.mkdir(mode=0o700)
-        monkeypatch.setenv("GNUPGHOME", str(gnupghome))
-        subprocess.run(
-            [
-                "gpg",
-                "--batch",
-                "--pinentry-mode",
-                "loopback",
-                "--passphrase",
-                "",
-                "--quick-generate-key",
-                "R6 SSH <r6-ssh@example.invalid>",
-                "default",
-                "default",
-                "never",
-            ],
-            check=True,
-            capture_output=True,
-        )
-        recipient = "r6-ssh@example.invalid"
+        recipient = isolated_gpg
 
         dest = tmp_path / "dest"
         dest.mkdir()
