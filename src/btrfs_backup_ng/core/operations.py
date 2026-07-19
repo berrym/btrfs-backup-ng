@@ -6,9 +6,10 @@ Extracted from __main__.py for modularity and reuse.
 import logging
 import subprocess
 import time
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 from .. import __util__
 from ..transaction import log_transaction
@@ -25,6 +26,56 @@ from .space import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class TransferResult:
+    """Outcome of a multi-snapshot synchronization.
+
+    ``transferred`` holds the snapshots that were verified onto the destination;
+    ``failed`` holds ``(snapshot, error)`` pairs for those whose transfer failed.
+    A sync with any failures raises ``SnapshotTransferError`` with this object
+    attached as ``err.result`` so the caller can report precise counts (e.g.
+    "3 of 5 transferred, 2 failed") instead of inferring success from the mere
+    absence of an exception.
+    """
+
+    transferred: list = field(default_factory=list)
+    failed: list = field(default_factory=list)
+
+    @property
+    def ok(self) -> bool:
+        return not self.failed
+
+    @property
+    def transferred_count(self) -> int:
+        return len(self.transferred)
+
+    @property
+    def failed_count(self) -> int:
+        return len(self.failed)
+
+    @property
+    def attempted(self) -> int:
+        return len(self.transferred) + len(self.failed)
+
+
+def _raise_transfer_failures(result: "TransferResult", label: str) -> None:
+    """Raise SnapshotTransferError (with ``result`` attached) if any transfer failed.
+
+    Fail-loud: a caller cannot accidentally treat a partial or total failure as
+    success, and the attached result carries the transferred/failed breakdown for
+    accurate exit codes and notifications.
+    """
+    if result.ok:
+        return
+    names = ", ".join(str(item) for item, _ in result.failed)
+    err: Any = __util__.SnapshotTransferError(
+        f"{result.failed_count} of {result.attempted} {label} transfer(s) "
+        f"failed: {names}"
+    )
+    err.result = result
+    raise err
 
 
 def send_snapshot(
@@ -1030,7 +1081,7 @@ def sync_snapshots(
     snapshot=None,
     options=None,
     **kwargs,
-) -> None:
+) -> TransferResult:
     """Synchronize snapshots from source to destination.
 
     Args:
@@ -1041,6 +1092,13 @@ def sync_snapshots(
         snapshot: Specific snapshot to transfer (None = use planning)
         options: Additional options dict
         **kwargs: Additional keyword arguments
+
+    Returns:
+        TransferResult with the transferred/failed breakdown.
+
+    Raises:
+        SnapshotTransferError: if any planned snapshot failed to transfer. The
+            exception carries the TransferResult as ``err.result``.
     """
     from .planning import plan_transfers
 
@@ -1081,14 +1139,14 @@ def sync_snapshots(
 
     if not to_transfer:
         logger.info("No snapshots need to be transferred.")
-        return
+        return TransferResult()
 
     logger.info("Going to transfer %d snapshot(s):", len(to_transfer))
     for snap in to_transfer:
         logger.info("  %s", snap)
 
     # Execute transfers
-    _execute_transfers(
+    result = _execute_transfers(
         source_endpoint,
         destination_endpoint,
         source_snapshots,
@@ -1098,6 +1156,11 @@ def sync_snapshots(
         options,
         **kwargs,
     )
+
+    # Fail loud: any failed transfer must surface as an exception so callers
+    # cannot mistake the absence of an exception for success.
+    _raise_transfer_failures(result, "snapshot")
+    return result
 
 
 def _execute_transfers(
@@ -1109,9 +1172,16 @@ def _execute_transfers(
     no_incremental,
     options,
     **kwargs,
-) -> None:
-    """Execute the actual snapshot transfers."""
+) -> TransferResult:
+    """Execute the actual snapshot transfers.
+
+    Returns a TransferResult recording which snapshots were verified onto the
+    destination and which failed. Locks are released and the snapshot registered
+    at the destination only for verified successes; a failed snapshot is kept
+    locked and recorded in ``result.failed`` (never silently dropped).
+    """
     destination_id = destination_endpoint.get_id()
+    result = TransferResult()
 
     while to_transfer:
         if no_incremental:
@@ -1162,14 +1232,18 @@ def _execute_transfers(
             except Exception as e:
                 logger.debug("Post-transfer snapshot list refresh failed: %s", e)
 
+            result.transferred.append(best_snapshot)
+
         except __util__.SnapshotTransferError as e:
             logger.error("Snapshot transfer failed for %s: %s", best_snapshot, e)
             logger.info("Keeping %s locked to prevent deletion.", best_snapshot)
+            result.failed.append((best_snapshot, e))
 
         to_transfer.remove(best_snapshot)
         logger.debug("%d snapshots left to transfer", len(to_transfer))
 
     logger.info(__util__.log_heading(f"Transfers to {destination_endpoint} complete!"))
+    return result
 
 
 # =============================================================================
@@ -1676,7 +1750,12 @@ def sync_snapper_snapshots(
         options: Additional transfer options
 
     Returns:
-        Number of snapshots transferred
+        Number of snapshots transferred (on full success).
+
+    Raises:
+        SnapshotTransferError: if any eligible snapshot failed to transfer. The
+            exception carries a TransferResult as ``err.result`` (transferred vs
+            failed) so the caller reports a non-zero exit and accurate counts.
     """
     if options is None:
         options = {}
@@ -1732,7 +1811,7 @@ def sync_snapper_snapshots(
     all_snapshots_by_num = {s.number: s for s in snapper_snapshots}
 
     # Transfer snapshots
-    transferred = 0
+    result = TransferResult()
     for i, snap in enumerate(to_transfer, 1):
         # Find parent for incremental transfer
         # Look for the highest numbered snapshot that:
@@ -1757,16 +1836,24 @@ def sync_snapper_snapshots(
                 parent_snapper_snapshot=parent,
                 options=options,
             )
-            transferred += 1
+            result.transferred.append(snap)
             backed_up_numbers.add(snap.number)
         except __util__.SnapshotTransferError as e:
             logger.error("Failed to transfer snapshot %d: %s", snap.number, e)
-            # Continue with remaining snapshots
+            result.failed.append((snap, e))
+            # Continue attempting the remaining snapshots; the failure is recorded
+            # and surfaced below so it is never silently dropped.
 
     logger.info("")
-    logger.info("Sync complete: %d/%d transferred", transferred, len(to_transfer))
+    logger.info(
+        "Sync complete: %d/%d transferred", result.transferred_count, len(to_transfer)
+    )
 
-    return transferred
+    # Fail loud: if any snapshot failed, raise with the breakdown attached so the
+    # caller reports a non-zero exit / failure notification instead of exit 0.
+    _raise_transfer_failures(result, "snapper snapshot")
+
+    return result.transferred_count
 
 
 def _list_snapper_backups_at_destination(endpoint) -> set[str]:
