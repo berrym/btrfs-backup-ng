@@ -143,8 +143,14 @@ volume /mnt/data
         # Normal target should NOT have raw:// prefix
         assert 'path = "/mnt/backup/var"' in toml_content
 
-    def test_all_compression_algorithms(self):
-        """Test that all btrbk compression algorithms are mapped correctly."""
+    def test_all_compression_algorithms_round_trip(self, tmp_path):
+        """Every btrbk compression algorithm must migrate to a config that ACTUALLY
+        LOADS with that compression -- not merely emit the right string. The
+        string-only version of this test stayed green while the loader rejected
+        xz/lzo/bzip2/pbzip2 (which raw targets run), so migrated configs failed to
+        load."""
+        from btrfs_backup_ng.config.loader import load_config
+
         algorithms = ["gzip", "pigz", "bzip2", "pbzip2", "xz", "lzo", "lz4", "zstd"]
 
         for algo in algorithms:
@@ -155,11 +161,12 @@ volume /mnt/data
     target /mnt/backup/test
 """
             btrbk_config = parse_btrbk_config(config_content)
-            toml_content, warnings = convert_to_toml(btrbk_config)
-
-            assert f'compress = "{algo}"' in toml_content, (
-                f"Algorithm {algo} not mapped"
-            )
+            toml_content, _ = convert_to_toml(btrbk_config)
+            p = tmp_path / f"config-{algo}.toml"
+            p.write_text(toml_content)
+            config, _ = load_config(str(p))  # must not raise for any algo
+            target = config.volumes[0].targets[0]
+            assert target.compress == algo, f"Algorithm {algo} lost on round-trip"
 
     def test_no_raw_options_means_normal_target(self):
         """Test that targets without raw options remain as normal btrfs targets."""
