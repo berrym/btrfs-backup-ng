@@ -40,66 +40,6 @@ def plan_transfers(
     return to_transfer
 
 
-def delete_corrupt_snapshots(
-    destination_endpoint,
-    source_snapshots: list,
-    destination_snapshots: list,
-) -> list:
-    """Delete corrupt snapshots from destination.
-
-    Corrupt snapshots are those that exist at destination but have
-    locks indicating a transfer was interrupted.
-
-    Args:
-        destination_endpoint: The destination endpoint
-        source_snapshots: List of source snapshots
-        destination_snapshots: List of destination snapshots
-
-    Returns:
-        Updated list of destination snapshots after deletion
-    """
-    to_remove = []
-    destination_id = destination_endpoint.get_id()
-
-    for snapshot in source_snapshots:
-        if snapshot in destination_snapshots and destination_id in snapshot.locks:
-            destination_snapshot = destination_snapshots[
-                destination_snapshots.index(snapshot)
-            ]
-            logger.info(
-                "Potentially corrupt snapshot %s found at %s",
-                destination_snapshot,
-                destination_endpoint,
-            )
-            to_remove.append(destination_snapshot)
-
-    if to_remove:
-        destination_endpoint.delete_snapshots(to_remove)
-        # Refresh after deletion
-        destination_snapshots = destination_endpoint.list_snapshots()
-
-    return destination_snapshots
-
-
-def clear_locks(
-    source_endpoint,
-    source_snapshots: list,
-    destination_id: str,
-) -> None:
-    """Clear locks for a destination from source snapshots.
-
-    Args:
-        source_endpoint: The source endpoint
-        source_snapshots: List of source snapshots
-        destination_id: ID of the destination to clear locks for
-    """
-    for snapshot in source_snapshots:
-        if destination_id in snapshot.locks:
-            source_endpoint.set_lock(snapshot, destination_id, False)
-        if destination_id in snapshot.parent_locks:
-            source_endpoint.set_lock(snapshot, destination_id, False, parent=True)
-
-
 def find_best_transfer_order(
     to_transfer: list,
     source_snapshots: list,
