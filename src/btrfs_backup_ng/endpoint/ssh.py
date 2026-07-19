@@ -21,6 +21,7 @@ import copy
 import getpass
 import os
 import shlex
+import shutil
 import subprocess
 import threading
 import time
@@ -2022,7 +2023,8 @@ print(json.dumps(result))
             snapshot_name: Name of the received subvolume within dest_path
 
         Returns:
-            True if a subvolume/directory exists at the exact expected path.
+            True only if a real received subvolume exists at the exact expected
+            path (a bare directory is not accepted).
         """
         expected_path = f"{dest_path.rstrip('/')}/{snapshot_name}"
         logger.debug(f"Verifying received snapshot at exact path: {expected_path}")
@@ -2046,18 +2048,16 @@ print(json.dumps(result))
             )
 
         try:
-            # Authoritative check: confirm a real subvolume exists at exactly the
-            # expected path (not merely a same-named subvolume elsewhere).
+            # Authoritative check: confirm a real *subvolume* exists at exactly the
+            # expected path (not merely a same-named subvolume elsewhere). A plain
+            # directory is deliberately NOT accepted: an interrupted or failed
+            # ``btrfs receive`` can leave a bare directory (or a half-applied,
+            # non-subvolume tree) at the destination, and a ``test -d`` check would
+            # report that partial as a valid backup. Only ``btrfs subvolume show``
+            # succeeding proves a real received subvolume is present.
             show_result = _run(["btrfs", "subvolume", "show", expected_path])
             if show_result.returncode == 0:
                 logger.debug(f"Snapshot verified via subvolume show: {expected_path}")
-                return True
-
-            # Fallback: exact directory existence at the expected path. Still scoped
-            # to the precise location, so it cannot match a sibling snapshot.
-            test_result = _run(["test", "-d", expected_path])
-            if test_result.returncode == 0:
-                logger.debug(f"Snapshot verified via path check: {expected_path}")
                 return True
 
             logger.error(f"Snapshot not found at expected path: {expected_path}")
@@ -2067,6 +2067,53 @@ print(json.dumps(result))
             logger.error(f"Error verifying snapshot: {e}")
             logger.debug(f"Verification exception details: {e}", exc_info=True)
             return False
+
+    def _cleanup_partial_subvolume(self, dest_path: str, received_name: str) -> None:
+        """Remove a partial/failed received subvolume at its exact destination path.
+
+        Called after a transfer is judged failed so that a leftover partial cannot
+        later be mistaken for a valid backup (by verification or skip-detection) and
+        so a subsequent retry starts from a clean destination. Scoped strictly to
+        ``{dest_path}/{received_name}`` — never a filesystem-wide search — for the
+        same reason exact-path verification is: sibling snapshots must not be touched.
+
+        Best-effort: failures are logged and swallowed (the caller has already
+        decided the transfer failed).
+        """
+        expected_path = f"{dest_path.rstrip('/')}/{received_name}"
+        use_sudo = self.config.get("ssh_sudo", False)
+
+        def _run(cmd: List[str]) -> Any:
+            if use_sudo:
+                return self._exec_remote_command_with_retry(
+                    cmd,
+                    max_retries=2,
+                    check=False,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                )
+            return self._exec_remote_command(
+                cmd,
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+
+        try:
+            # Only act if something is actually present at the exact path.
+            if _run(["test", "-e", expected_path]).returncode != 0:
+                return
+            logger.warning(
+                "Cleaning up partial/failed transfer artifact at %s", expected_path
+            )
+            # Prefer subvolume delete (handles the common partial-receive case);
+            # fall back to rm -rf for a plain directory left behind.
+            if _run(["btrfs", "subvolume", "delete", expected_path]).returncode != 0:
+                _run(["rm", "-rf", expected_path])
+        except Exception as e:
+            logger.debug(
+                "Partial-subvolume cleanup failed for %s: %s", expected_path, e
+            )
 
     def _find_buffer_program(self) -> Tuple[Optional[str], Optional[str]]:
         """Find pv program to use for transfer progress display.
@@ -2666,11 +2713,16 @@ print(json.dumps(result))
             while channel.recv_stderr_ready():
                 remote_stderr += channel.recv_stderr(4096)
 
+            # btrfs receive names the received subvolume after the source basename
+            # (== snapshot_name for native backups, "snapshot" for snapper).
+            received_name = Path(source_path).name
+
             if exit_status != 0:
                 stderr_text = remote_stderr.decode(errors="replace")
                 logger.error(
                     f"btrfs receive failed (exit {exit_status}): {stderr_text}"
                 )
+                self._cleanup_partial_subvolume(dest_path, received_name)
                 return False
 
             elapsed = time.time() - start_time
@@ -2680,16 +2732,18 @@ print(json.dumps(result))
                 f"({rate / (1024 * 1024):.1f} MiB/s)"
             )
 
-            # Verify snapshot exists on remote. btrfs receive names the received
-            # subvolume after the source basename (== snapshot_name for native
-            # backups, "snapshot" for snapper), so verify by that real name.
-            received_name = Path(source_path).name
+            # Secondary confirmation only after send+receive both exited 0. Because
+            # receive succeeded here, a failed verification is treated as
+            # inconclusive: report failure but do NOT delete the received
+            # subvolume (it may be a good backup and only the verify step failed).
             if self._verify_snapshot_exists(dest_path, received_name):
                 logger.info(f"Snapshot {received_name} verified on remote")
                 return True
             else:
                 logger.error(
-                    "Transfer verification failed - snapshot not found on remote"
+                    "Transfer verification inconclusive - leaving received "
+                    "subvolume in place at %s for reconciliation",
+                    dest_path,
                 )
                 return False
 
@@ -2798,14 +2852,34 @@ print(json.dumps(result))
         logger.info(f"Transferring {snapshot_name} to {self.hostname}:{dest_path}")
         logger.debug(f"Pipeline: {full_pipeline}")
 
+        # Run the pipeline under bash with `pipefail` so a failure of `btrfs send`
+        # or `pv` fails the whole pipeline. Without pipefail the shell reports only
+        # the exit status of the last stage (the `ssh`/receive), which masks an
+        # upstream send failure and yields a truncated/empty backup reported as
+        # success. Degrade to plain sh (with a warning) only if bash is absent.
+        bash_path = shutil.which("bash")
         try:
-            proc = subprocess.Popen(
-                full_pipeline,
-                shell=True,
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-            )
+            if bash_path:
+                proc = subprocess.Popen(
+                    "set -o pipefail; " + full_pipeline,
+                    shell=True,
+                    executable=bash_path,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                )
+            else:
+                logger.warning(
+                    "bash not found; running transfer pipeline without pipefail "
+                    "(a btrfs send or pv failure may be masked by ssh's exit code)"
+                )
+                proc = subprocess.Popen(
+                    full_pipeline,
+                    shell=True,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                )
 
             stderr_lines: List[str] = []
 
@@ -2825,24 +2899,32 @@ print(json.dumps(result))
             proc.wait()
             stderr_thread.join(timeout=5)
 
+            # The received subvolume is named after the source basename
+            # (== snapshot_name for native, "snapshot" for snapper).
+            received_name = Path(source_path).name
+
             if proc.returncode != 0:
                 stderr_output = "".join(stderr_lines)
                 logger.error(f"Transfer failed (exit {proc.returncode})")
                 if stderr_output:
                     logger.error(f"Error output: {stderr_output}")
+                self._cleanup_partial_subvolume(dest_path, received_name)
                 return False
 
             logger.info("Transfer completed successfully")
 
-            # The received subvolume is named after the source basename
-            # (== snapshot_name for native, "snapshot" for snapper).
-            received_name = Path(source_path).name
+            # The pipeline exited 0 (pipefail), so the receive succeeded. A failed
+            # verification here is inconclusive: report failure but do NOT delete
+            # the received subvolume (it may be a good backup and only the verify
+            # step failed).
             if self._verify_snapshot_exists(dest_path, received_name):
                 logger.info(f"Snapshot {received_name} verified on remote")
                 return True
             else:
                 logger.error(
-                    "Transfer verification failed - snapshot not found on remote"
+                    "Transfer verification inconclusive - leaving received "
+                    "subvolume in place at %s for reconciliation",
+                    dest_path,
                 )
                 return False
 
@@ -3087,29 +3169,17 @@ print(json.dumps(result))
                     received_name=received_name,
                 )
 
-            # Final verification if we timed out
-            if not transfer_succeeded:
-                logger.warning(
-                    "Reached maximum wait time, performing final verification..."
-                )
-                try:
-                    if self._verify_snapshot_exists(dest_path, received_name):
-                        logger.info(
-                            "SUCCESS: Transfer completed successfully (final check)"
-                        )
-                        transfer_succeeded = True
-                    else:
-                        logger.error(
-                            "FAILED: Transfer failed - no snapshot found after maximum wait time"
-                        )
-                except Exception as e:
-                    logger.error(f"Final verification failed: {e}")
+            # The monitor is authoritative: it has already required that send and
+            # receive both exited 0 AND that the received subvolume verifies, or it
+            # returned False (timeout, nonzero exit, or missing subvolume). Success
+            # is NOT re-derived from path existence here — doing so was the original
+            # false-success bug (a partial/failed receive that left a directory was
+            # reported as a valid backup).
 
-            # Clean up processes
+            # Clean up any lingering processes.
             all_processes = [send_process, receive_process]
             if buffer_process:
                 all_processes.append(buffer_process)
-
             for proc in all_processes:
                 if proc.poll() is None:
                     logger.debug("Terminating remaining process...")
@@ -3119,79 +3189,34 @@ print(json.dumps(result))
                     except Exception:
                         proc.kill()
 
-            # Set dummy results for compatibility
-            send_result = 0 if transfer_succeeded else 1
-            receive_result = 0 if transfer_succeeded else 1
-
             elapsed_time = time.time() - start_time
             logger.info(f"Transfer completed in {elapsed_time:.2f} seconds")
 
-            # Check process results
-            if send_result != 0:
-                stderr_output = (
-                    send_process.stderr.read().decode(errors="replace")
-                    if send_process.stderr
-                    else ""
-                )
-                logger.error(
-                    f"Local send process failed with exit code {send_result}: {stderr_output}"
-                )
-                return False
-
-            if receive_result != 0:
-                logger.error(
-                    f"Remote receive process failed with exit code {receive_result}"
-                )
-                return False
-
-            # Prioritize actual transfer verification over exit codes
-            logger.debug("=== TRANSFER VERIFICATION (Primary Check) ===")
-            logger.debug("Verifying snapshot was created on remote host...")
-            logger.debug(f"Looking for snapshot '{snapshot_name}' in '{dest_path}'")
-
-            # Check if transfer actually succeeded first
-            transfer_actually_succeeded = False
-            try:
-                verification_result = self._verify_snapshot_exists(
-                    dest_path, received_name
-                )
-                logger.debug(f"Snapshot existence verification: {verification_result}")
-
-                if verification_result:
-                    logger.info(
-                        "SUCCESS: TRANSFER ACTUALLY SUCCEEDED - Snapshot exists on remote host"
-                    )
-                    transfer_actually_succeeded = True
-                else:
-                    # Try alternative verification methods
-                    logger.debug(
-                        "Primary verification failed, trying alternative methods..."
-                    )
-                    ls_cmd = ["ls", "-la", dest_path]
-                    ls_result = self._exec_remote_command(
-                        ls_cmd, check=False, stdout=subprocess.PIPE
-                    )
-                    if ls_result.returncode == 0 and ls_result.stdout:
-                        ls_output = ls_result.stdout.decode(errors="replace")
-                        logger.debug(f"Directory listing: {ls_output}")
-                        if received_name in ls_output:
-                            logger.info(
-                                "SUCCESS: TRANSFER ACTUALLY SUCCEEDED - Snapshot found in directory listing"
-                            )
-                            transfer_actually_succeeded = True
-
-            except Exception as e:
-                logger.error(f"Exception during verification: {e}")
-
-            # Final decision based on actual transfer success
-            if transfer_actually_succeeded:
+            if transfer_succeeded:
                 logger.info("SUCCESS: TRANSFER VERIFICATION SUCCESSFUL")
                 return True
+
+            logger.error("FAILED: TRANSFER FAILED")
+            # Remove a partial ONLY when a process genuinely failed (nonzero exit or
+            # a timeout kill), which is exactly when a partial subvolume can exist.
+            # If the receive exited 0 but verification was merely inconclusive (e.g.
+            # a transient SSH/timeout on `btrfs subvolume show`), a GOOD received
+            # subvolume may be present -- deleting it would destroy a successful
+            # backup. In that case leave the artifact in place for a retry / the
+            # next run's skip-detection to reconcile.
+            recv_rc = receive_process.returncode
+            send_rc = send_process.returncode
+            receive_failed = recv_rc is not None and recv_rc != 0
+            send_failed = send_rc is not None and send_rc != 0
+            if receive_failed or send_failed:
+                self._cleanup_partial_subvolume(dest_path, received_name)
             else:
-                logger.error(
-                    "FAILED: TRANSFER FAILED - No snapshot found on remote host"
+                logger.warning(
+                    "Receive completed but verification was inconclusive; leaving "
+                    "the received subvolume in place at %s for reconciliation",
+                    dest_path,
                 )
-                return False
+            return False
 
         except Exception as e:
             logger.error(f"Error during transfer: {e}")
@@ -3583,21 +3608,13 @@ print(json.dumps(result))
                 )
                 last_status_time = current_time
 
-            # Periodic verification
+            # Periodic progress note only. We deliberately do NOT check for the
+            # received subvolume here: while the receive process is still alive the
+            # subvolume may already exist on disk yet not be fully applied, so
+            # treating existence as completion would report success mid-stream
+            # (the existence check races the still-running receive).
             if current_time - last_verification_time >= verification_interval:
-                logger.debug("Performing verification check...")
-                try:
-                    if self._verify_snapshot_exists(
-                        dest_path, received_name or snapshot_name
-                    ):
-                        logger.info("SUCCESS: Transfer verification successful!")
-                        return True
-                    else:
-                        logger.debug("STATUS: Transfer still in progress...")
-                except Exception as e:
-                    logger.debug(
-                        f"Verification check failed (normal during transfer): {e}"
-                    )
+                logger.debug("STATUS: Transfer still in progress...")
                 last_verification_time = current_time
 
             # Check if all processes finished
@@ -3606,25 +3623,46 @@ print(json.dumps(result))
                 and not receive_alive
                 and not (buffer_process and buffer_alive)
             ):
-                logger.debug(
-                    "STATUS: All processes completed, performing final verification..."
-                )
+                logger.debug("STATUS: All processes completed")
                 break
-
-            # Handle receive process warnings (but don't fail immediately)
-            if not receive_alive and receive_process.returncode not in [None, 0]:
-                logger.warning(
-                    f"WARNING: Receive process exit code: {receive_process.returncode}"
-                )
-                logger.debug(
-                    "STATUS: Checking if transfer succeeded despite exit code..."
-                )
 
             time.sleep(0.5)  # Short sleep for responsive monitoring
 
-        # Final verification
+        # Timeout: at least one process is still running after max_wait_time. Kill
+        # everything and fail — a still-running receive has NOT completed.
+        procs = [send_process, receive_process] + (
+            [buffer_process] if buffer_process else []
+        )
+        if any(proc.poll() is None for proc in procs):
+            logger.error("FAILED: Transfer timed out; terminating processes")
+            for proc in procs:
+                if proc.poll() is None:
+                    proc.terminate()
+                    try:
+                        proc.wait(timeout=5)
+                    except Exception:
+                        proc.kill()
+            return False
+
+        # Exit codes are AUTHORITATIVE: send and receive must both have exited 0.
+        # A nonzero receive means the stream was not fully applied regardless of
+        # whether a (partial) subvolume exists at the path.
+        if send_process.returncode != 0:
+            logger.error(
+                f"FAILED: Send process failed (exit code: {send_process.returncode})"
+            )
+            self._log_process_error(send_process, "send")
+            return False
+        if receive_process.returncode != 0:
+            logger.error(
+                f"FAILED: Receive process failed (exit code: {receive_process.returncode})"
+            )
+            self._log_process_error(receive_process, "receive")
+            return False
+
+        # Secondary confirmation only AFTER both processes exited 0.
         logger.debug(
-            "COMPLETE: Transfer monitoring complete, performing final verification..."
+            "COMPLETE: Transfer processes finished cleanly, performing final verification..."
         )
         try:
             transfer_succeeded = self._verify_snapshot_exists(
@@ -3641,6 +3679,7 @@ print(json.dumps(result))
                 )
         except Exception as e:
             logger.error(f"ERROR: Final verification failed: {e}")
+            transfer_succeeded = False
 
         return transfer_succeeded
 
@@ -3749,6 +3788,23 @@ print(json.dumps(result))
         # Check results
         elapsed_final = time.time() - start_time
 
+        # Timeout: the loop exited with at least one process still running. Kill
+        # everything and fail — a still-running receive has NOT completed, and
+        # accepting it here (on path existence) is exactly the false-success bug.
+        if any(proc.poll() is None for proc in processes_to_wait):
+            logger.error(
+                "FAILED: Transfer timed out after %.1fs; terminating processes",
+                elapsed_final,
+            )
+            for proc in processes_to_wait:
+                if proc.poll() is None:
+                    proc.terminate()
+                    try:
+                        proc.wait(timeout=5)
+                    except Exception:
+                        proc.kill()
+            return False
+
         # Check send process
         send_code = send_process.returncode
         if send_code != 0:
@@ -3758,15 +3814,21 @@ print(json.dumps(result))
 
         logger.info("SUCCESS: Send process completed successfully")
 
-        # Check receive process
+        # Check receive process. The receive exit code is AUTHORITATIVE: a nonzero
+        # `btrfs receive` means the stream was not fully applied, so the transfer
+        # failed regardless of whether a (partial) subvolume exists at the path.
         receive_code = receive_process.returncode
         if receive_code != 0:
-            logger.warning(f"WARNING: Receive process exit code: {receive_code}")
-            # Don't fail immediately - some exit codes may be acceptable
-        else:
-            logger.info("SUCCESS: Receive process completed successfully")
+            logger.error(
+                f"FAILED: Receive process failed with exit code {receive_code}"
+            )
+            self._log_simple_process_error(receive_process, "receive")
+            return False
+        logger.info("SUCCESS: Receive process completed successfully")
 
-        # Check buffer process if present
+        # Buffer process: a truncated stream would already have failed the receive
+        # above, so a nonzero buffer exit on an otherwise-clean transfer is not
+        # treated as fatal (only surfaced) to avoid rejecting a good backup.
         if buffer_process:
             buffer_code = buffer_process.returncode
             if buffer_code != 0:
@@ -3774,7 +3836,7 @@ print(json.dumps(result))
             else:
                 logger.info("SUCCESS: Buffer process completed successfully")
 
-        # Final verification
+        # Secondary confirmation only AFTER send+receive both exited 0.
         logger.debug("STATUS: Performing final verification...")
         try:
             if self._verify_snapshot_exists(dest_path, received_name or snapshot_name):
