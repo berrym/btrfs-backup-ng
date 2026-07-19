@@ -1203,9 +1203,9 @@ def _cleanup_partial_local_subvolume(destination_endpoint, name: str) -> None:
     if isinstance(destination_endpoint, RawEndpoint):
         return
 
-    base = str(destination_endpoint.config["path"]).rstrip("/")
-    expected = f"{base}/{name}"
     try:
+        base = str(destination_endpoint.config["path"]).rstrip("/")
+        expected = f"{base}/{name}"
         if not Path(expected).exists():
             return
         logger.warning("Cleaning up partial local transfer artifact at %s", expected)
@@ -1218,9 +1218,8 @@ def _cleanup_partial_local_subvolume(destination_endpoint, name: str) -> None:
             # A killed receive can leave a plain directory rather than a subvolume.
             subprocess.run([*sudo, "rm", "-rf", expected], capture_output=True)
     except Exception as cleanup_e:
-        logger.debug(
-            "Partial local-subvolume cleanup failed for %s: %s", expected, cleanup_e
-        )
+        # Best-effort: never let a cleanup problem mask the original transfer error.
+        logger.debug("Partial local-subvolume cleanup failed: %s", cleanup_e)
 
 
 def _cleanup_partial_remote_subvolume(destination_endpoint, manifest) -> None:

@@ -67,6 +67,14 @@ class TestCleanupPartialLocalSubvolume:
         ops._cleanup_partial_local_subvolume(ep, "snap-1")
         assert not called
 
+    def test_bad_config_does_not_escape(self):
+        # Best-effort contract: a malformed endpoint config must never raise out
+        # of cleanup and mask the original transfer error.
+        ep = MagicMock()
+        ep._is_remote = False
+        ep.config = {}  # missing "path"
+        ops._cleanup_partial_local_subvolume(ep, "snap-1")  # must not raise
+
     def test_skips_raw_endpoint(self, monkeypatch, tmp_path):
         from btrfs_backup_ng.endpoint.raw import RawEndpoint
 
