@@ -167,6 +167,7 @@ class TestDoChunkedTransfer:
         mock_send = MagicMock()
         mock_send.stdout = io.BytesIO(b"x" * 1024)  # 1KB of data
         mock_send.wait.return_value = 0
+        mock_send.returncode = 0  # a completed btrfs send exits 0
         snapshot.endpoint.send.return_value = mock_send
 
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -239,6 +240,7 @@ class TestDoChunkedTransfer:
         mock_send = MagicMock()
         mock_send.stdout = io.BytesIO(b"x" * 1024)
         mock_send.wait.return_value = 0
+        mock_send.returncode = 0  # a completed btrfs send exits 0
         snapshot.endpoint.send.return_value = mock_send
 
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -526,3 +528,91 @@ class TestChunkedTransferEndToEnd:
             # Verify parent info in manifest
             manifest = manager.get_transfer(transfer_id)
             assert manifest.parent_name == str(parent)
+
+
+class TestChunkedTransferSuccessContract:
+    """R1 enforcement: chunked transfers must not report a failed send/receive
+    as a successful (or resumable-complete) backup."""
+
+    def test_nonzero_send_exit_raises_and_does_not_transfer(self):
+        """A `btrfs send` that fails mid-chunking (nonzero exit) closes stdout
+        early, so chunking records a TRUNCATED manifest. The transfer must fail
+        rather than proceed to transfer the truncated chunks as success."""
+        import pytest
+
+        from btrfs_backup_ng import __util__
+
+        snapshot = MockSnapshot("test-snap", "/mnt/.snapshots/test-snap")
+        endpoint = MockEndpoint()
+
+        mock_send = MagicMock()
+        mock_send.stdout = io.BytesIO(b"x" * 1024)
+        mock_send.wait.return_value = 1
+        mock_send.returncode = 1  # btrfs send failed mid-stream
+        mock_send.stderr = io.BytesIO(b"ERROR: parent not found")
+        snapshot.endpoint.send.return_value = mock_send
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config = TransferConfig(cache_directory=Path(tmpdir), chunk_size_mb=1)
+            manager = ChunkedTransferManager(config)
+
+            with patch(
+                "btrfs_backup_ng.core.operations._transfer_chunks_local"
+            ) as mock_local:
+                with patch("btrfs_backup_ng.core.operations.log_transaction"):
+                    with pytest.raises(__util__.SnapshotTransferError):
+                        _do_chunked_transfer(
+                            snapshot=snapshot,
+                            destination_endpoint=endpoint,
+                            parent=None,
+                            clones=None,
+                            options={},
+                            chunked_manager=manager,
+                        )
+
+            # Must NOT have proceeded to transfer the truncated chunks.
+            assert not mock_local.called
+
+    def test_ssh_fallback_does_not_mark_chunks_before_receive_confirms(self):
+        """In the SSH fallback path, a receive that FAILS must not leave any chunk
+        marked TRANSFERRED (which would make the failed transfer look
+        resumable-complete on the next run)."""
+        import pytest
+
+        from btrfs_backup_ng import __util__
+
+        # spec without receive_chunked -> hits the fallback streaming path.
+        endpoint = MagicMock(spec=["receive", "_is_remote", "config"])
+        endpoint._is_remote = True
+        recv = MagicMock()
+        recv.stdin = MagicMock()
+        recv.wait.return_value = 1  # btrfs receive FAILS
+        recv.returncode = 1
+        recv.stderr = io.BytesIO(b"boom")
+        endpoint.receive.return_value = recv
+
+        chunk0 = MagicMock()
+        chunk0.sequence = 0
+        manifest = MagicMock()
+        manifest.chunks = [chunk0]
+        manifest.pending_chunks = [chunk0]
+        manifest.chunk_count = 1
+        manifest.completed_chunks = 0
+        manifest.snapshot_name = "test-snap"
+
+        manager = MagicMock()
+        reader = MagicMock()
+        reader.read_chunks.return_value = iter([b"data"])
+        manager.create_reassembly_reader.return_value = reader
+
+        with pytest.raises(__util__.SnapshotTransferError):
+            _transfer_chunks_ssh(
+                manifest=manifest,
+                destination_endpoint=endpoint,
+                chunked_manager=manager,
+                options={},
+                show_progress=False,
+            )
+
+        # Receive failed -> nothing should have been marked transferred.
+        manager.mark_chunk_transferred.assert_not_called()

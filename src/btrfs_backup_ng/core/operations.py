@@ -368,6 +368,25 @@ def _do_chunked_transfer(
                     send_process.kill()
                     send_process.wait()
 
+            # The send exit code is authoritative. If `btrfs send` failed (parent
+            # UUID mismatch, I/O error, killed) it closes stdout early, so chunking
+            # sees EOF and records a TRUNCATED manifest. Without this check the
+            # truncated stream would be transferred and reported as a successful
+            # backup.
+            if send_process.returncode not in (0, None):
+                send_stderr = ""
+                if send_process.stderr is not None:
+                    try:
+                        send_stderr = send_process.stderr.read().decode(
+                            errors="replace"
+                        )
+                    except Exception:
+                        pass
+                raise __util__.SnapshotTransferError(
+                    f"btrfs send failed during chunking "
+                    f"(exit {send_process.returncode}): {send_stderr}"
+                )
+
             logger.info(
                 "Chunking complete: %d chunks, %d bytes",
                 manifest.chunk_count,
@@ -579,19 +598,13 @@ def _transfer_chunks_ssh(
             for chunk_data in reader.read_chunks():
                 if receive_process.stdin:
                     receive_process.stdin.write(chunk_data)
-
-                # Find and mark chunk as transferred
-                if chunks_sent < len(manifest.chunks):
-                    chunk = manifest.chunks[chunks_sent]
-                    chunked_manager.mark_chunk_transferred(manifest, chunk.sequence)
-                    chunks_sent += 1
-
-                    if show_progress:
-                        logger.info(
-                            "Chunk %d/%d transferred",
-                            chunks_sent,
-                            manifest.chunk_count,
-                        )
+                chunks_sent += 1
+                if show_progress:
+                    logger.info(
+                        "Chunk %d/%d streamed",
+                        chunks_sent,
+                        manifest.chunk_count,
+                    )
 
             # Close stdin to signal end of stream
             if receive_process.stdin:
@@ -609,6 +622,16 @@ def _transfer_chunks_ssh(
                 raise __util__.SnapshotTransferError(
                     f"SSH btrfs receive failed with code {return_code}: {stderr}"
                 )
+
+            # Only NOW, after `btrfs receive` has confirmed success, mark the
+            # chunks transferred. Marking them as they were written to stdin (before
+            # receive completed) meant a receive that failed after ingesting bytes
+            # left a manifest full of TRANSFERRED chunks -- on the next run
+            # pending_chunks was empty, so nothing was re-sent and the failed
+            # transfer looked resumable-complete. btrfs receive applies the whole
+            # stream atomically, so all-or-nothing marking is correct.
+            for chunk in manifest.chunks:
+                chunked_manager.mark_chunk_transferred(manifest, chunk.sequence)
 
             logger.info("SSH chunked transfer complete: %d chunks", chunks_sent)
 
