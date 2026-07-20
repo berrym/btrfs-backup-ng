@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import functools
 import json
+import os
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -61,6 +62,26 @@ COMPRESSION_CONFIG: dict[str, dict[str, Any]] = {
 }
 
 
+def _to_utc(dt: datetime) -> datetime:
+    """Return ``dt`` as a UTC-aware datetime so sidecars record unambiguous
+    ISO-8601 UTC (a naive datetime is assumed to already be UTC)."""
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def _fsync_directory(directory: Path) -> None:
+    """Best-effort fsync of a directory so a rename into it is durable."""
+    try:
+        dfd = os.open(directory, os.O_RDONLY)
+        try:
+            os.fsync(dfd)
+        finally:
+            os.close(dfd)
+    except OSError:
+        pass
+
+
 @functools.total_ordering
 @dataclass(eq=False, repr=False)
 class RawSnapshot:
@@ -98,6 +119,13 @@ class RawSnapshot:
     compress: str | None = None
     encrypt: str | None = None
     gpg_recipient: str | None = None
+    openssl_cipher: str | None = None
+    # --- authoritative sidecar (0.8.5) ---
+    # checksum_value is RESERVED: the schema carries checksum{algorithm,value} but
+    # the value is populated later by `raw verify` (computed via a Python-native
+    # stream tee), so the zero-copy write pipeline is not taxed with a second read.
+    checksum_value: str | None = None
+    provenance_origin: str = "native-write"
     # --- Snapshot-interface compatibility (0.8.5) ---
     prefix: str = ""
     time_format: str | None = None
@@ -171,27 +199,52 @@ class RawSnapshot:
         return None
 
     def to_dict(self) -> dict[str, Any]:
-        """Serialize snapshot metadata to a dictionary."""
+        """Serialize snapshot metadata to the v2 sidecar dict.
+
+        v2 is additive over v1: the nested ``pipeline`` block gains
+        ``openssl_cipher``, and ``checksum``/``provenance`` blocks are added. A v1
+        reader ignores the new keys; ``from_dict`` reads either version. ``created``
+        is ISO-8601 in UTC. ``checksum.value`` is reserved (null on the write path;
+        populated later by ``raw verify``).
+        """
         return {
-            "version": 1,
+            "version": 2,
             "name": self.name,
             "uuid": self.uuid,
             "parent_uuid": self.parent_uuid,
             "parent_name": self.parent_name,
-            "created": self.created.isoformat(),
+            "created": _to_utc(self.created).isoformat(),
             "size": self.size,
             "pipeline": {
                 "compress": self.compress,
                 "encrypt": self.encrypt,
                 "gpg_recipient": self.gpg_recipient,
+                "openssl_cipher": self.openssl_cipher,
             },
+            "checksum": {"algorithm": "sha256", "value": self.checksum_value},
+            "provenance": {
+                "origin": self.provenance_origin,
+                "tool_version": __version__,
+            },
+            # Kept for backward compatibility with v1 readers.
             "btrfs_backup_ng_version": __version__,
         }
 
     def save_metadata(self) -> None:
-        """Save metadata to the metadata file."""
-        with open(self.metadata_path, "w", encoding="utf-8") as f:
-            json.dump(self.to_dict(), f, indent=2)
+        """Write the sidecar atomically (temp -> fsync -> rename -> dir fsync) at
+        mode 0600, so a crash never leaves a partial/half-written .meta and the
+        metadata dossier is not world-readable."""
+        meta = self.metadata_path
+        tmp = meta.with_name(meta.name + ".tmp")
+        payload = json.dumps(self.to_dict(), indent=2).encode("utf-8")
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        try:
+            os.write(fd, payload)
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        os.replace(tmp, meta)
+        _fsync_directory(meta.parent)
 
     @classmethod
     def from_dict(cls, data: dict[str, Any], stream_path: Path) -> RawSnapshot:
@@ -204,7 +257,11 @@ class RawSnapshot:
         Returns:
             RawSnapshot instance
         """
-        pipeline = data.get("pipeline", {})
+        # `or {}` (not a default arg) so an explicit JSON null for a block does
+        # not become None and crash the .get() calls below.
+        pipeline = data.get("pipeline") or {}
+        checksum = data.get("checksum") or {}
+        provenance = data.get("provenance") or {}
         created_str = data.get("created")
 
         if created_str:
@@ -224,6 +281,10 @@ class RawSnapshot:
             compress=pipeline.get("compress"),
             encrypt=pipeline.get("encrypt"),
             gpg_recipient=pipeline.get("gpg_recipient"),
+            # v2 fields (absent in v1 -> defaults):
+            openssl_cipher=pipeline.get("openssl_cipher"),
+            checksum_value=checksum.get("value"),
+            provenance_origin=provenance.get("origin", "native-write"),
         )
 
     @classmethod
@@ -353,8 +414,9 @@ def discover_raw_snapshots(
             snapshot = RawSnapshot.load_metadata(meta_path)
             if not prefix or snapshot.name.startswith(prefix):
                 snapshots.append(snapshot)
-        except (json.JSONDecodeError, OSError):
-            # Skip invalid metadata files
+        except (json.JSONDecodeError, OSError, ValueError, TypeError, AttributeError):
+            # Skip a single malformed sidecar rather than aborting the whole
+            # directory listing (bad JSON, wrong types, unexpected structure).
             continue
 
     # Second pass: find stream files without metadata
@@ -363,10 +425,11 @@ def discover_raw_snapshots(
         if not item.is_file() or item.suffix == ".meta":
             continue
 
-        # Skip in-progress stream files: a ".part" file is a transfer that has
-        # not been committed (renamed to its final name), so it must NEVER be
-        # listed as a complete backup.
-        if item.name.endswith(".part"):
+        # Skip in-progress artifacts: a ".part" file is an uncommitted stream and
+        # a ".tmp" file is an uncommitted sidecar (save_metadata writes
+        # "<name>.meta.tmp"). Both contain ".btrfs" in their name, so without this
+        # they would be parsed as phantom complete backups.
+        if item.name.endswith((".part", ".tmp")):
             continue
 
         # Check if it's a btrfs stream file

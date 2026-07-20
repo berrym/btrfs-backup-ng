@@ -27,6 +27,7 @@ from btrfs_backup_ng.endpoint.common import Endpoint
 from btrfs_backup_ng.endpoint.raw_metadata import (
     COMPRESSION_CONFIG,
     RawSnapshot,
+    _fsync_directory,
     discover_raw_snapshots,
     get_file_extension,
     parse_stream_filename,
@@ -43,6 +44,7 @@ class PendingMetadata(TypedDict):
     compress: str | None
     encrypt: str | None
     gpg_recipient: str | None
+    openssl_cipher: str | None
 
 
 # Environment variable for OpenSSL passphrase (compatible with btrbk)
@@ -167,6 +169,7 @@ class RawEndpoint(Endpoint):
             "compress": None,
             "encrypt": None,
             "gpg_recipient": None,
+            "openssl_cipher": None,
         }
 
     def _get_openssl_passphrase(self) -> str | None:
@@ -273,6 +276,11 @@ class RawEndpoint(Endpoint):
             "compress": self.compress,
             "encrypt": self.encrypt,
             "gpg_recipient": self.gpg_recipient,
+            # Only meaningful for openssl_enc; recorded so restore uses the exact
+            # cipher instead of guessing aes-256-cbc.
+            "openssl_cipher": (
+                self.openssl_cipher if self.encrypt == "openssl_enc" else None
+            ),
         }
 
         # Build and execute the pipeline (writes to the .part file)
@@ -375,15 +383,11 @@ class RawEndpoint(Endpoint):
 
     @staticmethod
     def _fsync_dir(directory: Path) -> None:
-        """Best-effort fsync of a directory so a rename into it is durable."""
-        try:
-            dfd = os.open(directory, os.O_RDONLY)
-            try:
-                os.fsync(dfd)
-            finally:
-                os.close(dfd)
-        except OSError as e:
-            logger.debug("Directory fsync failed for %s: %s", directory, e)
+        """Best-effort fsync of a directory so a rename into it is durable.
+
+        Delegates to the single shared implementation so the durability primitive
+        has one definition."""
+        _fsync_directory(directory)
 
     def commit_receive(self) -> None:
         """Atomically publish the received stream after a successful transfer.
@@ -422,7 +426,41 @@ class RawEndpoint(Endpoint):
         os.replace(part_path, final_path)
         # Persist the rename itself.
         self._fsync_dir(final_path.parent)
-        logger.debug("Committed raw stream: %s", final_path)
+        # Write the authoritative sidecar now that the stream is durable at its
+        # final name. Written last + atomically, so a crash yields at most a
+        # stream-without-sidecar (discovery falls back to filename inference),
+        # never a sidecar describing a missing/partial stream. Best-effort: the
+        # backup data already succeeded, so a sidecar error must not fail it.
+        try:
+            self._sidecar_snapshot(
+                final_path, final_path.stat().st_size
+            ).save_metadata()
+        except Exception as e:
+            # The backup data is already durable; a sidecar error must NEVER flip
+            # an already-successful transfer into a reported failure (PR1 contract).
+            # A missing sidecar just degrades to filename inference.
+            logger.warning("Failed to write sidecar for %s: %s", final_path, e)
+        self._cached_snapshots = None  # re-discover to include the new sidecar
+        logger.debug("Committed raw stream + sidecar: %s", final_path)
+
+    def _sidecar_snapshot(self, final_path: Path, size: int) -> RawSnapshot:
+        """Build the authoritative RawSnapshot to persist for a just-committed
+        stream, from the pending receive metadata. openssl_cipher is recorded so
+        restore uses the exact cipher; the checksum is reserved (filled later by
+        ``raw verify``)."""
+        pending = self._pending_metadata
+        return RawSnapshot(
+            name=pending["name"],
+            stream_path=final_path,
+            parent_name=pending.get("parent_name"),
+            created=datetime.now(timezone.utc),
+            size=size,
+            compress=pending.get("compress"),
+            encrypt=pending.get("encrypt"),
+            gpg_recipient=pending.get("gpg_recipient"),
+            openssl_cipher=pending.get("openssl_cipher"),
+            provenance_origin="native-write",
+        )
 
     def finalize_receive(
         self, proc: subprocess.Popen, uuid: str = "", parent_uuid: str | None = None
@@ -887,7 +925,63 @@ class SSHRawEndpoint(RawEndpoint):
                 f"Failed to publish remote raw stream {final_path}: "
                 f"{(stderr or '').strip()}"
             )
-        logger.debug("Committed remote raw stream: %s", final_path)
+        # Write the authoritative sidecar remotely (best-effort: the stream is
+        # already durable, so a sidecar error must not fail the backup).
+        self._write_remote_sidecar(Path(str(final_path)))
+        self._cached_snapshots = None
+        logger.debug("Committed remote raw stream + sidecar: %s", final_path)
+
+    def _write_remote_sidecar(self, final_path: Path) -> None:
+        """Stat the committed remote stream for its size, then write its .meta
+        sidecar remotely and atomically (temp -> sync -> mv -> chmod 600)."""
+        size = 0
+        # Portable remote size: GNU `stat -c %s`, else BSD/macOS `stat -f %z`,
+        # else POSIX `wc -c`. A raw target is often a non-Linux box (NAS, macOS),
+        # so GNU-only stat would record a bogus size on those.
+        q = shlex.quote(str(final_path))
+        size_cmd = (
+            f"stat -c %s {q} 2>/dev/null || stat -f %z {q} 2>/dev/null || wc -c < {q}"
+        )
+        try:
+            stat_res = self._exec_remote_command(["sh", "-c", size_cmd], check=False)
+            out = stat_res.stdout
+            if isinstance(out, (bytes, bytearray)):
+                out = out.decode(errors="replace")
+            if stat_res.returncode == 0:
+                size = int((str(out) or "0").strip() or "0")
+            else:
+                # Do not silently persist a bogus authoritative size of 0 -- make
+                # the failure observable (size stays 0, best-effort).
+                logger.warning(
+                    "Remote size of %s failed (rc=%s); recording sidecar size=0",
+                    final_path,
+                    stat_res.returncode,
+                )
+        except (ValueError, TypeError, OSError) as e:
+            logger.warning(
+                "Could not size remote stream %s: %s; recording sidecar size=0",
+                final_path,
+                e,
+            )
+        snapshot = self._sidecar_snapshot(final_path, size)
+        payload = json.dumps(snapshot.to_dict(), indent=2).encode("utf-8")
+        meta = f"{final_path}.meta"
+        tmp = f"{meta}.tmp"
+        script = (
+            f"cat > {shlex.quote(tmp)} && sync && "
+            f"mv -f {shlex.quote(tmp)} {shlex.quote(meta)} && "
+            f"chmod 600 {shlex.quote(meta)}"
+        )
+        result = self._exec_remote_command(
+            ["sh", "-c", script], input=payload, check=False
+        )
+        if result.returncode != 0:
+            stderr = result.stderr
+            if isinstance(stderr, (bytes, bytearray)):
+                stderr = stderr.decode(errors="replace")
+            logger.warning(
+                "Failed to write remote sidecar %s: %s", meta, (stderr or "").strip()
+            )
 
     def list_snapshots(self, flush_cache: bool = False) -> list[RawSnapshot]:
         """List raw snapshots on the remote host.
@@ -977,7 +1071,9 @@ class SSHRawEndpoint(RawEndpoint):
         # recorded name differs from the filename stem.
         loaded_paths = {str(s.stream_path) for s in snapshots}
         for stream_path_str in stream_files:
-            if not stream_path_str or stream_path_str.endswith((".meta", ".part")):
+            if not stream_path_str or stream_path_str.endswith(
+                (".meta", ".part", ".tmp")
+            ):
                 continue
             if stream_path_str in loaded_paths:
                 continue

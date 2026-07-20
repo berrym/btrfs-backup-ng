@@ -91,9 +91,10 @@ def test_commit_without_receive_is_noop(tmp_path):
 
 
 def test_ssh_commit_builds_sync_mv_sync_script_and_publishes():
-    """SSH commit runs exactly 'sync && mv -f <part> <final> && sync' remotely
-    (leading sync flushes bytes before rename; trailing sync makes the rename
-    durable). Mocked -- runs without any real SSH."""
+    """SSH commit's FIRST remote call publishes the stream with exactly
+    'sync && mv -f <part> <final> && sync' (leading sync flushes bytes before the
+    rename; trailing sync makes the rename durable); it then stats + writes the
+    sidecar remotely. Mocked -- runs without any real SSH."""
     ep = SSHRawEndpoint.__new__(SSHRawEndpoint)
     ep._pending_metadata = {
         "name": "snap",
@@ -101,17 +102,20 @@ def test_ssh_commit_builds_sync_mv_sync_script_and_publishes():
         "part_path": "/remote/snap.btrfs.part",
     }
     ep._exec_remote_command = MagicMock(
-        return_value=MagicMock(returncode=0, stderr=b"")
+        return_value=MagicMock(returncode=0, stderr=b"", stdout=b"1")
     )
     ep.commit_receive()
 
-    ep._exec_remote_command.assert_called_once()
-    argv = ep._exec_remote_command.call_args[0][0]
-    assert argv[0] == "sh"
-    assert argv[1] == "-c"
-    assert argv[2] == (
+    calls = ep._exec_remote_command.call_args_list
+    first_argv = calls[0][0][0]
+    assert first_argv[0] == "sh" and first_argv[1] == "-c"
+    assert first_argv[2] == (
         "sync && mv -f /remote/snap.btrfs.part /remote/snap.btrfs && sync"
     )
+    # The sidecar is published remotely and atomically (temp -> mv -> chmod 600).
+    sh_scripts = " ".join(c[0][0][2] for c in calls if c[0][0][0] == "sh")
+    assert "/remote/snap.btrfs.meta" in sh_scripts
+    assert "chmod 600" in sh_scripts
 
 
 def test_ssh_commit_raises_on_remote_failure():
@@ -143,14 +147,14 @@ def test_ssh_commit_wraps_in_sudo_when_configured():
         "part_path": "/backup/snap.btrfs.part",
     }
     with patch("btrfs_backup_ng.endpoint.raw.subprocess.run") as mrun:
-        mrun.return_value = MagicMock(returncode=0, stderr=b"")
+        mrun.return_value = MagicMock(returncode=0, stderr=b"", stdout=b"1")
         ep.commit_receive()
 
-    mrun.assert_called_once()
-    remote = mrun.call_args[0][0][-1]  # last element of the ssh argv
+    # First remote call is the sudoed mv; the sidecar stat/write calls follow.
+    remote = mrun.call_args_list[0][0][0][-1]  # last element of the ssh argv
     assert remote.startswith("sudo ")
     assert "sync && mv -f" in remote
-    assert remote.rstrip().endswith("&& sync") or "&& sync" in remote
+    assert "&& sync" in remote
 
 
 def test_commit_never_overwrites_a_committed_final(tmp_path):
