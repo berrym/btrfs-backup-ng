@@ -290,6 +290,12 @@ def discover_raw_snapshots(
         if not item.is_file() or item.suffix == ".meta":
             continue
 
+        # Skip in-progress stream files: a ".part" file is a transfer that has
+        # not been committed (renamed to its final name), so it must NEVER be
+        # listed as a complete backup.
+        if item.name.endswith(".part"):
+            continue
+
         # Check if it's a btrfs stream file
         if ".btrfs" not in item.name:
             continue

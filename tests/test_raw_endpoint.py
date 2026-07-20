@@ -554,12 +554,13 @@ class TestRawEndpointReceive:
         assert endpoint._pending_metadata["encrypt"] is None
 
     def test_receive_writes_stream_to_output_file(self, tmp_path):
-        """receive() writes the stream to the named file, not the cwd.
+        """receive() writes to a .part file; commit_receive() publishes it atomically.
 
-        Regression: _execute_pipeline reads stream_path from _pending_metadata,
-        which receive() previously set only AFTER executing, so the default
-        Path() ('.') was used and the pipeline opened the current directory
-        (IsADirectoryError). This runs the real pipeline (no mocks).
+        Regression: _execute_pipeline reads part_path from _pending_metadata,
+        which receive() sets BEFORE executing. This also pins the atomic-write
+        contract: the final name must NOT appear until commit_receive(), so a
+        crashed transfer can never be listed as a complete backup. Runs the real
+        pipeline (no mocks).
         """
         endpoint = RawEndpoint(config={"path": str(tmp_path)})
         src = tmp_path / "src.bin"
@@ -571,7 +572,15 @@ class TestRawEndpointReceive:
 
         assert proc.returncode == 0
         out = tmp_path / "snap-1.btrfs"
+        part = tmp_path / "snap-1.btrfs.part"
+        # Before commit, only the .part file exists -- the final name must not
+        # appear until commit_receive() atomically publishes it.
+        assert part.exists()
+        assert not out.exists()
+
+        endpoint.commit_receive()
         assert out.exists()
+        assert not part.exists()
         assert out.read_bytes() == b"hello-raw-stream"
 
     def test_receive_with_compression(self, tmp_path):
@@ -624,7 +633,10 @@ class TestRawEndpointExecutePipeline:
         """Test executing single-command pipeline."""
         endpoint = RawEndpoint(config={"path": tmp_path})
         output_path = tmp_path / "test.btrfs"
-        endpoint._pending_metadata = {"stream_path": output_path}
+        endpoint._pending_metadata = {
+            "stream_path": output_path,
+            "part_path": tmp_path / "test.btrfs.part",
+        }
 
         mock_stdin = MagicMock()
 
@@ -640,7 +652,10 @@ class TestRawEndpointExecutePipeline:
         """Test executing multi-command pipeline."""
         endpoint = RawEndpoint(config={"path": tmp_path})
         output_path = tmp_path / "test.btrfs.gz"
-        endpoint._pending_metadata = {"stream_path": output_path}
+        endpoint._pending_metadata = {
+            "stream_path": output_path,
+            "part_path": tmp_path / "test.btrfs.gz.part",
+        }
 
         mock_stdin = MagicMock()
 
@@ -917,7 +932,10 @@ class TestSSHRawEndpointMethods:
                 "username": "backup",
             }
         )
-        endpoint._pending_metadata = {"stream_path": Path("/backup/test.btrfs")}
+        endpoint._pending_metadata = {
+            "stream_path": Path("/backup/test.btrfs"),
+            "part_path": Path("/backup/test.btrfs.part"),
+        }
         mock_stdin = MagicMock()
 
         with patch("subprocess.Popen") as mock_popen:
@@ -939,7 +957,10 @@ class TestSSHRawEndpointMethods:
                 "compress": "zstd",
             }
         )
-        endpoint._pending_metadata = {"stream_path": Path("/backup/test.btrfs.zst")}
+        endpoint._pending_metadata = {
+            "stream_path": Path("/backup/test.btrfs.zst"),
+            "part_path": Path("/backup/test.btrfs.zst.part"),
+        }
         mock_stdin = MagicMock()
 
         with patch("subprocess.Popen") as mock_popen:
@@ -960,7 +981,10 @@ class TestSSHRawEndpointMethods:
                 "ssh_sudo": True,
             }
         )
-        endpoint._pending_metadata = {"stream_path": Path("/backup/test.btrfs")}
+        endpoint._pending_metadata = {
+            "stream_path": Path("/backup/test.btrfs"),
+            "part_path": Path("/backup/test.btrfs.part"),
+        }
         mock_stdin = MagicMock()
 
         with patch("subprocess.Popen") as mock_popen:

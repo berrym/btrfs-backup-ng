@@ -66,7 +66,7 @@ class Endpoint:
         self.config["timestamp_format"] = config.get("timestamp_format")
 
         self.btrfs_flags = ["-vv"] if self.config["btrfs_debug"] else []
-        self.__cached_snapshots = None
+        self.__cached_snapshots: List[Any] | None = None
 
         for key, value in kwargs.items():
             self.config[key] = value
@@ -261,6 +261,17 @@ class Endpoint:
         except Exception as e:
             logger.error("Error executing receive command: %s", e)
             raise
+
+    def commit_receive(self) -> None:
+        """Durably commit received data on the success path.
+
+        Called by the transfer engine only after the receive pipeline has been
+        confirmed successful. The base endpoint receives into a btrfs subvolume,
+        which ``btrfs receive`` already commits atomically, so this is a no-op.
+        RawEndpoint overrides it to fsync a temporary stream file and atomically
+        rename it to its final name.
+        """
+        return
 
     def list_snapshots(self, flush_cache: bool = False) -> List[Any]:
         """

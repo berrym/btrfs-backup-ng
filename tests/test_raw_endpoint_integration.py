@@ -430,6 +430,7 @@ class TestShellPipelineExecution:
         endpoint._pending_metadata = {
             "name": "test-snapshot",
             "stream_path": output_file,
+            "part_path": output_file.parent / (output_file.name + ".part"),
             "parent_name": None,
             "compress": "gzip",
             "encrypt": None,
@@ -444,6 +445,7 @@ class TestShellPipelineExecution:
             proc.wait()
 
         assert proc.returncode == 0
+        endpoint.commit_receive()  # publish .part -> final
         assert output_file.exists()
         assert output_file.stat().st_size > 0
 
@@ -477,6 +479,7 @@ class TestShellPipelineExecution:
         endpoint._pending_metadata = {
             "name": "test",
             "stream_path": output_file,
+            "part_path": output_file.parent / (output_file.name + ".part"),
             "parent_name": None,
             "compress": "gzip",
             "encrypt": None,
@@ -491,6 +494,7 @@ class TestShellPipelineExecution:
             proc.wait()
 
         assert proc.returncode == 0
+        endpoint.commit_receive()  # publish .part -> final
         assert output_file.exists()
 
 
@@ -1064,6 +1068,7 @@ class TestSSHRawEndpointIntegration:
         endpoint._pending_metadata = {
             "name": "test",
             "stream_path": output_file,
+            "part_path": output_file.parent / (output_file.name + ".part"),
             "parent_name": None,
             "compress": "zstd",
             "encrypt": None,
@@ -1085,6 +1090,7 @@ class TestSSHRawEndpointIntegration:
         proc.wait()
 
         assert result.returncode == 0
+        endpoint.commit_receive()  # remote sync + atomic mv .part -> final
         assert output_file.exists()
 
         # Verify data can be decompressed
@@ -1257,6 +1263,7 @@ class TestEdgeCases:
         endpoint._pending_metadata = {
             "name": "empty",
             "stream_path": output_file,
+            "part_path": output_file.parent / (output_file.name + ".part"),
             "parent_name": None,
             "compress": "gzip",
             "encrypt": None,
@@ -1268,6 +1275,7 @@ class TestEdgeCases:
             proc.wait()
 
         assert proc.returncode == 0
+        endpoint.commit_receive()  # publish .part -> final
         assert output_file.exists()
 
         # Decompress should return empty
@@ -1292,6 +1300,7 @@ class TestEdgeCases:
         endpoint._pending_metadata = {
             "name": "large",
             "stream_path": output_file,
+            "part_path": output_file.parent / (output_file.name + ".part"),
             "parent_name": None,
             "compress": "gzip",
             "encrypt": None,
@@ -1303,6 +1312,7 @@ class TestEdgeCases:
             proc.wait()
 
         assert proc.returncode == 0
+        endpoint.commit_receive()  # publish .part -> final
         assert output_file.exists()
         # Highly repetitive data should compress very well
         assert output_file.stat().st_size < len(large_data) / 100

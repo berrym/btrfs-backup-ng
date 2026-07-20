@@ -173,29 +173,47 @@ class TestChunkedPartialCleanup:
 
 
 class TestRawPartialCleanup:
-    """A failed raw transfer's partial stream file must be removed by its EXACT
-    path (never by a 'missing .meta' heuristic -- a complete generic raw backup
-    also lacks .meta, so that would delete good backups)."""
+    """A failed raw transfer leaves an uncommitted ``.part`` file; cleanup must
+    remove exactly that ``part_path`` (never the final name, which could be a
+    prior good backup, and never a name pattern)."""
 
-    def test_local_raw_deletes_exact_stream_file(self, tmp_path):
+    def test_local_raw_deletes_exact_part_file(self, tmp_path):
         from btrfs_backup_ng.endpoint.raw import RawEndpoint
 
-        f = tmp_path / "host-20260719.btrfs"
-        f.write_bytes(b"partial stream")
+        final = tmp_path / "host-20260719.btrfs"
+        part = tmp_path / "host-20260719.btrfs.part"
+        part.write_bytes(b"partial stream")
         ep = RawEndpoint.__new__(RawEndpoint)
-        ep._pending_metadata = {"stream_path": f}
+        ep._pending_metadata = {"stream_path": final, "part_path": part}
         ops._cleanup_partial_raw_stream(ep)
-        assert not f.exists()
+        assert not part.exists()
+
+    def test_local_raw_preserves_committed_final(self, tmp_path):
+        """False-negative guard: cleanup must NEVER delete a committed backup
+        that happens to sit at the final name."""
+        from btrfs_backup_ng.endpoint.raw import RawEndpoint
+
+        final = tmp_path / "host-20260719.btrfs"
+        final.write_bytes(b"good backup")
+        part = tmp_path / "host-20260719.btrfs.part"
+        ep = RawEndpoint.__new__(RawEndpoint)
+        ep._pending_metadata = {"stream_path": final, "part_path": part}
+        ops._cleanup_partial_raw_stream(ep)
+        assert final.exists()
+        assert final.read_bytes() == b"good backup"
 
     def test_ssh_raw_deletes_via_remote_command(self):
         from btrfs_backup_ng.endpoint.raw import SSHRawEndpoint
 
         ep = SSHRawEndpoint.__new__(SSHRawEndpoint)
-        ep._pending_metadata = {"stream_path": "/remote/host-20260719.btrfs"}
+        ep._pending_metadata = {
+            "stream_path": "/remote/host-20260719.btrfs",
+            "part_path": "/remote/host-20260719.btrfs.part",
+        }
         ep._exec_remote_command = MagicMock()
         ops._cleanup_partial_raw_stream(ep)
         ep._exec_remote_command.assert_called_once_with(
-            ["rm", "-f", "/remote/host-20260719.btrfs"], check=False
+            ["rm", "-f", "/remote/host-20260719.btrfs.part"], check=False
         )
 
     def test_non_raw_endpoint_is_noop(self):
