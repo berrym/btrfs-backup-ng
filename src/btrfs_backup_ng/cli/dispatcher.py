@@ -30,6 +30,7 @@ SUBCOMMANDS = frozenset(
         "manpages",
         "doctor",
         "snapper",
+        "raw",
     }
 )
 
@@ -347,6 +348,34 @@ def create_subcommand_parser() -> argparse.ArgumentParser:
         "--dry-run",
         action="store_true",
         help="Show what would be done without making changes",
+    )
+
+    # raw command with subcommands (inspect/maintain raw:// and raw+ssh:// targets)
+    raw_parser = subparsers.add_parser(
+        "raw",
+        help="Inspect and maintain raw-target backups",
+        description="Operate directly on a raw:// or raw+ssh:// backup target",
+    )
+    raw_subs = raw_parser.add_subparsers(dest="raw_action")
+    raw_list_parser = raw_subs.add_parser(
+        "list",
+        help="List the backups a raw target holds",
+        description="Enumerate a raw target's backups via their .meta sidecars",
+    )
+    raw_list_parser.add_argument(
+        "target",
+        metavar="TARGET",
+        help="Raw target: raw://PATH, raw+ssh://[USER@]HOST/PATH, or a plain path",
+    )
+    raw_list_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Output in JSON format for scripting",
+    )
+    raw_list_parser.add_argument(
+        "--ssh-sudo",
+        action="store_true",
+        help="Use sudo for remote commands on a raw+ssh target",
     )
 
     # install command
@@ -1432,6 +1461,7 @@ def run_subcommand(args: argparse.Namespace) -> int:
         "manpages": cmd_manpages,
         "doctor": cmd_doctor,
         "snapper": cmd_snapper,
+        "raw": cmd_raw,
     }
 
     handler = handlers.get(args.command)
@@ -1563,6 +1593,13 @@ def cmd_snapper(args: argparse.Namespace) -> int:
     from .snapper_cmd import execute_snapper
 
     return execute_snapper(args)
+
+
+def cmd_raw(args: argparse.Namespace) -> int:
+    """Execute raw command."""
+    from .raw_cmd import execute_raw
+
+    return execute_raw(args)
 
 
 def main(argv: list[str] | None = None) -> int:

@@ -1,0 +1,74 @@
+.\" Man page for btrfs-backup-ng raw
+.TH BTRFS-BACKUP-NG-RAW 1 "July 2026" "btrfs-backup-ng" "User Commands"
+.SH NAME
+btrfs-backup-ng-raw \- inspect and maintain raw-target backups
+.SH SYNOPSIS
+.B btrfs-backup-ng raw list
+\fITARGET\fR [\fB\-\-json\fR] [\fB\-\-ssh-sudo\fR]
+.SH DESCRIPTION
+Operate directly on a raw backup target. Raw targets (\fBraw://\fR and
+\fBraw+ssh://\fR) store btrfs send streams as files for backing up to non-btrfs
+storage (NFS, SMB, cloud, another OS). Each stream is written with an
+authoritative \fB.meta\fR sidecar recording its pipeline (compression, encryption,
+cipher), size, provenance, and creation time.
+.PP
+These subcommands read and maintain such a target directly, independently of any
+configured backup job.
+.SH SUBCOMMANDS
+.SS list
+List the backups a raw target holds.
+.PP
+.RS
+.B btrfs-backup-ng raw list
+\fITARGET\fR [\fB\-\-json\fR] [\fB\-\-ssh-sudo\fR]
+.RE
+.PP
+Enumerates the target's backups from each stream's \fB.meta\fR sidecar, falling
+back to filename inference for legacy streams written before sidecars existed.
+The human-readable output lists each backup's name, creation time, size, and
+pipeline (encryption method, compression, openssl cipher, and metadata origin).
+.TP
+.I TARGET
+Raw target to inspect: \fBraw://\fIPATH\fR (local),
+\fBraw+ssh://\fR[\fIUSER\fR@]\fIHOST\fR/\fIPATH\fR (remote over SSH), or a plain
+path (treated as \fBraw://\fR).
+.TP
+.B \-\-json
+Output the authoritative sidecar documents as JSON for scripting.
+.TP
+.B \-\-ssh-sudo
+Use \fBsudo\fR for the remote commands on a \fBraw+ssh://\fR target.
+.SH EXIT STATUS
+.TP
+.B 0
+Success (including an empty or nonexistent target; a warning is printed for a
+missing local path).
+.TP
+.B 1
+The target could not be listed.
+.TP
+.B 2
+Invalid target (for example a non-raw URL scheme).
+.SH EXAMPLES
+.TP
+List a local raw target:
+.B btrfs-backup-ng raw list raw:///mnt/usb/backups
+.TP
+List a plain path (treated as raw://):
+.B btrfs-backup-ng raw list /mnt/usb/backups
+.TP
+List a remote raw+ssh target with sudo:
+.B btrfs-backup-ng raw list raw+ssh://backup@nas/backups --ssh-sudo
+.TP
+Machine-readable output:
+.B btrfs-backup-ng raw list raw:///mnt/usb/backups --json
+.SH SEE ALSO
+.BR btrfs-backup-ng (1),
+.BR btrfs-backup-ng-restore (1),
+.BR btrfs-send (8),
+.BR btrfs-receive (8)
+.SH NOTES
+A \fBraw+ssh://\fR target is a POSIX-shell-remote model: btrfs-backup-ng runs
+\fBsh\fR, \fBcat\fR, \fBmv\fR, and \fBstat\fR over SSH on the remote host. For a
+non-POSIX or SMB/NFS/cloud destination, mount it locally and use a \fBraw://\fR
+path instead.

@@ -5,12 +5,13 @@ _btrfs_backup_ng() {
     local cur prev words cword split
     _init_completion -s || return
 
-    local commands="run snapshot transfer prune list status config install uninstall restore verify estimate doctor completions manpages transfers snapper"
+    local commands="run snapshot transfer prune list status config install uninstall restore verify estimate doctor completions manpages transfers snapper raw"
     local config_subcommands="validate init import detect"
     local completions_subcommands="install path"
     local manpages_subcommands="install path"
     local transfers_subcommands="list show resume pause cleanup operations"
     local snapper_subcommands="detect list backup status restore generate-config"
+    local raw_subcommands="list"
 
     # Global options
     local global_opts="-h --help -v --verbose -q --quiet --debug -V --version -c --config"
@@ -45,6 +46,7 @@ _btrfs_backup_ng() {
     local snapper_status_opts="--json"
     local snapper_restore_opts="--snapshot --dry-run --ssh-sudo --ssh-key"
     local snapper_generate_config_opts="-o --output"
+    local raw_list_opts="--json --ssh-sudo"
     local snapper_types="single pre post"
     local verify_levels="metadata stream full"
     local shell_types="bash zsh fish"
@@ -62,15 +64,26 @@ _btrfs_backup_ng() {
     local i
     for ((i=1; i < cword; i++)); do
         case "${words[i]}" in
-            run|snapshot|transfer|prune|list|status|config|install|uninstall|restore|verify|estimate|doctor|completions|manpages|transfers|snapper)
+            run|snapshot|transfer|prune|status|config|install|uninstall|restore|verify|estimate|doctor|completions|manpages|transfers|snapper|raw)
                 cmd="${words[i]}"
+                ;;
+            list)
+                # `list` is both a top-level command and a subcommand of
+                # transfers/raw: only treat it as the command when none is set yet,
+                # otherwise it is the subcommand (a plain command list first, then
+                # the combined-arm check, would let it overwrite $cmd to "list").
+                if [[ -z "$cmd" ]]; then
+                    cmd="list"
+                elif [[ "$cmd" == "transfers" || "$cmd" == "raw" ]]; then
+                    subcmd="list"
+                fi
                 ;;
             validate|init|import|detect)
                 if [[ "$cmd" == "config" ]]; then
                     subcmd="${words[i]}"
                 fi
                 ;;
-            list|show|resume|pause|cleanup|operations)
+            show|resume|pause|cleanup|operations)
                 if [[ "$cmd" == "transfers" ]]; then
                     subcmd="${words[i]}"
                 fi
@@ -345,6 +358,25 @@ _btrfs_backup_ng() {
                         ;;
                     generate-config)
                         COMPREPLY=($(compgen -W "$snapper_generate_config_opts" -- "$cur"))
+                        ;;
+                esac
+            fi
+            ;;
+        raw)
+            if [[ -z "$subcmd" ]]; then
+                if [[ "$cur" == -* ]]; then
+                    COMPREPLY=($(compgen -W "-h --help" -- "$cur"))
+                else
+                    COMPREPLY=($(compgen -W "$raw_subcommands" -- "$cur"))
+                fi
+            else
+                case "$subcmd" in
+                    list)
+                        if [[ "$cur" == -* ]]; then
+                            COMPREPLY=($(compgen -W "$raw_list_opts" -- "$cur"))
+                        else
+                            _filedir -d
+                        fi
                         ;;
                 esac
             fi

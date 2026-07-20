@@ -26,6 +26,7 @@ _btrfs-backup-ng() {
         'manpages:Install man pages'
         'transfers:Manage chunked and resumable transfers (experimental)'
         'snapper:Manage snapper-managed snapshots'
+        'raw:Inspect and maintain raw-target backups'
     )
 
     local -a global_opts
@@ -387,6 +388,31 @@ _btrfs-backup-ng() {
                                 generate-config)
                                     _arguments \
                                         '(-o --output)'{-o,--output}'[Output file]:file:_files'
+                                    ;;
+                            esac
+                            ;;
+                    esac
+                    ;;
+                raw)
+                    local -a raw_commands
+                    raw_commands=(
+                        'list:List the backups a raw target holds'
+                    )
+                    _arguments \
+                        '1: :->raw_cmd' \
+                        '*:: :->raw_args'
+
+                    case $state in
+                        raw_cmd)
+                            _describe -t commands 'raw command' raw_commands
+                            ;;
+                        raw_args)
+                            case $line[1] in
+                                list)
+                                    _arguments \
+                                        '--json[Output in JSON format]' \
+                                        '--ssh-sudo[Use sudo for remote commands on a raw+ssh target]' \
+                                        '1:raw target:_files -/'
                                     ;;
                             esac
                             ;;
