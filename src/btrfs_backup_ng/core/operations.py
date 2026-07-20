@@ -1322,7 +1322,13 @@ def _execute_transfers(
             best_snapshot = to_transfer[-1]
             parent = None
         else:
-            # Find snapshots present on destination for incremental
+            # Find snapshots present on destination for incremental.
+            # `snap in destination_snapshots` relies on the DESTINATION element's
+            # __eq__: for a raw target that is RawSnapshot.__eq__ (name-based),
+            # which is how a source btrfs snapshot is matched to its raw backup.
+            # Do NOT rewrite as `snap == d` -- that invokes the source Snapshot's
+            # prefix+time_obj __eq__, which never matches a raw snapshot and would
+            # silently degrade every backup-to-raw to a full send.
             present_snapshots = [
                 snap
                 for snap in source_snapshots

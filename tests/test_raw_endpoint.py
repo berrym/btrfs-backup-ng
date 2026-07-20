@@ -1,5 +1,6 @@
 """Tests for raw target endpoint."""
 
+import subprocess
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -1025,16 +1026,78 @@ class TestSSHRawEndpointMethods:
         )
 
         with patch("subprocess.run") as mock_run:
-            # First call: find metadata files
-            # Second call: cat metadata file
+            # 1) find *.meta  2) cat the meta  3) second-pass find *.btrfs*
+            # (returns the same stream, which is deduped against the meta pass).
             mock_run.side_effect = [
                 MagicMock(returncode=0, stdout="/backup/test.btrfs.meta\n"),
                 MagicMock(returncode=0, stdout=meta_content),
+                MagicMock(returncode=0, stdout="/backup/test.btrfs\n"),
             ]
             snapshots = endpoint.list_snapshots()
 
         assert len(snapshots) == 1
         assert snapshots[0].name == "test"
+
+    def test_list_snapshots_discovers_sidecar_less_remote(self):
+        """The second pass must surface remote streams that have NO .meta sidecar
+        (legacy/direct backups) -- otherwise they are invisible and unrestorable."""
+        endpoint = SSHRawEndpoint(config={"path": "/backup", "hostname": "nas"})
+
+        with patch("subprocess.run") as mock_run:
+            mock_run.side_effect = [
+                MagicMock(returncode=0, stdout=""),  # find *.meta -> none
+                # second-pass find *.btrfs* -> a sidecar-less compressed stream
+                MagicMock(returncode=0, stdout="/backup/legacy.btrfs.zst\n"),
+                MagicMock(returncode=0, stdout="1705320000 4096\n"),  # stat: mtime size
+            ]
+            snapshots = endpoint.list_snapshots()
+
+        assert len(snapshots) == 1
+        snap = snapshots[0]
+        assert snap.name == "legacy"
+        assert snap.compress == "zstd"  # inferred from the filename
+        assert snap.size == 4096
+        assert snap.endpoint is endpoint  # restore can read it back
+
+    def test_list_snapshots_dedups_meta_and_stream_by_path(self):
+        """A stream that has a .meta must not be listed twice even when its
+        recorded name differs from the filename stem (dedup on stream PATH)."""
+        endpoint = SSHRawEndpoint(config={"path": "/backup", "hostname": "nas"})
+        # .meta records a name ("renamed") different from the filename stem ("x").
+        meta = '{"name": "renamed", "created": "2024-01-15T12:00:00"}'
+        with patch("subprocess.run") as mock_run:
+            mock_run.side_effect = [
+                MagicMock(returncode=0, stdout="/backup/x.btrfs.meta\n"),
+                MagicMock(returncode=0, stdout=meta),
+                MagicMock(returncode=0, stdout="/backup/x.btrfs\n"),  # same stream
+            ]
+            snapshots = endpoint.list_snapshots()
+        assert len(snapshots) == 1  # deduped by path, not by (divergent) name
+        assert snapshots[0].name == "renamed"
+
+    def test_list_snapshots_second_pass_skips_part(self):
+        """An in-progress remote .part must never be listed as a backup."""
+        endpoint = SSHRawEndpoint(config={"path": "/backup", "hostname": "nas"})
+        with patch("subprocess.run") as mock_run:
+            mock_run.side_effect = [
+                MagicMock(returncode=0, stdout=""),  # find *.meta -> none
+                MagicMock(returncode=0, stdout="/backup/x.btrfs.part\n"),
+            ]
+            snapshots = endpoint.list_snapshots()
+        assert snapshots == []
+
+    def test_list_snapshots_skips_unstatable_stream(self):
+        """A stream that cannot be stat'd is skipped, not surfaced with a
+        fabricated created=now that would sort as newest."""
+        endpoint = SSHRawEndpoint(config={"path": "/backup", "hostname": "nas"})
+        with patch("subprocess.run") as mock_run:
+            mock_run.side_effect = [
+                MagicMock(returncode=0, stdout=""),  # find *.meta -> none
+                MagicMock(returncode=0, stdout="/backup/x.btrfs\n"),  # find stream
+                subprocess.CalledProcessError(1, "stat"),  # stat fails
+            ]
+            snapshots = endpoint.list_snapshots()
+        assert snapshots == []
 
     def test_list_snapshots_caching(self):
         """Test that SSH snapshot listing uses caching."""

@@ -18,6 +18,7 @@ import os
 import shlex
 import shutil
 import subprocess
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, TypedDict
 
@@ -28,6 +29,7 @@ from btrfs_backup_ng.endpoint.raw_metadata import (
     RawSnapshot,
     discover_raw_snapshots,
     get_file_extension,
+    parse_stream_filename,
 )
 
 
@@ -589,10 +591,37 @@ class RawEndpoint(Endpoint):
         prefix = self.config.get("snap_prefix", "")
 
         snapshots = discover_raw_snapshots(path, prefix)
+        # Restore/verify read the stream via this endpoint, so each snapshot must
+        # know which endpoint owns it (mirrors __util__.Snapshot.endpoint).
+        for snapshot in snapshots:
+            snapshot.endpoint = self
         self._cached_snapshots = snapshots
 
         logger.debug("Found %d raw snapshots in %s", len(snapshots), path)
         return list(snapshots)
+
+    def set_lock(
+        self,
+        snapshot: Any,
+        lock_id: Any,
+        lock_state: bool,
+        parent: bool = False,
+    ) -> None:
+        """Update the in-memory retention lock on a raw snapshot.
+
+        Overrides the base Endpoint.set_lock, which requires a ``source`` and
+        writes a LOCAL lock file at ``config['path']`` -- both wrong for a raw
+        target (restore does not set a source, and the path is remote for
+        raw+ssh, so the base write would raise and abort the restore). Raw lock
+        PERSISTENCE across runs is a separate change (audit root R3); until then
+        this mutates only the in-memory lock set so the restore/transfer
+        lock-guard logic works without touching disk.
+        """
+        target = snapshot.parent_locks if parent else snapshot.locks
+        if lock_state:
+            target.add(lock_id)
+        else:
+            target.discard(lock_id)
 
     def delete_snapshots(self, snapshots: list[RawSnapshot], **kwargs: Any) -> None:
         """Delete raw snapshot files and their metadata.
@@ -919,7 +948,82 @@ class SSHRawEndpoint(RawEndpoint):
                 logger.debug("Failed to parse remote metadata %s: %s", meta_path, e)
                 continue
 
+        # Second pass: sidecar-less remote streams (legacy backups, direct
+        # btrfs sends, lost .meta). Without this, remote backups that predate
+        # .meta sidecars are invisible -- unlistable and unrestorable. Mirrors
+        # discover_raw_snapshots' filename-fallback pass.
+        loaded_names = {s.name for s in snapshots}
+        prefix = self.config.get("snap_prefix", "")
+        find_stream_cmd = (
+            f"find {shlex.quote(str(path))} -name '*.btrfs*' -type f 2>/dev/null"
+        )
+        if self.ssh_sudo:
+            find_stream_cmd = f"sudo {find_stream_cmd}"
+        try:
+            result = subprocess.run(
+                ssh_cmd + [find_stream_cmd],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            stream_files = (
+                result.stdout.strip().split("\n") if result.stdout.strip() else []
+            )
+        except subprocess.CalledProcessError:
+            stream_files = []
+
+        # Dedup on the stream PATH (unambiguous) as well as the derived name, so
+        # a stream that also has a .meta is never enumerated twice even if its
+        # recorded name differs from the filename stem.
+        loaded_paths = {str(s.stream_path) for s in snapshots}
+        for stream_path_str in stream_files:
+            if not stream_path_str or stream_path_str.endswith((".meta", ".part")):
+                continue
+            if stream_path_str in loaded_paths:
+                continue
+            stream_path = Path(stream_path_str)
+            parsed = parse_stream_filename(stream_path.name)
+            name = parsed["name"]
+            if name in loaded_names:
+                continue
+            if prefix and not name.startswith(prefix):
+                continue
+            stat_cmd = f"stat -c '%Y %s' {shlex.quote(stream_path_str)}"
+            if self.ssh_sudo:
+                stat_cmd = f"sudo {stat_cmd}"
+            try:
+                stat_result = subprocess.run(
+                    ssh_cmd + [stat_cmd],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
+                mtime_str, size_str = stat_result.stdout.strip().split()
+                created = datetime.fromtimestamp(int(mtime_str), tz=timezone.utc)
+                size = int(size_str)
+            except (subprocess.CalledProcessError, ValueError):
+                # A committed stream we cannot stat (removed mid-list, permission
+                # error) must NOT be surfaced with a fabricated created=now, which
+                # would sort as newest and distort prune / parent selection. Skip it.
+                logger.debug("Skipping un-stat-able remote stream %s", stream_path_str)
+                continue
+            snapshots.append(
+                RawSnapshot(
+                    name=name,
+                    stream_path=stream_path,
+                    created=created,
+                    size=size,
+                    compress=parsed["compress"],
+                    encrypt=parsed["encrypt"],
+                )
+            )
+            loaded_names.add(name)
+            loaded_paths.add(stream_path_str)
+
         snapshots.sort(key=lambda s: s.created)
+        # Restore/verify read the stream via this endpoint (see RawEndpoint).
+        for snapshot in snapshots:
+            snapshot.endpoint = self
         self._cached_snapshots = snapshots
         return list(snapshots)
 
