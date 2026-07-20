@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -50,6 +51,91 @@ class PendingMetadata(TypedDict):
 # Environment variable for OpenSSL passphrase (compatible with btrbk)
 OPENSSL_PASSPHRASE_ENV = "BTRFS_BACKUP_PASSPHRASE"
 BTRBK_PASSPHRASE_ENV = "BTRBK_PASSPHRASE"
+
+# OpenSSL cipher names are alphanumerics and hyphens (aes-256-cbc, chacha20,
+# aes-128-ctr, ...). Restrict to that grammar so a cipher value -- which may come
+# from an on-disk .meta sidecar (semi-trusted) or from operator config -- can
+# never carry a shell metacharacter, space, or quote into a pipeline. Anchored
+# with \A ... \Z (not ^...$, which would match around a trailing newline) so a
+# newline cannot slip through the structural guard regardless of downstream
+# quoting.
+_CIPHER_RE = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9-]*\Z")
+
+# Substrings marking an AEAD mode. `openssl enc` cannot use AEAD ciphers (it errors
+# "AEAD ciphers not supported"), so accepting one only defers a cryptic failure to
+# mid-transfer. No non-AEAD cipher name contains these tokens.
+_AEAD_MARKERS = ("gcm", "ccm", "ocb", "poly1305")
+
+
+def _validate_cipher(cipher: str) -> str:
+    """Return ``cipher`` if it is a usable ``openssl enc`` cipher name, else raise
+    ValueError.
+
+    Structural check first (see ``_CIPHER_RE``: leading alphanumeric, then
+    ``[A-Za-z0-9-]``, no metacharacters/whitespace/newline). Then two SEMANTIC
+    rejections of values that are syntactically valid but unsafe or unusable:
+
+      * ``none`` -- openssl's NULL cipher performs NO encryption, so accepting it
+        would silently write a PLAINTEXT backup labelled as encrypted (the
+        CWE-311/312 class fixed in 0.8.4 / GHSA-vr25-6vrh-869j). Refused.
+      * AEAD modes (``*-gcm``/``*-ccm``/``*-ocb``/``*poly1305``) -- ``openssl enc``
+        cannot use them; refuse up front with a clear message instead of a cryptic
+        mid-transfer error.
+    """
+    if not isinstance(cipher, str) or not _CIPHER_RE.match(cipher):
+        raise ValueError(
+            f"Invalid openssl cipher name: {cipher!r}. Expected a name like "
+            "'aes-256-cbc' (letters, digits, hyphens only)."
+        )
+    lowered = cipher.lower()
+    if lowered == "none":
+        raise ValueError(
+            "Refusing openssl cipher 'none': it performs NO encryption and would "
+            "write a plaintext backup labelled as encrypted. Use a real cipher "
+            "such as aes-256-cbc, or set encrypt=none for an explicit plaintext "
+            "target."
+        )
+    if any(marker in lowered for marker in _AEAD_MARKERS):
+        raise ValueError(
+            f"openssl cipher {cipher!r} is an AEAD mode that 'openssl enc' cannot "
+            "use. Choose a non-AEAD cipher such as aes-256-cbc, aes-256-ctr, or "
+            "chacha20."
+        )
+    return cipher
+
+
+def _selected_passphrase_env() -> str | None:
+    """Return the NAME of the passphrase environment variable that is set (primary
+    ``BTRFS_BACKUP_PASSPHRASE`` preferred, then ``BTRBK_PASSPHRASE`` for btrbk
+    compatibility), or None if neither is set.
+
+    Single source of truth so the construction-time warning
+    (``_get_openssl_passphrase``) and the pipeline ``-pass`` argument
+    (``_openssl_pass_arg``) can never disagree about which variable is used."""
+    if os.environ.get(OPENSSL_PASSPHRASE_ENV):
+        return OPENSSL_PASSPHRASE_ENV
+    if os.environ.get(BTRBK_PASSPHRASE_ENV):
+        return BTRBK_PASSPHRASE_ENV
+    return None
+
+
+def _openssl_pass_arg() -> str:
+    """Return the openssl ``-pass`` argument (``env:<NAME>``) for whichever
+    passphrase env var is set.
+
+    openssl reads the passphrase from the named environment variable itself, so
+    the secret never appears on the command line. Raises ValueError if neither
+    variable is set -- the caller must not run openssl with an empty passphrase,
+    which silently produces an unreadable stream on encrypt and garbage on
+    decrypt."""
+    name = _selected_passphrase_env()
+    if name is None:
+        raise ValueError(
+            f"openssl_enc requires a passphrase in {OPENSSL_PASSPHRASE_ENV} or "
+            f"{BTRBK_PASSPHRASE_ENV}, but neither is set."
+        )
+    return f"env:{name}"
+
 
 # Suffix for the in-progress stream file. A raw receive writes here and the
 # transfer engine renames it to the final name only after the pipeline is
@@ -127,7 +213,13 @@ class RawEndpoint(Endpoint):
             self.encrypt = None
         self.gpg_recipient = config.get("gpg_recipient")
         self.gpg_keyring = config.get("gpg_keyring")
-        self.openssl_cipher = config.get("openssl_cipher", "aes-256-cbc")
+        # Validated at construction so a bad cipher fails fast rather than
+        # surfacing as a cryptic openssl error mid-transfer. An explicit None or
+        # "" (the CLI threads openssl_cipher=None for gpg/plaintext targets) means
+        # "unset" -> the aes-256-cbc default, exactly as an absent key would.
+        self.openssl_cipher = _validate_cipher(
+            config.get("openssl_cipher") or "aes-256-cbc"
+        )
 
         # Validate encryption config
         if self.encrypt == "gpg" and not self.gpg_recipient:
@@ -176,14 +268,14 @@ class RawEndpoint(Endpoint):
         """Get OpenSSL passphrase from environment.
 
         Checks BTRFS_BACKUP_PASSPHRASE first, then BTRBK_PASSPHRASE for
-        btrbk compatibility.
+        btrbk compatibility. Shares ``_selected_passphrase_env`` with the pipeline
+        ``-pass`` argument so the two never disagree about which variable is used.
 
         Returns:
             Passphrase string or None if not set
         """
-        return os.environ.get(OPENSSL_PASSPHRASE_ENV) or os.environ.get(
-            BTRBK_PASSPHRASE_ENV
-        )
+        name = _selected_passphrase_env()
+        return os.environ.get(name) if name else None
 
     def __repr__(self) -> str:
         parts = [f"raw://{self.config['path']}"]
@@ -325,7 +417,7 @@ class RawEndpoint(Endpoint):
                 "-salt",
                 "-pbkdf2",
                 "-pass",
-                "env:BTRFS_BACKUP_PASSPHRASE",
+                _openssl_pass_arg(),
             ]
             pipeline.append(openssl_cmd)
 
@@ -366,9 +458,11 @@ class RawEndpoint(Endpoint):
             return proc
 
         # For multiple commands, chain them together
-        # We use shell to handle the pipeline and file output
+        # We use shell to handle the pipeline and file output. Quote every argv
+        # element (a gpg recipient/keyring or cipher may contain spaces or shell
+        # metacharacters) so nothing word-splits or injects into the shell string.
         output_path = self._pending_metadata["part_path"]
-        cmd_strs = [" ".join(cmd) for cmd in pipeline]
+        cmd_strs = [" ".join(shlex.quote(a) for a in cmd) for cmd in pipeline]
         shell_cmd = " | ".join(cmd_strs) + f" > {shlex.quote(str(output_path))}"
 
         logger.debug("Executing pipeline: %s", shell_cmd)
@@ -551,15 +645,27 @@ class RawEndpoint(Endpoint):
                 gpg_cmd.extend(["--keyring", self.gpg_keyring])
             pipeline.append(gpg_cmd)
         elif snapshot.encrypt == "openssl_enc":
-            # OpenSSL symmetric decryption
+            # Restore with the cipher RECORDED in the sidecar so a backup made
+            # with a non-default cipher decrypts correctly. Fall back to this
+            # endpoint's configured cipher only for legacy backups that recorded
+            # none (every pre-sidecar backup used the aes-256-cbc default), and
+            # log it so the assumption is never silent. Validate whichever we use:
+            # the sidecar is on-disk and only semi-trusted.
+            cipher = _validate_cipher(snapshot.openssl_cipher or self.openssl_cipher)
+            if not snapshot.openssl_cipher:
+                logger.info(
+                    "No cipher recorded for %s; restoring with endpoint cipher %s",
+                    snapshot.name,
+                    cipher,
+                )
             openssl_cmd = [
                 "openssl",
                 "enc",
                 "-d",
-                f"-{self.openssl_cipher}",
+                f"-{cipher}",
                 "-pbkdf2",
                 "-pass",
-                "env:BTRFS_BACKUP_PASSPHRASE",
+                _openssl_pass_arg(),
             ]
             pipeline.append(openssl_cmd)
 
@@ -832,7 +938,7 @@ class SSHRawEndpoint(RawEndpoint):
         path = self.config["path"]
         ssh_cmd = self._build_ssh_command()
 
-        mkdir_cmd = f"mkdir -p {path}"
+        mkdir_cmd = f"mkdir -p {shlex.quote(str(path))}"
         if self.ssh_sudo:
             mkdir_cmd = f"sudo {mkdir_cmd}"
 
@@ -900,9 +1006,10 @@ class SSHRawEndpoint(RawEndpoint):
             )
             return proc
 
-        # Local processing then SSH. Quote ssh_cmd elements (operator config may
-        # contain spaces) since this is composed into a local shell string.
-        cmd_strs = [" ".join(cmd) for cmd in pipeline]
+        # Local processing then SSH. Quote every argv element (a gpg
+        # recipient/keyring or cipher may contain spaces or shell metacharacters)
+        # and ssh_cmd elements, since this is composed into a local shell string.
+        cmd_strs = [" ".join(shlex.quote(a) for a in cmd) for cmd in pipeline]
         local_pipeline = " | ".join(cmd_strs)
         ssh_part = (
             " ".join(shlex.quote(c) for c in ssh_cmd) + " " + shlex.quote(remote_cmd)
@@ -1080,7 +1187,7 @@ class SSHRawEndpoint(RawEndpoint):
         ssh_cmd = self._build_ssh_command()
 
         # List .meta files
-        find_cmd = f"find {path} -name '*.meta' -type f 2>/dev/null"
+        find_cmd = f"find {shlex.quote(str(path))} -name '*.meta' -type f 2>/dev/null"
         if self.ssh_sudo:
             find_cmd = f"sudo {find_cmd}"
 
@@ -1102,7 +1209,7 @@ class SSHRawEndpoint(RawEndpoint):
             if not meta_path:
                 continue
             try:
-                cat_cmd = f"cat {meta_path}"
+                cat_cmd = f"cat {shlex.quote(meta_path)}"
                 if self.ssh_sudo:
                     cat_cmd = f"sudo {cat_cmd}"
                 result = subprocess.run(
@@ -1210,7 +1317,10 @@ class SSHRawEndpoint(RawEndpoint):
         for snapshot in snapshots:
             try:
                 # Build rm command for stream and metadata
-                rm_cmd = f"rm -f {snapshot.stream_path} {snapshot.metadata_path}"
+                rm_cmd = (
+                    f"rm -f {shlex.quote(str(snapshot.stream_path))} "
+                    f"{shlex.quote(str(snapshot.metadata_path))}"
+                )
                 if self.ssh_sudo:
                     rm_cmd = f"sudo {rm_cmd}"
 
