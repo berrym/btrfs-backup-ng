@@ -526,9 +526,9 @@ class RawEndpoint(Endpoint):
         # never a sidecar describing a missing/partial stream. Best-effort: the
         # backup data already succeeded, so a sidecar error must not fail it.
         try:
-            self._sidecar_snapshot(
-                final_path, final_path.stat().st_size
-            ).save_metadata()
+            self.write_sidecar(
+                self._sidecar_snapshot(final_path, final_path.stat().st_size)
+            )
         except Exception as e:
             # The backup data is already durable; a sidecar error must NEVER flip
             # an already-successful transfer into a reported failure (PR1 contract).
@@ -536,6 +536,19 @@ class RawEndpoint(Endpoint):
             logger.warning("Failed to write sidecar for %s: %s", final_path, e)
         self._cached_snapshots = None  # re-discover to include the new sidecar
         logger.debug("Committed raw stream + sidecar: %s", final_path)
+
+    def write_sidecar(self, snapshot: RawSnapshot) -> None:
+        """Persist a snapshot's authoritative ``.meta`` sidecar.
+
+        The single sidecar-write entry point shared by the transfer engine
+        (``commit_receive``) and the raw maintenance commands, so every sidecar --
+        whatever its ``provenance_origin`` (native-write, backfill, remediation) --
+        is written the same atomic, 0600 way. Local endpoints write it directly
+        (see ``RawSnapshot.save_metadata``); the raw+ssh subclass overrides this to
+        write on the remote. Raises on failure; callers that must not fail an
+        already-durable backup on a sidecar error wrap the call (as the engine
+        does)."""
+        snapshot.save_metadata()
 
     def _sidecar_snapshot(self, final_path: Path, size: int) -> RawSnapshot:
         """Build the authoritative RawSnapshot to persist for a just-committed
@@ -555,53 +568,6 @@ class RawEndpoint(Endpoint):
             openssl_cipher=pending.get("openssl_cipher"),
             provenance_origin="native-write",
         )
-
-    def finalize_receive(
-        self, proc: subprocess.Popen, uuid: str = "", parent_uuid: str | None = None
-    ) -> RawSnapshot:
-        """Finalize a receive operation and save metadata.
-
-        Call this after the receive pipeline has completed.
-
-        Args:
-            proc: The Popen object from receive()
-            uuid: Btrfs subvolume UUID
-            parent_uuid: Parent subvolume UUID
-
-        Returns:
-            RawSnapshot with saved metadata
-        """
-        # Wait for pipeline to complete
-        _, stderr = proc.communicate()
-        if proc.returncode != 0:
-            error_msg = stderr.decode() if stderr else "Unknown error"
-            raise RuntimeError(f"Raw receive pipeline failed: {error_msg}")
-
-        # Get file size
-        stream_path = self._pending_metadata["stream_path"]
-        size = stream_path.stat().st_size
-
-        # Create and save metadata
-        snapshot = RawSnapshot(
-            name=self._pending_metadata["name"],
-            stream_path=stream_path,
-            uuid=uuid,
-            parent_uuid=parent_uuid,
-            parent_name=self._pending_metadata.get("parent_name"),
-            size=size,
-            compress=self._pending_metadata.get("compress"),
-            encrypt=self._pending_metadata.get("encrypt"),
-            gpg_recipient=self._pending_metadata.get("gpg_recipient"),
-        )
-        snapshot.save_metadata()
-
-        # Update cache
-        if self._cached_snapshots is not None:
-            self._cached_snapshots.append(snapshot)
-            self._cached_snapshots.sort(key=lambda s: s.created)
-
-        logger.info("Saved raw snapshot: %s (%d bytes)", snapshot.name, size)
-        return snapshot
 
     def send(
         self,
@@ -1097,9 +1063,21 @@ class SSHRawEndpoint(RawEndpoint):
                 final_path,
                 e,
             )
-        snapshot = self._sidecar_snapshot(final_path, size)
-        payload = json.dumps(snapshot.to_dict(), indent=2).encode("utf-8")
-        meta = f"{final_path}.meta"
+        # Best-effort: the stream is already durable, so a sidecar write error must
+        # not fail the backup (mirrors the local commit path). write_sidecar raises
+        # on failure; catch and log rather than propagate.
+        try:
+            self.write_sidecar(self._sidecar_snapshot(final_path, size))
+        except Exception as e:
+            logger.warning("Failed to write remote sidecar for %s: %s", final_path, e)
+
+    def write_sidecar(self, snapshot: RawSnapshot) -> None:
+        """Write ``snapshot``'s ``.meta`` sidecar on the remote target atomically
+        (temp -> sync -> mv -> chmod 600), using the same serialized bytes and
+        ``.meta`` path as the local writer. Raises RuntimeError on a nonzero remote
+        return so a maintenance command can tell whether the write succeeded; the
+        engine's commit path wraps this to stay best-effort."""
+        meta = str(snapshot.metadata_path)
         tmp = f"{meta}.tmp"
         script = (
             f"cat > {shlex.quote(tmp)} && sync && "
@@ -1107,14 +1085,14 @@ class SSHRawEndpoint(RawEndpoint):
             f"chmod 600 {shlex.quote(meta)}"
         )
         result = self._exec_remote_command(
-            ["sh", "-c", script], input=payload, check=False
+            ["sh", "-c", script], input=snapshot.serialize(), check=False
         )
         if result.returncode != 0:
             stderr = result.stderr
             if isinstance(stderr, (bytes, bytearray)):
                 stderr = stderr.decode(errors="replace")
-            logger.warning(
-                "Failed to write remote sidecar %s: %s", meta, (stderr or "").strip()
+            raise RuntimeError(
+                f"Failed to write remote sidecar {meta}: {(stderr or '').strip()}"
             )
 
     def send(

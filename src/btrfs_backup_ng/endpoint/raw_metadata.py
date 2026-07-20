@@ -230,13 +230,21 @@ class RawSnapshot:
             "btrfs_backup_ng_version": __version__,
         }
 
+    def serialize(self) -> bytes:
+        """Return the canonical on-disk sidecar bytes (pretty JSON, UTF-8).
+
+        Single definition of the wire format so the local writer
+        (``save_metadata``) and the raw+ssh remote writer cannot drift -- both a
+        local ``.meta`` and its remote twin are byte-for-byte the same document."""
+        return json.dumps(self.to_dict(), indent=2).encode("utf-8")
+
     def save_metadata(self) -> None:
         """Write the sidecar atomically (temp -> fsync -> rename -> dir fsync) at
         mode 0600, so a crash never leaves a partial/half-written .meta and the
         metadata dossier is not world-readable."""
         meta = self.metadata_path
         tmp = meta.with_name(meta.name + ".tmp")
-        payload = json.dumps(self.to_dict(), indent=2).encode("utf-8")
+        payload = self.serialize()
         fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         try:
             os.write(fd, payload)

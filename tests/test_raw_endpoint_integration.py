@@ -816,75 +816,40 @@ class TestFullReceiveWorkflow:
     """Integration tests for the complete receive workflow."""
 
     @pytest.mark.skipif(not tool_available("gzip"), reason="gzip not available")
-    def test_receive_finalize_workflow(self, tmp_path):
-        """Test the full receive -> finalize -> metadata workflow."""
+    def test_receive_commit_restore_workflow(self, tmp_path):
+        """The full receive -> commit -> restore workflow through the real atomic
+        path (receive writes a .part, commit_receive publishes it + the sidecar,
+        send restores). A gzip end-to-end round-trip must return the exact bytes."""
         endpoint = RawEndpoint(config={"path": tmp_path, "compress": "gzip"})
         endpoint._prepare()
 
-        # Simulate receiving a stream
         snapshot_name = "root.20240115T120000"
-
-        # Create input data (simulating btrfs send output)
         input_data = TEST_DATA
+        src = tmp_path / "src.bin"
+        src.write_bytes(input_data)
 
-        # Call receive with a pipe
-        import io
+        # Receive (compresses into a .part) then atomically commit (publish + sidecar).
+        with open(src, "rb") as stdin:
+            proc = endpoint.receive(stdin, snapshot_name=snapshot_name)
+            proc.communicate()
+        assert proc.returncode == 0
+        endpoint.commit_receive()
+        src.unlink()
 
-        io.BytesIO(input_data)
-
-        # Build and execute pipeline manually (since we're not using subprocess pipe)
-        extension = ".btrfs.gz"
-        output_path = tmp_path / f"{snapshot_name}{extension}"
-
-        endpoint._pending_metadata = {
-            "name": snapshot_name,
-            "stream_path": output_path,
-            "parent_name": None,
-            "compress": "gzip",
-            "encrypt": None,
-            "gpg_recipient": None,
-        }
-
-        # Compress the data
-        result = subprocess.run(
-            ["gzip", "-c"],
-            input=input_data,
-            capture_output=True,
-        )
-        assert result.returncode == 0
-        output_path.write_bytes(result.stdout)
-
-        # Create a mock process for finalize_receive
-        class MockProc:
-            returncode = 0
-
-            def communicate(self):
-                return (b"", b"")
-
-        # Finalize the receive
-        snapshot = endpoint.finalize_receive(
-            MockProc(),
-            uuid="test-uuid-123",
-            parent_uuid="parent-uuid-456",
-        )
-
-        # Verify snapshot was created correctly
+        # The snapshot is discovered via its authoritative sidecar.
+        snaps = endpoint.list_snapshots(flush_cache=True)
+        assert len(snaps) == 1
+        snapshot = snaps[0]
         assert snapshot.name == snapshot_name
-        assert snapshot.uuid == "test-uuid-123"
-        assert snapshot.parent_uuid == "parent-uuid-456"
         assert snapshot.compress == "gzip"
         assert snapshot.size > 0
-
-        # Verify metadata file was created
         assert snapshot.metadata_path.exists()
 
-        # Verify the data can be restored
-        result = subprocess.run(
-            ["gzip", "-d", "-c", str(output_path)],
-            capture_output=True,
-        )
-        assert result.returncode == 0
-        assert result.stdout == input_data
+        # Restore round-trips to the original bytes through the real send pipeline.
+        rproc = endpoint.send(snapshot)
+        out, _ = rproc.communicate()
+        assert rproc.returncode == 0
+        assert out == input_data
 
     @pytest.mark.skipif(not tool_available("zstd"), reason="zstd not available")
     def test_list_and_delete_workflow(self, tmp_path):
