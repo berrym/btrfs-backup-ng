@@ -380,7 +380,11 @@ class TestSSHRawEndpointEncryption:
         assert gpg, "raw+ssh gpg config must build a gpg encryption stage"
         assert "--encrypt" in gpg[0] and "KEYID" in gpg[0]
 
-    def test_ssh_raw_pipeline_includes_openssl_stage(self):
+    def test_ssh_raw_pipeline_includes_openssl_stage(self, monkeypatch):
+        # openssl_enc now hard-fails if no passphrase is available (an encrypt
+        # pipeline that could not decrypt is never built); set one so this
+        # structural check exercises a realistic encrypting configuration.
+        monkeypatch.setenv("BTRFS_BACKUP_PASSPHRASE", "test-pass")
         pipeline = self._ssh_raw(encrypt="openssl_enc")
         enc = [s for s in pipeline if s and s[0] == "openssl"]
         assert enc, "raw+ssh openssl config must build an openssl encryption stage"

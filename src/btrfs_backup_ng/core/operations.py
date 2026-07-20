@@ -1019,8 +1019,20 @@ def _do_rich_progress_transfer(
     """
     logger.debug("Using Rich progress bar for transfer")
 
-    # Start receive process (stderr is suppressed at the endpoint level)
-    receive_process = destination_endpoint.receive(subprocess.PIPE, snapshot_name)
+    # Start receive process (stderr is suppressed at the endpoint level). Building
+    # the receive pipeline can raise (e.g. a raw openssl target with no passphrase
+    # env now fails loud at build time); convert that to a SnapshotTransferError so
+    # this path reports a clean failure with the failed-transaction audit log,
+    # exactly like the non-rich transfer path.
+    try:
+        receive_process = destination_endpoint.receive(subprocess.PIPE, snapshot_name)
+    except Exception as e:
+        logger.error("Failed to start receive process: %s", e)
+        try:
+            send_process.kill()
+        except Exception:
+            pass
+        raise __util__.SnapshotTransferError(f"Receive process failed to start: {e}")
     if receive_process is None:
         logger.error("Failed to start receive process")
         if is_ssh_endpoint and not destination_endpoint.config.get("ssh_sudo", False):
