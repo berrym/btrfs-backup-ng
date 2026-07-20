@@ -929,6 +929,49 @@ ssh_sudo = true
 
 ---
 
+### raw
+
+Inspect and maintain [raw-target](#raw-targets) backups directly. Raw targets hold btrfs send streams as files, each with an authoritative `.meta` sidecar.
+
+```bash
+btrfs-backup-ng raw SUBCOMMAND [OPTIONS]
+```
+
+#### raw list
+
+List the backups a raw target holds, read from each stream's `.meta` sidecar (falling back to filename inference for legacy streams written before sidecars existed).
+
+```bash
+btrfs-backup-ng raw list TARGET [OPTIONS]
+```
+
+**Arguments:**
+| Argument | Description |
+|----------|-------------|
+| `TARGET` | Raw target: `raw://PATH`, `raw+ssh://[USER@]HOST/PATH`, or a plain path (treated as `raw://`) |
+
+**Options:**
+| Option | Description |
+|--------|-------------|
+| `--json` | Output the authoritative sidecar documents as JSON for scripting |
+| `--ssh-sudo` | Use `sudo` for remote commands on a `raw+ssh://` target |
+
+**Example:**
+```bash
+btrfs-backup-ng raw list raw:///mnt/usb/backups
+btrfs-backup-ng raw list raw+ssh://backup@nas/backups --ssh-sudo
+```
+
+**Example Output:**
+```
+Raw target: raw:///mnt/usb/backups  (2 snapshots)
+  NAME                             CREATED               SIZE  ENC         COMPRESS CIPHER       ORIGIN
+  root.20260101T120000             2026-01-01T12:00:00Z  1.2 GiB  openssl_enc zstd     aes-256-cbc  native-write
+  home.20260101T120000             2026-01-01T12:00:00Z  340 MiB  -           -        -            native-write
+```
+
+---
+
 ## Filesystem Checks
 
 The `--fs-checks` option controls how btrfs-backup-ng validates source and destination paths:

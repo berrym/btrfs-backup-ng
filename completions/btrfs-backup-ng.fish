@@ -10,7 +10,7 @@ function __fish_btrfs_backup_ng_no_subcommand
     set -e cmd[1]
     for c in $cmd
         switch $c
-            case run snapshot transfer prune list status config install uninstall restore verify estimate doctor completions manpages transfers snapper
+            case run snapshot transfer prune list status config install uninstall restore verify estimate doctor completions manpages transfers snapper raw
                 return 1
         end
     end
@@ -67,6 +67,7 @@ complete -c btrfs-backup-ng -n __fish_btrfs_backup_ng_no_subcommand -a completio
 complete -c btrfs-backup-ng -n __fish_btrfs_backup_ng_no_subcommand -a manpages -d 'Install man pages'
 complete -c btrfs-backup-ng -n __fish_btrfs_backup_ng_no_subcommand -a transfers -d 'Manage chunked and resumable transfers (experimental)'
 complete -c btrfs-backup-ng -n __fish_btrfs_backup_ng_no_subcommand -a snapper -d 'Manage snapper-managed snapshots'
+complete -c btrfs-backup-ng -n __fish_btrfs_backup_ng_no_subcommand -a raw -d 'Inspect and maintain raw-target backups'
 
 # Compression methods (including raw target compression algorithms)
 set -l compress_methods none zstd gzip lz4 pigz lzop xz bzip2 pbzip2 lzo
@@ -348,3 +349,25 @@ complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_snapper_using_subcommand 
 
 # snapper generate-config
 complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_snapper_using_subcommand generate-config' -s o -l output -d 'Output file' -r -F
+
+# raw command subcommands
+complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_using_command raw' -a list -d 'List the backups a raw target holds'
+
+# Helper for raw subcommand
+function __fish_btrfs_backup_ng_raw_using_subcommand
+    set -l cmd (commandline -opc)
+    set -e cmd[1]
+    if test (count $cmd) -gt 1
+        if test $cmd[1] = raw
+            if test $argv[1] = $cmd[2]
+                return 0
+            end
+        end
+    end
+    return 1
+end
+
+# raw list
+complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_raw_using_subcommand list' -l json -d 'Output in JSON format'
+complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_raw_using_subcommand list' -l ssh-sudo -d 'Use sudo for remote commands on a raw+ssh target'
+complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_raw_using_subcommand list' -a '(__fish_complete_directories)' -d 'Raw target path'

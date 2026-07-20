@@ -84,6 +84,7 @@ class TestSubcommands:
             "config",
             "install",
             "uninstall",
+            "raw",
         }
         for cmd in expected:
             assert cmd in SUBCOMMANDS, f"{cmd} not in SUBCOMMANDS"
