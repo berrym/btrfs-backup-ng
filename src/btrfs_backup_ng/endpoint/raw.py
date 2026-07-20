@@ -598,9 +598,10 @@ class RawEndpoint(Endpoint):
                 )
             return proc
 
-        # Chain commands with shell
-        cmd_strs = [" ".join(cmd) for cmd in pipeline]
-        shell_cmd = f"cat {input_path} | " + " | ".join(cmd_strs)
+        # Chain commands with shell; quote every argv element and the input path
+        # so a gpg keyring / stream path containing spaces does not word-split.
+        cmd_strs = [" ".join(shlex.quote(a) for a in cmd) for cmd in pipeline]
+        shell_cmd = f"cat {shlex.quote(str(input_path))} | " + " | ".join(cmd_strs)
 
         logger.debug("Executing restore pipeline: %s", shell_cmd)
 
@@ -844,6 +845,29 @@ class SSHRawEndpoint(RawEndpoint):
             logger.error("Failed to create remote directory: %s", e.stderr.decode())
             raise
 
+        # Preflight: raw+ssh runs POSIX shell commands on the remote (cat/mv/chmod
+        # + a size tool). The mkdir above already proved connectivity + a POSIX-ish
+        # shell, so a missing tool here means the remote can't host raw+ssh (e.g. a
+        # bare Windows/cmd box) -- fail loud with actionable guidance rather than
+        # failing cryptically mid-transfer.
+        # `stat` (not just wc) is required: listing sidecar-less streams needs the
+        # mtime only stat can give, so the preflight must promise what enumeration
+        # actually depends on.
+        check = (
+            'for t in cat mv chmod stat; do command -v "$t" >/dev/null 2>&1 '
+            "|| exit 1; done; echo RAWSSHOK"
+        )
+        res = self._exec_remote_command(["sh", "-c", check], check=False)
+        out = res.stdout
+        if isinstance(out, (bytes, bytearray)):
+            out = out.decode(errors="replace")
+        if "RAWSSHOK" not in (out or ""):
+            raise RuntimeError(
+                f"Remote host {self.hostname} does not provide the POSIX tools "
+                "raw+ssh needs (sh, cat, mv, chmod, stat). For a non-POSIX or "
+                "SMB/NFS/cloud target, mount it locally and use a raw:// path."
+            )
+
         # Check local tools
         self._check_tools()
 
@@ -876,10 +900,13 @@ class SSHRawEndpoint(RawEndpoint):
             )
             return proc
 
-        # Local processing then SSH
+        # Local processing then SSH. Quote ssh_cmd elements (operator config may
+        # contain spaces) since this is composed into a local shell string.
         cmd_strs = [" ".join(cmd) for cmd in pipeline]
         local_pipeline = " | ".join(cmd_strs)
-        ssh_part = " ".join(ssh_cmd) + " " + shlex.quote(remote_cmd)
+        ssh_part = (
+            " ".join(shlex.quote(c) for c in ssh_cmd) + " " + shlex.quote(remote_cmd)
+        )
         shell_cmd = f"{local_pipeline} | {ssh_part}"
 
         logger.debug("Executing SSH pipeline: %s", shell_cmd)
@@ -983,6 +1010,57 @@ class SSHRawEndpoint(RawEndpoint):
                 "Failed to write remote sidecar %s: %s", meta, (stderr or "").strip()
             )
 
+    def send(
+        self,
+        snapshot: Any,
+        parent: Any | None = None,
+        clones: list[Any] | None = None,
+    ) -> subprocess.Popen[bytes]:
+        """Read a raw stream back from the REMOTE host for restore.
+
+        The base RawEndpoint.send() opens a local file; for raw+ssh the stream
+        lives on the remote, so we stream it down over ssh and decrypt/decompress
+        it LOCALLY -- ``ssh host 'cat <remote>' | <decrypt> | <decompress>``. The
+        gpg key / openssl passphrase stay on the restore host; secrets are never
+        sent to the (untrusted) remote.
+        """
+        if not isinstance(snapshot, RawSnapshot):
+            raise TypeError(f"Expected RawSnapshot, got {type(snapshot)}")
+        remote = str(snapshot.stream_path)
+        # Clear error if the stream is not on the remote (vs a cryptic pipe fail).
+        test = self._exec_remote_command(
+            ["sh", "-c", f"test -f {shlex.quote(remote)}"], check=False
+        )
+        if test.returncode != 0:
+            raise FileNotFoundError(
+                f"Remote stream not found: {self.hostname}:{remote}"
+            )
+
+        pipeline = self._build_restore_pipeline(snapshot)  # LOCAL decrypt/decompress
+        ssh_cmd = self._build_ssh_command()
+        remote_cat = f"cat {shlex.quote(remote)}"
+        if self.ssh_sudo:
+            remote_cat = f"sudo sh -c {shlex.quote(remote_cat)}"
+        # Quote every argv element: this string is run by a local bash. ssh_cmd
+        # carries operator config (ssh_opts, key path) that may contain spaces.
+        ssh_part = (
+            " ".join(shlex.quote(c) for c in ssh_cmd) + " " + shlex.quote(remote_cat)
+        )
+        if pipeline and pipeline != [["cat"]]:
+            local_stages = " | ".join(
+                " ".join(shlex.quote(a) for a in cmd) for cmd in pipeline
+            )
+            shell_cmd = f"{ssh_part} | {local_stages}"
+        else:
+            shell_cmd = ssh_part
+        logger.debug("Executing remote restore pipeline: %s", shell_cmd)
+        return _popen_pipeline_pipefail(
+            shell_cmd,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+
     def list_snapshots(self, flush_cache: bool = False) -> list[RawSnapshot]:
         """List raw snapshots on the remote host.
 
@@ -1084,9 +1162,11 @@ class SSHRawEndpoint(RawEndpoint):
                 continue
             if prefix and not name.startswith(prefix):
                 continue
-            stat_cmd = f"stat -c '%Y %s' {shlex.quote(stream_path_str)}"
+            # Portable mtime+size: GNU/busybox `stat -c`, else BSD/macOS `stat -f`.
+            q = shlex.quote(stream_path_str)
+            stat_cmd = f"stat -c '%Y %s' {q} 2>/dev/null || stat -f '%m %z' {q}"
             if self.ssh_sudo:
-                stat_cmd = f"sudo {stat_cmd}"
+                stat_cmd = f"sudo sh -c {shlex.quote(stat_cmd)}"
             try:
                 stat_result = subprocess.run(
                     ssh_cmd + [stat_cmd],

@@ -878,12 +878,12 @@ class TestSSHRawEndpointMethods:
         )
 
         with patch("subprocess.run") as mock_run:
-            mock_run.return_value = MagicMock(returncode=0)
+            mock_run.return_value = MagicMock(returncode=0, stdout=b"RAWSSHOK\n")
             with patch.object(endpoint, "_check_tools", return_value=[]):
                 endpoint._prepare()
 
-        mock_run.assert_called_once()
-        call_args = mock_run.call_args[0][0]
+        # First remote call is mkdir; a POSIX-tools preflight follows.
+        call_args = mock_run.call_args_list[0][0][0]
         assert "ssh" in call_args
         assert "backup@nas" in call_args
         assert "mkdir -p /backup/data" in call_args
@@ -899,11 +899,11 @@ class TestSSHRawEndpointMethods:
         )
 
         with patch("subprocess.run") as mock_run:
-            mock_run.return_value = MagicMock(returncode=0)
+            mock_run.return_value = MagicMock(returncode=0, stdout=b"RAWSSHOK\n")
             with patch.object(endpoint, "_check_tools", return_value=[]):
                 endpoint._prepare()
 
-        call_args = mock_run.call_args[0][0]
+        call_args = mock_run.call_args_list[0][0][0]  # first call = mkdir
         assert "sudo mkdir" in call_args[-1]
 
     def test_prepare_failure(self):
