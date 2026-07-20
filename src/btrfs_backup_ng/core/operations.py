@@ -259,6 +259,18 @@ def send_snapshot(
             _log_process_errors(send_process, receive_process)
             raise __util__.SnapshotTransferError(error_message)
 
+        # Durably publish the received data before declaring success. For raw
+        # endpoints this atomically renames the ".part" stream to its final
+        # name; for btrfs endpoints it is a no-op. A commit failure means the
+        # data is not safely on disk, so treat it as a transfer failure rather
+        # than report a success that is not durably stored.
+        try:
+            destination_endpoint.commit_receive()
+        except Exception as commit_err:
+            raise __util__.SnapshotTransferError(
+                f"Failed to commit received data: {commit_err}"
+            ) from commit_err
+
         logger.info("Transfer completed successfully")
 
         # Log successful transaction
@@ -469,6 +481,10 @@ def _do_chunked_transfer(
                 options=options,
                 show_progress=show_progress,
             )
+
+        # Publish the received data (atomic rename of the raw ".part" stream;
+        # no-op for btrfs endpoints) before marking the transfer complete.
+        destination_endpoint.commit_receive()
 
         # Mark transfer as complete
         chunked_manager.complete_transfer(manifest)
@@ -1243,18 +1259,16 @@ def _cleanup_partial_remote_subvolume(destination_endpoint, manifest) -> None:
 
 
 def _cleanup_partial_raw_stream(destination_endpoint) -> None:
-    """Best-effort removal of the exact raw stream file a failed raw transfer wrote.
+    """Best-effort removal of the uncommitted ``.part`` file a failed raw
+    transfer left behind.
 
-    Raw backups use a distinct timestamped filename each run, and a generic raw
-    backup carries no ``.meta`` sidecar (``finalize_receive`` is unused), so a
-    failed partial is NOT overwritten by the next run and cannot be distinguished
-    from a complete backup by "missing .meta". ``discover_raw_snapshots``' filename
-    fallback would therefore re-list the partial as a phantom backup.
-
-    Delete ONLY the exact ``_pending_metadata['stream_path']`` this run wrote --
-    never a name pattern or a "no .meta" heuristic (which would destroy a good
-    generic raw backup). Called only on the failure path where the transfer
-    pipeline exited nonzero, so the stream file is genuinely incomplete.
+    A raw receive writes to ``<name>.part`` and is renamed to its final name
+    only by ``commit_receive`` after the pipeline succeeds, so a failed transfer
+    leaves an uncommitted ``.part`` file. ``discover_raw_snapshots`` already
+    ignores ``.part`` files, so they can never be listed as a phantom backup --
+    this deletion is hygiene, not the correctness guard. Remove ONLY the exact
+    ``_pending_metadata['part_path']`` this run wrote, never the final name
+    (which could be a prior good backup) and never a name pattern.
     """
     from ..endpoint.raw import RawEndpoint, SSHRawEndpoint
 
@@ -1263,24 +1277,24 @@ def _cleanup_partial_raw_stream(destination_endpoint) -> None:
     pending = getattr(destination_endpoint, "_pending_metadata", None)
     if not pending:
         return
-    stream_path = pending.get("stream_path")
-    if not stream_path:
+    part_path = pending.get("part_path")
+    if not part_path:
         return
     try:
         if isinstance(destination_endpoint, SSHRawEndpoint):
             logger.warning(
-                "Cleaning up partial remote raw stream file at %s", stream_path
+                "Cleaning up partial remote raw stream file at %s", part_path
             )
             destination_endpoint._exec_remote_command(
-                ["rm", "-f", str(stream_path)], check=False
+                ["rm", "-f", str(part_path)], check=False
             )
         else:
-            p = Path(stream_path)
+            p = Path(part_path)
             if p.exists():
                 logger.warning("Cleaning up partial raw stream file at %s", p)
                 p.unlink()
     except Exception as e:
-        logger.debug("Partial raw-stream cleanup failed for %s: %s", stream_path, e)
+        logger.debug("Partial raw-stream cleanup failed for %s: %s", part_path, e)
 
 
 def _execute_transfers(
@@ -1550,7 +1564,11 @@ def _cleanup_snapper_backup(destination_endpoint, snapshot_num, is_raw) -> None:
     import os
 
     if is_raw:
-        # Raw partial files are overwritten on the next attempt; nothing to undo.
+        # A failed raw transfer leaves an uncommitted ".part" file (atomic writes
+        # keep it out of discovery); remove it so partials do not accumulate.
+        # Raw uses a distinct timestamped name per run, so it is NOT overwritten
+        # on the next attempt -- the old "nothing to undo" assumption was wrong.
+        _cleanup_partial_raw_stream(destination_endpoint)
         return
 
     base = str(destination_endpoint.config["path"]).rstrip("/")

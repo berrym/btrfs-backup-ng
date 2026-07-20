@@ -82,7 +82,10 @@ class TestExecutePipelineRoutesThroughPipefail:
     def test_local_multistage_uses_pipefail_helper(self, monkeypatch, tmp_path):
         captured = self._spy(monkeypatch)
         ep = RawEndpoint.__new__(RawEndpoint)
-        ep._pending_metadata = {"stream_path": tmp_path / "out"}  # type: ignore[attr-defined]
+        ep._pending_metadata = {  # type: ignore[attr-defined]
+            "stream_path": tmp_path / "out",
+            "part_path": tmp_path / "out.part",
+        }
         proc = ep._execute_pipeline([["gzip"], ["cat"]], subprocess.DEVNULL)
         proc.wait()
         assert "gzip" in captured.get("shell_cmd", "")
@@ -90,7 +93,10 @@ class TestExecutePipelineRoutesThroughPipefail:
     def test_ssh_multistage_uses_pipefail_helper(self, monkeypatch, tmp_path):
         captured = self._spy(monkeypatch)
         ep = SSHRawEndpoint.__new__(SSHRawEndpoint)
-        ep._pending_metadata = {"stream_path": tmp_path / "out"}  # type: ignore[attr-defined]
+        ep._pending_metadata = {  # type: ignore[attr-defined]
+            "stream_path": tmp_path / "out",
+            "part_path": tmp_path / "out.part",
+        }
         ep.ssh_sudo = False  # type: ignore[attr-defined]
         ep._build_ssh_command = lambda: ["ssh", "host"]  # type: ignore[method-assign]
         proc = ep._execute_pipeline([["gzip"], ["cat"]], subprocess.DEVNULL)

@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import shutil
 import subprocess
 from pathlib import Path
@@ -35,6 +36,7 @@ class PendingMetadata(TypedDict):
 
     name: str
     stream_path: Path
+    part_path: Path
     parent_name: str | None
     compress: str | None
     encrypt: str | None
@@ -44,6 +46,13 @@ class PendingMetadata(TypedDict):
 # Environment variable for OpenSSL passphrase (compatible with btrbk)
 OPENSSL_PASSPHRASE_ENV = "BTRFS_BACKUP_PASSPHRASE"
 BTRBK_PASSPHRASE_ENV = "BTRBK_PASSPHRASE"
+
+# Suffix for the in-progress stream file. A raw receive writes here and the
+# transfer engine renames it to the final name only after the pipeline is
+# confirmed successful (see RawEndpoint.commit_receive). A crash therefore
+# leaves at most a ``.part`` file, which discovery ignores -- so a partial
+# transfer can never be listed as a complete backup.
+PARTIAL_SUFFIX = ".part"
 
 
 def _popen_pipeline_pipefail(shell_cmd: str, **popen_kwargs: Any) -> subprocess.Popen:
@@ -151,6 +160,7 @@ class RawEndpoint(Endpoint):
         self._pending_metadata: PendingMetadata = {
             "name": "",
             "stream_path": Path(),
+            "part_path": Path(),
             "parent_name": None,
             "compress": None,
             "encrypt": None,
@@ -243,24 +253,28 @@ class RawEndpoint(Endpoint):
         # Build output filename
         extension = get_file_extension(self.compress, self.encrypt)
         output_path = Path(self.config["path"]) / f"{snapshot_name}{extension}"
+        # Write to a temporary ".part" sibling; commit_receive() renames it to
+        # output_path only after the engine confirms the pipeline succeeded.
+        part_path = Path(f"{output_path}{PARTIAL_SUFFIX}")
 
-        logger.info("Writing raw stream to: %s", output_path)
+        logger.info("Writing raw stream to: %s", part_path)
 
         # Record metadata BEFORE executing: _execute_pipeline reads
-        # _pending_metadata["stream_path"] to know where to write. Setting it
+        # _pending_metadata["part_path"] to know where to write. Setting it
         # afterwards left the default Path() ('.') in place, so the pipeline
         # tried to open the current directory as the output file.
         self._pending_metadata = {
             "name": snapshot_name,
             "stream_path": output_path,
+            "part_path": part_path,
             "parent_name": parent_name,
             "compress": self.compress,
             "encrypt": self.encrypt,
             "gpg_recipient": self.gpg_recipient,
         }
 
-        # Build and execute the pipeline
-        pipeline = self._build_receive_pipeline(output_path)
+        # Build and execute the pipeline (writes to the .part file)
+        pipeline = self._build_receive_pipeline(part_path)
         proc = self._execute_pipeline(pipeline, stdin_pipe)
 
         return proc
@@ -331,7 +345,7 @@ class RawEndpoint(Endpoint):
 
         # For a single command, execute directly
         if len(pipeline) == 1:
-            output_path = self._pending_metadata["stream_path"]
+            output_path = self._pending_metadata["part_path"]
             with open(output_path, "wb") as outfile:
                 proc = subprocess.Popen(
                     pipeline[0],
@@ -343,9 +357,9 @@ class RawEndpoint(Endpoint):
 
         # For multiple commands, chain them together
         # We use shell to handle the pipeline and file output
-        output_path = self._pending_metadata["stream_path"]
+        output_path = self._pending_metadata["part_path"]
         cmd_strs = [" ".join(cmd) for cmd in pipeline]
-        shell_cmd = " | ".join(cmd_strs) + f" > {output_path}"
+        shell_cmd = " | ".join(cmd_strs) + f" > {shlex.quote(str(output_path))}"
 
         logger.debug("Executing pipeline: %s", shell_cmd)
 
@@ -356,6 +370,57 @@ class RawEndpoint(Endpoint):
             stderr=subprocess.PIPE,
         )
         return proc
+
+    @staticmethod
+    def _fsync_dir(directory: Path) -> None:
+        """Best-effort fsync of a directory so a rename into it is durable."""
+        try:
+            dfd = os.open(directory, os.O_RDONLY)
+            try:
+                os.fsync(dfd)
+            finally:
+                os.close(dfd)
+        except OSError as e:
+            logger.debug("Directory fsync failed for %s: %s", directory, e)
+
+    def commit_receive(self) -> None:
+        """Atomically publish the received stream after a successful transfer.
+
+        The receive pipeline writes to a ``.part`` file; only once the engine
+        has confirmed the pipeline exited 0 do we fsync that file, atomically
+        rename it to its final name, and fsync the directory so the rename is
+        durable. A crash before this point leaves only the ``.part`` file, which
+        ``discover_raw_snapshots`` ignores -- so a partial transfer can never be
+        mistaken for a complete backup.
+
+        Raises on failure so the engine treats an un-published stream as a
+        failed transfer rather than reporting a success that is not on disk.
+        """
+        pending = getattr(self, "_pending_metadata", None)
+        # No receive() has run on this endpoint (dummy init) -> nothing to publish.
+        if not pending or not pending.get("name"):
+            return
+        part_path = Path(pending["part_path"])
+        final_path = Path(pending["stream_path"])
+        if not part_path.exists():
+            # The stream we just received is gone; fail loud rather than report a
+            # success with no file on disk -- the exact phantom-success class this
+            # atomic-write scheme exists to prevent.
+            raise RuntimeError(
+                f"commit_receive: received stream {part_path} is missing; "
+                f"cannot publish {final_path}"
+            )
+        # Flush the stream's bytes to disk BEFORE renaming, so the final name can
+        # never refer to unflushed data.
+        fd = os.open(part_path, os.O_RDONLY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        os.replace(part_path, final_path)
+        # Persist the rename itself.
+        self._fsync_dir(final_path.parent)
+        logger.debug("Committed raw stream: %s", final_path)
 
     def finalize_receive(
         self, proc: subprocess.Popen, uuid: str = "", parent_uuid: str | None = None
@@ -722,13 +787,16 @@ class SSHRawEndpoint(RawEndpoint):
 
         Runs compression/encryption locally, then pipes to remote via SSH.
         """
-        output_path = self._pending_metadata["stream_path"]
+        output_path = self._pending_metadata["part_path"]
         ssh_cmd = self._build_ssh_command()
 
-        # Build the remote write command
-        remote_cmd = f"cat > {output_path}"
+        # Build the remote write command. Quote the destination path so a path
+        # with spaces/metacharacters writes to the intended file, and so the
+        # receive-write and commit_receive halves quote identically (they must
+        # agree on the target or a valid config could fail at commit).
+        remote_cmd = f"cat > {shlex.quote(str(output_path))}"
         if self.ssh_sudo:
-            remote_cmd = f"sudo sh -c '{remote_cmd}'"
+            remote_cmd = f"sudo sh -c {shlex.quote(remote_cmd)}"
 
         if not pipeline or pipeline == [["cat"]]:
             # No local processing, pipe directly to SSH
@@ -744,7 +812,7 @@ class SSHRawEndpoint(RawEndpoint):
         # Local processing then SSH
         cmd_strs = [" ".join(cmd) for cmd in pipeline]
         local_pipeline = " | ".join(cmd_strs)
-        ssh_part = " ".join(ssh_cmd) + f" '{remote_cmd}'"
+        ssh_part = " ".join(ssh_cmd) + " " + shlex.quote(remote_cmd)
         shell_cmd = f"{local_pipeline} | {ssh_part}"
 
         logger.debug("Executing SSH pipeline: %s", shell_cmd)
@@ -756,6 +824,41 @@ class SSHRawEndpoint(RawEndpoint):
             stderr=subprocess.PIPE,
         )
         return proc
+
+    def commit_receive(self) -> None:
+        """Atomically publish the remote stream after a successful transfer.
+
+        The receive pipeline writes to a remote ``.part`` file; once the engine
+        confirms success we ``sync`` the remote filesystem and ``mv -f`` the
+        ``.part`` file to its final name. A crash leaves only the ``.part`` file,
+        which discovery ignores. Raises on failure so an un-published stream is
+        treated as a failed transfer.
+        """
+        pending = getattr(self, "_pending_metadata", None)
+        # No receive() has run on this endpoint (dummy init) -> nothing to publish.
+        if not pending or not pending.get("name"):
+            return
+        part_path = pending["part_path"]
+        final_path = pending["stream_path"]
+        # The leading sync flushes the just-written bytes BEFORE the rename (so
+        # the final name can never refer to unflushed data); the trailing sync
+        # makes the rename itself durable, matching the local path's post-rename
+        # directory fsync. _exec_remote_command quotes each argv element and adds
+        # sudo itself, so the whole shell script is one quoted argument to sh -c.
+        mv_script = (
+            f"sync && mv -f {shlex.quote(str(part_path))} "
+            f"{shlex.quote(str(final_path))} && sync"
+        )
+        result = self._exec_remote_command(["sh", "-c", mv_script], check=False)
+        if result.returncode != 0:
+            stderr = result.stderr
+            if isinstance(stderr, (bytes, bytearray)):
+                stderr = stderr.decode(errors="replace")
+            raise RuntimeError(
+                f"Failed to publish remote raw stream {final_path}: "
+                f"{(stderr or '').strip()}"
+            )
+        logger.debug("Committed remote raw stream: %s", final_path)
 
     def list_snapshots(self, flush_cache: bool = False) -> list[RawSnapshot]:
         """List raw snapshots on the remote host.

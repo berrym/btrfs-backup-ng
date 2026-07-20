@@ -65,6 +65,10 @@ class MockEndpoint:
         mock_process.poll.return_value = None
         return mock_process
 
+    def commit_receive(self):
+        """No-op commit, mirroring the base Endpoint (btrfs receive is atomic)."""
+        return
+
 
 class TestSendSnapshotChunkedOption:
     """Tests for chunked transfer option in send_snapshot."""
