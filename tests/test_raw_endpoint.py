@@ -1086,6 +1086,19 @@ class TestSSHRawEndpointMethods:
             snapshots = endpoint.list_snapshots()
         assert snapshots == []
 
+    def test_list_snapshots_second_pass_skips_meta_tmp(self):
+        """An uncommitted remote sidecar (<name>.meta.tmp, left by a crash mid
+        sidecar-write) contains '.btrfs' and matches find '*.btrfs*'; it must NOT
+        be listed as a phantom backup."""
+        endpoint = SSHRawEndpoint(config={"path": "/backup", "hostname": "nas"})
+        with patch("subprocess.run") as mock_run:
+            mock_run.side_effect = [
+                MagicMock(returncode=0, stdout=""),  # find *.meta -> none
+                MagicMock(returncode=0, stdout="/backup/good.btrfs.gz.meta.tmp\n"),
+            ]
+            snapshots = endpoint.list_snapshots()
+        assert snapshots == []
+
     def test_list_snapshots_skips_unstatable_stream(self):
         """A stream that cannot be stat'd is skipped, not surfaced with a
         fabricated created=now that would sort as newest."""

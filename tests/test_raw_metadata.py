@@ -95,7 +95,7 @@ class TestRawSnapshot:
 
         data = snapshot.to_dict()
 
-        assert data["version"] == 1
+        assert data["version"] == 2
         assert data["name"] == "root.20240115T120000"
         assert data["uuid"] == "abc123"
         assert data["parent_uuid"] == "def456"
@@ -104,7 +104,14 @@ class TestRawSnapshot:
         assert data["pipeline"]["compress"] == "zstd"
         assert data["pipeline"]["encrypt"] == "gpg"
         assert data["pipeline"]["gpg_recipient"] == "backup@example.com"
-        assert "btrfs_backup_ng_version" in data
+        # v2 additions
+        assert data["pipeline"]["openssl_cipher"] is None
+        assert data["checksum"] == {"algorithm": "sha256", "value": None}
+        assert data["provenance"]["origin"] == "native-write"
+        assert "tool_version" in data["provenance"]
+        # created is ISO-8601 UTC
+        assert data["created"].endswith("+00:00")
+        assert "btrfs_backup_ng_version" in data  # kept for v1 readers
 
     def test_from_dict(self):
         """Test deserialization from dictionary."""

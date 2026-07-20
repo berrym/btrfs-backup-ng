@@ -750,13 +750,19 @@ class TestMetadataIntegration:
         with open(snapshot.metadata_path) as f:
             data = json.load(f)
 
-        # Check structure
-        assert data["version"] == 1
+        # Check structure (v2)
+        assert data["version"] == 2
         assert data["name"] == "root.20240115T120000"
         assert data["uuid"] == "test-uuid"
         assert "pipeline" in data
         assert data["pipeline"]["compress"] == "gzip"
+        assert data["checksum"] == {"algorithm": "sha256", "value": None}
+        assert data["provenance"]["origin"] == "native-write"
         assert "btrfs_backup_ng_version" in data
+        # Atomic write leaves no temp file behind.
+        assert not snapshot.metadata_path.with_name(
+            snapshot.metadata_path.name + ".tmp"
+        ).exists()
 
     def test_discover_snapshots_from_metadata(self, tmp_path):
         """Test discovering snapshots from metadata files."""
