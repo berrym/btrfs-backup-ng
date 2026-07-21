@@ -10,6 +10,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from btrfs_backup_ng.__util__ import AbortError
 from btrfs_backup_ng.endpoint.raw import SSHRawEndpoint
 from btrfs_backup_ng.endpoint.raw_metadata import RawSnapshot
 
@@ -77,6 +78,21 @@ def test_prepare_preflight_passes_when_tools_present():
     ):
         with patch.object(ep, "_check_tools", return_value=[]):
             ep._prepare()  # must not raise
+
+
+def test_prepare_fails_loud_when_local_compress_tool_missing():
+    """A raw+ssh backup whose LOCAL compress/encrypt tool is missing (compression
+    runs locally before the ssh pipe) must fail its preflight with an actionable
+    message, not a raw errno part-way through the transfer."""
+    ep = SSHRawEndpoint(
+        config={"path": "/backup", "hostname": "nas", "compress": "zstd"}
+    )
+    with patch(
+        "subprocess.run", return_value=MagicMock(returncode=0, stdout=b"RAWSSHOK\n")
+    ):
+        with patch("btrfs_backup_ng.endpoint.raw.shutil.which", return_value=None):
+            with pytest.raises(AbortError, match="not installed"):
+                ep._prepare()
 
 
 def test_send_encrypted_decrypts_locally_after_ssh_cat():
