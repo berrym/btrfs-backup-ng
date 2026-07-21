@@ -10,6 +10,7 @@ via their sidecars (falling back to filename inference for legacy streams); late
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
 import sys
@@ -88,6 +89,20 @@ def _open_target(args: argparse.Namespace):
                 file=sys.stderr,
             )
     return ep, spec
+
+
+def _warn_remote_no_lock(ep) -> None:
+    """Warn (on stderr, so ``--json`` stays clean) that a raw+ssh target is not
+    lock-protected. The per-target mutual-exclusion lock is local-only (a remote
+    lock needs a persistent connection to hold an flock, which is deferred), so a
+    remote maintenance write can still race a concurrent backup/prune -- run it
+    while the target is idle."""
+    if getattr(ep, "_is_remote", False):
+        print(
+            "warning: raw+ssh targets are not lock-protected; run maintenance while "
+            "the target is idle (no concurrent backup or prune to this target).",
+            file=sys.stderr,
+        )
 
 
 def _raw_list(args: argparse.Namespace) -> int:
@@ -227,48 +242,52 @@ def _raw_backfill(args: argparse.Namespace) -> int:
         print(str(e))
         return 2
 
+    dry = getattr(args, "dry_run", False)
+    if not dry:
+        _warn_remote_no_lock(ep)
+    # Hold the per-target lock across scan + write so a concurrent backup/prune
+    # cannot interleave (a dry-run is read-only, so it needs no lock).
+    lock_ctx = contextlib.nullcontext() if dry else ep.target_lock()
+    results = []
     try:
-        candidates = ep.streams_without_sidecar()
+        with lock_ctx:
+            candidates = ep.streams_without_sidecar()
+            for snap in candidates:
+                entry = {
+                    "name": snap.name,
+                    "stream": str(snap.stream_path),
+                    "compress": snap.compress,
+                    "encrypt": snap.encrypt,
+                }
+                if dry:
+                    entry["action"] = "would-backfill"
+                else:
+                    # Seal a checksum of the stream as it is now (detects later
+                    # corruption); completeness stays "unknown" -- this does not
+                    # prove the legacy stream is a complete btrfs send.
+                    snap.checksum_value = ep.compute_stream_checksum(snap)
+                    # Belt-and-suspenders under the lock: a sidecar should not appear
+                    # mid-operation now, but re-check and never overwrite one.
+                    if ep.sidecar_exists(snap):
+                        entry["action"] = "skipped"
+                        results.append(entry)
+                        continue
+                    try:
+                        ep.write_sidecar(snap)
+                        entry["action"] = "backfilled"
+                        entry["checksum"] = snap.checksum_value
+                    except Exception as e:
+                        logger.debug("backfill sidecar write failed", exc_info=True)
+                        entry["action"] = "error"
+                        entry["error"] = str(e)
+                results.append(entry)
+    except RuntimeError as e:  # target busy (lock timeout)
+        print(f"Cannot backfill {spec}: {e}")
+        return 1
     except Exception as e:  # pragma: no cover - defensive; endpoint errors vary
         logger.debug("raw backfill-metadata failed", exc_info=True)
         print(f"Failed to scan {spec}: {e}")
         return 1
-
-    dry = getattr(args, "dry_run", False)
-    results = []
-    for snap in candidates:
-        entry = {
-            "name": snap.name,
-            "stream": str(snap.stream_path),
-            "compress": snap.compress,
-            "encrypt": snap.encrypt,
-        }
-        if dry:
-            entry["action"] = "would-backfill"
-        else:
-            # Seal a checksum of the stream as it is now (detects later corruption);
-            # completeness stays "unknown" -- this does not prove the legacy stream
-            # is a complete btrfs send.
-            snap.checksum_value = ep.compute_stream_checksum(snap)
-            # Re-check immediately before writing: if a sidecar appeared since the
-            # scan (a backup committed concurrently -- commit publishes the stream
-            # then writes its sidecar as two steps), do NOT overwrite the
-            # authoritative sidecar with a backfill record. (A full per-target lock
-            # covering backup/prune/backfill lands with the raw maintenance lock;
-            # this re-check closes the practical window.)
-            if ep.sidecar_exists(snap):
-                entry["action"] = "skipped"
-                results.append(entry)
-                continue
-            try:
-                ep.write_sidecar(snap)
-                entry["action"] = "backfilled"
-                entry["checksum"] = snap.checksum_value
-            except Exception as e:
-                logger.debug("backfill sidecar write failed", exc_info=True)
-                entry["action"] = "error"
-                entry["error"] = str(e)
-        results.append(entry)
 
     if getattr(args, "json", False):
         print(json.dumps(results, indent=2))
@@ -367,64 +386,79 @@ def _raw_encrypt(args: argparse.Namespace) -> int:
             print("Aborted.", file=sys.stderr)
             return 1
 
-    results = []
-    for s in plaintext:
-        entry: dict = {"name": s.name, "stream": str(s.stream_path)}
-        if dry:
-            entry["action"] = "would-encrypt-and-shred" if shred else "would-encrypt"
-            results.append(entry)
-            continue
-        enc_path = Path(str(s.stream_path) + ext)
-        pre_existing = enc_path.exists()
-        if pre_existing:
-            # Never clobber an existing encrypted stream. Verify it decrypts to THIS
-            # plaintext; if so it is a valid prior remediation (idempotent re-run).
-            twin: RawSnapshot = RawSnapshot(
-                name=s.name,
-                stream_path=enc_path,
-                encrypt=encrypt,
-                compress=None,
-                openssl_cipher=cipher if encrypt == "openssl_enc" else None,
-            )
-        else:
-            try:
-                twin = ep.remediate_plaintext(
-                    s,
-                    encrypt=encrypt,
-                    gpg_recipient=gpg_recipient,
-                    gpg_keyring=gpg_keyring,
-                    openssl_cipher=cipher,
+    def _process() -> list:
+        out: list = []
+        for s in plaintext:
+            entry: dict = {"name": s.name, "stream": str(s.stream_path)}
+            if dry:
+                entry["action"] = (
+                    "would-encrypt-and-shred" if shred else "would-encrypt"
                 )
-            except Exception as e:
-                logger.debug("remediate failed for %s", s.name, exc_info=True)
-                entry["action"] = "error"
-                entry["error"] = str(e)
-                results.append(entry)
+                out.append(entry)
                 continue
-        entry["encrypted"] = str(enc_path)
-        verified = ep.decrypt_matches_plaintext(twin, s.stream_path)
-        entry["verified"] = verified
-        if not verified:
-            # Fresh: encrypted but unprovable (e.g. gpg without the secret key) -> keep
-            # the plaintext. Pre-existing: it does not decrypt to this plaintext ->
-            # never touch it or the plaintext.
-            entry["action"] = (
-                "existing-encrypted-differs" if pre_existing else "encrypted-unverified"
-            )
-            results.append(entry)
-            continue
-        if shred:
-            try:
-                os.unlink(s.stream_path)
-                if s.metadata_path.exists():
-                    os.unlink(s.metadata_path)
-                entry["action"] = "removed-plaintext"
-            except OSError as e:
-                entry["action"] = "remove-failed"
-                entry["error"] = str(e)
-        else:
-            entry["action"] = "already-encrypted" if pre_existing else "encrypted"
-        results.append(entry)
+            enc_path = Path(str(s.stream_path) + ext)
+            pre_existing = enc_path.exists()
+            if pre_existing:
+                # Never clobber an existing encrypted stream. Verify it decrypts to
+                # THIS plaintext; if so it is a valid prior remediation (idempotent).
+                twin: RawSnapshot = RawSnapshot(
+                    name=s.name,
+                    stream_path=enc_path,
+                    encrypt=encrypt,
+                    compress=None,
+                    openssl_cipher=cipher if encrypt == "openssl_enc" else None,
+                )
+            else:
+                try:
+                    twin = ep.remediate_plaintext(
+                        s,
+                        encrypt=encrypt,
+                        gpg_recipient=gpg_recipient,
+                        gpg_keyring=gpg_keyring,
+                        openssl_cipher=cipher,
+                    )
+                except Exception as e:
+                    logger.debug("remediate failed for %s", s.name, exc_info=True)
+                    entry["action"] = "error"
+                    entry["error"] = str(e)
+                    out.append(entry)
+                    continue
+            entry["encrypted"] = str(enc_path)
+            verified = ep.decrypt_matches_plaintext(twin, s.stream_path)
+            entry["verified"] = verified
+            if not verified:
+                # Fresh: encrypted but unprovable (e.g. gpg without the secret key)
+                # -> keep the plaintext. Pre-existing: it does not decrypt to this
+                # plaintext -> never touch it or the plaintext.
+                entry["action"] = (
+                    "existing-encrypted-differs"
+                    if pre_existing
+                    else "encrypted-unverified"
+                )
+                out.append(entry)
+                continue
+            if shred:
+                try:
+                    os.unlink(s.stream_path)
+                    if s.metadata_path.exists():
+                        os.unlink(s.metadata_path)
+                    entry["action"] = "removed-plaintext"
+                except OSError as e:
+                    entry["action"] = "remove-failed"
+                    entry["error"] = str(e)
+            else:
+                entry["action"] = "already-encrypted" if pre_existing else "encrypted"
+            out.append(entry)
+        return out
+
+    # Hold the per-target lock across the whole remediation (a dry-run is read-only).
+    lock_ctx = contextlib.nullcontext() if dry else ep.target_lock()
+    try:
+        with lock_ctx:
+            results = _process()
+    except RuntimeError as e:  # target busy (lock timeout)
+        print(f"Cannot encrypt {spec}: {e}")
+        return 1
 
     if getattr(args, "json", False):
         print(json.dumps(results, indent=2))

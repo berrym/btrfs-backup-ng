@@ -13,6 +13,9 @@ Encryption methods:
 
 from __future__ import annotations
 
+import contextlib
+import errno
+import fcntl
 import hashlib
 import json
 import os
@@ -20,6 +23,8 @@ import re
 import shlex
 import shutil
 import subprocess
+import time
+from collections.abc import Iterator
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, TypedDict
@@ -145,6 +150,10 @@ def _openssl_pass_arg() -> str:
 # transfer can never be listed as a complete backup.
 PARTIAL_SUFFIX = ".part"
 
+# Per-target advisory lock file. Mutating operations (backup commit, prune, backfill,
+# encrypt) hold an exclusive flock on it so they are mutually exclusive on one target.
+LOCK_FILENAME = ".btrfs-backup-ng.lock"
+
 
 def _sha256_file(path: Path) -> str | None:
     """Return the hex sha256 of ``path``'s bytes, or None on any I/O error.
@@ -253,6 +262,17 @@ class RawEndpoint(Endpoint):
             config.get("openssl_cipher") or "aes-256-cbc"
         )
 
+        # How long a mutating op waits for the per-target lock before reporting the
+        # target busy. The base __init__ only keeps known keys, so register it here.
+        # A generous default: the commit critical section is sub-second, but slow
+        # storage (NFS/SMB) can make a legitimate peer's own commit take longer.
+        try:
+            self.config["lock_timeout"] = float(config.get("lock_timeout", 30.0))
+        except (TypeError, ValueError):
+            raise ValueError("lock_timeout must be a number of seconds") from None
+        if self.config["lock_timeout"] < 0:
+            raise ValueError("lock_timeout must not be negative")
+
         # Validate encryption config
         if self.encrypt == "gpg" and not self.gpg_recipient:
             raise ValueError("gpg_recipient is required when encrypt=gpg")
@@ -321,6 +341,84 @@ class RawEndpoint(Endpoint):
         """Return a unique identifier for this endpoint."""
         path = self._normalize_path(self.config["path"])
         return f"raw://{path}"
+
+    @contextlib.contextmanager
+    def target_lock(self, *, timeout: float | None = None) -> Iterator[None]:
+        """Hold an exclusive lock on the target directory for a MUTATING operation.
+
+        Backup (commit), prune, ``raw backfill-metadata`` and ``raw encrypt`` on the
+        same raw target all take this lock, so they are mutually exclusive -- closing
+        the transient two-files-one-name window (e.g. a backfill mislabelling a native
+        backup during its non-atomic stream-then-sidecar commit, or a prune racing a
+        backfill).
+
+        A bounded-blocking exclusive ``flock``: it waits up to ``timeout`` seconds for
+        a peer to finish (so legitimate parallel commits to one target SERIALIZE rather
+        than fail), then raises RuntimeError if still busy. ``timeout`` defaults to the
+        ``lock_timeout`` config key (30s). The lock is released when the fd is closed
+        and is auto-released if the process dies, so it can never go stale.
+
+        Failure posture: a planted lock symlink (O_NOFOLLOW -> ELOOP), a lock that is
+        a directory (EISDIR), a foreign-owned/non-writable lock file (EACCES), or a
+        filesystem that cannot flock (ENOLCK) all raise RuntimeError rather than an
+        uncaught OSError -- so a hostile or mis-owned lock file degrades to the same
+        bounded fail/skip as contention instead of crashing every backup. The lock
+        lives inside the target directory, so that directory MUST NOT be writable by
+        untrusted users. The raw+ssh subclass overrides this as a no-op (remote
+        locking is a separate concern -- there is no persistent connection to hold an
+        flock)."""
+        if timeout is None:
+            timeout = float(self.config.get("lock_timeout", 30.0))
+        path = Path(self.config["path"])
+        path.mkdir(parents=True, exist_ok=True, mode=0o700)
+        lockfile = path / LOCK_FILENAME
+        # O_NOFOLLOW: refuse a planted <target>/.btrfs-backup-ng.lock symlink so the
+        # (often root) open cannot be pointed at an arbitrary file, matching the
+        # symlink hardening elsewhere in this module. Any open failure (symlink,
+        # directory, foreign-owned/unwritable regular file) is mapped to RuntimeError
+        # so it cannot escape as an uncaught OSError and turn a hostile/mis-owned lock
+        # file into a permanent DoS on backups and prune.
+        try:
+            fd = os.open(lockfile, os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+        except OSError as e:
+            logger.warning(
+                "Cannot open raw target lock file %s: %s -- a planted symlink, a "
+                "directory, or a foreign-owned/non-writable lock file. The target "
+                "directory must not be writable by untrusted users and the lock file "
+                "must be owned by the backup user.",
+                lockfile,
+                e,
+            )
+            raise RuntimeError(
+                f"raw target {path} is unavailable: cannot open its lock file "
+                f"{lockfile} ({e})"
+            ) from e
+        deadline = time.monotonic() + max(0.0, timeout)
+        try:
+            while True:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except OSError as e:
+                    # EAGAIN/EWOULDBLOCK (BlockingIOError) is the real contention
+                    # signal -- retry until the deadline. Any other errno (e.g. ENOLCK
+                    # from a filesystem that cannot flock) will never clear, so fail
+                    # immediately with an accurate message instead of polling for the
+                    # full timeout and mislabelling it "busy".
+                    if e.errno not in (errno.EAGAIN, errno.EWOULDBLOCK):
+                        raise RuntimeError(
+                            f"raw target {path}: cannot lock {lockfile} ({e}); the "
+                            "filesystem may not support flock"
+                        ) from e
+                    if time.monotonic() >= deadline:
+                        raise RuntimeError(
+                            f"raw target {path} is busy (another operation holds the "
+                            "lock); retry when it finishes"
+                        ) from None
+                    time.sleep(0.2)
+            yield
+        finally:
+            os.close(fd)  # releases the flock
 
     def _prepare(self) -> None:
         """Prepare the endpoint for use."""
@@ -543,32 +641,43 @@ class RawEndpoint(Endpoint):
                 f"cannot publish {final_path}"
             )
         # Flush the stream's bytes to disk BEFORE renaming, so the final name can
-        # never refer to unflushed data.
+        # never refer to unflushed data. Done OUTSIDE the lock: the ``.part`` name is
+        # unique to this transfer so no peer touches it, and this fsync can take a
+        # long time on a multi-GB stream -- holding the lock across it would make a
+        # legitimately parallel commit exceed the wait and FAIL instead of serialize.
         fd = os.open(part_path, os.O_RDONLY)
         try:
             os.fsync(fd)
         finally:
             os.close(fd)
-        os.replace(part_path, final_path)
-        # Persist the rename itself.
-        self._fsync_dir(final_path.parent)
-        # Write the authoritative sidecar now that the stream is durable at its
-        # final name. Written last + atomically, so a crash yields at most a
-        # stream-without-sidecar (discovery falls back to filename inference),
-        # never a sidecar describing a missing/partial stream. Best-effort: the
-        # backup data already succeeded, so a sidecar error must not fail it.
-        try:
-            size = final_path.stat().st_size
-            # sha256 of the committed ciphertext, read back from disk so it
-            # reflects the bytes that actually landed (raw verify recomputes and
-            # compares). Best-effort: on failure the checksum stays null.
-            checksum = _sha256_file(final_path)
-            self.write_sidecar(self._sidecar_snapshot(final_path, size, checksum))
-        except Exception as e:
-            # The backup data is already durable; a sidecar error must NEVER flip
-            # an already-successful transfer into a reported failure (PR1 contract).
-            # A missing sidecar just degrades to filename inference.
-            logger.warning("Failed to write sidecar for %s: %s", final_path, e)
+        # Hash the ``.part`` now too (also outside the lock, same slow-read reason).
+        # ``os.replace`` is a pure rename, so the committed stream's bytes are
+        # byte-identical to the ``.part`` -- this sha256 describes the final file, and
+        # ``_sha256_file`` drops the page cache (POSIX_FADV_DONTNEED) after the fsync
+        # above so it reflects the bytes actually on disk. Best-effort: None on error.
+        checksum = _sha256_file(part_path)
+        # Only the rename (which makes the stream visible under its shared final name)
+        # through the sidecar write must be mutually exclusive, so a concurrent
+        # backfill/prune cannot observe the stream in the window after the rename but
+        # before the sidecar is written (and mislabel it). This section is sub-second
+        # (a metadata rename + a directory fsync + a small sidecar write).
+        with self.target_lock():
+            os.replace(part_path, final_path)
+            # Persist the rename itself.
+            self._fsync_dir(final_path.parent)
+            # Write the authoritative sidecar now that the stream is durable at its
+            # final name. Written last + atomically, so a crash yields at most a
+            # stream-without-sidecar (discovery falls back to filename inference),
+            # never a sidecar describing a missing/partial stream. Best-effort: the
+            # backup data already succeeded, so a sidecar error must not fail it.
+            try:
+                size = final_path.stat().st_size
+                self.write_sidecar(self._sidecar_snapshot(final_path, size, checksum))
+            except Exception as e:
+                # The backup data is already durable; a sidecar error must NEVER flip
+                # an already-successful transfer into a reported failure (PR1
+                # contract). A missing sidecar just degrades to filename inference.
+                logger.warning("Failed to write sidecar for %s: %s", final_path, e)
         self._cached_snapshots = None  # re-discover to include the new sidecar
         logger.debug("Committed raw stream + sidecar: %s", final_path)
 
@@ -755,7 +864,10 @@ class RawEndpoint(Endpoint):
             # must not be treated as a real backup (defends the write + the hash).
             if item.is_symlink() or not item.is_file() or item.suffix == ".meta":
                 continue
-            if item.name.endswith((".part", ".tmp")) or ".btrfs" not in item.name:
+            if (
+                item.name.endswith((".part", ".tmp", ".lock"))
+                or ".btrfs" not in item.name
+            ):
                 continue
             if item.with_name(item.name + ".meta").exists():
                 continue  # already has an authoritative sidecar
@@ -974,6 +1086,16 @@ class RawEndpoint(Endpoint):
             snapshots: List of snapshots to delete
             **kwargs: Additional arguments (unused)
         """
+        # Prune under the per-target lock so it cannot race a concurrent backup
+        # commit or backfill. If the target is busy, skip (safe -- do NOT delete
+        # during contention); retention retries on the next run.
+        try:
+            with self.target_lock():
+                self._delete_snapshots_locked(snapshots)
+        except RuntimeError as e:
+            logger.warning("Skipping raw delete (target busy): %s", e)
+
+    def _delete_snapshots_locked(self, snapshots: list[RawSnapshot]) -> None:
         for snapshot in snapshots:
             try:
                 # Delete stream file
@@ -1020,7 +1142,15 @@ class RawEndpoint(Endpoint):
         to_delete = snapshots[:-keep]
         for snapshot in to_delete:
             logger.info("Deleting old raw snapshot: %s", snapshot.name)
-            self.delete_snapshot(snapshot)
+        # One lock for the whole prune pass so it is atomic as a unit (a concurrent
+        # commit cannot interleave between two deletions) and a busy target yields a
+        # single skip decision, not a partial prune. Call the non-locking variant --
+        # delete_snapshot would re-take the lock per snapshot and self-deadlock.
+        try:
+            with self.target_lock():
+                self._delete_snapshots_locked(to_delete)
+        except RuntimeError as e:
+            logger.warning("Skipping raw prune (target busy): %s", e)
 
     def get_space_info(self, path: str | None = None) -> Any:
         """Get space information for the raw target directory.
@@ -1087,6 +1217,15 @@ class SSHRawEndpoint(RawEndpoint):
             f"{self.username}@{self.hostname}" if self.username else self.hostname
         )
         return f"raw+ssh://{user_host}{self.config['path']}"
+
+    @contextlib.contextmanager
+    def target_lock(self, *, timeout: float | None = None) -> Iterator[None]:
+        """No-op for raw+ssh. A per-target lock over ssh needs a remote lockfile with
+        stale-detection (there is no persistent connection to hold an flock), which is
+        a separate change; concurrent-operation protection is currently local-only. Run
+        maintenance commands against a raw+ssh target when it is otherwise idle. The
+        raw maintenance CLI warns the operator of this at the point of use."""
+        yield
 
     def _build_ssh_command(self) -> list[str]:
         """Build the base SSH command."""
@@ -1388,7 +1527,7 @@ class SSHRawEndpoint(RawEndpoint):
         metas = set(self._remote_find("*.meta"))
         out: list[RawSnapshot] = []
         for sp in streams:
-            if sp.endswith((".meta", ".part", ".tmp")):
+            if sp.endswith((".meta", ".part", ".tmp", ".lock")):
                 continue
             if sp + ".meta" in metas:
                 continue  # already has an authoritative sidecar
@@ -1624,7 +1763,7 @@ class SSHRawEndpoint(RawEndpoint):
         loaded_paths = {str(s.stream_path) for s in snapshots}
         for stream_path_str in stream_files:
             if not stream_path_str or stream_path_str.endswith(
-                (".meta", ".part", ".tmp")
+                (".meta", ".part", ".tmp", ".lock")
             ):
                 continue
             if stream_path_str in loaded_paths:
@@ -1681,8 +1820,14 @@ class SSHRawEndpoint(RawEndpoint):
         self._cached_snapshots = snapshots
         return list(snapshots)
 
-    def delete_snapshots(self, snapshots: list[RawSnapshot], **kwargs: Any) -> None:
-        """Delete snapshots on the remote host."""
+    def _delete_snapshots_locked(self, snapshots: list[RawSnapshot]) -> None:
+        """Delete snapshots on the remote host (issuing a remote ``rm``).
+
+        This overrides the LOCAL delete primitive rather than ``delete_snapshots``,
+        so both entry points that wrap it in ``target_lock`` -- ``delete_snapshots``
+        (per batch) and ``delete_old_snapshots`` (whole prune pass) -- dispatch to the
+        remote deletion for a raw+ssh target. Inheriting the base ``delete_snapshots``
+        keeps the (no-op) lock discipline uniform across local and remote."""
         ssh_cmd = self._build_ssh_command()
 
         for snapshot in snapshots:
