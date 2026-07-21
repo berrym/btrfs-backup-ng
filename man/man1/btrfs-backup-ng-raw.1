@@ -23,6 +23,14 @@ cipher), size, provenance, and creation time.
 .PP
 These subcommands read and maintain such a target directly, independently of any
 configured backup job.
+.PP
+On a local \fBraw://\fR target, mutating operations (a backup's commit, prune,
+\fBbackfill-metadata\fR, and \fBencrypt\fR) hold an exclusive per-target lock so
+they serialize instead of racing. The lock is an empty \fB.btrfs-backup-ng.lock\fR
+file in the target directory, created mode \fB0600\fR; it is safe to leave in place
+and is never listed as a backup. Because the lock lives inside the target
+directory, that directory must not be writable by untrusted users. Remote
+\fBraw+ssh://\fR maintenance is not yet lock-protected.
 .SH SUBCOMMANDS
 .SS list
 List the backups a raw target holds.
@@ -105,8 +113,13 @@ with
 a legacy stream's completeness cannot be proven, so a backfilled sidecar is a
 reconstructed, non-authoritative record. The checksum lets
 .B raw verify
-detect later corruption, not confirm the original backup was complete. Run this
-command when no backup or prune is in flight against the same target.
+detect later corruption, not confirm the original backup was complete. On a local
+.B raw://
+target this holds the per-target lock, so a concurrent backup or prune serializes
+against it; on a
+.B raw+ssh://
+target the lock is a no-op (remote locking is not yet implemented) and the command
+warns you, so run remote maintenance while the target is idle.
 .TP
 .B \-\-dry-run
 Show which streams would be backfilled without writing anything.

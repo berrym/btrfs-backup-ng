@@ -937,6 +937,8 @@ Inspect and maintain [raw-target](#raw-targets) backups directly. Raw targets ho
 btrfs-backup-ng raw SUBCOMMAND [OPTIONS]
 ```
 
+Mutating operations on a local `raw://` target (a backup's commit, prune, `backfill-metadata`, and `encrypt`) hold an exclusive per-target lock so they cannot race each other; concurrent operations serialize rather than corrupt one another. The lock is an empty `.btrfs-backup-ng.lock` file kept in the target directory — it is created `0600`, is safe to leave in place, and is never listed as a backup. Because the lock lives inside the target directory, that directory must not be writable by untrusted users. The lock is currently local-only: `raw+ssh://` maintenance is not serialized, so run it while the target is otherwise idle.
+
 #### raw list
 
 List the backups a raw target holds, read from each stream's `.meta` sidecar (falling back to filename inference for legacy streams written before sidecars existed).
@@ -1024,7 +1026,7 @@ btrfs-backup-ng raw backfill-metadata TARGET [OPTIONS]
 
 Each backfilled sidecar records the pipeline inferred from the filename (compression/encryption) and a sha256 of the stream as it exists now, and is stamped `provenance_origin=backfill` with `stream_completeness=unknown`. A legacy stream's completeness cannot be proven (it might have been truncated), so a backfilled sidecar is marked as a **reconstructed, non-authoritative** record — the checksum lets `raw verify` detect later corruption, but does not confirm the original backup was complete. Exit status is `1` if any sidecar write failed, else `0`.
 
-Run `backfill-metadata` when no backup or prune is in flight against the same target: it re-checks for a sidecar immediately before writing (so a concurrently-committed backup is not overwritten), but a per-target lock is not yet in place.
+On a local `raw://` target, `backfill-metadata` holds the per-target lock while it works, so a concurrent backup or prune serializes against it; it also re-checks for a sidecar immediately before writing, so a concurrently-committed backup is never overwritten. On a `raw+ssh://` target the lock is a no-op (remote locking is not yet implemented) and the command warns you — run remote maintenance while the target is idle.
 
 **Example Output:**
 ```

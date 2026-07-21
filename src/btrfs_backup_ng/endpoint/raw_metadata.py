@@ -460,11 +460,11 @@ def discover_raw_snapshots(
         if not item.is_file() or item.suffix == ".meta":
             continue
 
-        # Skip in-progress artifacts: a ".part" file is an uncommitted stream and
-        # a ".tmp" file is an uncommitted sidecar (save_metadata writes
-        # "<name>.meta.tmp"). Both contain ".btrfs" in their name, so without this
-        # they would be parsed as phantom complete backups.
-        if item.name.endswith((".part", ".tmp")):
+        # Skip in-progress artifacts and the per-target lock file: a ".part" is an
+        # uncommitted stream, a ".tmp" is an uncommitted sidecar, and
+        # ".btrfs-backup-ng.lock" is the mutual-exclusion lock. All contain ".btrfs"
+        # in their name, so without this they would be parsed as phantom backups.
+        if item.name.endswith((".part", ".tmp", ".lock")):
             continue
 
         # Check if it's a btrfs stream file
