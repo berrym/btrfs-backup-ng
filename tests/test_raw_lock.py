@@ -7,6 +7,7 @@ file must never be mistaken for a backup stream.
 
 import argparse
 import os
+import signal
 import time
 from contextlib import contextmanager
 from pathlib import Path
@@ -77,6 +78,61 @@ def test_target_lock_excludes_across_processes(tmp_path):
         pass
     os.close(r)
     os.waitpid(pid, 0)
+
+
+def _raise_hung(*_a):
+    raise TimeoutError("target_lock hung")
+
+
+def test_fifo_lock_file_does_not_hang(tmp_path):
+    """A FIFO planted as the lock file must NOT block target_lock forever (O_NONBLOCK
+    -> ENXIO -> bounded RuntimeError). Without the fix the (often root) open blocks
+    indefinitely -- a silent permanent DoS on every backup/prune. A SIGALRM converts a
+    regression (hang) into a test failure instead of wedging the whole suite."""
+    os.mkfifo(tmp_path / LOCK_FILENAME)
+    ep = RawEndpoint(config={"path": str(tmp_path)})
+    old = signal.signal(signal.SIGALRM, _raise_hung)
+    signal.alarm(5)
+    try:
+        with pytest.raises(RuntimeError, match="FIFO|not a regular file"):
+            with ep.target_lock(timeout=1.0):
+                pass
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, old)
+
+
+def test_lock_fstat_failure_maps_to_runtime_error(tmp_path, monkeypatch):
+    """If fstat on the freshly-opened lock fd fails (exotic/hostile fs), it must
+    degrade to a bounded RuntimeError -- NOT escape as an uncaught OSError (the prune
+    path catches only RuntimeError, and the CLI would misreport an OSError on stdout)."""
+    ep = RawEndpoint(config={"path": str(tmp_path)})
+
+    def boom(_fd):
+        raise OSError(5, "simulated fstat failure")
+
+    monkeypatch.setattr(raw_mod.os, "fstat", boom)
+    with pytest.raises(RuntimeError, match="cannot stat"):
+        with ep.target_lock(timeout=1.0):
+            pass
+
+
+def test_hostile_lock_messages_are_plain_language(tmp_path):
+    """Hostile/mis-created lock files must surface a plain-language reason (not a bare
+    [Errno NN] repr), so a regular user understands what to fix."""
+    for i, (setup, word) in enumerate(
+        [
+            (lambda p: p.mkdir(), "directory"),
+            (lambda p: p.symlink_to("/etc/hostname"), "symlink"),
+        ]
+    ):
+        d = tmp_path / f"c{i}"
+        d.mkdir()
+        setup(d / LOCK_FILENAME)
+        ep = RawEndpoint(config={"path": str(d)})
+        with pytest.raises(RuntimeError, match=word):
+            with ep.target_lock(timeout=1.0):
+                pass
 
 
 def test_planted_lock_directory_degrades_to_runtime_error(tmp_path):
@@ -166,7 +222,8 @@ def test_backfill_reports_busy_target(tmp_path, monkeypatch, capsys):
         )
     )
     assert rc == 1
-    assert "busy" in capsys.readouterr().out
+    # The lock error goes to stderr (so a --json run's stdout stays valid JSON).
+    assert "busy" in capsys.readouterr().err
 
 
 def test_encrypt_reports_busy_target(tmp_path, monkeypatch, capsys):
@@ -195,7 +252,8 @@ def test_encrypt_reports_busy_target(tmp_path, monkeypatch, capsys):
         )
     )
     assert rc == 1
-    assert "busy" in capsys.readouterr().out
+    # The lock error goes to stderr (so a --json run's stdout stays valid JSON).
+    assert "busy" in capsys.readouterr().err
 
 
 def test_prune_takes_lock_once_for_whole_pass(tmp_path, monkeypatch):
