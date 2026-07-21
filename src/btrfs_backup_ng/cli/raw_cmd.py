@@ -281,8 +281,10 @@ def _raw_backfill(args: argparse.Namespace) -> int:
                         entry["action"] = "error"
                         entry["error"] = str(e)
                 results.append(entry)
-    except RuntimeError as e:  # target busy (lock timeout)
-        print(f"Cannot backfill {spec}: {e}")
+    except (
+        RuntimeError
+    ) as e:  # target busy / hostile lock -- to stderr so --json stays clean
+        print(f"Cannot backfill {spec}: {e}", file=sys.stderr)
         return 1
     except Exception as e:  # pragma: no cover - defensive; endpoint errors vary
         logger.debug("raw backfill-metadata failed", exc_info=True)
@@ -456,8 +458,10 @@ def _raw_encrypt(args: argparse.Namespace) -> int:
     try:
         with lock_ctx:
             results = _process()
-    except RuntimeError as e:  # target busy (lock timeout)
-        print(f"Cannot encrypt {spec}: {e}")
+    except (
+        RuntimeError
+    ) as e:  # target busy / hostile lock -- to stderr so --json stays clean
+        print(f"Cannot encrypt {spec}: {e}", file=sys.stderr)
         return 1
 
     if getattr(args, "json", False):

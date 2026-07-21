@@ -22,6 +22,7 @@ import os
 import re
 import shlex
 import shutil
+import stat
 import subprocess
 import time
 from collections.abc import Iterator
@@ -153,6 +154,33 @@ PARTIAL_SUFFIX = ".part"
 # Per-target advisory lock file. Mutating operations (backup commit, prune, backfill,
 # encrypt) hold an exclusive flock on it so they are mutually exclusive on one target.
 LOCK_FILENAME = ".btrfs-backup-ng.lock"
+
+
+def _lock_open_reason(e: OSError) -> str:
+    """A plain-language reason a lock-file open failed, for a user-facing message.
+
+    Translates the errno so a regular user sees why the lock could not be taken and
+    what to check, instead of a bare ``[Errno NN]`` repr (whose default text is
+    sometimes misleading -- e.g. ELOOP prints 'Too many levels of symbolic links'
+    for a single planted symlink)."""
+    reasons = {
+        errno.ELOOP: "it is a symlink (refused for safety)",
+        errno.EISDIR: "it is a directory, not a file",
+        errno.ENXIO: "it is a FIFO/special file with no reader (refused)",
+        errno.EACCES: (
+            "permission denied -- check the target directory's ownership and "
+            "permissions"
+        ),
+        errno.EPERM: (
+            "operation not permitted -- check the target directory's ownership and "
+            "permissions"
+        ),
+        errno.EROFS: "the filesystem is read-only",
+        errno.ENOTDIR: "a parent path component is not a directory",
+    }
+    if e.errno is None:
+        return str(e)
+    return reasons.get(e.errno, str(e))
 
 
 def _sha256_file(path: Path) -> str | None:
@@ -364,11 +392,14 @@ class RawEndpoint(Endpoint):
         and is auto-released if the process dies, so it can never go stale.
 
         Failure posture: a planted lock symlink (O_NOFOLLOW -> ELOOP), a lock that is
-        a directory (EISDIR), a foreign-owned/non-writable lock file (EACCES), or a
-        filesystem that cannot flock (ENOLCK) all raise RuntimeError rather than an
-        uncaught OSError -- so a hostile or mis-owned lock file degrades to the same
-        bounded fail/skip as contention instead of crashing every backup. The lock
-        lives inside the target directory, so that directory MUST NOT be writable by
+        a directory (EISDIR), a foreign-owned/non-writable lock file (EACCES), a
+        filesystem that cannot flock (ENOLCK), a planted FIFO/named-pipe (O_NONBLOCK
+        -> ENXIO instead of a permanent hang), and any non-regular lock target that
+        still opens (a FIFO with a reader, a device, or a socket -- refused by an
+        fstat check) all raise RuntimeError rather than an uncaught OSError -- so a
+        hostile or mis-created lock file degrades to the same bounded fail/skip as
+        contention instead of crashing (or hanging) every backup. The lock lives
+        inside the target directory, so that directory MUST NOT be writable by
         untrusted users. The raw+ssh subclass overrides this as a no-op (remote
         locking is a separate concern -- there is no persistent connection to hold an
         flock)."""
@@ -377,27 +408,47 @@ class RawEndpoint(Endpoint):
         path = Path(self.config["path"])
         path.mkdir(parents=True, exist_ok=True, mode=0o700)
         lockfile = path / LOCK_FILENAME
-        # O_NOFOLLOW: refuse a planted <target>/.btrfs-backup-ng.lock symlink so the
-        # (often root) open cannot be pointed at an arbitrary file, matching the
-        # symlink hardening elsewhere in this module. Any open failure (symlink,
-        # directory, foreign-owned/unwritable regular file) is mapped to RuntimeError
-        # so it cannot escape as an uncaught OSError and turn a hostile/mis-owned lock
-        # file into a permanent DoS on backups and prune.
+        # Harden the lock-file open against a hostile/mis-created lock:
+        #   O_NOFOLLOW  -- refuse a planted symlink (cannot redirect the often-root open)
+        #   O_NONBLOCK  -- a planted FIFO/named-pipe returns ENXIO immediately instead of
+        #                  blocking the open FOREVER waiting for a reader; without it a
+        #                  single FIFO wedges every backup/prune/maintenance op silently
+        #                  (a permanent DoS). No-op for a regular file.
+        # Any open failure is mapped to a bounded RuntimeError (with a plain-language
+        # reason) so it can never escape as an uncaught OSError.
         try:
-            fd = os.open(lockfile, os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW, 0o600)
-        except OSError as e:
-            logger.warning(
-                "Cannot open raw target lock file %s: %s -- a planted symlink, a "
-                "directory, or a foreign-owned/non-writable lock file. The target "
-                "directory must not be writable by untrusted users and the lock file "
-                "must be owned by the backup user.",
+            fd = os.open(
                 lockfile,
-                e,
+                os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK,
+                0o600,
             )
+        except OSError as e:
             raise RuntimeError(
-                f"raw target {path} is unavailable: cannot open its lock file "
-                f"{lockfile} ({e})"
+                f"raw target {path}: cannot acquire its lock file {lockfile} -- "
+                f"{_lock_open_reason(e)}. The target directory must not be writable by "
+                "untrusted users."
             ) from e
+        # Even if the open succeeded, refuse to trust anything that is not a REGULAR
+        # file: a FIFO that happened to have a reader, or a device/socket planted as
+        # the lock, must not be used to coordinate (or for any I/O).
+        try:
+            is_regular = stat.S_ISREG(os.fstat(fd).st_mode)
+        except OSError as e:
+            # Map to RuntimeError like every other branch here, so a stat failure on
+            # an exotic/hostile lock degrades to the bounded fail/skip posture rather
+            # than escaping as an uncaught OSError (which the prune path would not
+            # catch, and the CLI would misreport on stdout).
+            os.close(fd)
+            raise RuntimeError(
+                f"raw target {path}: cannot stat its lock file {lockfile} -- "
+                f"{_lock_open_reason(e)}"
+            ) from e
+        if not is_regular:
+            os.close(fd)
+            raise RuntimeError(
+                f"raw target {path}: lock file {lockfile} is not a regular file (a "
+                "FIFO, device, or socket may have been planted); refusing to use it"
+            )
         deadline = time.monotonic() + max(0.0, timeout)
         try:
             while True:
