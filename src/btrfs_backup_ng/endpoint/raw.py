@@ -13,6 +13,7 @@ Encryption methods:
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -143,6 +144,32 @@ def _openssl_pass_arg() -> str:
 # leaves at most a ``.part`` file, which discovery ignores -- so a partial
 # transfer can never be listed as a complete backup.
 PARTIAL_SUFFIX = ".part"
+
+
+def _sha256_file(path: Path) -> str | None:
+    """Return the hex sha256 of ``path``'s bytes, or None on any I/O error.
+
+    Best-effort: a checksum failure must never fail an already-durable backup. On
+    Linux, the file's page cache is dropped first (POSIX_FADV_DONTNEED) so the read
+    comes from the physical medium -- verifying the bytes that actually landed on
+    disk after fsync (catching write-side/media corruption a warm-cache read would
+    miss) -- without evicting other data from the cache."""
+    try:
+        h = hashlib.sha256()
+        with open(path, "rb") as f:
+            fadvise = getattr(os, "posix_fadvise", None)
+            dontneed = getattr(os, "POSIX_FADV_DONTNEED", None)
+            if fadvise is not None and dontneed is not None:
+                try:
+                    fadvise(f.fileno(), 0, 0, dontneed)
+                except OSError:
+                    pass
+            for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                h.update(chunk)
+        return h.hexdigest()
+    except OSError as e:
+        logger.warning("Could not checksum %s: %s", path, e)
+        return None
 
 
 def _popen_pipeline_pipefail(shell_cmd: str, **popen_kwargs: Any) -> subprocess.Popen:
@@ -526,9 +553,12 @@ class RawEndpoint(Endpoint):
         # never a sidecar describing a missing/partial stream. Best-effort: the
         # backup data already succeeded, so a sidecar error must not fail it.
         try:
-            self.write_sidecar(
-                self._sidecar_snapshot(final_path, final_path.stat().st_size)
-            )
+            size = final_path.stat().st_size
+            # sha256 of the committed ciphertext, read back from disk so it
+            # reflects the bytes that actually landed (raw verify recomputes and
+            # compares). Best-effort: on failure the checksum stays null.
+            checksum = _sha256_file(final_path)
+            self.write_sidecar(self._sidecar_snapshot(final_path, size, checksum))
         except Exception as e:
             # The backup data is already durable; a sidecar error must NEVER flip
             # an already-successful transfer into a reported failure (PR1 contract).
@@ -550,11 +580,13 @@ class RawEndpoint(Endpoint):
         does)."""
         snapshot.save_metadata()
 
-    def _sidecar_snapshot(self, final_path: Path, size: int) -> RawSnapshot:
+    def _sidecar_snapshot(
+        self, final_path: Path, size: int, checksum_value: str | None = None
+    ) -> RawSnapshot:
         """Build the authoritative RawSnapshot to persist for a just-committed
         stream, from the pending receive metadata. openssl_cipher is recorded so
-        restore uses the exact cipher; the checksum is reserved (filled later by
-        ``raw verify``)."""
+        restore uses the exact cipher; ``checksum_value`` is the sha256 of the
+        committed ciphertext (None if it could not be computed -- best-effort)."""
         pending = self._pending_metadata
         return RawSnapshot(
             name=pending["name"],
@@ -567,6 +599,7 @@ class RawEndpoint(Endpoint):
             gpg_recipient=pending.get("gpg_recipient"),
             openssl_cipher=pending.get("openssl_cipher"),
             provenance_origin="native-write",
+            checksum_value=checksum_value,
         )
 
     def send(
@@ -1063,13 +1096,65 @@ class SSHRawEndpoint(RawEndpoint):
                 final_path,
                 e,
             )
-        # Best-effort: the stream is already durable, so a sidecar write error must
-        # not fail the backup (mirrors the local commit path). write_sidecar raises
-        # on failure; catch and log rather than propagate.
+        # Best-effort: the stream is already durable, so a checksum or sidecar error
+        # must not fail the backup (mirrors the local commit path). Both the remote
+        # hash and write_sidecar are inside the try so neither can flip an
+        # already-successful transfer into a reported failure (the PR1/R1 contract).
         try:
-            self.write_sidecar(self._sidecar_snapshot(final_path, size))
+            checksum = self._remote_sha256(final_path)
+            self.write_sidecar(self._sidecar_snapshot(final_path, size, checksum))
         except Exception as e:
             logger.warning("Failed to write remote sidecar for %s: %s", final_path, e)
+
+    def _remote_sha256(self, final_path: Path) -> str | None:
+        """Compute the sha256 of the committed remote stream ON the remote host,
+        returning the 64-hex digest or None (best-effort).
+
+        Portable across a raw target that may be Linux, macOS/BSD, or a minimal
+        box: GNU ``sha256sum``, else BSD/macOS ``shasum -a 256``, else
+        ``openssl dgst``. The tool is chosen by EXISTENCE (``command -v``), not by a
+        pipeline's exit status -- a missing first tool must fall through to the next,
+        which a ``tool | awk || ...`` chain would not do (the ``||`` keys off awk's
+        exit, not the tool's). Hashing remotely keeps the bytes on the remote (no
+        re-download) and offloads the work to that host's kernel.
+
+        NOTE: because the digest is computed BY the (untrusted) target, it is only
+        as trustworthy as that host -- for raw+ssh the checksum detects passive/
+        accidental corruption noticed by an independent reader, but cannot catch
+        corruption introduced by a compromised target (unlike the local read-back,
+        which hashes honest bytes at write time). Corruption detection, not tamper
+        resistance."""
+        q = shlex.quote(str(final_path))
+        cmd = (
+            f"if command -v sha256sum >/dev/null 2>&1; then sha256sum {q} | awk '{{print $1}}'; "
+            f"elif command -v shasum >/dev/null 2>&1; then shasum -a 256 {q} | awk '{{print $1}}'; "
+            f"elif command -v openssl >/dev/null 2>&1; then openssl dgst -sha256 {q} | awk '{{print $NF}}'; "
+            f"else exit 1; fi"
+        )
+        try:
+            res = self._exec_remote_command(["sh", "-c", cmd], check=False)
+            out = res.stdout
+            if isinstance(out, (bytes, bytearray)):
+                out = out.decode(errors="replace")
+            digest = (str(out) or "").strip().lower()
+            if (
+                res.returncode == 0
+                and len(digest) == 64
+                and all(c in "0123456789abcdef" for c in digest)
+            ):
+                return digest
+            logger.warning(
+                "No usable sha256 tool (sha256sum/shasum/openssl) on %s or hashing "
+                "failed (rc=%s); sidecar checksum=null (corruption detection "
+                "disabled for this backup)",
+                getattr(self, "hostname", "remote"),
+                res.returncode,
+            )
+        except Exception as e:
+            # Fully best-effort: computing a checksum must NEVER raise out of here
+            # (and so can never fail a durable backup or skip the sidecar write).
+            logger.warning("Could not checksum remote %s: %s", final_path, e)
+        return None
 
     def write_sidecar(self, snapshot: RawSnapshot) -> None:
         """Write ``snapshot``'s ``.meta`` sidecar on the remote target atomically
