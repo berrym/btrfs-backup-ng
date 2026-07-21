@@ -11,7 +11,7 @@ _btrfs_backup_ng() {
     local manpages_subcommands="install path"
     local transfers_subcommands="list show resume pause cleanup operations"
     local snapper_subcommands="detect list backup status restore generate-config"
-    local raw_subcommands="list verify"
+    local raw_subcommands="list verify backfill-metadata"
 
     # Global options
     local global_opts="-h --help -v --verbose -q --quiet --debug -V --version -c --config"
@@ -48,6 +48,7 @@ _btrfs_backup_ng() {
     local snapper_generate_config_opts="-o --output"
     local raw_list_opts="--json --ssh-sudo"
     local raw_verify_opts="--snapshot --json --ssh-sudo"
+    local raw_backfill_opts="--dry-run --json --ssh-sudo"
     local snapper_types="single pre post"
     local verify_levels="metadata stream full"
     local shell_types="bash zsh fish"
@@ -86,6 +87,11 @@ _btrfs_backup_ng() {
                     cmd="verify"
                 elif [[ "$cmd" == "raw" ]]; then
                     subcmd="verify"
+                fi
+                ;;
+            backfill-metadata)
+                if [[ "$cmd" == "raw" ]]; then
+                    subcmd="backfill-metadata"
                 fi
                 ;;
             validate|init|import|detect)
@@ -391,6 +397,13 @@ _btrfs_backup_ng() {
                     verify)
                         if [[ "$cur" == -* ]]; then
                             COMPREPLY=($(compgen -W "$raw_verify_opts" -- "$cur"))
+                        else
+                            _filedir -d
+                        fi
+                        ;;
+                    backfill-metadata)
+                        if [[ "$cur" == -* ]]; then
+                            COMPREPLY=($(compgen -W "$raw_backfill_opts" -- "$cur"))
                         else
                             _filedir -d
                         fi

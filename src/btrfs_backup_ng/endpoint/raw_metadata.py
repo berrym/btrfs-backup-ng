@@ -130,6 +130,12 @@ class RawSnapshot:
     # rather than false-flag corruption if a sidecar ever records another algorithm.
     checksum_algorithm: str = "sha256"
     provenance_origin: str = "native-write"
+    # Whether the stream is known to be a COMPLETE btrfs send. "complete" for a
+    # native atomic commit (a failed transfer never commits); "unknown" for a
+    # backfilled or filename-inferred legacy stream, which could be truncated. This
+    # is a MARKER for callers to treat such a record conservatively (do not assume a
+    # verified complete backup); it is not itself an enforced prune guard.
+    stream_completeness: str = "complete"
     # --- Snapshot-interface compatibility (0.8.5) ---
     prefix: str = ""
     time_format: str | None = None
@@ -231,6 +237,7 @@ class RawSnapshot:
             },
             "provenance": {
                 "origin": self.provenance_origin,
+                "stream_completeness": self.stream_completeness,
                 "tool_version": __version__,
             },
             # Kept for backward compatibility with v1 readers.
@@ -248,11 +255,17 @@ class RawSnapshot:
     def save_metadata(self) -> None:
         """Write the sidecar atomically (temp -> fsync -> rename -> dir fsync) at
         mode 0600, so a crash never leaves a partial/half-written .meta and the
-        metadata dossier is not world-readable."""
+        metadata dossier is not world-readable.
+
+        O_NOFOLLOW on the temp open refuses to follow a symlink at the ``.meta.tmp``
+        path: writing while walking an untrusted directory (``raw backfill-metadata``
+        over a target with foreign/legacy content, typically as root) must not let a
+        pre-planted ``<name>.meta.tmp`` symlink redirect the O_CREAT|O_TRUNC write to
+        an arbitrary file."""
         meta = self.metadata_path
         tmp = meta.with_name(meta.name + ".tmp")
         payload = self.serialize()
-        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
         try:
             os.write(fd, payload)
             os.fsync(fd)
@@ -301,6 +314,7 @@ class RawSnapshot:
             checksum_value=checksum.get("value"),
             checksum_algorithm=checksum.get("algorithm") or "sha256",
             provenance_origin=provenance.get("origin", "native-write"),
+            stream_completeness=provenance.get("stream_completeness") or "complete",
         )
 
     @classmethod
@@ -463,7 +477,10 @@ def discover_raw_snapshots(
         if prefix and not name.startswith(prefix):
             continue
 
-        # Create snapshot from filename parsing
+        # Create snapshot from filename parsing. Mark it honestly: this record was
+        # reconstructed from the filename (no authoritative sidecar), so its origin
+        # is "filename-inferred" and its completeness is unknown -- never present it
+        # as a native atomic backup.
         stat = item.stat()
         snapshot = RawSnapshot(
             name=name,
@@ -472,6 +489,8 @@ def discover_raw_snapshots(
             size=stat.st_size,
             compress=parsed["compress"],
             encrypt=parsed["encrypt"],
+            provenance_origin="filename-inferred",
+            stream_completeness="unknown",
         )
         snapshots.append(snapshot)
 

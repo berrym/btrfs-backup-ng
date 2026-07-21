@@ -353,6 +353,7 @@ complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_snapper_using_subcommand 
 # raw command subcommands
 complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_using_command raw' -a list -d 'List the backups a raw target holds'
 complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_using_command raw' -a verify -d 'Verify raw backups against their recorded checksums'
+complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_using_command raw' -a backfill-metadata -d 'Write .meta sidecars for legacy streams that have none'
 
 # Helper for raw subcommand
 function __fish_btrfs_backup_ng_raw_using_subcommand
@@ -378,3 +379,9 @@ complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_raw_using_subcommand veri
 complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_raw_using_subcommand verify' -l json -d 'Output in JSON format'
 complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_raw_using_subcommand verify' -l ssh-sudo -d 'Use sudo for remote commands on a raw+ssh target'
 complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_raw_using_subcommand verify' -a '(__fish_complete_directories)' -d 'Raw target path'
+
+# raw backfill-metadata
+complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_raw_using_subcommand backfill-metadata' -l dry-run -d 'Show what would be backfilled without writing'
+complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_raw_using_subcommand backfill-metadata' -l json -d 'Output in JSON format'
+complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_raw_using_subcommand backfill-metadata' -l ssh-sudo -d 'Use sudo for remote commands on a raw+ssh target'
+complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_raw_using_subcommand backfill-metadata' -a '(__fish_complete_directories)' -d 'Raw target path'

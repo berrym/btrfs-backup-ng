@@ -1002,6 +1002,39 @@ Raw target: raw:///mnt/usb/backups  (verifying 2 snapshots)
   1 ok, 1 corrupt, 0 error, 0 unverifiable
 ```
 
+#### raw backfill-metadata
+
+Write authoritative `.meta` sidecars for **legacy** raw streams that have none — backups written before sidecars existed (or by another tool such as btrbk). New backups already write their sidecar automatically; this is only for pre-existing streams.
+
+```bash
+btrfs-backup-ng raw backfill-metadata TARGET [OPTIONS]
+```
+
+**Arguments:**
+| Argument | Description |
+|----------|-------------|
+| `TARGET` | Raw target: `raw://PATH`, `raw+ssh://[USER@]HOST/PATH`, or a plain path |
+
+**Options:**
+| Option | Description |
+|--------|-------------|
+| `--dry-run` | Show which streams would be backfilled without writing anything |
+| `--json` | Output per-stream results as JSON |
+| `--ssh-sudo` | Use `sudo` for remote commands on a `raw+ssh://` target |
+
+Each backfilled sidecar records the pipeline inferred from the filename (compression/encryption) and a sha256 of the stream as it exists now, and is stamped `provenance_origin=backfill` with `stream_completeness=unknown`. A legacy stream's completeness cannot be proven (it might have been truncated), so a backfilled sidecar is marked as a **reconstructed, non-authoritative** record — the checksum lets `raw verify` detect later corruption, but does not confirm the original backup was complete. Exit status is `1` if any sidecar write failed, else `0`.
+
+Run `backfill-metadata` when no backup or prune is in flight against the same target: it re-checks for a sidecar immediately before writing (so a concurrently-committed backup is not overwritten), but a per-target lock is not yet in place.
+
+**Example Output:**
+```
+Raw target: raw:///mnt/usb/backups  (2 legacy streams without a sidecar)
+  BACKFILLED      root.20240115T120000
+  BACKFILLED      home.20240115T120000
+  2 backfilled, 0 error
+  Note: backfilled sidecars are marked stream_completeness=unknown -- a legacy stream cannot be proven complete.
+```
+
 ---
 
 ## Filesystem Checks

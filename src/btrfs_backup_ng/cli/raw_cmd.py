@@ -25,6 +25,8 @@ def execute_raw(args: argparse.Namespace) -> int:
         return _raw_list(args)
     if action == "verify":
         return _raw_verify(args)
+    if action == "backfill-metadata":
+        return _raw_backfill(args)
     # No/unknown action: argparse allows a bare `raw`, so guide the user.
     print("No raw action specified. Try: btrfs-backup-ng raw list <target>")
     return 1
@@ -200,4 +202,87 @@ def _raw_verify(args: argparse.Namespace) -> int:
 
     # Fail if any backup is corrupt or its stream could not be read.
     bad = any(r["status"] in ("corrupt", "error") for r in results)
+    return 1 if bad else 0
+
+
+def _raw_backfill(args: argparse.Namespace) -> int:
+    """Write authoritative ``.meta`` sidecars for LEGACY streams that have none
+    (backups written before sidecars existed).
+
+    Each backfilled sidecar records the pipeline inferred from the filename and a
+    sha256 of the stream as it exists now, but is stamped
+    ``provenance_origin=backfill`` and ``stream_completeness=unknown``: a legacy
+    stream's completeness cannot be verified, so a backfilled sidecar is marked as a
+    reconstructed, non-authoritative record (callers should not assume it is a
+    verified complete backup). ``--dry-run`` reports the candidates without writing.
+    Exit 1 if any sidecar write failed."""
+    try:
+        ep, spec = _open_target(args)
+    except ValueError as e:
+        print(str(e))
+        return 2
+
+    try:
+        candidates = ep.streams_without_sidecar()
+    except Exception as e:  # pragma: no cover - defensive; endpoint errors vary
+        logger.debug("raw backfill-metadata failed", exc_info=True)
+        print(f"Failed to scan {spec}: {e}")
+        return 1
+
+    dry = getattr(args, "dry_run", False)
+    results = []
+    for snap in candidates:
+        entry = {
+            "name": snap.name,
+            "stream": str(snap.stream_path),
+            "compress": snap.compress,
+            "encrypt": snap.encrypt,
+        }
+        if dry:
+            entry["action"] = "would-backfill"
+        else:
+            # Seal a checksum of the stream as it is now (detects later corruption);
+            # completeness stays "unknown" -- this does not prove the legacy stream
+            # is a complete btrfs send.
+            snap.checksum_value = ep.compute_stream_checksum(snap)
+            # Re-check immediately before writing: if a sidecar appeared since the
+            # scan (a backup committed concurrently -- commit publishes the stream
+            # then writes its sidecar as two steps), do NOT overwrite the
+            # authoritative sidecar with a backfill record. (A full per-target lock
+            # covering backup/prune/backfill lands with the raw maintenance lock;
+            # this re-check closes the practical window.)
+            if ep.sidecar_exists(snap):
+                entry["action"] = "skipped"
+                results.append(entry)
+                continue
+            try:
+                ep.write_sidecar(snap)
+                entry["action"] = "backfilled"
+                entry["checksum"] = snap.checksum_value
+            except Exception as e:
+                logger.debug("backfill sidecar write failed", exc_info=True)
+                entry["action"] = "error"
+                entry["error"] = str(e)
+        results.append(entry)
+
+    if getattr(args, "json", False):
+        print(json.dumps(results, indent=2))
+    else:
+        plural = "" if len(results) == 1 else "s"
+        print(
+            f"Raw target: {spec}  "
+            f"({len(results)} legacy stream{plural} without a sidecar)"
+        )
+        for r in results:
+            print(f"  {r['action'].upper():<15} {r['name']}")
+        if not dry and results:
+            n_ok = sum(1 for r in results if r["action"] == "backfilled")
+            n_err = sum(1 for r in results if r["action"] == "error")
+            print(f"  {n_ok} backfilled, {n_err} error")
+            print(
+                "  Note: backfilled sidecars are marked stream_completeness=unknown "
+                "-- a legacy stream cannot be proven complete."
+            )
+
+    bad = any(r["action"] == "error" for r in results)
     return 1 if bad else 0
