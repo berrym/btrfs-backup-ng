@@ -128,6 +128,23 @@ def send_snapshot(
     if clones:
         logger.info(f"  Using clones: {clones!r}")
 
+    # Raw targets own their compression INSIDE the endpoint pipeline (recorded in the
+    # .meta sidecar so restore can reverse it). Applying the generic transfer-layer
+    # compression on top would (a) double-compress and (b) be invisible to the
+    # sidecar, yielding a compressed stream restore cannot detect or decompress -> an
+    # UNRESTORABLE backup. Neutralize any transfer-layer compress for raw destinations
+    # up front (on a COPY, so the caller's options dict is untouched) so NEITHER the
+    # chunked nor the standard path can double-compress. This single choke point keeps
+    # every backup path safe, including ones that never thread compress into the
+    # endpoint -- those simply do not compress, but stay restorable.
+    from ..endpoint.raw import RawEndpoint
+
+    if (
+        isinstance(destination_endpoint, RawEndpoint)
+        and options.get("compress", "none") != "none"
+    ):
+        options = {**options, "compress": "none"}
+
     # Check if chunked transfer is requested
     use_chunked = options.get("use_chunked", False)
     if use_chunked and chunked_manager is None:

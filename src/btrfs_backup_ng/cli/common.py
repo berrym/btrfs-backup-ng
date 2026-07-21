@@ -202,3 +202,29 @@ def thread_raw_encryption(kwargs: dict, target) -> None:
     kwargs["gpg_recipient"] = getattr(target, "gpg_recipient", None)
     kwargs["gpg_keyring"] = getattr(target, "gpg_keyring", None)
     kwargs["openssl_cipher"] = getattr(target, "openssl_cipher", None)
+
+
+def thread_raw_compression(kwargs: dict, target, override: str | None = None) -> None:
+    """Thread the EFFECTIVE compression into an endpoint config dict.
+
+    The mirror of ``thread_raw_encryption`` for compression. Without this, a raw
+    target's ``compress`` is dropped from the endpoint config and instead applied
+    by the generic *transfer layer* -- which is invisible to the raw ``.meta``
+    sidecar, so the sidecar records ``compress: null`` while the stream is actually
+    compressed. Restore then does not decompress and the backup is UNRESTORABLE.
+    Threading it here makes the raw endpoint own compression (in its own
+    ``send|compress|encrypt>file`` pipeline) and RECORD it in the sidecar, so
+    restore can reverse it. ``send_snapshot`` separately suppresses the
+    transfer-layer stage for raw destinations so the stream is never
+    double-compressed.
+
+    The effective value is the CLI ``--compress`` ``override`` if given, else the
+    target's configured ``compress`` -- the SAME expression the transfer options
+    use -- so a ``--compress`` override actually compresses a raw target (not just
+    non-raw ones) instead of being silently dropped. Harmless for non-raw targets
+    (dropped by the base config whitelist). After threading, feed the resulting
+    ``kwargs["compress"]`` to ``endpoint.assert_compression_applied`` so the guard
+    checks the effective value that was requested, not a possibly-different config
+    value (otherwise the guard is tautological and cannot catch a dropped override).
+    """
+    kwargs["compress"] = override or getattr(target, "compress", None)

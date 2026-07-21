@@ -35,6 +35,43 @@ def assert_encryption_applied(requested_encrypt, endpoint) -> None:
         )
 
 
+def assert_compression_applied(requested_compress, endpoint) -> None:
+    """Fail closed if requested compression did not reach the destination endpoint.
+
+    Defense-in-depth for the raw-target unrestorable-backup bug: a raw target's
+    ``compress`` must be owned by the raw endpoint (so it is recorded in the
+    ``.meta`` sidecar and restore can reverse it). If some config-threading site is
+    missed, the compression would instead be applied by the generic transfer layer,
+    invisibly to the sidecar -- producing a compressed stream that restore cannot
+    detect or decompress. Refuse to write rather than silently produce an
+    unrestorable backup. A no-op for non-raw endpoints, which legitimately delegate
+    compression to the transfer layer (their receive side decompresses
+    symmetrically). Call after building a destination endpoint and before transfer.
+
+    Raises:
+        AbortError: if ``requested_compress`` is a real method but a RAW endpoint
+            did not receive it.
+    """
+    if requested_compress in (None, "none"):
+        return
+    # Only raw endpoints record compression in a sidecar; non-raw targets decompress
+    # symmetrically at the transfer layer, so this guard does not apply to them.
+    from .raw import RawEndpoint
+
+    if not isinstance(endpoint, RawEndpoint):
+        return
+    effective = getattr(endpoint, "compress", None)
+    if effective in (None, "none"):
+        from .. import __util__
+
+        raise __util__.AbortError(
+            f"Compression '{requested_compress}' was requested for a raw target but "
+            f"the destination endpoint did not receive it. Writing now would record "
+            f"'compress: null' in the sidecar while the stream is compressed, "
+            f"producing an UNRESTORABLE backup; aborting instead."
+        )
+
+
 def choose_endpoint(spec, common_config=None, source=False, excluded_types=()):
     """
     Chooses a suitable endpoint based on the specification given.
