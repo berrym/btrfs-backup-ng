@@ -247,6 +247,11 @@ class RawEndpoint(Endpoint):
 
         # Raw-specific configuration
         self.compress = config.get("compress")
+        # "none" (the config sentinel) and None both mean no compression; normalize
+        # so a caller threading compress="none" is not treated as an unknown
+        # algorithm by the validation below (mirrors the encrypt handling).
+        if self.compress == "none":
+            self.compress = None
         self.encrypt = config.get("encrypt")
         # "none" (the documented string) and None both mean plaintext; normalize
         # so callers threading encrypt="none" do not trip the method validation.

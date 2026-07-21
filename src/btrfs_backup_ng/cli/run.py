@@ -32,6 +32,7 @@ from .common import (
     get_log_level,
     get_timestamp_format,
     should_show_progress,
+    thread_raw_compression,
     thread_raw_encryption,
 )
 
@@ -358,12 +359,14 @@ def _backup_volume(
                 dest_kwargs["ssh_identity_file"] = target.ssh_key
 
             thread_raw_encryption(dest_kwargs, target)
+            thread_raw_compression(dest_kwargs, target, compress_override)
             dest_endpoint = endpoint.choose_endpoint(
                 target.path,
                 dest_kwargs,
                 source=False,
             )
             endpoint.assert_encryption_applied(target.encrypt, dest_endpoint)
+            endpoint.assert_compression_applied(dest_kwargs["compress"], dest_endpoint)
             dest_endpoint.prepare()
             # Store endpoint with its target config for compression/throttle options
             destination_endpoints.append((dest_endpoint, target))
@@ -540,10 +543,14 @@ def _backup_snapper_volume(
                 snapper_endpoint_config["ssh_identity_file"] = target.ssh_key
                 snapper_endpoint_config["ssh_key"] = target.ssh_key
             thread_raw_encryption(snapper_endpoint_config, target)
+            thread_raw_compression(snapper_endpoint_config, target, compress_override)
             destination_endpoint = endpoint.choose_endpoint(
                 target.path, snapper_endpoint_config
             )
             endpoint.assert_encryption_applied(target.encrypt, destination_endpoint)
+            endpoint.assert_compression_applied(
+                snapper_endpoint_config["compress"], destination_endpoint
+            )
 
             # Sync snapper snapshots to this target
             logger.info("Syncing snapper config '%s' to %s", config_name, target.path)

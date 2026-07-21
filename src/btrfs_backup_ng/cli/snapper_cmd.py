@@ -245,10 +245,18 @@ def _handle_backup(args: argparse.Namespace) -> int:
         endpoint_config["gpg_recipient"] = getattr(args, "gpg_recipient", None)
         endpoint_config["gpg_keyring"] = getattr(args, "gpg_keyring", None)
         endpoint_config["openssl_cipher"] = getattr(args, "openssl_cipher", None)
+    # Compression for raw targets must be owned by the raw endpoint (recorded in the
+    # sidecar so restore can reverse it), not the transfer layer -- else the backup
+    # is unrestorable. Thread it here; send_snapshot suppresses the transfer-layer
+    # stage for raw so it is not double-compressed.
+    compress = getattr(args, "compress", None) or "none"
+    if compress != "none":
+        endpoint_config["compress"] = compress
     destination_endpoint = choose_endpoint(target_path, endpoint_config)
-    from ..endpoint import assert_encryption_applied
+    from ..endpoint import assert_compression_applied, assert_encryption_applied
 
     assert_encryption_applied(encrypt, destination_endpoint)
+    assert_compression_applied(compress, destination_endpoint)
 
     # Determine if this is a local or remote transfer
     is_remote = getattr(destination_endpoint, "_is_remote", False)
