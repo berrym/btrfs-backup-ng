@@ -1957,6 +1957,15 @@ class SSHRawEndpoint(RawEndpoint):
                 # Derive stream path from meta path
                 stream_path = Path(meta_path[:-5])  # Remove .meta
                 snapshot = RawSnapshot.from_dict(data, stream_path)
+                if not snapshot.name:
+                    # An empty/missing name is a meaningless phantom; skip it so the
+                    # stream is listed from its filename in the second pass instead.
+                    logger.warning(
+                        "Remote raw sidecar %s records no snapshot name; ignoring it "
+                        "(the stream will be listed from its filename).",
+                        meta_path,
+                    )
+                    continue
                 snapshots.append(snapshot)
             except subprocess.CalledProcessError as e:
                 # The `cat` failed (file vanished between find and cat, or a mid-listing
@@ -2005,20 +2014,36 @@ class SSHRawEndpoint(RawEndpoint):
         # a stream that also has a .meta is never enumerated twice even if its
         # recorded name differs from the filename stem.
         loaded_paths = {str(s.stream_path) for s in snapshots}
-        for stream_path_str in stream_files:
+        inferred_names: set[str] = set()
+        # Sorted so a same-name collision resolves deterministically across runs.
+        for stream_path_str in sorted(stream_files):
             if not stream_path_str or stream_path_str.endswith(
                 (".meta", ".part", ".tmp", ".lock")
             ):
                 continue
-            if stream_path_str in loaded_paths:
-                continue
             stream_path = Path(stream_path_str)
+            # Compare a NORMALIZED path: loaded_paths holds str(Path(...)) (collapsed
+            # // and /./), but the raw find output is not normalized, so a config path
+            # like "/backup//" would otherwise miss the dedup and double-count.
+            if str(stream_path) in loaded_paths:
+                continue
             parsed = parse_stream_filename(stream_path.name)
             name = parsed["name"]
             if name in loaded_names:
                 continue
             if prefix and not name.startswith(prefix):
                 continue
+            # Two sidecar-less remote streams deriving the same name (plaintext +
+            # compressed copy) violate name-based identity; keep the first, warn.
+            if name in inferred_names:
+                logger.warning(
+                    "Two remote raw streams derive the same name %r; keeping the "
+                    "first and ignoring %s.",
+                    name,
+                    stream_path_str,
+                )
+                continue
+            inferred_names.add(name)
             # Portable mtime+size: GNU/busybox `stat -c`, else BSD/macOS `stat -f`.
             q = shlex.quote(stream_path_str)
             stat_cmd = f"stat -c '%Y %s' {q} 2>/dev/null || stat -f '%m %z' {q}"

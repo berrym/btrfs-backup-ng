@@ -448,8 +448,6 @@ def discover_raw_snapshots(
     for meta_path in meta_files:
         try:
             snapshot = RawSnapshot.load_metadata(meta_path)
-            if not prefix or snapshot.name.startswith(prefix):
-                snapshots.append(snapshot)
         except Exception as e:
             # A sidecar EXISTS but could not be parsed (corrupt/truncated JSON, wrong
             # types, non-UTF8, pathologically-nested JSON). Two rules:
@@ -470,10 +468,45 @@ def discover_raw_snapshots(
                 e,
             )
             continue
+        # An empty/missing name yields a meaningless phantom record (and, paired with
+        # the second pass, double-counts the stream). Treat it as invalid: warn + skip
+        # so the stream is instead listed from its filename with a real name.
+        if not snapshot.name:
+            logger.warning(
+                "Raw sidecar %s records no snapshot name; ignoring it (the stream will "
+                "be listed from its filename instead).",
+                meta_path,
+            )
+            continue
+        # A sidecar whose recorded name disagrees with its own filename is suspicious
+        # (a renamed stream, or a hand-crafted/corrupt sidecar). Keep the authoritative
+        # record, but warn so the operator can reconcile -- and the path-based dedup in
+        # the second pass ensures the stream is not ALSO counted under its filename.
+        filename_name = parse_stream_filename(meta_path.with_suffix("").name)["name"]
+        if snapshot.name != filename_name:
+            logger.warning(
+                "Raw sidecar %s records name %r but its stream file is named %r; using "
+                "the sidecar's name.",
+                meta_path,
+                snapshot.name,
+                filename_name,
+            )
+        if not prefix or snapshot.name.startswith(prefix):
+            snapshots.append(snapshot)
 
     # Second pass: find stream files without metadata
     loaded_names = {s.name for s in snapshots}
-    for item in directory.iterdir():
+    # Dedup by resolved stream PATH as well as by name, so a stream whose sidecar
+    # records a name different from its filename is never counted twice (once from the
+    # sidecar, once inferred from the filename).
+    loaded_paths = {str(s.stream_path) for s in snapshots}
+    inferred_names: set[str] = set()
+    # Sorted so that when two streams collide on a derived name the winner is
+    # DETERMINISTIC across runs and hosts (iterdir order is otherwise arbitrary). The
+    # winner is the lexicographically-first filename (so a plaintext ".btrfs" beats a
+    # ".btrfs.zst" of the same name) -- arbitrary-but-stable; a real collision is a
+    # warned anomaly the operator should resolve, not a normal state.
+    for item in sorted(directory.iterdir()):
         if not item.is_file() or item.suffix == ".meta":
             continue
 
@@ -488,16 +521,37 @@ def discover_raw_snapshots(
         if ".btrfs" not in item.name:
             continue
 
+        # This exact stream is already represented by a sidecar (matched by path, so a
+        # sidecar whose recorded name differs from the filename does not cause a
+        # second, filename-inferred entry for the same file).
+        if str(item) in loaded_paths:
+            continue
+
         parsed = parse_stream_filename(item.name)
         name = parsed["name"]
 
-        # Skip if already loaded from metadata
+        # Skip if already loaded from metadata (by name)
         if name in loaded_names:
             continue
 
         # Skip if doesn't match prefix
         if prefix and not name.startswith(prefix):
             continue
+
+        # Two DIFFERENT sidecar-less stream files that derive the SAME name (e.g. a
+        # plaintext `x.btrfs` and a compressed `x.btrfs.zst`) would both be listed under
+        # one name, violating the name-based identity restore/prune rely on. Keep the
+        # first, warn on the collision.
+        if name in inferred_names:
+            logger.warning(
+                "Two raw streams in %s derive the same name %r (e.g. a plaintext and a "
+                "compressed copy); keeping the first and ignoring %s.",
+                directory,
+                name,
+                item.name,
+            )
+            continue
+        inferred_names.add(name)
 
         # Create snapshot from filename parsing. Mark it honestly: this record was
         # reconstructed from the filename (no authoritative sidecar), so its origin
