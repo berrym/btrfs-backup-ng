@@ -11,11 +11,14 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 
 from btrfs_backup_ng import endpoint
 from btrfs_backup_ng.__logger__ import logger
+from btrfs_backup_ng.endpoint import raw as raw_mod
+from btrfs_backup_ng.endpoint.raw_metadata import RawSnapshot
 
 
 def execute_raw(args: argparse.Namespace) -> int:
@@ -27,6 +30,8 @@ def execute_raw(args: argparse.Namespace) -> int:
         return _raw_verify(args)
     if action == "backfill-metadata":
         return _raw_backfill(args)
+    if action == "encrypt":
+        return _raw_encrypt(args)
     # No/unknown action: argparse allows a bare `raw`, so guide the user.
     print("No raw action specified. Try: btrfs-backup-ng raw list <target>")
     return 1
@@ -285,4 +290,186 @@ def _raw_backfill(args: argparse.Namespace) -> int:
             )
 
     bad = any(r["action"] == "error" for r in results)
+    return 1 if bad else 0
+
+
+def _raw_encrypt(args: argparse.Namespace) -> int:
+    """Encrypt plaintext raw streams in place (remediation for backups written as
+    plaintext despite an encrypt config -- GHSA-vr25-6vrh-869j).
+
+    For each plaintext stream: write an encrypted copy (new sidecar,
+    provenance_origin=remediation), then run a LIVE decrypt-to-identical proof
+    (decrypt the new stream and confirm it is byte-identical to the plaintext). The
+    plaintext is removed ONLY when that proof passes AND ``--shred`` was given -- and
+    even then by a plain unlink: on copy-on-write filesystems (btrfs) and SSDs an
+    overwrite does not erase the underlying blocks, so true physical erasure relies
+    on device-level trim/discard or full-disk encryption, which this tool cannot
+    provide. Prior plaintext exposure (old media, indexes) cannot be undone."""
+    spec = _coerce_raw_spec(args.target)
+    if spec.startswith("raw+ssh://"):
+        print(
+            "raw encrypt runs locally so the passphrase/keys never leave this host. "
+            "For a remote target, mount it locally and use a raw:// path."
+        )
+        return 2
+
+    try:
+        ep, spec = _open_target(args)
+    except ValueError as e:
+        print(str(e))
+        return 2
+
+    encrypt = args.encrypt
+    if encrypt == "gpg" and not getattr(args, "gpg_recipient", None):
+        print("--gpg-recipient is required with --encrypt gpg")
+        return 2
+    if encrypt == "openssl_enc" and raw_mod._selected_passphrase_env() is None:
+        print(
+            "openssl_enc requires a passphrase in BTRFS_BACKUP_PASSPHRASE or "
+            "BTRBK_PASSPHRASE"
+        )
+        return 2
+
+    try:
+        snapshots = ep.list_snapshots(flush_cache=True)
+    except Exception as e:  # pragma: no cover - defensive; endpoint errors vary
+        logger.debug("raw encrypt failed", exc_info=True)
+        print(f"Failed to list {spec}: {e}")
+        return 1
+    plaintext = [s for s in snapshots if not s.encrypt]
+    if not plaintext:
+        print(f"Raw target: {spec}  (no plaintext streams to encrypt)")
+        return 0
+
+    dry = getattr(args, "dry_run", False)
+    shred = getattr(args, "shred", False)
+    cipher = getattr(args, "openssl_cipher", None) or "aes-256-cbc"
+    gpg_recipient = getattr(args, "gpg_recipient", None)
+    gpg_keyring = getattr(args, "gpg_keyring", None)
+    ext = ".gpg" if encrypt == "gpg" else ".enc"
+    # The decrypt proof (and any pre-existing-twin check) uses this endpoint's
+    # send(); make it use the requested gpg keyring so encrypt and verify agree.
+    if gpg_keyring:
+        ep.gpg_keyring = gpg_keyring
+
+    # Destructive-op confirmation: --shred is the opt-in; an interactive TTY still
+    # confirms unless --yes was passed (mirrors restore's dangerous-op pattern). The
+    # prompt goes to stderr so --json output on stdout stays clean.
+    if shred and not dry and not getattr(args, "yes", False) and sys.stdin.isatty():
+        print(
+            f"About to encrypt {len(plaintext)} plaintext stream(s) and, after a "
+            "verified decrypt proof, DELETE each plaintext file (plain unlink; not a "
+            "secure wipe -- see --help). Continue? [y/N] ",
+            end="",
+            file=sys.stderr,
+        )
+        if input().strip().lower() not in ("y", "yes"):
+            print("Aborted.", file=sys.stderr)
+            return 1
+
+    results = []
+    for s in plaintext:
+        entry: dict = {"name": s.name, "stream": str(s.stream_path)}
+        if dry:
+            entry["action"] = "would-encrypt-and-shred" if shred else "would-encrypt"
+            results.append(entry)
+            continue
+        enc_path = Path(str(s.stream_path) + ext)
+        pre_existing = enc_path.exists()
+        if pre_existing:
+            # Never clobber an existing encrypted stream. Verify it decrypts to THIS
+            # plaintext; if so it is a valid prior remediation (idempotent re-run).
+            twin: RawSnapshot = RawSnapshot(
+                name=s.name,
+                stream_path=enc_path,
+                encrypt=encrypt,
+                compress=None,
+                openssl_cipher=cipher if encrypt == "openssl_enc" else None,
+            )
+        else:
+            try:
+                twin = ep.remediate_plaintext(
+                    s,
+                    encrypt=encrypt,
+                    gpg_recipient=gpg_recipient,
+                    gpg_keyring=gpg_keyring,
+                    openssl_cipher=cipher,
+                )
+            except Exception as e:
+                logger.debug("remediate failed for %s", s.name, exc_info=True)
+                entry["action"] = "error"
+                entry["error"] = str(e)
+                results.append(entry)
+                continue
+        entry["encrypted"] = str(enc_path)
+        verified = ep.decrypt_matches_plaintext(twin, s.stream_path)
+        entry["verified"] = verified
+        if not verified:
+            # Fresh: encrypted but unprovable (e.g. gpg without the secret key) -> keep
+            # the plaintext. Pre-existing: it does not decrypt to this plaintext ->
+            # never touch it or the plaintext.
+            entry["action"] = (
+                "existing-encrypted-differs" if pre_existing else "encrypted-unverified"
+            )
+            results.append(entry)
+            continue
+        if shred:
+            try:
+                os.unlink(s.stream_path)
+                if s.metadata_path.exists():
+                    os.unlink(s.metadata_path)
+                entry["action"] = "removed-plaintext"
+            except OSError as e:
+                entry["action"] = "remove-failed"
+                entry["error"] = str(e)
+        else:
+            entry["action"] = "already-encrypted" if pre_existing else "encrypted"
+        results.append(entry)
+
+    if getattr(args, "json", False):
+        print(json.dumps(results, indent=2))
+    else:
+        plural = "" if len(results) == 1 else "s"
+        print(f"Raw target: {spec}  ({len(results)} plaintext stream{plural})")
+        for r in results:
+            print(f"  {r['action'].upper():<28} {r['name']}")
+        if not dry:
+            unver = sum(1 for r in results if r["action"] == "encrypted-unverified")
+            if unver:
+                print(
+                    f"  {unver} encrypted but NOT verified (plaintext kept); check the "
+                    "passphrase, or that a trusted gpg key with its secret is on this "
+                    "host."
+                )
+            differs = sum(
+                1 for r in results if r["action"] == "existing-encrypted-differs"
+            )
+            if differs:
+                print(
+                    f"  {differs} skipped: an encrypted stream already exists that does "
+                    "NOT match the plaintext; resolve it manually (not overwritten)."
+                )
+            if not shred and any(
+                r["action"] in ("encrypted", "already-encrypted") for r in results
+            ):
+                print(
+                    "  Plaintext kept alongside the encrypted copy (no --shred). Once "
+                    "you have confirmed the encrypted backups, re-run with --shred to "
+                    "remove the plaintext."
+                )
+            if any(r["action"] == "removed-plaintext" for r in results):
+                print(
+                    "  Note: plaintext was removed by a plain unlink. On btrfs (CoW) "
+                    "or SSDs this does NOT securely erase the blocks -- rely on device "
+                    "trim/discard or full-disk encryption. Prior exposure cannot be "
+                    "undone."
+                )
+
+    bad = any(r["action"] in ("error", "remove-failed") for r in results) or (
+        shred
+        and any(
+            r["action"] in ("encrypted-unverified", "existing-encrypted-differs")
+            for r in results
+        )
+    )
     return 1 if bad else 0

@@ -136,6 +136,9 @@ class RawSnapshot:
     # is a MARKER for callers to treat such a record conservatively (do not assume a
     # verified complete backup); it is not itself an enforced prune guard.
     stream_completeness: str = "complete"
+    # For a `raw encrypt` remediation: the filename of the plaintext stream this
+    # encrypted stream was produced from (audit trail). None otherwise.
+    remediation_source: str | None = None
     # --- Snapshot-interface compatibility (0.8.5) ---
     prefix: str = ""
     time_format: str | None = None
@@ -238,6 +241,7 @@ class RawSnapshot:
             "provenance": {
                 "origin": self.provenance_origin,
                 "stream_completeness": self.stream_completeness,
+                "remediated_from": self.remediation_source,
                 "tool_version": __version__,
             },
             # Kept for backward compatibility with v1 readers.
@@ -315,6 +319,7 @@ class RawSnapshot:
             checksum_algorithm=checksum.get("algorithm") or "sha256",
             provenance_origin=provenance.get("origin", "native-write"),
             stream_completeness=provenance.get("stream_completeness") or "complete",
+            remediation_source=provenance.get("remediated_from"),
         )
 
     @classmethod

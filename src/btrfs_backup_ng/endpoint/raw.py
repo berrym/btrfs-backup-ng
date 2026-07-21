@@ -599,6 +599,144 @@ class RawEndpoint(Endpoint):
         overwritten with a backfill record. The raw+ssh subclass tests the remote."""
         return snapshot.metadata_path.exists()
 
+    def remediate_plaintext(
+        self,
+        snapshot: RawSnapshot,
+        *,
+        encrypt: str,
+        gpg_recipient: str | None = None,
+        gpg_keyring: str | None = None,
+        openssl_cipher: str = "aes-256-cbc",
+    ) -> RawSnapshot:
+        """Write an ENCRYPTED copy of a plaintext ``snapshot``'s stream (the same
+        bytes with an encryption layer added) atomically, plus its authoritative
+        sidecar (``provenance_origin=remediation``, ``remediated_from`` audit ref).
+
+        Does NOT touch the plaintext -- the caller removes it only after
+        ``decrypt_matches_plaintext`` proves the encryption is reversible and only
+        when the operator opted in. Returns the new RawSnapshot. Raises
+        FileExistsError if the encrypted target already exists (never clobber a prior
+        encrypted stream)."""
+        if encrypt not in ("gpg", "openssl_enc"):
+            # Defense in depth: a caller error must never produce a plaintext file
+            # wearing an encrypted name/label (the GHSA-vr25 class this remediates).
+            raise ValueError(
+                f"remediate_plaintext requires a real encryption method, got {encrypt!r}"
+            )
+        orig = snapshot.stream_path
+        ext = ".gpg" if encrypt == "gpg" else ".enc"
+        enc_path = Path(str(orig) + ext)
+        if enc_path.exists():
+            raise FileExistsError(
+                f"{enc_path} already exists; refusing to overwrite an existing "
+                "encrypted stream"
+            )
+        part = Path(str(enc_path) + PARTIAL_SUFFIX)
+        # A compress-less endpoint yields an ENCRYPT-ONLY argv (the plaintext bytes
+        # are already whatever they are), reusing the PR4-hardened crypto command.
+        enc_ep = RawEndpoint(
+            config={
+                "path": str(Path(self.config["path"])),
+                "encrypt": encrypt,
+                "gpg_recipient": gpg_recipient,
+                "gpg_keyring": gpg_keyring,
+                "openssl_cipher": openssl_cipher,
+            }
+        )
+        pipeline = enc_ep._build_receive_pipeline(enc_path)
+        if len(pipeline) != 1 or pipeline[0][:1] == ["cat"]:
+            raise RuntimeError("internal: expected a single encrypt stage")
+        encrypt_argv = pipeline[0]
+        # Open the .part with O_NOFOLLOW|O_EXCL so a pre-planted <orig>.<ext>.part
+        # symlink cannot redirect this (often root) write to an arbitrary file, and a
+        # stale/hostile pre-existing .part cannot be reused -- matching the O_NOFOLLOW
+        # hardening on save_metadata/_sha256_file for the untrusted-directory model.
+        part_fd = os.open(
+            part, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600
+        )
+        try:
+            with open(orig, "rb") as stdin:
+                proc = subprocess.Popen(
+                    encrypt_argv, stdin=stdin, stdout=part_fd, stderr=subprocess.PIPE
+                )
+                _, err = proc.communicate()
+        finally:
+            os.close(part_fd)
+        if proc.returncode != 0:
+            try:
+                part.unlink()
+            except OSError:
+                pass
+            msg = err.decode(errors="replace").strip() if err else "encryption failed"
+            raise RuntimeError(f"Encrypting {orig} failed: {msg}")
+        # Atomic publish of the encrypted stream (fsync -> rename -> dir fsync).
+        fd = os.open(part, os.O_RDONLY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        os.replace(part, enc_path)
+        self._fsync_dir(enc_path.parent)
+        new_snap = RawSnapshot(
+            name=snapshot.name,
+            stream_path=enc_path,
+            parent_name=snapshot.parent_name,
+            created=datetime.now(timezone.utc),
+            size=enc_path.stat().st_size,
+            compress=snapshot.compress,  # unchanged: the bytes were already compressed
+            encrypt=encrypt,
+            gpg_recipient=gpg_recipient,
+            openssl_cipher=openssl_cipher if encrypt == "openssl_enc" else None,
+            provenance_origin="remediation",
+            stream_completeness=snapshot.stream_completeness,
+            remediation_source=orig.name,
+            checksum_value=_sha256_file(enc_path),
+        )
+        self.write_sidecar(new_snap)
+        self._cached_snapshots = None  # a new stream now exists; re-discover on list
+        return new_snap
+
+    def decrypt_matches_plaintext(
+        self, new_snapshot: RawSnapshot, plaintext_path: Path
+    ) -> bool:
+        """LIVE proof that ``new_snapshot``'s encrypted stream decrypts back to
+        exactly ``plaintext_path``.
+
+        Reverses ONLY the encryption (the verify snapshot has ``compress=None``), so
+        the decrypt output must equal the original (possibly still-compressed)
+        plaintext file byte for byte. For gpg this needs the secret key on THIS host;
+        if it is absent the decrypt fails and this returns False -- so the plaintext
+        is never removed on a host that cannot prove reversibility."""
+        verify_snap = RawSnapshot(
+            name=new_snapshot.name,
+            stream_path=new_snapshot.stream_path,
+            encrypt=new_snapshot.encrypt,
+            compress=None,
+            openssl_cipher=new_snapshot.openssl_cipher,
+        )
+        try:
+            proc = self.send(verify_snap)
+        except Exception:
+            return False
+        stdout = proc.stdout
+        if stdout is None:
+            return False
+        # Any failure to PROVE reversibility -> False (so the plaintext is kept); an
+        # I/O error here must never crash the batch or leave the decision ambiguous.
+        try:
+            h = hashlib.sha256()
+            for chunk in iter(lambda: stdout.read(1024 * 1024), b""):
+                h.update(chunk)
+            stdout.close()
+            if proc.stderr is not None:
+                proc.stderr.read()  # drain (small) so wait() cannot deadlock
+            if proc.wait() != 0:
+                return False
+            plaintext_hash = _sha256_file(plaintext_path)
+            return plaintext_hash is not None and h.hexdigest() == plaintext_hash
+        except OSError:
+            return False
+
     def streams_without_sidecar(self) -> list[RawSnapshot]:
         """Return backfill candidates: RawSnapshots reconstructed from the filename
         for streams under this target that have NO ``.meta`` sidecar (legacy

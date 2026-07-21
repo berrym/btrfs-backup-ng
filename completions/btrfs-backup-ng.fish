@@ -354,6 +354,7 @@ complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_snapper_using_subcommand 
 complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_using_command raw' -a list -d 'List the backups a raw target holds'
 complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_using_command raw' -a verify -d 'Verify raw backups against their recorded checksums'
 complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_using_command raw' -a backfill-metadata -d 'Write .meta sidecars for legacy streams that have none'
+complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_using_command raw' -a encrypt -d 'Encrypt plaintext raw streams in place (remediation)'
 
 # Helper for raw subcommand
 function __fish_btrfs_backup_ng_raw_using_subcommand
@@ -385,3 +386,13 @@ complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_raw_using_subcommand back
 complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_raw_using_subcommand backfill-metadata' -l json -d 'Output in JSON format'
 complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_raw_using_subcommand backfill-metadata' -l ssh-sudo -d 'Use sudo for remote commands on a raw+ssh target'
 complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_raw_using_subcommand backfill-metadata' -a '(__fish_complete_directories)' -d 'Raw target path'
+
+# raw encrypt
+complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_raw_using_subcommand encrypt' -l encrypt -d 'Encryption method' -xa 'gpg openssl_enc'
+complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_raw_using_subcommand encrypt' -l gpg-recipient -d 'GPG recipient key' -x
+complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_raw_using_subcommand encrypt' -l openssl-cipher -d 'OpenSSL cipher' -x
+complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_raw_using_subcommand encrypt' -l shred -d 'Remove plaintext after a verified decrypt proof'
+complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_raw_using_subcommand encrypt' -l yes -d 'Do not prompt before removing plaintext'
+complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_raw_using_subcommand encrypt' -l dry-run -d 'Show what would be encrypted without changes'
+complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_raw_using_subcommand encrypt' -l json -d 'Output in JSON format'
+complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_raw_using_subcommand encrypt' -a '(__fish_complete_directories)' -d 'Raw target path'

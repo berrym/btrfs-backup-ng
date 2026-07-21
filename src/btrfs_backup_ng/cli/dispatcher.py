@@ -427,6 +427,59 @@ def create_subcommand_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Use sudo for remote commands on a raw+ssh target",
     )
+    raw_encrypt_parser = raw_subs.add_parser(
+        "encrypt",
+        help="Encrypt plaintext raw streams in place (remediation)",
+        description="Encrypt raw backups written as plaintext; verify then optionally"
+        " remove the plaintext",
+    )
+    raw_encrypt_parser.add_argument(
+        "target",
+        metavar="TARGET",
+        help="Local raw target: raw://PATH or a plain path (not raw+ssh)",
+    )
+    raw_encrypt_parser.add_argument(
+        "--encrypt",
+        required=True,
+        choices=["gpg", "openssl_enc"],
+        help="Encryption method to apply",
+    )
+    raw_encrypt_parser.add_argument(
+        "--gpg-recipient",
+        metavar="KEYID",
+        help="GPG recipient key (required with --encrypt gpg)",
+    )
+    raw_encrypt_parser.add_argument(
+        "--gpg-keyring",
+        metavar="FILE",
+        help="Use a non-default GPG keyring for encrypt and the decrypt proof",
+    )
+    raw_encrypt_parser.add_argument(
+        "--openssl-cipher",
+        metavar="CIPHER",
+        help="OpenSSL cipher for --encrypt openssl_enc (default aes-256-cbc)",
+    )
+    raw_encrypt_parser.add_argument(
+        "--shred",
+        action="store_true",
+        help="Remove each plaintext file after a verified decrypt proof "
+        "(plain unlink; not a secure wipe on CoW/SSD)",
+    )
+    raw_encrypt_parser.add_argument(
+        "--yes",
+        action="store_true",
+        help="Do not prompt before removing plaintext (for scripts; with --shred)",
+    )
+    raw_encrypt_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Show which plaintext streams would be encrypted without changes",
+    )
+    raw_encrypt_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Output in JSON format for scripting",
+    )
 
     # install command
     install_parser = subparsers.add_parser(
