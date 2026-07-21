@@ -184,6 +184,42 @@ def _lock_open_reason(e: OSError) -> str:
     return reasons.get(e.errno, str(e))
 
 
+def _check_remote_listing(
+    result: subprocess.CompletedProcess, host: str, path: Any
+) -> None:
+    """Guard a remote enumeration so a CONNECTION failure is never reported as an
+    empty target.
+
+    A raw+ssh ``list``/``verify`` that cannot reach the host must NOT silently return
+    "0 snapshots" / "all ok" -- that is a false all-clear that hides a down server (or
+    makes lost backups look intentionally absent). ``ssh`` exits 255 on its own
+    connection/auth/DNS failures, so that is raised as a clear error. A ``find`` on an
+    empty but reachable directory exits 0 (a genuinely empty target); any other
+    non-zero (e.g. a missing directory) is logged and treated as "no snapshots" rather
+    than swallowed silently."""
+    if result.returncode == 0:
+        return
+    stderr = (result.stderr or "").strip()
+    # Invariant: 255 is attributed to an ssh transport/auth/DNS failure. This relies on
+    # the remote enumeration command never itself exiting 255 -- true for the commands
+    # here (find exits 0/1/2; sudo exits 1 on auth failure). ssh's default BatchMode +
+    # ConnectTimeout (see _build_ssh_command) make a down/black-holing host reach this
+    # 255 path fast rather than hanging.
+    if result.returncode == 255:
+        raise RuntimeError(
+            f"Cannot reach raw+ssh target {host}: {stderr or 'ssh connection failed'}. "
+            "Its backups could NOT be listed -- this is NOT an empty target. Check the "
+            "host is up and reachable, then retry."
+        )
+    logger.warning(
+        "Listing raw+ssh target %s returned rc=%s (%s); reporting only the backups "
+        "that were readable",
+        path,
+        result.returncode,
+        stderr or "no stderr",
+    )
+
+
 def _sha256_file(path: Path) -> str | None:
     """Return the hex sha256 of ``path``'s bytes, or None on any I/O error.
 
@@ -1394,16 +1430,34 @@ class SSHRawEndpoint(RawEndpoint):
         yield
 
     def _build_ssh_command(self) -> list[str]:
-        """Build the base SSH command."""
+        """Build the base SSH command.
+
+        User ``ssh_opts`` come FIRST so they take precedence (ssh uses the first value
+        seen for each option), then defaults that make an unattended backup tool
+        behave: ``BatchMode=yes`` (never block on a password/host-key prompt), and
+        ``ConnectTimeout`` + ``ServerAlive*`` so a DOWN or packet-dropping host fails
+        FAST with ssh exit 255 -- which the listing guard turns into a clear "cannot
+        reach" error -- instead of hanging for the OS TCP timeout (or forever)."""
         cmd = ["ssh"]
+        cmd.extend(self.ssh_opts)
+        cmd.extend(
+            [
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                "ConnectTimeout=10",
+                "-o",
+                "ServerAliveInterval=5",
+                "-o",
+                "ServerAliveCountMax=3",
+            ]
+        )
 
         if self.port and self.port != 22:
             cmd.extend(["-p", str(self.port)])
 
         if self.ssh_key:
             cmd.extend(["-i", self.ssh_key])
-
-        cmd.extend(self.ssh_opts)
 
         user_host = (
             f"{self.username}@{self.hostname}" if self.username else self.hostname
@@ -1652,15 +1706,14 @@ class SSHRawEndpoint(RawEndpoint):
         )
         if self.ssh_sudo:
             find_cmd = f"sudo {find_cmd}"
-        try:
-            res = subprocess.run(
-                self._build_ssh_command() + [find_cmd],
-                check=True,
-                capture_output=True,
-                text=True,
-            )
-        except subprocess.CalledProcessError:
-            return []
+        res = subprocess.run(
+            self._build_ssh_command() + [find_cmd],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        # Never let an unreachable host look like an empty target (false all-clear).
+        _check_remote_listing(res, self.hostname, base)
         out: list[str] = []
         for p in res.stdout.split("\x00"):
             if not p or "\n" in p:
@@ -1880,15 +1933,10 @@ class SSHRawEndpoint(RawEndpoint):
 
         full_cmd = ssh_cmd + [find_cmd]
 
-        try:
-            result = subprocess.run(
-                full_cmd, check=True, capture_output=True, text=True
-            )
-            meta_files = (
-                result.stdout.strip().split("\n") if result.stdout.strip() else []
-            )
-        except subprocess.CalledProcessError:
-            meta_files = []
+        result = subprocess.run(full_cmd, check=False, capture_output=True, text=True)
+        # Never let an unreachable host look like an empty target (false all-clear).
+        _check_remote_listing(result, self.hostname, path)
+        meta_files = result.stdout.strip().split("\n") if result.stdout.strip() else []
 
         # For each metadata file, fetch and parse
         snapshots: list[RawSnapshot] = []
@@ -1925,18 +1973,17 @@ class SSHRawEndpoint(RawEndpoint):
         )
         if self.ssh_sudo:
             find_stream_cmd = f"sudo {find_stream_cmd}"
-        try:
-            result = subprocess.run(
-                ssh_cmd + [find_stream_cmd],
-                check=True,
-                capture_output=True,
-                text=True,
-            )
-            stream_files = (
-                result.stdout.strip().split("\n") if result.stdout.strip() else []
-            )
-        except subprocess.CalledProcessError:
-            stream_files = []
+        result = subprocess.run(
+            ssh_cmd + [find_stream_cmd], check=False, capture_output=True, text=True
+        )
+        # This is a fresh ssh call: a connection that succeeded on the first-pass find
+        # but DROPS before/at this second pass (e.g. a ServerAlive keepalive timeout
+        # mid-listing) must still fail loudly rather than truncate the legacy-stream
+        # pass to [] and under-report the target's backups.
+        _check_remote_listing(result, self.hostname, path)
+        stream_files = (
+            result.stdout.strip().split("\n") if result.stdout.strip() else []
+        )
 
         # Dedup on the stream PATH (unambiguous) as well as the derived name, so
         # a stream that also has a .meta is never enumerated twice even if its
