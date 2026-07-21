@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any
 
 from btrfs_backup_ng import __version__
+from btrfs_backup_ng.__logger__ import logger
 
 # Compression tool configurations
 COMPRESSION_CONFIG: dict[str, dict[str, Any]] = {
@@ -449,9 +450,25 @@ def discover_raw_snapshots(
             snapshot = RawSnapshot.load_metadata(meta_path)
             if not prefix or snapshot.name.startswith(prefix):
                 snapshots.append(snapshot)
-        except (json.JSONDecodeError, OSError, ValueError, TypeError, AttributeError):
-            # Skip a single malformed sidecar rather than aborting the whole
-            # directory listing (bad JSON, wrong types, unexpected structure).
+        except Exception as e:
+            # A sidecar EXISTS but could not be parsed (corrupt/truncated JSON, wrong
+            # types, non-UTF8, pathologically-nested JSON). Two rules:
+            #  1. Skip only THIS file, never abort the whole directory listing -- so a
+            #     broad except (a RecursionError from deeply-nested JSON is a
+            #     RuntimeError, NOT in the old narrow tuple, and would otherwise blind
+            #     the tool to every healthy backup in the directory).
+            #  2. Do NOT silently pretend the sidecar is absent: WARN by name. The
+            #     stream still falls back to filename inference in the second pass, but
+            #     that loses the authoritative compress/encrypt/cipher/checksum, so the
+            #     operator must know their metadata was damaged.
+            logger.warning(
+                "Raw sidecar %s is unreadable/corrupt and was ignored (%s); its "
+                "stream will be listed from the filename only, losing the recorded "
+                "compress/encrypt/cipher/checksum. Re-run the backup, or "
+                "'raw backfill-metadata' to rebuild a (non-authoritative) sidecar.",
+                meta_path,
+                e,
+            )
             continue
 
     # Second pass: find stream files without metadata
@@ -486,7 +503,14 @@ def discover_raw_snapshots(
         # reconstructed from the filename (no authoritative sidecar), so its origin
         # is "filename-inferred" and its completeness is unknown -- never present it
         # as a native atomic backup.
-        stat = item.stat()
+        try:
+            stat = item.stat()
+        except OSError:
+            # The stream vanished between iterdir() and stat() (e.g. a concurrent
+            # prune). Skip just this one rather than aborting the whole listing --
+            # mirrors the raw+ssh second pass, and the same one-bad-file-blinds-all
+            # class the sidecar loop above closes.
+            continue
         snapshot = RawSnapshot(
             name=name,
             stream_path=item,

@@ -1958,8 +1958,24 @@ class SSHRawEndpoint(RawEndpoint):
                 stream_path = Path(meta_path[:-5])  # Remove .meta
                 snapshot = RawSnapshot.from_dict(data, stream_path)
                 snapshots.append(snapshot)
-            except (subprocess.CalledProcessError, json.JSONDecodeError) as e:
-                logger.debug("Failed to parse remote metadata %s: %s", meta_path, e)
+            except subprocess.CalledProcessError as e:
+                # The `cat` failed (file vanished between find and cat, or a mid-listing
+                # connection drop -- a persistent outage is already caught at the find).
+                logger.debug("Could not read remote sidecar %s: %s", meta_path, e)
+                continue
+            except Exception as e:
+                # The sidecar was readable but could not be PARSED (corrupt/truncated/
+                # non-UTF8/pathologically-nested JSON). Warn instead of silently
+                # degrading to filename inference (which loses the authoritative
+                # compress/encrypt/cipher/checksum); the broad except also keeps a
+                # RecursionError from one bad sidecar from aborting the whole listing.
+                logger.warning(
+                    "Remote raw sidecar %s is unreadable/corrupt and was ignored (%s); "
+                    "its stream will be listed from the filename only, losing the "
+                    "recorded compress/encrypt/cipher/checksum.",
+                    meta_path,
+                    e,
+                )
                 continue
 
         # Second pass: sidecar-less remote streams (legacy backups, direct
