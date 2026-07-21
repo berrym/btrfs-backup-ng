@@ -121,9 +121,9 @@ class RawSnapshot:
     gpg_recipient: str | None = None
     openssl_cipher: str | None = None
     # --- authoritative sidecar (0.8.5) ---
-    # checksum_value is RESERVED: the schema carries checksum{algorithm,value} but
-    # the value is populated later by `raw verify` (computed via a Python-native
-    # stream tee), so the zero-copy write pipeline is not taxed with a second read.
+    # checksum_value: hex sha256 of the committed ciphertext, sealed at write time
+    # by reading the file back after the atomic commit (so it reflects the bytes on
+    # disk). None for legacy sidecars or when the read-back failed (best-effort).
     checksum_value: str | None = None
     provenance_origin: str = "native-write"
     # --- Snapshot-interface compatibility (0.8.5) ---
@@ -204,8 +204,8 @@ class RawSnapshot:
         v2 is additive over v1: the nested ``pipeline`` block gains
         ``openssl_cipher``, and ``checksum``/``provenance`` blocks are added. A v1
         reader ignores the new keys; ``from_dict`` reads either version. ``created``
-        is ISO-8601 in UTC. ``checksum.value`` is reserved (null on the write path;
-        populated later by ``raw verify``).
+        is ISO-8601 in UTC. ``checksum.value`` is the sha256 of the committed
+        ciphertext (null for legacy sidecars or a best-effort read-back failure).
         """
         return {
             "version": 2,

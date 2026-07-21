@@ -40,7 +40,11 @@ def test_commit_writes_authoritative_v2_sidecar(tmp_path):
     assert data["pipeline"]["compress"] == "gzip"
     assert data["pipeline"]["encrypt"] is None
     assert data["pipeline"]["openssl_cipher"] is None  # gated: only for openssl_enc
-    assert data["checksum"] == {"algorithm": "sha256", "value": None}  # reserved
+    # checksum is sealed at write time (PR6b): sha256 of the committed stream.
+    import hashlib
+
+    assert data["checksum"]["algorithm"] == "sha256"
+    assert data["checksum"]["value"] == hashlib.sha256(stream.read_bytes()).hexdigest()
     assert data["provenance"]["origin"] == "native-write"
     assert data["created"].endswith("+00:00")  # ISO-8601 UTC
 
