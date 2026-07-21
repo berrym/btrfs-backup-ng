@@ -30,6 +30,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, TypedDict
 
+from btrfs_backup_ng import __util__
 from btrfs_backup_ng.__logger__ import logger
 from btrfs_backup_ng.endpoint.common import Endpoint
 from btrfs_backup_ng.endpoint.raw_metadata import (
@@ -483,8 +484,16 @@ class RawEndpoint(Endpoint):
             logger.info("Creating raw target directory: %s", path)
             path.mkdir(parents=True, exist_ok=True, mode=0o700)
 
-        # Verify required tools are available
-        self._check_tools()
+        # Fail loud (before any transfer) with an actionable message if a required
+        # compression/encryption tool is missing, instead of a raw errno part-way
+        # through the send pipeline.
+        missing = self._check_tools()
+        if missing:
+            raise __util__.AbortError(
+                f"Cannot back up to raw target {path}: the required tool(s) "
+                f"{', '.join(missing)} are not installed. Install them (or change the "
+                "compress/encrypt method) and retry."
+            )
 
     def _check_tools(self) -> list[str]:
         """Check that required tools are available.
@@ -992,6 +1001,7 @@ class RawEndpoint(Endpoint):
             raise FileNotFoundError(f"Stream file not found: {snapshot.stream_path}")
 
         pipeline = self._build_restore_pipeline(snapshot)
+        self._preflight_restore_tools(pipeline, snapshot)
         return self._execute_restore_pipeline(pipeline, snapshot.stream_path)
 
     def _build_restore_pipeline(self, snapshot: RawSnapshot) -> list[list[str]]:
@@ -1035,19 +1045,69 @@ class RawEndpoint(Endpoint):
                 _openssl_pass_arg(),
             ]
             pipeline.append(openssl_cmd)
+        elif snapshot.encrypt:
+            # The sidecar records an encryption method this version does not know how
+            # to reverse. NEVER silently skip decryption -- that would pipe the still
+            # ENCRYPTED bytes into btrfs receive and produce a corrupt restore with no
+            # error (the same silent-corruption class as an unknown compression).
+            raise __util__.AbortError(
+                f"Cannot restore {snapshot.name}: it is encrypted with "
+                f"{snapshot.encrypt!r}, which this version cannot decrypt (supported: "
+                "gpg, openssl_enc). Restore with a version that supports it."
+            )
 
         # Decompression stage
         if snapshot.compress:
-            config = COMPRESSION_CONFIG.get(snapshot.compress, {})
-            cmd = config.get("decompress_cmd", [])
-            if cmd:
-                pipeline.append(list(cmd))
+            config = COMPRESSION_CONFIG.get(snapshot.compress)
+            cmd = config.get("decompress_cmd", []) if config else []
+            if not cmd:
+                # The sidecar records a compression this version cannot reverse. NEVER
+                # silently skip decompression -- that pipes the still-compressed bytes
+                # into btrfs receive and produces a corrupt restore with no error.
+                supported = ", ".join(sorted(COMPRESSION_CONFIG))
+                raise __util__.AbortError(
+                    f"Cannot restore {snapshot.name}: it is compressed with "
+                    f"{snapshot.compress!r}, which this version cannot decompress "
+                    f"(supported: {supported}). Restore with a version that supports "
+                    "it, or decompress the stream manually."
+                )
+            pipeline.append(list(cmd))
 
         # If no processing needed, just cat
         if not pipeline:
             pipeline.append(["cat"])
 
         return pipeline
+
+    @staticmethod
+    def _describe_pipeline(snapshot: RawSnapshot) -> str:
+        """A short human phrase describing a snapshot's pipeline, for error messages."""
+        parts = []
+        if snapshot.compress:
+            parts.append(f"compressed with {snapshot.compress}")
+        if snapshot.encrypt:
+            parts.append(f"encrypted with {snapshot.encrypt}")
+        return " and ".join(parts) if parts else "a plain btrfs stream"
+
+    def _preflight_restore_tools(
+        self, pipeline: list[list[str]], snapshot: RawSnapshot
+    ) -> None:
+        """Fail loud (before any bytes flow) if a tool the restore pipeline needs is
+        not installed, so a missing decompressor/decryptor gives a clear, actionable
+        message instead of a raw FileNotFoundError traceback part-way through the
+        restore. Kept separate from pipeline CONSTRUCTION so the built pipeline can be
+        inspected without requiring the tools to be present."""
+        for stage in pipeline:
+            tool = stage[0]
+            # "cat" is the pipeline's no-op passthrough sentinel (always present,
+            # never a decoder), so skipping it is not a generic "assume installed".
+            if tool != "cat" and shutil.which(tool) is None:
+                raise __util__.AbortError(
+                    f"Cannot restore {snapshot.name}: the tool {tool!r} is required "
+                    "to restore this backup (it is "
+                    f"{self._describe_pipeline(snapshot)}) but is not installed. "
+                    f"Install {tool!r} and retry."
+                )
 
     def _execute_restore_pipeline(
         self, pipeline: list[list[str]], input_path: Path
@@ -1368,8 +1428,15 @@ class SSHRawEndpoint(RawEndpoint):
                 "SMB/NFS/cloud target, mount it locally and use a raw:// path."
             )
 
-        # Check local tools
-        self._check_tools()
+        # Check local tools (compression/encryption run locally before the ssh pipe);
+        # fail loud with an actionable message rather than a raw errno mid-transfer.
+        missing = self._check_tools()
+        if missing:
+            raise __util__.AbortError(
+                f"Cannot back up to raw+ssh target {self.hostname}: the required local "
+                f"tool(s) {', '.join(missing)} are not installed. Install them (or "
+                "change the compress/encrypt method) and retry."
+            )
 
     def _execute_pipeline(
         self, pipeline: list[list[str]], stdin: Any
@@ -1696,6 +1763,11 @@ class SSHRawEndpoint(RawEndpoint):
         if not isinstance(snapshot, RawSnapshot):
             raise TypeError(f"Expected RawSnapshot, got {type(snapshot)}")
         remote = str(snapshot.stream_path)
+        # Build + preflight the LOCAL decrypt/decompress pipeline FIRST, so an
+        # undecodable sidecar (unknown algo/cipher) or a missing local tool fails
+        # offline and instantly, before we open an ssh connection to the remote.
+        pipeline = self._build_restore_pipeline(snapshot)
+        self._preflight_restore_tools(pipeline, snapshot)
         # Clear error if the stream is not on the remote (vs a cryptic pipe fail).
         test = self._exec_remote_command(
             ["sh", "-c", f"test -f {shlex.quote(remote)}"], check=False
@@ -1705,7 +1777,6 @@ class SSHRawEndpoint(RawEndpoint):
                 f"Remote stream not found: {self.hostname}:{remote}"
             )
 
-        pipeline = self._build_restore_pipeline(snapshot)  # LOCAL decrypt/decompress
         ssh_cmd = self._build_ssh_command()
         remote_cat = f"cat {shlex.quote(remote)}"
         if self.ssh_sudo:
