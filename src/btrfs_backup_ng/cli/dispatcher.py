@@ -402,6 +402,31 @@ def create_subcommand_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Use sudo for remote commands on a raw+ssh target",
     )
+    raw_backfill_parser = raw_subs.add_parser(
+        "backfill-metadata",
+        help="Write .meta sidecars for legacy streams that have none",
+        description="Reconstruct sidecars for pre-0.8.5 raw streams without one",
+    )
+    raw_backfill_parser.add_argument(
+        "target",
+        metavar="TARGET",
+        help="Raw target: raw://PATH, raw+ssh://[USER@]HOST/PATH, or a plain path",
+    )
+    raw_backfill_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Show which streams would be backfilled without writing sidecars",
+    )
+    raw_backfill_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Output in JSON format for scripting",
+    )
+    raw_backfill_parser.add_argument(
+        "--ssh-sudo",
+        action="store_true",
+        help="Use sudo for remote commands on a raw+ssh target",
+    )
 
     # install command
     install_parser = subparsers.add_parser(

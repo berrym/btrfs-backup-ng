@@ -156,7 +156,12 @@ def _sha256_file(path: Path) -> str | None:
     miss) -- without evicting other data from the cache."""
     try:
         h = hashlib.sha256()
-        with open(path, "rb") as f:
+        # O_NOFOLLOW: never hash through a symlink at the final path component --
+        # a backfill walking an untrusted directory must not be tricked into
+        # hashing (and, with --json, disclosing the digest of) an arbitrary file
+        # via a planted <name>.btrfs symlink.
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+        with os.fdopen(fd, "rb") as f:
             fadvise = getattr(os, "posix_fadvise", None)
             dontneed = getattr(os, "POSIX_FADV_DONTNEED", None)
             if fadvise is not None and dontneed is not None:
@@ -586,6 +591,56 @@ class RawEndpoint(Endpoint):
         sidecar's recorded ``checksum_value`` to detect corruption. The raw+ssh
         subclass overrides this to hash on the remote host (no re-download)."""
         return _sha256_file(snapshot.stream_path)
+
+    def sidecar_exists(self, snapshot: RawSnapshot) -> bool:
+        """Whether ``snapshot``'s ``.meta`` sidecar exists now. Used by
+        ``raw backfill-metadata`` to re-check just before writing, so a sidecar that
+        appeared since the scan (e.g. a backup committed concurrently) is not
+        overwritten with a backfill record. The raw+ssh subclass tests the remote."""
+        return snapshot.metadata_path.exists()
+
+    def streams_without_sidecar(self) -> list[RawSnapshot]:
+        """Return backfill candidates: RawSnapshots reconstructed from the filename
+        for streams under this target that have NO ``.meta`` sidecar (legacy
+        backups). Each is stamped ``provenance_origin=backfill`` and
+        ``stream_completeness=unknown`` -- a legacy stream could be truncated, so a
+        backfilled sidecar is never authoritative. The checksum is left None for the
+        caller (``raw backfill-metadata``) to seal by hashing the stream. The raw+ssh
+        subclass overrides this to scan the remote target."""
+        path = Path(self.config["path"])
+        if not path.exists():
+            return []
+        out: list[RawSnapshot] = []
+        for item in sorted(path.iterdir()):
+            # Skip symlinks: this scan writes a sidecar next to each candidate while
+            # walking a directory of foreign/legacy content, so a symlinked "stream"
+            # must not be treated as a real backup (defends the write + the hash).
+            if item.is_symlink() or not item.is_file() or item.suffix == ".meta":
+                continue
+            if item.name.endswith((".part", ".tmp")) or ".btrfs" not in item.name:
+                continue
+            if item.with_name(item.name + ".meta").exists():
+                continue  # already has an authoritative sidecar
+            parsed = parse_stream_filename(item.name)
+            try:
+                stat = item.stat()
+            except OSError:
+                # Raced away or unreadable: skip this one rather than abort the whole
+                # backfill (mirrors the SSH path's stat-failure -> skip).
+                continue
+            out.append(
+                RawSnapshot(
+                    name=parsed["name"],
+                    stream_path=item,
+                    created=datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc),
+                    size=stat.st_size,
+                    compress=parsed["compress"],
+                    encrypt=parsed["encrypt"],
+                    provenance_origin="backfill",
+                    stream_completeness="unknown",
+                )
+            )
+        return out
 
     def _sidecar_snapshot(
         self, final_path: Path, size: int, checksum_value: str | None = None
@@ -1119,6 +1174,104 @@ class SSHRawEndpoint(RawEndpoint):
         re-downloading the stream."""
         return self._remote_sha256(snapshot.stream_path)
 
+    def sidecar_exists(self, snapshot: RawSnapshot) -> bool:
+        """Whether ``snapshot``'s ``.meta`` sidecar exists on the remote now (a
+        pre-write re-check; see the base method)."""
+        meta = shlex.quote(str(snapshot.metadata_path))
+        cmd = f"test -f {meta}"
+        if self.ssh_sudo:
+            cmd = f"sudo sh -c {shlex.quote(cmd)}"
+        try:
+            res = self._exec_remote_command(["sh", "-c", cmd], check=False)
+            return res.returncode == 0
+        except Exception:
+            return False
+
+    def _remote_find(self, pattern: str) -> list[str]:
+        """Return remote file paths that are DIRECT CHILDREN of the target dir and
+        match ``pattern``.
+
+        ``-maxdepth 1`` keeps the scan flat (matching the local ``iterdir`` scan);
+        ``-print0`` (NUL-separated) so a filename containing a newline cannot inject
+        a second, out-of-target path into the result set; and each path is checked to
+        be a direct child of the target dir as defense in depth."""
+        base = str(self.config["path"]).rstrip("/") or "/"
+        find_cmd = (
+            f"find {shlex.quote(base)} -maxdepth 1 "
+            f"-name {shlex.quote(pattern)} -type f -print0 2>/dev/null"
+        )
+        if self.ssh_sudo:
+            find_cmd = f"sudo {find_cmd}"
+        try:
+            res = subprocess.run(
+                self._build_ssh_command() + [find_cmd],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+        except subprocess.CalledProcessError:
+            return []
+        out: list[str] = []
+        for p in res.stdout.split("\x00"):
+            if not p or "\n" in p:
+                continue
+            if os.path.dirname(p) != base:  # must stay inside the target dir
+                continue
+            out.append(p)
+        return out
+
+    def _remote_stat(self, remote_path: str) -> tuple[datetime | None, int]:
+        """Portable remote mtime+size (GNU ``stat -c``, else BSD/macOS ``stat -f``).
+        Returns ``(created_utc, size)`` or ``(None, 0)`` if it cannot be stat'd."""
+        q = shlex.quote(remote_path)
+        stat_cmd = f"stat -c '%Y %s' {q} 2>/dev/null || stat -f '%m %z' {q}"
+        if self.ssh_sudo:
+            stat_cmd = f"sudo sh -c {shlex.quote(stat_cmd)}"
+        try:
+            res = subprocess.run(
+                self._build_ssh_command() + [stat_cmd],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            mtime_str, size_str = res.stdout.strip().split()
+            return datetime.fromtimestamp(int(mtime_str), tz=timezone.utc), int(
+                size_str
+            )
+        except (subprocess.CalledProcessError, ValueError):
+            return None, 0
+
+    def streams_without_sidecar(self) -> list[RawSnapshot]:
+        """Remote backfill candidates: streams on the remote target with no ``.meta``
+        sidecar. Two remote finds (streams, sidecars) plus a portable stat per
+        candidate. Stamped ``backfill`` / ``unknown`` like the local scan; the
+        checksum is left None for the caller to seal on the remote."""
+        streams = self._remote_find("*.btrfs*")
+        metas = set(self._remote_find("*.meta"))
+        out: list[RawSnapshot] = []
+        for sp in streams:
+            if sp.endswith((".meta", ".part", ".tmp")):
+                continue
+            if sp + ".meta" in metas:
+                continue  # already has an authoritative sidecar
+            created, size = self._remote_stat(sp)
+            if created is None:
+                continue
+            parsed = parse_stream_filename(Path(sp).name)
+            out.append(
+                RawSnapshot(
+                    name=parsed["name"],
+                    stream_path=Path(sp),
+                    created=created,
+                    size=size,
+                    compress=parsed["compress"],
+                    encrypt=parsed["encrypt"],
+                    provenance_origin="backfill",
+                    stream_completeness="unknown",
+                )
+            )
+        return out
+
     def _remote_sha256(self, final_path: Path) -> str | None:
         """Compute the sha256 of the committed remote stream ON the remote host,
         returning the 64-hex digest or None (best-effort).
@@ -1366,6 +1519,8 @@ class SSHRawEndpoint(RawEndpoint):
                 # would sort as newest and distort prune / parent selection. Skip it.
                 logger.debug("Skipping un-stat-able remote stream %s", stream_path_str)
                 continue
+            # Reconstructed from the filename (no authoritative sidecar): mark it
+            # honestly so it is never presented as a native atomic backup.
             snapshots.append(
                 RawSnapshot(
                     name=name,
@@ -1374,6 +1529,8 @@ class SSHRawEndpoint(RawEndpoint):
                     size=size,
                     compress=parsed["compress"],
                     encrypt=parsed["encrypt"],
+                    provenance_origin="filename-inferred",
+                    stream_completeness="unknown",
                 )
             )
             loaded_names.add(name)
