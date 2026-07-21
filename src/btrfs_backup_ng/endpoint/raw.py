@@ -1002,7 +1002,55 @@ class RawEndpoint(Endpoint):
 
         pipeline = self._build_restore_pipeline(snapshot)
         self._preflight_restore_tools(pipeline, snapshot)
+        self._verify_stream_integrity(snapshot)
         return self._execute_restore_pipeline(pipeline, snapshot.stream_path)
+
+    def _verify_stream_integrity(self, snapshot: RawSnapshot) -> None:
+        """Refuse to restore a stored stream that no longer matches the sha256 sealed
+        when it was written -- so a corrupted/truncated backup is detected UP FRONT
+        instead of being decoded into a corrupt subvolume (or, worse, partially
+        applied). Reads the stream once to hash it (on the remote for raw+ssh, via
+        the ``compute_stream_checksum`` override -- no re-download); the extra read is
+        the price of not restoring silently-bad data.
+
+        Skipped when the sidecar recorded no checksum (a legacy backup) or a non-sha256
+        algorithm -- there is nothing to compare against, and the restore's own decode
+        step still surfaces a genuinely unreadable stream. Also skipped (for last-copy
+        recovery of a partially-corrupt backup, and to avoid the extra full read) when
+        ``verify_before_restore`` is turned off via the restore ``--skip-verify`` flag.
+
+        NOTE (raw+ssh trust model): for a remote target both the recomputed digest and
+        the recorded checksum come from the (untrusted) remote, so this detects at-rest
+        CORRUPTION, not tampering -- a compromised target could forge a match. Verify a
+        ``raw://`` copy for tamper-evidence (same caveat as ``raw verify``)."""
+        if not self.config.get("verify_before_restore", True):
+            logger.warning(
+                "Integrity check skipped for %s (--skip-verify): restoring without "
+                "confirming the stored stream matches its recorded checksum.",
+                snapshot.name,
+            )
+            return
+        recorded = snapshot.checksum_value
+        if not recorded or snapshot.checksum_algorithm != "sha256":
+            return
+        computed = self.compute_stream_checksum(snapshot)
+        if computed is None:
+            # Could not hash the stream -- do not BLOCK the restore on an inability to
+            # verify (the decode step will surface a real read error); just note it.
+            logger.warning(
+                "Could not verify %s before restore (checksum unreadable); proceeding",
+                snapshot.name,
+            )
+            return
+        if computed != recorded:
+            raise __util__.AbortError(
+                f"Refusing to restore {snapshot.name}: the stored stream is CORRUPT "
+                f"(its sha256 {computed} does not match {recorded}, sealed when it was "
+                "backed up). The backup on disk has changed since it was written. "
+                "Restore an intact copy if you have one; if this is the only copy, "
+                "'restore --skip-verify' will attempt it anyway (the result may be "
+                "incomplete). Run 'raw verify' to inspect the target."
+            )
 
     def _build_restore_pipeline(self, snapshot: RawSnapshot) -> list[list[str]]:
         """Build the decryption/decompression pipeline for restore.
@@ -1138,14 +1186,16 @@ class RawEndpoint(Endpoint):
 
         logger.debug("Executing restore pipeline: %s", shell_cmd)
 
-        proc = subprocess.Popen(
+        # pipefail so a mid-pipe decrypt/decompress failure (e.g. a wrong passphrase,
+        # a truncated stream) is NOT masked by the last stage exiting 0 -- otherwise a
+        # garbage/partial stream could be fed to btrfs receive and reported as a
+        # successful restore. Mirrors the write pipeline.
+        return _popen_pipeline_pipefail(
             shell_cmd,
-            shell=True,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
         )
-        return proc
 
     def list_snapshots(self, flush_cache: bool = False) -> list[RawSnapshot]:
         """List all raw snapshots in the target directory.
@@ -1776,6 +1826,10 @@ class SSHRawEndpoint(RawEndpoint):
             raise FileNotFoundError(
                 f"Remote stream not found: {self.hostname}:{remote}"
             )
+        # Verify the remote stream against its sealed sha256 (hashed ON the remote --
+        # no re-download) before streaming it down, so a corrupted remote backup is
+        # refused up front rather than decoded into a corrupt subvolume.
+        self._verify_stream_integrity(snapshot)
 
         ssh_cmd = self._build_ssh_command()
         remote_cat = f"cat {shlex.quote(remote)}"

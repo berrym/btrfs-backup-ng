@@ -466,6 +466,9 @@ def _prepare_backup_endpoint(args: argparse.Namespace, source: str):
         endpoint_kwargs,
         source=False,
     )
+    # Restore-time integrity check for raw targets: default ON, disabled by
+    # --skip-verify (for last-copy recovery of a partially-corrupt backup).
+    backup_ep.config["verify_before_restore"] = not getattr(args, "skip_verify", False)
     backup_ep.prepare()
 
     return backup_ep

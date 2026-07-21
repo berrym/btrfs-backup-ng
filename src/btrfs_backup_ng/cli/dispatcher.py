@@ -599,6 +599,13 @@ Config-driven restore:
         help="Force full transfers (don't use incremental)",
     )
     restore_parser.add_argument(
+        "--skip-verify",
+        action="store_true",
+        help="Skip the pre-restore integrity check for raw backups (restore even if "
+        "the stored stream's checksum no longer matches, and skip the extra read). "
+        "Use for last-copy recovery of a partially-corrupt backup.",
+    )
+    restore_parser.add_argument(
         "--overwrite",
         action="store_true",
         help="Overwrite existing snapshots instead of skipping",
