@@ -970,6 +970,38 @@ Raw target: raw:///mnt/usb/backups  (2 snapshots)
   home.20260101T120000             2026-01-01T12:00:00Z  340 MiB  -           -        -            native-write
 ```
 
+#### raw verify
+
+Verify raw backups by recomputing each stream's sha256 and comparing it to the checksum recorded in its `.meta` sidecar. For a `raw+ssh://` target the hash is computed on the remote host, so streams are not re-downloaded.
+
+```bash
+btrfs-backup-ng raw verify TARGET [OPTIONS]
+```
+
+**Arguments:**
+| Argument | Description |
+|----------|-------------|
+| `TARGET` | Raw target: `raw://PATH`, `raw+ssh://[USER@]HOST/PATH`, or a plain path |
+
+**Options:**
+| Option | Description |
+|--------|-------------|
+| `--snapshot NAME` | Verify only the named snapshot |
+| `--json` | Output per-snapshot results as JSON |
+| `--ssh-sudo` | Use `sudo` for remote commands on a `raw+ssh://` target |
+
+Per-snapshot status: **ok** (matches), **corrupt** (the stored stream differs from what was backed up), **error** (the stream could not be read/hashed), or **unverifiable** (no checksum was recorded — a legacy backup, or a best-effort write-time seal that failed). Exit status is `1` if any snapshot is corrupt or errored, else `0`.
+
+`raw verify` confirms a stream still matches the checksum recorded in its own `.meta` sidecar — an **integrity/consistency** check, not an authenticity one: an attacker who can rewrite both the stream and its sidecar can make a corrupted backup report `ok`. For a `raw+ssh://` target the hash is recomputed **on the (untrusted) remote host**, so an `ok` verdict only confirms the recorded checksum and cannot detect corruption or tampering introduced by a compromised target. For tamper-evident verification, verify a locally-mounted copy (`raw://`), where the stream is hashed with your own host's kernel after dropping its page cache.
+
+**Example Output:**
+```
+Raw target: raw:///mnt/usb/backups  (verifying 2 snapshots)
+  OK            root.20260101T120000
+  CORRUPT       home.20260101T120000
+  1 ok, 1 corrupt, 0 error, 0 unverifiable
+```
+
 ---
 
 ## Filesystem Checks

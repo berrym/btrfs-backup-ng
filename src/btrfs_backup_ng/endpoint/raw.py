@@ -580,6 +580,13 @@ class RawEndpoint(Endpoint):
         does)."""
         snapshot.save_metadata()
 
+    def compute_stream_checksum(self, snapshot: RawSnapshot) -> str | None:
+        """Return the CURRENT sha256 of ``snapshot``'s stream file, or None if it
+        cannot be read. ``raw verify`` recomputes this and compares it against the
+        sidecar's recorded ``checksum_value`` to detect corruption. The raw+ssh
+        subclass overrides this to hash on the remote host (no re-download)."""
+        return _sha256_file(snapshot.stream_path)
+
     def _sidecar_snapshot(
         self, final_path: Path, size: int, checksum_value: str | None = None
     ) -> RawSnapshot:
@@ -1105,6 +1112,12 @@ class SSHRawEndpoint(RawEndpoint):
             self.write_sidecar(self._sidecar_snapshot(final_path, size, checksum))
         except Exception as e:
             logger.warning("Failed to write remote sidecar for %s: %s", final_path, e)
+
+    def compute_stream_checksum(self, snapshot: RawSnapshot) -> str | None:
+        """Hash ``snapshot``'s stream ON the remote host (see ``_remote_sha256``),
+        so ``raw verify`` compares against the recorded checksum without
+        re-downloading the stream."""
+        return self._remote_sha256(snapshot.stream_path)
 
     def _remote_sha256(self, final_path: Path) -> str | None:
         """Compute the sha256 of the committed remote stream ON the remote host,

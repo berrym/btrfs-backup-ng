@@ -23,6 +23,8 @@ def execute_raw(args: argparse.Namespace) -> int:
     action = getattr(args, "raw_action", None)
     if action == "list":
         return _raw_list(args)
+    if action == "verify":
+        return _raw_verify(args)
     # No/unknown action: argparse allows a bare `raw`, so guide the user.
     print("No raw action specified. Try: btrfs-backup-ng raw list <target>")
     return 1
@@ -54,27 +56,23 @@ def _human_size(n: int) -> str:
     return f"{size:.1f} EiB"
 
 
-def _raw_list(args: argparse.Namespace) -> int:
-    """List the backups a raw target holds (via their ``.meta`` sidecars)."""
-    try:
-        spec = _coerce_raw_spec(args.target)
-    except ValueError as e:
-        print(str(e))
-        return 2
+def _open_target(args: argparse.Namespace):
+    """Coerce ``args.target`` to a raw spec and open the endpoint.
 
+    Returns ``(endpoint, spec)``. Raises ValueError on a non-raw scheme or an
+    endpoint that cannot be built. Warns (on stderr, so ``--json`` stays clean)
+    when a local target does not exist -- a typo/unmounted path should not read as
+    an empty target."""
+    spec = _coerce_raw_spec(args.target)
     common: dict = {}
     if getattr(args, "ssh_sudo", False):
         common["ssh_sudo"] = True
-
     try:
         ep = endpoint.choose_endpoint(spec, common_config=common)
     except ValueError as e:
-        print(f"Cannot open raw target: {e}")
-        return 2
-
-    # A local target that does not exist is almost always a typo or an unmounted
-    # path; warn (on stderr, so --json stays clean) rather than let the resulting
-    # empty list look like "this target holds no backups".
+        # Preserve the historical framing so a construction failure (e.g. a
+        # hostname-less raw+ssh spec) reads differently from a coercion error.
+        raise ValueError(f"Cannot open raw target: {e}") from e
     if spec.startswith("raw://"):
         local_path = Path(spec[len("raw://") :])
         if not local_path.exists():
@@ -82,6 +80,16 @@ def _raw_list(args: argparse.Namespace) -> int:
                 f"warning: {local_path} does not exist or is not mounted",
                 file=sys.stderr,
             )
+    return ep, spec
+
+
+def _raw_list(args: argparse.Namespace) -> int:
+    """List the backups a raw target holds (via their ``.meta`` sidecars)."""
+    try:
+        ep, spec = _open_target(args)
+    except ValueError as e:
+        print(str(e))
+        return 2
 
     try:
         snapshots = ep.list_snapshots(flush_cache=True)
@@ -111,3 +119,85 @@ def _raw_list(args: argparse.Namespace) -> int:
             f"{(s.openssl_cipher or '-'):<12} {s.provenance_origin or '-'}"
         )
     return 0
+
+
+def _raw_verify(args: argparse.Namespace) -> int:
+    """Verify raw backups by recomputing each stream's sha256 and comparing it to
+    the checksum recorded in its ``.meta`` sidecar.
+
+    Per-snapshot status: ``ok`` (matches), ``corrupt`` (mismatch -> the stored
+    stream differs from what was backed up), ``error`` (the stream could not be
+    read/hashed), or ``unverifiable`` (no checksum was recorded -- a legacy backup
+    or a best-effort write-time seal that failed). Exit 1 if any snapshot is corrupt
+    or errored, else 0."""
+    try:
+        ep, spec = _open_target(args)
+    except ValueError as e:
+        print(str(e))
+        return 2
+
+    try:
+        snapshots = ep.list_snapshots(flush_cache=True)
+    except Exception as e:  # pragma: no cover - defensive; endpoint errors vary
+        logger.debug("raw verify failed", exc_info=True)
+        print(f"Failed to list {spec}: {e}")
+        return 1
+
+    want = getattr(args, "snapshot", None)
+    if want:
+        snapshots = [s for s in snapshots if s.name == want]
+        if not snapshots:
+            print(f"No snapshot named {want!r} at {spec}")
+            return 2
+
+    results = []
+    for s in snapshots:
+        recorded = s.checksum_value
+        algorithm = getattr(s, "checksum_algorithm", "sha256")
+        if not recorded:
+            status, computed = "unverifiable", None
+        elif algorithm != "sha256":
+            # We only compute sha256; comparing it to a digest of another algorithm
+            # would false-flag an intact stream as corrupt. Cannot check -> unverifiable.
+            status, computed = "unverifiable", None
+        else:
+            computed = ep.compute_stream_checksum(s)
+            if computed is None:
+                status = "error"
+            elif computed == recorded:
+                status = "ok"
+            else:
+                status = "corrupt"
+        results.append(
+            {
+                "name": s.name,
+                "status": status,
+                "recorded": recorded,
+                "computed": computed,
+            }
+        )
+
+    if getattr(args, "json", False):
+        print(json.dumps(results, indent=2))
+    else:
+        plural = "" if len(results) == 1 else "s"
+        print(f"Raw target: {spec}  (verifying {len(results)} snapshot{plural})")
+        for r in results:
+            line = f"  {r['status'].upper():<13} {r['name']}"
+            if r["status"] == "corrupt":
+                # Show the mismatch on the one status an operator must investigate.
+                rec = (r["recorded"] or "-")[:12]
+                comp = (r["computed"] or "-")[:12]
+                line += f"  recorded={rec}... computed={comp}..."
+            print(line)
+        counts = {k: 0 for k in ("ok", "corrupt", "error", "unverifiable")}
+        for r in results:
+            counts[r["status"]] += 1
+        print(
+            f"  {counts['ok']} ok, {counts['corrupt']} corrupt, "
+            f"{counts['error']} error, {counts['unverifiable']} unverifiable"
+        )
+
+    # Fail if any backup is corrupt or its stream could not be read.
+    bad = any(r["status"] in ("corrupt", "error") for r in results)
+    return 1 if bad else 0

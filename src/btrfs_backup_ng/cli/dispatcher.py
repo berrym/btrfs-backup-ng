@@ -377,6 +377,31 @@ def create_subcommand_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Use sudo for remote commands on a raw+ssh target",
     )
+    raw_verify_parser = raw_subs.add_parser(
+        "verify",
+        help="Verify raw backups against their recorded checksums",
+        description="Recompute each stream's sha256 and compare to its .meta sidecar",
+    )
+    raw_verify_parser.add_argument(
+        "target",
+        metavar="TARGET",
+        help="Raw target: raw://PATH, raw+ssh://[USER@]HOST/PATH, or a plain path",
+    )
+    raw_verify_parser.add_argument(
+        "--snapshot",
+        metavar="NAME",
+        help="Verify only the named snapshot",
+    )
+    raw_verify_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Output in JSON format for scripting",
+    )
+    raw_verify_parser.add_argument(
+        "--ssh-sudo",
+        action="store_true",
+        help="Use sudo for remote commands on a raw+ssh target",
+    )
 
     # install command
     install_parser = subparsers.add_parser(
