@@ -399,6 +399,7 @@ _btrfs-backup-ng() {
                         'list:List the backups a raw target holds'
                         'verify:Verify raw backups against their recorded checksums'
                         'backfill-metadata:Write .meta sidecars for legacy streams'
+                        'encrypt:Encrypt plaintext raw streams in place (remediation)'
                     )
                     _arguments \
                         '1: :->raw_cmd' \
@@ -428,6 +429,17 @@ _btrfs-backup-ng() {
                                         '--dry-run[Show what would be backfilled without writing]' \
                                         '--json[Output in JSON format]' \
                                         '--ssh-sudo[Use sudo for remote commands on a raw+ssh target]' \
+                                        '1:raw target:_files -/'
+                                    ;;
+                                encrypt)
+                                    _arguments \
+                                        '--encrypt[Encryption method]:method:(gpg openssl_enc)' \
+                                        '--gpg-recipient[GPG recipient key]:keyid:' \
+                                        '--openssl-cipher[OpenSSL cipher]:cipher:' \
+                                        '--shred[Remove plaintext after a verified decrypt proof]' \
+                                        '--yes[Do not prompt before removing plaintext]' \
+                                        '--dry-run[Show what would be encrypted without changes]' \
+                                        '--json[Output in JSON format]' \
                                         '1:raw target:_files -/'
                                     ;;
                             esac

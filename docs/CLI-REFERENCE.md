@@ -1035,6 +1035,39 @@ Raw target: raw:///mnt/usb/backups  (2 legacy streams without a sidecar)
   Note: backfilled sidecars are marked stream_completeness=unknown -- a legacy stream cannot be proven complete.
 ```
 
+#### raw encrypt
+
+Encrypt raw streams that were written as **plaintext** — remediation for backups affected by [GHSA-vr25-6vrh-869j](https://github.com/berrym/btrfs-backup-ng/security/advisories/GHSA-vr25-6vrh-869j), where an `encrypt=` config on a raw target could silently write plaintext (fixed in 0.8.4). Runs **locally only** so the passphrase/keys never leave the host; for a remote target, mount it and use a `raw://` path.
+
+```bash
+btrfs-backup-ng raw encrypt TARGET --encrypt {gpg|openssl_enc} [OPTIONS]
+```
+
+**Options:**
+| Option | Description |
+|--------|-------------|
+| `--encrypt {gpg,openssl_enc}` | Encryption method to apply (required) |
+| `--gpg-recipient KEYID` | GPG recipient (required with `--encrypt gpg`) |
+| `--openssl-cipher CIPHER` | OpenSSL cipher for `openssl_enc` (default `aes-256-cbc`) |
+| `--shred` | Remove each plaintext file after a verified decrypt proof |
+| `--yes` | Do not prompt before removing plaintext (for scripts; with `--shred`) |
+| `--dry-run` | Show which plaintext streams would be encrypted, without changes |
+| `--json` | Per-stream results as JSON |
+
+For each plaintext stream, `raw encrypt` writes an encrypted copy alongside it (a new authoritative sidecar with `provenance.origin=remediation` and `remediated_from`), then runs a **live decrypt-to-identical proof** — it decrypts the new stream and confirms it is byte-identical to the plaintext.
+
+The plaintext is removed **only** when that proof passes **and** `--shred` was given (by default the plaintext is kept). For `gpg`, the proof needs the secret key on this host; if it is absent, the encrypted copy is written but the plaintext is kept.
+
+> **Erasure caveat.** `--shred` removes the plaintext with a plain `unlink`. On copy-on-write filesystems (btrfs) and on SSDs, this does **not** securely erase the underlying blocks (btrfs writes new blocks; SSD controllers remap them). True physical erasure relies on device-level `trim`/`discard` or full-disk encryption at rest, which this tool cannot provide — and prior exposure (older backup media, indexes) cannot be undone.
+
+**Example:**
+```bash
+# encrypt plaintext backups with openssl (BTRFS_BACKUP_PASSPHRASE set), keep plaintext:
+btrfs-backup-ng raw encrypt raw:///mnt/usb/backups --encrypt openssl_enc
+# ...then remove the plaintext after the verified proof:
+btrfs-backup-ng raw encrypt raw:///mnt/usb/backups --encrypt openssl_enc --shred
+```
+
 ---
 
 ## Filesystem Checks

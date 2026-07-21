@@ -11,6 +11,9 @@ btrfs-backup-ng-raw \- inspect and maintain raw-target backups
 .br
 .B btrfs-backup-ng raw backfill-metadata
 \fITARGET\fR [\fB\-\-dry-run\fR] [\fB\-\-json\fR] [\fB\-\-ssh-sudo\fR]
+.br
+.B btrfs-backup-ng raw encrypt
+\fITARGET\fR \fB\-\-encrypt\fR \fIMETHOD\fR [\fB\-\-shred\fR] [\fIOPTIONS\fR]
 .SH DESCRIPTION
 Operate directly on a raw backup target. Raw targets (\fBraw://\fR and
 \fBraw+ssh://\fR) store btrfs send streams as files for backing up to non-btrfs
@@ -113,6 +116,57 @@ Output per-stream results in JSON format.
 .TP
 .B \-\-ssh-sudo
 Use \fBsudo\fR for the remote commands on a \fBraw+ssh://\fR target.
+.SS encrypt
+Encrypt raw streams that were written as plaintext (remediation for
+GHSA-vr25-6vrh-869j).
+.PP
+.RS
+.B btrfs-backup-ng raw encrypt
+\fITARGET\fR \fB\-\-encrypt\fR \fIMETHOD\fR [\fB\-\-gpg-recipient\fR \fIKEYID\fR]
+[\fB\-\-openssl-cipher\fR \fICIPHER\fR] [\fB\-\-shred\fR] [\fB\-\-yes\fR]
+[\fB\-\-dry-run\fR] [\fB\-\-json\fR]
+.RE
+.PP
+Runs LOCALLY only so the passphrase/keys never leave this host; for a remote
+target, mount it and use a \fBraw://\fR path. For each plaintext stream, writes an
+encrypted copy alongside it (new sidecar, \fBprovenance.origin=remediation\fR), then
+runs a LIVE decrypt-to-identical proof (decrypts the new stream and confirms it is
+byte-identical to the plaintext). The plaintext is removed ONLY when that proof
+passes AND
+.B \-\-shred
+was given; by default it is kept. For gpg the proof needs the secret key on this
+host -- if absent, the encrypted copy is written but the plaintext is kept.
+.PP
+.B \-\-shred
+removes the plaintext with a plain unlink. On copy-on-write filesystems (btrfs) and
+SSDs this does NOT securely erase the underlying blocks; true physical erasure
+relies on device-level trim/discard or full-disk encryption at rest, which this tool
+cannot provide, and prior exposure cannot be undone.
+.TP
+.BI \-\-encrypt " METHOD"
+Encryption method to apply:
+.B gpg
+or
+.BR openssl_enc .
+Required.
+.TP
+.BI \-\-gpg-recipient " KEYID"
+GPG recipient key (required with \fB\-\-encrypt gpg\fR).
+.TP
+.BI \-\-openssl-cipher " CIPHER"
+OpenSSL cipher for \fBopenssl_enc\fR (default aes-256-cbc).
+.TP
+.B \-\-shred
+Remove each plaintext file after a verified decrypt proof (plain unlink).
+.TP
+.B \-\-yes
+Do not prompt before removing plaintext (for scripts; with \fB\-\-shred\fR).
+.TP
+.B \-\-dry-run
+Show which plaintext streams would be encrypted, without changes.
+.TP
+.B \-\-json
+Output per-stream results in JSON format.
 .SH EXIT STATUS
 .TP
 .B 0
@@ -130,7 +184,9 @@ backup is
 .B corrupt
 or
 .BR error .
-For \fBbackfill-metadata\fR, at least one sidecar could not be written.
+For \fBbackfill-metadata\fR, at least one sidecar could not be written. For
+\fBencrypt\fR, a stream could not be encrypted, or \fB\-\-shred\fR was requested but
+a plaintext could not be safely removed (proof failed or unlink error).
 .TP
 .B 2
 Invalid target (for example a non-raw URL scheme), or a
@@ -161,6 +217,12 @@ Preview backfilling sidecars for legacy streams:
 .TP
 Backfill sidecars for legacy streams:
 .B btrfs-backup-ng raw backfill-metadata raw:///mnt/usb/backups
+.TP
+Encrypt plaintext backups with openssl (keeping the plaintext):
+.B btrfs-backup-ng raw encrypt raw:///mnt/usb/backups --encrypt openssl_enc
+.TP
+Encrypt and then remove the plaintext after a verified proof:
+.B btrfs-backup-ng raw encrypt raw:///mnt/usb/backups --encrypt openssl_enc --shred
 .SH SEE ALSO
 .BR btrfs-backup-ng (1),
 .BR btrfs-backup-ng-restore (1),
