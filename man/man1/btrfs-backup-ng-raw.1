@@ -5,6 +5,9 @@ btrfs-backup-ng-raw \- inspect and maintain raw-target backups
 .SH SYNOPSIS
 .B btrfs-backup-ng raw list
 \fITARGET\fR [\fB\-\-json\fR] [\fB\-\-ssh-sudo\fR]
+.br
+.B btrfs-backup-ng raw verify
+\fITARGET\fR [\fB\-\-snapshot\fR \fINAME\fR] [\fB\-\-json\fR] [\fB\-\-ssh-sudo\fR]
 .SH DESCRIPTION
 Operate directly on a raw backup target. Raw targets (\fBraw://\fR and
 \fBraw+ssh://\fR) store btrfs send streams as files for backing up to non-btrfs
@@ -38,17 +41,66 @@ Output the authoritative sidecar documents as JSON for scripting.
 .TP
 .B \-\-ssh-sudo
 Use \fBsudo\fR for the remote commands on a \fBraw+ssh://\fR target.
+.SS verify
+Verify raw backups against their recorded checksums.
+.PP
+.RS
+.B btrfs-backup-ng raw verify
+\fITARGET\fR [\fB\-\-snapshot\fR \fINAME\fR] [\fB\-\-json\fR] [\fB\-\-ssh-sudo\fR]
+.RE
+.PP
+Recomputes each stream's sha256 and compares it to the value recorded in its
+\fB.meta\fR sidecar. For a \fBraw+ssh://\fR target the hash is computed on the
+remote host, so streams are not re-downloaded. Each backup is reported as
+.B ok
+(matches),
+.B corrupt
+(the stored stream differs from what was backed up),
+.B error
+(the stream could not be read or hashed), or
+.B unverifiable
+(no checksum was recorded -- a legacy backup, or a best-effort write-time seal
+that failed).
+.PP
+verify confirms a stream still matches the checksum in its own sidecar -- an
+integrity/consistency check, not authenticity: an attacker who can rewrite both
+the stream and its sidecar can make a corrupted backup report
+.BR ok .
+For a \fBraw+ssh://\fR target the hash is recomputed ON the (untrusted) remote
+host, so an
+.B ok
+verdict only confirms the recorded checksum and cannot detect corruption or
+tampering introduced by a compromised target. For tamper-evident verification,
+verify a locally-mounted copy (\fBraw://\fR).
+.TP
+.BI \-\-snapshot " NAME"
+Verify only the named snapshot.
+.TP
+.B \-\-json
+Output per-snapshot results in JSON format.
+.TP
+.B \-\-ssh-sudo
+Use \fBsudo\fR for the remote commands on a \fBraw+ssh://\fR target.
 .SH EXIT STATUS
 .TP
 .B 0
-Success (including an empty or nonexistent target; a warning is printed for a
-missing local path).
+Success. For \fBlist\fR, includes an empty or nonexistent target (a warning is
+printed for a missing local path). For \fBverify\fR, all backups are
+.B ok
+or
+.BR unverifiable .
 .TP
 .B 1
-The target could not be listed.
+For \fBlist\fR, the target could not be listed. For \fBverify\fR, at least one
+backup is
+.B corrupt
+or
+.BR error .
 .TP
 .B 2
-Invalid target (for example a non-raw URL scheme).
+Invalid target (for example a non-raw URL scheme), or a
+.B \-\-snapshot
+name that is not present.
 .SH EXAMPLES
 .TP
 List a local raw target:
@@ -62,6 +114,12 @@ List a remote raw+ssh target with sudo:
 .TP
 Machine-readable output:
 .B btrfs-backup-ng raw list raw:///mnt/usb/backups --json
+.TP
+Verify every backup a target holds:
+.B btrfs-backup-ng raw verify raw:///mnt/usb/backups
+.TP
+Verify a single backup on a remote target:
+.B btrfs-backup-ng raw verify raw+ssh://backup@nas/backups --snapshot root.20260101T120000
 .SH SEE ALSO
 .BR btrfs-backup-ng (1),
 .BR btrfs-backup-ng-restore (1),

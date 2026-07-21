@@ -11,7 +11,7 @@ _btrfs_backup_ng() {
     local manpages_subcommands="install path"
     local transfers_subcommands="list show resume pause cleanup operations"
     local snapper_subcommands="detect list backup status restore generate-config"
-    local raw_subcommands="list"
+    local raw_subcommands="list verify"
 
     # Global options
     local global_opts="-h --help -v --verbose -q --quiet --debug -V --version -c --config"
@@ -47,6 +47,7 @@ _btrfs_backup_ng() {
     local snapper_restore_opts="--snapshot --dry-run --ssh-sudo --ssh-key"
     local snapper_generate_config_opts="-o --output"
     local raw_list_opts="--json --ssh-sudo"
+    local raw_verify_opts="--snapshot --json --ssh-sudo"
     local snapper_types="single pre post"
     local verify_levels="metadata stream full"
     local shell_types="bash zsh fish"
@@ -64,7 +65,7 @@ _btrfs_backup_ng() {
     local i
     for ((i=1; i < cword; i++)); do
         case "${words[i]}" in
-            run|snapshot|transfer|prune|status|config|install|uninstall|restore|verify|estimate|doctor|completions|manpages|transfers|snapper|raw)
+            run|snapshot|transfer|prune|status|config|install|uninstall|restore|estimate|doctor|completions|manpages|transfers|snapper|raw)
                 cmd="${words[i]}"
                 ;;
             list)
@@ -76,6 +77,15 @@ _btrfs_backup_ng() {
                     cmd="list"
                 elif [[ "$cmd" == "transfers" || "$cmd" == "raw" ]]; then
                     subcmd="list"
+                fi
+                ;;
+            verify)
+                # `verify` is both a top-level command and a raw subcommand (same
+                # reasoning as `list` above).
+                if [[ -z "$cmd" ]]; then
+                    cmd="verify"
+                elif [[ "$cmd" == "raw" ]]; then
+                    subcmd="verify"
                 fi
                 ;;
             validate|init|import|detect)
@@ -374,6 +384,13 @@ _btrfs_backup_ng() {
                     list)
                         if [[ "$cur" == -* ]]; then
                             COMPREPLY=($(compgen -W "$raw_list_opts" -- "$cur"))
+                        else
+                            _filedir -d
+                        fi
+                        ;;
+                    verify)
+                        if [[ "$cur" == -* ]]; then
+                            COMPREPLY=($(compgen -W "$raw_verify_opts" -- "$cur"))
                         else
                             _filedir -d
                         fi

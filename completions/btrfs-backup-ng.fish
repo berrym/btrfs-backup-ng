@@ -352,6 +352,7 @@ complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_snapper_using_subcommand 
 
 # raw command subcommands
 complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_using_command raw' -a list -d 'List the backups a raw target holds'
+complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_using_command raw' -a verify -d 'Verify raw backups against their recorded checksums'
 
 # Helper for raw subcommand
 function __fish_btrfs_backup_ng_raw_using_subcommand
@@ -371,3 +372,9 @@ end
 complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_raw_using_subcommand list' -l json -d 'Output in JSON format'
 complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_raw_using_subcommand list' -l ssh-sudo -d 'Use sudo for remote commands on a raw+ssh target'
 complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_raw_using_subcommand list' -a '(__fish_complete_directories)' -d 'Raw target path'
+
+# raw verify
+complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_raw_using_subcommand verify' -l snapshot -d 'Verify only the named snapshot' -x
+complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_raw_using_subcommand verify' -l json -d 'Output in JSON format'
+complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_raw_using_subcommand verify' -l ssh-sudo -d 'Use sudo for remote commands on a raw+ssh target'
+complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_raw_using_subcommand verify' -a '(__fish_complete_directories)' -d 'Raw target path'

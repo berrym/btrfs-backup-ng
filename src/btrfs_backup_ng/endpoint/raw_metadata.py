@@ -125,6 +125,10 @@ class RawSnapshot:
     # by reading the file back after the atomic commit (so it reflects the bytes on
     # disk). None for legacy sidecars or when the read-back failed (best-effort).
     checksum_value: str | None = None
+    # The digest algorithm ``checksum_value`` was computed with. Always "sha256"
+    # today; carried so ``raw verify`` refuses to compare (reports "unverifiable")
+    # rather than false-flag corruption if a sidecar ever records another algorithm.
+    checksum_algorithm: str = "sha256"
     provenance_origin: str = "native-write"
     # --- Snapshot-interface compatibility (0.8.5) ---
     prefix: str = ""
@@ -221,7 +225,10 @@ class RawSnapshot:
                 "gpg_recipient": self.gpg_recipient,
                 "openssl_cipher": self.openssl_cipher,
             },
-            "checksum": {"algorithm": "sha256", "value": self.checksum_value},
+            "checksum": {
+                "algorithm": self.checksum_algorithm,
+                "value": self.checksum_value,
+            },
             "provenance": {
                 "origin": self.provenance_origin,
                 "tool_version": __version__,
@@ -292,6 +299,7 @@ class RawSnapshot:
             # v2 fields (absent in v1 -> defaults):
             openssl_cipher=pipeline.get("openssl_cipher"),
             checksum_value=checksum.get("value"),
+            checksum_algorithm=checksum.get("algorithm") or "sha256",
             provenance_origin=provenance.get("origin", "native-write"),
         )
 

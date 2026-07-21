@@ -6,6 +6,7 @@ cover the target-spec coercion, the human + JSON output, and the error paths.
 
 import argparse
 import json
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -59,6 +60,29 @@ def test_human_size():
     assert raw_cmd._human_size(512) == "512 B"
     assert raw_cmd._human_size(1024) == "1.0 KiB"
     assert raw_cmd._human_size(1024 * 1024) == "1.0 MiB"
+    # Beyond PiB falls through to the final EiB unit.
+    assert raw_cmd._human_size(1024**6) == "1.0 EiB"
+
+
+def test_ssh_sudo_is_threaded_to_endpoint(monkeypatch):
+    """--ssh-sudo must reach the endpoint via choose_endpoint's common_config."""
+    captured = {}
+
+    def fake_choose(spec, common_config=None, **kw):
+        captured["common"] = common_config
+        return MagicMock(list_snapshots=lambda flush_cache=False: [])
+
+    monkeypatch.setattr(raw_cmd.endpoint, "choose_endpoint", fake_choose)
+    rc = raw_cmd.execute_raw(
+        _args(
+            raw_action="list",
+            target="raw+ssh://nas/backup",
+            json=True,
+            ssh_sudo=True,
+        )
+    )
+    assert rc == 0
+    assert captured["common"].get("ssh_sudo") is True
 
 
 # --------------------------------------------------------------------------- #

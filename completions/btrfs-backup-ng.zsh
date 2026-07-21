@@ -397,6 +397,7 @@ _btrfs-backup-ng() {
                     local -a raw_commands
                     raw_commands=(
                         'list:List the backups a raw target holds'
+                        'verify:Verify raw backups against their recorded checksums'
                     )
                     _arguments \
                         '1: :->raw_cmd' \
@@ -410,6 +411,13 @@ _btrfs-backup-ng() {
                             case $line[1] in
                                 list)
                                     _arguments \
+                                        '--json[Output in JSON format]' \
+                                        '--ssh-sudo[Use sudo for remote commands on a raw+ssh target]' \
+                                        '1:raw target:_files -/'
+                                    ;;
+                                verify)
+                                    _arguments \
+                                        '--snapshot[Verify only the named snapshot]:snapshot name:' \
                                         '--json[Output in JSON format]' \
                                         '--ssh-sudo[Use sudo for remote commands on a raw+ssh target]' \
                                         '1:raw target:_files -/'
