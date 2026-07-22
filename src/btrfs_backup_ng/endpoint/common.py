@@ -198,11 +198,20 @@ class Endpoint:
                 self.add_snapshot(snapshot)
         return snapshot
 
-    @require_source
     def send(
         self, snapshot: Any, parent: Any = None, clones: Optional[List[Any]] = None
     ) -> Any:
-        """Call 'btrfs send' for the given snapshot and return its Popen object."""
+        """Call 'btrfs send' for the given snapshot and return its Popen object.
+
+        NOT ``@require_source``: this sends the GIVEN ``snapshot`` by its own path and
+        never reads ``config["source"]``. The restore path deliberately swaps endpoints
+        and calls send() on the BACKUP endpoint (which has no source) to stream a stored
+        snapshot back -- requiring a source aborted native btrfs restore. Creating a NEW
+        snapshot (``snapshot()``) still requires a source; sending an existing one does
+        not. NB: the base implementation runs ``btrfs send`` LOCALLY, so it serves LOCAL
+        btrfs restore; a remote ssh:// restore source is gated in the restore CLI until
+        SSHEndpoint gains a remote-aware send.
+        """
         cmd = self._build_send_command(snapshot, parent=parent, clones=clones)
         # Suppress stderr ("At subvol" messages) - they're just informational
         return self._exec_command(
@@ -341,11 +350,20 @@ class Endpoint:
         )
         return list(snapshots)
 
-    @require_source
     def set_lock(
         self, snapshot: Any, lock_id: Any, lock_state: bool, parent: bool = False
     ) -> None:
-        """Add or remove the given lock from ``snapshot`` and update the lock file."""
+        """Add or remove the given lock from ``snapshot`` and update the lock file.
+
+        NOT ``@require_source``: a lock lives at the endpoint's ``path`` (the backup
+        location), not at a source subvolume. During a restore this is called on the
+        BACKUP endpoint -- which correctly has no ``source`` -- to lock the snapshot
+        being restored against deletion. Requiring a source here aborted native btrfs
+        restore at the lock step before any bytes moved; raw endpoints already override
+        set_lock without the guard. Removing it fully enables LOCAL btrfs restore;
+        restore from a remote ssh:// btrfs source is separately gated in the restore CLI
+        (base send/lock run locally, so a real remote source can't be streamed back yet).
+        """
         if lock_state:
             (snapshot.parent_locks if parent else snapshot.locks).add(lock_id)
         else:
@@ -792,13 +810,15 @@ class Endpoint:
             )
             raise __util__.AbortError from e
 
-    @require_source
     def _get_lock_file_path(self) -> Path:
+        # Lock file lives at the endpoint's path (backup location), not a source.
         if self.config["path"] is None:
-            raise ValueError
-        return self.config["path"] / str(self.config["lock_file_name"])
+            raise ValueError("path hasn't been set")
+        # Coerce to Path: LocalEndpoint resolves ``path`` to a Path, but SSH endpoints
+        # keep it as a str, so ``path / name`` raised TypeError ('str' / 'str') on a
+        # restore FROM an ssh:// btrfs backup (which sets a lock on the ssh endpoint).
+        return Path(self.config["path"]) / str(self.config["lock_file_name"])
 
-    @require_source
     def _read_locks(self) -> Dict[str, Any]:
         path = self._get_lock_file_path()
         try:
@@ -810,7 +830,6 @@ class Endpoint:
             logger.error("Error on reading lock file %s: %s", path, e)
             raise __util__.AbortError
 
-    @require_source
     def _write_locks(self, lock_dict: Dict[str, Any]) -> None:
         path = self._get_lock_file_path()
         try:

@@ -289,6 +289,15 @@ def _execute_main_restore(args: argparse.Namespace) -> int:
         logger.error("Destination validation failed: %s", e)
         return 1
 
+    # Reject a remote ssh:// btrfs restore source up front (not supported yet), with a
+    # clear message -- before preparing/connecting. list/status paths do NOT call this,
+    # so read-only ssh:// listing keeps working.
+    try:
+        _reject_remote_ssh_restore(source)
+    except __util__.AbortError as e:
+        logger.error("%s", e)
+        return 1
+
     # Prepare backup endpoint (source)
     try:
         backup_endpoint = _prepare_backup_endpoint(args, source)
@@ -472,6 +481,27 @@ def _prepare_backup_endpoint(args: argparse.Namespace, source: str):
     backup_ep.prepare()
 
     return backup_ep
+
+
+def _reject_remote_ssh_restore(source: str) -> None:
+    """Fail fast if a RESTORE would pull from a remote ssh:// btrfs source.
+
+    A native btrfs SSHEndpoint runs ``btrfs send`` and reads/writes the lock file
+    LOCALLY, so it cannot stream a snapshot back from the remote host -- a real remote
+    source would otherwise fail late with a misleading local-path error. Raise a clear,
+    actionable message instead. The check is by URL scheme, matching how the endpoint is
+    chosen: only ``ssh://`` (native btrfs over ssh) is rejected. ``raw+ssh://`` (its own
+    scheme -> SSHRawEndpoint) DOES support remote restore, and ``raw://`` / local btrfs
+    are unaffected -- none of those start with ``ssh://``. Called ONLY on the restore
+    path, so ``restore --list`` / ``--status`` of an ssh:// target keep working."""
+    if source.startswith("ssh://"):
+        raise __util__.AbortError(
+            f"Restoring a native btrfs backup directly from a remote ssh:// source "
+            f"({source}) is not supported yet -- the snapshot has to be read on the "
+            "machine that stores it. Options: restore on that machine; or copy/mount "
+            "the backup locally and restore from a local path; or use a raw+ssh:// "
+            "backup, which does support remote restore."
+        )
 
 
 def _prepare_local_endpoint(dest_path: Path, timestamp_format: str | None = None):
