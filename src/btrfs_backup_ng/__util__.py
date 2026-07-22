@@ -84,6 +84,14 @@ class Snapshot:
         self.time_format = time_format
         self.locks = set()
         self.parent_locks = set()
+        # btrfs subvolume identity, populated best-effort at enumeration (Phase 0).
+        # ``uuid`` is this snapshot's own UUID; ``received_uuid`` is set on a subvolume
+        # produced by ``btrfs receive`` and equals the source subvolume's UUID -- the
+        # correspondence btrfs incremental send/receive actually uses. Empty when it
+        # could not be read (non-root, non-btrfs, older btrfs-progs). NOT part of
+        # identity yet: __eq__/__lt__ remain name/time based in Phase 0.
+        self.uuid = ""
+        self.received_uuid = ""
 
     def __eq__(self, other):
         return self.prefix == other.prefix and self.time_obj == other.time_obj
@@ -124,6 +132,72 @@ class Snapshot:
             return present_snapshots[0]
 
         return None
+
+
+def parse_subvolume_list(output):
+    """Parse ``btrfs subvolume list -o -u -R`` output into per-subvolume identity.
+
+    Returns a list of dicts ``{'name', 'uuid', 'received_uuid', 'path'}``. Parsed
+    token-wise (locating the ``uuid`` / ``received_uuid`` / ``path`` markers) rather than
+    by fixed column position, so it tolerates btrfs-progs version differences in column
+    ordering and spacing. An unset value (``-``) becomes an empty string. ``name`` is the
+    final path component (the on-disk snapshot name). Unparseable lines are skipped.
+    """
+    entries = []
+    for line in output.splitlines():
+        tokens = line.split()
+        if not tokens:
+            continue
+        uuid = received_uuid = path = ""
+        i = 0
+        while i < len(tokens):
+            tok = tokens[i]
+            if tok == "uuid" and i + 1 < len(tokens):
+                uuid = tokens[i + 1]
+                i += 2
+                continue
+            if tok == "received_uuid" and i + 1 < len(tokens):
+                received_uuid = tokens[i + 1]
+                i += 2
+                continue
+            if tok == "path" and i + 1 < len(tokens):
+                # ``path`` is always the terminal field of a ``btrfs subvolume list`` line,
+                # so the remainder is the path (which may legitimately contain spaces). Any
+                # uuid/received_uuid always precede it and have already been captured.
+                path = " ".join(tokens[i + 1 :])
+                break
+            i += 1
+        if not path:
+            continue
+        entries.append(
+            {
+                "name": path.rsplit("/", 1)[-1],
+                "uuid": "" if uuid == "-" else uuid,
+                "received_uuid": "" if received_uuid == "-" else received_uuid,
+                "path": path,
+            }
+        )
+    return entries
+
+
+def parse_subvolume_show(output):
+    """Parse ``btrfs subvolume show <path>`` output for a subvolume's identity.
+
+    Returns ``{'uuid': ..., 'received_uuid': ...}`` (empty strings when a field is unset
+    ``-`` or absent). ``Received UUID`` is matched exactly so it is never confused with the
+    plain ``UUID`` line, and ``Parent UUID`` is ignored. Unlike ``subvolume list``, ``show``
+    targets one exact path, so the identity is unambiguous even when the subvolume lives
+    under a mounted (non-filesystem-root) subvolume."""
+    uuid = received_uuid = ""
+    for line in output.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("Received UUID:"):
+            v = stripped.split(":", 1)[1].strip()
+            received_uuid = "" if v == "-" else v
+        elif stripped.startswith("UUID:"):
+            v = stripped.split(":", 1)[1].strip()
+            uuid = "" if v == "-" else v
+    return {"uuid": uuid, "received_uuid": received_uuid}
 
 
 def exec_subprocess(command, method="check_output", **kwargs):

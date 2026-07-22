@@ -351,12 +351,60 @@ class Endpoint:
         # failed transfer looked unlocked on the next run and retention could prune a
         # snapshot a failed/pending transfer still needs.
         self._load_locks_into(snapshots)
+        # Phase 0: best-effort btrfs identity so snapshots are self-describing (uuid +
+        # received_uuid). Never fatal -- a non-root/non-btrfs enumeration keeps working
+        # with empty uuids.
+        self._load_subvolume_ids_into(snapshots)
         snapshots.sort()
         self.__cached_snapshots = snapshots
         logger.debug(
             "Populated snapshot cache of %r with %d items.", self, len(snapshots)
         )
         return list(snapshots)
+
+    def _load_subvolume_ids_into(self, snapshots: List[Any]) -> None:
+        """Best-effort: populate each snapshot's btrfs ``uuid`` / ``received_uuid``.
+
+        Runs ``btrfs subvolume show`` on each snapshot's exact path. ``show`` targets one
+        path, so the identity is unambiguous even when snapshots live under a mounted
+        (non-filesystem-root) subvolume -- unlike ``subvolume list``, whose id-5-relative
+        paths cannot be reliably matched back to a mount-relative absolute path. Purely
+        additive: any failure (not root, not btrfs, older btrfs-progs, command error)
+        leaves that snapshot's uuids empty and enumeration unaffected. Identity is NOT
+        changed here -- these values are carried for the Phase 2 planner, not yet
+        consulted."""
+        if not snapshots:
+            return
+        enriched = 0
+        for snap in snapshots:
+            try:
+                result = subprocess.run(
+                    ["btrfs", "subvolume", "show", str(snap.get_path())],
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                    check=False,
+                )
+                if result.returncode != 0:
+                    continue
+                ids = __util__.parse_subvolume_show(result.stdout)
+                snap.uuid = ids["uuid"]
+                snap.received_uuid = ids["received_uuid"]
+                if snap.uuid:
+                    enriched += 1
+            except subprocess.TimeoutExpired:
+                logger.debug("subvolume show timed out for %s", snap.get_name())
+            except Exception as e:  # noqa: BLE001 - best-effort, never fatal
+                logger.debug(
+                    "Could not read subvolume uuid for %s (ignoring): %s",
+                    snap.get_name(),
+                    e,
+                )
+        logger.debug(
+            "btrfs uuid enrichment: %d/%d snapshot(s) have a uuid",
+            enriched,
+            len(snapshots),
+        )
 
     def _load_locks_into(self, snapshots: List[Any]) -> None:
         """Populate each snapshot's in-memory lock sets from the persisted lock file.

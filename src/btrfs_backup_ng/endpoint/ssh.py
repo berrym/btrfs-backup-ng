@@ -1954,8 +1954,10 @@ print(json.dumps(result))
             except Exception:
                 pass
 
-        # Standard method - works with cached credentials
-        cmd = ["btrfs", "subvolume", "list", "-o", path]
+        # Standard method - works with cached credentials. -u -R add the subvolume UUID
+        # and received_uuid columns so snapshots are self-describing (Phase 0); older
+        # btrfs-progs simply omit the columns and the parser tolerates that.
+        cmd = ["btrfs", "subvolume", "list", "-o", "-u", "-R", path]
         try:
             logger.debug("Listing remote snapshots with command: %s", cmd)
             # Use retry mechanism for commands that may require authentication
@@ -2053,6 +2055,13 @@ print(json.dumps(result))
                             time_obj=time_obj,
                             time_format=matched_fmt,
                         )
+                        # Parse THIS line for its own uuid/received_uuid (the -u -R
+                        # columns) so identity comes from the same subvolume, never a
+                        # same-named one elsewhere on the filesystem.
+                        line_ids = __util__.parse_subvolume_list(line)
+                        if line_ids:
+                            snapshot.uuid = line_ids[0]["uuid"]
+                            snapshot.received_uuid = line_ids[0]["received_uuid"]
                         snapshots.append(snapshot)
                     except Exception as e:
                         # Debug level - it's normal for directories to contain
