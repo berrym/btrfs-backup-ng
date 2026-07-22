@@ -5,6 +5,80 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.5] - 2026-07-22
+
+This release makes **raw backups first-class** — a raw backup now carries everything
+needed to list, check, and restore it, and there are commands to manage raw backups
+directly — and hardens reliability across the board, including a fix for **standard
+btrfs restores**, which were broken.
+
+### Security
+
+#### An openssl cipher of "none" (or an AEAD mode) could write a plaintext raw backup labelled as encrypted
+
+Continuing the plaintext-exposure class fixed in 0.8.4 (GHSA-vr25-6vrh-869j, CWE-311/312):
+a raw target configured with `openssl_cipher = "none"` — or with an AEAD mode such as
+`*-gcm` that `openssl enc` cannot actually use — would previously pass a syntactic check
+and could write a stream that was **not encrypted** while the backup was recorded as
+encrypted. The cipher is now validated by *meaning*, not just shape: `none`, AEAD modes,
+and ciphers the local `openssl` does not support are rejected up front with a clear error,
+at backup time and again at restore time. If you use raw-target encryption, verify your
+existing backups are genuine ciphertext (see `raw verify` and, for remediation, `raw
+encrypt`).
+
+### Added
+
+- **Raw backups are now self-describing and self-checking.** Every raw backup writes an
+  authoritative sidecar (`.meta`) recording its compression, encryption, cipher, size,
+  and a checksum of the exact bytes written — so a backup can be listed, integrity-checked,
+  and restored without guessing from the filename. New backups need no manual backfill.
+- **New `raw` command family** for managing raw backups directly:
+  - `raw list` — list raw backups at a `raw://` or `raw+ssh://` target.
+  - `raw verify` — recompute each backup's checksum and report ok / corrupt / error.
+  - `raw backfill-metadata` — write authoritative sidecars for older sidecar-less streams.
+  - `raw encrypt` — encrypt existing plaintext raw backups in place (remediation for the
+    0.8.4 issue), with a live decrypt-to-identical proof before anything is removed, and
+    honest documentation that a plain delete does not physically erase data on
+    copy-on-write filesystems or SSDs.
+- **Restore from a `raw+ssh://` backup** (streamed back over ssh; decrypt/decompress happen
+  locally so secrets never leave the host), plus a preflight that checks the needed tools
+  are installed before a transfer starts.
+- `--no-check-space`, `--force`, and `--safety-margin` now actually take effect for `run`
+  and `transfer` (previously parsed but ignored), so a conservative space estimate on a
+  raw target can be overridden.
+
+### Fixed
+
+- **btrfs restore now works — local AND remote.** Restoring a native btrfs backup was
+  broken (it failed immediately with an internal "source hasn't been set" error). Local
+  btrfs restores — full and incremental — now work and are verified byte-identical, and
+  restore from a *remote* `ssh://` btrfs source works too: the stream is read back over
+  ssh, and full, `--all`, and incremental top-up restores were all verified byte-identical
+  against a real remote btrfs host.
+- **Transfers no longer hang on a failed or interrupted stream.** The send/receive
+  supervisor could block for up to an hour when the receiving side exited early (e.g. the
+  subvolume already exists, or the disk is full) and the sending side did not notice; it
+  now terminates cleanly and reports the failure. Fixed for local btrfs, ssh, and raw.
+- **Compressed raw backups are restorable.** Compression is recorded in the sidecar, so a
+  compressed raw backup can be decompressed on restore instead of failing.
+- A failed transfer can no longer report success, and a partial/incomplete backup is no
+  longer published as complete or left behind to be mistaken for a good backup.
+- A raw backup is verified against its recorded checksum before it is restored, so silent
+  corruption is caught rather than written back.
+- A raw backup that used an unknown compression or encryption method, or needs a tool that
+  is not installed, now fails with a clear message instead of silently producing a corrupt
+  restore or a raw traceback.
+- A damaged or unreadable raw sidecar warns and falls back to the filename instead of being
+  silently dropped, and one bad sidecar no longer hides the healthy backups beside it.
+- A `raw+ssh://` target that cannot be reached is reported as an error, not as "no backups".
+- **Every failure is delivered as a clear, plain-language message** with a suggested next
+  step, and the tool no longer prints a raw Python traceback: unexpected errors are shown as
+  one line (with `--debug` for the full trace), a same-second snapshot name collision is
+  explained instead of surfacing btrfs's misleading "Read-only file system", and command
+  failures carry the real reason.
+- A per-target lock serializes concurrent raw operations (backup / prune / backfill /
+  encrypt) on a local raw target so they cannot corrupt each other.
+
 ## [0.8.4] - 2026-07-19
 
 ### Security
