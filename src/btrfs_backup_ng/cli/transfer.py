@@ -163,6 +163,8 @@ def execute_transfer(args: argparse.Namespace) -> int:
 
                     if target.ssh_key:
                         dest_kwargs["ssh_identity_file"] = target.ssh_key
+                    if target.ssh_auth_sock:
+                        dest_kwargs["ssh_auth_sock"] = target.ssh_auth_sock
 
                     thread_raw_encryption(dest_kwargs, target)
                     thread_raw_compression(

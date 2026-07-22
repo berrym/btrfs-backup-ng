@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+#### Remote backups over SSH now work with a passphrase-protected key under sudo
+
+Backups run as root (btrfs send/receive need it), and `sudo` clears `SSH_AUTH_SOCK`. If your
+SSH key is passphrase-protected, the usable (decrypted) key lives only in your ssh-agent — so
+without the agent, the remote server accepts your public key but the client can't sign, and
+the backup fails with a confusing "Permission denied". btrfs-backup-ng now **auto-discovers
+your ssh-agent socket** across common locations (`~/.ssh/agent/`, `/tmp/ssh-*`,
+`/run/user/<uid>/…`, gpg/gcr, 1Password, Bitwarden), validating each is a socket you own, so a
+plain `sudo btrfs-backup-ng run` just works in most setups. For unusual setups you can pin the
+socket explicitly with a new `ssh_auth_sock` target option (or `BTRFS_BACKUP_SSH_AUTH_SOCK`
+env var, or `--ssh-auth-sock` on restore/verify/estimate/snapper), and a preserved
+`SSH_AUTH_SOCK` (via `sudo -E`) is honored. When authentication does fail, the error now spells
+out exactly how to fix it for your situation. **SSH password authentication continues to work
+unchanged** — the agent is only tried first, then it falls through cleanly to password (and a
+dead/stale agent socket is never selected, so it can't get in the way).
+
 #### Snapshots you still need are no longer deleted after an interrupted backup
 
 When a backup transfer fails or is interrupted partway, btrfs-backup-ng marks the source

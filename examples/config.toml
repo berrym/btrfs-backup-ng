@@ -146,10 +146,20 @@ require_mount = true    # Fail if drive is not mounted (safety check)
 # ssh_sudo = false                   # Use sudo on remote host
 # ssh_port = 22                      # SSH port number
 # ssh_key = "~/.ssh/id_rsa"         # Path to SSH private key
+# ssh_auth_sock = "/path/to/agent.sock"  # Explicit ssh-agent socket (see note below)
 # ssh_password_auth = true           # Allow password authentication fallback
 # compress = "none"                  # Compression: none|gzip|zstd|lz4|pigz|lzop
 # rate_limit = "10M"                 # Bandwidth limit: number with K|M|G suffix
 # require_mount = false              # Require path to be a mount point (local only)
+#
+# SSH agent under sudo:
+# Backups run as root (btrfs send/receive need it), and sudo strips SSH_AUTH_SOCK.
+# If your SSH key is passphrase-protected, its usable key lives in your ssh-agent, so
+# btrfs-backup-ng auto-discovers your agent socket (common locations incl. ~/.ssh/agent/,
+# /run/user/<uid>/...) and uses it. If your agent lives somewhere unusual, pin it with
+# ssh_auth_sock above, export BTRFS_BACKUP_SSH_AUTH_SOCK, or run with
+# `sudo --preserve-env=SSH_AUTH_SOCK` (or `sudo -E`). Alternatively use a passphrase-less
+# key. On the CLI (restore/verify/estimate/snapper) the same override is --ssh-auth-sock.
 
 
 # =============================================================================

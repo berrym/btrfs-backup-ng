@@ -401,6 +401,7 @@ btrfs-backup-ng estimate --volume PATH [--target INDEX] [--check-space]
 | `--safety-margin PERCENT` | Safety margin percentage (default: 10%) |
 | `--ssh-sudo` | Use sudo on remote host |
 | `--ssh-key FILE` | SSH private key file |
+| `--ssh-auth-sock PATH` | Explicit ssh-agent socket (overrides auto-discovery) |
 | `--fs-checks MODE` | Filesystem check mode: auto, strict, skip |
 | `--no-fs-checks` | Skip filesystem checks (alias for --fs-checks=skip) |
 | `--json` | Output in JSON format |
@@ -760,6 +761,7 @@ btrfs-backup-ng snapper backup CONFIG TARGET [OPTIONS]
 | `--rate-limit RATE` | Bandwidth limit (e.g., '10M', '1G') |
 | `--ssh-sudo` | Use sudo on remote host |
 | `--ssh-key FILE` | SSH private key file |
+| `--ssh-auth-sock PATH` | Explicit ssh-agent socket (overrides auto-discovery) |
 | `--progress` | Show progress bars |
 | `--no-progress` | Disable progress bars |
 
@@ -852,6 +854,7 @@ btrfs-backup-ng snapper restore SOURCE --config NAME [OPTIONS]
 | `--rate-limit RATE` | Bandwidth limit |
 | `--ssh-sudo` | Use sudo on remote host |
 | `--ssh-key FILE` | SSH private key file |
+| `--ssh-auth-sock PATH` | Explicit ssh-agent socket (overrides auto-discovery) |
 | `--progress` | Show progress bars |
 | `--json` | Output in JSON format (for --list) |
 
@@ -1143,14 +1146,35 @@ When backing up to a remote host via SSH, there are several authentication scena
 
 **Key-based authentication (recommended):**
 
-For key-based SSH authentication, ensure your SSH key is loaded in ssh-agent. When running with sudo, you must preserve the `SSH_AUTH_SOCK` environment variable:
+For key-based SSH authentication, load your SSH key into ssh-agent (`ssh-add`). Backups run
+as root (btrfs send/receive need it), and `sudo` strips `SSH_AUTH_SOCK` — but a
+passphrase-protected key can only sign via its agent. btrfs-backup-ng therefore
+**auto-discovers your ssh-agent socket** across common locations (including `~/.ssh/agent/`,
+`/tmp/ssh-*`, `/run/user/<uid>/keyring/ssh`, gpg/gcr agents) and uses it, preferring a
+socket that actually has keys loaded. In most setups a plain `sudo btrfs-backup-ng run`
+just works.
+
+If your agent lives somewhere unusual, or you run several agents, pin the socket explicitly
+(highest precedence, then a preserved `SSH_AUTH_SOCK`, then auto-discovery):
 
 ```bash
-# Run with sudo -E to preserve SSH agent socket
-sudo -E btrfs-backup-ng run
+# 1. Explicit socket in the target config:
+#    [[volumes.targets]]
+#    ssh_auth_sock = "/path/to/agent.sock"
+#
+# 2. Environment override (works for every command):
+export BTRFS_BACKUP_SSH_AUTH_SOCK="$SSH_AUTH_SOCK"
+sudo --preserve-env=BTRFS_BACKUP_SSH_AUTH_SOCK btrfs-backup-ng run
+#
+# 3. Preserve your existing agent socket through sudo:
+sudo --preserve-env=SSH_AUTH_SOCK btrfs-backup-ng run   # or: sudo -E ...
+#
+# 4. On one-off commands: restore/verify/estimate/snapper accept --ssh-auth-sock PATH
 ```
 
-The tool will automatically detect SSH keys in `~/.ssh/` (id_ed25519, id_rsa, id_ecdsa) for the original user when running via sudo.
+The tool also detects SSH keys in `~/.ssh/` (id_ed25519, id_rsa, id_ecdsa) for the original
+user when running via sudo. If authentication fails, the error message names the exact
+remediation for your situation. A passphrase-less key avoids the agent requirement entirely.
 
 **Password authentication:**
 
