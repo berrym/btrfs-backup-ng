@@ -335,6 +335,25 @@ def send_snapshot(
         )
         raise __util__.SnapshotTransferError(f"Exception during transfer: {e}") from e
 
+    except ValueError as e:
+        # A misconfiguration surfaced mid-transfer (e.g. a sidecar recording an
+        # unusable cipher, or a missing passphrase). Record the failed transaction and
+        # convert it into a transfer error so the per-target handler reports the reason
+        # cleanly and moves on, rather than letting it escape as a bare traceback.
+        logger.error("Transfer to %s cannot proceed: %s", dest_path, e)
+        duration = time.monotonic() - transfer_start
+        log_transaction(
+            action="transfer",
+            status="failed",
+            source=source_path,
+            destination=dest_path,
+            snapshot=snapshot_name,
+            parent=parent_name,
+            duration_seconds=duration,
+            error=str(e),
+        )
+        raise __util__.SnapshotTransferError(str(e)) from e
+
     finally:
         _cleanup_processes(send_process, receive_process)
 
@@ -1420,7 +1439,18 @@ def _execute_transfers(
         to_transfer.remove(best_snapshot)
         logger.debug("%d snapshots left to transfer", len(to_transfer))
 
-    logger.info(__util__.log_heading(f"Transfers to {destination_endpoint} complete!"))
+    # Report honestly: a "complete!" banner must not print when a transfer failed.
+    if result.failed:
+        logger.warning(
+            __util__.log_heading(
+                f"Transfers to {destination_endpoint} finished with "
+                f"{len(result.failed)} failure(s); {len(result.transferred)} succeeded"
+            )
+        )
+    else:
+        logger.info(
+            __util__.log_heading(f"Transfers to {destination_endpoint} complete!")
+        )
     return result
 
 

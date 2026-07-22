@@ -8,6 +8,8 @@ import argparse
 import sys
 from typing import Callable
 
+from .. import __util__
+from ..__logger__ import logger
 from .common import add_fs_checks_args, add_progress_args, add_verbosity_args
 
 # Known subcommands for the new CLI
@@ -1575,10 +1577,38 @@ def run_subcommand(args: argparse.Namespace) -> int:
     }
 
     handler = handlers.get(args.command)
-    if handler:
-        return handler(args)
-    else:
+    if handler is None:
         print(f"Unknown command: {args.command}")
+        return 1
+
+    try:
+        return handler(args)
+    except KeyboardInterrupt:
+        # Ctrl-C: acknowledge cleanly instead of dumping a KeyboardInterrupt traceback.
+        print("\nInterrupted.", file=sys.stderr)
+        return 130
+    except __util__.AbortError as e:
+        # A deliberate, already-plain-language abort (a failed integrity check, a
+        # missing tool, a refused unsafe operation). Its message carries the reason
+        # and the next step, so show it as-is.
+        message = str(e).strip()
+        print(
+            f"Error: {message}" if message else "Error: operation aborted.",
+            file=sys.stderr,
+        )
+        return 1
+    except Exception as e:  # noqa: BLE001 - last-resort user-facing guard
+        # Any other unhandled error must never reach the user as a raw Python
+        # traceback (this often fires mid-backup or mid-restore). Render one plain
+        # line plus a pointer to --debug for the full trace, and exit non-zero. The
+        # traceback itself is preserved at debug level for troubleshooting.
+        logger.debug("Unhandled error in '%s' command", args.command, exc_info=True)
+        message = str(e).strip() or e.__class__.__name__
+        print(f"Error: {message}", file=sys.stderr)
+        print(
+            "Run the same command with --debug to see the full technical traceback.",
+            file=sys.stderr,
+        )
         return 1
 
 
