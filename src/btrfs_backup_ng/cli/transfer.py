@@ -12,6 +12,7 @@ from ..core.operations import sync_snapshots
 from .common import (
     get_log_level,
     get_timestamp_format,
+    space_options_from_args,
     thread_raw_compression,
     thread_raw_encryption,
 )
@@ -187,6 +188,9 @@ def execute_transfer(args: argparse.Namespace) -> int:
                         "compress": compress_override or target.compress,
                         "rate_limit": rate_limit_override or target.rate_limit,
                         "ssh_sudo": target.ssh_sudo,
+                        # Space-check flags (--no-check-space/--force/--safety-margin)
+                        # so the destination space preflight can be bypassed.
+                        **space_options_from_args(args),
                     }
 
                     sync_snapshots(

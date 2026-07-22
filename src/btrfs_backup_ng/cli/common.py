@@ -2,8 +2,29 @@
 
 import argparse
 import sys
+from typing import Any
 
 from .. import __util__
+
+
+def space_options_from_args(args: argparse.Namespace) -> dict[str, Any]:
+    """Space-check transfer options derived from the parsed CLI flags.
+
+    Without threading these, ``--no-check-space``/``--force``/``--safety-margin`` are
+    dead flags: ``send_snapshot`` defaults ``check_space=True`` and ``force=False``, so
+    the destination space preflight always runs and can never be bypassed -- which bites
+    hardest on raw targets, whose size estimate is conservative and can refuse a
+    transfer that would actually fit. Merge the result into the transfer ``options``
+    dict so the flags take effect (the default -- no flags -- reproduces today's
+    always-check behavior)."""
+    opts: dict[str, Any] = {
+        "check_space": not getattr(args, "no_check_space", False),
+        "force": getattr(args, "force", False),
+    }
+    margin = getattr(args, "safety_margin", None)
+    if margin is not None:
+        opts["safety_margin"] = margin
+    return opts
 
 
 def is_interactive() -> bool:
