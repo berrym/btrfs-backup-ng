@@ -32,6 +32,7 @@ from .common import (
     get_log_level,
     get_timestamp_format,
     should_show_progress,
+    space_options_from_args,
     thread_raw_compression,
     thread_raw_encryption,
 )
@@ -109,6 +110,9 @@ def execute_run(args: argparse.Namespace) -> int:
     # Get CLI overrides for compression/throttling
     compress_override = getattr(args, "compress", None)
     rate_limit_override = getattr(args, "rate_limit", None)
+    # Space-check flags (--no-check-space/--force/--safety-margin); threaded into the
+    # transfer options so they actually take effect (see space_options_from_args).
+    space_options = space_options_from_args(args)
 
     # Determine if progress should be shown
     show_progress = should_show_progress(args)
@@ -137,6 +141,7 @@ def execute_run(args: argparse.Namespace) -> int:
                     compress_override,
                     rate_limit_override,
                     show_progress,
+                    space_options,
                 ): volume
                 for volume in enabled_volumes
             }
@@ -163,6 +168,7 @@ def execute_run(args: argparse.Namespace) -> int:
                     compress_override,
                     rate_limit_override,
                     show_progress,
+                    space_options,
                 )
                 results.append((volume.path, success))
                 transfer_stats["completed"] += vol_stats.get("completed", 0)
@@ -248,6 +254,7 @@ def _backup_volume(
     compress_override: str | None = None,
     rate_limit_override: str | None = None,
     show_progress: bool = False,
+    space_options: dict[str, Any] | None = None,
 ) -> tuple[bool, dict[str, int], list[str]]:
     """Execute backup for a single volume.
 
@@ -258,6 +265,7 @@ def _backup_volume(
         compress_override: CLI override for compression method
         rate_limit_override: CLI override for bandwidth limit
         show_progress: Whether to show progress bars
+        space_options: Space-check options from the CLI space flags
 
     Returns:
         Tuple of (success, transfer_stats, error_messages)
@@ -274,6 +282,7 @@ def _backup_volume(
             compress_override,
             rate_limit_override,
             show_progress,
+            space_options,
         )
 
     # Build endpoint kwargs
@@ -397,6 +406,7 @@ def _backup_volume(
                     compress_override,
                     rate_limit_override,
                     show_progress,
+                    space_options,
                 ): (dest_endpoint, target_config)
                 for dest_endpoint, target_config in destination_endpoints
             }
@@ -427,6 +437,7 @@ def _backup_volume(
                     compress_override,
                     rate_limit_override,
                     show_progress,
+                    space_options,
                 )
                 if success:
                     stats["completed"] += 1
@@ -448,6 +459,7 @@ def _backup_snapper_volume(
     compress_override: str | None = None,
     rate_limit_override: str | None = None,
     show_progress: bool = False,
+    space_options: dict[str, Any] | None = None,
 ) -> tuple[bool, dict[str, int], list[str]]:
     """Execute backup for a snapper-sourced volume.
 
@@ -528,6 +540,8 @@ def _backup_snapper_volume(
                 "compress": compress_override or target.compress or default_compress,
                 "rate_limit": rate_limit_override or target.rate_limit,
                 "show_progress": show_progress,
+                # Space-check flags so --no-check-space/--force actually apply.
+                **(space_options or {}),
             }
 
             # Route the destination through the endpoint layer (local/ssh/raw),
@@ -588,6 +602,7 @@ def _transfer_to_target(
     compress_override: str | None = None,
     rate_limit_override: str | None = None,
     show_progress: bool = False,
+    space_options: dict[str, Any] | None = None,
 ) -> bool:
     """Transfer snapshot to a single target.
 
@@ -600,6 +615,7 @@ def _transfer_to_target(
         compress_override: CLI override for compression method
         rate_limit_override: CLI override for bandwidth limit
         show_progress: Whether to show progress bars
+        space_options: Space-check options from the CLI space flags
 
     Returns:
         True if successful
@@ -612,6 +628,9 @@ def _transfer_to_target(
             "rate_limit": rate_limit_override or target_config.rate_limit,
             "ssh_sudo": target_config.ssh_sudo,
             "show_progress": show_progress,
+            # Space-check flags (--no-check-space/--force/--safety-margin) so the
+            # destination space preflight can actually be bypassed when requested.
+            **(space_options or {}),
         }
 
         sync_snapshots(
