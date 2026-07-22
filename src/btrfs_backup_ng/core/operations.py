@@ -1234,9 +1234,18 @@ def sync_snapshots(
 
     destination_snapshots = destination_endpoint.list_snapshots()
 
-    # Clear locks for this destination
+    # Reconcile this destination's locks against reality (R3). A lock pins a source
+    # snapshot so retention cannot prune it while a transfer to this destination still
+    # needs it. Clear the lock only for snapshots CONFIRMED present on the destination --
+    # the transfer succeeded, so the lock has done its job. KEEP the lock for a snapshot
+    # not yet on the destination: a prior transfer failed or is pending and still depends
+    # on it. This is presence-based, not time-based, so a long outage can never cause a
+    # needed snapshot to be pruned.
     destination_id = destination_endpoint.get_id()
+    destination_names = {s.get_name() for s in destination_snapshots}
     for snap in source_snapshots:
+        if snap.get_name() not in destination_names:
+            continue  # not yet on the destination -> keep any lock
         if destination_id in snap.locks:
             source_endpoint.set_lock(snap, destination_id, False)
         if destination_id in snap.parent_locks:

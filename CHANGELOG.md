@@ -5,6 +5,31 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+#### Snapshots you still need are no longer deleted after an interrupted backup
+
+When a backup transfer fails or is interrupted partway, btrfs-backup-ng marks the source
+snapshot (and the parent it builds on) as "still needed" so cleanup won't remove it before
+the backup can be retried. That mark was being written to disk but **never read back on the
+next run**, so the next cleanup saw the snapshot as unneeded and could delete it — breaking
+the incremental chain the unfinished backup depended on. The mark is now read back and
+honored across runs, so a snapshot a pending or failed transfer needs survives cleanup
+until the transfer actually completes.
+
+Related hardening to the same lock file:
+
+- **Cleanup now refuses to delete anything if the lock file is unreadable or corrupt**,
+  with a clear message, rather than guessing everything is unneeded and pruning a snapshot
+  it can no longer tell is protected.
+- The lock file is now written **atomically and crash-safely** (temporary file, flush to
+  disk, atomic rename, directory flush), so an interrupted write can't leave a half-written
+  file that later reads as "nothing is protected."
+- Updates to the lock file are **serialized**, so backing up to several targets at once (or
+  two runs overlapping) can no longer clobber each other's marks.
+
 ## [0.8.5] - 2026-07-22
 
 This release makes **raw backups first-class** — a raw backup now carries everything

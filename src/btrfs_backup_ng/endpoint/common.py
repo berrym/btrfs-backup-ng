@@ -67,6 +67,9 @@ class Endpoint:
 
         self.btrfs_flags = ["-vv"] if self.config["btrfs_debug"] else []
         self.__cached_snapshots: List[Any] | None = None
+        # Set True when the lock file could not be read (corrupt/permission); retention
+        # then refuses to delete so a still-needed locked snapshot is never pruned.
+        self._locks_read_failed = False
 
         for key, value in kwargs.items():
             self.config[key] = value
@@ -343,12 +346,49 @@ class Endpoint:
                     time_format=matched_fmt,
                 )
                 snapshots.append(snapshot)
+        # R3: load persisted retention locks back onto the snapshots. set_lock writes them
+        # to the lock file, but nothing read them back, so a snapshot kept locked after a
+        # failed transfer looked unlocked on the next run and retention could prune a
+        # snapshot a failed/pending transfer still needs.
+        self._load_locks_into(snapshots)
         snapshots.sort()
         self.__cached_snapshots = snapshots
         logger.debug(
             "Populated snapshot cache of %r with %d items.", self, len(snapshots)
         )
         return list(snapshots)
+
+    def _load_locks_into(self, snapshots: List[Any]) -> None:
+        """Populate each snapshot's in-memory lock sets from the persisted lock file.
+
+        Locks are keyed by ``get_name()`` (see ``set_lock``). A damaged or unreadable
+        lock file must never abort the whole listing (that would also stop new snapshots),
+        so it lists as unlocked but sets ``_locks_read_failed`` -- retention then refuses
+        to delete anything (fail-safe) rather than silently pruning a still-needed
+        snapshot it can no longer see is locked."""
+        try:
+            lock_dict = self._read_locks()
+            self._locks_read_failed = False
+        except Exception as e:  # noqa: BLE001 - never abort a listing on a bad lock file
+            # A corrupt/unreadable lock file must NOT silently become "no locks": that
+            # would let retention prune a snapshot a pending transfer still needs. Keep
+            # listing (so backups continue) but flag the failure so retention refuses to
+            # delete anything until an operator repairs or removes the lock file.
+            self._locks_read_failed = True
+            logger.error(
+                "Lock file %s is unreadable/corrupt (%s); snapshots will list as "
+                "unlocked and retention will REFUSE to delete until it is repaired or "
+                "removed.",
+                self._get_lock_file_path(),
+                e,
+            )
+            return
+        for snap in snapshots:
+            entry = lock_dict.get(snap.get_name())
+            if not entry:
+                continue
+            snap.locks = set(entry.get("locks", []))
+            snap.parent_locks = set(entry.get("parent_locks", []))
 
     def set_lock(
         self, snapshot: Any, lock_id: Any, lock_state: bool, parent: bool = False
@@ -368,16 +408,29 @@ class Endpoint:
             (snapshot.parent_locks if parent else snapshot.locks).add(lock_id)
         else:
             (snapshot.parent_locks if parent else snapshot.locks).discard(lock_id)
-        lock_dict = {}
-        for _snapshot in self.list_snapshots():
-            snap_entry = {}
-            if _snapshot.locks:
-                snap_entry["locks"] = list(_snapshot.locks)
-            if _snapshot.parent_locks:
-                snap_entry["parent_locks"] = list(_snapshot.parent_locks)
-            if snap_entry:
-                lock_dict[_snapshot.get_name()] = snap_entry
-        self._write_locks(lock_dict)
+        # Read-modify-write against the AUTHORITATIVE on-disk lock file, serialized by a
+        # FileLock so concurrent parallel-target transfers (multiple threads sharing this
+        # source endpoint) and concurrent processes cannot lose each other's updates. The
+        # previous rebuild-from-cache dropped a lock written after this run's cache was
+        # populated (last-writer-wins) and could lose the mutation entirely on a cache
+        # miss. We only touch THIS snapshot's entry; every other snapshot's locks come
+        # straight from disk, so a concurrent writer's locks survive.
+        guard = str(self._get_lock_file_path()) + ".guard"
+        with FileLock(guard):
+            # _read_locks raises on a corrupt file: abort loudly rather than overwrite
+            # (which would silently discard locks we could not read).
+            lock_dict = self._read_locks()
+            name = snapshot.get_name()
+            entry: Dict[str, Any] = {}
+            if snapshot.locks:
+                entry["locks"] = list(snapshot.locks)
+            if snapshot.parent_locks:
+                entry["parent_locks"] = list(snapshot.parent_locks)
+            if entry:
+                lock_dict[name] = entry
+            else:
+                lock_dict.pop(name, None)
+            self._write_locks(lock_dict)
         logger.debug(
             "Lock state for %s and lock_id %s changed to %s (parent = %s)",
             snapshot,
@@ -403,6 +456,14 @@ class Endpoint:
 
     def delete_snapshots(self, snapshots: List[Any], **kwargs: Any) -> None:
         """Delete the given snapshots (subvolumes)."""
+        if getattr(self, "_locks_read_failed", False):
+            logger.error(
+                "Refusing to delete snapshots: the lock file is unreadable/corrupt, so "
+                "locked (still-needed) snapshots cannot be identified. Repair or remove "
+                "%s and retry.",
+                self._get_lock_file_path(),
+            )
+            return
         for snapshot in snapshots:
             if snapshot.locks or snapshot.parent_locks:
                 logger.info("Skipping locked snapshot: %s", snapshot)
@@ -439,6 +500,14 @@ class Endpoint:
         Delete old snapshots, keeping only the most recent `keep` unlocked snapshots.
         """
         snapshots = self.list_snapshots()
+        if getattr(self, "_locks_read_failed", False):
+            logger.error(
+                "Refusing to delete old snapshots: the lock file is unreadable/corrupt, "
+                "so locked (still-needed) snapshots cannot be identified. Repair or "
+                "remove %s and retry.",
+                self._get_lock_file_path(),
+            )
+            return
         unlocked = [s for s in snapshots if not s.locks and not s.parent_locks]
         if keep <= 0 or len(unlocked) <= keep:
             logger.debug(
@@ -832,10 +901,39 @@ class Endpoint:
 
     def _write_locks(self, lock_dict: Dict[str, Any]) -> None:
         path = self._get_lock_file_path()
+        data = __util__.write_locks(lock_dict)
+        tmp = path.with_name(path.name + ".tmp")
         try:
             logger.debug("Writing lock file: %s", path)
-            with open(path, "w", encoding="utf-8") as f:
-                f.write(__util__.write_locks(lock_dict))
+            # Atomic: write a temp file, fsync it, then os.replace over the target, so a
+            # crash mid-write can never leave a half-written / corrupt lock file (which
+            # would then be misread as "no locks" and let retention prune a locked
+            # snapshot). O_NOFOLLOW|O_EXCL refuse a planted symlink or a stale temp at what
+            # is often a root-owned path; a leftover temp from a prior crash is cleared
+            # first.
+            with contextlib.suppress(OSError):
+                os.unlink(tmp)
+            fd = os.open(
+                str(tmp),
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                0o600,
+            )
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(data)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(str(tmp), str(path))
+            # fsync the parent directory so the rename itself is durable: the content
+            # fsync above does not guarantee the new directory entry survives a crash, and
+            # a lost rename would silently drop the locks R3 exists to persist.
+            with contextlib.suppress(OSError):
+                dfd = os.open(str(path.parent), os.O_RDONLY)
+                try:
+                    os.fsync(dfd)
+                finally:
+                    os.close(dfd)
         except OSError as e:
+            with contextlib.suppress(OSError):
+                os.unlink(tmp)
             logger.error("Error on writing lock file %s: %s", path, e)
             raise __util__.AbortError
