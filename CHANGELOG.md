@@ -21,7 +21,9 @@ plain `sudo btrfs-backup-ng run` just works in most setups. For unusual setups y
 socket explicitly with a new `ssh_auth_sock` target option (or `BTRFS_BACKUP_SSH_AUTH_SOCK`
 env var, or `--ssh-auth-sock` on restore/verify/estimate/snapper), and a preserved
 `SSH_AUTH_SOCK` (via `sudo -E`) is honored. When authentication does fail, the error now spells
-out exactly how to fix it for your situation.
+out exactly how to fix it for your situation. **SSH password authentication continues to work
+unchanged** — the agent is only tried first, then it falls through cleanly to password (and a
+dead/stale agent socket is never selected, so it can't get in the way).
 
 #### Snapshots you still need are no longer deleted after an interrupted backup
 

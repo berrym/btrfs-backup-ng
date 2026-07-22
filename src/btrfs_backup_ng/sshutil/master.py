@@ -215,6 +215,23 @@ class SSHMasterManager:
             return False
         return _stat.S_ISSOCK(st.st_mode) and st.st_uid in (uid, 0)
 
+    def _agent_status(self, sock_path: str) -> int:
+        """`ssh-add -l` status for an agent socket.
+
+        0 = the agent has keys, 1 = the agent is reachable but has no keys, 2 = the socket
+        is dead/unreachable (a leftover file whose agent process died, or a timeout). A
+        dead socket must never be chosen -- setting SSH_AUTH_SOCK to it makes ssh waste a
+        round trip on an agent it cannot talk to before falling back to password auth."""
+        try:
+            sub_env = os.environ.copy()
+            sub_env["SSH_AUTH_SOCK"] = sock_path
+            result = subprocess.run(
+                ["ssh-add", "-l"], env=sub_env, capture_output=True, timeout=5
+            )
+            return result.returncode
+        except Exception:  # noqa: BLE001 - any failure means "treat as unreachable"
+            return 2
+
     def _resolve_agent_socket(self, uid: int, env: dict) -> Optional[str]:
         """Resolve which ssh-agent socket to use.
 
@@ -254,7 +271,6 @@ class SSHMasterManager:
             Path to an agent socket if found, else None.
         """
         import glob
-        import subprocess
 
         # Owning user's home for ~/.ssh sockets. Derive from the uid so it is correct under
         # sudo; if the uid is not in the password db (containers/NSS), fall back to the
@@ -279,18 +295,6 @@ class SSHMasterManager:
             f"/run/user/{uid}/openssh_agent",  # openssh per-user
         ]
 
-        def socket_has_keys(sock_path: str) -> bool:
-            """True if the agent at sock_path has at least one key loaded."""
-            try:
-                sub_env = os.environ.copy()
-                sub_env["SSH_AUTH_SOCK"] = sock_path
-                result = subprocess.run(
-                    ["ssh-add", "-l"], env=sub_env, capture_output=True, timeout=5
-                )
-                return result.returncode == 0  # 0 = has keys, 1 = none, 2 = no agent
-            except Exception:
-                return False
-
         def candidates():
             # sorted() so a deterministic socket is chosen when a glob matches several.
             for pattern in search_paths:
@@ -299,17 +303,26 @@ class SSHMasterManager:
                 elif os.path.exists(pattern):
                     yield pattern
 
-        # Pass 1: a socket that actually has keys (what we really want).
+        # Pass 1: a live agent that actually has keys (what enables passphrase-key auth).
         for sock in candidates():
-            if self._owned_socket(sock, uid, follow=False) and socket_has_keys(sock):
+            if (
+                self._owned_socket(sock, uid, follow=False)
+                and self._agent_status(sock) == 0
+            ):
                 logger.debug("Found agent socket with keys: %s", sock)
                 self._agent_socket_had_keys = True
                 return sock
-        # Pass 2: any owned socket (no keys loaded). Kept so the failure path can tell the
-        # user an agent exists but is empty ("run ssh-add") instead of "none found".
+        # Pass 2: a REACHABLE agent with no keys (status 1). A dead/stale socket (status 2 --
+        # a leftover file whose agent process died) is skipped so we never set SSH_AUTH_SOCK
+        # to a socket ssh cannot talk to, which would only add latency/noise before password
+        # fallback. Kept so the failure path can say "an agent is running but has no keys"
+        # instead of "none found".
         for sock in candidates():
-            if self._owned_socket(sock, uid, follow=False):
-                logger.debug("Found agent socket (no keys loaded): %s", sock)
+            if (
+                self._owned_socket(sock, uid, follow=False)
+                and self._agent_status(sock) == 1
+            ):
+                logger.debug("Found reachable agent socket (no keys loaded): %s", sock)
                 self._agent_socket_had_keys = False
                 return sock
         return None
@@ -359,6 +372,10 @@ class SSHMasterManager:
         if not self._has_sshpass():
             logger.debug("sshpass not available for password authentication")
             return False
+
+        # Reset per-attempt state so a stale failure flag from a prior attempt cannot
+        # skew the retry decision in start_master.
+        self._password_auth_failed = False
 
         # Build command with sshpass
         ssh_cmd = self._ssh_base_cmd()
@@ -472,6 +489,9 @@ class SSHMasterManager:
                 self._resolved_agent_sock = agent_sock
                 logger.debug("Using ssh-agent socket: %s", agent_sock)
             else:
+                # No usable agent. Clear any inherited SSH_AUTH_SOCK so ssh does not try a
+                # stale/foreign socket before falling back to password auth.
+                env.pop("SSH_AUTH_SOCK", None)
                 self._resolved_agent_sock = None
                 logger.debug("No usable ssh-agent socket found")
 

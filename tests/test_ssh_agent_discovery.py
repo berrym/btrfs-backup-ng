@@ -137,6 +137,13 @@ def test_falls_through_to_discovery_when_nothing_explicit(tmp_path, monkeypatch)
 # --------------------------------------------------------------------------- #
 # _find_ssh_agent_socket searches ~/.ssh/agent/ (the real-world gap)
 # --------------------------------------------------------------------------- #
+def _reachable_only_under(mgr, monkeypatch, base):
+    """Make _agent_status treat only sockets under `base` as a reachable-but-empty agent
+    (status 1) and everything else (real system sockets on the box) as dead (status 2), so
+    discovery tests are isolated from the tester's real agents."""
+    monkeypatch.setattr(mgr, "_agent_status", lambda s: 1 if str(base) in str(s) else 2)
+
+
 def test_discovery_finds_socket_in_dot_ssh_agent(tmp_path, monkeypatch):
     """A socket under <home>/.ssh/agent/ must be discovered. Mutation guard: removing the
     ~/.ssh/agent/* entry from search_paths makes this return None."""
@@ -154,9 +161,9 @@ def test_discovery_finds_socket_in_dot_ssh_agent(tmp_path, monkeypatch):
             "btrfs_backup_ng.sshutil.master.pwd.getpwuid", lambda u: _PW()
         )
         mgr = _mgr(tmp_path)
+        _reachable_only_under(mgr, monkeypatch, home)
         got = mgr._find_ssh_agent_socket(uid, {})
-        # No ssh-agent is actually serving the socket, so it is returned by the
-        # second (any-owned-socket) pass rather than the has-keys pass.
+        # The agent is reachable but has no keys, so it comes from pass 2.
         assert got == str(agent_dir / "s.abc.agent.def")
         assert mgr._agent_socket_had_keys is False  # empty-agent path recorded
     finally:
@@ -182,12 +189,34 @@ def test_discovery_skips_non_socket_files(tmp_path, monkeypatch):
             "btrfs_backup_ng.sshutil.master.pwd.getpwuid", lambda u: _PW()
         )
         mgr = _mgr(tmp_path)
-        # ~/.ssh/*.sock precedes /run/user in the search order, so the real socket here
-        # is returned before any real system agent -- and the regular file is skipped.
+        _reachable_only_under(mgr, monkeypatch, home)
         got = mgr._find_ssh_agent_socket(os.getuid(), {})
         assert got == str(ssh_dir / "z-real.sock")
     finally:
         real.close()
+
+
+def test_discovery_skips_dead_socket(tmp_path, monkeypatch):
+    """A socket whose agent is dead/unreachable (ssh-add rc 2) must NOT be chosen -- setting
+    SSH_AUTH_SOCK to a dead socket would only slow down the fall-through to password auth.
+    Mutation guard: accepting any reachability status in pass 2 returns the dead socket."""
+    home = tmp_path / "home"
+    agent_dir = home / ".ssh" / "agent"
+    agent_dir.mkdir(parents=True)
+    sock = _real_socket(agent_dir / "dead.sock")
+    try:
+
+        class _PW:
+            pw_dir = str(home)
+
+        monkeypatch.setattr(
+            "btrfs_backup_ng.sshutil.master.pwd.getpwuid", lambda u: _PW()
+        )
+        mgr = _mgr(tmp_path)
+        monkeypatch.setattr(mgr, "_agent_status", lambda s: 2)  # everything dead
+        assert mgr._find_ssh_agent_socket(os.getuid(), {}) is None
+    finally:
+        sock.close()
 
 
 def test_discovery_home_fallback_uses_env_not_root(tmp_path, monkeypatch):
@@ -205,6 +234,7 @@ def test_discovery_home_fallback_uses_env_not_root(tmp_path, monkeypatch):
 
         monkeypatch.setattr("btrfs_backup_ng.sshutil.master.pwd.getpwuid", _boom)
         mgr = _mgr(tmp_path)
+        _reachable_only_under(mgr, monkeypatch, home)
         got = mgr._find_ssh_agent_socket(os.getuid(), {"HOME": str(home)})
         assert got == str(agent_dir / "a.sock")
     finally:
