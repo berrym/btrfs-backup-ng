@@ -438,6 +438,40 @@ class Endpoint:
             snap.locks = set(entry.get("locks", []))
             snap.parent_locks = set(entry.get("parent_locks", []))
 
+    def correspondent_of(self, snapshot: Any) -> Optional[Any]:
+        """Return THIS endpoint's snapshot that is the btrfs-receive copy of ``snapshot``.
+
+        Two btrfs subvolumes correspond when one was produced by ``btrfs receive`` of a
+        stream from the other: the received copy's ``received_uuid`` equals the source
+        subvolume's ``uuid``. That is the correspondence btrfs incremental send/receive
+        actually resolves on the destination -- NOT the on-disk name, which can collide
+        (a re-created snapshot reuses the name but gets a new uuid). This is the single
+        authority for "does this endpoint hold the correspondent of that snapshot"; it is
+        used both to detect whether a source snapshot is already on a destination and to
+        find a valid incremental parent.
+
+        Returns the corresponding snapshot object, or ``None`` when identity is unknown
+        (empty ``uuid`` -- a best-effort enrichment miss), no correspondent exists, or the
+        listing fails. A ``None`` return is ALWAYS safe for callers: it degrades to a full
+        (non-incremental) transfer, never an unapplyable ``send -p`` -- so this method
+        never raises.
+
+        This base implementation is the btrfs (uuid) semantics used by Local and SSH
+        endpoints; raw endpoints override it with name semantics.
+        """
+        src_uuid = getattr(snapshot, "uuid", "")
+        if not src_uuid:
+            return None
+        try:
+            candidates = self.list_snapshots()
+        except Exception as e:  # noqa: BLE001 - contract: never raise; None is safe
+            logger.debug("correspondent_of: could not list snapshots (%s)", e)
+            return None
+        for candidate in candidates:
+            if getattr(candidate, "received_uuid", "") == src_uuid:
+                return candidate
+        return None
+
     def set_lock(
         self, snapshot: Any, lock_id: Any, lock_state: bool, parent: bool = False
     ) -> None:
