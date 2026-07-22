@@ -174,7 +174,20 @@ def exec_subprocess(command, method="check_output", **kwargs):
         raise AbortError(f"Command not found: {command[0]}") from e
     except subprocess.CalledProcessError as e:
         logger.error("Error on command: %s\nCaught: %s", command, e)
-        raise AbortError from e
+        # Give the AbortError a real message. A bare ``raise AbortError from e`` left
+        # it empty, so callers logged garbled lines like "Failed to create snapshot: "
+        # with no reason. Include the command's exit status and its stderr when it was
+        # captured so the failure is self-explanatory.
+        stderr = e.stderr
+        if isinstance(stderr, bytes):
+            stderr = stderr.decode("utf-8", "replace")
+        detail = (stderr or "").strip()
+        cmd_name = str(command[0]) if command else "command"
+        if detail:
+            raise AbortError(
+                f"{cmd_name} failed (exit {e.returncode}): {detail}"
+            ) from e
+        raise AbortError(f"{cmd_name} failed with exit status {e.returncode}") from e
     except Exception as e:
         logger.error("Unexpected error executing command: %s\nError: %s", command, e)
         raise AbortError(f"Error executing {command[0]}: {e}") from e

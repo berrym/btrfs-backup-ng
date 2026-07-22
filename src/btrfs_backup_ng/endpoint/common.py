@@ -171,6 +171,18 @@ class Endpoint:
         logger.debug("Acquiring snapshot lock: %s", lock_path)
         with FileLock(lock_path):
             logger.debug("Snapshot lock acquired: %s", lock_path)
+            if Path(snapshot_path).exists():
+                # A snapshot with this exact name already exists. The usual cause is two
+                # snapshots requested within the same second (identical timestamp, hence
+                # identical name). btrfs would otherwise fail here with the misleading
+                # "Could not create subvolume: Read-only file system"; give the real
+                # reason and what to do instead.
+                raise __util__.AbortError(
+                    f"A snapshot named '{snapshot.get_name()}' already exists at "
+                    f"{snapshot_path}. Two snapshots were likely requested within the "
+                    "same second (identical timestamp). Wait a second and retry; if the "
+                    "existing snapshot is incomplete, remove it first."
+                )
             self._remount(self.config["source"], read_write=True)
             commands = [
                 self._build_snapshot_cmd(

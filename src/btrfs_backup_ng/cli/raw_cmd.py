@@ -471,6 +471,12 @@ def _raw_encrypt(args: argparse.Namespace) -> int:
         print(f"Raw target: {spec}  ({len(results)} plaintext stream{plural})")
         for r in results:
             print(f"  {r['action'].upper():<28} {r['name']}")
+            # Surface the actionable reason for failed entries in plain output too --
+            # previously it was only visible with --json, so a plain-mode "ERROR" gave
+            # the user no idea what went wrong or how to fix it.
+            reason = r.get("error")
+            if reason:
+                print(f"    reason: {reason}")
         if not dry:
             unver = sum(1 for r in results if r["action"] == "encrypted-unverified")
             if unver:

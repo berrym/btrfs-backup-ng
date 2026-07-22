@@ -112,6 +112,46 @@ def _validate_cipher(cipher: str) -> str:
     return cipher
 
 
+def _openssl_supports_cipher(cipher: str) -> bool:
+    """Whether THIS host's openssl can actually use ``cipher`` with ``openssl enc``.
+
+    ``_validate_cipher`` checks a cipher name's shape and rejects the unsafe/unusable
+    ones, but a name it accepts can still be absent from this particular openssl build
+    (a backup made on a host with a different openssl, or a hand-edited sidecar). Left
+    to the decrypt pipeline, that surfaces as a cryptic multi-line OpenSSL EVP error
+    dump. Probe the exact local binary (raw+ssh decrypts locally, so this is the binary
+    that runs) by encrypting empty input: exit 0 means the cipher is known, non-zero
+    means openssl rejects it -- the real cipher against the real binary, no fragile
+    output parsing, portable across OpenSSL/LibreSSL. Returns True when the probe cannot
+    run (openssl missing, an OS error, or a timeout) so this never blocks a restore it
+    cannot actually adjudicate -- the decrypt pipeline still fails safe if the cipher is
+    genuinely unusable."""
+    openssl = shutil.which("openssl")
+    if not openssl:
+        return True
+    try:
+        proc = subprocess.run(
+            [
+                openssl,
+                "enc",
+                f"-{cipher}",
+                "-in",
+                os.devnull,
+                "-out",
+                os.devnull,
+                "-pass",
+                "pass:x",
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+            timeout=15,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return True
+    return proc.returncode == 0
+
+
 def _selected_passphrase_env() -> str | None:
     """Return the NAME of the passphrase environment variable that is set (primary
     ``BTRFS_BACKUP_PASSPHRASE`` preferred, then ``BTRBK_PASSPHRASE`` for btrbk
@@ -157,13 +197,14 @@ PARTIAL_SUFFIX = ".part"
 LOCK_FILENAME = ".btrfs-backup-ng.lock"
 
 
-def _lock_open_reason(e: OSError) -> str:
-    """A plain-language reason a lock-file open failed, for a user-facing message.
+def _open_failure_reason(e: OSError) -> str:
+    """A plain-language reason opening a path failed, for a user-facing message.
 
-    Translates the errno so a regular user sees why the lock could not be taken and
+    Translates the errno so a regular user sees why the file could not be opened and
     what to check, instead of a bare ``[Errno NN]`` repr (whose default text is
     sometimes misleading -- e.g. ELOOP prints 'Too many levels of symbolic links'
-    for a single planted symlink)."""
+    for a single planted symlink). Shared by the lock open and the checksum open,
+    both of which use O_NOFOLLOW and so surface ELOOP for a planted symlink."""
     reasons = {
         errno.ELOOP: "it is a symlink (refused for safety)",
         errno.EISDIR: "it is a directory, not a file",
@@ -247,7 +288,10 @@ def _sha256_file(path: Path) -> str | None:
                 h.update(chunk)
         return h.hexdigest()
     except OSError as e:
-        logger.warning("Could not checksum %s: %s", path, e)
+        # Translate the errno to plain language: with O_NOFOLLOW a symlink stream
+        # surfaces ELOOP, whose default text ("Too many levels of symbolic links")
+        # wrongly implies a loop rather than "this is a symlink, refused for safety".
+        logger.warning("Could not checksum %s: %s", path, _open_failure_reason(e))
         return None
 
 
@@ -462,7 +506,7 @@ class RawEndpoint(Endpoint):
         except OSError as e:
             raise RuntimeError(
                 f"raw target {path}: cannot acquire its lock file {lockfile} -- "
-                f"{_lock_open_reason(e)}. The target directory must not be writable by "
+                f"{_open_failure_reason(e)}. The target directory must not be writable by "
                 "untrusted users."
             ) from e
         # Even if the open succeeded, refuse to trust anything that is not a REGULAR
@@ -478,7 +522,7 @@ class RawEndpoint(Endpoint):
             os.close(fd)
             raise RuntimeError(
                 f"raw target {path}: cannot stat its lock file {lockfile} -- "
-                f"{_lock_open_reason(e)}"
+                f"{_open_failure_reason(e)}"
             ) from e
         if not is_regular:
             os.close(fd)
@@ -1118,6 +1162,15 @@ class RawEndpoint(Endpoint):
                     "No cipher recorded for %s; restoring with endpoint cipher %s",
                     snapshot.name,
                     cipher,
+                )
+            if not _openssl_supports_cipher(cipher):
+                # Fail clearly BEFORE the pipeline dumps a cryptic OpenSSL EVP error.
+                raise __util__.AbortError(
+                    f"Cannot restore {snapshot.name}: the backup records openssl cipher "
+                    f"{cipher!r}, which this system's openssl does not support. It was "
+                    "likely created on a host with a different openssl build. Restore on "
+                    "that host, install an openssl that provides the cipher, or run "
+                    "'openssl enc -ciphers' to see what this host supports."
                 )
             openssl_cmd = [
                 "openssl",
