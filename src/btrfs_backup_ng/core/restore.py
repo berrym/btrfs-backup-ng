@@ -537,6 +537,21 @@ def restore_snapshots(
                 if parent:
                     logger.debug("Found time-based parent: %s", parent.get_name())
 
+            # The ``btrfs send -p <parent>`` diff is computed ON THE BACKUP SIDE (the
+            # REMOTE host for an ssh:// source, the local backup dir otherwise). A parent
+            # picked from the locally-restored copies carries a path that is meaningless
+            # there -- e.g. a local ``/mnt/restore/snap-0`` handed to a REMOTE send, which
+            # always fails. Remap the chosen parent to the BACKUP snapshot of the same
+            # name (which carries the correct send-side path). If it is not present on the
+            # backup side, drop to a full send rather than send a bogus parent path. The
+            # parent is still guaranteed present LOCALLY because it was chosen from the
+            # already-restored set, so ``btrfs receive`` can apply the incremental.
+            if parent is not None:
+                parent = next(
+                    (b for b in backup_snapshots if b.get_name() == parent.get_name()),
+                    None,
+                )
+
         mode = "incremental" if parent else "full"
         parent_info = f" from {parent.get_name()}" if parent else ""
 

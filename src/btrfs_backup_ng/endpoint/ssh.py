@@ -635,6 +635,66 @@ class SSHEndpoint(Endpoint):
             logger.info("Deleting old remote snapshot: %s", str(snap))  # type: ignore
             self.delete_snapshots([snap])
 
+    def set_lock(
+        self,
+        snapshot: Any,
+        lock_id: Any,
+        lock_state: bool,
+        parent: bool = False,
+    ) -> None:
+        """Update the in-memory retention lock on a remote snapshot.
+
+        Overrides the base Endpoint.set_lock, which writes a LOCAL lock file at
+        ``config['path']``. For an ssh endpoint that path is on the REMOTE host, so
+        the base write opens a nonexistent local path and raises -- which aborted a
+        restore FROM an ssh:// source at the lock step. Restore only needs the lock
+        held in memory for the duration of the transfer; persisting ssh locks across
+        runs is a separate change (audit root R3). Mirrors RawEndpoint.set_lock.
+        """
+        target = snapshot.parent_locks if parent else snapshot.locks
+        if lock_state:
+            target.add(lock_id)
+        else:
+            target.discard(lock_id)
+
+    def send(
+        self, snapshot: Any, parent: Any = None, clones: Optional[List[Any]] = None
+    ) -> subprocess.Popen[Any]:
+        """Stream ``btrfs send`` FROM the remote host over ssh (restore direction).
+
+        The base ``Endpoint.send`` runs ``btrfs send`` LOCALLY -- correct for a local
+        backup SOURCE, but wrong when this ssh endpoint is the BACKUP location a restore
+        reads FROM: the snapshot lives on the remote host, so a local send fails. Run the
+        send on the remote and return a Popen whose stdout is the stream, for the local
+        ``btrfs receive`` to consume (mirrors the raw+ssh restore, which reads its stream
+        back over ssh). Incremental restore threads ``-p <parent>``.
+        """
+        remote_snap = self._normalize_path(snapshot.get_path())
+        argv: List[str] = ["btrfs", "send"]
+        if parent is not None:
+            argv += ["-p", self._normalize_path(parent.get_path())]
+        for clone in clones or []:
+            argv += ["-c", self._normalize_path(clone.get_path())]
+        argv.append(remote_snap)
+        # _build_remote_command prepends sudo (-n in passwordless mode) for btrfs; the
+        # remote command is shlex-quoted so a path with spaces/metacharacters cannot be
+        # split or injected when ssh runs it through the remote shell.
+        remote_cmd = self._build_remote_command(argv)
+        remote_str = " ".join(shlex.quote(str(a)) for a in remote_cmd)
+        ssh_cmd = self.ssh_manager.get_ssh_base_cmd(force_tty=False) + [remote_str]
+        logger.debug("Remote btrfs send over ssh: %s", " ".join(ssh_cmd))
+        # stderr -> DEVNULL, matching the base send and every other send in the codebase.
+        # The transfer supervisor blocks on the RECEIVE and does NOT drain the send's
+        # stderr during the stream, so a PIPE here could (pathologically) fill -- ssh also
+        # forwards the remote command's stderr -- stall the send, starve the receive, and
+        # hang until the overall timeout. A failed remote send still surfaces cleanly: ssh
+        # exits non-zero and the receive fails, and the supervisor terminates the send and
+        # reports the failure. (Never redirect remote stderr into stdout -- it corrupts the
+        # btrfs stream.)
+        return subprocess.Popen(
+            ssh_cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
+        )
+
     def _apply_agent_forwarding(self) -> None:
         """
         Apply SSH agent forwarding if enabled in config.
