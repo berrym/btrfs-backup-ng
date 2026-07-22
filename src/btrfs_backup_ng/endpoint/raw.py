@@ -28,7 +28,7 @@ import time
 from collections.abc import Iterator
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, TypedDict
+from typing import Any, Optional, TypedDict
 
 from btrfs_backup_ng import __util__
 from btrfs_backup_ng.__logger__ import logger
@@ -455,6 +455,29 @@ class RawEndpoint(Endpoint):
         """Return a unique identifier for this endpoint."""
         path = self._normalize_path(self.config["path"])
         return f"raw://{path}"
+
+    def correspondent_of(self, snapshot: Any) -> Optional[Any]:
+        """Raw override of :meth:`Endpoint.correspondent_of` -- NAME semantics.
+
+        A raw backup is a self-contained ``btrfs send`` stream written to a file; there is
+        no ``btrfs receive`` on the destination and therefore no ``received_uuid`` to match.
+        Correspondence for raw targets is by snapshot name (the sidecar also records the
+        parent by name), which is correct because a raw stream is replayed by name/order at
+        restore time. Returns the raw backup with the same name, or ``None`` (never raises).
+        """
+        get_name = getattr(snapshot, "get_name", None)
+        if not callable(get_name):
+            return None
+        name = get_name()
+        try:
+            candidates = self.list_snapshots()
+        except Exception as e:  # noqa: BLE001 - contract: never raise; None is safe
+            logger.debug("correspondent_of: could not list snapshots (%s)", e)
+            return None
+        for candidate in candidates:
+            if candidate.get_name() == name:
+                return candidate
+        return None
 
     @contextlib.contextmanager
     def target_lock(self, *, timeout: float | None = None) -> Iterator[None]:
