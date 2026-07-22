@@ -289,15 +289,6 @@ def _execute_main_restore(args: argparse.Namespace) -> int:
         logger.error("Destination validation failed: %s", e)
         return 1
 
-    # Reject a remote ssh:// btrfs restore source up front (not supported yet), with a
-    # clear message -- before preparing/connecting. list/status paths do NOT call this,
-    # so read-only ssh:// listing keeps working.
-    try:
-        _reject_remote_ssh_restore(source)
-    except __util__.AbortError as e:
-        logger.error("%s", e)
-        return 1
-
     # Prepare backup endpoint (source)
     try:
         backup_endpoint = _prepare_backup_endpoint(args, source)
@@ -305,13 +296,16 @@ def _execute_main_restore(args: argparse.Namespace) -> int:
         logger.error("Failed to prepare backup endpoint: %s", e)
         return 1
 
-    # Prepare local endpoint (destination). Resolve the SAME timestamp_format the
-    # backup (source) endpoint uses so already-restored custom-named snapshots are
-    # recognized (skip-existing + incremental-base detection).
+    # Prepare local endpoint (destination). Resolve the SAME timestamp_format AND the
+    # SAME snapshot prefix the backup (source) endpoint uses, so already-restored
+    # snapshots are recognized by name (skip-existing + incremental-base detection). An
+    # empty prefix here made list_snapshots fail to parse prefixed names like
+    # "home-20240101-..." -> the chain never saw the local parent and re-restored it.
     try:
         local_endpoint = _prepare_local_endpoint(
             dest_path,
             resolve_timestamp_format(getattr(args, "timestamp_format", None)),
+            snap_prefix=getattr(args, "prefix", "") or "",
         )
     except Exception as e:
         logger.error("Failed to prepare local endpoint: %s", e)
@@ -483,28 +477,11 @@ def _prepare_backup_endpoint(args: argparse.Namespace, source: str):
     return backup_ep
 
 
-def _reject_remote_ssh_restore(source: str) -> None:
-    """Fail fast if a RESTORE would pull from a remote ssh:// btrfs source.
-
-    A native btrfs SSHEndpoint runs ``btrfs send`` and reads/writes the lock file
-    LOCALLY, so it cannot stream a snapshot back from the remote host -- a real remote
-    source would otherwise fail late with a misleading local-path error. Raise a clear,
-    actionable message instead. The check is by URL scheme, matching how the endpoint is
-    chosen: only ``ssh://`` (native btrfs over ssh) is rejected. ``raw+ssh://`` (its own
-    scheme -> SSHRawEndpoint) DOES support remote restore, and ``raw://`` / local btrfs
-    are unaffected -- none of those start with ``ssh://``. Called ONLY on the restore
-    path, so ``restore --list`` / ``--status`` of an ssh:// target keep working."""
-    if source.startswith("ssh://"):
-        raise __util__.AbortError(
-            f"Restoring a native btrfs backup directly from a remote ssh:// source "
-            f"({source}) is not supported yet -- the snapshot has to be read on the "
-            "machine that stores it. Options: restore on that machine; or copy/mount "
-            "the backup locally and restore from a local path; or use a raw+ssh:// "
-            "backup, which does support remote restore."
-        )
-
-
-def _prepare_local_endpoint(dest_path: Path, timestamp_format: str | None = None):
+def _prepare_local_endpoint(
+    dest_path: Path,
+    timestamp_format: str | None = None,
+    snap_prefix: str = "",
+):
     """Prepare the local endpoint for receiving restored snapshots.
 
     Args:
@@ -513,6 +490,9 @@ def _prepare_local_endpoint(dest_path: Path, timestamp_format: str | None = None
             destination, so skip-existing and incremental-base detection see
             custom-named snapshots instead of silently dropping them. Must match
             the format the backup (source) endpoint uses.
+        snap_prefix: Snapshot name prefix the backup uses (e.g. ``home-``). The local
+            endpoint must parse already-restored subvolumes under the SAME prefix, or it
+            fails to recognize them and the restore chain re-restores an existing parent.
 
     Returns:
         Configured local endpoint
@@ -525,7 +505,7 @@ def _prepare_local_endpoint(dest_path: Path, timestamp_format: str | None = None
     endpoint_kwargs = {
         "path": dest_path,
         "source": None,  # This is the destination for receive
-        "snap_prefix": "",
+        "snap_prefix": snap_prefix,
         "convert_rw": False,
         "subvolume_sync": False,
         "btrfs_debug": False,

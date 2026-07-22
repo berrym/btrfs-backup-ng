@@ -1002,34 +1002,54 @@ def _do_process_transfer(
         logger.error("Failed to start receive process: %s", e)
         raise __util__.SnapshotTransferError(f"Receive process failed to start: {e}")
 
-    timeout_seconds = 3600  # 1 hour
+    timeout_seconds = 3600  # 1 hour overall bound
+    send_reap_seconds = 30  # grace for the send to finish once the receive is done
 
+    # Wait on the RECEIVE (the sink) first, NOT the send. The send is the producer and
+    # the receive is the sink; the old code blocked on the send for up to an hour, which
+    # deadlocked when the receive exited early (e.g. "subvolume already exists", ENOSPC,
+    # a permission error) and a remote ``ssh btrfs send`` did not get a prompt SIGPIPE --
+    # that was the hang on remote restores. A finished receive implies the send has (or
+    # is about to) finish too, so this ordering is correct for the normal case as well.
     try:
-        return_code_send = send_process.wait(timeout=timeout_seconds)
-        logger.debug("Send process completed with return code: %d", return_code_send)
-    except subprocess.TimeoutExpired:
-        logger.error("Timeout waiting for send process")
-        send_process.kill()
-        transfer_utils.cleanup_pipeline(pipeline_processes)
-        raise __util__.SnapshotTransferError("Timeout waiting for send process")
-
-    # Wait for pipeline processes
-    pipeline_return_codes = transfer_utils.wait_for_pipeline(
-        pipeline_processes, timeout=timeout_seconds
-    )
-
-    try:
-        # Match the send timeout: applying a large received stream can legitimately
-        # take well over the old 300s, and killing it here manufactures exactly the
-        # partial subvolume this path must avoid.
         return_code_receive = receive_process.wait(timeout=timeout_seconds)
         logger.debug(
-            "Receive process completed with return code: %d", return_code_receive
+            "Receive process completed with return code: %s", return_code_receive
         )
     except subprocess.TimeoutExpired:
         logger.error("Timeout waiting for receive process")
-        receive_process.kill()
+        _terminate_process(receive_process)
+        _terminate_process(send_process)
+        transfer_utils.cleanup_pipeline(pipeline_processes)
         raise __util__.SnapshotTransferError("Timeout waiting for receive process")
+
+    if return_code_receive != 0:
+        # The receive failed, so the send's consumer is gone. Do NOT wait on the send
+        # (it may never see the closed pipe and would hang); terminate it now and report.
+        _terminate_process(send_process)
+        return_code_send = (
+            send_process.returncode if send_process.returncode is not None else -1
+        )
+    else:
+        # The receive succeeded; the send should already be done. Reap it with a short
+        # grace and terminate if it somehow lingers, so a stuck send cannot hang a
+        # transfer whose data is already safely received.
+        try:
+            return_code_send = send_process.wait(timeout=send_reap_seconds)
+        except subprocess.TimeoutExpired:
+            logger.warning(
+                "Send process still running after the receive finished; terminating it"
+            )
+            _terminate_process(send_process)
+            return_code_send = (
+                send_process.returncode if send_process.returncode is not None else -1
+            )
+    logger.debug("Send process completed with return code: %s", return_code_send)
+
+    # Wait for any intermediate pipeline processes (compress/throttle/progress).
+    pipeline_return_codes = transfer_utils.wait_for_pipeline(
+        pipeline_processes, timeout=timeout_seconds
+    )
 
     return [return_code_send] + pipeline_return_codes + [return_code_receive]
 
@@ -1131,6 +1151,29 @@ def _log_subprocess_error(e, destination_endpoint) -> None:
 
     if hasattr(e, "stdout") and e.stdout:
         logger.error("Process stdout: %s", e.stdout.decode("utf-8", errors="replace"))
+
+
+def _terminate_process(proc, grace: float = 5.0) -> None:
+    """Stop a subprocess promptly: SIGTERM, then SIGKILL if it lingers.
+
+    Used to tear down a producer whose consumer has already exited (e.g. a remote
+    ``ssh btrfs send`` after the local ``btrfs receive`` failed early) so the transfer
+    supervisor never blocks for the full timeout waiting on a process that will not
+    finish on its own. Best-effort and idempotent -- safe to call on a process that has
+    already exited (terminate/kill on a reaped process is a harmless no-op)."""
+    if proc is None:
+        return
+    try:
+        proc.terminate()
+        proc.wait(timeout=grace)
+    except subprocess.TimeoutExpired:
+        try:
+            proc.kill()
+            proc.wait(timeout=grace)
+        except Exception:  # noqa: BLE001 - best-effort teardown
+            pass
+    except Exception:  # noqa: BLE001 - best-effort teardown
+        pass
 
 
 def _cleanup_processes(send_process, receive_process) -> None:

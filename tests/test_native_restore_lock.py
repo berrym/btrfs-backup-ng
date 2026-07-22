@@ -12,16 +12,16 @@ BACKUP endpoint -- which legitimately has no ``source``. Two mistakes in
    ``TypeError: unsupported operand type(s) for /: 'str' and 'str'``.
 
 Raw endpoints were always immune (they override ``set_lock`` decorator-free and their
-``send`` reads a stream). Removing the guards + coercing the path fully enable LOCAL
-btrfs restore. Restore from a REMOTE ssh:// btrfs source is a separate matter: the base
-``send``/lock run locally, so it cannot stream a snapshot back from the remote host --
-the restore CLI now rejects it up front with a clear message (also pinned here) until a
-remote-aware ssh send lands. These tests pin the local-restore fixes and that guard.
+``send`` reads a stream). Removing the guards + coercing the path enable LOCAL btrfs
+restore; SSHEndpoint additionally overrides ``set_lock`` (in-memory) and ``send`` (stream
+``btrfs send`` FROM the remote over ssh) so REMOTE ssh:// btrfs restore works too -- see
+``tests/test_ssh_remote_restore.py`` for the ssh-specific overrides. These tests pin the
+shared base fixes.
 """
 
 from __future__ import annotations
 
-import argparse
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -100,47 +100,65 @@ def test_snapshot_still_requires_source(tmp_path):
         ep.snapshot()
 
 
-def test_remote_ssh_native_restore_source_fails_fast():
-    """Restoring a native btrfs backup from a remote ssh:// source is not supported yet
-    (SSHEndpoint runs send/lock locally). The restore path must reject it up front with a
-    clear, actionable message -- NOT let it die later with a misleading local-path error.
-    Mutation guard: neutering the ``source.startswith('ssh://')`` check drops the raise."""
-    from btrfs_backup_ng.cli.restore import _reject_remote_ssh_restore
+def test_restore_local_endpoint_uses_backup_prefix(tmp_path):
+    """The destination endpoint must parse already-restored snapshots under the SAME
+    prefix the backup uses; an empty prefix made it miss prefixed names, so the restore
+    chain re-restored an existing parent (and hung over ssh). Mutation guard: hardcoding
+    ``snap_prefix=''`` in _prepare_local_endpoint fails this."""
+    from btrfs_backup_ng.cli.restore import _prepare_local_endpoint
 
-    with pytest.raises(__util__.AbortError, match="not supported yet"):
-        _reject_remote_ssh_restore("ssh://user@backup-host:/backups/data")
-
-
-def test_reject_does_not_block_raw_ssh_or_raw_or_local():
-    """The reject must be scoped to the ``ssh://`` scheme only: raw+ssh:// (which DOES
-    support remote restore), raw://, and local paths must NOT be rejected."""
-    from btrfs_backup_ng.cli.restore import _reject_remote_ssh_restore
-
-    for source in (
-        "raw+ssh://user@backup-host:/backups/data",
-        "raw:///mnt/backup",
-        "/mnt/backup/data",
-    ):
-        _reject_remote_ssh_restore(source)  # must not raise
-
-
-def test_ssh_list_path_is_not_rejected_wiring(monkeypatch):
-    """The reject fires on RESTORE but must NOT touch ``restore --list ssh://...`` (a
-    read-only op that works). This pins the CALLER WIRING, not just the pure function: a
-    future change routing the reject through _execute_list (or a shared helper both
-    restore and list call) would silently break ssh:// listing. Mutation guard: adding a
-    ``_reject_remote_ssh_restore(source)`` call into _execute_list trips the sentinel."""
-    import btrfs_backup_ng.cli.restore as restore_mod
-
-    def _must_not_call(*a, **k):
-        raise AssertionError("reject must NOT be invoked on the list path")
-
-    monkeypatch.setattr(restore_mod, "_reject_remote_ssh_restore", _must_not_call)
-    monkeypatch.setattr(
-        restore_mod, "_prepare_backup_endpoint", lambda *a, **k: object()
+    ep = _prepare_local_endpoint(
+        tmp_path, timestamp_format="%Y%m%d-%H%M%S", snap_prefix="home-"
     )
-    monkeypatch.setattr(restore_mod, "list_remote_snapshots", lambda *a, **k: [])
+    assert ep.config["snap_prefix"] == "home-"
 
-    args = argparse.Namespace(source="ssh://user@backup-host:/backups/data")
-    rc = restore_mod._execute_list(args)
-    assert rc == 0  # listed (empty) cleanly -- NOT rejected with exit 1
+
+def test_incremental_parent_is_the_backup_side_snapshot(monkeypatch):
+    """``btrfs send -p`` runs where the backup lives (the REMOTE host for ssh://), so the
+    parent handed to the send must be the BACKUP snapshot -- whose path is valid there --
+    not a locally-restored copy whose path is meaningless on the remote (that always
+    failed). Mutation guard: removing the backup-side remap in restore_snapshots hands the
+    LOCAL parent to send() and fails this."""
+    import time as _time
+
+    import btrfs_backup_ng.core.restore as restore_mod
+    from btrfs_backup_ng import __util__
+
+    def _snap(name_time, endpoint, path):
+        s = __util__.Snapshot(
+            path, "s-", endpoint, time_obj=_time.strptime(name_time, "%Y%m%d-%H%M%S")
+        )
+        return s
+
+    backup_ep = MagicMock()
+    backup_ep.get_id.return_value = "backup"
+    local_ep = MagicMock()
+    local_ep.get_id.return_value = "local"
+
+    # Same NAME on both sides, but different locations (remote backup vs local dest).
+    b0 = _snap("20240101-000000", backup_ep, "/remote/backup")
+    b1 = _snap("20240102-000000", backup_ep, "/remote/backup")
+    l0 = _snap("20240101-000000", local_ep, "/local/dest")  # already restored locally
+
+    backup_ep.list_snapshots.return_value = [b0, b1]
+    local_ep.list_snapshots.return_value = [l0]
+
+    # Force the name/time fallback parent path (the one that picked a local snapshot).
+    monkeypatch.setattr(
+        restore_mod, "find_parent_by_uuid", lambda *a, **k: (None, None)
+    )
+
+    captured = {}
+
+    def fake_restore_snapshot(be, le, snap, parent=None, **k):
+        captured[snap.get_name()] = parent
+
+    monkeypatch.setattr(restore_mod, "restore_snapshot", fake_restore_snapshot)
+
+    restore_mod.restore_snapshots(
+        backup_ep, local_ep, snapshot_name=b1.get_name(), skip_existing=True
+    )
+
+    parent = captured[b1.get_name()]
+    assert parent is b0  # the BACKUP-side object (remote path), not the local copy l0
+    assert str(parent.get_path()).startswith("/remote/backup")
