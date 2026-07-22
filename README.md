@@ -8,7 +8,18 @@
 [![Ruff](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/ruff/main/assets/badge/v2.json)](https://github.com/astral-sh/ruff)
 [![Code style: black](https://img.shields.io/badge/code%20style-black-000000.svg)](https://github.com/psf/black)
 
-A modern, feature-rich tool for automated BTRFS snapshot backup management with TOML configuration, time-based retention policies, and robust SSH transfer support.
+**btrfs-backup-ng** creates, transfers, prunes, and restores btrfs snapshots — to local
+disks, over SSH, or as raw stream files on any filesystem — with TOML configuration,
+incremental transfers, and time-based retention.
+
+### Project status
+
+Actively developed, pre-1.0, with a strong emphasis on data integrity. Backup and restore
+across local, SSH, and raw targets are working and have been adversarially tested and
+verified byte-identical on real hardware. A reliability-hardening roadmap (lock
+persistence, retention edge cases, deeper verification, SSH hardening) is tracked in
+[#20](https://github.com/berrym/btrfs-backup-ng/issues/20). As with any backup tool, test
+your restores.
 
 ## Heritage
 
@@ -24,9 +35,14 @@ See the [LICENSE](LICENSE) file for full copyright attribution.
 
 ### Core Functionality
 - **TOML Configuration**: Clean, validated configuration files (no custom syntax)
-- **Subcommand CLI**: Modern interface with `run`, `snapshot`, `transfer`, `prune`, `restore`, `verify`, `estimate`, `list`, `status`
-- **Disaster Recovery**: Built-in restore command to pull backups back to local systems
-- **Backup Verification**: Multi-level integrity checks (metadata, stream, full restore test)
+- **Subcommand CLI**: Modern interface with `run`, `snapshot`, `transfer`, `prune`, `restore`, `verify`, `estimate`, `raw`, `snapper`, `doctor`, `list`, `status`
+- **Disaster Recovery**: Restore backups back to btrfs from local, remote SSH, and raw
+  targets — full or incremental chains, verified byte-identical against real hardware
+- **Reliable Transfers**: A failed or partial transfer is never reported as success, and
+  an interrupted stream terminates cleanly instead of hanging (local, SSH, and raw alike)
+- **Backup Verification**: Raw backups carry a sealed checksum and can be re-verified
+  against it (`raw verify`); btrfs backup verification (metadata / stream / full restore
+  test) is being deepened as part of the reliability roadmap ([#20](https://github.com/berrym/btrfs-backup-ng/issues/20))
 - **Space-Aware Operations**: Pre-flight destination space checking with btrfs quota support
 - **Time-based Retention**: Intuitive policies (hourly, daily, weekly, monthly, yearly)
 
@@ -60,9 +76,15 @@ See the [LICENSE](LICENSE) file for full copyright attribution.
 
 ### Raw Targets (Non-btrfs Destinations)
 - **Write to Files**: Store btrfs send streams as files on any filesystem (NFS, SMB, cloud storage)
+- **Self-describing Backups**: Every raw backup writes an authoritative `.meta` sidecar
+  recording its compression, encryption, cipher, size, and a checksum of the exact bytes
+  written — so a backup can be listed, integrity-checked, and restored without guessing
 - **Compression**: gzip, pigz, zstd, lz4, xz, lzo, bzip2, pbzip2
 - **Encryption**: GPG (public-key) or OpenSSL (symmetric, btrbk-compatible)
-- **Restore Support**: Restore from raw backups back to btrfs
+- **Restore Support**: Restore from `raw://` and `raw+ssh://` backups back to btrfs
+- **Management Commands**: `raw list`, `raw verify` (recompute and compare checksums),
+  `raw backfill-metadata` (write sidecars for older streams), and `raw encrypt` (encrypt
+  existing plaintext backups in place)
 - **btrbk Compatibility**: Migrate raw_target_compress and raw_target_encrypt settings
 
 ### Monitoring & Automation
@@ -225,9 +247,11 @@ btrfs-backup-ng install --user --timer=daily
 | `snapshot` | Create snapshots only |
 | `transfer` | Transfer existing snapshots to targets |
 | `prune` | Apply retention policies |
-| `restore` | Restore snapshots from backup location |
+| `restore` | Restore snapshots from a local, SSH, or raw backup location |
 | `verify` | Verify backup integrity (metadata, stream, or full test) |
 | `estimate` | Estimate backup transfer sizes (use `--check-space` for space verification) |
+| `raw` | Manage raw backups: `list`, `verify`, `backfill-metadata`, `encrypt` |
+| `snapper` | Back up, list, and show status of Snapper-managed snapshots |
 | `doctor` | Diagnose backup system health and fix common issues |
 | `list` | Show snapshots and backups |
 | `status` | Show job status and statistics |
