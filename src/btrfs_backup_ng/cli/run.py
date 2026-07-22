@@ -366,6 +366,8 @@ def _backup_volume(
 
             if target.ssh_key:
                 dest_kwargs["ssh_identity_file"] = target.ssh_key
+            if target.ssh_auth_sock:
+                dest_kwargs["ssh_auth_sock"] = target.ssh_auth_sock
 
             thread_raw_encryption(dest_kwargs, target)
             thread_raw_compression(dest_kwargs, target, compress_override)
@@ -556,6 +558,8 @@ def _backup_snapper_volume(
             if target.ssh_key:
                 snapper_endpoint_config["ssh_identity_file"] = target.ssh_key
                 snapper_endpoint_config["ssh_key"] = target.ssh_key
+            if target.ssh_auth_sock:
+                snapper_endpoint_config["ssh_auth_sock"] = target.ssh_auth_sock
             thread_raw_encryption(snapper_endpoint_config, target)
             thread_raw_compression(snapper_endpoint_config, target, compress_override)
             destination_endpoint = endpoint.choose_endpoint(

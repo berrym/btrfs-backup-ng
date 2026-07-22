@@ -644,6 +644,11 @@ Config-driven restore:
         help="SSH private key file",
     )
     restore_parser.add_argument(
+        "--ssh-auth-sock",
+        metavar="PATH",
+        help="Explicit ssh-agent socket (overrides auto-discovery; useful under sudo)",
+    )
+    restore_parser.add_argument(
         "--compress",
         metavar="METHOD",
         choices=["none", "gzip", "zstd", "lz4", "pigz", "lzop"],
@@ -790,6 +795,11 @@ Examples:
         metavar="FILE",
         help="SSH private key file",
     )
+    verify_parser.add_argument(
+        "--ssh-auth-sock",
+        metavar="PATH",
+        help="Explicit ssh-agent socket (overrides auto-discovery; useful under sudo)",
+    )
     add_fs_checks_args(verify_parser)
     verify_parser.add_argument(
         "--json",
@@ -930,6 +940,11 @@ Examples:
         "--ssh-key",
         metavar="FILE",
         help="SSH private key file",
+    )
+    estimate_parser.add_argument(
+        "--ssh-auth-sock",
+        metavar="PATH",
+        help="Explicit ssh-agent socket (overrides auto-discovery; useful under sudo)",
     )
     estimate_parser.add_argument(
         "--timestamp-format",
@@ -1278,6 +1293,11 @@ Examples:
         help="SSH private key file",
     )
     snapper_backup.add_argument(
+        "--ssh-auth-sock",
+        metavar="PATH",
+        help="Explicit ssh-agent socket (overrides auto-discovery; useful under sudo)",
+    )
+    snapper_backup.add_argument(
         "--compress",
         metavar="METHOD",
         choices=["none", "gzip", "zstd", "lz4", "pigz", "lzop"],
@@ -1394,6 +1414,11 @@ Examples:
         "--ssh-key",
         metavar="FILE",
         help="SSH private key file",
+    )
+    snapper_restore.add_argument(
+        "--ssh-auth-sock",
+        metavar="PATH",
+        help="Explicit ssh-agent socket (overrides auto-discovery; useful under sudo)",
     )
     snapper_restore.add_argument(
         "-l",

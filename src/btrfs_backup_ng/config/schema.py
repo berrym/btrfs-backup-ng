@@ -129,6 +129,8 @@ class TargetConfig:
         ssh_sudo: Whether to use sudo on remote SSH targets
         ssh_port: SSH port for remote targets
         ssh_key: Path to SSH private key
+        ssh_auth_sock: Explicit ssh-agent socket path (overrides auto-discovery; useful
+            under sudo where SSH_AUTH_SOCK is stripped and the key is passphrase-protected)
         ssh_password_auth: Allow password authentication fallback
         compress: Compression algorithm for transfers (none, gzip, zstd, lz4)
         rate_limit: Bandwidth limit for transfers (e.g., "10M", "1G", "500K")
@@ -143,6 +145,7 @@ class TargetConfig:
     ssh_sudo: bool = False
     ssh_port: int = 22
     ssh_key: Optional[str] = None
+    ssh_auth_sock: Optional[str] = None
     ssh_password_auth: bool = True
     compress: str = "none"
     rate_limit: Optional[str] = None
@@ -175,6 +178,7 @@ class RawTargetConfig:
         ssh_sudo: Whether to use sudo on remote SSH targets
         ssh_port: SSH port for remote targets
         ssh_key: Path to SSH private key
+        ssh_auth_sock: Explicit ssh-agent socket path (overrides auto-discovery)
     """
 
     path: str
@@ -185,6 +189,7 @@ class RawTargetConfig:
     ssh_sudo: bool = False
     ssh_port: int = 22
     ssh_key: Optional[str] = None
+    ssh_auth_sock: Optional[str] = None
 
     def __post_init__(self):
         """Validate configuration after initialization."""

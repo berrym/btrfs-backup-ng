@@ -154,6 +154,8 @@ def _estimate_from_config(args: argparse.Namespace, volume_path: str) -> int:
             dest_kwargs["ssh_sudo"] = True
         if target.ssh_key:
             dest_kwargs["ssh_identity_file"] = target.ssh_key
+        if target.ssh_auth_sock:
+            dest_kwargs["ssh_auth_sock"] = target.ssh_auth_sock
 
         dest_ep = endpoint.choose_endpoint(
             target.path,
@@ -197,6 +199,7 @@ def _estimate_direct(args: argparse.Namespace, source: str, destination: str) ->
     prefix = getattr(args, "prefix", "") or ""
     ssh_sudo = getattr(args, "ssh_sudo", False)
     ssh_key = getattr(args, "ssh_key", None)
+    ssh_auth_sock = getattr(args, "ssh_auth_sock", None)
 
     # Prepare source endpoint
     fs_checks_mode = get_fs_checks_mode(args)
@@ -234,6 +237,8 @@ def _estimate_direct(args: argparse.Namespace, source: str, destination: str) ->
             dest_kwargs["ssh_sudo"] = True
         if ssh_key:
             dest_kwargs["ssh_identity_file"] = ssh_key
+        if ssh_auth_sock:
+            dest_kwargs["ssh_auth_sock"] = ssh_auth_sock
         if not destination.startswith("ssh://"):
             dest_kwargs["path"] = Path(destination).resolve()
 

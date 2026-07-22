@@ -52,6 +52,8 @@ def execute(args: argparse.Namespace) -> int:
             endpoint_kwargs["ssh_sudo"] = True
         if args.ssh_key:
             endpoint_kwargs["ssh_identity_file"] = args.ssh_key
+        if getattr(args, "ssh_auth_sock", None):
+            endpoint_kwargs["ssh_auth_sock"] = args.ssh_auth_sock
     else:
         # For local paths, set 'path' for LocalEndpoint
         endpoint_kwargs["path"] = Path(args.location).resolve()

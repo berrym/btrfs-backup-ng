@@ -456,6 +456,9 @@ def _prepare_backup_endpoint(args: argparse.Namespace, source: str):
         ssh_key = getattr(args, "ssh_key", None)
         if ssh_key:
             endpoint_kwargs["ssh_identity_file"] = ssh_key
+        ssh_auth_sock = getattr(args, "ssh_auth_sock", None)
+        if ssh_auth_sock:
+            endpoint_kwargs["ssh_auth_sock"] = ssh_auth_sock
     else:
         # For local paths, we need to set 'path' as well since LocalEndpoint
         # always resolves config["path"] during initialization

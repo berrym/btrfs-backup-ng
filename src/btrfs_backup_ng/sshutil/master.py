@@ -36,6 +36,7 @@ class SSHMasterManager:
         debug: bool = False,
         identity_file: Optional[str] = None,
         allow_password_auth: bool = False,
+        ssh_auth_sock: Optional[str] = None,
     ):
         self.hostname = hostname
         self.username = username or getpass.getuser()
@@ -45,6 +46,16 @@ class SSHMasterManager:
         self.debug = debug
         self.identity_file = identity_file
         self.allow_password_auth = allow_password_auth
+        # Explicit ssh-agent socket override (config `ssh_auth_sock` / CLI / the
+        # BTRFS_BACKUP_SSH_AUTH_SOCK env var). Takes precedence over auto-discovery so a
+        # multi-agent or non-standard deployment can pin exactly which agent to use.
+        self.ssh_auth_sock = ssh_auth_sock or os.environ.get(
+            "BTRFS_BACKUP_SSH_AUTH_SOCK"
+        )
+        # The agent socket actually used for the last connection (for diagnostics/errors),
+        # and whether it had keys loaded (drives the auth-failure guidance).
+        self._resolved_agent_sock: Optional[str] = None
+        self._agent_socket_had_keys: bool = True
 
         # Password caching
         self._cached_ssh_password: Optional[str] = None
@@ -182,101 +193,125 @@ class SSHMasterManager:
         """Check if sshpass utility is available."""
         return shutil.which("sshpass") is not None
 
-    def _find_ssh_agent_socket(self, uid: int) -> Optional[str]:
-        """Find SSH agent socket for a given user.
+    @staticmethod
+    def _owned_socket(path: Optional[str], uid: int, *, follow: bool) -> bool:
+        """True if ``path`` is a unix socket owned by ``uid`` (or root).
 
-        Searches common locations for SSH agent sockets. This is useful when
-        running with sudo where SSH_AUTH_SOCK may not be preserved.
+        The ownership gate stops a hostile path (in the environment/config or planted in a
+        world-writable search dir) from making root connect to an attacker's agent -- only
+        root can create a root-owned file, and a non-target user cannot create one owned by
+        the target uid. ``follow=False`` uses lstat, so a planted symlink is rejected
+        outright (no TOCTOU / redirection). ``follow=True`` is for a user-pinned override /
+        preserved SSH_AUTH_SOCK, where a symlink is the user's own choice but the resolved
+        target must still be a socket they own.
+        """
+        if not path:
+            return False
+        import stat as _stat
 
-        The search prioritizes sockets that are likely to have keys loaded:
-        1. Traditional ssh-agent sockets in /tmp (from ssh-agent or ssh -A)
-        2. GNOME Keyring socket
-        3. GPG agent with SSH support
-        4. systemd ssh-agent socket (often empty/unused)
+        try:
+            st = os.stat(path) if follow else os.lstat(path)
+        except OSError:
+            return False
+        return _stat.S_ISSOCK(st.st_mode) and st.st_uid in (uid, 0)
+
+    def _resolve_agent_socket(self, uid: int, env: dict) -> Optional[str]:
+        """Resolve which ssh-agent socket to use.
+
+        Precedence: (1) explicit override (config ``ssh_auth_sock`` /
+        ``BTRFS_BACKUP_SSH_AUTH_SOCK``), (2) a preserved ``SSH_AUTH_SOCK`` in the
+        environment (``sudo -E`` / ``--preserve-env``), (3) auto-discovery. Every source is
+        validated to be a socket owned by the invoking user (or root) so a hostile path
+        cannot make root connect to an attacker-controlled agent.
+        """
+        if self.ssh_auth_sock:
+            if self._owned_socket(self.ssh_auth_sock, uid, follow=True):
+                return self.ssh_auth_sock
+            logger.warning(
+                "Configured ssh_auth_sock %s is not a usable agent socket owned by the "
+                "backup user; falling back to auto-discovery.",
+                self.ssh_auth_sock,
+            )
+        env_sock = env.get("SSH_AUTH_SOCK")
+        if env_sock and self._owned_socket(env_sock, uid, follow=True):
+            return env_sock
+        return self._find_ssh_agent_socket(uid, env)
+
+    def _find_ssh_agent_socket(self, uid: int, env: dict) -> Optional[str]:
+        """Find an ssh-agent socket owned by ``uid``, preferring one with keys loaded.
+
+        Needed because sudo strips SSH_AUTH_SOCK, so a passphrase-protected key -- whose
+        usable key lives only in the agent -- would otherwise be unusable. Candidates are
+        validated as real unix sockets owned by the user (symlinks rejected). This is
+        best-effort breadth; setups not covered here (or multi-agent systems) should pin
+        ``ssh_auth_sock`` explicitly.
 
         Args:
-            uid: User ID to search for agent sockets
+            uid: User ID whose agent socket to find.
+            env: Environment already prepared by start_master (correct HOME under sudo).
 
         Returns:
-            Path to agent socket if found, None otherwise
+            Path to an agent socket if found, else None.
         """
         import glob
         import subprocess
 
-        # Common locations for ssh-agent sockets, ordered by likelihood of having keys
+        # Owning user's home for ~/.ssh sockets. Derive from the uid so it is correct under
+        # sudo; if the uid is not in the password db (containers/NSS), fall back to the
+        # HOME already resolved into env by start_master -- NOT os.path.expanduser, which
+        # under sudo would wrongly resolve to root's home.
+        try:
+            user_home = pwd.getpwuid(uid).pw_dir
+        except (KeyError, OSError):
+            user_home = env.get("HOME") or os.path.expanduser("~")
+
         search_paths = [
-            # Traditional ssh-agent in /tmp - most likely to have keys from ssh-add
-            "/tmp/ssh-*/agent.*",
-            # GNOME Keyring - often has keys from login
-            f"/run/user/{uid}/keyring/ssh",
-            # gpg-agent with ssh support
-            f"/run/user/{uid}/gnupg/S.gpg-agent.ssh",
-            # systemd ssh-agent - often exists but may be empty
-            f"/run/user/{uid}/ssh-agent.socket",
+            "/tmp/ssh-*/agent.*",  # traditional ssh-agent
+            f"{user_home}/.ssh/agent/*",  # custom agent managers / keychains
+            f"{user_home}/.ssh/agent.sock",
+            f"{user_home}/.ssh/*.sock",
+            f"{user_home}/.1password/agent.sock",  # 1Password
+            f"{user_home}/.bitwarden-ssh-agent.sock",  # Bitwarden
+            f"/run/user/{uid}/keyring/ssh",  # GNOME Keyring
+            f"/run/user/{uid}/gcr/ssh",  # gcr (newer GNOME)
+            f"/run/user/{uid}/gnupg/S.gpg-agent.ssh",  # gpg-agent with ssh support
+            f"/run/user/{uid}/ssh-agent.socket",  # systemd per-user
+            f"/run/user/{uid}/openssh_agent",  # openssh per-user
         ]
 
         def socket_has_keys(sock_path: str) -> bool:
-            """Check if an agent socket has any keys loaded."""
+            """True if the agent at sock_path has at least one key loaded."""
             try:
-                env = os.environ.copy()
-                env["SSH_AUTH_SOCK"] = sock_path
+                sub_env = os.environ.copy()
+                sub_env["SSH_AUTH_SOCK"] = sock_path
                 result = subprocess.run(
-                    ["ssh-add", "-l"],
-                    env=env,
-                    capture_output=True,
-                    timeout=5,
+                    ["ssh-add", "-l"], env=sub_env, capture_output=True, timeout=5
                 )
-                # Return code 0 means keys are loaded
-                # Return code 1 means "no identities"
-                return result.returncode == 0
+                return result.returncode == 0  # 0 = has keys, 1 = none, 2 = no agent
             except Exception:
                 return False
 
-        # First pass: find sockets with keys loaded
-        for pattern in search_paths:
-            if "*" in pattern:
-                # Glob pattern - find matching sockets owned by the user
-                for sock in glob.glob(pattern):
-                    try:
-                        stat = os.stat(sock)
-                        if stat.st_uid == uid and socket_has_keys(sock):
-                            logger.debug(f"Found agent socket with keys: {sock}")
-                            return sock
-                    except (OSError, IOError):
-                        continue
-            else:
-                # Exact path
-                if os.path.exists(pattern):
-                    try:
-                        stat = os.stat(pattern)
-                        if stat.st_uid == uid and socket_has_keys(pattern):
-                            logger.debug(f"Found agent socket with keys: {pattern}")
-                            return pattern
-                    except (OSError, IOError):
-                        continue
+        def candidates():
+            # sorted() so a deterministic socket is chosen when a glob matches several.
+            for pattern in search_paths:
+                if "*" in pattern:
+                    yield from sorted(glob.glob(pattern))
+                elif os.path.exists(pattern):
+                    yield pattern
 
-        # Second pass: return any accessible socket (even without keys)
-        # This allows password auth fallback to work
-        for pattern in search_paths:
-            if "*" in pattern:
-                for sock in glob.glob(pattern):
-                    try:
-                        stat = os.stat(sock)
-                        if stat.st_uid == uid:
-                            logger.debug(f"Found agent socket (no keys): {sock}")
-                            return sock
-                    except (OSError, IOError):
-                        continue
-            else:
-                if os.path.exists(pattern):
-                    try:
-                        stat = os.stat(pattern)
-                        if stat.st_uid == uid:
-                            logger.debug(f"Found agent socket (no keys): {pattern}")
-                            return pattern
-                    except (OSError, IOError):
-                        continue
-
+        # Pass 1: a socket that actually has keys (what we really want).
+        for sock in candidates():
+            if self._owned_socket(sock, uid, follow=False) and socket_has_keys(sock):
+                logger.debug("Found agent socket with keys: %s", sock)
+                self._agent_socket_had_keys = True
+                return sock
+        # Pass 2: any owned socket (no keys loaded). Kept so the failure path can tell the
+        # user an agent exists but is empty ("run ssh-add") instead of "none found".
+        for sock in candidates():
+            if self._owned_socket(sock, uid, follow=False):
+                logger.debug("Found agent socket (no keys loaded): %s", sock)
+                self._agent_socket_had_keys = False
+                return sock
         return None
 
     def _try_key_auth(self, env: dict) -> bool:
@@ -422,17 +457,23 @@ class SSHMasterManager:
                 sudo_user_info = pwd.getpwnam(self.sudo_user)
                 env["HOME"] = sudo_user_info.pw_dir
                 env["USER"] = self.sudo_user
+                agent_uid = sudo_user_info.pw_uid
+            else:
+                agent_uid = os.getuid()
 
-                # Preserve SSH_AUTH_SOCK for ssh-agent access
-                # When running with sudo, the agent socket variable is often cleared
-                # but the socket itself may still be accessible
-                if "SSH_AUTH_SOCK" not in env or not os.path.exists(
-                    env.get("SSH_AUTH_SOCK", "")
-                ):
-                    agent_sock = self._find_ssh_agent_socket(sudo_user_info.pw_uid)
-                    if agent_sock:
-                        env["SSH_AUTH_SOCK"] = agent_sock
-                        logger.debug(f"Found SSH agent socket: {agent_sock}")
+            # Resolve the ssh-agent socket. A passphrase-protected key can only be used
+            # for signing via its agent; sudo strips SSH_AUTH_SOCK, so without this the
+            # server accepts the offered public key but the client cannot sign it ->
+            # "Permission denied". Precedence: explicit override, then a preserved
+            # SSH_AUTH_SOCK, then auto-discovery across common socket locations.
+            agent_sock = self._resolve_agent_socket(agent_uid, env)
+            if agent_sock:
+                env["SSH_AUTH_SOCK"] = agent_sock
+                self._resolved_agent_sock = agent_sock
+                logger.debug("Using ssh-agent socket: %s", agent_sock)
+            else:
+                self._resolved_agent_sock = None
+                logger.debug("No usable ssh-agent socket found")
 
             # Try key-based auth first
             logger.debug("Attempting SSH key-based authentication...")
@@ -467,9 +508,7 @@ class SSHMasterManager:
                 logger.error(
                     f"All SSH authentication methods failed for {self.username}@{self.hostname}"
                 )
-                logger.info(
-                    "Ensure SSH keys are properly configured or provide password via:"
-                )
+                self._log_auth_failure_help()
                 logger.info("  - BTRFS_BACKUP_SSH_PASSWORD environment variable")
                 logger.info("  - Interactive prompt (when running in a terminal)")
                 logger.info("  - Install 'sshpass' for non-interactive password auth")
@@ -477,11 +516,50 @@ class SSHMasterManager:
                 logger.error(
                     f"SSH key authentication failed for {self.username}@{self.hostname}"
                 )
-                logger.info(
-                    "To enable password fallback, the connection must allow password auth"
-                )
+                self._log_auth_failure_help()
 
             return False
+
+    def _log_auth_failure_help(self) -> None:
+        """Emit actionable remediation for an SSH auth failure.
+
+        The most common failure under sudo is a passphrase-protected key whose usable
+        (decrypted) key lives only in the user's ssh-agent, which sudo cannot see because
+        it strips SSH_AUTH_SOCK. Tell the user exactly how to fix that."""
+        if self._resolved_agent_sock:
+            if self._agent_socket_had_keys:
+                logger.info(
+                    "An ssh-agent was used (%s) but did not provide a key the server "
+                    "accepted; check `ssh-add -l` and that the key is authorized on the "
+                    "server.",
+                    self._resolved_agent_sock,
+                )
+            else:
+                logger.info(
+                    "An ssh-agent was found (%s) but has NO keys loaded; run `ssh-add` to "
+                    "load your key, or point ssh_auth_sock at the agent that holds it.",
+                    self._resolved_agent_sock,
+                )
+            return
+        logger.info("No usable ssh-agent was found for %s.", self.username)
+        if self.running_as_sudo:
+            logger.info(
+                "sudo strips SSH_AUTH_SOCK, so a passphrase-protected key (whose key "
+                "lives in your agent) cannot sign. Fix with ONE of:"
+            )
+            logger.info(
+                "  - run: sudo --preserve-env=SSH_AUTH_SOCK <command>  (or sudo -E)"
+            )
+        else:
+            logger.info(
+                "  - ensure your ssh-agent is running and holds the key: "
+                "`eval $(ssh-agent)` then `ssh-add`"
+            )
+        logger.info(
+            "  - set ssh_auth_sock in the target config, export "
+            "BTRFS_BACKUP_SSH_AUTH_SOCK=$SSH_AUTH_SOCK, or pass --ssh-auth-sock"
+        )
+        logger.info("  - or use a passphrase-less key via ssh_key")
 
     def stop_master(self) -> bool:
         """Stop the SSH master connection.

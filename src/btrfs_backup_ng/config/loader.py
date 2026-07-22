@@ -196,6 +196,7 @@ def _parse_target(data: dict[str, Any]) -> TargetConfig:
         ssh_sudo=data.get("ssh_sudo", False),
         ssh_port=data.get("ssh_port", 22),
         ssh_key=data.get("ssh_key"),
+        ssh_auth_sock=data.get("ssh_auth_sock"),
         ssh_password_auth=data.get("ssh_password_auth", True),
         compress=compress,
         rate_limit=data.get("rate_limit"),

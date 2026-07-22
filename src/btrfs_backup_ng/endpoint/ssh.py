@@ -224,6 +224,7 @@ class SSHEndpoint(Endpoint):
             "passwordless",
             "ssh_identity_file",
             "ssh_key",
+            "ssh_auth_sock",
             "ssh_password_fallback",
         ):
             if config.get(_ssh_key) is not None:
@@ -437,6 +438,7 @@ class SSHEndpoint(Endpoint):
             debug=True,
             identity_file=self.config.get("ssh_identity_file"),
             allow_password_auth=allow_password,
+            ssh_auth_sock=self.config.get("ssh_auth_sock"),
         )
         logger.debug("SSHMasterManager created successfully")
 
