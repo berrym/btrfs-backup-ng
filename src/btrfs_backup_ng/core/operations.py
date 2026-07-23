@@ -1412,7 +1412,30 @@ def _execute_transfers(
     destination_id = destination_endpoint.get_id()
     result = TransferResult()
 
+    # Names transferred in THIS run, to guard within-run incremental chaining: if a snapshot
+    # parents off an earlier in-run transfer that FAILED, the parent is not on the destination,
+    # so a ``send -p`` against it cannot apply. btrfs receive self-detects this (nonzero rc ->
+    # SnapshotTransferError), but a raw target would just write bytes and commit a valid-looking
+    # but UNRESTORABLE stream -- a false success (R1 violation). Short-circuit such a child on
+    # ALL endpoint types instead.
+    planned_names = {s.get_name() for s, _ in plan}
+    transferred_names: set = set()
+
     for best_snapshot, parent in plan:
+        if parent is not None:
+            parent_name = parent.get_name()
+            # A parent that is itself scheduled in this run must have already succeeded
+            # (plan is oldest-first, executed in order) before we can chain onto it.
+            if parent_name in planned_names and parent_name not in transferred_names:
+                err = __util__.SnapshotTransferError(
+                    f"incremental parent {parent_name} was not transferred to the "
+                    f"destination (its transfer failed); refusing to send "
+                    f"{best_snapshot.get_name()} against a missing parent"
+                )
+                logger.error("Skipping %s: %s", best_snapshot.get_name(), err)
+                result.failed.append((best_snapshot, err))
+                continue
+
         # Set locks
         source_endpoint.set_lock(best_snapshot, destination_id, True)
         if parent:
@@ -1441,6 +1464,7 @@ def _execute_transfers(
                 logger.debug("Post-transfer snapshot list refresh failed: %s", e)
 
             result.transferred.append(best_snapshot)
+            transferred_names.add(best_snapshot.get_name())
 
         except __util__.SnapshotTransferError as e:
             logger.error("Snapshot transfer failed for %s: %s", best_snapshot, e)
