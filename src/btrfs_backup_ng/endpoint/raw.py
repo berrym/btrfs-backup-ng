@@ -468,15 +468,14 @@ class RawEndpoint(Endpoint):
         get_name = getattr(snapshot, "get_name", None)
         if not callable(get_name):
             return None
-        name = get_name()
         try:
+            name = get_name()
             candidates = self.list_snapshots()
+            for candidate in candidates:
+                if candidate.get_name() == name:
+                    return candidate
         except Exception as e:  # noqa: BLE001 - contract: never raise; None is safe
-            logger.debug("correspondent_of: could not list snapshots (%s)", e)
-            return None
-        for candidate in candidates:
-            if candidate.get_name() == name:
-                return candidate
+            logger.debug("correspondent_of: could not resolve correspondent (%s)", e)
         return None
 
     @contextlib.contextmanager

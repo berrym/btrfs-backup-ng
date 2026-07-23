@@ -1218,33 +1218,30 @@ def sync_snapshots(
         SnapshotTransferError: if any planned snapshot failed to transfer. The
             exception carries the TransferResult as ``err.result``.
     """
-    from .planning import plan_transfers
+    from .planning import plan_transfer_sequence, snapshots_present_on
 
     logger.info(__util__.log_heading(f"  To {destination_endpoint} ..."))
 
-    # List all source snapshots
-    all_source_snapshots = source_endpoint.list_snapshots()
+    # List all source snapshots. flush_cache forces a fresh, ENRICHED enumeration (uuid /
+    # received_uuid via `subvolume show`): a stale cache populated by a prior list -- then
+    # appended to by snapshot()/add_snapshot(), which stores an UNENRICHED snapshot -- would
+    # otherwise feed empty-uuid snapshots to the correspondence-based planner/reconcile,
+    # silently degrading every transfer to a full send. The planner's identity must never
+    # depend on cache-population order.
+    source_snapshots = source_endpoint.list_snapshots(flush_cache=True)
 
-    if snapshot is None:
-        source_snapshots = all_source_snapshots
-        snapshots_to_transfer = None
-    else:
-        source_snapshots = all_source_snapshots
-        snapshots_to_transfer = [snapshot]
-
-    destination_snapshots = destination_endpoint.list_snapshots()
-
-    # Reconcile this destination's locks against reality (R3). A lock pins a source
-    # snapshot so retention cannot prune it while a transfer to this destination still
-    # needs it. Clear the lock only for snapshots CONFIRMED present on the destination --
-    # the transfer succeeded, so the lock has done its job. KEEP the lock for a snapshot
-    # not yet on the destination: a prior transfer failed or is pending and still depends
-    # on it. This is presence-based, not time-based, so a long outage can never cause a
-    # needed snapshot to be pruned.
+    # Reconcile this destination's locks against reality (R3), using the SAME presence
+    # authority as the planner (correspondence: uuid for btrfs, name for raw) so the two
+    # can never disagree. A lock pins a source snapshot so retention cannot prune it while
+    # a transfer to this destination still needs it. Clear the lock only for snapshots
+    # CONFIRMED present on the destination; KEEP it for one not yet there (a prior transfer
+    # failed/pending). Presence-based, not time-based -- a long outage never prunes a
+    # needed snapshot; and a re-created snapshot (same name, new uuid) is correctly "not
+    # present", so its lock is not cleared by a name coincidence.
+    present_names = snapshots_present_on(source_snapshots, destination_endpoint)
     destination_id = destination_endpoint.get_id()
-    destination_names = {s.get_name() for s in destination_snapshots}
     for snap in source_snapshots:
-        if snap.get_name() not in destination_names:
+        if snap.get_name() not in present_names:
             continue  # not yet on the destination -> keep any lock
         if destination_id in snap.locks:
             source_endpoint.set_lock(snap, destination_id, False)
@@ -1252,34 +1249,33 @@ def sync_snapshots(
             source_endpoint.set_lock(snap, destination_id, False, parent=True)
 
     logger.debug("Source snapshots found: %d", len(source_snapshots))
-    logger.debug("Destination snapshots found: %d", len(destination_snapshots))
 
-    # Plan transfers
-    if snapshots_to_transfer is not None:
-        to_transfer = [
-            snap for snap in snapshots_to_transfer if snap not in destination_snapshots
-        ]
-    else:
-        to_transfer = plan_transfers(
-            source_snapshots, destination_snapshots, keep_num_backups
-        )
+    # Plan: the single authority decides what to transfer, in what order, and with which
+    # (correspondence-verified) parent -- so a `send -p` is only emitted for a parent the
+    # destination actually holds.
+    plan = plan_transfer_sequence(
+        source_snapshots,
+        destination_endpoint,
+        no_incremental=no_incremental,
+        keep_num_backups=keep_num_backups,
+        only=snapshot,
+    )
 
-    if not to_transfer:
+    if not plan:
         logger.info("No snapshots need to be transferred.")
         return TransferResult()
 
-    logger.info("Going to transfer %d snapshot(s):", len(to_transfer))
-    for snap in to_transfer:
-        logger.info("  %s", snap)
+    logger.info("Going to transfer %d snapshot(s):", len(plan))
+    for snap, parent in plan:
+        logger.info(
+            "  %s%s", snap, f" (parent {parent.get_name()})" if parent else " (full)"
+        )
 
-    # Execute transfers
+    # Execute the plan (dumb executor -- no parent/ordering decisions here).
     result = _execute_transfers(
         source_endpoint,
         destination_endpoint,
-        source_snapshots,
-        destination_snapshots,
-        to_transfer,
-        no_incremental,
+        plan,
         options,
         **kwargs,
     )
@@ -1400,51 +1396,23 @@ def _cleanup_partial_raw_stream(destination_endpoint) -> None:
 def _execute_transfers(
     source_endpoint,
     destination_endpoint,
-    source_snapshots,
-    destination_snapshots,
-    to_transfer,
-    no_incremental,
+    plan,
     options,
     **kwargs,
 ) -> TransferResult:
-    """Execute the actual snapshot transfers.
+    """Execute a pre-computed transfer plan -- a dumb executor.
 
-    Returns a TransferResult recording which snapshots were verified onto the
-    destination and which failed. Locks are released and the snapshot registered
-    at the destination only for verified successes; a failed snapshot is kept
-    locked and recorded in ``result.failed`` (never silently dropped).
+    ``plan`` is a list of ``(snapshot, parent_or_None)`` pairs from
+    ``planning.plan_transfer_sequence``; ALL ordering and parent decisions were made there.
+    This function only moves bytes and manages the lock lifecycle: it locks the snapshot
+    (and its parent), sends, and on a verified success releases the locks and registers the
+    snapshot at the destination; a failed snapshot is kept locked and recorded in
+    ``result.failed`` (never silently dropped), and any partial artifact is cleaned.
     """
     destination_id = destination_endpoint.get_id()
     result = TransferResult()
 
-    while to_transfer:
-        if no_incremental:
-            best_snapshot = to_transfer[-1]
-            parent = None
-        else:
-            # Find snapshots present on destination for incremental.
-            # `snap in destination_snapshots` relies on the DESTINATION element's
-            # __eq__: for a raw target that is RawSnapshot.__eq__ (name-based),
-            # which is how a source btrfs snapshot is matched to its raw backup.
-            # Do NOT rewrite as `snap == d` -- that invokes the source Snapshot's
-            # prefix+time_obj __eq__, which never matches a raw snapshot and would
-            # silently degrade every backup-to-raw to a full send.
-            present_snapshots = [
-                snap
-                for snap in source_snapshots
-                if snap in destination_snapshots and snap.get_name() not in snap.locks
-            ]
-
-            def key(s):
-                p = s.find_parent(present_snapshots)
-                if p is None:
-                    return float("inf")
-                d = source_snapshots.index(s) - source_snapshots.index(p)
-                return -d if d < 0 else d
-
-            best_snapshot = min(to_transfer, key=key)
-            parent = best_snapshot.find_parent(present_snapshots)
-
+    for best_snapshot, parent in plan:
         # Set locks
         source_endpoint.set_lock(best_snapshot, destination_id, True)
         if parent:
@@ -1487,9 +1455,6 @@ def _execute_transfers(
                 destination_endpoint, best_snapshot.get_name()
             )
             _cleanup_partial_raw_stream(destination_endpoint)
-
-        to_transfer.remove(best_snapshot)
-        logger.debug("%d snapshots left to transfer", len(to_transfer))
 
     # Report honestly: a "complete!" banner must not print when a transfer failed.
     if result.failed:

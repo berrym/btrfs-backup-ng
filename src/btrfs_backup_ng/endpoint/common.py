@@ -368,18 +368,26 @@ class Endpoint:
         Runs ``btrfs subvolume show`` on each snapshot's exact path. ``show`` targets one
         path, so the identity is unambiguous even when snapshots live under a mounted
         (non-filesystem-root) subvolume -- unlike ``subvolume list``, whose id-5-relative
-        paths cannot be reliably matched back to a mount-relative absolute path. Purely
-        additive: any failure (not root, not btrfs, older btrfs-progs, command error)
-        leaves that snapshot's uuids empty and enumeration unaffected. Identity is NOT
-        changed here -- these values are carried for the Phase 2 planner, not yet
-        consulted."""
+        paths cannot be reliably matched back to a mount-relative absolute path.
+
+        ``subvolume show`` needs CAP_SYS_ADMIN to read the uuid/received_uuid, so it is
+        sudo-escalated in the SAME context the transfer path uses (``sudo -n`` when not
+        root; see the send/receive escalation and restore's parent-by-uuid lookup) --
+        otherwise a non-root run WITH passwordless sudo would send/receive fine yet read
+        empty uuids, silently degrading the planner to full sends and disabling the
+        re-created-snapshot (received_uuid) correspondence. ``-n`` keeps enumeration
+        non-interactive: with no passwordless sudo it fails fast rather than prompting.
+        Purely additive and best-effort: any failure (no sudo, not btrfs, older
+        btrfs-progs, command error) leaves that snapshot's uuids empty and enumeration
+        unaffected. The planner consumes these identities (Phase 2 correspondence)."""
         if not snapshots:
             return
+        sudo_prefix = ["sudo", "-n"] if os.geteuid() != 0 else []
         enriched = 0
         for snap in snapshots:
             try:
                 result = subprocess.run(
-                    ["btrfs", "subvolume", "show", str(snap.get_path())],
+                    [*sudo_prefix, "btrfs", "subvolume", "show", str(snap.get_path())],
                     capture_output=True,
                     text=True,
                     timeout=30,
