@@ -114,14 +114,15 @@ def test_correspondent_none_when_no_match(tmp_path, monkeypatch):
 
 
 # --------------------------------------------------------------------------- #
-# Restore direction (backup_ep.correspondent_of(local)) == find_parent_by_uuid relation
+# Restore direction: backup_ep.correspondent_of(local) is the restore-parent relation
 # --------------------------------------------------------------------------- #
-def test_correspondent_restore_direction_matches_find_parent_by_uuid(
+def test_correspondent_restore_direction_finds_backup_by_received_uuid(
     tmp_path, monkeypatch
 ):
-    """restore's find_parent_by_uuid returns the backup whose received_uuid == a local
-    snapshot's uuid. That relation is exactly ``backup_ep.correspondent_of(local)``.
-    Mutation guard: any direction/field change breaks this equivalence."""
+    """Restore's parent selection (P3a find_parent_by_correspondence) needs the backup whose
+    received_uuid == a local snapshot's uuid. That relation is exactly
+    ``backup_ep.correspondent_of(local)``. Mutation guard: any direction/field change breaks
+    this equivalence."""
     backup_ep = _local(tmp_path)
     b_match = _snap(
         backup_ep, tmp_path, "20240101-000000", uuid="B1", received_uuid="LOCAL-UUID"
@@ -236,16 +237,21 @@ def test_polymorphism_btrfs_uses_base_raw_overrides():
     assert SSHRawEndpoint.correspondent_of is RawEndpoint.correspondent_of
 
 
-def test_phase_boundary_planner_wired_restore_not_yet():
-    """Phase 2 wires the backup planner onto correspondent_of; restore is converged in
-    Phase 3, not before. This guards the phase boundary -- a still-name-based restore is
-    expected until P3."""
+def test_planner_and_restore_both_wired_onto_correspondent_of():
+    """Phase 2 wired the backup planner onto correspondent_of; Phase 3a converges restore's
+    incremental-parent selection onto the SAME primitive (find_parent_by_correspondence).
+    Both now route through the one correspondence authority -- no more bespoke uuid parsing
+    in restore."""
     import btrfs_backup_ng.core.planning as planning
     import btrfs_backup_ng.core.restore as restore
 
     assert "correspondent_of" in inspect.getsource(planning), (
-        "P2 should wire the planner onto correspondent_of"
+        "the planner is wired onto correspondent_of (P2)"
     )
-    assert "correspondent_of" not in inspect.getsource(restore), (
-        "restore converges onto correspondent_of in Phase 3, not now"
+    assert "correspondent_of" in inspect.getsource(restore), (
+        "restore is converged onto correspondent_of (P3a)"
+    )
+    # The bespoke restore-side uuid matcher is gone.
+    assert "find_parent_by_uuid" not in inspect.getsource(restore), (
+        "find_parent_by_uuid should be replaced by find_parent_by_correspondence"
     )
