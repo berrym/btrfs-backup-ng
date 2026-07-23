@@ -266,6 +266,7 @@ def send_snapshot(
                 show_progress=show_progress,
                 snapshot_name=snapshot_name,
                 estimated_size=estimated_size,
+                parent_name=parent_name,
             )
 
         if any(rc != 0 for rc in return_codes):
@@ -595,9 +596,10 @@ def _transfer_chunks_local(
     # Create a reader to reassemble chunks
     reader = chunked_manager.create_reassembly_reader(manifest)
 
-    # Start btrfs receive
+    # Start btrfs receive (parent_name lets a raw endpoint record the incremental parent in
+    # its .meta sidecar; btrfs ignores it).
     receive_process = destination_endpoint.receive(
-        subprocess.PIPE, manifest.snapshot_name
+        subprocess.PIPE, manifest.snapshot_name, parent_name=manifest.parent_name
     )
     if receive_process is None:
         raise __util__.SnapshotTransferError("Receive process failed to start")
@@ -694,9 +696,10 @@ def _transfer_chunks_ssh(
             raise __util__.SnapshotTransferError("SSH chunked receive failed")
     else:
         # Fall back to streaming through regular receive
-        # Start btrfs receive on remote
+        # Start btrfs receive on remote (parent_name lets a raw endpoint record the
+        # incremental parent in its .meta sidecar; btrfs ignores it).
         receive_process = destination_endpoint.receive(
-            subprocess.PIPE, manifest.snapshot_name
+            subprocess.PIPE, manifest.snapshot_name, parent_name=manifest.parent_name
         )
         if receive_process is None:
             raise __util__.SnapshotTransferError("SSH receive process failed to start")
@@ -917,6 +920,7 @@ def _do_process_transfer(
     show_progress: bool = False,
     snapshot_name: str = "",
     estimated_size: int | None = None,
+    parent_name: str | None = None,
 ) -> list[int]:
     """Perform transfer using traditional process piping.
 
@@ -967,6 +971,7 @@ def _do_process_transfer(
             is_ssh_endpoint,
             snapshot_name,
             estimated_size,
+            parent_name=parent_name,
         )
 
     pipeline_processes = []
@@ -985,8 +990,11 @@ def _do_process_transfer(
                 show_progress=effective_show_progress,
             )
 
-        # Start receive process with potentially modified input stream
-        receive_process = destination_endpoint.receive(current_stdout, snapshot_name)
+        # Start receive process with potentially modified input stream. parent_name lets a
+        # raw endpoint record the incremental parent in its .meta sidecar (btrfs ignores it).
+        receive_process = destination_endpoint.receive(
+            current_stdout, snapshot_name, parent_name=parent_name
+        )
         if receive_process is None:
             logger.error("Failed to start receive process")
             if is_ssh_endpoint and not destination_endpoint.config.get(
@@ -1060,6 +1068,7 @@ def _do_rich_progress_transfer(
     is_ssh_endpoint: bool,
     snapshot_name: str,
     estimated_size: int | None,
+    parent_name: str | None = None,
 ) -> list[int]:
     """Perform transfer with Rich progress bar display.
 
@@ -1081,7 +1090,9 @@ def _do_rich_progress_transfer(
     # this path reports a clean failure with the failed-transaction audit log,
     # exactly like the non-rich transfer path.
     try:
-        receive_process = destination_endpoint.receive(subprocess.PIPE, snapshot_name)
+        receive_process = destination_endpoint.receive(
+            subprocess.PIPE, snapshot_name, parent_name=parent_name
+        )
     except Exception as e:
         logger.error("Failed to start receive process: %s", e)
         try:
