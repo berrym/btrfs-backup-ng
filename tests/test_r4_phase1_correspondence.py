@@ -191,6 +191,22 @@ def test_raw_correspondent_returns_none_when_list_snapshots_raises(
     assert raw.correspondent_of(source) is None
 
 
+def test_raw_correspondent_returns_none_when_get_name_raises(tmp_path):
+    """The never-raises contract also covers a callable ``get_name`` that itself raises
+    (malformed time tuple, etc.) -- it is inside the try, not before it. Mutation guard:
+    moving ``get_name()`` back outside the try lets the exception escape and fails this."""
+    from btrfs_backup_ng.endpoint.raw import RawEndpoint
+
+    raw = RawEndpoint(config={"path": str(tmp_path)})
+    raw.list_snapshots = lambda flush_cache=False: []  # type: ignore[method-assign]
+
+    class _BadName:
+        def get_name(self):
+            raise ValueError("malformed time tuple")
+
+    assert raw.correspondent_of(_BadName()) is None
+
+
 def test_correspondent_none_for_arg_without_identity(tmp_path, monkeypatch):
     """An arg with no uuid attr (btrfs) or no get_name (raw) yields None, not AttributeError.
     Mutation guard: dropping the getattr guards raises."""
@@ -220,14 +236,16 @@ def test_polymorphism_btrfs_uses_base_raw_overrides():
     assert SSHRawEndpoint.correspondent_of is RawEndpoint.correspondent_of
 
 
-def test_phase1_is_non_behavioral_not_wired_into_planner_or_restore():
-    """Phase 1 only ADDS the primitive; the planner and restore adopt it in P2/P3.
-    Mutation guard: wiring correspondent_of into these modules now fails this."""
-    import btrfs_backup_ng.core.operations as ops
+def test_phase_boundary_planner_wired_restore_not_yet():
+    """Phase 2 wires the backup planner onto correspondent_of; restore is converged in
+    Phase 3, not before. This guards the phase boundary -- a still-name-based restore is
+    expected until P3."""
     import btrfs_backup_ng.core.planning as planning
     import btrfs_backup_ng.core.restore as restore
 
-    for mod in (ops, planning, restore):
-        assert "correspondent_of" not in inspect.getsource(mod), (
-            f"{mod.__name__} references correspondent_of; Phase 1 must stay non-behavioral"
-        )
+    assert "correspondent_of" in inspect.getsource(planning), (
+        "P2 should wire the planner onto correspondent_of"
+    )
+    assert "correspondent_of" not in inspect.getsource(restore), (
+        "restore converges onto correspondent_of in Phase 3, not now"
+    )

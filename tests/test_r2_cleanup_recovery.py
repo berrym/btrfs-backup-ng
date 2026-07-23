@@ -104,7 +104,7 @@ class TestExecuteTransfersCleansPartialOnFailure:
         spy = MagicMock()
         monkeypatch.setattr(ops, "_cleanup_partial_local_subvolume", spy)
 
-        ops._execute_transfers(src, dst, [snap], [], [snap], True, {})
+        ops._execute_transfers(src, dst, [(snap, None)], {})
 
         spy.assert_called_once()
         # cleanup targets the exact received name of the snapshot that failed
@@ -121,7 +121,7 @@ class TestExecuteTransfersCleansPartialOnFailure:
         spy = MagicMock()
         monkeypatch.setattr(ops, "_cleanup_partial_local_subvolume", spy)
 
-        ops._execute_transfers(src, dst, [snap], [], [snap], True, {})
+        ops._execute_transfers(src, dst, [(snap, None)], {})
         spy.assert_not_called()
 
 
@@ -239,5 +239,5 @@ class TestRawPartialCleanup:
         monkeypatch.setattr(ops, "_cleanup_partial_local_subvolume", MagicMock())
         spy = MagicMock()
         monkeypatch.setattr(ops, "_cleanup_partial_raw_stream", spy)
-        ops._execute_transfers(src, dst, [snap], [], [snap], True, {})
+        ops._execute_transfers(src, dst, [(snap, None)], {})
         spy.assert_called_once_with(dst)

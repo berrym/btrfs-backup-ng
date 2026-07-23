@@ -6,7 +6,7 @@ monolithic __main__.py, organized into focused modules.
 
 from .execution import execute_parallel, run_task
 from .operations import send_snapshot, sync_snapshots
-from .planning import plan_transfers
+from .planning import plan_transfer_sequence, snapshots_present_on
 
 # Error classification and retry framework
 from .errors import (
@@ -75,7 +75,8 @@ __all__ = [
     # Operations
     "send_snapshot",
     "sync_snapshots",
-    "plan_transfers",
+    "plan_transfer_sequence",
+    "snapshots_present_on",
     "run_task",
     "execute_parallel",
     # Errors

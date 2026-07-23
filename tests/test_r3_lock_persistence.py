@@ -29,6 +29,7 @@ import pytest
 
 import btrfs_backup_ng.core.operations as ops
 from btrfs_backup_ng import __util__
+from btrfs_backup_ng.endpoint.common import Endpoint
 from btrfs_backup_ng.endpoint.local import LocalEndpoint
 
 
@@ -60,6 +61,8 @@ def _fake_snap(name, locks=None, parent_locks=None):
     s.locks = set(locks or ())
     s.parent_locks = set(parent_locks or ())
     s.get_name.return_value = name
+    s.uuid = "uuid-" + name  # truthy -> presence is decided by correspondent_of only
+    s.received_uuid = ""
     return s
 
 
@@ -70,7 +73,37 @@ def _endpoints(source_snaps, dest_snaps=()):
     dst = MagicMock()
     dst.get_id.return_value = "dest-1"
     dst.list_snapshots.return_value = list(dest_snaps)
+    # Presence via the correspondence primitive: present iff a same-named dest snap exists.
+    _dest_by_name = {s.get_name(): s for s in dest_snaps}
+    dst.correspondent_of.side_effect = lambda s: _dest_by_name.get(s.get_name())
     return src, dst
+
+
+class _FakeDest:
+    """Minimal destination test double with REAL correspondence semantics.
+
+    ``correspondent_of`` is the production ``Endpoint.correspondent_of`` bound here verbatim
+    -- so the double can never drift from the real ``received_uuid == source.uuid`` logic --
+    while the test supplies only the state (``list_snapshots``) and bookkeeping
+    (``get_id``/``add_snapshot``). This is the wired-reconcile fidelity the review asked for
+    without monkeypatching a real ``LocalEndpoint`` (whose send/receive side effects would
+    otherwise leak into the test).
+    """
+
+    correspondent_of = Endpoint.correspondent_of  # the real uuid-correspondence logic
+
+    def __init__(self, dest_snaps=(), ep_id="fake-dest"):
+        self._snaps = list(dest_snaps)
+        self._id = ep_id
+
+    def list_snapshots(self, flush_cache=False):
+        return list(self._snaps)
+
+    def get_id(self):
+        return self._id
+
+    def add_snapshot(self, snapshot, *args, **kwargs):
+        self._snaps.append(snapshot)
 
 
 # --------------------------------------------------------------------------- #
@@ -143,7 +176,7 @@ def test_reconcile_clears_lock_when_present_on_destination(monkeypatch):
     """A snapshot confirmed present on the destination has done its job -> clear the
     lock. Mutation guard: making the reconcile a no-op (never clear) fails this."""
     monkeypatch.setattr(
-        "btrfs_backup_ng.core.planning.plan_transfers", lambda *a, **k: []
+        "btrfs_backup_ng.core.planning.plan_transfer_sequence", lambda *a, **k: []
     )
     snap = _fake_snap("snap-1", locks=["dest-1"], parent_locks=["dest-1"])
     present = _fake_snap("snap-1")  # same NAME on the destination
@@ -161,7 +194,7 @@ def test_reconcile_keeps_lock_when_absent_from_destination(monkeypatch):
     unconditional blanket-clear (no presence check) clears this lock and fails the
     test."""
     monkeypatch.setattr(
-        "btrfs_backup_ng.core.planning.plan_transfers", lambda *a, **k: []
+        "btrfs_backup_ng.core.planning.plan_transfer_sequence", lambda *a, **k: []
     )
     snap = _fake_snap("snap-1", locks=["dest-1"])
     other = _fake_snap("snap-2")  # destination has a DIFFERENT snapshot
@@ -173,6 +206,87 @@ def test_reconcile_keeps_lock_when_absent_from_destination(monkeypatch):
         c for c in src.set_lock.call_args_list if c.args[:3] == (snap, "dest-1", False)
     ]
     assert clears == []
+
+
+def test_reconcile_keeps_lock_for_recreated_snapshot_via_real_correspondence(
+    monkeypatch,
+):
+    """WIRED reconcile through the REAL ``Endpoint.correspondent_of`` (received_uuid==uuid),
+    not a name fake: a re-created snapshot (same name, NEW uuid) whose destination copy is a
+    STALE same-named subvolume (received_uuid = OLD) is correctly ABSENT, so its lock is KEPT
+    -- retention cannot prune the snapshot the next real transfer still needs. Mutation guard:
+    reverting the reconcile to name-based presence clears the lock on the name coincidence and
+    fails this; the name-fake reconcile tests above structurally cannot catch that."""
+    monkeypatch.setattr(
+        "btrfs_backup_ng.core.planning.plan_transfer_sequence", lambda *a, **k: []
+    )
+    stale = MagicMock()  # destination's stale same-named copy
+    stale.get_name.return_value = "snap-1"
+    stale.received_uuid = "OLD-UUID"
+    dst = _FakeDest(dest_snaps=[stale], ep_id="dest-1")
+
+    recreated = _fake_snap("snap-1", locks=["dest-1"], parent_locks=["dest-1"])
+    recreated.uuid = "NEW-UUID"  # re-created: same name, brand-new uuid
+    src = MagicMock()
+    src.list_snapshots.return_value = [recreated]
+
+    ops.sync_snapshots(src, dst)
+
+    # Real correspondence reports ABSENT (NEW != OLD) -> the lock must NOT be cleared.
+    clears = [
+        c
+        for c in src.set_lock.call_args_list
+        if c.args[:3] == (recreated, "dest-1", False)
+    ]
+    assert clears == []
+
+
+def test_reconcile_and_planner_agree_end_to_end(monkeypatch):
+    """End-to-end ``sync_snapshots``: the reconcile and the planner share ONE presence
+    authority (``correspondent_of``), so for a mixed source they cannot disagree. The
+    uuid-present snapshot has its lock CLEARED by the reconcile (it is on the destination)
+    and is SKIPPED by the planner; the re-created snapshot (new uuid, same name as a stale
+    dest copy) is planned and transferred incrementally against the older *corresponding*
+    snapshot -- never ``send -p`` against the stale same-named dest copy. (The re-created
+    snapshot's lock-keeping across a FAILED transfer is covered in isolation above; here the
+    transfer succeeds, so its lock is released normally by the executor.)
+
+    Uses the real-semantics ``_FakeDest`` (not a monkeypatched LocalEndpoint) so the real
+    planner runs end-to-end with only ``send_snapshot`` stubbed."""
+    monkeypatch.setattr(ops, "send_snapshot", MagicMock(return_value=None))
+
+    present_copy = MagicMock()
+    present_copy.get_name.return_value = "snap-A"
+    present_copy.received_uuid = "U-PRESENT"
+    stale_copy = MagicMock()
+    stale_copy.get_name.return_value = "snap-B"
+    stale_copy.received_uuid = "OLD"
+    dst = _FakeDest(dest_snaps=[present_copy, stale_copy], ep_id="dest-1")
+
+    # snap-A truly present (uuid corresponds); snap-B re-created (new uuid vs the stale copy).
+    present = _fake_snap("snap-A", locks=["dest-1"])
+    present.uuid = "U-PRESENT"
+    present.time_obj = (2024, 1, 1, 0, 0, 0, 0, 0, 0)
+    recreated = _fake_snap("snap-B", locks=["dest-1"])
+    recreated.uuid = "NEW"
+    recreated.time_obj = (2024, 1, 2, 0, 0, 0, 0, 0, 0)
+    src = MagicMock()
+    src.list_snapshots.return_value = [present, recreated]
+
+    result = ops.sync_snapshots(src, dst)
+
+    # Reconcile CLEARS the present snapshot's lock (it is confirmed on the destination).
+    assert any(
+        c.args[:3] == (present, "dest-1", False) for c in src.set_lock.call_args_list
+    )
+    # Planner: the present snapshot is SKIPPED; only the re-created snapshot transfers,
+    # parented on the older CORRESPONDING snapshot (present), never on the stale same-named
+    # dest copy.
+    assert result.transferred_count == 1
+    sent = ops.send_snapshot.call_args_list
+    assert len(sent) == 1
+    assert sent[0].args[0] is recreated
+    assert sent[0].kwargs.get("parent") is present
 
 
 # --------------------------------------------------------------------------- #

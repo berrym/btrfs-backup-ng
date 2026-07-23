@@ -4,8 +4,10 @@ Phase 0 is strictly NON-behavioral: it only ENRICHES snapshot objects with the b
 ``uuid`` and ``received_uuid`` at enumeration -- local endpoints via ``btrfs subvolume
 show`` per snapshot (mount-safe, unambiguous), ssh endpoints from each ``subvolume list
 -o -u -R`` line. Identity (`__eq__` / `__lt__` / `find_parent`) is unchanged and nothing
-consults the new fields yet -- that is Phase 2. Population is best-effort: any failure
-(non-root, non-btrfs, older btrfs-progs) leaves the uuids empty and enumeration working.
+consults the new fields yet -- that is Phase 2. ``subvolume show`` is sudo-escalated
+(``sudo -n`` when not root) so a non-root+passwordless-sudo run populates uuids like the
+transfer path; population stays best-effort: any failure (no sudo, non-btrfs, older
+btrfs-progs) leaves the uuids empty and enumeration working.
 """
 
 from __future__ import annotations
@@ -135,6 +137,49 @@ def test_enrichment_uses_subvolume_show_per_snapshot(tmp_path, monkeypatch):
     assert by["home-20240102-000000"].received_uuid == (
         "cccccccc-cccc-cccc-cccc-cccccccccccc"
     )
+
+
+def test_enrichment_sudo_escalates_when_not_root(tmp_path, monkeypatch):
+    """``subvolume show`` needs CAP_SYS_ADMIN, so a NON-root enumeration must sudo-escalate
+    (``sudo -n``) exactly like the transfer path -- otherwise a non-root run WITH passwordless
+    sudo backs up fine yet reads empty uuids, silently degrading the planner. Mutation guard:
+    dropping the escalation leaves the bare ``btrfs`` argv and fails this."""
+    ep = _local(tmp_path)
+    snaps = _named_snaps(ep, tmp_path)
+    captured = []
+
+    def fake_run(argv, *a, **k):
+        captured.append(list(argv))
+        return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+    monkeypatch.setattr("btrfs_backup_ng.endpoint.common.os.geteuid", lambda: 1000)
+    monkeypatch.setattr("btrfs_backup_ng.endpoint.common.subprocess.run", fake_run)
+    ep._load_subvolume_ids_into(snaps)
+
+    assert captured, "enrichment ran no commands"
+    for argv in captured:
+        assert argv[:3] == ["sudo", "-n", "btrfs"], argv
+        assert argv[3:5] == ["subvolume", "show"]
+
+
+def test_enrichment_no_sudo_when_root(tmp_path, monkeypatch):
+    """When already root, enrichment runs ``btrfs`` directly -- no needless sudo. Mutation
+    guard: unconditionally prepending sudo fails this."""
+    ep = _local(tmp_path)
+    snaps = _named_snaps(ep, tmp_path)
+    captured = []
+
+    def fake_run(argv, *a, **k):
+        captured.append(list(argv))
+        return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+    monkeypatch.setattr("btrfs_backup_ng.endpoint.common.os.geteuid", lambda: 0)
+    monkeypatch.setattr("btrfs_backup_ng.endpoint.common.subprocess.run", fake_run)
+    ep._load_subvolume_ids_into(snaps)
+
+    assert captured, "enrichment ran no commands"
+    for argv in captured:
+        assert argv[0] == "btrfs" and "sudo" not in argv, argv
 
 
 def test_parse_subvolume_show_uuid_and_received():

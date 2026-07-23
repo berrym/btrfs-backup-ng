@@ -265,10 +265,7 @@ def _drive_transfers(monkeypatch, send_side_effect):
     result = ops._execute_transfers(
         source_endpoint=src,
         destination_endpoint=dest,
-        source_snapshots=[snap],
-        destination_snapshots=[],
-        to_transfer=[snap],
-        no_incremental=True,
+        plan=[(snap, None)],
         options={},
     )
     return result, headings
