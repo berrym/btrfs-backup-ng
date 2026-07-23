@@ -131,16 +131,39 @@ def test_parent_skips_name_present_but_noncorresponding_older_snapshot(tmp_path)
             ),  # NON-matching
         ],
     )
-    plan = plan_transfer_sequence([s_oldest, s_mid, newest], dest)
-    # s_oldest present (skipped); s_mid absent (U-MID-NEW != U-MID-OLD) and newest absent.
+    # only=newest so s_mid is NOT transferred this run (and so not projected as an in-run
+    # parent) -- isolating the guard: a name-present-but-non-corresponding older snapshot,
+    # not itself in this run, must never be chosen as a parent.
+    plan = plan_transfer_sequence([s_oldest, s_mid, newest], dest, only=newest)
+    assert [s.get_name() for s, _ in plan] == ["home-20240103-000000"]
     # newest's parent must be s_oldest (verified) -- NEVER the newer name-present-but-
     # non-corresponding s_mid, whose send -p the destination could not resolve.
+    assert plan[0][1] is s_oldest
+
+
+def test_within_run_chaining_over_re_sent_noncorresponding_older(tmp_path):
+    """Full-list counterpart to the only= guard: when the name-present-but-non-corresponding
+    older snapshot (s_mid) IS transferred this run, its stale dest copy is corrected and it
+    becomes a valid IN-RUN parent -- so newest chains off s_mid (uuid U-MID-NEW), not the
+    older s_oldest. (This is safe: s_mid is executed before newest.)"""
+    s_oldest = _snap("20240101-000000", uuid="U-OLDEST")
+    s_mid = _snap("20240102-000000", uuid="U-MID-NEW")
+    newest = _snap("20240103-000000", uuid="U-NEW")
+    dest = _dest(
+        tmp_path,
+        [
+            _snap("20240101-000000", uuid="Da", received_uuid="U-OLDEST"),
+            _snap("20240102-000000", uuid="Db", received_uuid="U-MID-OLD"),  # stale
+        ],
+    )
+    plan = plan_transfer_sequence([s_oldest, s_mid, newest], dest)
     by = {s.get_name(): p for s, p in plan}
-    assert set(by) == {"home-20240102-000000", "home-20240103-000000"}
-    assert (
-        by["home-20240103-000000"] is s_oldest
-    )  # skipped s_mid (name-only), used s_oldest
-    assert by["home-20240102-000000"] is s_oldest  # s_mid parents on s_oldest too
+    assert set(by) == {
+        "home-20240102-000000",
+        "home-20240103-000000",
+    }  # s_oldest skipped
+    assert by["home-20240102-000000"] is s_oldest  # s_mid re-sent, parents on s_oldest
+    assert by["home-20240103-000000"] is s_mid  # newest chains off the IN-RUN s_mid
 
 
 # --------------------------------------------------------------------------- #
@@ -158,39 +181,59 @@ def test_no_incremental_forces_full_sends(tmp_path):
 def test_empty_uuid_source_is_not_present_and_planned_full(tmp_path):
     """NO name fallback (R4 purity): a source snapshot whose uuid is unknown cannot be
     verified present -- correspondent_of returns None for an empty uuid -- so it is planned
-    as a FULL send, never skipped by a name coincidence and never given an unverifiable
-    incremental parent. An empty uuid is an enrichment problem to fix at the source
-    (sudo-escalated `subvolume show`), not a reason to dilute the planner into name matching.
-    Mutation guard: any name-based presence/parent fallback re-skips these."""
-    s1 = _snap("20240101-000000", uuid="")  # unknown identity
-    s2 = _snap("20240102-000000", uuid="")
-    # The dest even lists a SAME-NAMED snapshot for s1: a name fallback would (wrongly) skip
-    # it. Pure correspondence does not.
+    as a FULL send, never skipped by a name coincidence with a same-named dest copy. An empty
+    uuid is an enrichment problem to fix at the source (sudo-escalated `subvolume show`), not
+    a reason to dilute the planner into name matching. (Single snapshot, so within-run
+    chaining is not in play.) Mutation guard: a name-based presence fallback re-skips it."""
+    s = _snap("20240101-000000", uuid="")  # unknown identity
+    # The dest lists a SAME-NAMED snapshot: a name fallback would (wrongly) skip s.
     dest = _dest(
         tmp_path, [_snap("20240101-000000", uuid="Dz", received_uuid="anything")]
     )
-    present = snapshots_present_on([s1, s2], dest)
+    present = snapshots_present_on([s], dest)
     assert present == set()  # strictly correspondence; no name fallback
-    plan = plan_transfer_sequence([s1, s2], dest)
-    assert [s.get_name() for s, _ in plan] == [
-        "home-20240101-000000",
-        "home-20240102-000000",
-    ]
-    assert all(p is None for _, p in plan)  # no name-based parent
+    plan = plan_transfer_sequence([s], dest)
+    assert [n.get_name() for n, _ in plan] == ["home-20240101-000000"]
+    assert plan[0][1] is None  # full send (no older snapshot to parent off)
 
 
-def test_ordering_is_oldest_first(tmp_path):
+def test_ordering_oldest_first_with_within_run_chaining(tmp_path):
+    """Plan is oldest-first, and a fresh multi-snapshot run forms a tight within-run
+    incremental CHAIN: the oldest is a full send, each later one parents off the
+    immediately-earlier in-run transfer (safe -- executed oldest-first, so the parent is on
+    the destination by the time its child sends). Mutation guard: dropping the in-run
+    projection makes every snapshot a full send."""
     s3 = _snap("20240103-000000", uuid="U3")
     s1 = _snap("20240101-000000", uuid="U1")
     s2 = _snap("20240102-000000", uuid="U2")
-    dest = _dest(tmp_path, [])  # empty -> all full sends
+    dest = _dest(tmp_path, [])  # empty dest
     plan = plan_transfer_sequence([s3, s1, s2], dest)
     assert [s.get_name() for s, _ in plan] == [
         "home-20240101-000000",
         "home-20240102-000000",
         "home-20240103-000000",
     ]
-    assert all(p is None for _, p in plan)
+    assert plan[0][1] is None  # oldest: full send
+    assert plan[1][1] is s1  # chains off the in-run s1
+    assert plan[2][1] is s2  # chains off the in-run s2
+
+
+def test_within_run_chaining_off_earlier_in_run_transfer(tmp_path):
+    """A snapshot parents off an EARLIER-in-this-run transfer, not only the destination's
+    plan-time state: the dest already holds s1; s2 and s3 transfer this run -> s2 parents the
+    on-dest s1, and s3 parents the IN-RUN s2. Mutation guard: dropping the in-run projection
+    makes s3 parent s1 (stale, larger diff) instead of s2."""
+    s1 = _snap("20240101-000000", uuid="U1")
+    s2 = _snap("20240102-000000", uuid="U2")
+    s3 = _snap("20240103-000000", uuid="U3")
+    dest = _dest(tmp_path, [_snap("20240101-000000", uuid="Da", received_uuid="U1")])
+    plan = plan_transfer_sequence([s1, s2, s3], dest)
+    by = {s.get_name(): p for s, p in plan}
+    assert set(by) == {"home-20240102-000000", "home-20240103-000000"}  # s1 skipped
+    assert by["home-20240102-000000"] is s1  # s2 parents the already-on-dest s1
+    assert (
+        by["home-20240103-000000"] is s2
+    )  # s3 parents the IN-RUN s2 (within-run chain)
 
 
 def test_only_single_snapshot_mode(tmp_path):
@@ -200,6 +243,41 @@ def test_only_single_snapshot_mode(tmp_path):
     plan = plan_transfer_sequence([s1, s2], dest, only=s2)
     assert [s.get_name() for s, _ in plan] == ["home-20240102-000000"]
     assert plan[0][1] is s1  # incremental against the corresponding s1
+
+
+def test_no_incremental_suppresses_within_run_chaining(tmp_path):
+    """``no_incremental`` forces ALL full sends even across a multi-snapshot in-run batch --
+    the in-run projection must never sneak in an incremental parent. Mutation guard: chaining
+    under no_incremental."""
+    s1 = _snap("20240101-000000", uuid="U1")
+    s2 = _snap("20240102-000000", uuid="U2")
+    s3 = _snap("20240103-000000", uuid="U3")
+    dest = _dest(tmp_path, [])
+    plan = plan_transfer_sequence([s1, s2, s3], dest, no_incremental=True)
+    assert [s.get_name() for s, _ in plan] == [
+        "home-20240101-000000",
+        "home-20240102-000000",
+        "home-20240103-000000",
+    ]
+    assert all(p is None for _, p in plan)
+
+
+def test_keep_num_backups_chain_does_not_parent_outside_window(tmp_path):
+    """With ``keep_num_backups``, an in-window snapshot must NOT parent off an OUT-of-window
+    older snapshot (which is not transferred this run, so not on the destination). The first
+    kept snapshot is a full send; later kept ones chain within the window. Mutation guard:
+    parenting off the out-of-window U2 would emit an unresolvable send -p."""
+    snaps = [_snap(f"2024010{i}-000000", uuid=f"U{i}") for i in range(1, 5)]  # U1..U4
+    dest = _dest(tmp_path, [])  # empty
+    plan = plan_transfer_sequence(snaps, dest, keep_num_backups=2)
+    # candidates = [U3, U4]. U3 is full (out-of-window U2 is not transferred -> not present);
+    # U4 chains off the in-run U3.
+    assert [s.get_name() for s, _ in plan] == [
+        "home-20240103-000000",
+        "home-20240104-000000",
+    ]
+    assert plan[0][1] is None  # U3 full -- never parents off the out-of-window U2
+    assert plan[1][1] is snaps[2]  # U4 chains off the in-run U3
 
 
 def test_keep_num_backups_limits_candidates(tmp_path):

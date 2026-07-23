@@ -50,12 +50,18 @@ def plan_transfer_sequence(
         only: If given, plan just this one snapshot (single-snapshot transfer mode).
 
     A snapshot whose correspondent is already present on the destination is skipped. For
-    each snapshot to transfer, the parent is the newest source snapshot OLDER than it whose
-    correspondent is present on the destination (so ``btrfs receive`` can resolve the
-    ``send -p``); if none corresponds the snapshot is sent in full. Correspondence is the
-    only presence/parent authority -- a snapshot the destination cannot verifiably resolve
-    is never used as a parent. Parents are drawn from the destination's current state (no
-    within-run chaining), matching existing run semantics.
+    each snapshot to transfer, the parent is the newest source snapshot OLDER than it that is
+    (or, within this run, will be) present on the destination by correspondence (uuid for
+    btrfs, name for raw), so ``btrfs receive`` can resolve the ``send -p``; if none qualifies
+    the snapshot is sent in full. Correspondence is the only presence/parent authority -- a
+    snapshot the destination cannot verifiably resolve is never used as a parent.
+
+    Within-run chaining: because the plan executes oldest-first and each transferred snapshot
+    then corresponds on the destination, a snapshot may parent off an EARLIER-in-this-run
+    transfer (not only snapshots already on the destination at plan time). This keeps a fresh
+    multi-snapshot run (e.g. an initial snapper-history backup) a tight incremental chain
+    instead of all-full sends. If an earlier transfer fails at execution, its dependent
+    incremental fails too and is surfaced (R1) -- never silently mis-applied.
     """
     present = snapshots_present_on(source_snapshots, destination_endpoint)
 
@@ -71,6 +77,12 @@ def plan_transfer_sequence(
         key=lambda s: s.time_obj,
     )
 
+    # A parent is valid if its correspondent is present on the destination -- either already
+    # (``present``) or projected to be, because it is transferred earlier in THIS run.
+    # ``to_transfer`` is oldest-first, so an earlier item is on the destination by the time a
+    # later one sends against it.
+    projected_present = set(present)
+
     plan = []
     for snap in to_transfer:
         parent = None
@@ -82,11 +94,15 @@ def plan_transfer_sequence(
             )
             for candidate in older_newest_first:
                 # A valid incremental parent must have a verified correspondent on the
-                # destination (uuid for btrfs, name for raw) -- never a bare name match.
-                if candidate.get_name() in present:
+                # destination (uuid for btrfs, name for raw) -- never a bare name match --
+                # counting in-run transfers already planned before this one.
+                if candidate.get_name() in projected_present:
                     parent = candidate
                     break
         plan.append((snap, parent))
+        # This snapshot will correspond on the destination once transferred, so later
+        # snapshots in this run may use it as an incremental parent.
+        projected_present.add(snap.get_name())
 
     logger.debug(
         "Planned %d transfer(s) (%d incremental)",

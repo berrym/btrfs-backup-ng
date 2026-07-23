@@ -72,6 +72,34 @@ class TestExecuteTransfersResult:
         assert result.attempted == 2
         assert not result.ok
 
+    def test_failed_in_run_parent_short_circuits_dependents(self, monkeypatch):
+        """Within-run chaining safety: if an in-run parent transfer FAILS, its dependent
+        incrementals must NOT be attempted or committed -- a raw target would otherwise write
+        a valid-looking but UNRESTORABLE stream (a false success). They are recorded as
+        failures (R1). Mutation guard: removing the short-circuit lets the dependents transfer
+        against a missing parent."""
+        s1 = _fake_snap("s1")
+        s2 = _fake_snap("s2")
+        s3 = _fake_snap("s3")
+        src, dst = _endpoints([s1, s2, s3])
+
+        attempted = []
+
+        def fake_send(snap, *a, **k):
+            attempted.append(snap)
+            if snap is s1:
+                raise __util__.SnapshotTransferError("boom")
+
+        monkeypatch.setattr(ops, "send_snapshot", fake_send)
+
+        # Chained plan: s2 parents s1, s3 parents s2. s1 fails -> s2, s3 must short-circuit.
+        result = ops._execute_transfers(src, dst, [(s1, None), (s2, s1), (s3, s2)], {})
+
+        assert result.transferred_count == 0
+        assert result.failed_count == 3
+        # Only s1 was actually attempted; s2 and s3 were short-circuited (parent missing).
+        assert attempted == [s1]
+
     def test_parent_lock_lifecycle(self, monkeypatch):
         """The executor locks the incremental PARENT (parent=True) before the send and
         releases it after a verified success -- the R3 lock lifecycle that keeps retention
