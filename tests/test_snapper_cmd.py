@@ -1157,6 +1157,109 @@ class TestHandleBackup:
 
         assert result == 1
 
+    def _single_backup_args(self, num):
+        return argparse.Namespace(
+            config="root",
+            target="/mnt/backup",
+            snapshot=num,
+            type=None,
+            dry_run=False,
+            compress=None,
+            rate_limit=None,
+            verbose=False,
+            quiet=False,
+            log_level=None,
+        )
+
+    def _run_single_backup(self, args, all_snaps, target_snap, fake_plan):
+        """Drive _handle_backup's single-snapshot path with the correspondence planner mocked;
+        return (result, sent) where ``sent`` records send_snapper_snapshot's parent arg."""
+        from btrfs_backup_ng.cli.snapper_cmd import _handle_backup
+
+        mock_scanner = MagicMock()
+        mock_scanner.get_config.return_value = MagicMock()
+        mock_scanner.get_snapshot.return_value = target_snap
+        mock_scanner.get_snapshots.return_value = all_snaps
+
+        def _wrap(s, dest=None):
+            w = MagicMock()
+            w.get_name.return_value = f"cfg-{s.number}"
+            return w
+
+        sent = []
+
+        def _send(snap, dest, parent_snapper_snapshot=None, options=None):
+            sent.append((snap, parent_snapper_snapshot))
+
+        with (
+            patch(
+                "btrfs_backup_ng.cli.snapper_cmd.SnapperScanner",
+                return_value=mock_scanner,
+            ),
+            patch(
+                "btrfs_backup_ng.endpoint.choose_endpoint",
+                return_value=MagicMock(_is_remote=False),
+            ),
+            patch("btrfs_backup_ng.endpoint.assert_encryption_applied"),
+            patch("btrfs_backup_ng.endpoint.assert_compression_applied"),
+            patch(
+                "btrfs_backup_ng.core.operations._create_snapper_snapshot_wrapper",
+                side_effect=_wrap,
+            ),
+            patch(
+                "btrfs_backup_ng.core.operations._snapper_dest_view",
+                return_value=MagicMock(),
+            ),
+            patch(
+                "btrfs_backup_ng.core.planning.plan_transfer_sequence",
+                side_effect=fake_plan,
+            ),
+            patch(
+                "btrfs_backup_ng.core.operations.send_snapper_snapshot",
+                side_effect=_send,
+            ),
+        ):
+            result = _handle_backup(args)
+        return result, sent
+
+    def test_single_backup_skips_when_already_present(self):
+        """FINDING #9: `snapper backup <cfg> --snapshot N` decides skip by CORRESPONDENCE via the
+        shared planner (same authority as a full sync). When the planner reports the target is
+        already present (empty plan), the handler returns 0 and NEVER calls send. Mutation guard:
+        a number-based or unconditional send would call send here."""
+        target = MagicMock(number=5)
+
+        def fake_plan(wrappers, view, only=None, **k):
+            return []  # already present on the destination
+
+        result, sent = self._run_single_backup(
+            self._single_backup_args(5), [target], target, fake_plan
+        )
+        assert result == 0
+        assert sent == []  # correspondence skip -> nothing sent
+
+    def test_single_backup_sends_with_correspondence_parent(self):
+        """FINDING #9: an ABSENT single snapshot is sent with the planner's correspondence-chosen
+        parent threaded into send_snapper_snapshot -- so a single-snapshot backup gets a valid
+        incremental parent (or a recycled number is handled right), just like a full sync.
+        Mutation guard: dropping the parent wiring sends it as a full (parent=None)."""
+        parent = MagicMock(number=4)
+        target = MagicMock(number=5)
+
+        def fake_plan(wrappers, view, only=None, **k):
+            # Planner selects an older wrapper as the incremental parent of the target.
+            parent_w = next(w for w in wrappers if w is not only)
+            return [(only, parent_w)]
+
+        result, sent = self._run_single_backup(
+            self._single_backup_args(5), [parent, target], target, fake_plan
+        )
+        assert result == 0
+        assert len(sent) == 1
+        sent_snap, sent_parent = sent[0]
+        assert sent_snap is target
+        assert sent_parent is parent  # correspondence-selected parent threaded through
+
 
 class TestHandleRestore:
     """Tests for the restore command handler."""
@@ -1396,32 +1499,9 @@ class TestExecuteSnapper:
 class TestSnapperEndpointRouting:
     """Snapper backup routes through the endpoint layer (issue #1)."""
 
-    def test_list_backed_up_numbers_btrfs_local(self, tmp_path):
-        """btrfs targets report numbers from .snapshots/{num}/snapshot dirs."""
-        from btrfs_backup_ng.core.operations import _list_backed_up_snapper_numbers
-
-        base = tmp_path / "backup"
-        for num in (1, 2):
-            (base / ".snapshots" / str(num) / "snapshot").mkdir(parents=True)
-        # A numbered dir with no 'snapshot' subvolume is not counted.
-        (base / ".snapshots" / "3").mkdir(parents=True)
-
-        ep = MagicMock()
-        ep.config = {"path": str(base)}
-        ep._is_remote = False
-
-        assert _list_backed_up_snapper_numbers(ep) == {1, 2}
-
-    def test_list_backed_up_numbers_raw_is_empty(self, tmp_path):
-        """Raw targets have no numbered layout, so the set is empty (re-send)."""
-        from btrfs_backup_ng.core.operations import _list_backed_up_snapper_numbers
-        from btrfs_backup_ng.endpoint.raw import RawEndpoint
-
-        ep = RawEndpoint(config={"path": str(tmp_path)})
-        assert _list_backed_up_snapper_numbers(ep) == set()
-
-    def test_send_snapper_btrfs_receives_into_per_snapshot_dir(self):
-        """btrfs dispatch points the endpoint at .snapshots/{num} then restores it."""
+    def test_send_snapper_btrfs_receives_into_incoming_temp_slot(self):
+        """btrfs dispatch receives into the transactional .snapshots/{num}.incoming slot (NOT
+        the final slot), then publishes; the endpoint's base path is restored afterward."""
         from btrfs_backup_ng.core import operations
 
         ep = MagicMock()
@@ -1440,18 +1520,19 @@ class TestSnapperEndpointRouting:
 
         with (
             patch.object(
-                operations, "_list_backed_up_snapper_numbers", return_value=set()
-            ),
-            patch.object(
                 operations, "_create_snapper_snapshot_wrapper", return_value=MagicMock()
             ),
             patch.object(operations, "send_snapshot", side_effect=fake_send_snapshot),
+            patch.object(operations, "_snapper_run_shell", return_value=(0, "")),
+            patch.object(operations, "_snapper_publish_slot") as pub,
             patch.object(operations, "_place_info_xml"),
             patch.object(operations, "_write_snapper_metadata"),
         ):
             operations.send_snapper_snapshot(snap, ep)
 
-        assert captured["path"] == "/backup/home/.snapshots/5"
+        # Received into the .incoming temp slot, never the final one.
+        assert captured["path"] == "/backup/home/.snapshots/5.incoming"
+        pub.assert_called_once_with(ep, 5)  # then published atomically
         # The endpoint's base path is restored after the transfer.
         assert ep.config["path"] == "/backup/home"
 
@@ -1530,14 +1611,13 @@ class TestSnapperEndpointRouting:
         # Regression: the ssh URL is not turned into a local directory.
         assert not (tmp_path / "ssh:").exists()
 
-    def test_cleanup_uses_btrfs_subvolume_delete(self, tmp_path):
-        """Cleanup removes the read-only received subvolume via btrfs, not rm -rf
-        (a received subvolume is read-only and cannot be rm'd)."""
+    def test_cleanup_targets_only_incoming_temp_never_published_backup(self, tmp_path):
+        """DATA-LOSS GUARD: cleanup after a failed transfer touches ONLY the transactional
+        .snapshots/{num}.incoming temp -- NEVER the published .snapshots/{num}/snapshot backup.
+        It deletes the temp's read-only received subvolume via btrfs subvolume delete."""
         from btrfs_backup_ng.core import operations
 
         base = tmp_path / "backup"
-        (base / ".snapshots" / "7" / "snapshot").mkdir(parents=True)
-
         ep = MagicMock()
         ep.config = {"path": str(base)}
         ep._is_remote = False
@@ -1546,16 +1626,23 @@ class TestSnapperEndpointRouting:
 
         def record(cmd, *a, **k):
             calls.append(list(cmd))
-            return MagicMock(returncode=0)
+            return MagicMock(returncode=0, stdout="")
 
         with (
             patch("btrfs_backup_ng.core.operations.subprocess.run", side_effect=record),
-            patch("os.geteuid", return_value=0),
+            patch("btrfs_backup_ng.core.operations.os.geteuid", return_value=0),
         ):
             operations._cleanup_snapper_backup(ep, 7, is_raw=False)
 
-        subvol = str(base / ".snapshots" / "7" / "snapshot")
-        assert ["btrfs", "subvolume", "delete", subvol] in calls
+        # One privileged shell pass.
+        assert len(calls) == 1
+        assert calls[0][:2] == ["sh", "-c"]
+        script = calls[0][2]
+        incoming = str(base / ".snapshots" / "7.incoming")
+        published = str(base / ".snapshots" / "7" / "snapshot")
+        assert "btrfs subvolume delete" in script
+        assert incoming in script  # only the temp is targeted
+        assert published not in script  # the published backup is NEVER touched
 
     def test_handle_backup_threads_ssh_options(self, tmp_path, monkeypatch):
         """--ssh-sudo / --ssh-key reach the endpoint config for ssh targets."""

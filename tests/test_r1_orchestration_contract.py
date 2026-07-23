@@ -181,7 +181,21 @@ class TestSyncSnapperSnapshotsFailLoud:
         monkeypatch.setattr(
             ops, "get_snapper_snapshots_for_backup", lambda *a, **k: list(snaps)
         )
-        monkeypatch.setattr(ops, "_list_backed_up_snapper_numbers", lambda ep: set())
+
+        # Wrap each snapper snapshot as a lightweight named stand-in, and plan every one as a
+        # full send (no chaining), so the fail-loud loop is exercised in isolation from the
+        # wrapper enrichment / correspondence enumeration.
+        def _wrap(s, dest=None):
+            w = MagicMock()
+            w.get_name.return_value = f"backup-{s.number}"
+            return w
+
+        monkeypatch.setattr(ops, "_create_snapper_snapshot_wrapper", _wrap)
+        monkeypatch.setattr(ops, "_snapper_dest_view", lambda dest: MagicMock())
+        monkeypatch.setattr(
+            "btrfs_backup_ng.core.planning.plan_transfer_sequence",
+            lambda wrappers, view, **k: [(w, None) for w in wrappers],
+        )
 
     def test_failed_snapshot_raises_with_result(self, monkeypatch):
         snap = MagicMock()
