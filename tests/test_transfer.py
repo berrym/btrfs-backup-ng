@@ -583,11 +583,12 @@ class TestCleanupPipelineExceptions:
 
 
 class TestReceivePassesSnapshotName:
-    """The transfer paths pass snapshot_name to endpoint.receive().
+    """The transfer paths pass snapshot_name AND parent_name to endpoint.receive().
 
-    Raw endpoints require snapshot_name to name their output file; passing it on
-    every transfer path is what makes raw and raw+ssh targets work end to end.
-    These would fail on the pre-fix code where receive() was called without it.
+    Raw endpoints require snapshot_name to name their output file; parent_name lets them
+    record the incremental parent in the .meta sidecar (btrfs ignores it). Passing both on
+    every transfer path is what makes raw and raw+ssh incrementals self-describing end to
+    end. These would fail on code that dropped either argument.
     """
 
     def _mock_process(self, returncode=0):
@@ -613,10 +614,13 @@ class TestReceivePassesSnapshotName:
             snapshot_name="host-20240115-120000",
             estimated_size=None,
             show_progress=False,
+            parent_name="host-20240110-120000",
         )
 
         dest.receive.assert_called_once_with(
-            send_process.stdout, "host-20240115-120000"
+            send_process.stdout,
+            "host-20240115-120000",
+            parent_name="host-20240110-120000",
         )
 
     def test_rich_progress_transfer_passes_snapshot_name(self):
@@ -638,9 +642,14 @@ class TestReceivePassesSnapshotName:
                 False,
                 "host-20240115-120000",
                 1000,
+                parent_name="host-20240110-120000",
             )
 
-        dest.receive.assert_called_once_with(subprocess.PIPE, "host-20240115-120000")
+        dest.receive.assert_called_once_with(
+            subprocess.PIPE,
+            "host-20240115-120000",
+            parent_name="host-20240110-120000",
+        )
 
     def test_chunked_local_passes_snapshot_name(self):
         """The chunked local reassembly path forwards manifest.snapshot_name."""
@@ -648,6 +657,7 @@ class TestReceivePassesSnapshotName:
 
         manifest = MagicMock()
         manifest.snapshot_name = "host-20240115-120000"
+        manifest.parent_name = "host-20240110-120000"
         manifest.chunk_count = 1
         manifest.chunks = []
         dest = MagicMock()
@@ -659,7 +669,11 @@ class TestReceivePassesSnapshotName:
 
         operations._transfer_chunks_local(manifest, dest, chunked_manager, {})
 
-        dest.receive.assert_called_once_with(subprocess.PIPE, "host-20240115-120000")
+        dest.receive.assert_called_once_with(
+            subprocess.PIPE,
+            "host-20240115-120000",
+            parent_name="host-20240110-120000",
+        )
 
     def test_chunked_ssh_passes_snapshot_name(self):
         """The chunked SSH fallback (non-receive_chunked) path forwards the name."""
@@ -667,6 +681,7 @@ class TestReceivePassesSnapshotName:
 
         manifest = MagicMock()
         manifest.snapshot_name = "host-20240115-120000"
+        manifest.parent_name = "host-20240110-120000"
         manifest.pending_chunks = [MagicMock()]
         manifest.completed_chunks = 0
         manifest.chunk_count = 1
@@ -683,4 +698,8 @@ class TestReceivePassesSnapshotName:
 
         operations._transfer_chunks_ssh(manifest, dest, chunked_manager, {})
 
-        dest.receive.assert_called_once_with(subprocess.PIPE, "host-20240115-120000")
+        dest.receive.assert_called_once_with(
+            subprocess.PIPE,
+            "host-20240115-120000",
+            parent_name="host-20240110-120000",
+        )
