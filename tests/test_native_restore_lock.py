@@ -145,7 +145,7 @@ def test_incremental_parent_is_the_backup_side_snapshot(monkeypatch):
 
     # Force the name/time fallback parent path (the one that picked a local snapshot).
     monkeypatch.setattr(
-        restore_mod, "find_parent_by_uuid", lambda *a, **k: (None, None)
+        restore_mod, "find_parent_by_correspondence", lambda *a, **k: (None, None)
     )
 
     captured = {}

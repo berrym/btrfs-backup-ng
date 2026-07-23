@@ -490,12 +490,12 @@ def restore_snapshots(
     if dry_run:
         logger.info("Dry run - no changes made")
         for i, snap in enumerate(to_restore, 1):
-            # Try UUID-based parent detection first
-            parent, _local_match = find_parent_by_uuid(
+            # Correspondence-based parent (received_uuid for btrfs, name for raw)
+            parent, _local_match = find_parent_by_correspondence(
                 backup_snapshots, local_snapshots, snap, backup_endpoint
             )
             if not parent:
-                # Fall back to traditional parent finding
+                # Degrade to time-based parent finding when no correspondent exists
                 parent = snap.find_parent(
                     [s for s in to_restore if s != snap] + local_snapshots
                 )
@@ -525,14 +525,14 @@ def restore_snapshots(
         # Then fall back to name/time-based matching
         parent = None
         if not no_incremental:
-            # Try UUID-based parent detection first
-            parent, _local_match = find_parent_by_uuid(
+            # Correspondence-based parent (received_uuid for btrfs, name for raw)
+            parent, _local_match = find_parent_by_correspondence(
                 backup_snapshots, restored_snapshots, snap, backup_endpoint
             )
             if parent:
-                logger.debug("Found UUID-matched parent: %s", parent.get_name())
+                logger.debug("Found corresponding parent: %s", parent.get_name())
             else:
-                # Fall back to traditional parent finding
+                # Degrade to time-based parent finding when no correspondent exists
                 parent = snap.find_parent(restored_snapshots)
                 if parent:
                     logger.debug("Found time-based parent: %s", parent.get_name())
@@ -623,92 +623,62 @@ def list_remote_snapshots(
     return snapshots
 
 
-def find_parent_by_uuid(
+def find_parent_by_correspondence(
     backup_snapshots: list,
     local_snapshots: list,
     target_backup,
     backup_endpoint,
 ) -> tuple:
-    """Find a parent backup whose Received UUID matches a local snapshot's UUID.
+    """Find a backup to use as the incremental parent for restoring ``target_backup``.
 
-    For btrfs incremental send/receive to work across filesystems:
-    1. The backup's "Received UUID" must match a local snapshot's UUID
-    2. We use -p with the backup that has this matching Received UUID
+    A valid restore parent must be present on BOTH sides: on the backup side (its path feeds
+    ``btrfs send -p``) AND locally (so ``btrfs receive`` can apply the diff onto it). That is
+    exactly ``backup_endpoint.correspondent_of(local_snap)`` -- the ONE polymorphic
+    correspondence primitive the backup planner uses (R4): ``received_uuid == uuid`` for
+    btrfs, name for raw. So restore no longer re-implements uuid matching with its own
+    ``btrfs subvolume show`` parsing (which blocked on a password via bare ``sudo`` and, on a
+    raw target, silently failed because a stream file is not a subvolume -- forcing raw
+    restore onto the time-based fallback). Correspondence gives btrfs restore the identical
+    result (Phase 1 proved the equivalence) and raw restore proper name correspondence.
 
     Args:
-        backup_snapshots: All snapshots at backup location
-        local_snapshots: Snapshots that exist locally
-        target_backup: The backup we want to restore
-        backup_endpoint: Endpoint where backups are stored
+        backup_snapshots: All snapshots at the backup location.
+        local_snapshots: Snapshots that exist locally (already-restored copies).
+        target_backup: The backup being restored (never its own parent).
+        backup_endpoint: Endpoint where backups are stored; queried via correspondent_of.
 
     Returns:
-        Tuple of (parent_backup, matching_local_snapshot) or (None, None)
+        Tuple of (parent_backup, matching_local_snapshot) or (None, None). Never raises
+        (the correspondent_of contract). When None, the caller degrades to the time-based
+        ``Snapshot.find_parent`` fallback.
     """
-    import subprocess
+    # A backup is a valid parent iff a local snapshot corresponds to it (present on both
+    # sides). Map each locally-present backup (by name) to its local correspondent.
+    local_by_backup_name: dict = {}
+    for local_snap in local_snapshots:
+        backup = backup_endpoint.correspondent_of(local_snap)
+        if backup is not None:
+            local_by_backup_name[backup.get_name()] = local_snap
 
-    backup_path = Path(backup_endpoint.config["path"])
-
-    # Build map of local UUID -> snapshot
-    local_uuid_map = {}
-    for snap in local_snapshots:
-        try:
-            result = subprocess.run(
-                ["sudo", "btrfs", "subvolume", "show", str(snap.get_path())],
-                capture_output=True,
-                text=True,
-                check=True,
-            )
-            for line in result.stdout.split("\n"):
-                if (
-                    "UUID:" in line
-                    and "Parent UUID" not in line
-                    and "Received UUID" not in line
-                ):
-                    uuid_val = line.split(":")[1].strip()
-                    if uuid_val and uuid_val != "-":
-                        local_uuid_map[uuid_val] = snap
-                    break
-        except Exception:
-            continue
-
-    if not local_uuid_map:
-        logger.debug("No local UUIDs found for parent matching")
+    if not local_by_backup_name:
+        logger.debug(
+            "No corresponding local snapshot found for restore parent matching"
+        )
         return None, None
 
-    # Find a backup whose Received UUID matches a local snapshot's UUID
+    # Preserve the prior selection order: the first backup (in backup_snapshots order,
+    # excluding the target) that is present locally becomes the incremental parent.
     for backup in backup_snapshots:
         if backup == target_backup:
             continue
-
-        backup_snap_path = backup_path / backup.get_name()
-        try:
-            result = subprocess.run(
-                ["sudo", "btrfs", "subvolume", "show", str(backup_snap_path)],
-                capture_output=True,
-                text=True,
-                check=True,
+        local_match = local_by_backup_name.get(backup.get_name())
+        if local_match is not None:
+            logger.debug(
+                "Restore parent by correspondence: backup %s <-> local %s",
+                backup.get_name(),
+                local_match.get_name(),
             )
-            received_uuid = None
-            for line in result.stdout.split("\n"):
-                if "Received UUID:" in line:
-                    received_uuid = line.split(":")[1].strip()
-                    break
-
-            if (
-                received_uuid
-                and received_uuid != "-"
-                and received_uuid in local_uuid_map
-            ):
-                local_snap = local_uuid_map[received_uuid]
-                logger.debug(
-                    "Found UUID match: backup %s (Received UUID %s) matches local %s",
-                    backup.get_name(),
-                    received_uuid,
-                    local_snap.get_name(),
-                )
-                return backup, local_snap
-        except Exception:
-            continue
+            return backup, local_match
 
     return None, None
 
