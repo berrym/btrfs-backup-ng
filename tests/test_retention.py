@@ -13,6 +13,7 @@ from btrfs_backup_ng.retention import (
     format_retention_summary,
     get_bucket_key,
     parse_duration,
+    subtract_duration,
 )
 
 
@@ -195,6 +196,21 @@ class TestGetBucketKey:
         bucket = get_bucket_key(dt, "weekly")
         # Should return a consistent key for the week
         assert bucket is not None
+
+    def test_weekly_bucket_is_iso_week_no_year_boundary_split(self):
+        """R10c: all seven days of an ISO week share ONE weekly key, even across a year boundary
+        (2021-12-27 Mon .. 2022-01-02 Sun == ISO 2021-W52). Mutation guard: calendar %Y+%W splits
+        this week into '2021-W52' and '2022-W00'."""
+        keys = {
+            get_bucket_key(datetime(2021, 12, 27) + timedelta(days=d), "weekly")
+            for d in range(7)  # Mon 2021-12-27 .. Sun 2022-01-02
+        }
+        assert keys == {"2021-W52"}
+
+    def test_weekly_bucket_jan1_maps_to_prior_iso_year(self):
+        """R10c: 2023-01-01 (a Sunday) belongs to ISO week 2022-W52, not '2023-W00'. Mutation
+        guard: %Y+%W yields '2023-W00'."""
+        assert get_bucket_key(datetime(2023, 1, 1), "weekly") == "2022-W52"
 
     def test_monthly_bucket(self):
         """Test monthly bucket calculation."""
@@ -485,3 +501,55 @@ class TestFormatRetentionSummary:
         result = format_retention_summary(to_keep, to_delete)
 
         assert "and 10 more" in result
+
+
+class TestSubtractDuration:
+    """R10c: calendar-aware min cutoff for month/year units (stdlib, no dep)."""
+
+    def test_fixed_units_unchanged(self):
+        """s/m/h/d/w stay fixed timedeltas (identical to the old behavior). Mutation guard:
+        routing these through month math changes them."""
+        now = datetime(2024, 3, 15, 12, 0, 0)
+        assert subtract_duration(now, "7d") == now - timedelta(days=7)
+        assert subtract_duration(now, "2h") == now - timedelta(hours=2)
+        assert subtract_duration(now, "3w") == now - timedelta(weeks=3)
+
+    def test_calendar_month_full_31_day_month(self):
+        """min='1M' subtracts a CALENDAR month, not a fixed 30 days: 2024-03-31 - 1M -> 2024-02-29
+        (not 2024-03-01). Mutation guard: fixed 30d yields 2024-03-01."""
+        assert subtract_duration(datetime(2024, 3, 31, 12), "1M") == datetime(
+            2024, 2, 29, 12
+        )
+
+    def test_calendar_month_day_clamp_non_leap(self):
+        """Day clamps to the target month's last day: 2023-03-31 - 1M -> 2023-02-28."""
+        assert subtract_duration(datetime(2023, 3, 31), "1M") == datetime(2023, 2, 28)
+
+    def test_12M_equals_1y_calendar(self):
+        """Calendar math makes 12M == 1y (both one calendar year), fixing the old 360d != 365d
+        mismatch. Mutation guard: the fixed 30d/365d approximation makes them differ."""
+        now = datetime(2024, 7, 15, 8, 30, 0)
+        assert subtract_duration(now, "12M") == subtract_duration(now, "1y")
+        assert subtract_duration(now, "1y") == datetime(2023, 7, 15, 8, 30, 0)
+
+    def test_year_leap_day_clamp(self):
+        """1y from a leap day clamps: 2024-02-29 - 1y -> 2023-02-28."""
+        assert subtract_duration(datetime(2024, 2, 29), "1y") == datetime(2023, 2, 28)
+
+    def test_invalid_duration_raises_valueerror(self):
+        """An invalid duration raises ValueError (callers map it to RetentionError/ConfigError --
+        fail closed)."""
+        with pytest.raises(ValueError):
+            subtract_duration(datetime(2024, 1, 1), "not-a-duration")
+
+    def test_calendar_min_keeps_snapshot_a_30day_cutoff_would_prune(self):
+        """Integration: with now on a 31-day month's last day and min='1M', a snapshot 31 days old
+        is KEPT (calendar month back), where the old fixed-30d cutoff would have PRUNED it.
+        Mutation guard: reverting to `now - parse_duration` deletes the 31-day-old snapshot."""
+        now = datetime(2024, 1, 31, 12, 0, 0)
+        newest = "home-20240131-000000"  # holds the always-keep-latest slot
+        old = "home-20231231-120000"  # 31 days before now; calendar 1M cutoff is 2023-12-31 12:00
+        retention = RetentionConfig(min="1M", hourly=0, daily=0, weekly=0, monthly=0)
+        to_keep, to_delete = apply_retention([newest, old], retention, now=now)
+        # 'old' is kept ONLY by the within-min rule -> proves the calendar cutoff reaches 31 days.
+        assert old in to_keep and old not in to_delete
