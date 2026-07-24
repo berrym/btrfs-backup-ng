@@ -6,6 +6,8 @@ import pytest
 
 from btrfs_backup_ng.config.schema import RetentionConfig
 from btrfs_backup_ng.retention import (
+    CLOCK_SKEW_TOLERANCE,
+    RetentionError,
     apply_retention,
     extract_timestamp,
     format_retention_summary,
@@ -251,19 +253,70 @@ class TestApplyRetention:
 
         assert len(to_keep) >= 1
 
-    def test_invalid_min_duration_defaults(self):
-        """Test that invalid min duration defaults to 1 day."""
+    def test_invalid_min_raises_and_deletes_nothing(self):
+        """R10a: an invalid min fails LOUD and CLOSED -- apply_retention raises RetentionError
+        (so the caller prunes nothing) instead of silently defaulting to 1d and deleting.
+        Mutation guard: the old silent-1d fallback returns a non-empty to_delete."""
         now = datetime(2024, 1, 15, 12, 0, 0)
         retention = RetentionConfig(
             min="invalid", hourly=0, daily=0, weekly=0, monthly=0
         )
-
-        timestamps = [now - timedelta(hours=i) for i in range(5)]
+        timestamps = [now - timedelta(days=i) for i in range(5)]
         snapshots = self._make_snapshot_names(timestamps)
 
-        # Should not raise, should use default
-        to_keep, to_delete = apply_retention(snapshots, retention, now=now)
-        assert len(to_keep) >= 1
+        with pytest.raises(RetentionError):
+            apply_retention(snapshots, retention, now=now)
+
+    def test_unparseable_does_not_steal_latest(self):
+        """R10a CRITICAL: an unparseable-named entry must NOT consume the 'keep latest' slot --
+        the real newest snapshot is still kept, the junk is quarantined (kept). Mutation guard:
+        the old code assigns the unparseable timestamp=now, making IT 'latest' and DELETING the
+        real newest."""
+        now = datetime(2024, 1, 15, 12, 0, 0)
+        retention = RetentionConfig(min="0s", hourly=0, daily=0, weekly=0, monthly=0)
+        real_new = "home-20240115-100000"  # 2h before now -> newest real
+        real_old = "home-20240110-100000"
+        to_keep, to_delete = apply_retention(
+            ["garbage-name-xyz", real_new, real_old], retention, now=now
+        )
+        assert real_new in to_keep  # the real newest keeps its 'latest' guarantee
+        assert real_new not in to_delete
+        assert "garbage-name-xyz" in to_keep  # quarantined, always kept
+        assert "garbage-name-xyz" not in to_delete
+
+    def test_future_dated_does_not_steal_latest(self):
+        """R10a HIGH: a future-dated snapshot (beyond the skew tolerance) is quarantined (kept)
+        and never consumes 'latest'; the real newest valid snapshot survives. Mutation guard:
+        without the future partition it sorts first, steals latest, and the real newest is
+        deleted."""
+        now = datetime(2024, 1, 15, 12, 0, 0)
+        retention = RetentionConfig(min="0s", hourly=0, daily=0, weekly=0, monthly=0)
+        future = "home-20240115-180000"  # +6h, well beyond the 5m tolerance
+        real_new = "home-20240115-100000"
+        real_old = "home-20240110-100000"
+        to_keep, to_delete = apply_retention(
+            [future, real_new, real_old], retention, now=now
+        )
+        assert future in to_keep  # quarantined, kept
+        assert future not in to_delete
+        assert real_new in to_keep  # real newest still 'latest'
+        assert real_new not in to_delete
+
+    def test_skew_within_tolerance_is_valid_and_can_be_latest(self):
+        """R10a: a snapshot a couple minutes in the future (benign NTP jitter, within
+        CLOCK_SKEW_TOLERANCE) is treated as VALID (clamped to now), so it is the 'latest' and
+        retention still functions -- it is NOT quarantined. Mutation guard: dropping the
+        tolerance (quarantining every t>now) makes the OLDER snapshot 'latest', so nothing is
+        deleted and this test's `older in to_delete` fails."""
+        # This test fixes the skew at +2min; assert the default tolerance actually covers it.
+        assert CLOCK_SKEW_TOLERANCE >= timedelta(minutes=2)
+        now = datetime(2024, 1, 15, 12, 0, 0)
+        skew = "home-20240115-120200"  # +2min, within tolerance
+        older = "home-20240115-100000"
+        retention = RetentionConfig(min="0s", hourly=0, daily=0, weekly=0, monthly=0)
+        to_keep, to_delete = apply_retention([skew, older], retention, now=now)
+        assert skew in to_keep  # kept as the latest valid (clamped to now)
+        assert older in to_delete  # retention still runs: older is pruned
 
     def test_with_prefix(self):
         """Test retention with prefix parameter."""

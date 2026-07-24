@@ -162,6 +162,24 @@ class TestLoadConfig:
         assert logs_volume.retention.daily == 14
         assert logs_volume.retention.weekly == 8
 
+    def test_load_invalid_retention_min(self, tmp_config_dir):
+        """R10a: an invalid retention 'min' duration fails LOUD at config load (ConfigError),
+        so a corrupt policy can never reach the destructive prune path. Mutation guard: without
+        load-time validation the bad value loads and only silently defaults/fails at prune time."""
+        bad_config = tmp_config_dir / "bad_min.toml"
+        bad_config.write_text("""
+[global.retention]
+min = "not-a-duration"
+
+[[volumes]]
+path = "/home"
+
+[[volumes.targets]]
+path = "/mnt/backup"
+""")
+        with pytest.raises(ConfigError, match="retention"):
+            load_config(bad_config)
+
     def test_load_nonexistent_file(self, tmp_path):
         """Test error when loading nonexistent file."""
         with pytest.raises(ConfigError, match="Cannot read config file"):
