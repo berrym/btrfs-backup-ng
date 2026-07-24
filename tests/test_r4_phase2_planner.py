@@ -29,6 +29,15 @@ def _snap(stamp, uuid="", received_uuid=""):
     return s
 
 
+def _snap_named(name, stamp, uuid="", received_uuid=""):
+    """A snapshot with an EXPLICIT name decoupled from its timestamp -- the real snapper shape
+    (``{config}-{number}-{date}``), so two snapshots can share a same-second ``time_obj`` yet
+    keep distinct identities/uuids (which the vanilla name==timestamp ``_snap`` cannot express)."""
+    s = _snap(stamp, uuid=uuid, received_uuid=received_uuid)
+    s.get_name = lambda: name  # type: ignore[method-assign]
+    return s
+
+
 def _dest(tmp_path, dest_snaps):
     """A real btrfs (Local) destination endpoint whose listing we control, so the real
     Endpoint.correspondent_of (received_uuid == source.uuid) drives the planner."""
@@ -234,6 +243,78 @@ def test_within_run_chaining_off_earlier_in_run_transfer(tmp_path):
     assert (
         by["home-20240103-000000"] is s2
     )  # s3 parents the IN-RUN s2 (within-run chain)
+
+
+# --------------------------------------------------------------------------- #
+# Same-second tiebreak: equal timestamps still chain (deterministic total order)
+# --------------------------------------------------------------------------- #
+def test_same_second_snapshots_chain_incrementally(tmp_path):
+    """Two snapshots created in the SAME SECOND (equal ``time_obj``, distinct names/uuids -- e.g.
+    a fast pre/post pair, snapper's date having 1s resolution) must still chain: ordered by the
+    positional tiebreak, the later one parents off the earlier in-run transfer instead of BOTH
+    falling back to full sends. Mutation guard: selecting parents by ``time_obj <`` alone (no
+    positional tiebreak) excludes the equal-second earlier snapshot -> plan[1] parent is None
+    (a redundant full send)."""
+    s1 = _snap_named("cfg-1-20240101-000000", "20240101-000000", uuid="U1")
+    s2 = _snap_named("cfg-2-20240101-000000", "20240101-000000", uuid="U2")
+    dest = _dest(tmp_path, [])  # fresh dest
+    plan = plan_transfer_sequence([s1, s2], dest)
+    assert [s.get_name() for s, _ in plan] == [
+        "cfg-1-20240101-000000",
+        "cfg-2-20240101-000000",
+    ]
+    assert plan[0][1] is None  # oldest by (time, position): full send
+    assert plan[1][1] is s1  # SAME-SECOND child chains off s1 -- the fix
+
+
+def test_same_second_present_snapshot_is_used_as_parent(tmp_path):
+    """A same-second earlier snapshot ALREADY on the destination is a valid parent for the later
+    same-second snapshot -- the positional tiebreak makes it 'ordered before', so ``send -p`` can
+    resolve. Mutation guard: a ``time_obj``-only comparison drops it -> full send."""
+    s1 = _snap_named("cfg-1-20240101-000000", "20240101-000000", uuid="U1")
+    s2 = _snap_named("cfg-2-20240101-000000", "20240101-000000", uuid="U2")
+    dest = _dest(
+        tmp_path,
+        [
+            _snap_named(
+                "cfg-1-20240101-000000",
+                "20240101-000000",
+                uuid="Da",
+                received_uuid="U1",
+            )
+        ],
+    )
+    plan = plan_transfer_sequence([s1, s2], dest)
+    # s1 present -> skipped; s2 planned with the on-dest same-second s1 as parent.
+    assert [s.get_name() for s, _ in plan] == ["cfg-2-20240101-000000"]
+    assert plan[0][1] is s1
+
+
+def test_same_second_pair_embedded_in_longer_chain(tmp_path):
+    """A same-second pair inside a longer fresh run chains cleanly end-to-end: the oldest is
+    full, the two same-second snaps chain (second off first), and a later snap chains off the
+    second. Guards that the tiebreak threads a whole chain, not just an isolated pair."""
+    s0 = _snap_named("cfg-0-20240101-000000", "20240101-000000", uuid="U0")
+    s1 = _snap_named("cfg-1-20240101-000010", "20240101-000010", uuid="U1")
+    s2 = _snap_named(
+        "cfg-2-20240101-000010", "20240101-000010", uuid="U2"
+    )  # same sec as s1
+    s3 = _snap_named("cfg-3-20240101-000020", "20240101-000020", uuid="U3")
+    dest = _dest(tmp_path, [])
+    plan = plan_transfer_sequence([s0, s1, s2, s3], dest)
+    parents = {s.get_name(): (p.get_name() if p else None) for s, p in plan}
+    assert [s.get_name() for s, _ in plan] == [
+        "cfg-0-20240101-000000",
+        "cfg-1-20240101-000010",
+        "cfg-2-20240101-000010",
+        "cfg-3-20240101-000020",
+    ]
+    assert parents["cfg-0-20240101-000000"] is None
+    assert parents["cfg-1-20240101-000010"] == "cfg-0-20240101-000000"
+    assert (
+        parents["cfg-2-20240101-000010"] == "cfg-1-20240101-000010"
+    )  # same-second chain
+    assert parents["cfg-3-20240101-000020"] == "cfg-2-20240101-000010"
 
 
 def test_only_single_snapshot_mode(tmp_path):
