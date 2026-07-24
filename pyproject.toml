@@ -29,7 +29,10 @@ dev = [
     "pytest>=7.0",
     "pytest-cov>=4.0",
     "pytest-asyncio>=0.23.0",
-    "ruff>=0.1.0",
+    # Pin below 0.16: ruff 0.16.0 enabled new/changed lint+format rules that flag ~1000
+    # pre-existing findings repo-wide. Adopting 0.16 is a deliberate follow-up (folds into the
+    # 0.9.0 reliability audit); until then, stay on the 0.15 line the codebase is clean against.
+    "ruff>=0.15.0,<0.16.0",
     "mypy>=1.0",
     "types-paramiko>=3.0",
 ]
