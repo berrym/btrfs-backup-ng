@@ -611,6 +611,20 @@ class Endpoint:
             logger.info("Deleting old snapshot: %s", snap)
             self.delete_snapshots([snap])
 
+    def protect_incremental_parents(
+        self, to_keep: List[Any], to_delete: List[Any]
+    ) -> tuple[List[Any], List[Any]]:
+        """Adjust a retention decision so deleting a snapshot cannot break an incremental chain
+        a KEPT snapshot still depends on. Returns the (possibly adjusted) ``(to_keep, to_delete)``.
+
+        Base (btrfs) behaviour is a NO-OP: on a btrfs destination a received subvolume is
+        self-contained once committed, so pruning an incremental PARENT only forces the next
+        backup to be a full send (a bandwidth/space cost) -- never data loss. Raw targets, whose
+        backups are ``btrfs send`` STREAM files, override this: deleting a parent stream makes
+        every dependent child stream unrestorable, so raw must protect the chain.
+        """
+        return to_keep, to_delete
+
     def get_space_info(self, path: Optional[str] = None) -> SpaceInfo:
         """Get space information for the endpoint's destination path.
 

@@ -4,9 +4,16 @@ Implements a clear, predictable retention model:
 
 1. `min` - Absolute minimum retention period. Nothing deleted before this age.
 2. Time buckets (hourly, daily, weekly, monthly, yearly) evaluated newest-to-oldest.
-3. First snapshot in each bucket is kept.
+3. The OLDEST snapshot in each bucket is kept (the first-of-interval representative, matching
+   btrbk/snapper convention).
 4. Latest snapshot is always preserved.
-5. Snapshots needed for incremental chains are preserved automatically.
+
+Incremental chains: this module decides keep/delete purely by time. It does NOT itself preserve
+incremental parents -- that is applied afterwards by ``Endpoint.protect_incremental_parents`` on
+the (to_keep, to_delete) result. For btrfs that is a no-op (a pruned parent only forces the next
+backup to be a full send -- a bandwidth/space cost, not data loss). For raw targets it is real:
+``RawEndpoint`` refuses to delete a stream a kept stream still needs as a parent, because a raw
+child stream is unrestorable without its parent.
 
 Example:
     min = "1d"      # Keep everything for at least 1 day
