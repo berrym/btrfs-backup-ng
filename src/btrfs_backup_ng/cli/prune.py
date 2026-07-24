@@ -2,9 +2,11 @@
 
 import argparse
 import logging
+import sys
 import time
+from datetime import timedelta
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 from .. import __util__, endpoint
 from ..__logger__ import add_file_handler, create_logger
@@ -18,10 +20,33 @@ from ..notifications import (
 from ..notifications import (
     NotificationConfig as NotifConfig,
 )
-from ..retention import apply_retention
+from ..retention import apply_retention, parse_duration
 from .common import get_log_level, get_timestamp_format
 
 logger = logging.getLogger(__name__)
+
+
+def _is_degenerate_policy(retention: Any) -> bool:
+    """A retention policy that would keep only the LATEST snapshot: no periodic buckets AND a
+    near-zero ``min`` (<= 1 day). Such a policy is almost always a misconfiguration (fat-fingered
+    or all-zeroed config) that would prune essentially all history, so prune refuses it without
+    ``--force``. A legitimate short-window policy (e.g. ``min="30d"`` with zeroed buckets) is NOT
+    degenerate -- it deliberately keeps a time window."""
+    if any(
+        c > 0
+        for c in (
+            retention.hourly,
+            retention.daily,
+            retention.weekly,
+            retention.monthly,
+            retention.yearly,
+        )
+    ):
+        return False
+    try:
+        return parse_duration(retention.min) <= timedelta(days=1)
+    except ValueError:
+        return False  # invalid min is rejected at config load / fails closed in apply_retention
 
 
 def execute_prune(args: argparse.Namespace) -> int:
@@ -77,7 +102,11 @@ def execute_prune(args: argparse.Namespace) -> int:
     total_kept = 0
     volumes_processed = 0
     volumes_failed = 0
-    error_messages = []
+    error_messages: list[str] = []
+    force = getattr(args, "force", False)
+    # PLAN pass: collect every deletion as (endpoint, [snapshots], label) WITHOUT touching
+    # anything, so the whole prune is shown and confirmed once before any delete happens.
+    plan: list[tuple[Any, list, str]] = []
 
     for volume in volumes:
         logger.info("Volume: %s", volume.path)
@@ -86,13 +115,30 @@ def execute_prune(args: argparse.Namespace) -> int:
 
         retention = config.get_effective_retention(volume)
         logger.info(
-            "  Retention: min=%s, hourly=%d, daily=%d, weekly=%d, monthly=%d",
+            "  Retention: min=%s, hourly=%d, daily=%d, weekly=%d, monthly=%d, yearly=%d",
             retention.min,
             retention.hourly,
             retention.daily,
             retention.weekly,
             retention.monthly,
+            retention.yearly,
         )
+
+        # Degenerate-policy guardrail: refuse to prune a volume whose policy keeps only the
+        # latest snapshot, unless --force -- enforced even non-interactively (the fat-fingered-
+        # config-nukes-all-history backstop). Does not change pruning semantics, only gates them.
+        if _is_degenerate_policy(retention) and not force:
+            logger.error(
+                "  Refusing to prune %s: retention keeps ONLY the latest snapshot "
+                "(all buckets 0, min=%s). Re-run with --force if this is intended.",
+                volume.path,
+                retention.min,
+            )
+            error_messages.append(
+                f"Refused (degenerate policy, no --force): {volume.path}"
+            )
+            volumes_failed += 1
+            continue
 
         # Build endpoint kwargs
         endpoint_kwargs = {
@@ -152,29 +198,9 @@ def execute_prune(args: argparse.Namespace) -> int:
                 )
 
                 logger.info("  Keeping %d, deleting %d", len(to_keep), len(to_delete))
-
-                if to_delete:
-                    if dry_run:
-                        for snap in to_delete:
-                            logger.info("    Would delete: %s", snap.get_name())
-                        total_deleted += len(to_delete)
-                    else:
-                        delete_session = {s.get_name() for s in to_delete}
-                        for snap in to_delete:
-                            try:
-                                source_endpoint.delete_snapshots(
-                                    [snap], delete_session=delete_session
-                                )
-                                logger.info("    Deleted: %s", snap.get_name())
-                                total_deleted += 1
-                            except Exception as e:
-                                logger.error(
-                                    "    Failed to delete %s: %s", snap.get_name(), e
-                                )
-                                error_messages.append(f"Delete {snap.get_name()}: {e}")
-                                volume_had_errors = True
-
                 total_kept += len(to_keep)
+                if to_delete:
+                    plan.append((source_endpoint, to_delete, f"source {volume.path}"))
 
         except Exception as e:
             logger.error("  Error pruning source: %s", e)
@@ -216,33 +242,9 @@ def execute_prune(args: argparse.Namespace) -> int:
                     logger.info(
                         "    Keeping %d, deleting %d", len(to_keep), len(to_delete)
                     )
-
-                    if to_delete:
-                        if dry_run:
-                            for snap in to_delete:
-                                logger.info("      Would delete: %s", snap.get_name())
-                            total_deleted += len(to_delete)
-                        else:
-                            delete_session = {s.get_name() for s in to_delete}
-                            for snap in to_delete:
-                                try:
-                                    dest_endpoint.delete_snapshots(
-                                        [snap], delete_session=delete_session
-                                    )
-                                    logger.info("      Deleted: %s", snap.get_name())
-                                    total_deleted += 1
-                                except Exception as e:
-                                    logger.error(
-                                        "      Failed to delete %s: %s",
-                                        snap.get_name(),
-                                        e,
-                                    )
-                                    error_messages.append(
-                                        f"Delete {snap.get_name()}: {e}"
-                                    )
-                                    volume_had_errors = True
-
                     total_kept += len(to_keep)
+                    if to_delete:
+                        plan.append((dest_endpoint, to_delete, f"target {target.path}"))
 
             except Exception as e:
                 logger.error("  Error pruning target %s: %s", target.path, e)
@@ -252,6 +254,42 @@ def execute_prune(args: argparse.Namespace) -> int:
         # Track volume failure
         if volume_had_errors:
             volumes_failed += 1
+
+    # ---- AGGREGATE + CONFIRM + EXECUTE ----
+    total_to_delete = sum(len(td) for _, td, _ in plan)
+    if dry_run:
+        for _ep, to_delete, label in plan:
+            for snap in to_delete:
+                logger.info("  Would delete (%s): %s", label, snap.get_name())
+        total_deleted = total_to_delete
+    elif total_to_delete == 0:
+        logger.info("Nothing to prune")
+    else:
+        # A single confirmation before ANY deletion. An interactive TTY prompts unless --yes;
+        # a non-interactive run (cron) proceeds without prompting -- a degenerate policy was
+        # already refused above unless --force, so cron cannot silently mass-delete.
+        proceed = getattr(args, "yes", False) or not sys.stdin.isatty()
+        if not proceed:
+            print(f"About to delete {total_to_delete} snapshot(s)/backup(s):")
+            for _ep, to_delete, label in plan:
+                print(f"  {label} -- {len(to_delete)}:")
+                for snap in to_delete:
+                    print(f"    - {snap.get_name()}")
+            print(f"Proceed with deleting {total_to_delete}? [y/N] ", end="")
+            proceed = input().strip().lower() in ("y", "yes")
+        if not proceed:
+            logger.info("Aborted; nothing deleted.")
+        else:
+            for ep, to_delete, label in plan:
+                delete_session = {s.get_name() for s in to_delete}
+                for snap in to_delete:
+                    try:
+                        ep.delete_snapshots([snap], delete_session=delete_session)
+                        logger.info("  Deleted (%s): %s", label, snap.get_name())
+                        total_deleted += 1
+                    except Exception as e:
+                        logger.error("  Failed to delete %s: %s", snap.get_name(), e)
+                        error_messages.append(f"Delete {snap.get_name()}: {e}")
 
     end_time = time.time()
     duration = end_time - start_time

@@ -238,6 +238,17 @@ def create_subcommand_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Show what would be deleted without making changes",
     )
+    prune_parser.add_argument(
+        "--yes",
+        "-y",
+        action="store_true",
+        help="Skip the interactive confirmation prompt (for automation)",
+    )
+    prune_parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Allow pruning under a degenerate policy that would keep only the latest snapshot",
+    )
 
     # list command
     list_parser = subparsers.add_parser(
