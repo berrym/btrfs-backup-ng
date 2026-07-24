@@ -134,8 +134,21 @@ def find_config_file(explicit_path: str | None = None) -> Path | None:
 
 def _parse_retention(data: dict[str, Any]) -> RetentionConfig:
     """Parse retention configuration from dict."""
+    min_value = data.get("min", "1d")
+    # Validate the min duration at the config boundary so an invalid value fails LOUD here
+    # (ConfigError) instead of silently reaching the destructive prune path -- matching the
+    # fail-closed validation already done for compress/encrypt/source. Function-local import
+    # avoids a config<->retention import cycle.
+    from ..retention import parse_duration
+
+    try:
+        parse_duration(str(min_value))
+    except ValueError as e:
+        raise ConfigError(
+            f"Invalid retention 'min' duration: {min_value!r} ({e})"
+        ) from e
     return RetentionConfig(
-        min=data.get("min", "1d"),
+        min=min_value,
         hourly=data.get("hourly", 24),
         daily=data.get("daily", 7),
         weekly=data.get("weekly", 4),

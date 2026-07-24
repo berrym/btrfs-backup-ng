@@ -27,6 +27,23 @@ from .config import RetentionConfig
 logger = logging.getLogger(__name__)
 
 
+class RetentionError(Exception):
+    """Raised when a retention policy is invalid or ambiguous.
+
+    Retention decides what to DELETE, so an unresolvable policy must fail LOUD and CLOSED:
+    the caller (e.g. ``cli/prune``) catches this, prunes nothing for that volume, and reports
+    a non-zero exit -- never silently substitutes a more-permissive policy that deletes more.
+    """
+
+
+# A parsed snapshot timestamp at most this far in the future of ``now`` is treated as benign
+# clock skew (NTP jitter / VM drift / small host offset): it is clamped to ``now`` and still
+# participates in retention. Anything further in the future is quarantined (kept, but excluded
+# from the retention math) so it cannot hijack the "keep latest" slot. Full cross-timezone
+# normalization is a separate, later change; until then large skews are safely kept + warned.
+CLOCK_SKEW_TOLERANCE = timedelta(minutes=5)
+
+
 # Duration parsing regex
 DURATION_PATTERN = re.compile(r"^(?P<value>\d+)\s*(?P<unit>[smhdwMy])$")
 
@@ -217,57 +234,88 @@ def apply_retention(
     # Use provided get_name or default to str()
     name_func: Callable[[Any], str] = get_name if get_name is not None else str
 
-    # Parse minimum retention duration
+    # Parse minimum retention duration. ``min`` is a corrupt-retention selector when invalid:
+    # fail LOUD and CLOSED (raise -> the caller prunes nothing) rather than silently choosing a
+    # shorter, more-permissive window that DELETES more (the project's R1/R3 "never delete on
+    # ambiguous input" contract). Config load validates ``min`` too, so this is defence-in-depth.
     try:
         min_age = parse_duration(config.min)
-    except ValueError:
-        logger.warning("Invalid min duration '%s', defaulting to 1 day", config.min)
-        min_age = timedelta(days=1)
+    except ValueError as e:
+        raise RetentionError(
+            f"Invalid retention 'min' duration {config.min!r}: {e}"
+        ) from e
 
     min_cutoff = now - min_age
+    future_cutoff = now + CLOCK_SKEW_TOLERANCE
 
-    # Build snapshot info list with timestamps
-    snapshot_infos: list[SnapshotInfo] = []
+    # Partition the snapshots. VALID = a parseable timestamp no further in the future than the
+    # clock-skew tolerance (a within-tolerance future time is clamped to ``now`` so benign skew
+    # still participates in retention). QUARANTINED = unparseable OR implausibly future-dated:
+    # ALWAYS kept and COMPLETELY excluded from the retention math, so such an entry can never
+    # (a) consume the "keep latest" slot from the real newest snapshot, nor (b) occupy a
+    # time-bucket slot. This is the R10a data-loss fix: only real, orderable snapshots decide
+    # what gets deleted.
+    valid_infos: list[SnapshotInfo] = []
+    quarantined_infos: list[SnapshotInfo] = []
     for snap in snapshots:
         name = name_func(snap)
         timestamp = extract_timestamp(name, prefix, timestamp_format)
 
         if timestamp is None:
-            # Can't parse timestamp, keep it to be safe
-            logger.debug("Cannot parse timestamp from '%s', keeping", name)
-            snapshot_infos.append(
+            logger.warning(
+                "Retention: cannot parse a timestamp from %r; keeping it, excluded from "
+                "retention counting",
+                name,
+            )
+            quarantined_infos.append(
                 SnapshotInfo(
                     name=name,
-                    timestamp=now,  # Treat as current
+                    timestamp=now,
                     snapshot=snap,
                     keep=True,
                     keep_reason="unparseable timestamp",
                 )
             )
-        else:
-            snapshot_infos.append(
+        elif timestamp > future_cutoff:
+            logger.warning(
+                "Retention: snapshot %r is dated in the future (%s > now %s); keeping it, "
+                "excluded from retention counting -- check clock/timezone skew",
+                name,
+                timestamp,
+                now,
+            )
+            quarantined_infos.append(
                 SnapshotInfo(
                     name=name,
                     timestamp=timestamp,
                     snapshot=snap,
+                    keep=True,
+                    keep_reason="future-dated timestamp",
                 )
             )
+        else:
+            # Clamp a within-tolerance future timestamp to ``now`` so benign skew sorts as the
+            # newest and buckets correctly (it is within ``min`` anyway).
+            effective = timestamp if timestamp <= now else now
+            valid_infos.append(
+                SnapshotInfo(name=name, timestamp=effective, snapshot=snap)
+            )
 
-    # Sort by timestamp, newest first
-    snapshot_infos.sort(key=lambda s: s.timestamp, reverse=True)
+    # Sort valid snapshots newest-first (quarantined entries never participate in ordering).
+    valid_infos.sort(key=lambda s: s.timestamp, reverse=True)
 
-    # Rule 1: Always keep the latest snapshot
-    if snapshot_infos and not snapshot_infos[0].keep:
-        snapshot_infos[0].keep = True
-        snapshot_infos[0].keep_reason = "latest"
+    # Rule 1: Always keep the latest VALID snapshot (never a quarantined entry).
+    if valid_infos and not valid_infos[0].keep:
+        valid_infos[0].keep = True
+        valid_infos[0].keep_reason = "latest"
 
     # Rule 2: Keep everything within min retention period
-    for info in snapshot_infos:
+    for info in valid_infos:
         if not info.keep and info.timestamp >= min_cutoff:
             info.keep = True
             info.keep_reason = f"within min ({config.min})"
 
-    # Rule 3: Apply time bucket retention
+    # Rule 3: Apply time bucket retention (over the valid set only)
     bucket_types = [
         ("hourly", config.hourly),
         ("daily", config.daily),
@@ -280,15 +328,16 @@ def apply_retention(
         if count <= 0:
             continue
 
-        _apply_bucket_retention(snapshot_infos, bucket_type, count, min_cutoff)
+        _apply_bucket_retention(valid_infos, bucket_type, count, min_cutoff)
 
-    # Split into keep and delete lists
-    to_keep = [info.snapshot for info in snapshot_infos if info.keep]
-    to_delete = [info.snapshot for info in snapshot_infos if not info.keep]
+    # Assemble: quarantined snapshots are ALWAYS kept; only valid non-keeps are deleted.
+    to_keep = [info.snapshot for info in valid_infos if info.keep]
+    to_keep += [info.snapshot for info in quarantined_infos]
+    to_delete = [info.snapshot for info in valid_infos if not info.keep]
 
     # Log decisions
-    logger.debug("Retention decisions for %d snapshots:", len(snapshot_infos))
-    for info in snapshot_infos:
+    logger.debug("Retention decisions for %d snapshots:", len(snapshots))
+    for info in valid_infos + quarantined_infos:
         status = "KEEP" if info.keep else "DELETE"
         reason = f" ({info.keep_reason})" if info.keep_reason else ""
         logger.debug("  %s: %s%s", status, info.name, reason)
