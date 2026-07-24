@@ -128,7 +128,21 @@ btrbk's retention syntax can be confusing. Here's how it maps:
 
 **Important**: btrfs-backup-ng uses a simpler mental model:
 1. `min` - Keep everything for at least this duration
-2. Time buckets (hourly, daily, weekly, monthly, yearly) - Keep N snapshots per bucket
+2. Time buckets (hourly, daily, weekly, monthly, yearly) - Keep N snapshots per bucket, keeping
+   the **oldest** snapshot in each bucket (the same first-of-interval representative btrbk uses)
+
+A few semantics worth knowing when coming from btrbk:
+
+- `min` with **month/year** units (`"1M"`, `"1y"`) is **calendar-aware** — `min = "1M"` is one
+  calendar month (28–31 days), not a flat 30 days — so the minimum-retention window lines up with
+  the monthly/yearly bucket boundaries.
+- **Weekly** buckets use **ISO-8601** week numbering, so a week that straddles a calendar-year
+  boundary (late Dec / early Jan) is counted as one week, matching btrbk/snapper.
+- **`prune` safety.** On an interactive terminal, `btrfs-backup-ng prune` (see
+  [CLI Reference](CLI-REFERENCE.md#prune)) shows its deletion plan and asks for confirmation
+  before deleting (skip with `--yes` for cron/automation), and it **refuses** a degenerate policy
+  that would keep only the latest snapshot (all buckets `0` with `min ≤ 1d`) unless you pass
+  `--force` — a guard against a mistyped policy wiping your history.
 
 ### Volume and Subvolume Mapping
 
