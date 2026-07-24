@@ -50,11 +50,13 @@ def plan_transfer_sequence(
         only: If given, plan just this one snapshot (single-snapshot transfer mode).
 
     A snapshot whose correspondent is already present on the destination is skipped. For
-    each snapshot to transfer, the parent is the newest source snapshot OLDER than it that is
-    (or, within this run, will be) present on the destination by correspondence (uuid for
-    btrfs, name for raw), so ``btrfs receive`` can resolve the ``send -p``; if none qualifies
-    the snapshot is sent in full. Correspondence is the only presence/parent authority -- a
-    snapshot the destination cannot verifiably resolve is never used as a parent.
+    each snapshot to transfer, the parent is the newest source snapshot ordered BEFORE it --
+    by creation time, then source-enumeration position to break same-second ties (see
+    ``_order_key``) -- that is (or, within this run, will be) present on the destination by
+    correspondence (uuid for btrfs, name for raw), so ``btrfs receive`` can resolve the
+    ``send -p``; if none qualifies the snapshot is sent in full. Correspondence is the only
+    presence/parent authority -- a snapshot the destination cannot verifiably resolve is never
+    used as a parent.
 
     Within-run chaining: because the plan executes oldest-first and each transferred snapshot
     then corresponds on the destination, a snapshot may parent off an EARLIER-in-this-run
@@ -72,9 +74,21 @@ def plan_transfer_sequence(
     else:
         candidates = list(source_snapshots)
 
+    # A TOTAL order over snapshots: primary = creation time, secondary = position in the source
+    # enumeration (snapper number / btrfs subvol-id order, which is creation order -- and unlike
+    # a ``.number`` attribute, every snapshot type has a list position). The secondary breaks
+    # SAME-SECOND ties (e.g. a fast pre/post pair snapper's 1s-resolution date collapses to one
+    # timestamp): without it, ``o.time_obj < snap.time_obj`` excludes an equal-timestamp earlier
+    # snapshot from being a parent, so each same-second snapshot falls back to a full send. For
+    # distinct timestamps the secondary never engages, so ordering is unchanged.
+    order_pos = {s.get_name(): i for i, s in enumerate(source_snapshots)}
+
+    def _order_key(s):
+        return (s.time_obj, order_pos.get(s.get_name(), 0))
+
     to_transfer = sorted(
         (s for s in candidates if s.get_name() not in present),
-        key=lambda s: s.time_obj,
+        key=_order_key,
     )
 
     # A parent is valid if its correspondent is present on the destination -- either already
@@ -88,8 +102,8 @@ def plan_transfer_sequence(
         parent = None
         if not no_incremental:
             older_newest_first = sorted(
-                (o for o in source_snapshots if o.time_obj < snap.time_obj),
-                key=lambda o: o.time_obj,
+                (o for o in source_snapshots if _order_key(o) < _order_key(snap)),
+                key=_order_key,
                 reverse=True,
             )
             for candidate in older_newest_first:
