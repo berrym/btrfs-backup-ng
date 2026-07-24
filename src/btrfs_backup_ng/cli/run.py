@@ -27,6 +27,7 @@ from ..notifications import (
 from ..notifications import (
     NotificationConfig as NotifConfig,
 )
+from ..retention import RetentionError
 from ..transaction import set_transaction_log
 from .common import (
     get_log_level,
@@ -35,6 +36,11 @@ from .common import (
     space_options_from_args,
     thread_raw_compression,
     thread_raw_encryption,
+)
+from .prune import (
+    execute_retention_deletes,
+    is_degenerate_policy,
+    plan_endpoint_retention,
 )
 
 logger = logging.getLogger(__name__)
@@ -234,6 +240,16 @@ def _dry_run(config: Config) -> int:
             print(
                 f"  Retention: min={retention.min}, hourly={retention.hourly}, daily={retention.daily}"
             )
+            if is_degenerate_policy(retention):
+                print(
+                    "  Retention: WOULD FAIL -- policy keeps only the latest snapshot "
+                    "(run `prune --force` to prune it deliberately)"
+                )
+            else:
+                print(
+                    "  Retention: applied after transfer "
+                    "(use `prune --dry-run` to preview exact deletions)"
+                )
 
         if volume.targets:
             print("  Targets:")
@@ -393,6 +409,9 @@ def _backup_volume(
 
     # Transfer to destinations
     all_success = True
+    # Targets whose transfer SUCCEEDED -- only these are pruned afterwards (fate-sharing: never
+    # prune on a broken backup).
+    succeeded_targets: list = []
 
     if parallel_targets > 1 and len(destination_endpoints) > 1:
         # Parallel target transfers
@@ -418,6 +437,7 @@ def _backup_volume(
                     success = future.result()
                     if success:
                         stats["completed"] += 1
+                        succeeded_targets.append((dest, target_cfg))
                     else:
                         stats["failed"] += 1
                         all_success = False
@@ -443,6 +463,7 @@ def _backup_volume(
                 )
                 if success:
                     stats["completed"] += 1
+                    succeeded_targets.append((dest_endpoint, target_config))
                 else:
                     stats["failed"] += 1
                     all_success = False
@@ -452,7 +473,72 @@ def _backup_volume(
                 errors.append(f"Transfer to {target_config.path}: {e}")
                 all_success = False
 
-    return all_success, stats, errors
+    # --- Retention (prune) phase ---
+    # run = snapshot -> transfer -> prune, as a strict pipeline. Apply the SAME time-based
+    # retention engine as the `prune` command (non-interactively), so `run` leaves the source and
+    # its successfully-transferred targets in a policy-compliant state instead of accumulating
+    # snapshots forever. Strict contract: a degenerate policy or an invalid `min` fails loudly
+    # (non-zero exit) rather than being silently skipped. Fate-sharing: the source is pruned (R3
+    # lock reconcile keeps a snapshot a failed transfer still needs), and only targets whose
+    # transfer SUCCEEDED are pruned.
+    prune_ok = _prune_after_transfer(
+        volume, config, source_endpoint, succeeded_targets, errors
+    )
+    return (all_success and prune_ok), stats, errors
+
+
+def _prune_after_transfer(
+    volume: VolumeConfig,
+    config: Config,
+    source_endpoint: Any,
+    succeeded_targets: list,
+    errors: list[str],
+) -> bool:
+    """The ``run`` pipeline's post-transfer retention phase (regular volumes).
+
+    Applies the SAME shared time-based retention engine as the ``prune`` command
+    (``plan_endpoint_retention`` + ``execute_retention_deletes``), non-interactively, to the
+    source and each successfully-transferred target. Returns True on success; returns False (with
+    messages appended to ``errors``) if the policy is degenerate or invalid, or a delete fails --
+    so ``run`` exits non-zero rather than silently skipping retention. ``run`` never forces a
+    degenerate prune: an intentional keep-only-latest prune is the explicit ``prune --force``.
+    """
+    retention = config.get_effective_retention(volume)
+    if is_degenerate_policy(retention):
+        logger.error(
+            "Refusing to prune %s: retention keeps ONLY the latest snapshot (all buckets 0, "
+            "min=%s). Fix the policy, or run `prune --force` to prune it deliberately.",
+            volume.path,
+            retention.min,
+        )
+        errors.append(f"Degenerate retention policy: {volume.path}")
+        return False
+
+    prefix = volume.snapshot_prefix
+    ts_format = get_timestamp_format(config)
+    ok = True
+    endpoints = [(source_endpoint, f"source {volume.path}")]
+    endpoints += [(ep, f"target {tc.path}") for ep, tc in succeeded_targets]
+    for ep, label in endpoints:
+        try:
+            _keep, to_delete = plan_endpoint_retention(ep, retention, prefix, ts_format)
+            deleted, del_errs = execute_retention_deletes(ep, to_delete)
+            if deleted:
+                logger.info("Pruned %d old snapshot(s) (%s)", deleted, label)
+            if del_errs:
+                for msg in del_errs:
+                    logger.error("  %s", msg)
+                errors.extend(del_errs)
+                ok = False
+        except RetentionError as e:
+            logger.error("Prune failed (%s): %s", label, e)
+            errors.append(f"Prune {label}: {e}")
+            ok = False
+        except Exception as e:  # noqa: BLE001 - record and continue to the next endpoint
+            logger.error("Prune error (%s): %s", label, e)
+            errors.append(f"Prune {label}: {e}")
+            ok = False
+    return ok
 
 
 def _backup_snapper_volume(

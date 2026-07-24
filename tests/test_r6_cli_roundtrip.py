@@ -62,6 +62,9 @@ class TestRunThreadsEncryption:
         captured: dict = {}
         monkeypatch.setattr(run_mod.endpoint, "choose_endpoint", _spy_choose(captured))
         monkeypatch.setattr(run_mod, "_transfer_to_target", lambda *a, **k: True)
+        # This test targets encryption threading, not the post-transfer prune phase (which
+        # operates on the spy's mock endpoints); stub it to a clean success.
+        monkeypatch.setattr(run_mod, "_prune_after_transfer", lambda *a, **k: True)
 
         ok, _stats, errors = run_mod._backup_volume(volume, config, parallel_targets=1)
 
@@ -94,6 +97,8 @@ class TestRunThreadsEncryption:
         captured: dict = {}
         monkeypatch.setattr(run_mod.endpoint, "choose_endpoint", _spy_choose(captured))
         monkeypatch.setattr(run_mod, "_transfer_to_target", lambda *a, **k: True)
+        # Not exercising the prune phase here (spy endpoints); stub it to a clean success.
+        monkeypatch.setattr(run_mod, "_prune_after_transfer", lambda *a, **k: True)
 
         ok, _stats, errors = run_mod._backup_volume(volume, config, parallel_targets=1)
         assert ok, errors

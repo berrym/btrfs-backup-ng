@@ -26,12 +26,13 @@ from .common import get_log_level, get_timestamp_format
 logger = logging.getLogger(__name__)
 
 
-def _is_degenerate_policy(retention: Any) -> bool:
+def is_degenerate_policy(retention: Any) -> bool:
     """A retention policy that would keep only the LATEST snapshot: no periodic buckets AND a
     near-zero ``min`` (<= 1 day). Such a policy is almost always a misconfiguration (fat-fingered
-    or all-zeroed config) that would prune essentially all history, so prune refuses it without
-    ``--force``. A legitimate short-window policy (e.g. ``min="30d"`` with zeroed buckets) is NOT
-    degenerate -- it deliberately keeps a time window."""
+    or all-zeroed config) that would prune essentially all history, so both the ``prune`` command
+    and the ``run`` pipeline refuse it (``prune`` unless ``--force``; ``run`` always, since an
+    intentional degenerate prune is an explicit ``prune --force``). A legitimate short-window
+    policy (e.g. ``min="30d"`` with zeroed buckets) is NOT degenerate -- it keeps a time window."""
     if any(
         c > 0
         for c in (
@@ -47,6 +48,49 @@ def _is_degenerate_policy(retention: Any) -> bool:
         return parse_duration(retention.min) <= timedelta(days=1)
     except ValueError:
         return False  # invalid min is rejected at config load / fails closed in apply_retention
+
+
+def plan_endpoint_retention(
+    endpoint_obj: Any, retention: Any, prefix: str, timestamp_format: str | None
+) -> tuple[list, list]:
+    """The shared, deterministic retention PLAN for one endpoint: list its snapshots, apply the
+    time-based policy, then protect incremental parents. Returns ``(to_keep, to_delete)``. Raises
+    ``RetentionError`` on an invalid ``min`` (fail-closed -- the caller prunes nothing and errors).
+    Both the ``prune`` command and the ``run`` pipeline use this, so they can never diverge."""
+    snapshots = endpoint_obj.list_snapshots()
+    if not snapshots:
+        return [], []
+    to_keep, to_delete = apply_retention(
+        snapshots,
+        retention,
+        get_name=lambda s: s.get_name(),
+        prefix=prefix,
+        timestamp_format=timestamp_format,
+    )
+    # Never prune a snapshot a kept one still needs as an incremental parent (no-op for btrfs;
+    # protects raw stream chains from becoming unrestorable).
+    return endpoint_obj.protect_incremental_parents(to_keep, to_delete)
+
+
+def execute_retention_deletes(
+    endpoint_obj: Any, to_delete: list
+) -> tuple[int, list[str]]:
+    """Delete ``to_delete`` on one endpoint, passing the full batch as the delete-session (so the
+    chain guard never mistakes a whole-chain delete for orphaning). Returns
+    ``(deleted_count, error_messages)`` -- a per-snapshot failure is recorded, not raised, so one
+    bad delete does not abort the rest."""
+    if not to_delete:
+        return 0, []
+    delete_session = {s.get_name() for s in to_delete}
+    deleted = 0
+    errors: list[str] = []
+    for snap in to_delete:
+        try:
+            endpoint_obj.delete_snapshots([snap], delete_session=delete_session)
+            deleted += 1
+        except Exception as e:  # noqa: BLE001 - record and continue
+            errors.append(f"Delete {snap.get_name()}: {e}")
+    return deleted, errors
 
 
 def execute_prune(args: argparse.Namespace) -> int:
@@ -127,7 +171,7 @@ def execute_prune(args: argparse.Namespace) -> int:
         # Degenerate-policy guardrail: refuse to prune a volume whose policy keeps only the
         # latest snapshot, unless --force -- enforced even non-interactively (the fat-fingered-
         # config-nukes-all-history backstop). Does not change pruning semantics, only gates them.
-        if _is_degenerate_policy(retention) and not force:
+        if is_degenerate_policy(retention) and not force:
             logger.error(
                 "  Refusing to prune %s: retention keeps ONLY the latest snapshot "
                 "(all buckets 0, min=%s). Re-run with --force if this is intended.",
@@ -179,28 +223,13 @@ def execute_prune(args: argparse.Namespace) -> int:
             )
             source_endpoint.prepare()
 
-            snapshots = source_endpoint.list_snapshots()
-            logger.info("  Source: %d snapshots", len(snapshots))
-
-            if snapshots:
-                # Apply time-based retention
-                to_keep, to_delete = apply_retention(
-                    snapshots,
-                    retention,
-                    get_name=lambda s: s.get_name(),
-                    prefix=prefix,
-                    timestamp_format=get_timestamp_format(config),
-                )
-                # Never prune a snapshot a kept one still needs as an incremental parent
-                # (no-op for btrfs; protects raw stream chains from becoming unrestorable).
-                to_keep, to_delete = source_endpoint.protect_incremental_parents(
-                    to_keep, to_delete
-                )
-
-                logger.info("  Keeping %d, deleting %d", len(to_keep), len(to_delete))
-                total_kept += len(to_keep)
-                if to_delete:
-                    plan.append((source_endpoint, to_delete, f"source {volume.path}"))
+            to_keep, to_delete = plan_endpoint_retention(
+                source_endpoint, retention, prefix, get_timestamp_format(config)
+            )
+            logger.info("  Keeping %d, deleting %d", len(to_keep), len(to_delete))
+            total_kept += len(to_keep)
+            if to_delete:
+                plan.append((source_endpoint, to_delete, f"source {volume.path}"))
 
         except Exception as e:
             logger.error("  Error pruning source: %s", e)
@@ -221,30 +250,13 @@ def execute_prune(args: argparse.Namespace) -> int:
                 )
                 dest_endpoint.prepare()
 
-                dest_snapshots = dest_endpoint.list_snapshots()
-                logger.info("  Target %s: %d backups", target.path, len(dest_snapshots))
-
-                if dest_snapshots:
-                    # Apply time-based retention
-                    to_keep, to_delete = apply_retention(
-                        dest_snapshots,
-                        retention,
-                        get_name=lambda s: s.get_name(),
-                        prefix=prefix,
-                        timestamp_format=get_timestamp_format(config),
-                    )
-                    # Never prune a backup a kept one still needs as an incremental parent
-                    # (no-op for btrfs; protects raw stream chains from becoming unrestorable).
-                    to_keep, to_delete = dest_endpoint.protect_incremental_parents(
-                        to_keep, to_delete
-                    )
-
-                    logger.info(
-                        "    Keeping %d, deleting %d", len(to_keep), len(to_delete)
-                    )
-                    total_kept += len(to_keep)
-                    if to_delete:
-                        plan.append((dest_endpoint, to_delete, f"target {target.path}"))
+                to_keep, to_delete = plan_endpoint_retention(
+                    dest_endpoint, retention, prefix, get_timestamp_format(config)
+                )
+                logger.info("    Keeping %d, deleting %d", len(to_keep), len(to_delete))
+                total_kept += len(to_keep)
+                if to_delete:
+                    plan.append((dest_endpoint, to_delete, f"target {target.path}"))
 
             except Exception as e:
                 logger.error("  Error pruning target %s: %s", target.path, e)
@@ -281,15 +293,12 @@ def execute_prune(args: argparse.Namespace) -> int:
             logger.info("Aborted; nothing deleted.")
         else:
             for ep, to_delete, label in plan:
-                delete_session = {s.get_name() for s in to_delete}
-                for snap in to_delete:
-                    try:
-                        ep.delete_snapshots([snap], delete_session=delete_session)
-                        logger.info("  Deleted (%s): %s", label, snap.get_name())
-                        total_deleted += 1
-                    except Exception as e:
-                        logger.error("  Failed to delete %s: %s", snap.get_name(), e)
-                        error_messages.append(f"Delete {snap.get_name()}: {e}")
+                deleted, errs = execute_retention_deletes(ep, to_delete)
+                total_deleted += deleted
+                logger.info("  Deleted %d (%s)", deleted, label)
+                for err in errs:
+                    logger.error("  %s", err)
+                error_messages.extend(errs)
 
     end_time = time.time()
     duration = end_time - start_time
