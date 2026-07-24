@@ -4,6 +4,8 @@ Extracted from __main__.py for modularity and reuse.
 """
 
 import logging
+import os
+import shlex
 import subprocess
 import time
 from dataclasses import dataclass, field
@@ -1590,46 +1592,191 @@ def get_snapper_snapshots_for_backup(
     return snapshots
 
 
-def _list_backed_up_snapper_numbers(destination_endpoint) -> set[int]:
-    """Return snapper snapshot numbers already present at the destination.
+class _SnapperBtrfsBackup:
+    """A destination-side snapper backup on a btrfs target (``.snapshots/{num}/snapshot``),
+    carrying just enough for correspondence: its ``received_uuid`` (== the source snapshot's
+    uuid it was received from). The number is retained for logging only, NEVER for identity --
+    a recycled snapper number gets a new uuid, so correspondence correctly treats it as absent.
+    """
 
-    btrfs targets: numbered subdirs under ``{base}/.snapshots`` that contain a
-    ``snapshot`` subvolume. Raw targets have no numbered layout, so this returns
-    an empty set (the caller re-sends; raw skip-detection is a follow-up).
+    def __init__(self, number: int, received_uuid: str) -> None:
+        self.number = number
+        self.received_uuid = received_uuid
+
+    def get_name(self) -> str:
+        # Not used for correspondence (received_uuid drives btrfs matching); descriptive only.
+        return f".snapshots/{self.number}/snapshot"
+
+
+def _snapper_run_shell(destination_endpoint, script: str):
+    """Run a ``/bin/sh`` script on the destination WITH ROOT (local or over ssh), honoring the
+    endpoint's sudo strategy, capturing output. Returns ``(returncode, stdout_text)``.
+
+    Snapper's btrfs slot operations -- ``subvolume show`` (enumeration), and the ``mv`` /
+    ``subvolume delete`` of the numbered layout (publish/cleanup) -- all need CAP_SYS_ADMIN and
+    write access to a root-owned ``.snapshots`` tree, so the WHOLE script runs under sudo (not
+    just the ``btrfs`` verbs, which is why the endpoint's own per-command sudo-prepend is
+    insufficient here). For a password-sudo remote, credentials are primed first so ``sudo -n``
+    succeeds with cached creds. Best-effort: never raises; a non-zero return is handled by the
+    caller (enumeration degrades to fewer backups; publish raises a clean transfer error).
+
+    Over ssh the script MUST be passed as a single ``shlex.quote``-d argument: ssh joins the
+    remote argv with spaces and the remote shell re-splits it, so an unquoted multi-word script
+    would be torn apart -- ``sudo`` would bind only its first token and the real work would run
+    unprivileged (or not at all). Quoting keeps ``sh -c`` receiving the whole script intact.
+    """
+    is_remote = getattr(destination_endpoint, "_is_remote", False)
+    try:
+        if is_remote and hasattr(destination_endpoint, "_exec_remote_command"):
+            probe = destination_endpoint._exec_remote_command(
+                ["sudo", "-n", "true"], check=False
+            )
+            if getattr(probe, "returncode", 1) != 0 and hasattr(
+                destination_endpoint, "_prime_remote_sudo"
+            ):
+                try:
+                    destination_endpoint._prime_remote_sudo()
+                except Exception as e:  # noqa: BLE001 - best-effort priming
+                    logger.debug("Could not prime remote sudo: %s", e)
+            # shlex.quote so the whole script survives ssh's join + remote re-split as one
+            # argument to ``sh -c`` (otherwise sudo binds only the first word -- see docstring).
+            result = destination_endpoint._exec_remote_command(
+                ["sudo", "-n", "sh", "-c", shlex.quote(script)],
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            out = (
+                result.stdout.decode(errors="replace")
+                if getattr(result, "stdout", None)
+                else ""
+            )
+            return getattr(result, "returncode", 1), out
+        sudo = [] if os.geteuid() == 0 else ["sudo", "-n"]
+        result = subprocess.run(
+            [*sudo, "sh", "-c", script], capture_output=True, text=True
+        )
+        return result.returncode, result.stdout
+    except Exception as e:  # noqa: BLE001 - best-effort; never crash the caller
+        logger.debug("snapper privileged shell failed: %s", e)
+        return 1, ""
+
+
+def _enumerate_snapper_btrfs_backups(destination_endpoint) -> list:
+    """Received snapper backups on a BTRFS destination, each carrying its ``received_uuid``,
+    read from ``.snapshots/{num}/snapshot`` (local or over ssh). A SINGLE privileged shell
+    pass emits ``<num> <received_uuid>`` for every numeric slot holding a ``snapshot``
+    subvolume with a real Received UUID -- one sudo call (not O(N) subprocesses) that degrades
+    to fewer/no backups on any failure (a missing match simply re-sends its source, which is
+    safe). NEVER raises: an ssh/permission/timeout failure returns what was parsed so far.
+    """
+    snap_dir = f"{str(destination_endpoint.config['path']).rstrip('/')}/.snapshots"
+    script = (
+        f"cd {shlex.quote(snap_dir)} 2>/dev/null || exit 0; "
+        "for n in */; do n=${n%/}; "
+        'case "$n" in ""|*[!0-9]*) continue ;; esac; '
+        '[ -e "$n/snapshot" ] || continue; '
+        'ru=$(btrfs subvolume show "$n/snapshot" 2>/dev/null '
+        '| sed -n "s/.*Received UUID:[[:space:]]*//p" | head -1); '
+        '[ -n "$ru" ] && [ "$ru" != "-" ] && printf "%s %s\\n" "$n" "$ru"; '
+        "done"
+    )
+    rc, out = _snapper_run_shell(destination_endpoint, script)
+    backups: list = []
+    if rc == 0:
+        for line in out.split("\n"):
+            parts = line.split()
+            if len(parts) == 2 and parts[0].isdigit():
+                backups.append(_SnapperBtrfsBackup(int(parts[0]), parts[1]))
+    return backups
+
+
+def _snapper_publish_slot(destination_endpoint, snapshot_num) -> None:
+    """Publish ``.snapshots/{num}.incoming`` as ``.snapshots/{num}``, replacing an occupied slot
+    (a recycled snapper number) WITHOUT a data-loss window.
+
+    A received subvolume is read-only and cannot be renamed (``mv`` -> EROFS), and making it
+    read-write would clear its ``received_uuid`` (breaking correspondence). So the swap renames
+    the CONTAINING DIRECTORY (a plain dir), which relocates the subvolume WITHOUT renaming it
+    and preserves ``received_uuid``: the occupied slot dir is moved aside to ``{num}.stale``,
+    the incoming dir is renamed into place, and only THEN is the stale backup deleted.
+
+    The step ordering is crash-consistent AND self-healing. First it REFUSES to touch the slot
+    unless ``.incoming/snapshot`` actually exists, so a receive that produced nothing can never
+    disturb a pre-existing good backup. Then the ``.stale`` slot is NEVER deleted while the
+    published slot is empty, so a crash between "move aside" and "publish" cannot lose the old
+    backup: a subsequent run's RECOVERY block detects that state (``.stale`` present, the
+    ``{num}`` slot empty) and restores the old backup before retrying -- it only treats ``.stale``
+    as deletable junk when ``{num}/snapshot`` already holds a good backup. Raises
+    SnapshotTransferError on failure (the ``.incoming`` temp is left for cleanup; a pre-existing
+    published backup is always recoverable, never destroyed).
+    """
+    base = f"{str(destination_endpoint.config['path']).rstrip('/')}/.snapshots"
+    q = shlex.quote
+    final_dir = f"{base}/{snapshot_num}"
+    incoming_dir = f"{base}/{snapshot_num}.incoming"
+    stale_dir = f"{base}/{snapshot_num}.stale"
+    script = (
+        "set -e; "
+        # GUARD: the new backup MUST be present to publish. If the receive produced no subvol,
+        # abort BEFORE touching the occupied slot -- a bad/missing incoming can never disturb a
+        # pre-existing good backup.
+        f'[ -e {q(incoming_dir)}/snapshot ] || {{ echo "incoming snapshot missing" >&2; exit 1; }}; '
+        # RECOVERY from a prior crashed publish: NEVER blindly delete ``.stale`` -- it may hold
+        # the ONLY copy of the old backup (a crash after moving it aside but before the new one
+        # was published). If the slot already has a good backup, ``.stale`` is deletable junk;
+        # otherwise the slot is empty and ``.stale`` holds the old backup, so restore it.
+        f"if [ -e {q(stale_dir)} ]; then "
+        f"if [ -e {q(final_dir)}/snapshot ]; then "
+        f"btrfs subvolume delete {q(stale_dir)}/snapshot >/dev/null 2>&1 || true; "
+        f"rm -rf {q(stale_dir)} 2>/dev/null || true; "
+        f"else rm -rf {q(final_dir)} 2>/dev/null || true; mv {q(stale_dir)} {q(final_dir)}; fi; "
+        "fi; "
+        # Move an occupied slot ASIDE (dir rename preserves the read-only subvol + received_uuid).
+        f"if [ -e {q(final_dir)} ]; then mv {q(final_dir)} {q(stale_dir)}; fi; "
+        f"mv {q(incoming_dir)} {q(final_dir)}; "  # publish the new backup (dir rename)
+        # Now that the new backup is in place, delete the moved-aside stale one (if any).
+        f"if [ -e {q(stale_dir)}/snapshot ]; then "
+        f"btrfs subvolume delete {q(stale_dir)}/snapshot >/dev/null 2>&1 || true; fi; "
+        f"rm -rf {q(stale_dir)} 2>/dev/null || true"
+    )
+    rc, _out = _snapper_run_shell(destination_endpoint, script)
+    if rc != 0:
+        raise __util__.SnapshotTransferError(
+            f"Failed to publish snapshot {snapshot_num} into its .snapshots slot"
+        )
+
+
+class _SnapperBtrfsDestView:
+    """Presents the received snapper backups on a BTRFS destination to the shared planner so it
+    decides skip + parent by CORRESPONDENCE (``received_uuid == source.uuid``) instead of the
+    brittle snapper-number scan. ``correspondent_of`` is the production
+    ``Endpoint.correspondent_of`` bound verbatim, so this view can never drift from the real
+    correspondence logic; only the enumeration (the numbered layout) is view-specific.
+    """
+
+    def __init__(self, destination_endpoint) -> None:
+        from ..endpoint.common import Endpoint
+
+        self._snaps = _enumerate_snapper_btrfs_backups(destination_endpoint)
+        # Bind the real primitive to this instance (avoids a module-level Endpoint import /
+        # circular dependency).
+        self.correspondent_of = Endpoint.correspondent_of.__get__(self)
+
+    def list_snapshots(self, flush_cache: bool = False) -> list:
+        return list(self._snaps)
+
+
+def _snapper_dest_view(destination_endpoint):
+    """A destination view the shared planner can query via ``correspondent_of``. Raw targets
+    already enumerate their snapper backups by sidecar name (name correspondence works
+    directly), so the real endpoint is returned; btrfs targets use the numbered-layout view.
     """
     from ..endpoint.raw import RawEndpoint
 
     if isinstance(destination_endpoint, RawEndpoint):
-        return set()
-
-    numbers: set[int] = set()
-    base = str(destination_endpoint.config["path"]).rstrip("/")
-    snap_dir = f"{base}/.snapshots"
-    is_remote = getattr(destination_endpoint, "_is_remote", False)
-
-    if is_remote and hasattr(destination_endpoint, "_exec_remote_command"):
-        try:
-            result = destination_endpoint._exec_remote_command(
-                ["ls", "-1", snap_dir], check=False
-            )
-            if result.returncode == 0:
-                for name in result.stdout.decode().split():
-                    if name.isdigit():
-                        numbers.add(int(name))
-        except Exception as e:
-            logger.debug("Could not list remote snapper backups: %s", e)
-    else:
-        snap_path = Path(snap_dir)
-        if snap_path.exists():
-            for item in snap_path.iterdir():
-                if (
-                    item.is_dir()
-                    and item.name.isdigit()
-                    and (item / "snapshot").exists()
-                ):
-                    numbers.add(int(item.name))
-
-    return numbers
+        return destination_endpoint
+    return _SnapperBtrfsDestView(destination_endpoint)
 
 
 def _place_info_xml(snapper_snapshot, destination_endpoint) -> None:
@@ -1672,46 +1819,30 @@ def _place_info_xml(snapper_snapshot, destination_endpoint) -> None:
 
 
 def _cleanup_snapper_backup(destination_endpoint, snapshot_num, is_raw) -> None:
-    """Best-effort removal of a partial snapper backup after a failed transfer.
+    """Remove ONLY this run's transactional temp artifacts -- NEVER a published backup.
 
-    A received btrfs subvolume is read-only and cannot be removed with ``rm``, so
-    the ``.snapshots/{num}/snapshot`` subvolume is deleted with
-    ``btrfs subvolume delete`` before the numbered directory is removed.
+    For btrfs the temp is the ``.snapshots/{num}.incoming`` slot (a received, read-only
+    subvolume -> ``btrfs subvolume delete`` before removing the dir); the published
+    ``.snapshots/{num}/snapshot`` is deliberately never touched, so a failed transfer can never
+    destroy a pre-existing good backup (the data-loss guard). For raw, the uncommitted ``.part``.
     """
-    import os
-
     if is_raw:
-        # A failed raw transfer leaves an uncommitted ".part" file (atomic writes
-        # keep it out of discovery); remove it so partials do not accumulate.
-        # Raw uses a distinct timestamped name per run, so it is NOT overwritten
-        # on the next attempt -- the old "nothing to undo" assumption was wrong.
+        # A failed raw transfer leaves an uncommitted ".part" file (atomic writes keep it out
+        # of discovery); remove it so partials do not accumulate.
         _cleanup_partial_raw_stream(destination_endpoint)
         return
 
-    base = str(destination_endpoint.config["path"]).rstrip("/")
-    snap_dir = f"{base}/.snapshots/{snapshot_num}"
-    subvol = f"{snap_dir}/snapshot"
-    is_remote = getattr(destination_endpoint, "_is_remote", False)
-
-    try:
-        if is_remote and hasattr(destination_endpoint, "_exec_remote_command"):
-            destination_endpoint._exec_remote_command(
-                ["btrfs", "subvolume", "delete", subvol], check=False
-            )
-            destination_endpoint._exec_remote_command(
-                ["rm", "-rf", snap_dir], check=False
-            )
-        else:
-            sudo = [] if os.geteuid() == 0 else ["sudo"]
-            if Path(subvol).exists():
-                subprocess.run(
-                    [*sudo, "btrfs", "subvolume", "delete", subvol],
-                    capture_output=True,
-                )
-            if Path(snap_dir).exists():
-                subprocess.run([*sudo, "rm", "-rf", snap_dir], capture_output=True)
-    except Exception as cleanup_e:
-        logger.warning("Cleanup failed: %s", cleanup_e)
+    base = f"{str(destination_endpoint.config['path']).rstrip('/')}/.snapshots"
+    q = shlex.quote
+    incoming_dir = f"{base}/{snapshot_num}.incoming"
+    incoming_sub = f"{incoming_dir}/snapshot"
+    script = (
+        f"if [ -e {q(incoming_sub)} ]; then "
+        f"btrfs subvolume delete {q(incoming_sub)} >/dev/null 2>&1 || "
+        f"rm -rf {q(incoming_sub)}; fi; "
+        f"rm -rf {q(incoming_dir)} 2>/dev/null || true"
+    )
+    _snapper_run_shell(destination_endpoint, script)
 
 
 def send_snapper_snapshot(
@@ -1746,10 +1877,9 @@ def send_snapper_snapshot(
     is_raw = isinstance(destination_endpoint, RawEndpoint)
     base_path = str(destination_endpoint.config["path"])
 
-    # Skip if this snapshot number is already present at the destination.
-    if snapshot_num in _list_backed_up_snapper_numbers(destination_endpoint):
-        logger.info("Snapshot %d already exists at destination, skipping", snapshot_num)
-        return
+    # Presence/skip is decided by the caller via correspondence (received_uuid for btrfs, name
+    # for raw) -- NOT the snapper number, which is reused after a prune. So there is no
+    # number-based skip here; the caller only sends snapshots the planner selected.
 
     parent_num = parent_snapper_snapshot.number if parent_snapper_snapshot else None
     if parent_snapper_snapshot:
@@ -1794,12 +1924,19 @@ def send_snapper_snapshot(
                 options=raw_options,
             )
         else:
-            # btrfs targets: temporarily point the same endpoint (reusing its SSH
-            # connection) at .snapshots/{num} so receive lands
-            # .snapshots/{num}/snapshot, then place info.xml beside it.
-            snap_path = f"{base_path.rstrip('/')}/.snapshots/{snapshot_num}"
+            # btrfs targets: TRANSACTIONAL receive. Land the stream in a separate
+            # .snapshots/{num}.incoming slot, then atomically publish it as
+            # .snapshots/{num}/snapshot. A mid-flight failure only ever leaves the .incoming
+            # temp (cleaned below) -- it can never touch a pre-existing good backup -- and a
+            # recycled snapper number (occupied slot, new uuid) is replaced without a
+            # data-loss window (see _snapper_publish_slot).
+            snap_root = f"{base_path.rstrip('/')}/.snapshots"
+            incoming = f"{snap_root}/{snapshot_num}.incoming"
+            final_dir = f"{snap_root}/{snapshot_num}"
+            # Clear any leftover temp from a prior crashed run before receiving.
+            _cleanup_snapper_backup(destination_endpoint, snapshot_num, is_raw)
             saved_path = destination_endpoint.config["path"]
-            destination_endpoint.config["path"] = snap_path
+            destination_endpoint.config["path"] = incoming
             try:
                 send_snapshot(
                     source_wrapper,
@@ -1807,6 +1944,14 @@ def send_snapper_snapshot(
                     parent=parent_wrapper,
                     options=options,
                 )
+            finally:
+                destination_endpoint.config["path"] = saved_path
+            # Receive succeeded -> atomically publish into the numbered slot.
+            _snapper_publish_slot(destination_endpoint, snapshot_num)
+            # Place info.xml beside the published snapshot.
+            saved_path = destination_endpoint.config["path"]
+            destination_endpoint.config["path"] = final_dir
+            try:
                 _place_info_xml(snapper_snapshot, destination_endpoint)
             finally:
                 destination_endpoint.config["path"] = saved_path
@@ -1909,6 +2054,13 @@ def _create_snapper_snapshot_wrapper(snapper_snapshot, destination_endpoint=None
 
     wrapper.get_name = get_name_override  # type: ignore[method-assign]
     wrapper.get_path = get_path_override  # type: ignore[method-assign]
+
+    # Enrich the wrapper's btrfs uuid / received_uuid (sudo-escalated `subvolume show` via the
+    # source endpoint, same as P2 enumeration) so the correspondence-based planner can
+    # identify this snapshot on the destination by received_uuid -- NOT by the snapper number,
+    # which snapper reuses after a prune. get_path() is overridden to the snapper subvolume,
+    # so _load_subvolume_ids_into inspects the right path. Best-effort (empty on failure).
+    source_endpoint._load_subvolume_ids_into([wrapper])
 
     return wrapper
 
@@ -2051,49 +2203,56 @@ def sync_snapper_snapshots(
 
     logger.info("Found %d snapper snapshot(s) to consider", len(snapper_snapshots))
 
-    # Get existing backup snapshot numbers at destination (endpoint-aware)
-    backed_up_numbers = _list_backed_up_snapper_numbers(destination_endpoint)
+    # Decide skip + parent by CORRESPONDENCE via the shared planner (received_uuid for btrfs,
+    # name for raw) instead of the brittle snapper-number scan: a recycled snapper number gets
+    # a new uuid, so it is correctly "absent" and re-sent; and snapper->raw now gets
+    # incrementals. Each snapper snapshot is wrapped as a uuid-enriched Snapshot; the planner
+    # also projects in-run transfers, so a fresh full history is a tight incremental chain
+    # (P3b-1), not all-full sends.
+    from .planning import plan_transfer_sequence
 
-    logger.debug("Already backed up: %s", sorted(backed_up_numbers))
+    wrappers = [
+        _create_snapper_snapshot_wrapper(s, destination_endpoint)
+        for s in snapper_snapshots
+    ]
+    snapper_by_wrapper_name = {
+        w.get_name(): s for w, s in zip(wrappers, snapper_snapshots)
+    }
+    dest_view = _snapper_dest_view(destination_endpoint)
+    plan = plan_transfer_sequence(wrappers, dest_view)
 
-    # Filter to snapshots not yet backed up
-    to_transfer = [s for s in snapper_snapshots if s.number not in backed_up_numbers]
-
-    if not to_transfer:
+    if not plan:
         logger.info("All snapper snapshots already backed up")
         return 0
 
-    # Sort by number to ensure proper incremental chain
-    to_transfer.sort(key=lambda s: s.number)
+    logger.info("Transferring %d snapshot(s):", len(plan))
+    for w, _ in plan:
+        logger.info("  %d", snapper_by_wrapper_name[w.get_name()].number)
 
-    logger.info("Transferring %d snapshot(s):", len(to_transfer))
-    for snap in to_transfer:
-        logger.info("  %d", snap.number)
-
-    # Build a map of all available snapshots (local + already backed up)
-    # for finding parents
-    all_snapshots_by_num = {s.number: s for s in snapper_snapshots}
-
-    # Transfer snapshots
+    # Transfer snapshots. Mirror the executor's within-run-chaining safety (P3b-1): if an
+    # in-run parent's transfer FAILED, its dependent incremental cannot apply -- a raw target
+    # would otherwise commit a false-success, unrestorable stream -- so short-circuit it.
+    planned_names = {w.get_name() for w, _ in plan}
+    transferred_names: set = set()
     result = TransferResult()
-    for i, snap in enumerate(to_transfer, 1):
-        # Find parent for incremental transfer
-        # Look for the highest numbered snapshot that:
-        # 1. Is lower than current snapshot number
-        # 2. Either already backed up OR will be backed up before this one
-        parent = None
-        for candidate_num in sorted(all_snapshots_by_num.keys(), reverse=True):
-            if candidate_num >= snap.number:
-                continue
-            # Check if this candidate is available as parent
-            if candidate_num in backed_up_numbers or candidate_num in [
-                s.number for s in to_transfer[: i - 1]
-            ]:
-                parent = all_snapshots_by_num.get(candidate_num)
-                break
-
+    for i, (w, parent_w) in enumerate(plan, 1):
+        snap = snapper_by_wrapper_name[w.get_name()]
+        if (
+            parent_w is not None
+            and parent_w.get_name() in planned_names
+            and parent_w.get_name() not in transferred_names
+        ):
+            parent_num = snapper_by_wrapper_name[parent_w.get_name()].number
+            err = __util__.SnapshotTransferError(
+                f"incremental parent (snapshot {parent_num}) was not transferred; "
+                f"refusing to send snapshot {snap.number} against a missing parent"
+            )
+            logger.error("Skipping snapshot %d: %s", snap.number, err)
+            result.failed.append((snap, err))
+            continue
+        parent = snapper_by_wrapper_name.get(parent_w.get_name()) if parent_w else None
         try:
-            logger.info("[%d/%d] Snapshot %d", i, len(to_transfer), snap.number)
+            logger.info("[%d/%d] Snapshot %d", i, len(plan), snap.number)
             send_snapper_snapshot(
                 snap,
                 destination_endpoint,
@@ -2101,7 +2260,7 @@ def sync_snapper_snapshots(
                 options=options,
             )
             result.transferred.append(snap)
-            backed_up_numbers.add(snap.number)
+            transferred_names.add(w.get_name())
         except __util__.SnapshotTransferError as e:
             logger.error("Failed to transfer snapshot %d: %s", snap.number, e)
             result.failed.append((snap, e))
@@ -2109,9 +2268,7 @@ def sync_snapper_snapshots(
             # and surfaced below so it is never silently dropped.
 
     logger.info("")
-    logger.info(
-        "Sync complete: %d/%d transferred", result.transferred_count, len(to_transfer)
-    )
+    logger.info("Sync complete: %d/%d transferred", result.transferred_count, len(plan))
 
     # Fail loud: if any snapshot failed, raise with the breakdown attached so the
     # caller reports a non-zero exit / failure notification instead of exit 0.

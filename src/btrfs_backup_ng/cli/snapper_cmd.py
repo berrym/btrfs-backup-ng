@@ -290,22 +290,44 @@ def _handle_backup(args: argparse.Namespace) -> int:
             return 0
 
         try:
-            # Find a parent for incremental transfer: the highest already-backed-up
-            # snapshot number below the target. Uses the endpoint layer so remote
-            # and raw destinations are handled the same as local ones.
-            from ..core.operations import _list_backed_up_snapper_numbers
+            # Decide skip + parent by CORRESPONDENCE (received_uuid for btrfs, name for raw)
+            # via the shared planner -- the same authority as a full sync, so a recycled
+            # snapper number is handled correctly and raw gets incrementals.
+            from ..core.operations import (
+                _create_snapper_snapshot_wrapper,
+                _snapper_dest_view,
+            )
+            from ..core.planning import plan_transfer_sequence
 
-            parent = None
-            backed_up = _list_backed_up_snapper_numbers(destination_endpoint)
-            if backed_up:
-                all_by_num = {s.number: s for s in scanner.get_snapshots(config)}
-                for backup_num in sorted(backed_up, reverse=True):
-                    if backup_num < snapshot.number and backup_num in all_by_num:
-                        parent = all_by_num[backup_num]
-                        logger.debug(
-                            "Found parent snapshot %d for incremental", backup_num
-                        )
-                        break
+            all_snaps = scanner.get_snapshots(config)
+            wrappers = [
+                _create_snapper_snapshot_wrapper(s, destination_endpoint)
+                for s in all_snaps
+            ]
+            by_name = {w.get_name(): s for w, s in zip(wrappers, all_snaps)}
+            target_wrapper = next(
+                (w for w, s in zip(wrappers, all_snaps) if s.number == snapshot.number),
+                None,
+            )
+            if target_wrapper is None:  # target not in the scan; wrap it directly
+                target_wrapper = _create_snapper_snapshot_wrapper(
+                    snapshot, destination_endpoint
+                )
+                wrappers.append(target_wrapper)
+                by_name[target_wrapper.get_name()] = snapshot
+
+            dest_view = _snapper_dest_view(destination_endpoint)
+            plan = plan_transfer_sequence(wrappers, dest_view, only=target_wrapper)
+            if not plan:
+                logger.info(
+                    "Snapshot %d already backed up at destination", snapshot.number
+                )
+                return 0
+
+            parent_w = plan[0][1]
+            parent = by_name.get(parent_w.get_name()) if parent_w else None
+            if parent is not None:
+                logger.debug("Found parent snapshot %d for incremental", parent.number)
 
             send_snapper_snapshot(
                 snapshot,
