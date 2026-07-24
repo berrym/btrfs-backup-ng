@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-07-24
+
+A large reliability release. The incremental-backup engine has been re-architected around a
+single, UUID-based notion of snapshot identity, and the retention/prune system has been
+hardened against several ways it could delete the wrong backups. Enhanced backup
+**verification** is the headline focus of the next release (0.9.1).
+
+### Changed
+
+#### Incremental backups now identify snapshots by their btrfs UUID, not their name
+
+Deciding which existing backup a new incremental backup should build on ("the parent") used to
+be done inconsistently — some code paths matched snapshots by name/timestamp, others by btrfs
+UUID — which could pick a parent the destination does not actually have. btrfs then either
+refused the transfer ("cannot find parent subvolume") or the tool silently fell back to
+re-sending the whole subvolume as a full backup. Snapshot identity is now unified across the
+whole tool onto one rule: a backup on the destination corresponds to a source snapshot when it
+is the received copy of it (matched by btrfs `received_uuid` for btrfs targets, and by name for
+raw stream targets). Concretely:
+
+- A **re-created snapshot** (same name, new content/UUID) is no longer mistaken for the old one
+  — it is correctly seen as new and backed up, and never used as an incorrect parent.
+- **Restore** picks the incremental parent by the same correspondence, and **raw** backups now
+  get proper incremental chains (with the parent recorded in the backup's metadata).
+- **Snapper** backups use the same logic, so a snapper number reused after a prune no longer
+  causes the wrong snapshot to be skipped or re-sent.
+- Within a single run, a fresh batch of snapshots forms a tight incremental chain instead of
+  every snapshot being sent in full.
+
 ### Fixed
 
 #### Remote backups over SSH now work with a passphrase-protected key under sudo
@@ -45,6 +74,41 @@ Related hardening to the same lock file:
   file that later reads as "nothing is protected."
 - Updates to the lock file are **serialized**, so backing up to several targets at once (or
   two runs overlapping) can no longer clobber each other's marks.
+
+#### Retention can no longer delete the wrong backups
+
+Several ways the retention/prune system could delete backups you meant to keep have been fixed:
+
+- A backup whose name can't be parsed as a timestamp, or that is dated in the future (from clock
+  skew or a different timezone), can no longer take over the "always keep the newest backup" slot
+  and cause your real newest backup to be deleted. Such backups are now kept and set aside, with a
+  warning, instead of distorting the retention math.
+- An invalid minimum-retention value (`min`) now fails loudly and deletes nothing, instead of
+  silently falling back to "1 day" and pruning far more than intended. Invalid values are also
+  rejected up front when the configuration is loaded.
+- For **raw** (stream-file) backups, retention will never delete a parent stream that a kept
+  incremental backup still depends on — deleting it would make the newer backup impossible to
+  restore.
+- **Weekly** retention now uses ISO week numbering, so a week that straddles a year boundary is
+  counted as one week instead of being split into two (which kept one extra).
+- `min = "1M"` / `"1y"` now mean one **calendar** month/year (not a flat 30/365 days), so the
+  minimum-retention window lines up with the monthly/yearly buckets.
+
+#### `prune` now confirms before deleting, and refuses a "keep only the latest" policy
+
+Running `prune` interactively now shows what it will delete and asks for confirmation first (skip
+it with `--yes`). Automated (non-interactive) runs of a normal policy still proceed without
+prompting so scheduled jobs don't hang. A **degenerate policy that would keep only the latest
+backup** (all time buckets set to 0 with a near-zero `min`) is now refused unless you pass
+`--force`, even when non-interactive — so a mistyped or empty retention configuration can't
+quietly wipe out your backup history.
+
+#### Snapshots created in the same second now chain incrementally
+
+Two snapshots taken within the same second (for example a fast pre/post pair) share a one-second
+timestamp, and the transfer planner previously could not order them — so each was sent as a full
+backup. A stable secondary ordering now lets the later one build incrementally on the earlier,
+producing smaller, faster transfers.
 
 ## [0.8.5] - 2026-07-22
 
