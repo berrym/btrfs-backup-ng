@@ -10,21 +10,21 @@ from __future__ import annotations
 import argparse
 from datetime import datetime, timedelta
 
-from btrfs_backup_ng.cli.prune import _is_degenerate_policy, execute_prune
+from btrfs_backup_ng.cli.prune import is_degenerate_policy, execute_prune
 from btrfs_backup_ng.config.schema import RetentionConfig
 from btrfs_backup_ng.endpoint.local import LocalEndpoint
 
 
 # --------------------------------------------------------------------------- #
-# _is_degenerate_policy (pure)
+# is_degenerate_policy (pure)
 # --------------------------------------------------------------------------- #
 def test_degenerate_all_zero_buckets_with_tiny_min():
     """All buckets 0 AND a near-zero min (<=1d) keeps only the latest -> degenerate. Mutation
     guard: ignoring min (all-zero => degenerate) would misclassify a short-window policy."""
-    assert _is_degenerate_policy(
+    assert is_degenerate_policy(
         RetentionConfig(min="0s", hourly=0, daily=0, weekly=0, monthly=0, yearly=0)
     )
-    assert _is_degenerate_policy(
+    assert is_degenerate_policy(
         RetentionConfig(min="1d", hourly=0, daily=0, weekly=0, monthly=0, yearly=0)
     )
 
@@ -32,7 +32,7 @@ def test_degenerate_all_zero_buckets_with_tiny_min():
 def test_not_degenerate_short_window_policy():
     """All buckets 0 but a real min window (30d) is a legitimate short-retention policy, NOT
     degenerate. Mutation guard: an all-zero-only check flags this."""
-    assert not _is_degenerate_policy(
+    assert not is_degenerate_policy(
         RetentionConfig(min="30d", hourly=0, daily=0, weekly=0, monthly=0, yearly=0)
     )
 
@@ -40,7 +40,7 @@ def test_not_degenerate_short_window_policy():
 def test_not_degenerate_with_a_bucket():
     """Any positive bucket count means real periodic retention -> not degenerate. Mutation guard:
     dropping the bucket check flags a normal policy."""
-    assert not _is_degenerate_policy(
+    assert not is_degenerate_policy(
         RetentionConfig(min="1d", hourly=0, daily=7, weekly=0, monthly=0, yearly=0)
     )
 
