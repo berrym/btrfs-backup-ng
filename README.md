@@ -57,7 +57,9 @@ See the [LICENSE](LICENSE) file for full copyright attribution.
 - **Full Snapper Support**: Back up and restore Snapper-managed snapshots
 - **Metadata Preservation**: Preserves `info.xml` for seamless Snapper restoration
 - **Pre/Post Pairs**: Supports single, pre, and post snapshot types
-- **Incremental Transfers**: Efficient delta-based transfers between snapshots
+- **Incremental Transfers**: Efficient delta-based transfers between snapshots, with the parent
+  matched by btrfs UUID correspondence (name for raw targets) — so a re-created snapshot with the
+  same name but new content is correctly treated as new, never reused as an incorrect parent
 - **Generate Config**: Auto-generate TOML config from existing Snapper setup
 
 ### btrbk Migration
@@ -526,14 +528,33 @@ sudo chown root:root /etc/btrfs-backup-ng/config.toml
 ```toml
 [global.retention]
 min = "1d"       # Keep all snapshots for at least 1 day
-hourly = 24      # Keep 24 hourly snapshots
-daily = 7        # Keep 7 daily snapshots
-weekly = 4       # Keep 4 weekly snapshots
-monthly = 12     # Keep 12 monthly snapshots
+hourly = 24      # Keep 24 hourly snapshots (one per hour)
+daily = 7        # Keep 7 daily snapshots (one per day)
+weekly = 4       # Keep 4 weekly snapshots (one per ISO week)
+monthly = 12     # Keep 12 monthly snapshots (one per calendar month)
 yearly = 0       # Don't keep yearly (0 = disabled)
 ```
 
-Duration format: `30m` (minutes), `2h` (hours), `1d` (days), `1w` (weeks)
+**How retention decides what to keep:**
+
+1. Everything is kept for at least `min`.
+2. The latest snapshot is always kept.
+3. For each time bucket, the **oldest** snapshot in the bucket is kept — the "first-of-interval"
+   representative, matching the btrbk/snapper convention — for the newest N buckets of each type.
+
+**Duration format:** `30s` (seconds), `30m` (minutes), `2h` (hours), `1d` (days), `1w` (weeks),
+`1M` (month), `1y` (year). Months and years are **calendar-aware**: `min = "1M"` means one calendar
+month (aligned with the monthly bucket boundary), not a flat 30 days, and `1y` is one calendar year.
+Weekly buckets use **ISO-8601 week numbering**, so a week that straddles a year boundary is counted
+once rather than split in two.
+
+An invalid `min` value (e.g. a typo) now **fails loudly** and prunes nothing for that volume, rather
+than silently falling back to a shorter window and deleting more than intended.
+
+> **Safety:** on an interactive terminal, [`prune`](#prune) shows its deletion plan and asks for
+> confirmation first (skip with `--yes`). A degenerate policy that would keep *only* the latest
+> snapshot (all buckets `0` **and** `min` ≤ 1 day) is refused unless you pass `--force`, even
+> non-interactively — so a mistyped or empty retention block can't silently wipe your history.
 
 ### Volume Configuration
 

@@ -122,14 +122,48 @@ btrfs-backup-ng prune [OPTIONS]
 | Option | Description |
 |--------|-------------|
 | `--dry-run` | Show what would be deleted without making changes |
+| `--yes`, `-y` | Skip the interactive confirmation prompt (for automation) |
+| `--force` | Prune even under a degenerate policy that would keep only the latest snapshot |
+
+**Confirmation prompt.** On an interactive terminal, a real (non-`--dry-run`) prune first prints
+the full deletion plan and asks for confirmation before deleting anything:
+
+```
+About to delete 5 snapshot(s)/backup(s):
+  source /home -- 2:
+    - home-20260101-000000
+    - home-20260102-000000
+  target /mnt/backup/home -- 3:
+    - home-20260103-000000
+    - home-20260104-000000
+    - home-20260105-000000
+Proceed with deleting 5? [y/N]
+```
+
+Declining aborts with **zero** deletions. In a non-interactive context (cron, a pipe, a script)
+the prompt is skipped and the prune proceeds — use `--yes` to skip the prompt in an interactive
+terminal too.
+
+**Degenerate-policy guard.** A retention policy that would keep **only the latest snapshot** — all
+time buckets set to `0` **and** `min` ≤ 1 day — is almost always a misconfiguration that would
+delete your entire history. Prune **refuses** such a policy (deleting nothing, with a non-zero
+exit) unless you pass `--force`, and this refusal applies **even non-interactively** so a
+fat-fingered config cannot silently wipe your backups. A legitimate short-window policy (e.g.
+`min = "30d"` with all buckets `0`) is *not* degenerate and prunes normally.
 
 **Examples:**
 ```bash
-# Apply retention policies
+# Apply retention policies (prompts for confirmation on an interactive terminal)
 btrfs-backup-ng prune
 
-# See what would be deleted
+# See what would be deleted, change nothing
 btrfs-backup-ng prune --dry-run
+
+# Non-interactive / automation: skip the prompt
+btrfs-backup-ng prune --yes
+
+# Intentionally prune under a keep-only-latest policy
+btrfs-backup-ng prune --force
 ```
 
 ---

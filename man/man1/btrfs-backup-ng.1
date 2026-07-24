@@ -127,25 +127,35 @@ compress = "zstd"
 .fi
 .RE
 .SH RETENTION POLICIES
-Time-based retention uses these settings:
+Time-based retention (applied by the
+.BR btrfs-backup-ng-prune (1)
+command) uses these settings. For each bucket the
+.B oldest
+snapshot in the interval is kept (the first\(hyof\(hyinterval representative,
+matching the btrbk/snapper convention).
 .TP
 .B min
-Minimum retention period (e.g., "1d", "12h"). Nothing is deleted before this age.
+Minimum retention period (e.g., "1d", "12h", "1M", "1y"). Nothing is deleted
+before this age. Month and year units are calendar\(hyaware:
+.B 1M
+is one calendar month (not a flat 30 days) and
+.B 1y
+is one calendar year. An invalid value fails loudly and prunes nothing.
 .TP
 .B hourly
-Number of hourly snapshots to keep.
+Number of hourly snapshots to keep (one per clock hour).
 .TP
 .B daily
-Number of daily snapshots to keep.
+Number of daily snapshots to keep (one per day).
 .TP
 .B weekly
-Number of weekly snapshots to keep.
+Number of weekly snapshots to keep (one per ISO\(hy8601 week).
 .TP
 .B monthly
-Number of monthly snapshots to keep.
+Number of monthly snapshots to keep (one per calendar month).
 .TP
 .B yearly
-Number of yearly snapshots to keep.
+Number of yearly snapshots to keep (one per year).
 .SH COMPRESSION
 Supported compression methods for transfers:
 .TP

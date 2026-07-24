@@ -1,5 +1,5 @@
 .\" Man page for btrfs-backup-ng prune
-.TH BTRFS-BACKUP-NG-PRUNE 1 "January 2026" "btrfs-backup-ng" "User Commands"
+.TH BTRFS-BACKUP-NG-PRUNE 1 "July 2026" "btrfs-backup-ng" "User Commands"
 .SH NAME
 btrfs-backup-ng-prune \- apply retention policies
 .SH SYNOPSIS
@@ -18,23 +18,66 @@ Retention is evaluated with these rules:
 Time buckets (hourly, daily, weekly, monthly, yearly) are evaluated
 newest-to-oldest.
 .IP 3. 3
-The first snapshot in each bucket is kept.
+The oldest snapshot in each time bucket is kept (the first-of-interval
+representative, matching the btrbk/snapper convention).
 .IP 4. 3
 The latest snapshot is always preserved.
 .IP 5. 3
-Snapshots needed for incremental backup chains are preserved.
+For raw (stream-file) targets, a parent stream that a kept incremental backup
+still needs is never deleted (deleting it would make the newer backup
+unrestorable). For btrfs targets a pruned parent simply forces the next backup
+to be a full send.
+.PP
+Note on durations:
+.BR min " values in months or years (" "1M" ", " "1y" ") are calendar-aware in"
+this version \(em
+.B 1M
+is one calendar month (aligned with the monthly bucket), not a flat 30 days.
+Weekly buckets use ISO\(hy8601 week numbering, so a week that straddles a year
+boundary is counted once. An invalid
+.B min
+value now fails loudly (the volume is skipped) rather than silently defaulting.
+.SH SAFETY
+On an interactive terminal, a real (non\(hy\fB\-\-dry-run\fR) prune prints the
+full deletion plan and prompts for confirmation before deleting anything;
+declining aborts with no deletions. In a non\(hyinteractive context (cron, a
+pipe) the prompt is skipped and prune proceeds \(em use
+.B \-\-yes
+to skip the prompt in an interactive terminal too.
+.PP
+A degenerate policy that would keep
+.B only
+the latest snapshot (all time buckets 0 and
+.BR min " \(<= 1 day)"
+is refused, deleting nothing, unless
+.B \-\-force
+is given \(em enforced even non\(hyinteractively, so a misconfiguration cannot
+silently wipe your history. A short\(hywindow policy with a real
+.BR min " (e.g. " "30d" " with zero buckets) is not degenerate."
 .SH OPTIONS
 .TP
 .B \-\-dry-run
 Show what would be deleted without making any changes. Highly recommended
 before running prune for the first time.
+.TP
+.BR \-\-yes ", " \-y
+Skip the interactive confirmation prompt (for automation).
+.TP
+.B \-\-force
+Prune even under a degenerate policy that would keep only the latest snapshot.
 .SH EXAMPLES
 .TP
 Show what would be pruned (dry run):
 .B btrfs-backup-ng prune --dry-run
 .TP
-Apply retention policies:
+Apply retention policies (prompts on an interactive terminal):
 .B btrfs-backup-ng prune
+.TP
+Non\(hyinteractive / automation (skip the prompt):
+.B btrfs-backup-ng prune --yes
+.TP
+Intentionally prune under a keep\(hyonly\(hylatest policy:
+.B btrfs-backup-ng prune --force
 .SH RETENTION CONFIGURATION
 Example retention settings in config.toml:
 .PP
