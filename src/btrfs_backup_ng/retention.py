@@ -23,6 +23,7 @@ Example:
     monthly = 12    # Then keep 12 monthly
 """
 
+import calendar
 import logging
 import re
 from dataclasses import dataclass
@@ -113,6 +114,39 @@ def parse_duration(duration_str: str) -> timedelta:
         raise ValueError(f"Unknown duration unit: {unit}")
 
 
+def _subtract_months(dt: datetime, months: int) -> datetime:
+    """Return ``dt`` minus ``months`` CALENDAR months, clamping the day to the target month's
+    length (e.g. Mar 31 minus 1 month -> Feb 28/29)."""
+    total = dt.year * 12 + (dt.month - 1) - months
+    year, month0 = divmod(total, 12)
+    month = month0 + 1
+    last_day = calendar.monthrange(year, month)[1]
+    return dt.replace(year=year, month=month, day=min(dt.day, last_day))
+
+
+def subtract_duration(now: datetime, duration_str: str) -> datetime:
+    """Return ``now`` minus a duration string, CALENDAR-aware for month/year units.
+
+    Seconds/minutes/hours/days/weeks are fixed timedeltas; ``M`` and ``y`` are calendar
+    arithmetic, so ``min="1M"`` means "one calendar month ago" -- aligning the ``min`` window with
+    the calendar-based monthly/yearly bucket keys instead of a fixed 30/365 days (which made
+    ``min="1M"`` up to a day short in a 31-day month and ``12M != 1y``). Raises ValueError on an
+    invalid duration; callers map it to RetentionError/ConfigError (fail closed -- never delete on
+    ambiguous input). ``parse_duration`` keeps its plain-timedelta contract for other callers.
+    """
+    s = duration_str.strip()
+    match = DURATION_PATTERN.match(s)
+    if not match:
+        raise ValueError(f"Invalid duration format: {duration_str}")
+    value = int(match.group("value"))
+    unit = match.group("unit")
+    if unit == "M":
+        return _subtract_months(now, value)
+    if unit == "y":
+        return _subtract_months(now, value * 12)
+    return now - parse_duration(s)
+
+
 @dataclass
 class SnapshotInfo:
     """Information about a snapshot for retention processing."""
@@ -200,8 +234,12 @@ def get_bucket_key(timestamp: datetime, bucket_type: str) -> str:
     elif bucket_type == "daily":
         return timestamp.strftime("%Y-%m-%d")
     elif bucket_type == "weekly":
-        # ISO week number
-        return timestamp.strftime("%Y-W%W")
+        # ISO-8601 year + week so a single ISO week is never split across a year boundary
+        # (calendar %Y + %W does: the year flips on Jan 1 while the week counter resets to 00,
+        # over-retaining a boundary week as two buckets). isocalendar() pairs the ISO week-year
+        # with the ISO week; e.g. 2023-01-01 (Sun) -> "2022-W52", not "2023-W00".
+        iso = timestamp.isocalendar()
+        return f"{iso[0]}-W{iso[1]:02d}"
     elif bucket_type == "monthly":
         return timestamp.strftime("%Y-%m")
     elif bucket_type == "yearly":
@@ -241,18 +279,18 @@ def apply_retention(
     # Use provided get_name or default to str()
     name_func: Callable[[Any], str] = get_name if get_name is not None else str
 
-    # Parse minimum retention duration. ``min`` is a corrupt-retention selector when invalid:
-    # fail LOUD and CLOSED (raise -> the caller prunes nothing) rather than silently choosing a
-    # shorter, more-permissive window that DELETES more (the project's R1/R3 "never delete on
-    # ambiguous input" contract). Config load validates ``min`` too, so this is defence-in-depth.
+    # Minimum retention cutoff, CALENDAR-aware for month/year units (subtract_duration) so
+    # ``min="1M"`` is one calendar month, aligned with the monthly/yearly bucket keys. ``min`` is
+    # a corrupt-retention selector when invalid: fail LOUD and CLOSED (raise -> the caller prunes
+    # nothing) rather than silently choosing a shorter, more-permissive window that DELETES more
+    # (R1/R3 "never delete on ambiguous input"). Config load validates ``min`` too (defence-in-depth).
     try:
-        min_age = parse_duration(config.min)
+        min_cutoff = subtract_duration(now, config.min)
     except ValueError as e:
         raise RetentionError(
             f"Invalid retention 'min' duration {config.min!r}: {e}"
         ) from e
 
-    min_cutoff = now - min_age
     future_cutoff = now + CLOCK_SKEW_TOLERANCE
 
     # Partition the snapshots. VALID = a parseable timestamp no further in the future than the
