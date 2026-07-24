@@ -1495,6 +1495,9 @@ class RawEndpoint(Endpoint):
     def delete_old_snapshots(self, keep: int) -> None:
         """Delete old snapshots, keeping only the most recent.
 
+        LEGACY count-based path (see ``Endpoint.delete_old_snapshots``); the modern retention
+        engine is time-based ``retention.apply_retention`` via ``prune``.
+
         Args:
             keep: Number of snapshots to keep
         """

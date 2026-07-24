@@ -616,8 +616,10 @@ class SSHEndpoint(Endpoint):
                 logger.debug(f"Deletion exception details: {e}", exc_info=True)
 
     def delete_old_snapshots(self, keep: int) -> None:
-        """
-        Delete old snapshots on the remote host, keeping only the most recent `keep` unlocked snapshots.
+        """Delete old snapshots on the remote host, keeping the most recent ``keep`` unlocked.
+
+        LEGACY count-based path (see ``Endpoint.delete_old_snapshots``); the modern retention
+        engine is time-based ``retention.apply_retention`` via ``prune``.
         """
         snapshots = self.list_snapshots()  # type: ignore
         unlocked = [  # type: ignore

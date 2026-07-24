@@ -586,8 +586,15 @@ class Endpoint:
         self.delete_snapshots([snapshot], **kwargs)
 
     def delete_old_snapshots(self, keep: int) -> None:
-        """
-        Delete old snapshots, keeping only the most recent `keep` unlocked snapshots.
+        """Delete old snapshots, keeping only the most recent ``keep`` unlocked snapshots.
+
+        LEGACY COUNT-based retention: keeps a fixed NUMBER of snapshots, ignoring age/time
+        buckets. It is used only by the legacy CLI path (``core.execution.run_task`` ->
+        ``_cleanup_snapshots``, reached via ``cli/dispatcher.is_legacy_mode``). The MODERN,
+        time-based policy engine is ``retention.apply_retention`` (min + hourly/daily/weekly/
+        monthly/yearly buckets), driven by the ``prune`` command -- prefer it for any new code.
+        Chain/lock safety is preserved either way: this routes deletions through
+        ``delete_snapshots`` (R10b incremental-parent guard) and skips R3-locked snapshots.
         """
         snapshots = self.list_snapshots()
         if getattr(self, "_locks_read_failed", False):

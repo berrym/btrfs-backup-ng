@@ -36,9 +36,15 @@ def run_task(
 ) -> list[JobResult]:
     """Run a backup task with given endpoints.
 
-    This is the main entry point for executing a backup task.
-    Handles snapshot creation, transfer to all destinations,
-    and cleanup.
+    Handles snapshot creation, transfer to all destinations, and cleanup.
+
+    LEGACY path: this drives the old-style CLI (``_legacy_main`` via
+    ``cli/dispatcher.is_legacy_mode``) and its COUNT-based cleanup
+    (``_cleanup_snapshots`` -> ``Endpoint.delete_old_snapshots(keep)``). The MODERN CLI does
+    not use it: the ``run`` command transfers via ``core.operations.sync_snapshots`` and the
+    ``prune`` command applies the TIME-based policy engine ``retention.apply_retention``. Kept
+    for backwards compatibility; do not wire new code through here -- use ``prune``/
+    ``apply_retention`` for retention.
 
     Args:
         source_endpoint: Prepared source endpoint
@@ -100,7 +106,10 @@ def run_task(
 
 
 def _cleanup_snapshots(source_endpoint, destination_endpoints, options) -> None:
-    """Clean up old snapshots according to retention settings."""
+    """LEGACY COUNT-based cleanup: keep the most recent ``num_snapshots``/``num_backups`` via
+    ``Endpoint.delete_old_snapshots(keep)``. Used only by the legacy ``run_task`` path. The
+    modern retention authority is the TIME-based ``retention.apply_retention`` (``prune``
+    command); prefer that."""
     logger.info(__util__.log_heading("Cleaning up..."))
 
     num_snapshots = options.get("num_snapshots", 0)
