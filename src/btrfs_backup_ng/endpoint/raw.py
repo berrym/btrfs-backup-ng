@@ -1356,24 +1356,113 @@ class RawEndpoint(Endpoint):
         else:
             target.discard(lock_id)
 
+    def protect_incremental_parents(
+        self, to_keep: list, to_delete: list
+    ) -> tuple[list, list]:
+        """Raw override: never delete a stream a KEPT stream needs as an incremental parent.
+
+        A raw backup is a ``btrfs send`` stream file; an incremental child cannot be applied
+        without its parent stream, so deleting a parent silently makes its children unrestorable.
+        Walk the ``parent_name`` chain from every kept stream back to its root and rescue any
+        ancestor currently marked for deletion (transitive -- walking the full chain also covers a
+        rescued parent's own parents). A kept stream whose parent is not present on this target has
+        a chain already broken upstream (pre-existing, not caused by this prune): warn, never
+        fabricate. Legacy streams with no recorded ``parent_name`` cannot be chain-resolved and are
+        left as the time-based decision placed them.
+        """
+        by_name = {s.get_name(): s for s in list(to_keep) + list(to_delete)}
+        delete_names = {s.get_name() for s in to_delete}
+        protected: set[str] = set()
+        for leaf in to_keep:
+            cur = leaf
+            seen: set[str] = set()
+            while cur is not None:
+                parent_name = getattr(cur, "parent_name", None)
+                if not parent_name or parent_name in seen:
+                    break
+                seen.add(parent_name)
+                parent = by_name.get(parent_name)
+                if parent is None:
+                    logger.warning(
+                        "Retention: retained raw stream %r references parent %r which is not "
+                        "present on this target -- its incremental chain is already broken "
+                        "upstream (not caused by this prune)",
+                        leaf.get_name(),
+                        parent_name,
+                    )
+                    break
+                if parent.get_name() in delete_names:
+                    protected.add(parent.get_name())
+                cur = parent
+        if protected:
+            rescued = [s for s in to_delete if s.get_name() in protected]
+            to_keep = list(to_keep) + rescued
+            to_delete = [s for s in to_delete if s.get_name() not in protected]
+            logger.info(
+                "Retention: protecting %d raw incremental parent(s) from deletion: %s",
+                len(rescued),
+                ", ".join(sorted(protected)),
+            )
+        return to_keep, to_delete
+
+    def _chain_referenced_parents(
+        self, delete_batch: list[RawSnapshot], delete_session: set[str] | None = None
+    ) -> set[str]:
+        """Defence-in-depth for the delete primitive: names in ``delete_batch`` that are still the
+        recorded ``parent_name`` of a SURVIVING stream -- one present on the target and NOT part of
+        this deletion session -- so deleting them would orphan a child. The delete primitive skips
+        these for ANY caller, independent of the prune-level ``protect_incremental_parents`` pass.
+
+        ``delete_session`` (a set of names) is the FULL set intended for deletion this pass; a
+        caller that deletes a chain across multiple one-at-a-time calls (prune) passes it so a
+        legitimate whole-chain delete is not mistaken for orphaning. Absent, the session is just
+        this batch.
+        """
+        batch_names = {s.get_name() for s in delete_batch}
+        session = delete_session if delete_session is not None else batch_names
+        try:
+            current = self.list_snapshots()
+        except Exception as e:  # noqa: BLE001 - best-effort net; prune-level pass is primary
+            logger.debug("chain-guard: could not list snapshots (%s)", e)
+            return set()
+        referenced_by_survivors = {
+            s.parent_name
+            for s in current
+            if s.parent_name and s.get_name() not in session
+        }
+        return {n for n in batch_names if n in referenced_by_survivors}
+
     def delete_snapshots(self, snapshots: list[RawSnapshot], **kwargs: Any) -> None:
         """Delete raw snapshot files and their metadata.
 
         Args:
             snapshots: List of snapshots to delete
-            **kwargs: Additional arguments (unused)
+            **kwargs: ``delete_session`` (set[str]) -- the full set of names being deleted this
+                pass, so the chain guard does not mistake a whole-chain delete for orphaning.
         """
+        delete_session = kwargs.get("delete_session")
         # Prune under the per-target lock so it cannot race a concurrent backup
         # commit or backfill. If the target is busy, skip (safe -- do NOT delete
         # during contention); retention retries on the next run.
         try:
             with self.target_lock():
-                self._delete_snapshots_locked(snapshots)
+                self._delete_snapshots_locked(snapshots, delete_session)
         except RuntimeError as e:
             logger.warning("Skipping raw delete (target busy): %s", e)
 
-    def _delete_snapshots_locked(self, snapshots: list[RawSnapshot]) -> None:
+    def _delete_snapshots_locked(
+        self, snapshots: list[RawSnapshot], delete_session: set[str] | None = None
+    ) -> None:
+        protected = self._chain_referenced_parents(snapshots, delete_session)
         for snapshot in snapshots:
+            if snapshot.get_name() in protected:
+                logger.error(
+                    "Refusing to delete raw stream %r: it is the incremental parent of a stream "
+                    "that is NOT being deleted; removing it would make that child unrestorable. "
+                    "Skipping.",
+                    snapshot.get_name(),
+                )
+                continue
             try:
                 # Delete stream file
                 if snapshot.stream_path.exists():
@@ -2164,17 +2253,29 @@ class SSHRawEndpoint(RawEndpoint):
         self._cached_snapshots = snapshots
         return list(snapshots)
 
-    def _delete_snapshots_locked(self, snapshots: list[RawSnapshot]) -> None:
+    def _delete_snapshots_locked(
+        self, snapshots: list[RawSnapshot], delete_session: set[str] | None = None
+    ) -> None:
         """Delete snapshots on the remote host (issuing a remote ``rm``).
 
         This overrides the LOCAL delete primitive rather than ``delete_snapshots``,
         so both entry points that wrap it in ``target_lock`` -- ``delete_snapshots``
         (per batch) and ``delete_old_snapshots`` (whole prune pass) -- dispatch to the
         remote deletion for a raw+ssh target. Inheriting the base ``delete_snapshots``
-        keeps the (no-op) lock discipline uniform across local and remote."""
+        keeps the (no-op) lock discipline uniform across local and remote. The same
+        chain guard as the local primitive applies (never orphan a child stream)."""
+        protected = self._chain_referenced_parents(snapshots, delete_session)
         ssh_cmd = self._build_ssh_command()
 
         for snapshot in snapshots:
+            if snapshot.get_name() in protected:
+                logger.error(
+                    "Refusing to delete raw+ssh stream %r: it is the incremental parent of a "
+                    "stream that is NOT being deleted; removing it would make that child "
+                    "unrestorable. Skipping.",
+                    snapshot.get_name(),
+                )
+                continue
             try:
                 # Build rm command for stream and metadata
                 rm_cmd = (

@@ -1066,6 +1066,9 @@ class TestSSHRawEndpointMethods:
             name="test",
             stream_path=Path("/backup/test.btrfs"),
         )
+        # The chain guard lists snapshots before deleting; stub it so this test isolates the
+        # remote rm (no survivors -> nothing protected -> the delete proceeds).
+        endpoint.list_snapshots = lambda flush_cache=False: []  # type: ignore[method-assign]
 
         with patch("subprocess.run") as mock_run:
             mock_run.return_value = MagicMock(returncode=0)

@@ -145,6 +145,11 @@ def execute_prune(args: argparse.Namespace) -> int:
                     prefix=prefix,
                     timestamp_format=get_timestamp_format(config),
                 )
+                # Never prune a snapshot a kept one still needs as an incremental parent
+                # (no-op for btrfs; protects raw stream chains from becoming unrestorable).
+                to_keep, to_delete = source_endpoint.protect_incremental_parents(
+                    to_keep, to_delete
+                )
 
                 logger.info("  Keeping %d, deleting %d", len(to_keep), len(to_delete))
 
@@ -154,9 +159,12 @@ def execute_prune(args: argparse.Namespace) -> int:
                             logger.info("    Would delete: %s", snap.get_name())
                         total_deleted += len(to_delete)
                     else:
+                        delete_session = {s.get_name() for s in to_delete}
                         for snap in to_delete:
                             try:
-                                source_endpoint.delete_snapshots([snap])
+                                source_endpoint.delete_snapshots(
+                                    [snap], delete_session=delete_session
+                                )
                                 logger.info("    Deleted: %s", snap.get_name())
                                 total_deleted += 1
                             except Exception as e:
@@ -199,6 +207,11 @@ def execute_prune(args: argparse.Namespace) -> int:
                         prefix=prefix,
                         timestamp_format=get_timestamp_format(config),
                     )
+                    # Never prune a backup a kept one still needs as an incremental parent
+                    # (no-op for btrfs; protects raw stream chains from becoming unrestorable).
+                    to_keep, to_delete = dest_endpoint.protect_incremental_parents(
+                        to_keep, to_delete
+                    )
 
                     logger.info(
                         "    Keeping %d, deleting %d", len(to_keep), len(to_delete)
@@ -210,9 +223,12 @@ def execute_prune(args: argparse.Namespace) -> int:
                                 logger.info("      Would delete: %s", snap.get_name())
                             total_deleted += len(to_delete)
                         else:
+                            delete_session = {s.get_name() for s in to_delete}
                             for snap in to_delete:
                                 try:
-                                    dest_endpoint.delete_snapshots([snap])
+                                    dest_endpoint.delete_snapshots(
+                                        [snap], delete_session=delete_session
+                                    )
                                     logger.info("      Deleted: %s", snap.get_name())
                                     total_deleted += 1
                                 except Exception as e:
