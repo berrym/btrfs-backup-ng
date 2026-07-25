@@ -933,6 +933,19 @@ class RawEndpoint(Endpoint):
             )
         return StructureVerdict("ok", f"authoritative sidecar (origin={origin})")
 
+    def test_send_stream(self, snapshot: RawSnapshot, parent: Any = None) -> None:
+        """Not applicable to a raw target: a raw backup is a STORED send stream (a file),
+        not a subvolume, so ``btrfs send`` cannot run on it. Raw stream integrity is
+        verified by its sealed sha256 (``verify_stream_checksum``), which is what the
+        ``verify`` command uses for a raw target's stream/full levels. Raising keeps this
+        honest if a caller ever routes a raw endpoint here (the CLI does not)."""
+        from btrfs_backup_ng.core.verify import VerifyError
+
+        raise VerifyError(
+            "raw target: a stored stream is not a subvolume; its integrity is verified "
+            "by checksum (raw verify / verify --level stream), not by 'btrfs send'"
+        )
+
     def sidecar_exists(self, snapshot: RawSnapshot) -> bool:
         """Whether ``snapshot``'s ``.meta`` sidecar exists now. Used by
         ``raw backfill-metadata`` to re-check just before writing, so a sidecar that

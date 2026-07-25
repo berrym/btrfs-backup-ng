@@ -2102,6 +2102,58 @@ print(json.dumps(result))
             "remote listing could not read it)",
         )
 
+    def test_send_stream(self, snapshot: Any, parent: Any = None) -> None:
+        """Verify a ``btrfs send --no-data`` stream can be generated for ``snapshot`` ON
+        THE REMOTE host (the STREAM verification level for an ssh:// btrfs target).
+
+        The command runs where the subvolume actually lives -- via ``_exec_remote_command``
+        (which wraps it for ssh and applies ``ssh_sudo``/path normalization) -- so it never
+        does what the old code did: run ``btrfs send`` LOCALLY against a remote path (which
+        false-failed every ssh:// stream verify). The metadata-only stream is discarded
+        (stdout -> DEVNULL, so nothing but the exit status matters). Raises ``VerifyError``
+        on a non-zero send."""
+        from btrfs_backup_ng.core.verify import VerifyError
+
+        cmd: List[Any] = ["btrfs", "send", "--no-data"]
+        if parent is not None:
+            cmd.extend(["-p", self._normalize_path(str(parent.get_path()))])
+        cmd.append(self._normalize_path(str(snapshot.get_path())))
+
+        use_sudo = self.config.get("ssh_sudo", False)
+        try:
+            if use_sudo:
+                result = self._exec_remote_command_with_retry(
+                    cmd,
+                    max_retries=2,
+                    check=False,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.PIPE,
+                )
+            else:
+                result = self._exec_remote_command(
+                    cmd,
+                    check=False,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.PIPE,
+                )
+        except (TransientNetworkError, subprocess.TimeoutExpired):
+            # A transient SSH/timeout fault is NOT a stream-verification result: we could
+            # not reach the remote to run the test, which is a can't-check condition, not a
+            # corrupt/broken snapshot. Surface it as itself so it is never mislabelled a
+            # verification failure (and any future retry logic can act on its real type).
+            raise
+        except Exception as e:
+            raise VerifyError(f"Send stream test failed (remote): {e}") from e
+
+        if result.returncode != 0:
+            # stderr is bytes (stderr=PIPE), possibly empty; decode robustly and fall back
+            # to a clear message when the remote wrote nothing.
+            stderr = (result.stderr or b"").decode(errors="replace").strip() or (
+                "unknown error (remote btrfs send returned "
+                f"{result.returncode} with no stderr)"
+            )
+            raise VerifyError(f"Send stream test failed (remote): {stderr}")
+
     def _verify_snapshot_exists(self, dest_path: str, snapshot_name: str) -> bool:
         """Verify a snapshot exists on the remote host at its exact path.
 

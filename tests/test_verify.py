@@ -8,17 +8,11 @@ import pytest
 
 from btrfs_backup_ng.endpoint.raw_metadata import StructureVerdict
 from btrfs_backup_ng.core.verify import (
-    ParentViability,
-    ParentViabilityResult,
     VerifyError,
     VerifyLevel,
     VerifyReport,
     VerifyResult,
     _find_parent_snapshot,
-    _test_send_stream,
-    check_parent_viability,
-    find_viable_parent,
-    validate_transfer_chain,
     verify_full,
     verify_metadata,
     verify_stream,
@@ -406,9 +400,9 @@ class TestVerifyStream:
         assert report.total == 0
         assert "not found" in report.errors[0]
 
-    @patch("btrfs_backup_ng.core.verify._test_send_stream")
-    def test_verify_latest_by_default(self, mock_test_stream):
-        """Test that only latest snapshot is verified by default."""
+    def test_verify_latest_by_default(self):
+        """Test that only latest snapshot is verified by default. (verify_stream calls
+        the endpoint's polymorphic test_send_stream, auto-mocked to succeed here.)"""
         snapshots = make_snapshots(
             [
                 ("snap-1", "20260101-100000"),
@@ -426,8 +420,7 @@ class TestVerifyStream:
         assert report.total == 1
         assert report.results[0].snapshot_name == "snap-3"
 
-    @patch("btrfs_backup_ng.core.verify._test_send_stream")
-    def test_verify_specific_snapshot(self, mock_test_stream):
+    def test_verify_specific_snapshot(self):
         """Test verification of specific snapshot."""
         snapshots = make_snapshots(
             [
@@ -445,9 +438,9 @@ class TestVerifyStream:
         assert report.total == 1
         assert report.results[0].snapshot_name == "snap-1"
 
-    @patch("btrfs_backup_ng.core.verify._test_send_stream")
-    def test_stream_success(self, mock_test_stream):
-        """Test successful stream verification."""
+    def test_stream_success(self):
+        """Test successful stream verification (endpoint.test_send_stream returns without
+        raising)."""
         mock_endpoint = MagicMock()
         mock_endpoint.list_snapshots.return_value = [MockSnapshot("snap-1")]
         mock_endpoint.config = {"path": "/backup"}
@@ -459,14 +452,13 @@ class TestVerifyStream:
         assert report.results[0].passed is True
         assert "verified successfully" in report.results[0].message
 
-    @patch("btrfs_backup_ng.core.verify._test_send_stream")
-    def test_stream_failure(self, mock_test_stream):
-        """Test failed stream verification."""
-        mock_test_stream.side_effect = Exception("Stream error")
-
+    def test_stream_failure(self):
+        """Test failed stream verification: endpoint.test_send_stream raising -> the
+        snapshot fails."""
         mock_endpoint = MagicMock()
         mock_endpoint.list_snapshots.return_value = [MockSnapshot("snap-1")]
         mock_endpoint.config = {"path": "/backup"}
+        mock_endpoint.test_send_stream.side_effect = Exception("Stream error")
 
         report = verify_stream(mock_endpoint)
 
@@ -475,8 +467,7 @@ class TestVerifyStream:
         assert report.results[0].passed is False
         assert "failed" in report.results[0].message
 
-    @patch("btrfs_backup_ng.core.verify._test_send_stream")
-    def test_progress_callback(self, mock_test_stream):
+    def test_progress_callback(self):
         """Test that progress callback is called."""
         mock_endpoint = MagicMock()
         mock_endpoint.list_snapshots.return_value = [MockSnapshot("snap-1")]
@@ -492,8 +483,7 @@ class TestVerifyStream:
         assert len(progress_calls) == 1
         assert progress_calls[0] == (1, 1, "snap-1")
 
-    @patch("btrfs_backup_ng.core.verify._test_send_stream")
-    def test_incremental_detection(self, mock_test_stream):
+    def test_incremental_detection(self):
         """Test that incremental parent is detected."""
         snapshots = make_snapshots(
             [
@@ -780,139 +770,184 @@ class TestVerifyFull:
             assert progress_calls[0] == (1, 1, "snap-1")
 
 
-class TestTestSendStream:
-    """Tests for _test_send_stream function."""
+class TestEndpointTestSendStream:
+    """R8c: the polymorphic endpoint.test_send_stream replaces the deleted module-level
+    _test_send_stream (and its dead ssh_client branch). Local runs `btrfs send --no-data`
+    locally; SSH runs it ON THE REMOTE via _exec_remote_command -- the exact bug the dead
+    branch caused was ssh:// stream verify running btrfs send LOCALLY against a remote
+    path; raw rejects (a stored stream is not a subvolume)."""
 
-    @patch("subprocess.run")
-    def test_local_send_success(self, mock_run):
-        """Test successful local send stream test."""
-        mock_run.return_value = MagicMock(returncode=0)
+    def _local_ep(self):
+        from btrfs_backup_ng.endpoint.local import LocalEndpoint
 
-        mock_endpoint = MagicMock()
-        mock_endpoint.config = {"path": "/backup"}
-        mock_endpoint.ssh_client = None
+        return LocalEndpoint(config={"path": "/backup", "snap_prefix": ""})
 
-        snapshot = MockSnapshot("snap-1")
+    def test_local_runs_btrfs_send_locally(self, monkeypatch):
+        """LocalEndpoint.test_send_stream runs `btrfs send --no-data <path>` via a local
+        subprocess; returncode 0 -> passes."""
+        import btrfs_backup_ng.endpoint.common as common_mod
+        from types import SimpleNamespace
 
-        # Should not raise
-        _test_send_stream(mock_endpoint, snapshot)
+        calls = {}
 
-        mock_run.assert_called_once()
-        call_args = mock_run.call_args
-        assert "btrfs" in call_args[0][0]
-        assert "--no-data" in call_args[0][0]
+        def fake_run(cmd, **kw):
+            calls["cmd"] = cmd
+            return SimpleNamespace(returncode=0, stderr=b"")
 
-    @patch("subprocess.run")
-    def test_local_send_with_parent(self, mock_run):
-        """Test local send with parent snapshot."""
-        mock_run.return_value = MagicMock(returncode=0)
+        monkeypatch.setattr(common_mod.subprocess, "run", fake_run)
+        snap = SimpleNamespace(get_path=lambda: Path("/backup/snap-1"))
 
-        mock_endpoint = MagicMock()
-        mock_endpoint.config = {"path": "/backup"}
-        mock_endpoint.ssh_client = None
+        self._local_ep().test_send_stream(snap)  # must not raise
 
-        snapshot = MockSnapshot("snap-2")
-        parent = MockSnapshot("snap-1")
+        assert calls["cmd"][:3] == ["btrfs", "send", "--no-data"]
+        assert calls["cmd"][-1] == "/backup/snap-1"
 
-        _test_send_stream(mock_endpoint, snapshot, parent)
+    def test_local_nonzero_raises(self, monkeypatch):
+        """A non-zero `btrfs send` -> VerifyError."""
+        import btrfs_backup_ng.endpoint.common as common_mod
+        from types import SimpleNamespace
 
-        call_args = mock_run.call_args
-        assert "-p" in call_args[0][0]
-
-    @patch("subprocess.run")
-    def test_local_send_failure(self, mock_run):
-        """Test failed local send stream test."""
-        mock_run.return_value = MagicMock(
-            returncode=1, stderr=b"Send failed: corrupted data"
+        monkeypatch.setattr(
+            common_mod.subprocess,
+            "run",
+            lambda cmd, **kw: SimpleNamespace(
+                returncode=1, stderr=b"unable to resolve"
+            ),
         )
+        snap = SimpleNamespace(get_path=lambda: Path("/backup/s"))
+        with pytest.raises(VerifyError):
+            self._local_ep().test_send_stream(snap)
 
-        mock_endpoint = MagicMock()
-        mock_endpoint.config = {"path": "/backup"}
-        mock_endpoint.ssh_client = None
+    def test_local_incremental_adds_parent_flag(self, monkeypatch):
+        """An incremental test adds `-p <parent>` before the snapshot path."""
+        import btrfs_backup_ng.endpoint.common as common_mod
+        from types import SimpleNamespace
 
-        snapshot = MockSnapshot("snap-1")
+        calls = {}
 
-        with pytest.raises(VerifyError) as exc_info:
-            _test_send_stream(mock_endpoint, snapshot)
+        def fake_run(cmd, **kw):
+            calls["cmd"] = cmd
+            return SimpleNamespace(returncode=0, stderr=b"")
 
-        assert "failed" in str(exc_info.value).lower()
+        monkeypatch.setattr(common_mod.subprocess, "run", fake_run)
+        snap = SimpleNamespace(get_path=lambda: Path("/backup/child"))
+        parent = SimpleNamespace(get_path=lambda: Path("/backup/base"))
 
-    def test_ssh_send_success(self):
-        """Test successful SSH send stream test."""
-        mock_stdout = MagicMock()
-        mock_stdout.channel.recv_exit_status.return_value = 0
+        self._local_ep().test_send_stream(snap, parent)
 
-        mock_stderr = MagicMock()
-        mock_stderr.read.return_value = b""
+        assert "-p" in calls["cmd"] and "/backup/base" in calls["cmd"]
 
-        mock_ssh_client = MagicMock()
-        mock_ssh_client.exec_command.return_value = (
-            MagicMock(),
-            mock_stdout,
-            mock_stderr,
+    def _ssh_ep(self, ssh_sudo=False):
+        import btrfs_backup_ng.endpoint.ssh as ssh_mod
+
+        ep = ssh_mod.SSHEndpoint.__new__(ssh_mod.SSHEndpoint)  # avoid a live connection
+        ep.config = {"path": "/backups", "ssh_sudo": ssh_sudo}
+        ep._normalize_path = lambda pth: str(pth)
+        return ep
+
+    def test_ssh_dispatches_to_remote_exec_not_local_subprocess(self, monkeypatch):
+        """THE dead-branch fix: SSHEndpoint.test_send_stream runs `btrfs send --no-data`
+        via _exec_remote_command (ON THE REMOTE) and NEVER via a local subprocess.run.
+        Mutation guard: routing it to a local subprocess (the old fallthrough) trips the
+        tripwire below."""
+        import btrfs_backup_ng.endpoint.ssh as ssh_mod
+        from types import SimpleNamespace
+
+        ep = self._ssh_ep()
+        remote = {}
+
+        def fake_exec(cmd, **kw):
+            remote["cmd"] = cmd
+            return SimpleNamespace(returncode=0, stderr=b"")
+
+        ep._exec_remote_command = fake_exec
+
+        def boom(*a, **k):
+            raise AssertionError("must not run btrfs send LOCALLY for an ssh target")
+
+        monkeypatch.setattr(ssh_mod.subprocess, "run", boom)
+
+        snap = SimpleNamespace(get_path=lambda: Path("/backups/snap-1"))
+        ep.test_send_stream(snap)  # must not raise, must not run locally
+
+        assert remote["cmd"][:3] == ["btrfs", "send", "--no-data"]
+        assert "/backups/snap-1" in remote["cmd"]
+
+    def test_ssh_nonzero_remote_raises(self):
+        """A non-zero remote send -> VerifyError (surfacing the remote stderr)."""
+        from types import SimpleNamespace
+
+        ep = self._ssh_ep()
+        ep._exec_remote_command = lambda cmd, **kw: SimpleNamespace(
+            returncode=1, stderr=b"unable to resolve"
         )
+        snap = SimpleNamespace(get_path=lambda: Path("/backups/s"))
+        with pytest.raises(VerifyError) as e:
+            ep.test_send_stream(snap)
+        assert "remote" in str(e.value).lower()
 
-        mock_endpoint = MagicMock()
-        mock_endpoint.config = {"path": "/backup", "ssh_sudo": False}
-        mock_endpoint.ssh_client = mock_ssh_client
+    def test_ssh_empty_stderr_gives_informative_message(self):
+        """A non-zero remote send with EMPTY stderr -> a clear message (not a crash, not a
+        blank), since stderr is bytes b'' (falsy). Guards the robust-decode fix."""
+        from types import SimpleNamespace
 
-        snapshot = MockSnapshot("snap-1")
-
-        # Should not raise
-        _test_send_stream(mock_endpoint, snapshot)
-
-        mock_ssh_client.exec_command.assert_called_once()
-
-    def test_ssh_send_with_sudo(self):
-        """Test SSH send with sudo."""
-        mock_stdout = MagicMock()
-        mock_stdout.channel.recv_exit_status.return_value = 0
-
-        mock_stderr = MagicMock()
-
-        mock_ssh_client = MagicMock()
-        mock_ssh_client.exec_command.return_value = (
-            MagicMock(),
-            mock_stdout,
-            mock_stderr,
+        ep = self._ssh_ep()
+        ep._exec_remote_command = lambda cmd, **kw: SimpleNamespace(
+            returncode=3, stderr=b""
         )
+        with pytest.raises(VerifyError) as e:
+            ep.test_send_stream(SimpleNamespace(get_path=lambda: Path("/backups/s")))
+        msg = str(e.value)
+        # Informative even with no remote stderr: names the returncode (the old truthiness
+        # guard produced a bare "unknown error" with no such context).
+        assert "unknown error" in msg and "returned 3" in msg
 
-        mock_endpoint = MagicMock()
-        mock_endpoint.config = {"path": "/backup", "ssh_sudo": True}
-        mock_endpoint.ssh_client = mock_ssh_client
+    def test_ssh_transient_error_propagates_not_wrapped(self):
+        """A transient SSH/timeout fault propagates as ITSELF (not disguised as a
+        VerifyError 'stream test failed'): a can't-reach-the-remote condition is not a
+        corrupt-snapshot verdict. Guards the transient-passthrough fix."""
+        import subprocess as _sp
+        from types import SimpleNamespace
 
-        snapshot = MockSnapshot("snap-1")
+        ep = self._ssh_ep()
 
-        _test_send_stream(mock_endpoint, snapshot)
+        def _timeout(cmd, **kw):
+            raise _sp.TimeoutExpired(cmd, 300)
 
-        call_args = mock_ssh_client.exec_command.call_args
-        assert "sudo" in call_args[0][0]
+        ep._exec_remote_command = _timeout
+        with pytest.raises(_sp.TimeoutExpired):
+            ep.test_send_stream(SimpleNamespace(get_path=lambda: Path("/backups/s")))
 
-    def test_ssh_send_failure(self):
-        """Test failed SSH send stream test."""
-        mock_stdout = MagicMock()
-        mock_stdout.channel.recv_exit_status.return_value = 1
+    def test_ssh_sudo_uses_retry_variant(self):
+        """With ssh_sudo, the auth-aware retry variant is used, not the plain exec."""
+        from types import SimpleNamespace
 
-        mock_stderr = MagicMock()
-        mock_stderr.read.return_value = b"Permission denied"
+        ep = self._ssh_ep(ssh_sudo=True)
+        used = {}
+        ep._exec_remote_command_with_retry = lambda cmd, **kw: (
+            used.__setitem__("retry", True),
+            SimpleNamespace(returncode=0, stderr=b""),
+        )[1]
+        ep._exec_remote_command = lambda cmd, **kw: (
+            used.__setitem__("plain", True),
+            SimpleNamespace(returncode=0, stderr=b""),
+        )[1]
 
-        mock_ssh_client = MagicMock()
-        mock_ssh_client.exec_command.return_value = (
-            MagicMock(),
-            mock_stdout,
-            mock_stderr,
-        )
+        ep.test_send_stream(SimpleNamespace(get_path=lambda: Path("/backups/s")))
 
-        mock_endpoint = MagicMock()
-        mock_endpoint.config = {"path": "/backup", "ssh_sudo": False}
-        mock_endpoint.ssh_client = mock_ssh_client
+        assert used.get("retry") is True and "plain" not in used
 
-        snapshot = MockSnapshot("snap-1")
+    def test_raw_rejects_as_not_a_subvolume(self):
+        """RawEndpoint.test_send_stream raises (a stored stream is not a subvolume; raw
+        integrity is verified by checksum)."""
+        from btrfs_backup_ng.endpoint.raw import RawEndpoint
+        from btrfs_backup_ng.endpoint.raw_metadata import RawSnapshot
 
-        with pytest.raises(VerifyError) as exc_info:
-            _test_send_stream(mock_endpoint, snapshot)
-
-        assert "failed" in str(exc_info.value).lower()
+        ep = RawEndpoint(config={"path": "/raw"})
+        snap = RawSnapshot(name="s", stream_path=Path("/raw/s.btrfs"))
+        with pytest.raises(VerifyError) as e:
+            ep.test_send_stream(snap)
+        assert "checksum" in str(e.value).lower()
 
 
 class TestVerifyError:
@@ -975,385 +1010,6 @@ class TestVerifyReportDuration:
         # Duration should be calculated from now
         duration = report.duration
         assert duration >= 2.0
-
-
-# =============================================================================
-# Pre-Transfer Parent Validation Tests
-# =============================================================================
-
-
-class TestParentViabilityResult:
-    """Tests for ParentViabilityResult dataclass."""
-
-    def test_viable_result(self):
-        """Test a viable parent result."""
-        result = ParentViabilityResult(
-            status=ParentViability.VIABLE,
-            parent_name="root-20240101",
-            message="Parent is viable",
-        )
-        assert result.is_viable
-        assert not result.should_use_full_send
-        assert result.parent_name == "root-20240101"
-
-    def test_missing_result(self):
-        """Test a missing parent result."""
-        result = ParentViabilityResult(
-            status=ParentViability.MISSING,
-            parent_name="root-20240101",
-            message="Parent not found",
-            fallback_to_full=True,
-        )
-        assert not result.is_viable
-        assert result.should_use_full_send
-
-    def test_corrupted_result(self):
-        """Test a corrupted parent result."""
-        result = ParentViabilityResult(
-            status=ParentViability.CORRUPTED,
-            parent_name="root-20240101",
-            message="Send stream failed",
-            fallback_to_full=True,
-            details={"error": "checksum mismatch"},
-        )
-        assert not result.is_viable
-        assert result.should_use_full_send
-        assert "error" in result.details
-
-    def test_locked_result(self):
-        """Test a locked parent result - should not auto-fallback."""
-        result = ParentViabilityResult(
-            status=ParentViability.LOCKED,
-            parent_name="root-20240101",
-            message="Parent is locked",
-            fallback_to_full=False,
-        )
-        assert not result.is_viable
-        # Locked parents should NOT auto-fallback (wait for lock)
-        assert result.should_use_full_send  # still true because not viable
-
-
-class TestCheckParentViability:
-    """Tests for check_parent_viability function."""
-
-    def test_no_parent_returns_viable_with_fallback(self):
-        """When no parent is specified, return viable but fallback to full."""
-        source_ep = MagicMock()
-        dest_ep = MagicMock()
-        snapshot = MockSnapshot("root-20240102")
-
-        result = check_parent_viability(
-            snapshot, None, source_ep, dest_ep, check_level="quick"
-        )
-
-        assert result.status == ParentViability.VIABLE
-        assert result.parent_name is None
-        assert result.fallback_to_full
-
-    def test_check_level_none_skips_validation(self):
-        """check_level='none' skips all validation."""
-        source_ep = MagicMock()
-        dest_ep = MagicMock()
-        snapshot = MockSnapshot("root-20240102")
-        parent = MockSnapshot("root-20240101")
-
-        result = check_parent_viability(
-            snapshot, parent, source_ep, dest_ep, check_level="none"
-        )
-
-        assert result.status == ParentViability.VIABLE
-        assert result.parent_name == "root-20240101"
-        # Destination should not be called
-        dest_ep.list_snapshots.assert_not_called()
-
-    def test_parent_exists_at_destination(self):
-        """Parent found at destination passes quick check."""
-        source_ep = MagicMock()
-        dest_ep = MagicMock()
-        dest_ep.list_snapshots.return_value = [
-            MockSnapshot("root-20240101"),
-            MockSnapshot("root-20240102"),
-        ]
-        snapshot = MockSnapshot("root-20240103")
-        parent = MockSnapshot("root-20240101")
-
-        result = check_parent_viability(
-            snapshot, parent, source_ep, dest_ep, check_level="quick"
-        )
-
-        assert result.status == ParentViability.VIABLE
-        assert result.parent_name == "root-20240101"
-
-    def test_parent_missing_at_destination(self):
-        """Parent not found at destination returns MISSING."""
-        source_ep = MagicMock()
-        dest_ep = MagicMock()
-        dest_ep.list_snapshots.return_value = [
-            MockSnapshot("root-20240102"),
-        ]
-        snapshot = MockSnapshot("root-20240103")
-        parent = MockSnapshot("root-20240101")  # Not at destination
-
-        result = check_parent_viability(
-            snapshot, parent, source_ep, dest_ep, check_level="quick"
-        )
-
-        assert result.status == ParentViability.MISSING
-        assert result.fallback_to_full
-
-    def test_parent_locked(self):
-        """Locked parent returns LOCKED status."""
-        source_ep = MagicMock()
-        dest_ep = MagicMock()
-        dest_ep.list_snapshots.return_value = [MockSnapshot("root-20240101")]
-
-        snapshot = MockSnapshot("root-20240102")
-        parent = MockSnapshot("root-20240101")
-        parent.locks = {"backup_operation"}  # Parent is locked
-
-        result = check_parent_viability(
-            snapshot, parent, source_ep, dest_ep, check_level="quick"
-        )
-
-        assert result.status == ParentViability.LOCKED
-        assert not result.fallback_to_full  # Don't fallback, wait for lock
-
-    def test_destination_list_failure_continues(self):
-        """If listing destination fails, proceed cautiously."""
-        source_ep = MagicMock()
-        dest_ep = MagicMock()
-        dest_ep.list_snapshots.side_effect = Exception("Connection failed")
-
-        snapshot = MockSnapshot("root-20240102")
-        parent = MockSnapshot("root-20240101")
-
-        # Should not raise, should log warning and proceed
-        result = check_parent_viability(
-            snapshot, parent, source_ep, dest_ep, check_level="quick"
-        )
-
-        # Should assume viable since we can't verify
-        assert result.status == ParentViability.VIABLE
-
-    @patch("btrfs_backup_ng.core.verify._test_send_stream")
-    def test_stream_check_success(self, mock_send_stream):
-        """Stream-level check succeeds when send stream works."""
-        source_ep = MagicMock()
-        dest_ep = MagicMock()
-        dest_ep.list_snapshots.return_value = [MockSnapshot("root-20240101")]
-
-        snapshot = MockSnapshot("root-20240102")
-        parent = MockSnapshot("root-20240101")
-
-        result = check_parent_viability(
-            snapshot, parent, source_ep, dest_ep, check_level="stream"
-        )
-
-        mock_send_stream.assert_called_once()
-        assert result.status == ParentViability.VIABLE
-
-    @patch("btrfs_backup_ng.core.verify._test_send_stream")
-    def test_stream_check_failure(self, mock_send_stream):
-        """Stream-level check fails when send stream fails."""
-        mock_send_stream.side_effect = Exception("Send stream failed")
-
-        source_ep = MagicMock()
-        dest_ep = MagicMock()
-        dest_ep.list_snapshots.return_value = [MockSnapshot("root-20240101")]
-
-        snapshot = MockSnapshot("root-20240102")
-        parent = MockSnapshot("root-20240101")
-
-        result = check_parent_viability(
-            snapshot, parent, source_ep, dest_ep, check_level="stream"
-        )
-
-        assert result.status == ParentViability.CORRUPTED
-        assert result.fallback_to_full
-
-
-class TestFindViableParent:
-    """Tests for find_viable_parent function."""
-
-    def test_no_present_snapshots(self):
-        """Empty destination should recommend full send."""
-        source_ep = MagicMock()
-        dest_ep = MagicMock()
-        snapshot = MockSnapshot("root-20240101")
-
-        result = find_viable_parent(
-            snapshot, [], source_ep, dest_ep, check_level="quick"
-        )
-
-        assert result.status == ParentViability.MISSING
-        assert result.fallback_to_full
-        assert result.parent_name is None
-
-    def test_finds_best_parent(self):
-        """Should find the most recent viable parent."""
-        source_ep = MagicMock()
-        dest_ep = MagicMock()
-        dest_ep.list_snapshots.return_value = [
-            MockSnapshot(
-                "root-20240101", time.strptime("20240101-120000", "%Y%m%d-%H%M%S")
-            ),
-            MockSnapshot(
-                "root-20240102", time.strptime("20240102-120000", "%Y%m%d-%H%M%S")
-            ),
-        ]
-
-        present = [
-            MockSnapshot(
-                "root-20240101", time.strptime("20240101-120000", "%Y%m%d-%H%M%S")
-            ),
-            MockSnapshot(
-                "root-20240102", time.strptime("20240102-120000", "%Y%m%d-%H%M%S")
-            ),
-        ]
-        snapshot = MockSnapshot(
-            "root-20240103", time.strptime("20240103-120000", "%Y%m%d-%H%M%S")
-        )
-
-        result = find_viable_parent(
-            snapshot, present, source_ep, dest_ep, check_level="quick"
-        )
-
-        assert result.status == ParentViability.VIABLE
-        # Should pick most recent (20240102)
-        assert result.parent_name == "root-20240102"
-
-    def test_no_older_candidates(self):
-        """No older snapshots should recommend full send."""
-        source_ep = MagicMock()
-        dest_ep = MagicMock()
-
-        # All present snapshots are newer
-        present = [
-            MockSnapshot(
-                "root-20240105", time.strptime("20240105-120000", "%Y%m%d-%H%M%S")
-            ),
-        ]
-        snapshot = MockSnapshot(
-            "root-20240101", time.strptime("20240101-120000", "%Y%m%d-%H%M%S")
-        )
-
-        result = find_viable_parent(
-            snapshot, present, source_ep, dest_ep, check_level="quick"
-        )
-
-        assert result.status == ParentViability.MISSING
-        assert result.fallback_to_full
-
-    def test_fallback_to_older_parent(self):
-        """If best parent is missing, try older ones."""
-        source_ep = MagicMock()
-        dest_ep = MagicMock()
-
-        # Only the oldest parent exists at destination
-        dest_ep.list_snapshots.return_value = [
-            MockSnapshot(
-                "root-20240101", time.strptime("20240101-120000", "%Y%m%d-%H%M%S")
-            ),
-        ]
-
-        present = [
-            MockSnapshot(
-                "root-20240101", time.strptime("20240101-120000", "%Y%m%d-%H%M%S")
-            ),
-            MockSnapshot(
-                "root-20240102", time.strptime("20240102-120000", "%Y%m%d-%H%M%S")
-            ),
-        ]
-        snapshot = MockSnapshot(
-            "root-20240103", time.strptime("20240103-120000", "%Y%m%d-%H%M%S")
-        )
-
-        result = find_viable_parent(
-            snapshot, present, source_ep, dest_ep, check_level="quick"
-        )
-
-        # Should fall back to 20240101 since 20240102 is missing at dest
-        assert result.status == ParentViability.VIABLE
-        assert result.parent_name == "root-20240101"
-
-
-class TestValidateTransferChain:
-    """Tests for validate_transfer_chain function."""
-
-    def test_validates_multiple_snapshots(self):
-        """Should validate parent for each snapshot in order."""
-        source_ep = MagicMock()
-        dest_ep = MagicMock()
-        dest_ep.list_snapshots.return_value = []
-
-        present = []
-        to_transfer = [
-            MockSnapshot(
-                "root-20240101", time.strptime("20240101-120000", "%Y%m%d-%H%M%S")
-            ),
-            MockSnapshot(
-                "root-20240102", time.strptime("20240102-120000", "%Y%m%d-%H%M%S")
-            ),
-            MockSnapshot(
-                "root-20240103", time.strptime("20240103-120000", "%Y%m%d-%H%M%S")
-            ),
-        ]
-
-        results = validate_transfer_chain(
-            to_transfer, present, source_ep, dest_ep, check_level="quick"
-        )
-
-        assert len(results) == 3
-
-        # First snapshot has no parent (full send)
-        snap1, result1 = results[0]
-        assert result1.fallback_to_full
-
-        # Subsequent snapshots can use previous as parent
-        # (they would be in will_be_present after simulated transfer)
-
-    def test_tracks_transferred_snapshots(self):
-        """Should track what will be present after each transfer."""
-        source_ep = MagicMock()
-        dest_ep = MagicMock()
-        # All snapshots will be "present" at dest after they're transferred
-        dest_ep.list_snapshots.return_value = [
-            MockSnapshot(
-                "root-20240101", time.strptime("20240101-120000", "%Y%m%d-%H%M%S")
-            ),
-            MockSnapshot(
-                "root-20240102", time.strptime("20240102-120000", "%Y%m%d-%H%M%S")
-            ),
-            MockSnapshot(
-                "root-20240103", time.strptime("20240103-120000", "%Y%m%d-%H%M%S")
-            ),
-        ]
-
-        present = [
-            MockSnapshot(
-                "root-20240101", time.strptime("20240101-120000", "%Y%m%d-%H%M%S")
-            ),
-        ]
-        to_transfer = [
-            MockSnapshot(
-                "root-20240102", time.strptime("20240102-120000", "%Y%m%d-%H%M%S")
-            ),
-            MockSnapshot(
-                "root-20240103", time.strptime("20240103-120000", "%Y%m%d-%H%M%S")
-            ),
-        ]
-
-        results = validate_transfer_chain(
-            to_transfer, present, source_ep, dest_ep, check_level="quick"
-        )
-
-        # First can use 20240101 as parent
-        _, result1 = results[0]
-        assert result1.parent_name == "root-20240101"
-
-        # Second can use 20240102 (which will be present after first transfer)
-        _, result2 = results[1]
-        assert result2.parent_name == "root-20240102"
 
 
 # =============================================================================
