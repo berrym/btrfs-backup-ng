@@ -174,28 +174,13 @@ def _raw_verify(args: argparse.Namespace) -> int:
 
     results = []
     for s in snapshots:
-        recorded = s.checksum_value
-        algorithm = getattr(s, "checksum_algorithm", "sha256")
-        if not recorded:
-            status, computed = "unverifiable", None
-        elif algorithm != "sha256":
-            # We only compute sha256; comparing it to a digest of another algorithm
-            # would false-flag an intact stream as corrupt. Cannot check -> unverifiable.
-            status, computed = "unverifiable", None
-        else:
-            computed = ep.compute_stream_checksum(s)
-            if computed is None:
-                status = "error"
-            elif computed == recorded:
-                status = "ok"
-            else:
-                status = "corrupt"
+        verdict = ep.verify_stream_checksum(s)
         results.append(
             {
                 "name": s.name,
-                "status": status,
-                "recorded": recorded,
-                "computed": computed,
+                "status": verdict.status,
+                "recorded": verdict.recorded,
+                "computed": verdict.computed,
             }
         )
 

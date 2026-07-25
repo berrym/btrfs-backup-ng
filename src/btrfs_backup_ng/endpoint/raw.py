@@ -35,6 +35,7 @@ from btrfs_backup_ng.__logger__ import logger
 from btrfs_backup_ng.endpoint.common import Endpoint
 from btrfs_backup_ng.endpoint.raw_metadata import (
     COMPRESSION_CONFIG,
+    ChecksumVerdict,
     RawSnapshot,
     _fsync_directory,
     discover_raw_snapshots,
@@ -868,6 +869,45 @@ class RawEndpoint(Endpoint):
         subclass overrides this to hash on the remote host (no re-download)."""
         return _sha256_file(snapshot.stream_path)
 
+    # False for a local raw:// target (we hash with this host's own kernel, so an
+    # ``ok`` is tamper-evident). Overridden to True on the raw+ssh subclass, where the
+    # digest is computed BY the untrusted remote (corruption-detection only).
+    _checksum_is_remote: bool = False
+
+    def verify_stream_checksum(self, snapshot: RawSnapshot) -> ChecksumVerdict:
+        """Verify ``snapshot``'s stream against its sealed sha256 and classify the
+        result. THE single checksum-verification path -- ``raw verify``, the
+        restore-time integrity guard, and the general ``verify`` command all call this,
+        so the ok/corrupt/error/unverifiable taxonomy cannot drift between them.
+
+        Never raises (a report collects findings; it does not abort mid-scan): an
+        unreadable stream is ``error``, a missing/non-sha256 checksum is
+        ``unverifiable``, and the caller decides how severe each is. Skips the recompute
+        entirely for the unverifiable cases -- there is nothing to compare against, so
+        there is no reason to pay the read.
+
+        Dispatch is polymorphic via ``compute_stream_checksum`` (local ``_sha256_file``
+        for raw://, remote ``_remote_sha256`` for raw+ssh); ``remote_untrusted`` records
+        which, so a raw+ssh verdict can be labelled consistency-only."""
+        recorded = snapshot.checksum_value
+        algorithm = getattr(snapshot, "checksum_algorithm", "sha256")
+        remote = self._checksum_is_remote
+        if not recorded:
+            # Legacy backup, or a best-effort write-time seal that failed to record.
+            return ChecksumVerdict("unverifiable", recorded, None, algorithm, remote)
+        if algorithm != "sha256":
+            # We only recompute sha256; comparing it to a digest of another algorithm
+            # would false-flag an intact stream as corrupt. Cannot check.
+            return ChecksumVerdict("unverifiable", recorded, None, algorithm, remote)
+        computed = self.compute_stream_checksum(snapshot)
+        if computed is None:
+            # The recorded checksum exists and is sha256, but the current stream on
+            # disk (or on the remote) could not be read/hashed.
+            return ChecksumVerdict("error", recorded, None, algorithm, remote)
+        if computed == recorded:
+            return ChecksumVerdict("ok", recorded, computed, algorithm, remote)
+        return ChecksumVerdict("corrupt", recorded, computed, algorithm, remote)
+
     def sidecar_exists(self, snapshot: RawSnapshot) -> bool:
         """Whether ``snapshot``'s ``.meta`` sidecar exists now. Used by
         ``raw backfill-metadata`` to re-check just before writing, so a sidecar that
@@ -1132,11 +1172,12 @@ class RawEndpoint(Endpoint):
                 snapshot.name,
             )
             return
-        recorded = snapshot.checksum_value
-        if not recorded or snapshot.checksum_algorithm != "sha256":
+        verdict = self.verify_stream_checksum(snapshot)
+        if verdict.status == "unverifiable":
+            # Nothing to compare against (legacy backup, or a non-sha256 algorithm) --
+            # the restore's own decode step still surfaces a genuinely unreadable stream.
             return
-        computed = self.compute_stream_checksum(snapshot)
-        if computed is None:
+        if verdict.status == "error":
             # Could not hash the stream -- do not BLOCK the restore on an inability to
             # verify (the decode step will surface a real read error); just note it.
             logger.warning(
@@ -1144,14 +1185,14 @@ class RawEndpoint(Endpoint):
                 snapshot.name,
             )
             return
-        if computed != recorded:
+        if verdict.status == "corrupt":
             raise __util__.AbortError(
                 f"Refusing to restore {snapshot.name}: the stored stream is CORRUPT "
-                f"(its sha256 {computed} does not match {recorded}, sealed when it was "
-                "backed up). The backup on disk has changed since it was written. "
-                "Restore an intact copy if you have one; if this is the only copy, "
-                "'restore --skip-verify' will attempt it anyway (the result may be "
-                "incomplete). Run 'raw verify' to inspect the target."
+                f"(its sha256 {verdict.computed} does not match {verdict.recorded}, "
+                "sealed when it was backed up). The backup on disk has changed since it "
+                "was written. Restore an intact copy if you have one; if this is the "
+                "only copy, 'restore --skip-verify' will attempt it anyway (the result "
+                "may be incomplete). Run 'raw verify' to inspect the target."
             )
 
     def _build_restore_pipeline(self, snapshot: RawSnapshot) -> list[list[str]]:
@@ -1563,6 +1604,9 @@ class SSHRawEndpoint(RawEndpoint):
         self.ssh_key = config.get("ssh_key")
         self.ssh_opts = config.get("ssh_opts", [])
         self.ssh_sudo = config.get("ssh_sudo", False)
+        # An explicit ssh-agent socket (e.g. `--ssh-auth-sock`), useful under sudo where
+        # SSH_AUTH_SOCK is not inherited. None -> rely on ssh's own agent discovery.
+        self.ssh_auth_sock = config.get("ssh_auth_sock")
 
         self._is_remote = True
 
@@ -1625,6 +1669,12 @@ class SSHRawEndpoint(RawEndpoint):
 
         if self.ssh_key:
             cmd.extend(["-i", self.ssh_key])
+
+        if self.ssh_auth_sock:
+            # Point ssh at the explicit agent socket (mirrors the btrfs SSHEndpoint's
+            # IdentityAgent handling) so agent auth works under sudo, where the inherited
+            # SSH_AUTH_SOCK is typically stripped.
+            cmd.extend(["-o", f"IdentityAgent={self.ssh_auth_sock}"])
 
         user_host = (
             f"{self.username}@{self.hostname}" if self.username else self.hostname
@@ -1838,6 +1888,10 @@ class SSHRawEndpoint(RawEndpoint):
             self.write_sidecar(self._sidecar_snapshot(final_path, size, checksum))
         except Exception as e:
             logger.warning("Failed to write remote sidecar for %s: %s", final_path, e)
+
+    # The digest is computed BY the untrusted remote, so a raw+ssh ``ok`` verdict is
+    # corruption-detection only, not tamper-evidence (see ChecksumVerdict).
+    _checksum_is_remote: bool = True
 
     def compute_stream_checksum(self, snapshot: RawSnapshot) -> str | None:
         """Hash ``snapshot``'s stream ON the remote host (see ``_remote_sha256``),

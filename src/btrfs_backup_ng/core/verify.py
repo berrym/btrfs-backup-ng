@@ -438,6 +438,102 @@ def verify_full(
     return report
 
 
+def verify_raw_checksums(
+    backup_endpoint,
+    level: VerifyLevel,
+    snapshot_name: str | None = None,
+    on_progress: Callable[[int, int, str], None] | None = None,
+) -> VerifyReport:
+    """Verify a raw target by recomputing each stream's sha256 and comparing it to the
+    checksum sealed in the ``.meta`` sidecar.
+
+    This is what ``stream``/``full`` verification MEANS for a raw:// or raw+ssh:// target
+    (a raw backup is a stored send stream, not a subvolume, so ``btrfs send`` cannot be
+    run on it). It routes through ``RawEndpoint.verify_stream_checksum`` -- the SAME
+    primitive ``raw verify`` and the restore-time integrity guard use -- so the
+    ok/corrupt/error/unverifiable classification cannot drift between them.
+
+    A ``corrupt`` (bytes changed) or ``error`` (stream unreadable) snapshot FAILS; an
+    ``unverifiable`` one (no recorded checksum, or a non-sha256 algorithm) is not a
+    failure but is reported as such (never a silent green). All snapshots are checked,
+    not just the latest -- the sealed-checksum compare is cheap, so there is no reason
+    to leave a blind spot in the chain.
+    """
+    location = str(backup_endpoint.config.get("path", "unknown"))
+    report = VerifyReport(level=level, location=location)
+
+    try:
+        backup_snapshots = backup_endpoint.list_snapshots()
+
+        if not backup_snapshots:
+            report.errors.append("No snapshots found at backup location")
+            report.completed_at = time.time()
+            return report
+
+        if snapshot_name:
+            backup_snapshots = [
+                s for s in backup_snapshots if s.get_name() == snapshot_name
+            ]
+            if not backup_snapshots:
+                report.errors.append(f"Snapshot '{snapshot_name}' not found")
+                report.completed_at = time.time()
+                return report
+
+        for i, snap in enumerate(backup_snapshots, 1):
+            name = snap.get_name()
+
+            if on_progress:
+                on_progress(i, len(backup_snapshots), name)
+
+            start = time.monotonic()
+            verdict = backup_endpoint.verify_stream_checksum(snap)
+
+            result = VerifyResult(
+                snapshot_name=name,
+                level=level,
+                # ok/unverifiable pass; corrupt/error fail -- the single source of
+                # truth (ChecksumVerdict.is_failure) shared with `raw verify`'s exit code.
+                passed=not verdict.is_failure,
+            )
+            result.details["checksum_status"] = verdict.status
+            result.details["checksum_recorded"] = verdict.recorded
+            result.details["checksum_computed"] = verdict.computed
+            result.details["checksum_algorithm"] = verdict.algorithm
+            if verdict.remote_untrusted:
+                # A raw+ssh digest is computed by the untrusted remote: consistency, not
+                # authenticity. Surface it so an operator does not read `ok` as tamper-proof.
+                result.details["trust"] = "consistency-only (remote hash)"
+
+            if verdict.status == "ok":
+                result.message = "Checksum verified"
+                if verdict.remote_untrusted:
+                    result.message += " (consistency-only: remote hash)"
+            elif verdict.status == "corrupt":
+                rec = (verdict.recorded or "-")[:12]
+                comp = (verdict.computed or "-")[:12]
+                result.message = (
+                    f"CORRUPT: stored stream no longer matches its sealed checksum "
+                    f"(recorded={rec}... computed={comp}...)"
+                )
+            elif verdict.status == "error":
+                result.message = "Stream could not be read to verify its checksum"
+            else:  # unverifiable
+                result.message = (
+                    "Unverifiable: no sha256 checksum was recorded for this stream "
+                    "(a legacy backup or one sealed before checksums existed)"
+                )
+
+            result.duration_seconds = time.monotonic() - start
+            report.results.append(result)
+
+    except Exception as e:
+        report.errors.append(f"Verification failed: {e}")
+        logger.error("Raw checksum verification failed: %s", e)
+
+    report.completed_at = time.time()
+    return report
+
+
 def _find_parent_snapshot(snapshot, all_snapshots: list):
     """Find the parent snapshot for incremental operations.
 

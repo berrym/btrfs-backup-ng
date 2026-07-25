@@ -83,6 +83,49 @@ def _fsync_directory(directory: Path) -> None:
         pass
 
 
+@dataclass(frozen=True)
+class ChecksumVerdict:
+    """The result of verifying one raw stream against its sealed sha256.
+
+    The single classification shared by every checksum caller (``raw verify``, the
+    restore-time integrity guard, and the general ``verify`` command) so the taxonomy
+    lives in ONE place and cannot drift between them:
+
+    - ``ok``           the recomputed digest matches the sealed checksum -- intact.
+    - ``corrupt``      it does NOT match -- the stream on disk differs from what was
+                       backed up (the one status an operator must investigate).
+    - ``error``        the stream could not be read/hashed (recorded checksum exists
+                       and is sha256, but the current stream is inaccessible).
+    - ``unverifiable`` nothing to compare against: no checksum was recorded (a legacy
+                       backup or a best-effort seal that failed) or it used a non-sha256
+                       algorithm we cannot recompute. NOT a failure.
+
+    ``is_failure`` (corrupt/error) is the single source of truth for "does this count
+    against the run" -- exit codes, restore aborts, and verify PASS/FAIL all derive
+    from it, so they can never disagree.
+    """
+
+    status: str
+    recorded: str | None
+    computed: str | None
+    algorithm: str
+    # True for a raw+ssh target: the digest was computed BY the (untrusted) remote, so
+    # an ``ok`` verdict evidences at-rest CONSISTENCY, not authenticity -- a compromised
+    # target could forge a match. Callers surface this caveat; hash a raw:// copy for
+    # tamper-evidence.
+    remote_untrusted: bool = False
+
+    @property
+    def is_failure(self) -> bool:
+        """Whether this verdict should count as a verification failure."""
+        return self.status in ("corrupt", "error")
+
+    @property
+    def is_verified(self) -> bool:
+        """Whether the stream was positively confirmed intact."""
+        return self.status == "ok"
+
+
 @functools.total_ordering
 @dataclass(eq=False, repr=False)
 class RawSnapshot:

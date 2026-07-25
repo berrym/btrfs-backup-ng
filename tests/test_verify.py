@@ -1288,3 +1288,109 @@ class TestValidateTransferChain:
         # Second can use 20240102 (which will be present after first transfer)
         _, result2 = results[1]
         assert result2.parent_name == "root-20240102"
+
+
+# =============================================================================
+# verify_raw_checksums (R8a): raw-target checksum verification branches
+# =============================================================================
+from btrfs_backup_ng.core.verify import verify_raw_checksums  # noqa: E402
+from btrfs_backup_ng.endpoint.raw_metadata import ChecksumVerdict  # noqa: E402
+
+
+class _FakeRawEndpoint:
+    """Minimal raw endpoint: returns preset snapshots and a preset verdict per name."""
+
+    def __init__(self, verdicts, path="/raw", raises=None):
+        # verdicts: dict name -> ChecksumVerdict
+        self._verdicts = verdicts
+        self.config = {"path": path}
+        self._raises = raises
+
+    def list_snapshots(self):
+        if self._raises:
+            raise self._raises
+        return [MockSnapshot(name) for name in self._verdicts]
+
+    def verify_stream_checksum(self, snap):
+        return self._verdicts[snap.get_name()]
+
+
+def _v(status, recorded="a" * 64, computed=None, remote=False):
+    return ChecksumVerdict(status, recorded, computed, "sha256", remote)
+
+
+def test_raw_checksums_empty_target_reports_error():
+    """No snapshots -> a reported error (exit 2 upstream), not a silent empty pass."""
+    ep = _FakeRawEndpoint({})
+    report = verify_raw_checksums(ep, VerifyLevel.STREAM)
+    assert report.errors == ["No snapshots found at backup location"]
+    assert report.total == 0
+
+
+def test_raw_checksums_snapshot_filter_selects_one():
+    """--snapshot NAME verifies only that stream."""
+    ep = _FakeRawEndpoint(
+        {"a": _v("ok", computed="a" * 64), "b": _v("corrupt", computed="b" * 64)}
+    )
+    report = verify_raw_checksums(ep, VerifyLevel.STREAM, snapshot_name="a")
+    assert report.total == 1
+    assert report.results[0].snapshot_name == "a"
+    assert report.results[0].passed is True
+
+
+def test_raw_checksums_snapshot_filter_missing_reports_error():
+    """--snapshot NAME for an absent snapshot -> reported error, no results."""
+    ep = _FakeRawEndpoint({"a": _v("ok", computed="a" * 64)})
+    report = verify_raw_checksums(ep, VerifyLevel.STREAM, snapshot_name="nope")
+    assert report.total == 0
+    assert any("nope" in e for e in report.errors)
+
+
+def test_raw_checksums_invokes_on_progress():
+    """The on_progress callback fires once per verified snapshot."""
+    ep = _FakeRawEndpoint({"a": _v("ok", computed="a" * 64)})
+    seen = []
+    verify_raw_checksums(
+        ep, VerifyLevel.STREAM, on_progress=lambda i, n, name: seen.append((i, n, name))
+    )
+    assert seen == [(1, 1, "a")]
+
+
+def test_raw_checksums_error_status_fails_with_message():
+    """An unreadable stream -> error verdict -> failed result with an explanatory message."""
+    ep = _FakeRawEndpoint({"a": _v("error", computed=None)})
+    report = verify_raw_checksums(ep, VerifyLevel.STREAM)
+    r = report.results[0]
+    assert r.passed is False
+    assert "could not be read" in r.message
+    assert report.failed == 1
+
+
+def test_raw_checksums_unverifiable_is_not_a_failure():
+    """No recorded checksum -> unverifiable -> passes (not a failure) with a clear message."""
+    ep = _FakeRawEndpoint({"a": ChecksumVerdict("unverifiable", None, None, "sha256")})
+    report = verify_raw_checksums(ep, VerifyLevel.STREAM)
+    r = report.results[0]
+    assert r.passed is True
+    assert "Unverifiable" in r.message
+    assert report.failed == 0
+
+
+def test_raw_checksums_remote_ok_carries_trust_caveat():
+    """A raw+ssh 'ok' verdict passes AND its message/details carry the consistency-only
+    caveat (the digest came from the untrusted remote)."""
+    ep = _FakeRawEndpoint({"a": _v("ok", computed="a" * 64, remote=True)})
+    report = verify_raw_checksums(ep, VerifyLevel.STREAM)
+    r = report.results[0]
+    assert r.passed is True
+    assert "consistency-only" in r.message
+    assert r.details["trust"] == "consistency-only (remote hash)"
+
+
+def test_raw_checksums_list_failure_is_reported_not_raised():
+    """A list_snapshots failure is captured as a report error (exit 2 upstream), never
+    propagated as an unhandled exception."""
+    ep = _FakeRawEndpoint({}, raises=OSError("mount gone"))
+    report = verify_raw_checksums(ep, VerifyLevel.STREAM)
+    assert any("mount gone" in e for e in report.errors)
+    assert report.total == 0
