@@ -16,6 +16,7 @@ from btrfs_backup_ng import __util__
 from btrfs_backup_ng.__logger__ import logger
 from btrfs_backup_ng.core.space import SpaceInfo
 from btrfs_backup_ng.core.space import get_space_info as _get_space_info
+from btrfs_backup_ng.endpoint.raw_metadata import StructureVerdict
 
 
 def require_source(method):
@@ -479,6 +480,51 @@ class Endpoint:
             if getattr(candidate, "received_uuid", "") == src_uuid:
                 return candidate
         return None
+
+    def verify_structure(self, snapshot: Any) -> StructureVerdict:
+        """Confirm ``snapshot`` is a real, valid backup ARTIFACT (not just a name-shaped
+        directory entry) -- the polymorphic structural check behind the ``verify`` metadata
+        level. This base implementation is the LOCAL btrfs semantics (Local endpoint);
+        SSH and raw endpoints override it.
+
+        A local backup is enumerated by ``iterdir`` (any directory entry whose NAME parses
+        as a snapshot), so an interrupted ``btrfs receive`` that left a plain directory, or
+        a hand-created folder, is listed like a real backup. This confirms otherwise:
+
+        - NOT a btrfs subvolume (``is_subvolume`` is a privilege-free inode check) ->
+          ``invalid``: deterministically not a backup (the interrupted-receive / plain-dir
+          case). This is the core false-pass this method closes.
+        - a subvolume with a non-empty ``received_uuid`` (set only by ``btrfs receive``,
+          and a received subvolume is read-only by construction) -> ``ok``.
+        - a subvolume whose ``received_uuid`` could not be confirmed (empty: a non-received
+          subvolume, or the best-effort ``btrfs subvolume show`` enrichment could not run
+          without privilege) -> ``unverifiable``: never fail a real subvolume just because
+          the environment could not prove it is a received backup.
+        """
+        try:
+            path = snapshot.get_path()
+        except Exception:  # noqa: BLE001 - a snapshot with no resolvable path is not ours
+            return StructureVerdict("unverifiable", "could not resolve snapshot path")
+        try:
+            is_subvol = __util__.is_subvolume(path)
+        except OSError as e:
+            # Could not stat the path (e.g. permission) -- cannot determine; do not fail.
+            return StructureVerdict(
+                "unverifiable", f"could not check subvolume status: {e}"
+            )
+        if not is_subvol:
+            return StructureVerdict(
+                "invalid",
+                "not a btrfs subvolume (a plain directory -- e.g. an interrupted "
+                "receive left a partial/empty backup)",
+            )
+        if getattr(snapshot, "received_uuid", ""):
+            return StructureVerdict("ok", "received read-only subvolume")
+        return StructureVerdict(
+            "unverifiable",
+            "a subvolume, but its received_uuid could not be confirmed "
+            "(not a received backup, or btrfs subvolume show needs privilege)",
+        )
 
     def set_lock(
         self, snapshot: Any, lock_id: Any, lock_state: bool, parent: bool = False

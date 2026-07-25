@@ -37,6 +37,7 @@ from btrfs_backup_ng.endpoint.raw_metadata import (
     COMPRESSION_CONFIG,
     ChecksumVerdict,
     RawSnapshot,
+    StructureVerdict,
     _fsync_directory,
     discover_raw_snapshots,
     get_file_extension,
@@ -907,6 +908,30 @@ class RawEndpoint(Endpoint):
         if computed == recorded:
             return ChecksumVerdict("ok", recorded, computed, algorithm, remote)
         return ChecksumVerdict("corrupt", recorded, computed, algorithm, remote)
+
+    def verify_structure(self, snapshot: RawSnapshot) -> StructureVerdict:
+        """Confirm ``snapshot`` is a raw backup with AUTHORITATIVE metadata (the ``verify``
+        metadata-level structural check for a raw target). The stream file itself exists by
+        virtue of discovery; the structural question is whether it carries a real ``.meta``
+        sidecar:
+
+        - a native/backfilled/remediation sidecar (``provenance_origin`` is anything but
+          ``filename-inferred``) -> ``ok``: authoritative metadata is present.
+        - a filename-inferred stream (no ``.meta`` sidecar; metadata reconstructed from the
+          filename) -> ``unverifiable``: its pipeline and parentage are guesses, not a
+          failure but not a confirmed-authoritative backup either.
+
+        Byte integrity (the sealed sha256) is the ``stream``/``full`` level's job
+        (``verify_stream_checksum``); this level is the cheap structural check.
+        """
+        origin = getattr(snapshot, "provenance_origin", "native-write")
+        if origin == "filename-inferred":
+            return StructureVerdict(
+                "unverifiable",
+                "no .meta sidecar (metadata inferred from the filename -- run "
+                "'raw backfill-metadata' to write an authoritative sidecar)",
+            )
+        return StructureVerdict("ok", f"authoritative sidecar (origin={origin})")
 
     def sidecar_exists(self, snapshot: RawSnapshot) -> bool:
         """Whether ``snapshot``'s ``.meta`` sidecar exists now. Used by

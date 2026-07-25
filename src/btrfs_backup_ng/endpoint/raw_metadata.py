@@ -126,6 +126,45 @@ class ChecksumVerdict:
         return self.status == "ok"
 
 
+@dataclass(frozen=True)
+class StructureVerdict:
+    """The result of verifying one backup entry is a real, valid backup ARTIFACT (as
+    opposed to its byte content, which is ``ChecksumVerdict``'s job). Produced
+    polymorphically by ``Endpoint.verify_structure`` -- each endpoint knows how to
+    confirm its own kind of backup -- so the general ``verify`` metadata level validates
+    structure instead of trusting that a name-shaped directory entry is a backup:
+
+    - ``ok``           confirmed a real backup: a received read-only btrfs subvolume
+                       (non-empty ``received_uuid``), or a raw stream with an authoritative
+                       ``.meta`` sidecar.
+    - ``invalid``      DETERMINISTICALLY not a valid backup -- e.g. a plain directory left
+                       by an interrupted ``btrfs receive`` (not a subvolume at all). A
+                       failure.
+    - ``unverifiable`` a real subvolume/stream whose backup identity could NOT be confirmed
+                       -- ``received_uuid`` empty (a non-received subvolume, or an enrichment
+                       miss with no privilege) or a filename-inferred raw stream with no
+                       sidecar. NOT a failure: we never fail a good backup just because the
+                       environment (missing sudo) could not prove it.
+
+    ``invalid`` is reserved for what we can prove is wrong; anything merely unconfirmed is
+    ``unverifiable``. ``is_failure`` (invalid only) is the single source of truth for
+    PASS/FAIL, mirroring ``ChecksumVerdict``.
+    """
+
+    status: str
+    message: str = ""
+
+    @property
+    def is_failure(self) -> bool:
+        """Whether this verdict should count as a verification failure."""
+        return self.status == "invalid"
+
+    @property
+    def is_ok(self) -> bool:
+        """Whether the entry was positively confirmed a valid backup."""
+        return self.status == "ok"
+
+
 @functools.total_ordering
 @dataclass(eq=False, repr=False)
 class RawSnapshot:
