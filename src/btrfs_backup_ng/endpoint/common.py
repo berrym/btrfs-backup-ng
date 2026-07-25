@@ -526,6 +526,34 @@ class Endpoint:
             "(not a received backup, or btrfs subvolume show needs privilege)",
         )
 
+    def test_send_stream(self, snapshot: Any, parent: Any = None) -> None:
+        """Verify a ``btrfs send`` stream can be generated for ``snapshot`` -- the STREAM
+        verification level for a btrfs subvolume target. Runs ``btrfs send --no-data`` (a
+        metadata-only stream: it validates the subvolume and, with ``-p``, the incremental
+        parent chain, without moving any file data) and raises ``VerifyError`` on failure.
+
+        This base implementation runs the command LOCALLY (the Local endpoint). SSH
+        endpoints override it to run ON THE REMOTE where the subvolume actually lives, and
+        raw endpoints override it to reject (a stored stream file is not a subvolume; raw
+        integrity is verified by checksum)."""
+        from btrfs_backup_ng.core.verify import VerifyError
+
+        cmd = ["btrfs", "send", "--no-data"]
+        if parent is not None:
+            cmd.extend(["-p", str(parent.get_path())])
+        cmd.append(str(snapshot.get_path()))
+        result = subprocess.run(
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            timeout=300,
+        )
+        if result.returncode != 0:
+            raise VerifyError(
+                f"Send stream test failed: "
+                f"{result.stderr.decode(errors='replace').strip()}"
+            )
+
     def set_lock(
         self, snapshot: Any, lock_id: Any, lock_state: bool, parent: bool = False
     ) -> None:
