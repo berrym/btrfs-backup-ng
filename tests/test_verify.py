@@ -1545,6 +1545,46 @@ class TestVerifyMetadataStructural:
         assert verdict.status == "unverifiable"
         assert verdict.is_failure is False
 
+    def test_local_verify_structure_ok_and_unverifiable_by_received_uuid(
+        self, tmp_path, monkeypatch
+    ):
+        """With is_subvolume True (a real subvolume), the received_uuid decides: non-empty
+        -> ok (a received backup); empty -> unverifiable (a subvolume, but not a received
+        backup). Covers the local ok/unverifiable branches without root; the tier2 suite
+        proves the same against a REAL received subvolume. Mutation guard: dropping the
+        received_uuid gate makes the empty case report ok."""
+        import btrfs_backup_ng.endpoint.common as common_mod
+        from types import SimpleNamespace
+
+        backup = tmp_path / "b"
+        backup.mkdir()
+        ep = LocalEndpoint(config={"path": str(backup), "snap_prefix": "home-"})
+        monkeypatch.setattr(common_mod.__util__, "is_subvolume", lambda _p: True)
+
+        received = SimpleNamespace(
+            get_path=lambda: backup / "recv", received_uuid="uuid-1234"
+        )
+        non_received = SimpleNamespace(
+            get_path=lambda: backup / "local", received_uuid=""
+        )
+
+        assert ep.verify_structure(received).status == "ok"
+        verdict = ep.verify_structure(non_received)
+        assert verdict.status == "unverifiable" and verdict.is_failure is False
+
+    def test_local_verify_structure_unresolvable_path_is_unverifiable(self, tmp_path):
+        """A snapshot whose path cannot be resolved -> unverifiable (not a crash, not an
+        invalid): a snapshot with no resolvable path is simply not ours to judge."""
+        from types import SimpleNamespace
+
+        ep = LocalEndpoint(config={"path": str(tmp_path), "snap_prefix": "home-"})
+
+        def _boom():
+            raise RuntimeError("no path")
+
+        verdict = ep.verify_structure(SimpleNamespace(get_path=_boom))
+        assert verdict.status == "unverifiable" and verdict.is_failure is False
+
     def test_raw_authoritative_sidecar_passes(self, tmp_path):
         """A raw backup with a real native-write sidecar -> structure ok -> passes."""
         _build_raw_backup(tmp_path, "a.20260101T120000")
