@@ -1,5 +1,5 @@
 .\" Man page for btrfs-backup-ng verify
-.TH BTRFS-BACKUP-NG-VERIFY 1 "January 2026" "btrfs-backup-ng" "User Commands"
+.TH BTRFS-BACKUP-NG-VERIFY 1 "July 2026" "btrfs-backup-ng" "User Commands"
 .SH NAME
 btrfs-backup-ng-verify \- verify backup integrity
 .SH SYNOPSIS
@@ -10,16 +10,25 @@ Verify that backups at a given location are valid and restorable. This command
 provides multiple levels of verification to check backup integrity, from quick
 metadata checks to full restore tests.
 .PP
-Verification works with both local backup directories and remote SSH locations.
+Verification works with btrfs backup subvolumes (local directories and remote SSH
+locations) and with raw targets (\fBraw://\fR and \fBraw+ssh://\fR), which store
+\fBbtrfs send\fR streams as files. For a raw target, verification recomputes each
+stream's sha256 and compares it to the checksum sealed in the stream's \fB.meta\fR
+sidecar \(em the same integrity check performed by \fBbtrfs-backup-ng raw verify\fR
+and before every raw restore.
 .SH ARGUMENTS
 .TP
 .I LOCATION
-Backup location to verify. Can be a local path (e.g., /mnt/backup/home) or
-an SSH URL (e.g., ssh://user@host:/path/to/backup).
+Backup location to verify. Can be a local path (e.g., /mnt/backup/home), an SSH URL
+(e.g., ssh://user@host:/path/to/backup), or a raw target
+(e.g., raw:///mnt/usb/backups or raw+ssh://user@host:/backups).
 .SH OPTIONS
 .TP
 .BI \-\-level " " \fILEVEL\fR
-Verification level. Default: metadata. Valid levels:
+Verification level. Default: \fBmetadata\fR for a btrfs target, \fBstream\fR (the
+sealed-checksum check) for a raw target \(em a raw backup's integrity is whether its
+stored bytes still match what was written, so a bare \fBverify\fR on a raw target reads
+the stream rather than reporting a hollow pass from a directory listing. Valid levels:
 .RS
 .TP
 .B metadata
@@ -28,14 +37,17 @@ all snapshots exist and that incremental chains are complete (no missing
 parent snapshots). This is fast and non-destructive.
 .TP
 .B stream
-Verify that btrfs send stream can be generated. Uses \fBbtrfs send --no-data\fR
-to test stream generation without transferring actual file data. This validates
-that snapshot metadata is intact.
+For a btrfs target, verify that a \fBbtrfs send\fR stream can be generated (uses
+\fBbtrfs send --no-data\fR to test stream generation without transferring file data,
+validating that snapshot metadata is intact). For a raw target, recompute the stored
+stream's sha256 and compare it to the checksum sealed in its \fB.meta\fR sidecar,
+detecting at-rest corruption.
 .TP
 .B full
-Complete restore test to a temporary location. Actually restores snapshot(s)
-and verifies the restored subvolume is valid. This is the most thorough check
-but also the slowest. Requires \fB--temp-dir\fR for remote backups.
+For a btrfs target, a complete restore test to a temporary location: actually restores
+snapshot(s) and verifies the restored subvolume is valid \(em the most thorough check,
+but the slowest; requires \fB--temp-dir\fR for remote backups. For a raw target, \fBfull\fR
+performs the same sealed-checksum verification as \fBstream\fR.
 .RE
 .TP
 .BI \-\-snapshot " " \fINAME\fR
@@ -117,6 +129,25 @@ Tests the complete restore pipeline
 Cleans up after verification (unless \fB--no-cleanup\fR)
 .PP
 This is the definitive test that a backup can be restored.
+.SS Raw targets (sealed checksum)
+For a \fBraw://\fR or \fBraw+ssh://\fR target, the \fBstream\fR and \fBfull\fR levels
+recompute each stored stream's sha256 and compare it to the checksum sealed in the
+stream's \fB.meta\fR sidecar. Every stream is checked (not just the latest). Per-snapshot
+status is one of:
+.IP \(bu 2
+\fBok\fR \(em the stream matches its sealed checksum (intact).
+.IP \(bu 2
+\fBcorrupt\fR \(em the stream on disk no longer matches (fails; exit 1).
+.IP \(bu 2
+\fBerror\fR \(em the stream could not be read to hash it (fails; exit 1).
+.IP \(bu 2
+\fBunverifiable\fR \(em no sha256 checksum was recorded (a legacy backup); not a failure,
+but reported explicitly rather than as a silent pass.
+.PP
+For a \fBraw+ssh://\fR target the sha256 is recomputed \fBon the (untrusted) remote
+host\fR, so an \fBok\fR verdict evidences at-rest consistency, not authenticity \(em a
+compromised target could forge a match. Verify a locally-mounted \fBraw://\fR copy for
+tamper-evidence.
 .SH EXIT STATUS
 .TP
 .B 0
@@ -143,6 +174,12 @@ Full restore test:
 .TP
 Full verification of remote backup:
 .B btrfs-backup-ng verify ssh://server:/backups/home --level full --temp-dir /mnt/test
+.TP
+Verify a raw target (checks the sealed sha256 of every stream):
+.B btrfs-backup-ng verify raw:///mnt/usb/backups
+.TP
+Verify a remote raw target over SSH:
+.B btrfs-backup-ng verify raw+ssh://backup@server:/backups --ssh-sudo
 .TP
 Verify specific snapshot:
 .B btrfs-backup-ng verify /mnt/backup/home --snapshot home-20260104-120000

@@ -13,6 +13,7 @@ from ..core.verify import (
     VerifyReport,
     verify_full,
     verify_metadata,
+    verify_raw_checksums,
     verify_stream,
 )
 from .common import get_fs_checks_mode, resolve_timestamp_format
@@ -30,9 +31,6 @@ def execute(args: argparse.Namespace) -> int:
     Returns:
         Exit code (0 = success, 1 = failures found, 2 = error)
     """
-    # Determine verification level
-    level = VerifyLevel(args.level)
-
     # Build endpoint kwargs. Thread timestamp_format so custom-named snapshots
     # are parsed (otherwise verify silently skips them and can report success).
     endpoint_kwargs = {
@@ -46,7 +44,7 @@ def execute(args: argparse.Namespace) -> int:
         ),
     }
 
-    # SSH options
+    # SSH / raw options
     if args.location.startswith("ssh://"):
         if args.ssh_sudo:
             endpoint_kwargs["ssh_sudo"] = True
@@ -54,6 +52,18 @@ def execute(args: argparse.Namespace) -> int:
             endpoint_kwargs["ssh_identity_file"] = args.ssh_key
         if getattr(args, "ssh_auth_sock", None):
             endpoint_kwargs["ssh_auth_sock"] = args.ssh_auth_sock
+    elif args.location.startswith(("raw://", "raw+ssh://")):
+        # Raw target: choose_endpoint parses the path (and host, for raw+ssh) from the
+        # spec itself, so do NOT set 'path' -- Path().resolve() on a raw:// URL would
+        # mangle it. Thread ssh creds for raw+ssh (SSHRawEndpoint reads
+        # ssh_sudo/ssh_key/ssh_auth_sock from config); the base RawEndpoint ignores them.
+        if args.location.startswith("raw+ssh://"):
+            if args.ssh_sudo:
+                endpoint_kwargs["ssh_sudo"] = True
+            if args.ssh_key:
+                endpoint_kwargs["ssh_key"] = args.ssh_key
+            if getattr(args, "ssh_auth_sock", None):
+                endpoint_kwargs["ssh_auth_sock"] = args.ssh_auth_sock
     else:
         # For local paths, set 'path' for LocalEndpoint
         endpoint_kwargs["path"] = Path(args.location).resolve()
@@ -71,30 +81,62 @@ def execute(args: argparse.Namespace) -> int:
         console.print(f"[red]Error:[/red] Cannot access backup location: {e}")
         return 2
 
+    # A raw:// or raw+ssh:// target stores send STREAMS, not subvolumes, so its
+    # verification is the sealed-checksum check (not btrfs send/restore).
+    from ..endpoint.raw import (
+        RawEndpoint,
+    )  # local import: avoid an endpoint import cycle
+
+    is_raw = isinstance(backup_ep, RawEndpoint)
+
+    # Resolve level: an explicit --level wins; otherwise default to metadata for a btrfs
+    # target, but stream (the sealed-checksum check) for a raw target -- a bare
+    # `verify raw://X` must read the stored bytes, not report a hollow pass from a listing.
+    if args.level:
+        level = VerifyLevel(args.level)
+    else:
+        level = VerifyLevel.STREAM if is_raw else VerifyLevel.METADATA
+
+    # In --json mode stdout must be machine-readable, so the human header/progress
+    # lines (which go to stdout) are suppressed just like under --quiet -- otherwise a
+    # `verify ... --json` consumer gets unparseable output unless they also pass --quiet.
+    human = not args.quiet and not args.json
+
     # Progress callback
     def on_progress(current: int, total: int, name: str):
-        if not args.quiet:
+        if human:
             console.print(f"  [{current}/{total}] Verifying {name}...")
 
     # Run verification based on level
     report: VerifyReport
     try:
-        if not args.quiet:
+        if human:
             console.print(f"\n[bold]Verifying backups at:[/bold] {args.location}")
             console.print(f"[bold]Level:[/bold] {level.value}\n")
 
-        if level == VerifyLevel.METADATA:
+        if is_raw and level in (VerifyLevel.STREAM, VerifyLevel.FULL):
+            # For a raw target, stream/full verification means recompute each stream's
+            # sha256 and compare it to the sealed sidecar checksum (a raw backup is a
+            # stored stream, not a subvolume -- btrfs send/restore cannot operate on it).
+            report = verify_raw_checksums(
+                backup_ep,
+                level,
+                snapshot_name=args.snapshot,
+                on_progress=on_progress if human else None,
+            )
+
+        elif level == VerifyLevel.METADATA:
             report = verify_metadata(
                 backup_ep,
                 snapshot_name=args.snapshot,
-                on_progress=on_progress if not args.quiet else None,
+                on_progress=on_progress if human else None,
             )
 
         elif level == VerifyLevel.STREAM:
             report = verify_stream(
                 backup_ep,
                 snapshot_name=args.snapshot,
-                on_progress=on_progress if not args.quiet else None,
+                on_progress=on_progress if human else None,
             )
 
         else:  # level == VerifyLevel.FULL
@@ -112,7 +154,7 @@ def execute(args: argparse.Namespace) -> int:
                 snapshot_name=args.snapshot,
                 temp_dir=Path(args.temp_dir) if args.temp_dir else None,
                 cleanup=not args.no_cleanup,
-                on_progress=on_progress if not args.quiet else None,
+                on_progress=on_progress if human else None,
             )
 
     except KeyboardInterrupt:

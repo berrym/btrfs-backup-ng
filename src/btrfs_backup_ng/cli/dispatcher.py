@@ -739,11 +739,18 @@ Config-driven restore:
         epilog="""
 Verification levels:
   metadata  Quick check of snapshot existence and parent chain integrity
-  stream    Verify btrfs send stream can be generated (no data transfer)
+  stream    btrfs targets: verify a send stream can be generated (no data transfer).
+            raw:// / raw+ssh:// targets: recompute each stream's sha256 and compare it
+            to the checksum sealed in the .meta sidecar (detects at-rest corruption).
   full      Complete restore test to temporary location (most thorough)
 
+For a raw:// or raw+ssh:// target the default level is 'stream' (the sealed-checksum
+check), since a raw backup's integrity IS whether its stored bytes still match what was
+written. NOTE: a raw+ssh checksum is recomputed BY the (untrusted) remote, so it detects
+corruption, not tampering -- verify a raw:// copy for tamper-evidence.
+
 Examples:
-  # Quick metadata check
+  # Quick metadata check (btrfs target)
   btrfs-backup-ng verify /mnt/backup/home
 
   # Verify remote backup over SSH
@@ -751,6 +758,10 @@ Examples:
 
   # Stream integrity check
   btrfs-backup-ng verify /mnt/backup/home --level stream
+
+  # Verify a raw target (checks the sealed sha256 of every stream)
+  btrfs-backup-ng verify raw:///mnt/usb/backups
+  btrfs-backup-ng verify raw+ssh://backup@server:/backups --ssh-sudo
 
   # Full restore test (requires temp dir on btrfs)
   btrfs-backup-ng verify ssh://...:/backups/home --level full --temp-dir /mnt/test
@@ -767,8 +778,9 @@ Examples:
     verify_parser.add_argument(
         "--level",
         choices=["metadata", "stream", "full"],
-        default="metadata",
-        help="Verification level (default: metadata)",
+        default=None,
+        help="Verification level (default: metadata for btrfs targets; stream, which "
+        "checks the sealed sha256, for raw:// and raw+ssh:// targets)",
     )
     verify_parser.add_argument(
         "--snapshot",

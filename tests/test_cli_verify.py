@@ -705,3 +705,213 @@ class TestProgressCallback:
 
         call_kwargs = mock_verify.call_args[1]
         assert call_kwargs["on_progress"] is None
+
+
+class TestGeneralVerifyAgainstRawTarget:
+    """R8a: the GENERAL ``verify`` command (not ``raw verify``) must consult the sealed
+    sha256 on raw:// targets. Before R8a a bare ``verify raw://X`` ran the metadata level
+    and reported 'All verifications passed' for a CORRUPT stream -- a false all-clear.
+    These drive the real ``execute()`` with a real RawEndpoint (choose_endpoint builds
+    it), mocking nothing about the checksum path -- closing the exact coverage gap the
+    R8 audit flagged (no test drove general verify against any raw target)."""
+
+    @staticmethod
+    def _build_raw(path, name):
+        from btrfs_backup_ng.endpoint.raw import RawEndpoint
+
+        ep = RawEndpoint(config={"path": str(path)})
+        src = path / (name + ".src")
+        src.write_bytes(b"cli-verify-payload-" * 300)
+        with open(src, "rb") as f:
+            ep.receive(f, snapshot_name=name).communicate()
+        ep.commit_receive()
+        src.unlink()
+
+    @staticmethod
+    def _args(location, **kw):
+        base = dict(
+            level=None,
+            location=location,
+            prefix="",
+            fs_checks="auto",
+            snapshot=None,
+            quiet=True,
+            json=False,
+            temp_dir=None,
+            no_cleanup=False,
+            ssh_sudo=False,
+            ssh_key=None,
+            ssh_auth_sock=None,
+            timestamp_format=None,
+        )
+        base.update(kw)
+        return argparse.Namespace(**base)
+
+    def test_default_level_detects_raw_corruption(self, tmp_path, capsys):
+        """THE gap test: seal a checksum, corrupt the stream, run the GENERAL verify at
+        its DEFAULT level against raw://<dir> -> exit 1 + CORRUPT. Mutation guard: revert
+        the raw-branch wiring (falls back to metadata) and this reports success (exit 0)."""
+        self._build_raw(tmp_path, "good")
+        self._build_raw(tmp_path, "bad")
+        bad = tmp_path / "bad.btrfs"
+        bad.write_bytes(bad.read_bytes() + b"CORRUPTION")
+
+        rc = execute(self._args(f"raw://{tmp_path}"))
+
+        out = capsys.readouterr().out
+        assert rc == 1
+        assert "CORRUPT" in out
+
+    def test_default_level_resolves_to_stream_and_passes_on_intact_raw(
+        self, tmp_path, capsys
+    ):
+        """An intact raw backup passes at the default level (exit 0), and the default
+        actually resolved to the sealed-checksum check (report level == stream, status
+        ok) -- not the byte-blind metadata listing."""
+        import json
+
+        self._build_raw(tmp_path, "ok1")
+
+        rc = execute(self._args(f"raw://{tmp_path}", json=True))
+
+        data = json.loads(capsys.readouterr().out)
+        assert rc == 0
+        assert data["level"] == "stream"  # default -> the checksum check, not metadata
+        assert data["results"][0]["details"]["checksum_status"] == "ok"
+
+    def test_legacy_no_checksum_is_unverifiable_not_false_pass(self, tmp_path, capsys):
+        """A legacy stream with no recorded checksum is reported 'unverifiable' (exit 0
+        but explicitly not a clean 'verified') -- never a silent green on an unchecked
+        stream. Mutation guard: reporting it as ok/passed with no status fails."""
+        import json
+
+        self._build_raw(tmp_path, "legacy")
+        meta = tmp_path / "legacy.btrfs.meta"
+        doc = json.loads(meta.read_text())
+        doc["checksum"]["value"] = None
+        meta.write_text(json.dumps(doc))
+
+        rc = execute(self._args(f"raw://{tmp_path}", json=True))
+
+        data = json.loads(capsys.readouterr().out)
+        assert rc == 0
+        assert data["results"][0]["details"]["checksum_status"] == "unverifiable"
+
+    def test_explicit_metadata_level_bypasses_raw_checksum_branch(self, tmp_path):
+        """An explicit --level metadata on a raw target still routes to verify_metadata
+        (an operator override); the raw-checksum branch owns only stream/full. Proves the
+        default->stream RESOLUTION is what closes the false-pass, not a blanket override."""
+        self._build_raw(tmp_path, "m1")
+        with (
+            patch("btrfs_backup_ng.cli.verify.verify_metadata") as mv,
+            patch("btrfs_backup_ng.cli.verify.verify_raw_checksums") as mrc,
+        ):
+            mv.return_value = _make_report(results=[_make_result("m1", passed=True)])
+            execute(self._args(f"raw://{tmp_path}", level="metadata"))
+            mv.assert_called_once()
+            mrc.assert_not_called()
+
+    def test_json_output_is_clean_stdout_without_quiet(self, tmp_path, capsys):
+        """`verify raw://X --json` (WITHOUT --quiet) must emit ONLY parseable JSON on
+        stdout -- the human header/progress lines are suppressed in json mode. Mutation
+        guard: reverting the `human` gate re-pollutes stdout so json.loads raises."""
+        import json
+
+        self._build_raw(tmp_path, "j1")
+
+        execute(self._args(f"raw://{tmp_path}", json=True, quiet=False))
+
+        out = capsys.readouterr().out
+        data = json.loads(out)  # would raise if the header lines leaked onto stdout
+        assert data["level"] == "stream"
+        assert data["results"][0]["details"]["checksum_status"] == "ok"
+
+    def test_explicit_stream_level_on_raw_routes_to_checksums(self, tmp_path, capsys):
+        """An EXPLICIT --level stream on a raw target routes to the sealed-checksum check
+        (not btrfs send on a stream file): a corrupt stream -> exit 1 + CORRUPT. Mutation
+        guard: narrowing the raw routing to exclude STREAM would call verify_stream (btrfs
+        send), producing a non-CORRUPT failure and tripping the assertion."""
+        self._build_raw(tmp_path, "s")
+        stream = tmp_path / "s.btrfs"
+        stream.write_bytes(stream.read_bytes() + b"CORRUPTION")
+        rc = execute(self._args(f"raw://{tmp_path}", level="stream"))
+        out = capsys.readouterr().out
+        assert rc == 1
+        assert "CORRUPT" in out
+
+    def test_explicit_full_level_on_raw_routes_to_checksums_not_restore(
+        self, tmp_path, capsys
+    ):
+        """An EXPLICIT --level full on a raw target ALSO routes to the sealed-checksum
+        check, NOT verify_full's btrfs restore (which cannot restore a raw stream into a
+        temp subvolume). Mutation guard: if the raw routing check were `level == STREAM`,
+        full would fall through to verify_full and fail with a restore/temp-dir error,
+        not a CORRUPT verdict."""
+        self._build_raw(tmp_path, "f")
+        stream = tmp_path / "f.btrfs"
+        stream.write_bytes(stream.read_bytes() + b"CORRUPTION")
+        rc = execute(self._args(f"raw://{tmp_path}", level="full"))
+        out = capsys.readouterr().out
+        assert rc == 1
+        assert "CORRUPT" in out
+
+    def test_raw_ssh_corrupt_verdict_surfaces_via_general_verify(
+        self, tmp_path, capsys
+    ):
+        """End-to-end through the general verify stack for raw+ssh: a mismatching remote
+        digest -> exit 1, 'corrupt' status, and the consistency-only trust caveat (the
+        digest came from an untrusted remote). Guards the general-verify -> SSHRawEndpoint
+        -> verify_raw_checksums chain, not just the primitive in isolation."""
+        import json
+
+        from btrfs_backup_ng.endpoint.raw import SSHRawEndpoint
+        from btrfs_backup_ng.endpoint.raw_metadata import RawSnapshot
+
+        ep = SSHRawEndpoint(config={"path": "/backups", "hostname": "nas"})
+        snap = RawSnapshot(
+            name="r", stream_path=Path("/backups/r.btrfs"), checksum_value="a" * 64
+        )
+        ep.list_snapshots = lambda flush_cache=False: [snap]
+        ep.compute_stream_checksum = lambda s: "b" * 64  # remote reports a mismatch
+        ep.prepare = lambda: None
+
+        with patch(
+            "btrfs_backup_ng.cli.verify.endpoint.choose_endpoint", return_value=ep
+        ):
+            rc = execute(self._args("raw+ssh://nas/backups", json=True))
+
+        data = json.loads(capsys.readouterr().out)
+        assert rc == 1
+        res = data["results"][0]
+        assert res["details"]["checksum_status"] == "corrupt"
+        assert res["details"]["trust"] == "consistency-only (remote hash)"
+
+    def test_raw_ssh_location_recognized_and_threads_ssh_creds(self, tmp_path):
+        """A raw+ssh:// location is recognized (NOT mangled into a local path) and threads
+        ssh_sudo/ssh_key/ssh_auth_sock into the endpoint kwargs. Mutation guard: dropping
+        the raw+ssh routing branch drops the ssh creds (a sudo/agent-required remote verify
+        would silently fail) and stuffs a bogus 'path' from Path(url).resolve()."""
+        captured: dict = {}
+
+        def fake_choose(location, kwargs, source=False):
+            captured.update(kwargs)
+            raise RuntimeError("stop after capturing kwargs")
+
+        with patch(
+            "btrfs_backup_ng.cli.verify.endpoint.choose_endpoint",
+            side_effect=fake_choose,
+        ):
+            rc = execute(
+                self._args(
+                    "raw+ssh://backup@nas:/backups",
+                    ssh_sudo=True,
+                    ssh_key="/k/id",
+                    ssh_auth_sock="/run/agent.sock",
+                )
+            )
+
+        assert rc == 2  # choose_endpoint raised -> caught -> return 2
+        assert captured.get("ssh_sudo") is True
+        assert captured.get("ssh_key") == "/k/id"
+        assert captured.get("ssh_auth_sock") == "/run/agent.sock"
+        assert "path" not in captured  # a raw scheme must not get a resolved local path

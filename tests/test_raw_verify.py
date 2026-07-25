@@ -228,6 +228,125 @@ def test_open_target_construction_error_keeps_prefix(capsys):
     assert "Cannot open raw target:" in capsys.readouterr().out
 
 
+# --------------------------------------------------------------------------- #
+# verify_stream_checksum primitive (R8a): the ONE classification shared by
+# `raw verify`, the restore guard, and the general `verify` command.
+# --------------------------------------------------------------------------- #
+def test_primitive_ok_on_intact_stream(tmp_path):
+    """A fresh backup's stream matches its sealed checksum -> ok / is_verified.
+    Mutation guard: breaking the computed==recorded compare drops this to corrupt."""
+    _build(tmp_path, "s1")
+    ep = RawEndpoint(config={"path": str(tmp_path)})
+    (snap,) = ep.list_snapshots(flush_cache=True)
+    v = ep.verify_stream_checksum(snap)
+    assert v.status == "ok"
+    assert v.is_verified and not v.is_failure
+    assert v.recorded == v.computed == snap.checksum_value
+    assert v.remote_untrusted is False  # local raw:// hash is tamper-evident
+
+
+def test_primitive_corrupt_on_changed_bytes(tmp_path):
+    """A stream whose bytes changed after backup -> corrupt / is_failure.
+    Mutation guard: skipping the recompute (returning ok) fails is_failure."""
+    _build(tmp_path, "bad")
+    (tmp_path / "bad.btrfs").write_bytes(
+        (tmp_path / "bad.btrfs").read_bytes() + b"CORRUPTION"
+    )
+    ep = RawEndpoint(config={"path": str(tmp_path)})
+    (snap,) = ep.list_snapshots(flush_cache=True)
+    v = ep.verify_stream_checksum(snap)
+    assert v.status == "corrupt"
+    assert v.is_failure and not v.is_verified
+    assert v.recorded != v.computed and v.computed is not None
+
+
+def test_primitive_unverifiable_when_no_recorded_checksum(tmp_path):
+    """No recorded checksum -> unverifiable (not a failure), and the recompute is
+    SKIPPED (no reason to read a stream we cannot compare). Mutation guard: folding
+    unverifiable into is_failure, or computing anyway, fails."""
+    _build(tmp_path, "legacy")
+    meta = tmp_path / "legacy.btrfs.meta"
+    doc = json.loads(meta.read_text())
+    doc["checksum"]["value"] = None
+    meta.write_text(json.dumps(doc))
+    ep = RawEndpoint(config={"path": str(tmp_path)})
+    ep.compute_stream_checksum = MagicMock(
+        side_effect=AssertionError("must not hash an unverifiable stream")
+    )
+    (snap,) = ep.list_snapshots(flush_cache=True)
+    v = ep.verify_stream_checksum(snap)
+    assert v.status == "unverifiable"
+    assert not v.is_failure and not v.is_verified
+    ep.compute_stream_checksum.assert_not_called()
+
+
+def test_primitive_unverifiable_on_foreign_algorithm_skips_read(tmp_path):
+    """A non-sha256 algorithm -> unverifiable WITHOUT recomputing (comparing a sha256
+    to a foreign digest would false-flag corruption). Mutation guard: dropping the
+    algorithm gate would compute and mis-classify."""
+    _build(tmp_path, "other")
+    meta = tmp_path / "other.btrfs.meta"
+    doc = json.loads(meta.read_text())
+    doc["checksum"]["algorithm"] = "blake2b"
+    meta.write_text(json.dumps(doc))
+    ep = RawEndpoint(config={"path": str(tmp_path)})
+    ep.compute_stream_checksum = MagicMock(
+        side_effect=AssertionError("must not hash a foreign-algorithm stream")
+    )
+    (snap,) = ep.list_snapshots(flush_cache=True)
+    v = ep.verify_stream_checksum(snap)
+    assert v.status == "unverifiable"
+    ep.compute_stream_checksum.assert_not_called()
+
+
+@pytest.mark.skipif(
+    os.geteuid() == 0, reason="root bypasses chmod 0o000, so the stream stays readable"
+)
+def test_primitive_error_when_stream_unreadable(tmp_path):
+    """A recorded sha256 but an unreadable stream -> error / is_failure (distinct from
+    corrupt). Mutation guard: mapping a None recompute to ok/unverifiable fails."""
+    _build(tmp_path, "locked")
+    stream = tmp_path / "locked.btrfs"
+    stream.chmod(0o000)
+    try:
+        ep = RawEndpoint(config={"path": str(tmp_path)})
+        (snap,) = ep.list_snapshots(flush_cache=True)
+        v = ep.verify_stream_checksum(snap)
+        assert v.status == "error"
+        assert v.is_failure and v.computed is None
+    finally:
+        stream.chmod(0o600)
+
+
+def test_primitive_ssh_marks_remote_untrusted(tmp_path):
+    """A raw+ssh verdict carries remote_untrusted=True (the digest was computed BY the
+    untrusted remote -> consistency, not authenticity). Mutation guard: hardcoding the
+    flag False would erase the trust caveat the report surfaces."""
+    ep = SSHRawEndpoint(config={"path": "/backup", "hostname": "nas"})
+    snap = RawSnapshot(
+        name="s", stream_path=Path("/backup/s.btrfs"), checksum_value="a" * 64
+    )
+    ep._remote_sha256 = lambda p: "a" * 64  # remote reports a match
+    v = ep.verify_stream_checksum(snap)
+    assert v.status == "ok"
+    assert v.remote_untrusted is True
+
+
+def test_ssh_auth_sock_renders_as_identity_agent():
+    """An explicit ssh_auth_sock (from `verify --ssh-auth-sock`) is rendered as an
+    `-o IdentityAgent=<sock>` ssh option so agent auth works under sudo (SSH_AUTH_SOCK is
+    stripped there). Mutation guard: dropping the _build_ssh_command handling omits the
+    option; absent config must add NOTHING (zero behavior change for the common case)."""
+    ep = SSHRawEndpoint(
+        config={"path": "/b", "hostname": "nas", "ssh_auth_sock": "/run/agent.sock"}
+    )
+    cmd = ep._build_ssh_command()
+    assert "-o" in cmd and "IdentityAgent=/run/agent.sock" in cmd
+
+    ep_none = SSHRawEndpoint(config={"path": "/b", "hostname": "nas"})
+    assert not any("IdentityAgent" in tok for tok in ep_none._build_ssh_command())
+
+
 def test_dispatcher_parses_raw_verify():
     """The real parser recognizes `raw verify TARGET --snapshot ... --json
     --ssh-sudo`. A missing subparser registration would fail here."""
