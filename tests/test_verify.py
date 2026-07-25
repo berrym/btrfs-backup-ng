@@ -6,6 +6,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from btrfs_backup_ng.endpoint.raw_metadata import StructureVerdict
 from btrfs_backup_ng.core.verify import (
     ParentViability,
     ParentViabilityResult,
@@ -182,12 +183,15 @@ class TestVerifyMetadata:
         assert "No snapshots found" in report.errors[0]
 
     def test_single_snapshot(self):
-        """Test verification of single snapshot."""
+        """A single snapshot the endpoint confirms structurally valid -> passes.
+        (Plumbing: the count/report; the real structural checks are exercised against
+        real filesystem objects in TestVerifyMetadataStructural.)"""
         mock_endpoint = MagicMock()
         mock_endpoint.list_snapshots.return_value = [
             MockSnapshot("snap-1"),
         ]
         mock_endpoint.config = {"path": "/backup"}
+        mock_endpoint.verify_structure.return_value = StructureVerdict("ok", "valid")
 
         report = verify_metadata(mock_endpoint)
 
@@ -195,8 +199,10 @@ class TestVerifyMetadata:
         assert report.passed == 1
         assert report.failed == 0
 
-    def test_complete_chain(self):
-        """Test verification of complete parent chain."""
+    def test_all_valid_snapshots_pass(self):
+        """N structurally-valid snapshots -> N passed. (Replaces the old 'complete chain'
+        test, which only passed because the parent check was a tautology that could never
+        fail; real chain-break detection is in TestVerifyMetadataStructural.)"""
         snapshots = make_snapshots(
             [
                 ("snap-1", "20260101-100000"),
@@ -208,6 +214,7 @@ class TestVerifyMetadata:
         mock_endpoint = MagicMock()
         mock_endpoint.list_snapshots.return_value = snapshots
         mock_endpoint.config = {"path": "/backup"}
+        mock_endpoint.verify_structure.return_value = StructureVerdict("ok", "valid")
 
         report = verify_metadata(mock_endpoint)
 
@@ -228,6 +235,7 @@ class TestVerifyMetadata:
         mock_endpoint = MagicMock()
         mock_endpoint.list_snapshots.return_value = snapshots
         mock_endpoint.config = {"path": "/backup"}
+        mock_endpoint.verify_structure.return_value = StructureVerdict("ok", "valid")
 
         report = verify_metadata(mock_endpoint, snapshot_name="snap-2")
 
@@ -257,6 +265,7 @@ class TestVerifyMetadata:
         mock_endpoint = MagicMock()
         mock_endpoint.list_snapshots.return_value = snapshots
         mock_endpoint.config = {"path": "/backup"}
+        mock_endpoint.verify_structure.return_value = StructureVerdict("ok", "valid")
 
         progress_calls = []
 
@@ -288,6 +297,7 @@ class TestVerifyMetadata:
         backup_ep = MagicMock()
         backup_ep.list_snapshots.return_value = backup_snapshots
         backup_ep.config = {"path": "/backup"}
+        backup_ep.verify_structure.return_value = StructureVerdict("ok", "valid")
 
         source_ep = MagicMock()
         source_ep.list_snapshots.return_value = source_snapshots
@@ -296,6 +306,62 @@ class TestVerifyMetadata:
 
         # Should report missing snapshot
         assert any("snap-3" in str(e) for e in report.errors)
+
+    def test_mixed_structural_verdicts_counted_correctly(self):
+        """A single run with invalid + ok + unverifiable snapshots -> `failed` counts ONLY
+        the invalid one; ok AND unverifiable both pass. This guards the aggregation rule
+        (is_failure == invalid only): mutating `if structure.is_failure` to
+        `if structure.status != "ok"` would wrongly fail the unverifiable one -- and every
+        other test would still pass, so only this mixed-report test catches it."""
+        snaps = [
+            MockSnapshot("s-invalid"),
+            MockSnapshot("s-ok"),
+            MockSnapshot("s-unver"),
+        ]
+        verdicts = {
+            "s-invalid": StructureVerdict("invalid", "not a subvolume"),
+            "s-ok": StructureVerdict("ok", "received subvolume"),
+            "s-unver": StructureVerdict("unverifiable", "no received_uuid"),
+        }
+        ep = MagicMock()
+        ep.list_snapshots.return_value = snaps
+        ep.config = {"path": "/backup"}
+        ep.verify_structure.side_effect = lambda s: verdicts[s.get_name()]
+
+        report = verify_metadata(ep)
+
+        assert report.total == 3
+        assert report.failed == 1  # only the invalid one
+        assert report.passed == 2  # ok + unverifiable both pass
+        by = {r.snapshot_name: r for r in report.results}
+        assert by["s-invalid"].passed is False
+        assert by["s-invalid"].details["structure"] == "invalid"
+        assert by["s-ok"].passed is True
+        assert by["s-ok"].details["structure"] == "ok"
+        assert by["s-unver"].passed is True  # unverifiable is NOT a failure
+        assert by["s-unver"].details["structure"] == "unverifiable"
+
+    def test_ssh_verify_structure_checks_received_uuid(self):
+        """SSHEndpoint.verify_structure: a received subvolume (non-empty received_uuid) ->
+        ok; a non-received one (empty received_uuid) -> unverifiable, NOT a failure. SSH
+        enumerates only real subvolumes, so the received_uuid is the masquerade check.
+        (self is unused, so the method is exercised without a live SSH connection.)
+        Mutation guard: dropping the received_uuid check makes the non-received case pass
+        as ok."""
+        from types import SimpleNamespace
+
+        from btrfs_backup_ng.endpoint.ssh import SSHEndpoint
+
+        received = SSHEndpoint.verify_structure(
+            None, SimpleNamespace(received_uuid="1111-2222")
+        )
+        non_received = SSHEndpoint.verify_structure(
+            None, SimpleNamespace(received_uuid="")
+        )
+
+        assert received.status == "ok"
+        assert non_received.status == "unverifiable"
+        assert non_received.is_failure is False
 
 
 class TestVerifyLevel:
@@ -1394,3 +1460,154 @@ def test_raw_checksums_list_failure_is_reported_not_raised():
     report = verify_raw_checksums(ep, VerifyLevel.STREAM)
     assert any("mount gone" in e for e in report.errors)
     assert report.total == 0
+
+
+# =============================================================================
+# verify_metadata STRUCTURAL validation (R8b): real filesystem objects, no mocks.
+# These exercise the actual endpoint.verify_structure + authoritative parent check
+# against real directories / real raw streams -- the audit's whole point was that the
+# old mock tests hid a byte-blind, tautological metadata level.
+# =============================================================================
+from btrfs_backup_ng.core.verify import verify_metadata as _verify_metadata  # noqa: E402
+from btrfs_backup_ng.endpoint.local import LocalEndpoint  # noqa: E402
+from btrfs_backup_ng.endpoint.raw import RawEndpoint  # noqa: E402
+
+
+def _build_raw_backup(path, name):
+    """Write a real raw backup (stream + authoritative .meta sidecar) at path."""
+    ep = RawEndpoint(config={"path": str(path)})
+    src = path / (name + ".src")
+    src.write_bytes(b"r8b-structural-" * 200)
+    with open(src, "rb") as f:
+        ep.receive(f, snapshot_name=name).communicate()
+    ep.commit_receive()
+    src.unlink()
+
+
+class TestVerifyMetadataStructural:
+    """R8b: metadata level validates real structure (F1) and authoritative parent
+    continuity (F2), against real filesystem objects."""
+
+    def test_local_plain_directory_fails_as_invalid(self, tmp_path):
+        """F1 end-to-end: a real LocalEndpoint over a directory holding plain (non-
+        subvolume) directories named like snapshots -> every entry FAILS as 'invalid'.
+        Before R8b these passed with a green 'All verifications passed'. Mutation guard:
+        revert verify_structure to hardcode exists=True and this reports all passed."""
+        backup = tmp_path / "backup"
+        backup.mkdir()
+        (backup / "home-20260101-120000").mkdir()  # interrupted-receive leftover
+        (backup / "home-20260102-120000").mkdir()
+        ep = LocalEndpoint(config={"path": str(backup), "snap_prefix": "home-"})
+
+        report = _verify_metadata(ep)
+
+        assert report.total == 2
+        assert report.failed == 2 and report.passed == 0
+        assert all("not a btrfs subvolume" in r.message for r in report.results)
+        assert all(r.details["structure"] == "invalid" for r in report.results)
+
+    def test_local_verify_structure_direct_on_plain_dir(self, tmp_path):
+        """The polymorphic check itself: LocalEndpoint.verify_structure on a real plain
+        directory -> invalid (a privilege-free inode check, no root needed)."""
+        backup = tmp_path / "b"
+        backup.mkdir()
+        (backup / "home-20260101-120000").mkdir()
+        ep = LocalEndpoint(config={"path": str(backup), "snap_prefix": "home-"})
+        (snap,) = ep.list_snapshots(flush_cache=True)
+
+        verdict = ep.verify_structure(snap)
+
+        assert verdict.status == "invalid" and verdict.is_failure
+
+    def test_local_is_subvolume_permission_error_is_unverifiable_not_fail(
+        self, tmp_path, monkeypatch
+    ):
+        """The false-negative-safety path: if is_subvolume cannot even stat the path (e.g.
+        permission denied), the entry is 'unverifiable' (passed=True), NEVER 'invalid' --
+        a good backup must not be failed just because the environment could not check it.
+        Mutation guard: removing the OSError catch (letting it raise / marking invalid)
+        breaks this."""
+        import btrfs_backup_ng.endpoint.common as common_mod
+
+        backup = tmp_path / "b"
+        backup.mkdir()
+        (backup / "home-20260101-120000").mkdir()
+        ep = LocalEndpoint(config={"path": str(backup), "snap_prefix": "home-"})
+        (snap,) = ep.list_snapshots(flush_cache=True)
+
+        def _denied(_path):
+            raise OSError(13, "Permission denied")
+
+        monkeypatch.setattr(common_mod.__util__, "is_subvolume", _denied)
+
+        verdict = ep.verify_structure(snap)
+
+        assert verdict.status == "unverifiable"
+        assert verdict.is_failure is False
+
+    def test_raw_authoritative_sidecar_passes(self, tmp_path):
+        """A raw backup with a real native-write sidecar -> structure ok -> passes."""
+        _build_raw_backup(tmp_path, "a.20260101T120000")
+        ep = RawEndpoint(config={"path": str(tmp_path)})
+
+        report = _verify_metadata(ep)
+
+        assert report.passed == 1 and report.failed == 0
+        assert report.results[0].details["structure"] == "ok"
+
+    def test_raw_filename_inferred_is_unverifiable_not_silent_pass(self, tmp_path):
+        """A raw stream with NO .meta sidecar (metadata inferred from the filename) is
+        'unverifiable' -- reported explicitly, not a silent clean pass and not a failure.
+        Mutation guard: treating filename-inferred as 'ok' loses the distinction."""
+        _build_raw_backup(tmp_path, "legacy.20260101T120000")
+        # Drop the sidecar so discovery falls back to filename inference.
+        (tmp_path / "legacy.20260101T120000.btrfs.meta").unlink()
+        ep = RawEndpoint(config={"path": str(tmp_path)})
+
+        report = _verify_metadata(ep)
+
+        assert report.total == 1
+        r = report.results[0]
+        assert r.passed is True  # unverifiable is not a failure
+        assert r.details["structure"] == "unverifiable"
+        assert "no .meta sidecar" in r.message
+
+    def test_raw_missing_incremental_parent_fails(self, tmp_path):
+        """F2 end-to-end: a raw snapshot whose sidecar records a parent_name that is NOT
+        present at the target -> FAIL 'missing incremental parent' (an unrestorable chain
+        break). This branch was UNREACHABLE before R8b (the tautology); the test proves it
+        now fires. Mutation guard: dropping the parent-continuity check makes this pass."""
+        import json
+
+        _build_raw_backup(tmp_path, "child.20260102T120000")
+        meta = tmp_path / "child.20260102T120000.btrfs.meta"
+        doc = json.loads(meta.read_text())
+        doc["parent_name"] = (
+            "ghost.20250101T000000"  # a parent that is not on the target
+        )
+        meta.write_text(json.dumps(doc))
+        ep = RawEndpoint(config={"path": str(tmp_path)})
+
+        report = _verify_metadata(ep)
+
+        r = report.results[0]
+        assert r.passed is False
+        assert "missing incremental parent: ghost.20250101T000000" in r.message
+        assert r.details["parent_missing"] is True
+
+    def test_raw_present_incremental_parent_passes(self, tmp_path):
+        """A valid raw chain (parent_name points at a snapshot that IS present) -> PASS.
+        Guards against false-failing a genuinely intact incremental chain."""
+        import json
+
+        _build_raw_backup(tmp_path, "base.20260101T120000")
+        _build_raw_backup(tmp_path, "child.20260102T120000")
+        meta = tmp_path / "child.20260102T120000.btrfs.meta"
+        doc = json.loads(meta.read_text())
+        doc["parent_name"] = "base.20260101T120000"  # present at the target
+        meta.write_text(json.dumps(doc))
+        ep = RawEndpoint(config={"path": str(tmp_path)})
+
+        report = _verify_metadata(ep)
+
+        assert report.failed == 0 and report.passed == 2

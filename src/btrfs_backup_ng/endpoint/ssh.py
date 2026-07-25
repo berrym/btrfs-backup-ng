@@ -60,6 +60,7 @@ except ImportError:
 
 from btrfs_backup_ng import __util__  # noqa: E402
 from btrfs_backup_ng.__logger__ import logger  # noqa: E402
+from btrfs_backup_ng.endpoint.raw_metadata import StructureVerdict  # noqa: E402
 from btrfs_backup_ng.core.errors import (  # noqa: E402
     TransientNetworkError,
     classify_error,
@@ -2077,6 +2078,29 @@ print(json.dumps(result))
         logger.info(f"Found {len(snapshots)} remote snapshots at {path}")
         logger.debug(f"Remote snapshots: {[str(s) for s in snapshots]}")
         return snapshots
+
+    def verify_structure(self, snapshot: Any) -> StructureVerdict:
+        """Confirm ``snapshot`` is a real received backup on the remote (the ``verify``
+        metadata-level structural check for an ssh:// btrfs target).
+
+        Unlike the local endpoint (which enumerates with ``iterdir`` and so can list a
+        plain directory), the SSH endpoint enumerates with ``btrfs subvolume list``, which
+        returns ONLY real subvolumes -- so subvolume-ness is already guaranteed and the
+        plain-directory false-pass cannot arise here. The meaningful check is therefore the
+        ``received_uuid`` (parsed from the ``-R`` column at list time, computed on the
+        remote): non-empty -> ``ok`` (a received backup); empty -> ``unverifiable`` (a
+        non-received subvolume, not a backup this tool produced). We do not re-run
+        ``btrfs subvolume show`` here: it needs privilege the read-only verify path should
+        not require, and a failure could not be distinguished from a genuinely-absent
+        subvolume -- which would false-fail a good backup.
+        """
+        if getattr(snapshot, "received_uuid", ""):
+            return StructureVerdict("ok", "received subvolume")
+        return StructureVerdict(
+            "unverifiable",
+            "a subvolume, but received_uuid is empty (not a received backup, or the "
+            "remote listing could not read it)",
+        )
 
     def _verify_snapshot_exists(self, dest_path: str, snapshot_name: str) -> bool:
         """Verify a snapshot exists on the remote host at its exact path.

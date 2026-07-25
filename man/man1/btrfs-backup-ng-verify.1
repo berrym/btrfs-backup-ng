@@ -32,9 +32,15 @@ the stream rather than reporting a hollow pass from a directory listing. Valid l
 .RS
 .TP
 .B metadata
-Quick check of snapshot existence and parent chain integrity. Verifies that
-all snapshots exist and that incremental chains are complete (no missing
-parent snapshots). This is fast and non-destructive.
+Fast structural check that each backup is a real backup artifact, not merely a
+name-shaped entry. For a btrfs target, confirms each entry is a received read-only
+subvolume (an interrupted receive that left a plain directory FAILS rather than passing);
+an entry whose received status cannot be confirmed without privilege is reported
+\fBunverifiable\fR rather than failed. For a raw target, confirms an authoritative
+\fB.meta\fR sidecar is present and, when a snapshot records an incremental parent, that the
+parent actually exists among the backups (a recorded-but-absent parent is an unrestorable
+chain break and FAILS). This is fast and non-destructive; it does not read stream/file
+data (use \fBstream\fR or \fBfull\fR for that).
 .TP
 .B stream
 For a btrfs target, verify that a \fBbtrfs send\fR stream can be generated (uses
@@ -96,16 +102,21 @@ Output results in JSON format for scripting and automation.
 Suppress progress output.
 .SH VERIFICATION LEVELS
 .SS Metadata (Fast)
-Checks performed:
+Checks performed, per snapshot:
 .IP \(bu 2
-Snapshot existence at backup location
+Structural validity \(em that the entry is a REAL backup artifact: a received read-only
+btrfs subvolume (non-empty received UUID), or a raw stream with an authoritative
+\fB.meta\fR sidecar. A plain directory (e.g. an interrupted receive) FAILS; an entry whose
+backup identity cannot be confirmed without privilege is reported \fBunverifiable\fR, not
+failed \(em a good backup is never failed merely because the environment could not prove it.
 .IP \(bu 2
-Parent chain completeness (no missing incremental parents)
-.IP \(bu 2
-Optional comparison with source to find missing backups
+Authoritative incremental-parent continuity \(em for a raw snapshot that records its
+parent's name, that the parent actually exists among the backups (a recorded-but-absent
+parent is an unrestorable chain break and FAILS). btrfs snapshots carry no recorded parent
+name at this level, so their chain is validated by \fBfull\fR verification.
 .PP
-This level is suitable for routine checks and can verify hundreds of
-snapshots in seconds.
+This level is fast and non-destructive and can verify hundreds of snapshots in seconds; it
+does not read stream/file data.
 .SS Stream (Medium)
 In addition to metadata checks:
 .IP \(bu 2

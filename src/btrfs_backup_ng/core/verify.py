@@ -86,10 +86,18 @@ def verify_metadata(
 ) -> VerifyReport:
     """Verify backup metadata integrity.
 
-    Checks:
-    - Snapshots exist at backup location
-    - Parent chain is complete (no missing incremental parents)
-    - Optionally compares with source to find missing backups
+    Checks, per snapshot:
+    - Structural validity -- that the entry is a REAL backup artifact, not just a
+      name-shaped directory entry: a received read-only btrfs subvolume, or a raw stream
+      with an authoritative ``.meta`` sidecar. The endpoint checks its own kind via
+      ``verify_structure`` (polymorphic). A plain directory left by an interrupted receive
+      FAILS instead of passing; a subvolume whose received status cannot be confirmed
+      (missing privilege) is reported ``unverifiable`` rather than failed.
+    - Authoritative incremental-parent continuity -- for a raw snapshot that records its
+      parent's name in the sidecar, that the parent actually exists among the backups (a
+      recorded-but-absent parent is an unrestorable chain break). btrfs snapshots carry no
+      recorded parent name here, so their chain is validated at ``--level full``.
+    - Optionally compares with source to find missing backups.
 
     Args:
         backup_endpoint: Endpoint where backups are stored
@@ -125,8 +133,10 @@ def verify_metadata(
                 report.completed_at = time.time()
                 return report
 
-        # Build set of all snapshot names for chain checking
-        all_names = {s.get_name() for s in backup_snapshots}
+        # The set of names actually present at the backup -- the INDEPENDENT reference a
+        # recorded parent is checked against. (The old check drew the parent FROM this same
+        # list and then tested membership IN it: a tautology that could never fail.)
+        present_names = {s.get_name() for s in backup_snapshots}
 
         # Verify each snapshot
         for i, snap in enumerate(backup_snapshots, 1):
@@ -142,22 +152,31 @@ def verify_metadata(
                 passed=True,
             )
 
-            # Check 1: Snapshot exists (we already know it does from list)
-            result.details["exists"] = True
+            # Check 1: structural validity -- is this a REAL backup artifact (a received
+            # subvolume / a sidecar-backed raw stream), not merely a name-shaped entry?
+            # The endpoint validates its own kind (polymorphic verify_structure).
+            structure = backup_endpoint.verify_structure(snap)
+            result.details["structure"] = structure.status
+            result.message = structure.message
+            if structure.is_failure:
+                result.passed = False
+            # 'unverifiable' keeps passed=True (never fail a good backup the environment
+            # could not prove) but the message surfaces it -- not read as a clean pass.
 
-            # Check 2: Parent chain integrity
-            # Find what would be the parent for this snapshot
-            parent = _find_parent_snapshot(snap, backup_snapshots)
-            if parent:
-                parent_name = parent.get_name()
-                result.details["parent"] = parent_name
-                if parent_name not in all_names:
+            # Check 2: authoritative incremental-parent continuity. A raw snapshot records
+            # its parent's NAME in the sidecar; a parent recorded but absent from the
+            # backup is an unrestorable chain break. btrfs Snapshots carry no recorded
+            # parent name here (getattr -> None), so this is a no-op for them.
+            required_parent = getattr(snap, "parent_name", None)
+            if required_parent:
+                result.details["parent"] = required_parent
+                if required_parent not in present_names:
                     result.passed = False
-                    result.message = f"Missing parent: {parent_name}"
+                    miss = f"missing incremental parent: {required_parent}"
+                    result.message = (
+                        f"{result.message}; {miss}" if result.message else miss
+                    )
                     result.details["parent_missing"] = True
-            else:
-                result.details["parent"] = None
-                result.details["is_base"] = True  # This is a base snapshot
 
             result.duration_seconds = time.monotonic() - start
             report.results.append(result)
