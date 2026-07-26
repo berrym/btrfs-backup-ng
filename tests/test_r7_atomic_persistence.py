@@ -311,3 +311,32 @@ def test_archive_operation_keeps_source_when_archive_write_fails(tmp_path, monke
     assert archived is False  # archive write failed -> reported failure
     assert src.exists()  # SOURCE RECORD PRESERVED (never destroyed on a failed archive)
     assert not mgr._get_archive_path(op.operation_id).exists()
+
+
+def test_archive_operation_keeps_source_when_archive_unreadable(tmp_path, monkeypatch):
+    """Even if the archive copy is written but comes back UNREADABLE (torn/corrupt JSON),
+    the source record is kept -- the load-verification except-branch. Mutation guard:
+    drop the loadability check (existence only) and a corrupt archive would pass, unlinking
+    the source."""
+    mgr = OperationManager(state_dir=tmp_path)
+    op = mgr.create_operation("/data", ["ssh://h/p"])
+    op.state = OperationState.SUCCESS
+    src = mgr._get_operation_path(op.operation_id)
+    op.save(src)
+
+    # The archive copy is written fine, but loading it back raises (simulated corruption).
+    # The source-record load (operations/, not archive/) must still succeed.
+    archive_path = str(mgr._get_archive_path(op.operation_id))
+    real_load = OperationRecord.load
+
+    def flaky_load(path):
+        if str(path) == archive_path:
+            raise ValueError("simulated corrupt archive record")
+        return real_load(path)
+
+    monkeypatch.setattr(OperationRecord, "load", staticmethod(flaky_load))
+
+    archived = mgr.archive_operation(op.operation_id)
+
+    assert archived is False  # unreadable archive -> reported failure
+    assert src.exists()  # SOURCE RECORD PRESERVED
