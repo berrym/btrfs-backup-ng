@@ -215,6 +215,9 @@ class TestVerifyMetadata:
         assert report.total == 3
         assert report.passed == 3
         assert report.failed == 0
+        # R8e: metadata sets the unified status; all-ok structure -> verdict pass.
+        assert all(r.details["status"] == "ok" for r in report.results)
+        assert report.verdict == "pass" and report.available == 3
 
     def test_specific_snapshot(self):
         """Test verification of specific snapshot only."""
@@ -511,6 +514,79 @@ class TestVerifyStream:
 
         assert len(report.errors) > 0
         assert "Connection failed" in report.errors[0]
+
+
+class TestVerifyReportVerdictAndCounts:
+    """R8e: the report's tri-state verdict + honest counts (verified/failed/unverifiable,
+    checked-of-available) are the single source of truth for the display and JSON."""
+
+    def _report(self, statuses, errors=None, available=None):
+        rep = VerifyReport(
+            level=VerifyLevel.STREAM, location="/b", errors=list(errors or [])
+        )
+        for i, s in enumerate(statuses):
+            rep.results.append(
+                VerifyResult(
+                    f"snap-{i}",
+                    VerifyLevel.STREAM,
+                    passed=(s != "failed"),
+                    details={"status": s},
+                )
+            )
+        rep.available = available if available is not None else len(statuses)
+        return rep
+
+    def test_verdict_pass_when_all_ok(self):
+        r = self._report(["ok", "ok"])
+        assert r.verdict == "pass"
+        assert r.verified_ok == 2 and r.failed == 0 and r.unverifiable == 0
+
+    def test_verdict_unverifiable_when_some_unverifiable_no_fail(self):
+        """Any unverifiable (and no failure) -> verdict 'unverifiable', NOT 'pass' -- an
+        unverifiable result is never counted as verified. Mutation guard: counting
+        unverifiable as ok would flip the verdict to pass."""
+        r = self._report(["ok", "unverifiable"])
+        assert r.verdict == "unverifiable"
+        assert r.verified_ok == 1 and r.unverifiable == 1
+
+    def test_verdict_fail_on_any_failure(self):
+        r = self._report(["ok", "failed"])
+        assert r.verdict == "fail" and r.failed == 1
+
+    def test_verdict_fail_on_run_error(self):
+        """An empty/errored run is 'fail', never a naive success (the audit's exact
+        false-positive: summary.failed==0 on an empty run)."""
+        r = self._report([], errors=["No snapshots found"])
+        assert r.verdict == "fail" and r.total == 0
+
+
+class TestVerifyStreamSelection:
+    """R8e: latest-only default vs --all, and report.available reflects the whole set."""
+
+    def _endpoint(self, n):
+        snaps = make_snapshots(
+            [(f"snap-{i}", f"2026010{i}-120000") for i in range(1, n + 1)]
+        )
+        ep = MagicMock()
+        ep.list_snapshots.return_value = snaps
+        ep.config = {"path": "/backup"}
+        return ep
+
+    def test_latest_only_by_default_but_available_is_full(self):
+        """Default checks ONLY the latest, but records how many exist so the summary can
+        say 'checked 1 of N'. Mutation guard: dropping report.available loses the honesty."""
+        report = verify_stream(self._endpoint(5))
+        assert report.total == 1
+        assert report.available == 5
+        assert report.results[0].snapshot_name == "snap-5"  # the latest
+        assert report.results[0].details["status"] == "ok"
+
+    def test_all_snapshots_checks_every_one(self):
+        """--all verifies every snapshot. Mutation guard: ignoring all_snapshots leaves
+        total==1."""
+        report = verify_stream(self._endpoint(5), all_snapshots=True)
+        assert report.total == 5 and report.available == 5
+        assert all(r.details["status"] == "ok" for r in report.results)
 
 
 class TestVerifyFull:
@@ -1329,6 +1405,8 @@ def test_raw_checksums_error_status_fails_with_message():
     assert r.passed is False
     assert "could not be read" in r.message
     assert report.failed == 1
+    # R8e: the checksum taxonomy maps onto the unified status (error/corrupt -> failed).
+    assert r.details["status"] == "failed"
 
 
 def test_raw_checksums_unverifiable_is_not_a_failure():
@@ -1339,6 +1417,10 @@ def test_raw_checksums_unverifiable_is_not_a_failure():
     assert r.passed is True
     assert "Unverifiable" in r.message
     assert report.failed == 0
+    # R8e: unverifiable maps to the unified 'unverifiable' status (not 'ok'), so the report
+    # verdict is 'unverifiable', never a clean pass.
+    assert r.details["status"] == "unverifiable"
+    assert report.verdict == "unverifiable"
 
 
 def test_raw_checksums_remote_ok_carries_trust_caveat():

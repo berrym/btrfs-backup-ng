@@ -19,20 +19,28 @@ def _make_result(
     details=None,
     duration=0.0,
     level=VerifyLevel.METADATA,
+    status=None,
 ):
-    """Helper to create VerifyResult with required fields."""
+    """Helper to create VerifyResult with required fields. Sets the unified
+    details['status'] (ok when passed, failed otherwise) unless overridden."""
+    details = dict(details or {})
+    details.setdefault("status", status or ("ok" if passed else "failed"))
     return VerifyResult(
         snapshot_name=name,
         level=level,
         passed=passed,
         message=message,
         duration_seconds=duration,
-        details=details or {},
+        details=details,
     )
 
 
 def _make_report(
-    level=VerifyLevel.METADATA, location="/backup", results=None, errors=None
+    level=VerifyLevel.METADATA,
+    location="/backup",
+    results=None,
+    errors=None,
+    available=None,
 ):
     """Helper to create VerifyReport with results."""
     report = VerifyReport(level=level, location=location)
@@ -40,6 +48,7 @@ def _make_report(
         report.results.extend(results)
     if errors:
         report.errors.extend(errors)
+    report.available = available if available is not None else len(report.results)
     return report
 
 
@@ -424,9 +433,10 @@ class TestDisplayReport:
         assert "snap-1" in captured.out
         assert "snap-2" in captured.out
         assert "PASS" in captured.out
-        assert "2 passed" in captured.out
+        assert "2 verified" in captured.out
         assert "0 failed" in captured.out
-        assert "All verifications passed" in captured.out
+        assert "checked 2 of 2 snapshots" in captured.out
+        assert "All 2 checked snapshot(s) verified" in captured.out
 
     def test_display_failing_results(self, capsys):
         """Test displaying failing verification results."""
@@ -451,7 +461,7 @@ class TestDisplayReport:
         assert "PASS" in captured.out
         assert "FAIL" in captured.out
         assert "Stream corrupted" in captured.out
-        assert "1 passed" in captured.out
+        assert "1 verified" in captured.out
         assert "1 failed" in captured.out
         assert "found issues" in captured.out
 
@@ -915,3 +925,140 @@ class TestGeneralVerifyAgainstRawTarget:
         assert captured.get("ssh_key") == "/k/id"
         assert captured.get("ssh_auth_sock") == "/run/agent.sock"
         assert "path" not in captured  # a raw scheme must not get a resolved local path
+
+
+class TestR8eHonestOutput:
+    """R8e: unverifiable is visually distinct (not green PASS), the summary is honest about
+    'checked N of M' with a --all hint, and the JSON carries a top-level tri-state verdict."""
+
+    def test_unverifiable_is_distinct_from_pass(self, capsys):
+        """A report with ok + unverifiable + failed renders three DISTINCT statuses, and
+        the conclusion is NOT 'All verified' (unverifiable is not a clean pass). Mutation
+        guard: rendering unverifiable as green PASS / counting it as verified breaks this."""
+        report = _make_report(
+            level=VerifyLevel.FULL,
+            results=[
+                _make_result("ok-snap", passed=True, status="ok", message="verified"),
+                _make_result(
+                    "unv-snap", passed=True, status="unverifiable", message="no room"
+                ),
+                _make_result(
+                    "bad-snap", passed=False, status="failed", message="corrupt"
+                ),
+            ],
+        )
+        args = argparse.Namespace(json=False)
+        _display_report(report, args)
+
+        out = capsys.readouterr().out
+        assert "UNVERIFIABLE" in out
+        assert "1 verified" in out and "1 failed" in out and "1 unverifiable" in out
+        assert "found issues" in out  # a failure present -> verdict fail
+        assert "All" not in out.split("Summary")[-1] or "verified" in out
+
+    def test_summary_states_checked_of_available_with_all_hint(self, capsys):
+        """When only a subset was checked (available > checked), the summary says so and
+        points at --all. Mutation guard: dropping report.available or the hint hides the
+        sampling."""
+        report = _make_report(
+            level=VerifyLevel.STREAM,
+            results=[_make_result("latest", passed=True, status="ok")],
+            available=7,
+        )
+        args = argparse.Namespace(json=False)
+        _display_report(report, args)
+
+        out = capsys.readouterr().out
+        assert "checked 1 of 7 snapshots" in out
+        assert "--all" in out
+
+    def test_json_verdict_pass(self, capsys):
+        import json
+
+        report = _make_report(
+            results=[_make_result("a", passed=True, status="ok")], available=1
+        )
+        _display_json(report)
+        data = json.loads(capsys.readouterr().out)
+        assert data["verdict"] == "pass"
+        assert data["summary"]["verified"] == 1
+        assert data["summary"]["available"] == 1
+        assert data["results"][0]["status"] == "ok"
+
+    def test_json_verdict_unverifiable(self, capsys):
+        import json
+
+        report = _make_report(
+            results=[_make_result("a", passed=True, status="unverifiable")]
+        )
+        _display_json(report)
+        data = json.loads(capsys.readouterr().out)
+        assert data["verdict"] == "unverifiable"
+        assert data["summary"]["unverifiable"] == 1
+
+    def test_json_verdict_fail_on_empty_errored_run(self, capsys):
+        """The audit's exact false-positive: an empty/errored run must NOT read as success.
+        verdict=='fail' even though summary.failed==0. Mutation guard: a naive
+        success=failed==0 would say pass here."""
+        import json
+
+        report = _make_report(results=[], errors=["No snapshots found"])
+        _display_json(report)
+        data = json.loads(capsys.readouterr().out)
+        assert data["verdict"] == "fail"
+        assert data["summary"]["failed"] == 0  # the trap the verdict avoids
+        assert data["errors"] == ["No snapshots found"]
+
+
+class TestR8eReviewFixes:
+    """Guards for the R8e adversarial-review fixes."""
+
+    def test_all_hint_suppressed_when_snapshot_named(self, capsys):
+        """--snapshot is mutually exclusive with --all, so the 'pass --all' hint must NOT
+        appear when the user named one snapshot (it would be unfollowable). Mutation guard:
+        dropping the args.snapshot check prints the misleading hint."""
+        report = _make_report(
+            level=VerifyLevel.STREAM,
+            results=[_make_result("snap-3", passed=True, status="ok")],
+            available=9,
+        )
+        args = argparse.Namespace(json=False, snapshot="snap-3")
+        _display_report(report, args)
+        out = capsys.readouterr().out
+        assert "--all" not in out
+
+    def test_all_hint_shown_without_snapshot(self, capsys):
+        """Without --snapshot, a subset check DOES show the --all hint (control for above)."""
+        report = _make_report(
+            level=VerifyLevel.STREAM,
+            results=[_make_result("latest", passed=True, status="ok")],
+            available=9,
+        )
+        args = argparse.Namespace(json=False, snapshot=None)
+        _display_report(report, args)
+        assert "--all" in capsys.readouterr().out
+
+    def test_empty_errored_run_has_no_misleading_results_line(self, capsys):
+        """An empty/errored run shows the error, NOT a 'checked 0 of 0' Results line that
+        reads like 'no backups exist'."""
+        report = _make_report(errors=["Verification failed: connection refused"])
+        args = argparse.Namespace(json=False)
+        _display_report(report, args)
+        out = capsys.readouterr().out
+        assert "connection refused" in out
+        assert "checked 0 of 0" not in out
+
+    def test_json_status_fallback_never_falsely_ok(self, capsys):
+        """A passed result with NO details['status'] must NOT be reported 'ok' in JSON
+        (that would falsely claim it was verified) -- it degrades to 'unverifiable'.
+        Mutation guard: the old 'ok' if passed fallback would report 'ok' here."""
+        import json
+
+        # A result deliberately missing details['status'] (simulates a future path drift).
+        r = VerifyResult("x", VerifyLevel.METADATA, passed=True, details={})
+        report = _make_report(results=[r])
+        report.results[0].details.pop("status", None)  # ensure absent
+        _display_json(report)
+        data = json.loads(capsys.readouterr().out)
+        assert data["results"][0]["status"] != "ok"
+        assert data["results"][0]["status"] == "unverifiable"
