@@ -157,6 +157,19 @@ def _parse_retention(data: dict[str, Any]) -> RetentionConfig:
     )
 
 
+VALID_HOST_KEY_POLICIES = ("accept-new", "strict")
+
+
+def _validate_host_key_policy(value: Any, path: str) -> str:
+    """Validate the ssh_host_key_policy value, failing closed on anything unrecognized."""
+    if value not in VALID_HOST_KEY_POLICIES:
+        raise ConfigError(
+            f"Invalid ssh_host_key_policy {value!r} for target {path}. "
+            f"Valid: {list(VALID_HOST_KEY_POLICIES)}"
+        )
+    return value
+
+
 def _parse_target(data: dict[str, Any]) -> TargetConfig:
     """Parse target configuration from dict."""
     if "path" not in data:
@@ -204,6 +217,13 @@ def _parse_target(data: dict[str, Any]) -> TargetConfig:
     if encrypt == "gpg" and not gpg_recipient:
         raise ConfigError(f"gpg_recipient is required when encrypt=gpg (target {path})")
 
+    # Host-key policy is a SECURITY selector: fail CLOSED on an unrecognized value rather
+    # than silently falling back to a default (a typo'd "strict" must not degrade to
+    # accept-new). Only the two safe modes are accepted -- there is no "off"/"no". R12b.
+    ssh_host_key_policy = _validate_host_key_policy(
+        data.get("ssh_host_key_policy", "accept-new"), path
+    )
+
     return TargetConfig(
         path=path,
         ssh_sudo=data.get("ssh_sudo", False),
@@ -211,6 +231,7 @@ def _parse_target(data: dict[str, Any]) -> TargetConfig:
         ssh_key=data.get("ssh_key"),
         ssh_auth_sock=data.get("ssh_auth_sock"),
         ssh_password_auth=data.get("ssh_password_auth", True),
+        ssh_host_key_policy=ssh_host_key_policy,
         compress=compress,
         rate_limit=data.get("rate_limit"),
         require_mount=data.get("require_mount", False),

@@ -450,6 +450,9 @@ def _prepare_backup_endpoint(args: argparse.Namespace, source: str):
     # SSH options
     if source.startswith("ssh://"):
         endpoint_kwargs["ssh_sudo"] = getattr(args, "ssh_sudo", False)
+        _hkp = getattr(args, "ssh_host_key_policy", None)
+        if _hkp:
+            endpoint_kwargs["ssh_host_key_policy"] = _hkp
         endpoint_kwargs["ssh_password_fallback"] = getattr(
             args, "ssh_password_auth", True
         )

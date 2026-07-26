@@ -100,6 +100,7 @@ class SSHMasterManager:
         identity_file: Optional[str] = None,
         allow_password_auth: bool = False,
         ssh_auth_sock: Optional[str] = None,
+        host_key_policy: str = "accept-new",
     ):
         self.hostname = hostname
         self.username = username or getpass.getuser()
@@ -111,6 +112,9 @@ class SSHMasterManager:
         self.debug = debug
         self.identity_file = identity_file
         self.allow_password_auth = allow_password_auth
+        # "accept-new" (TOFU: trust first contact, reject a changed key) or "strict"
+        # (known_hosts-only; an unknown host is refused). R12b.
+        self.host_key_policy = host_key_policy
         # Explicit ssh-agent socket override (config `ssh_auth_sock` / CLI / the
         # BTRFS_BACKUP_SSH_AUTH_SOCK env var). Takes precedence over auto-discovery so a
         # multi-agent or non-standard deployment can pin exactly which agent to use.
@@ -185,7 +189,10 @@ class SSHMasterManager:
             "TCPKeepAlive=yes",
             "ConnectTimeout=30",
             "ConnectionAttempts=3",
-            "StrictHostKeyChecking=accept-new",
+            # strict => an unknown host is refused (known_hosts-only); accept-new => TOFU
+            # (trust first contact, reject a changed key). R12b.
+            "StrictHostKeyChecking="
+            + ("yes" if self.host_key_policy == "strict" else "accept-new"),
             "PasswordAuthentication=yes",
             "PubkeyAuthentication=yes",
             "PreferredAuthentications=publickey,keyboard-interactive,password",
