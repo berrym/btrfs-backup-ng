@@ -159,6 +159,7 @@ def execute_transfer(args: argparse.Namespace) -> int:
 
                     dest_kwargs = dict(endpoint_kwargs)
                     dest_kwargs["ssh_sudo"] = target.ssh_sudo
+                    dest_kwargs["ssh_host_key_policy"] = target.ssh_host_key_policy
                     dest_kwargs["ssh_password_fallback"] = target.ssh_password_auth
 
                     if target.ssh_key:

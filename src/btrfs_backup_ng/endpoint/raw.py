@@ -1642,6 +1642,10 @@ class SSHRawEndpoint(RawEndpoint):
         self.ssh_key = config.get("ssh_key")
         self.ssh_opts = config.get("ssh_opts", [])
         self.ssh_sudo = config.get("ssh_sudo", False)
+        # Host-key policy: "accept-new" (default; unifies raw+ssh with the btrfs transport --
+        # previously it set no StrictHostKeyChecking and inherited the ambient ssh default)
+        # or "strict" (refuse an unknown host). R12b.
+        self.ssh_host_key_policy = config.get("ssh_host_key_policy", "accept-new")
         # An explicit ssh-agent socket (e.g. `--ssh-auth-sock`), useful under sudo where
         # SSH_AUTH_SOCK is not inherited. None -> rely on ssh's own agent discovery.
         self.ssh_auth_sock = config.get("ssh_auth_sock")
@@ -1688,11 +1692,16 @@ class SSHRawEndpoint(RawEndpoint):
         FAST with ssh exit 255 -- which the listing guard turns into a clear "cannot
         reach" error -- instead of hanging for the OS TCP timeout (or forever)."""
         cmd = ["ssh"]
-        cmd.extend(self.ssh_opts)
+        cmd.extend(
+            self.ssh_opts
+        )  # operator opts first -> they win (ssh first-value-wins)
+        strict = "yes" if self.ssh_host_key_policy == "strict" else "accept-new"
         cmd.extend(
             [
                 "-o",
                 "BatchMode=yes",
+                "-o",
+                f"StrictHostKeyChecking={strict}",
                 "-o",
                 "ConnectTimeout=10",
                 "-o",

@@ -150,6 +150,7 @@ def _estimate_from_config(args: argparse.Namespace, volume_path: str) -> int:
             "fs_checks": "auto",
             "timestamp_format": get_timestamp_format(config),
         }
+        dest_kwargs["ssh_host_key_policy"] = target.ssh_host_key_policy
         if target.ssh_sudo:
             dest_kwargs["ssh_sudo"] = True
         if target.ssh_key:
@@ -233,6 +234,8 @@ def _estimate_direct(args: argparse.Namespace, source: str, destination: str) ->
             "fs_checks": fs_checks_mode,
             "timestamp_format": ts_fmt,
         }
+        if getattr(args, "ssh_host_key_policy", None):
+            dest_kwargs["ssh_host_key_policy"] = args.ssh_host_key_policy
         if ssh_sudo:
             dest_kwargs["ssh_sudo"] = True
         if ssh_key:

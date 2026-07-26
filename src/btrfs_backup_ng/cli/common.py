@@ -154,6 +154,22 @@ def add_fs_checks_args(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def add_ssh_hostkey_arg(parser: argparse.ArgumentParser) -> None:
+    """Add the ``--ssh-host-key-policy`` argument to an ssh-capable parser (R12b).
+
+    ``default=None`` so that an unset flag never overrides a config-file setting -- the
+    handler only threads it into endpoint kwargs when the operator passed it explicitly.
+    """
+    parser.add_argument(
+        "--ssh-host-key-policy",
+        choices=["accept-new", "strict"],
+        default=None,
+        help="SSH host-key verification for this run: 'accept-new' (trust first contact, "
+        "reject a changed key) or 'strict' (known_hosts-only, reject an unknown host). "
+        "Overrides the target config.",
+    )
+
+
 def get_fs_checks_mode(args: argparse.Namespace) -> str:
     """Get the filesystem checks mode from parsed arguments.
 

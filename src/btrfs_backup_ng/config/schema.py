@@ -147,6 +147,9 @@ class TargetConfig:
     ssh_key: Optional[str] = None
     ssh_auth_sock: Optional[str] = None
     ssh_password_auth: bool = True
+    # Host-key verification policy: "accept-new" (default; trust-on-first-use, reject a
+    # changed key) or "strict" (known_hosts-only, reject an unknown host). R12b.
+    ssh_host_key_policy: str = "accept-new"
     compress: str = "none"
     rate_limit: Optional[str] = None
     require_mount: bool = False
@@ -190,6 +193,10 @@ class RawTargetConfig:
     ssh_port: int = 22
     ssh_key: Optional[str] = None
     ssh_auth_sock: Optional[str] = None
+    # Host-key policy. NOTE: raw targets are represented by TargetConfig at load time
+    # (the loader does not instantiate RawTargetConfig), so the LIVE knob is
+    # TargetConfig.ssh_host_key_policy; kept here for schema parity. R12b.
+    ssh_host_key_policy: str = "accept-new"
 
     def __post_init__(self):
         """Validate configuration after initialization."""

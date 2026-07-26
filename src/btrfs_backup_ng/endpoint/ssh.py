@@ -227,6 +227,7 @@ class SSHEndpoint(Endpoint):
             "ssh_key",
             "ssh_auth_sock",
             "ssh_password_fallback",
+            "ssh_host_key_policy",
         ):
             if config.get(_ssh_key) is not None:
                 self.config[_ssh_key] = config[_ssh_key]
@@ -440,6 +441,7 @@ class SSHEndpoint(Endpoint):
             identity_file=self.config.get("ssh_identity_file"),
             allow_password_auth=allow_password,
             ssh_auth_sock=self.config.get("ssh_auth_sock"),
+            host_key_policy=self.config.get("ssh_host_key_policy", "accept-new"),
         )
         logger.debug("SSHMasterManager created successfully")
 
@@ -2649,7 +2651,13 @@ print(json.dumps(result))
             client.load_host_keys(known_hosts)
         except OSError as e:
             logger.warning("Could not load known_hosts %s: %s", known_hosts, e)
-        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        # strict => an UNKNOWN host is refused (RejectPolicy); accept-new => trust+pin a new
+        # host (AutoAddPolicy). A CHANGED key is rejected under BOTH (the loaded store raises
+        # BadHostKeyException before the missing-key policy is consulted). R12b.
+        if self.config.get("ssh_host_key_policy", "accept-new") == "strict":
+            client.set_missing_host_key_policy(paramiko.RejectPolicy())
+        else:
+            client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
         return client
 
     def _do_paramiko_transfer(

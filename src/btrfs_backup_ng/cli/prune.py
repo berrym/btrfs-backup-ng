@@ -241,6 +241,7 @@ def execute_prune(args: argparse.Namespace) -> int:
             try:
                 dest_kwargs = dict(endpoint_kwargs)
                 dest_kwargs["ssh_sudo"] = target.ssh_sudo
+                dest_kwargs["ssh_host_key_policy"] = target.ssh_host_key_policy
                 dest_kwargs["ssh_password_fallback"] = target.ssh_password_auth
 
                 dest_endpoint = endpoint.choose_endpoint(
