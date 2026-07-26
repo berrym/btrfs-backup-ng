@@ -62,7 +62,13 @@ sealed-checksum verification as \fBstream\fR.
 .RE
 .TP
 .BI \-\-snapshot " " \fINAME\fR
-Verify only the specified snapshot instead of all snapshots.
+Verify only the named snapshot. Mutually exclusive with \fB\-\-all\fR.
+.TP
+.B \-\-all
+Verify EVERY snapshot at the backup location. The \fBstream\fR and \fBfull\fR levels check
+only the latest snapshot by default (fast); \fB\-\-all\fR verifies the whole chain. The
+\fBmetadata\fR level and raw targets already check all snapshots, so \fB\-\-all\fR is a
+no-op there. Mutually exclusive with \fB\-\-snapshot\fR.
 .TP
 .BI \-\-temp-dir " " \fIPATH\fR
 Temporary directory for full verification. Must be on a btrfs filesystem.
@@ -168,16 +174,34 @@ For a \fBraw+ssh://\fR target the sha256 is recomputed \fBon the (untrusted) rem
 host\fR, so an \fBok\fR verdict evidences at-rest consistency, not authenticity \(em a
 compromised target could forge a match. Verify a locally-mounted \fBraw://\fR copy for
 tamper-evidence.
+.SH VERDICT AND COUNTS
+Every run reports one of three verdicts (the \fBverdict\fR field in \fB\-\-json\fR; the
+final line in human output):
+.IP \(bu 2
+\fBpass\fR \(em every snapshot that was checked verified successfully.
+.IP \(bu 2
+\fBunverifiable\fR \(em no failures, but one or more snapshots could not be confirmed (an
+environmental limit, e.g. no privilege or a legacy backup with no recorded checksum). This
+is NOT a failure; a good backup is never reported bad because it could not be checked.
+.IP \(bu 2
+\fBfail\fR \(em at least one snapshot failed, or a run-level error occurred.
+.PP
+The summary counts \fBverified\fR (positively confirmed), \fBfailed\fR, and
+\fBunverifiable\fR separately \(em an unverifiable snapshot is never counted as verified.
+It also states how many snapshots were \fBchecked\fR of how many are \fBavailable\fR; when
+only a subset was checked (the latest, at \fBstream\fR/\fBfull\fR level), it hints to pass
+\fB\-\-all\fR to verify the whole chain.
 .SH EXIT STATUS
 .TP
 .B 0
-All verifications passed.
+Verdict \fBpass\fR or \fBunverifiable\fR (no failure detected; an environmental inability to
+verify does not raise an alarm).
 .TP
 .B 1
-One or more verifications failed.
+Verdict \fBfail\fR \(em one or more verifications failed.
 .TP
 .B 2
-Error during verification (could not complete).
+Run-level error (bad arguments, no snapshots found, temp directory unusable, etc.).
 .SH EXAMPLES
 .TP
 Quick metadata check of local backup:
@@ -204,20 +228,21 @@ Verify a remote raw target over SSH:
 Verify specific snapshot:
 .B btrfs-backup-ng verify /mnt/backup/home --snapshot home-20260104-120000
 .TP
+Verify the ENTIRE chain (every snapshot), not just the latest:
+.B btrfs-backup-ng verify /mnt/backup/home --level stream --all
+.TP
 JSON output for automation:
 .B btrfs-backup-ng verify /mnt/backup/home --json
 .SH OUTPUT
-The verify command displays a table of results showing:
-.IP \(bu 2
-Snapshot name
-.IP \(bu 2
-Pass/Fail status
-.IP \(bu 2
-Details (parent snapshot, error messages)
-.PP
-Summary shows total passed, failed, and duration.
+The verify command displays a table of per-snapshot results with a distinct status of
+\fBPASS\fR (green), \fBUNVERIFIABLE\fR (yellow), or \fBFAIL\fR (red), followed by a summary
+with the verified/failed/unverifiable counts, the checked-of-available count, and the
+verdict.
 .PP
 With \fB--json\fR, output is a JSON object containing:
+.IP \(bu 2
+verdict: the authoritative top-level result \(em \fBpass\fR, \fBunverifiable\fR, or
+\fBfail\fR. Monitoring should gate on this rather than re-deriving from counts.
 .IP \(bu 2
 level: Verification level used
 .IP \(bu 2
@@ -225,20 +250,24 @@ location: Backup location
 .IP \(bu 2
 duration_seconds: Total verification time
 .IP \(bu 2
-summary: Counts of passed, failed, total
+summary: verified, failed, unverifiable, checked, and available counts (passed and total
+are retained as back-compat aliases: passed = not-failed, total = checked)
 .IP \(bu 2
-results: Array of individual snapshot results
+results: Array of individual snapshot results, each with a \fBstatus\fR of ok/failed/unverifiable
 .IP \(bu 2
-errors: Array of error messages
+errors: Array of run-level error messages
 .SH AUTOMATION
-For automated backup verification in scripts or cron:
+For automated backup verification in scripts or cron, gate on the \fBverdict\fR field:
 .PP
 .RS
 .nf
 #!/bin/bash
-if ! btrfs-backup-ng verify /mnt/backup/home --json > /tmp/verify.json; then
-    # Send alert on failure
-    cat /tmp/verify.json | mail -s "Backup verification failed" admin@example.com
+report=$(btrfs-backup-ng verify /mnt/backup/home --all --json)
+verdict=$(printf '%s' "$report" | jq -r .verdict)
+if [ "$verdict" = "fail" ]; then
+    printf '%s' "$report" | mail -s "Backup verification FAILED" admin@example.com
+elif [ "$verdict" = "unverifiable" ]; then
+    printf '%s' "$report" | mail -s "Backup could not be fully verified" admin@example.com
 fi
 .fi
 .RE

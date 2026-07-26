@@ -137,6 +137,7 @@ def execute(args: argparse.Namespace) -> int:
                 backup_ep,
                 snapshot_name=args.snapshot,
                 on_progress=on_progress if human else None,
+                all_snapshots=getattr(args, "all", False),
             )
 
         else:  # level == VerifyLevel.FULL
@@ -155,6 +156,7 @@ def execute(args: argparse.Namespace) -> int:
                 temp_dir=Path(args.temp_dir) if args.temp_dir else None,
                 cleanup=not args.no_cleanup,
                 on_progress=on_progress if human else None,
+                all_snapshots=getattr(args, "all", False),
             )
 
     except KeyboardInterrupt:
@@ -193,10 +195,15 @@ def _display_report(report: VerifyReport, args: argparse.Namespace):
         table.add_column("Details")
 
         for result in report.results:
-            if result.passed:
-                status = "[green]PASS[/green]"
-            else:
+            # An unverifiable result is NOT a pass -- give it a distinct (yellow) status so
+            # it is never read as a clean green PASS.
+            status_key = result.details.get("status")
+            if not result.passed:
                 status = "[red]FAIL[/red]"
+            elif status_key == "unverifiable":
+                status = "[yellow]UNVERIFIABLE[/yellow]"
+            else:
+                status = "[green]PASS[/green]"
 
             details = result.message
             if not details and result.details:
@@ -221,15 +228,42 @@ def _display_report(report: VerifyReport, args: argparse.Namespace):
     console.print(f"  Location: {report.location}")
     console.print(f"  Level: {report.level.value}")
     console.print(f"  Duration: {report.duration:.1f}s")
-    console.print(
-        f"  Results: [green]{report.passed} passed[/green], "
-        f"[red]{report.failed} failed[/red] "
-        f"(of {report.total} total)"
-    )
+    # Honest counts: 'verified' is positively-confirmed (status ok), separate from
+    # 'unverifiable' (not a failure, but not confirmed) -- never lumped into a green pass.
+    # Skipped for a run that verified nothing (empty/errored) -- the errors above say why.
+    if report.results:
+        console.print(
+            f"  Results: [green]{report.verified_ok} verified[/green], "
+            f"[red]{report.failed} failed[/red], "
+            f"[yellow]{report.unverifiable} unverifiable[/yellow] "
+            f"(checked {report.total} of {report.available} snapshots)"
+        )
+    # If only a subset was checked (stream/full default to the latest), make the sampling
+    # visible and actionable -- otherwise "verified" reads as if the whole history passed.
+    # Suppressed when the user explicitly named one snapshot (--all is mutually exclusive
+    # with --snapshot, so the hint would be unfollowable) or when nothing was checked.
+    if (
+        report.results
+        and report.available > report.total
+        and not report.errors
+        and not getattr(args, "snapshot", None)
+    ):
+        console.print(
+            f"  [dim]Only the latest {report.total} of {report.available} checked -- "
+            f"pass --all to verify every snapshot.[/dim]"
+        )
 
-    if report.failed == 0 and not report.errors:
-        console.print("\n[green bold]✓ All verifications passed[/green bold]")
-    else:
+    verdict = report.verdict
+    if verdict == "pass":
+        console.print(
+            f"\n[green bold]✓ All {report.total} checked snapshot(s) verified[/green bold]"
+        )
+    elif verdict == "unverifiable":
+        console.print(
+            f"\n[yellow bold]⚠ {report.verified_ok} verified, {report.unverifiable} "
+            f"could not be verified (no failures)[/yellow bold]"
+        )
+    else:  # fail
         console.print("\n[red bold]✗ Verification found issues[/red bold]")
 
 
@@ -240,15 +274,30 @@ def _display_json(report: VerifyReport):
     data = {
         "level": report.level.value,
         "location": report.location,
+        # Authoritative top-level tri-state for monitoring: gate on this instead of
+        # re-deriving from counts (a naive summary.failed==0 treats an empty/errored run as
+        # success). 'fail' = a real failure or run error; 'unverifiable' = no failures but
+        # something could not be confirmed; 'pass' = every checked snapshot verified.
+        "verdict": report.verdict,
         "duration_seconds": report.duration,
         "summary": {
-            "passed": report.passed,
+            "verified": report.verified_ok,
             "failed": report.failed,
-            "total": report.total,
+            "unverifiable": report.unverifiable,
+            "passed": report.passed,  # back-compat: not-failed (verified + unverifiable)
+            "checked": report.total,
+            "available": report.available,
+            "total": report.total,  # back-compat alias for checked
         },
         "results": [
             {
                 "snapshot": r.snapshot_name,
+                # Every verify path sets details["status"]; the fallback NEVER guesses "ok"
+                # for a status-less passed result (that would falsely claim a snapshot was
+                # verified) -- an unset status degrades to the honest "unverifiable".
+                "status": r.details.get(
+                    "status", "failed" if not r.passed else "unverifiable"
+                ),
                 "passed": r.passed,
                 "message": r.message,
                 "duration_seconds": r.duration_seconds,

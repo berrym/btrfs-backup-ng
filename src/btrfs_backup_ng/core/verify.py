@@ -117,9 +117,15 @@ class VerifyReport:
     completed_at: float = 0.0
     results: list[VerifyResult] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
+    # Total snapshots present at the backup location -- may exceed len(results) when only
+    # a subset was checked (stream/full default to the latest only). Lets the report say
+    # honestly "checked N of M" instead of implying the whole history was verified.
+    available: int = 0
 
     @property
     def passed(self) -> int:
+        """Results that are not failures (positively verified OR unverifiable). Kept for
+        back-compat; prefer ``verified_ok`` for 'confirmed good'."""
         return sum(1 for r in self.results if r.passed)
 
     @property
@@ -127,8 +133,33 @@ class VerifyReport:
         return sum(1 for r in self.results if not r.passed)
 
     @property
+    def verified_ok(self) -> int:
+        """Results POSITIVELY confirmed good (status == 'ok') -- not merely 'not failed'
+        (which would also count the unverifiable)."""
+        return sum(1 for r in self.results if r.details.get("status") == "ok")
+
+    @property
+    def unverifiable(self) -> int:
+        """Results that could not be confirmed (status == 'unverifiable'): not a failure,
+        but not a clean pass -- surfaced separately so it is never read as verified."""
+        return sum(1 for r in self.results if r.details.get("status") == "unverifiable")
+
+    @property
     def total(self) -> int:
+        """Number of snapshots actually checked this run (== len(results))."""
         return len(self.results)
+
+    @property
+    def verdict(self) -> str:
+        """Authoritative tri-state for monitoring: 'fail' if any result FAILED or a
+        run-level error occurred; else 'unverifiable' if any checked snapshot could not be
+        confirmed (or nothing was checked); else 'pass' (every checked snapshot positively
+        verified). Exit codes: fail->1 (or 2 on a run error), unverifiable/pass->0."""
+        if self.failed > 0 or self.errors:
+            return "fail"
+        if self.unverifiable > 0 or self.total == 0:
+            return "unverifiable"
+        return "pass"
 
     @property
     def duration(self) -> float:
@@ -187,6 +218,7 @@ def verify_metadata(
             return report
 
         logger.info("Found %d snapshot(s) at backup location", len(backup_snapshots))
+        report.available = len(backup_snapshots)
 
         # Filter to specific snapshot if requested
         if snapshot_name:
@@ -243,6 +275,15 @@ def verify_metadata(
                     )
                     result.details["parent_missing"] = True
 
+            # Unified per-result verdict (ok/failed/unverifiable) -- the single status the
+            # report/summary/JSON read uniformly across all verify levels.
+            if not result.passed:
+                result.details["status"] = "failed"
+            elif structure.status == "unverifiable":
+                result.details["status"] = "unverifiable"
+            else:
+                result.details["status"] = "ok"
+
             result.duration_seconds = time.monotonic() - start
             report.results.append(result)
 
@@ -281,6 +322,7 @@ def verify_stream(
     backup_endpoint,
     snapshot_name: str | None = None,
     on_progress: Callable[[int, int, str], None] | None = None,
+    all_snapshots: bool = False,
 ) -> VerifyReport:
     """Verify btrfs send stream can be generated.
 
@@ -290,8 +332,9 @@ def verify_stream(
 
     Args:
         backup_endpoint: Endpoint where backups are stored
-        snapshot_name: Specific snapshot to verify (None = latest only)
+        snapshot_name: Specific snapshot to verify (None = latest only unless all_snapshots)
         on_progress: Progress callback
+        all_snapshots: Verify EVERY snapshot (not just the latest) -- the --all flag
 
     Returns:
         VerifyReport with results
@@ -307,6 +350,8 @@ def verify_stream(
             report.completed_at = time.time()
             return report
 
+        report.available = len(backup_snapshots)
+
         # Filter or select snapshots
         if snapshot_name:
             to_verify = [s for s in backup_snapshots if s.get_name() == snapshot_name]
@@ -314,8 +359,11 @@ def verify_stream(
                 report.errors.append(f"Snapshot '{snapshot_name}' not found")
                 report.completed_at = time.time()
                 return report
+        elif all_snapshots:
+            to_verify = list(backup_snapshots)
         else:
-            # Default: verify latest snapshot only (stream check is slower)
+            # Default: verify latest snapshot only (stream check is slower). The summary
+            # says "checked 1 of N" so the sampling is never invisible.
             to_verify = [backup_snapshots[-1]]
 
         for i, snap in enumerate(to_verify, 1):
@@ -340,12 +388,14 @@ def verify_stream(
                 # local target, ON THE REMOTE for an ssh:// target), raising on failure.
                 backup_endpoint.test_send_stream(snap, parent)
                 result.message = "Stream verified successfully"
+                result.details["status"] = "ok"
                 result.details["incremental"] = parent is not None
                 if parent:
                     result.details["parent"] = parent.get_name()
 
             except Exception as e:
                 result.passed = False
+                result.details["status"] = "failed"
                 result.message = f"Stream verification failed: {e}"
                 logger.error("Stream verify failed for %s: %s", name, e)
 
@@ -366,6 +416,7 @@ def verify_full(
     temp_dir: Path | None = None,
     cleanup: bool = True,
     on_progress: Callable[[int, int, str], None] | None = None,
+    all_snapshots: bool = False,
 ) -> VerifyReport:
     """Perform full restore verification.
 
@@ -455,6 +506,8 @@ def verify_full(
             report.completed_at = time.time()
             return report
 
+        report.available = len(backup_snapshots)
+
         # Filter or select snapshots
         if snapshot_name:
             to_verify = [s for s in backup_snapshots if s.get_name() == snapshot_name]
@@ -462,8 +515,11 @@ def verify_full(
                 report.errors.append(f"Snapshot '{snapshot_name}' not found")
                 report.completed_at = time.time()
                 return report
+        elif all_snapshots:
+            to_verify = list(backup_snapshots)
         else:
-            # Default: verify latest snapshot only
+            # Default: verify latest snapshot only (a full restore is slow). The summary
+            # says "checked 1 of N" so the sampling is never invisible.
             to_verify = [backup_snapshots[-1]]
 
         # Create local endpoint for receiving
@@ -617,6 +673,8 @@ def verify_raw_checksums(
             report.completed_at = time.time()
             return report
 
+        report.available = len(backup_snapshots)
+
         if snapshot_name:
             backup_snapshots = [
                 s for s in backup_snapshots if s.get_name() == snapshot_name
@@ -646,6 +704,13 @@ def verify_raw_checksums(
             result.details["checksum_recorded"] = verdict.recorded
             result.details["checksum_computed"] = verdict.computed
             result.details["checksum_algorithm"] = verdict.algorithm
+            # Map the checksum taxonomy onto the unified per-result status the report reads.
+            result.details["status"] = {
+                "ok": "ok",
+                "corrupt": "failed",
+                "error": "failed",
+                "unverifiable": "unverifiable",
+            }.get(verdict.status, "failed")
             if verdict.remote_untrusted:
                 # A raw+ssh digest is computed by the untrusted remote: consistency, not
                 # authenticity. Surface it so an operator does not read `ok` as tamper-proof.

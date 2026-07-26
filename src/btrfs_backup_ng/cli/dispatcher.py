@@ -782,10 +782,18 @@ Examples:
         help="Verification level (default: metadata for btrfs targets; stream, which "
         "checks the sealed sha256, for raw:// and raw+ssh:// targets)",
     )
-    verify_parser.add_argument(
+    verify_selection = verify_parser.add_mutually_exclusive_group()
+    verify_selection.add_argument(
         "--snapshot",
         metavar="NAME",
-        help="Verify specific snapshot only",
+        help="Verify only this specific snapshot",
+    )
+    verify_selection.add_argument(
+        "--all",
+        action="store_true",
+        help="Verify EVERY snapshot at the backup location. stream/full default to the "
+        "latest only (fast); --all checks the whole chain. metadata and raw targets "
+        "already check all snapshots, so --all is a no-op there.",
     )
     verify_parser.add_argument(
         "--temp-dir",
