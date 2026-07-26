@@ -514,7 +514,25 @@ class TestVerifyStream:
 
 
 class TestVerifyFull:
-    """Tests for verify_full function."""
+    """Tests for verify_full function (plumbing; real restore is in tier2)."""
+
+    @pytest.fixture(autouse=True)
+    def _env(self):
+        """These unit tests exercise verify_full's plumbing, not the environment gates:
+        mock the privilege probe to available and the space preflight to no-shortfall so
+        the tests are hermetic and CI-safe (CI is non-root without passwordless sudo). The
+        gates themselves are tested in TestVerifyFullEnvironment."""
+        with (
+            patch(
+                "btrfs_backup_ng.core.verify._can_run_btrfs_privileged",
+                return_value=True,
+            ),
+            patch(
+                "btrfs_backup_ng.core.verify._estimate_temp_shortfall",
+                return_value=None,
+            ),
+        ):
+            yield
 
     @patch("btrfs_backup_ng.core.verify.__util__.is_btrfs")
     def test_empty_backup_location(self, mock_is_btrfs):
@@ -768,6 +786,145 @@ class TestVerifyFull:
 
             assert len(progress_calls) == 1
             assert progress_calls[0] == (1, 1, "snap-1")
+
+
+class TestVerifyFullEnvironment:
+    """R8d false-negative-safety: verify_full must NEVER report a good backup as FAILED
+    just because the environment could not run the restore test. Missing privilege, a
+    space shortfall, ENOSPC, or a permission error are UNVERIFIABLE / run-level errors,
+    not per-snapshot failures. A GENUINE restore failure is still a FAIL."""
+
+    def _endpoint(self, tmpdir):
+        ep = MagicMock()
+        ep.list_snapshots.return_value = [MockSnapshot("snap-1")]
+        ep.config = {"path": tmpdir}
+        return ep
+
+    def test_no_privilege_is_run_error_not_failure(self):
+        """Not root -> the whole run is a reported error (exit 2), and ZERO snapshots are
+        marked failed. Mutation guard: dropping the privilege gate would attempt a real
+        restore (and, in CI, fail the snapshot)."""
+        import tempfile
+
+        with (
+            patch(
+                "btrfs_backup_ng.core.verify._can_run_btrfs_privileged",
+                return_value=False,
+            ),
+            tempfile.TemporaryDirectory() as tmpdir,
+        ):
+            report = verify_full(self._endpoint(tmpdir), temp_dir=Path(tmpdir))
+
+        assert report.total == 0
+        assert report.failed == 0
+        assert any("requires root" in e for e in report.errors)
+
+    def test_privilege_gate_is_root_only(self):
+        """_can_run_btrfs_privileged is strictly euid==0 (root-only): a non-root run does
+        NOT attempt to probe/accept passwordless sudo (the receive escalates with a plain,
+        prompting sudo that would hang in the pipe). Mutation guard: re-adding a sudo -n
+        acceptance path would make this return True off-root."""
+        import btrfs_backup_ng.core.verify as vmod
+
+        with patch.object(vmod.os, "geteuid", return_value=0):
+            assert vmod._can_run_btrfs_privileged() is True
+        with patch.object(vmod.os, "geteuid", return_value=1000):
+            assert vmod._can_run_btrfs_privileged() is False
+
+    @patch("btrfs_backup_ng.core.verify.__util__.is_btrfs", return_value=True)
+    @patch("btrfs_backup_ng.core.verify._can_run_btrfs_privileged", return_value=True)
+    def test_space_shortfall_is_unverifiable_not_failure(self, _priv, _btrfs):
+        """A confident temp-space shortfall -> the snapshot is UNVERIFIABLE (passed=True,
+        status unverifiable), NOT failed, and the restore is never attempted. Mutation
+        guard: treating the shortfall as a failure flips passed/failed."""
+        import tempfile
+
+        with (
+            patch(
+                "btrfs_backup_ng.core.verify._estimate_temp_shortfall",
+                return_value="Insufficient temp space for restore test: ~50 GiB needed, "
+                "1 GiB available",
+            ),
+            patch("btrfs_backup_ng.core.verify._test_restore") as mock_restore,
+            tempfile.TemporaryDirectory() as tmpdir,
+        ):
+            report = verify_full(self._endpoint(tmpdir), temp_dir=Path(tmpdir))
+
+        assert report.failed == 0 and report.passed == 1
+        r = report.results[0]
+        assert r.details["status"] == "unverifiable"
+        assert "Insufficient temp space" in r.message
+        mock_restore.assert_not_called()  # never started a doomed restore
+
+    @patch("btrfs_backup_ng.core.verify._estimate_temp_shortfall", return_value=None)
+    @patch("btrfs_backup_ng.core.verify.__util__.is_btrfs", return_value=True)
+    @patch("btrfs_backup_ng.core.verify._can_run_btrfs_privileged", return_value=True)
+    def test_enospc_during_restore_is_unverifiable(self, _priv, _btrfs, _short):
+        """An ENOSPC raised DURING receive -> unverifiable, not a backup failure."""
+        import tempfile
+
+        with (
+            patch(
+                "btrfs_backup_ng.core.verify._test_restore",
+                side_effect=Exception(
+                    "btrfs send/receive failed with return codes: [1, 0]: "
+                    "ERROR: No space left on device"
+                ),
+            ),
+            tempfile.TemporaryDirectory() as tmpdir,
+        ):
+            report = verify_full(self._endpoint(tmpdir), temp_dir=Path(tmpdir))
+
+        assert report.failed == 0
+        assert report.results[0].details["status"] == "unverifiable"
+
+    @patch("btrfs_backup_ng.core.verify._estimate_temp_shortfall", return_value=None)
+    @patch("btrfs_backup_ng.core.verify.__util__.is_btrfs", return_value=True)
+    @patch("btrfs_backup_ng.core.verify._can_run_btrfs_privileged", return_value=True)
+    def test_genuine_restore_failure_is_a_failure(self, _priv, _btrfs, _short):
+        """A genuine restore failure (a rejected/corrupt stream) IS a FAIL -- the
+        unverifiable escape hatch must not swallow real corruption. Mutation guard:
+        mapping every error to unverifiable would let this pass a broken backup."""
+        import tempfile
+
+        with (
+            patch(
+                "btrfs_backup_ng.core.verify._test_restore",
+                side_effect=Exception("ERROR: unexpected end of stream / invalid data"),
+            ),
+            tempfile.TemporaryDirectory() as tmpdir,
+        ):
+            report = verify_full(self._endpoint(tmpdir), temp_dir=Path(tmpdir))
+
+        assert report.failed == 1
+        assert report.results[0].passed is False
+        assert report.results[0].details["status"] == "failed"
+
+    @patch("btrfs_backup_ng.core.verify._estimate_temp_shortfall", return_value=None)
+    @patch("btrfs_backup_ng.core.verify.__util__.is_btrfs", return_value=True)
+    @patch("btrfs_backup_ng.core.verify._can_run_btrfs_privileged", return_value=True)
+    def test_corruption_mentioning_permission_still_fails(self, _priv, _btrfs, _short):
+        """A GENUINE corruption error whose stderr happens to contain 'permission' must
+        still be a FAIL, never downgraded to unverifiable. Only OUT-OF-SPACE maps to
+        unverifiable (under root-only, a permission error is anomalous, not environmental).
+        Mutation guard: re-adding PERMANENT_PERMISSION to the unverifiable set makes this
+        pass a corrupt backup."""
+        import tempfile
+
+        with (
+            patch(
+                "btrfs_backup_ng.core.verify._test_restore",
+                side_effect=Exception(
+                    "ERROR: crc32 mismatch in received stream; permission denied"
+                ),
+            ),
+            tempfile.TemporaryDirectory() as tmpdir,
+        ):
+            report = verify_full(self._endpoint(tmpdir), temp_dir=Path(tmpdir))
+
+        assert report.failed == 1
+        assert report.results[0].passed is False
+        assert report.results[0].details["status"] == "failed"
 
 
 class TestEndpointTestSendStream:

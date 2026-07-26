@@ -104,3 +104,24 @@ def test_chunked_transfer_commits_on_success(monkeypatch, tmp_path):
         chunked_manager=manager,
     )
     dest.commit_receive.assert_called_once()
+
+
+class _StderrProc:
+    """A process double whose stderr yields fixed bytes once (read-once contract)."""
+
+    def __init__(self, data: bytes):
+        self.stderr = io.BytesIO(data)
+
+
+def test_log_process_errors_returns_captured_stderr():
+    """R8d enrichment: _log_process_errors RETURNS the (send_err, recv_err) it read, so a
+    caller can surface the real btrfs reason in the raised error rather than losing it to
+    the log. Mutation guard: reverting it to return None makes the tuple-unpack fail, and
+    the caller could no longer classify ENOSPC vs corruption."""
+    send = _StderrProc(b"")
+    recv = _StderrProc(b"ERROR: No space left on device\n")
+
+    send_err, recv_err = ops._log_process_errors(send, recv)
+
+    assert send_err == ""
+    assert "No space left on device" in recv_err
