@@ -261,6 +261,12 @@ def save_backup_metadata(path: Path | str, metadata: BackupMetadata) -> None:
     """
     path = Path(path)
     data = asdict(metadata)
+    # NOTE (R7 scope boundary): this snapper .snapper-meta.json sidecar is written
+    # non-atomically (a crash mid-write can leave a torn JSON). It was deliberately left
+    # out of R7's atomic-persistence pass -- the snapper metadata round-trip is audit
+    # root R11's territory, where the read/write path is being reworked wholesale;
+    # hardening it there (via __util__.atomic_write_bytes, like the raw .meta sidecar)
+    # avoids touching the snapper subsystem twice. Tracked, not forgotten.
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2)
 

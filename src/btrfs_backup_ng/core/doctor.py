@@ -1106,11 +1106,11 @@ class Doctor:
         self, lock_file: Path, snapshot_name: str, lock_id: str
     ) -> bool:
         """Remove a stale lock."""
-        from ..__util__ import read_locks, write_locks
+        from btrfs_backup_ng import __util__
 
         try:
             lock_content = lock_file.read_text()
-            locks = read_locks(lock_content)
+            locks = __util__.read_locks(lock_content)
             if snapshot_name in locks:
                 snapshot_locks = locks[snapshot_name].get("locks", [])
                 if lock_id in snapshot_locks:
@@ -1121,7 +1121,12 @@ class Doctor:
                         del locks[snapshot_name]
                     else:
                         locks[snapshot_name]["locks"] = snapshot_locks
-                    lock_file.write_text(write_locks(locks))
+                    # Atomic replace via the shared primitive (R7): a plain write_text
+                    # here could leave a torn lock file on a crash, which read_locks then
+                    # misreads as "no locks" -> retention prunes a still-locked snapshot.
+                    __util__.atomic_write_bytes(  # type: ignore[attr-defined]
+                        lock_file, __util__.write_locks(locks), mode=0o600
+                    )
                     logger.info(
                         "Removed stale lock: %s from %s", lock_id, snapshot_name
                     )

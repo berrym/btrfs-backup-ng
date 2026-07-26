@@ -57,6 +57,7 @@ from enum import Enum
 from pathlib import Path
 from typing import IO, Any, Callable, Iterator, Optional
 
+from .. import __util__
 from .errors import (
     ChunkChecksumError,
     PermanentCorruptedError,
@@ -252,10 +253,21 @@ class TransferManifest:
         return manifest
 
     def save(self, path: Path) -> None:
-        """Save manifest to file."""
+        """Save manifest to file.
+
+        Crash-atomic + best-effort (R7): written via the shared atomic-write primitive
+        (temp -> fsync -> os.replace), so a crash mid-write can never leave a torn
+        manifest that ``load()`` would reject -- which would force a full retransmit of
+        an already-partial (potentially GB-scale) chunked transfer. On an I/O failure the
+        previous complete manifest is left intact and we log + continue; the on-disk
+        manifest is then at worst one state-transition stale, so resume merely redoes one
+        idempotent, checksum-guarded chunk."""
         self.updated_at = datetime.now().isoformat()
-        with open(path, "w") as f:
-            json.dump(self.to_dict(), f, indent=2)
+        payload = json.dumps(self.to_dict(), indent=2)
+        try:
+            __util__.atomic_write_bytes(path, payload)  # type: ignore[attr-defined]
+        except OSError as e:
+            logger.warning("Failed to persist transfer manifest to %s: %s", path, e)
 
     @classmethod
     def load(cls, path: Path) -> "TransferManifest":

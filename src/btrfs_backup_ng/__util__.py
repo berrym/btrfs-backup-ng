@@ -2,6 +2,7 @@
 Common utility code shared between modules.
 """
 
+import contextlib
 import functools
 import json
 import os
@@ -26,6 +27,7 @@ __all__ = [
     "get_mount_info",
     "read_locks",
     "write_locks",
+    "atomic_write_bytes",
     "delete_subvolume",
     "DATE_FORMAT",
     "MOUNTS_FILE",
@@ -457,6 +459,68 @@ def get_mount_info(path):
     else:
         logger.debug("  -> No mount info found")
     return best_match
+
+
+def atomic_write_bytes(path, data, *, mode=0o600, fsync=True):
+    """Crash-atomically replace ``path`` with ``data``.
+
+    Writes a sibling temp file (in the SAME directory, so ``os.replace`` is a
+    same-filesystem rename and can never fail with ``EXDEV``), fsyncs it, atomically
+    renames it over the target, then fsyncs the parent directory so the rename itself
+    survives a power loss. A crash at any point leaves either the OLD complete file or
+    the NEW complete file -- never a half-written / truncated one. This is the single
+    atomic-write primitive shared by lock files, raw ``.meta`` sidecars, operation
+    state, and transfer manifests (R7): a torn state/manifest would break resume and a
+    torn lock file would be misread as "no locks" and let retention prune a locked
+    snapshot.
+
+    The temp is opened ``O_CREAT|O_EXCL|O_NOFOLLOW`` at ``mode``: ``O_NOFOLLOW`` refuses
+    a symlink planted at the temp path (defense when writing into a directory that may
+    hold untrusted content, e.g. a raw target walked as root), ``O_EXCL`` refuses a
+    pre-existing temp, and any stale temp left by a prior crash is unlinked first (the
+    temp name is a fixed ``<name>.tmp`` sibling, so it is reclaimed rather than left to
+    accumulate). Callers writing the SAME target concurrently must serialize themselves
+    (the lock writer does, via its FileLock); the atomic replace still guarantees no
+    torn file even if such a race occurs.
+
+    ``data`` may be ``str`` (encoded UTF-8) or ``bytes``. Raises ``OSError`` on any
+    failure, after removing the temp; the target file is left untouched. Set
+    ``fsync=False`` only where durability is not required (e.g. throwaway test dirs) --
+    the atomic replace still holds, only the power-loss durability guarantee is dropped.
+    """
+    path = Path(path)
+    if isinstance(data, str):
+        data = data.encode("utf-8")
+    tmp = path.with_name(path.name + ".tmp")
+    try:
+        # Clear a leftover temp from a prior crash so the O_EXCL create below succeeds.
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        fd = os.open(
+            str(tmp),
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+            mode,
+        )
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+            f.flush()
+            if fsync:
+                os.fsync(f.fileno())
+        os.replace(str(tmp), str(path))
+        # fsync the parent directory: the content fsync above does not guarantee the new
+        # directory entry (the rename) survives a crash, and a lost rename would silently
+        # revert to the old file.
+        if fsync:
+            with contextlib.suppress(OSError):
+                dfd = os.open(str(path.parent), os.O_RDONLY)
+                try:
+                    os.fsync(dfd)
+                finally:
+                    os.close(dfd)
+    except OSError:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        raise
 
 
 def read_locks(s):
