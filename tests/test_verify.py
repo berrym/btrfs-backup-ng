@@ -927,6 +927,92 @@ class TestVerifyFullEnvironment:
         assert report.results[0].details["status"] == "failed"
 
 
+class TestVerifyFullHelpers:
+    """Unit coverage for the R8d preflight/cleanup helpers, mutation-guarded without root
+    (the real paths are exercised on real btrfs in tier2)."""
+
+    def test_estimate_temp_shortfall_none_when_cannot_estimate(self):
+        """Size unmeasurable (e.g. a remote source) -> None (proceed, catch ENOSPC)."""
+        import btrfs_backup_ng.core.verify as vmod
+
+        with (
+            patch.object(
+                vmod, "_estimate_temp_shortfall", vmod._estimate_temp_shortfall
+            ),
+            patch(
+                "btrfs_backup_ng.core.estimate.estimate_snapshot_full_size",
+                return_value=(None, "none"),
+            ),
+        ):
+            assert (
+                vmod._estimate_temp_shortfall(MagicMock(), MagicMock(), Path("/t"))
+                is None
+            )
+
+    def test_estimate_temp_shortfall_none_when_sufficient(self):
+        """Enough space -> None (proceed with the restore)."""
+        import btrfs_backup_ng.core.verify as vmod
+
+        ep = MagicMock()
+        ep.get_space_info.return_value = MagicMock(effective_available=10**12)
+        with (
+            patch(
+                "btrfs_backup_ng.core.estimate.estimate_snapshot_full_size",
+                return_value=(1000, "du"),
+            ),
+            patch(
+                "btrfs_backup_ng.core.space.check_space_availability",
+                return_value=MagicMock(sufficient=True),
+            ),
+        ):
+            assert vmod._estimate_temp_shortfall(MagicMock(), ep, Path("/t")) is None
+
+    def test_estimate_temp_shortfall_message_when_short(self):
+        """A confident shortfall -> a human message (drives UNVERIFIABLE upstream)."""
+        import btrfs_backup_ng.core.verify as vmod
+
+        ep = MagicMock()
+        ep.get_space_info.return_value = MagicMock(effective_available=1)
+        with (
+            patch(
+                "btrfs_backup_ng.core.estimate.estimate_snapshot_full_size",
+                return_value=(10**12, "du"),
+            ),
+            patch(
+                "btrfs_backup_ng.core.space.check_space_availability",
+                return_value=MagicMock(
+                    sufficient=False, warning_message="short by lots"
+                ),
+            ),
+        ):
+            msg = vmod._estimate_temp_shortfall(MagicMock(), ep, Path("/t"))
+        assert msg == "short by lots"
+
+    def test_delete_temp_subvolume_ok(self):
+        """A successful delete does not raise."""
+        import btrfs_backup_ng.core.verify as vmod
+
+        with patch.object(
+            vmod.subprocess,
+            "run",
+            return_value=MagicMock(returncode=0, stderr=b""),
+        ):
+            vmod._delete_temp_subvolume(Path("/t/sub"))  # must not raise
+
+    def test_delete_temp_subvolume_raises_with_stderr(self):
+        """A failed delete raises RuntimeError carrying the btrfs stderr (not a bare code).
+        Mutation guard: swallowing the failure would let a leaked subvolume go unreported."""
+        import btrfs_backup_ng.core.verify as vmod
+
+        with patch.object(
+            vmod.subprocess,
+            "run",
+            return_value=MagicMock(returncode=1, stderr=b"ERROR: could not delete"),
+        ):
+            with pytest.raises(RuntimeError, match="could not delete"):
+                vmod._delete_temp_subvolume(Path("/t/sub"))
+
+
 class TestEndpointTestSendStream:
     """R8c: the polymorphic endpoint.test_send_stream replaces the deleted module-level
     _test_send_stream (and its dead ssh_client branch). Local runs `btrfs send --no-data`
