@@ -3,10 +3,11 @@ Common functionality among modules.
 """
 
 import contextlib
-import getpass
 import logging
 import os
+import stat
 import subprocess
+import tempfile
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -17,6 +18,53 @@ from btrfs_backup_ng.__logger__ import logger
 from btrfs_backup_ng.core.space import SpaceInfo
 from btrfs_backup_ng.core.space import get_space_info as _get_space_info
 from btrfs_backup_ng.endpoint.raw_metadata import StructureVerdict
+
+
+def _secure_lock_dir(base: Path, euid: int) -> Optional[Path]:
+    """Return a euid-owned 0700 ``btrfs-backup-ng-<euid>`` subdir of ``base`` for lock files,
+    or None if it cannot be secured (a pre-planted symlink or foreign-owned dir at that
+    predictable name). Placing the lock INSIDE a private 0700 dir means no untrusted symlink
+    can be planted at the lock path itself -- this closes the check-then-open TOCTOU that a
+    bare /tmp lock has (the filelock library opens O_TRUNC without O_NOFOLLOW). R12c/P5."""
+    d = base / f"btrfs-backup-ng-{euid}"
+    try:
+        d.mkdir(mode=0o700, exist_ok=True)
+        st = os.lstat(d)  # lstat: a symlink is seen AS a symlink, not its target
+    except OSError:
+        return None
+    if (
+        not stat.S_ISDIR(st.st_mode)
+        or st.st_uid != euid
+        or stat.S_IMODE(st.st_mode) != 0o700
+    ):
+        return None
+    return d
+
+
+def _command_lock_path() -> Path:
+    """Stable per-euid path for the btrfs-command serialization lock, placed INSIDE a
+    euid-owned 0700 directory so it is immune to a symlink race in world-writable /tmp
+    (R12c/P5). Prefer ``$XDG_RUNTIME_DIR`` (euid-owned); else a verified
+    ``/tmp/btrfs-backup-ng-<euid>``. Fails CLOSED if neither can be secured -- never follows
+    an attacker-controlled path to truncate a victim file."""
+    euid = os.geteuid()
+    xdg = os.environ.get("XDG_RUNTIME_DIR")
+    if xdg and os.path.isdir(xdg) and not os.path.islink(xdg):
+        try:
+            if os.stat(xdg).st_uid == euid:
+                d = _secure_lock_dir(Path(xdg), euid)
+                if d is not None:
+                    return d / "command.lock"
+        except OSError:
+            pass
+    d = _secure_lock_dir(Path(tempfile.gettempdir()), euid)
+    if d is None:
+        raise __util__.AbortError(
+            f"Refusing to proceed: cannot secure a lock directory "
+            f"(a symlink or foreign-owned btrfs-backup-ng-{euid} is present in the temp "
+            f"dir -- remove it)"
+        )
+    return d / "command.lock"
 
 
 def require_source(method):
@@ -938,7 +986,7 @@ class Endpoint:
         # Convert all command arguments to strings for subprocess
         command = [str(arg) for arg in command]
         logger.debug("Executing command: %s", command)
-        lock_path = Path("/tmp") / f".btrfs-backup-ng.{getpass.getuser()}.lock"
+        lock_path = _command_lock_path()
 
         try:
             with FileLock(lock_path):

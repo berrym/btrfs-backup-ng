@@ -1,13 +1,34 @@
+import atexit
 import getpass
 import os
 import pwd
 import shutil
 import subprocess
+import tempfile
 import threading
 from pathlib import Path
 from typing import List, Optional
 
 from btrfs_backup_ng.__logger__ import logger
+
+
+def _control_dir_base() -> Optional[str]:
+    """Base dir for the (mkdtemp) ControlMaster socket dir.
+
+    Prefer ``$XDG_RUNTIME_DIR`` (tmpfs, auto-cleaned on logout) BUT only when it is owned by
+    the current euid -- so under sudo we never place root's control socket inside the
+    invoking user's runtime dir (where they could tamper with or DoS it). Otherwise return
+    None so tempfile falls back to its default ($TMPDIR / /tmp); the unpredictable 0700
+    mkdtemp name is hijack-safe there regardless."""
+    xdg = os.environ.get("XDG_RUNTIME_DIR")
+    if xdg:
+        try:
+            st = os.stat(xdg)
+            if st.st_uid == os.geteuid() and os.path.isdir(xdg):
+                return xdg
+        except OSError:
+            pass
+    return None
 
 
 def operator_ssh_dir() -> Path:
@@ -143,15 +164,23 @@ class SSHMasterManager:
 
         if control_dir:
             self.control_dir = Path(control_dir)
+            self.control_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+            self._own_control_dir = False
         else:
-            if self.running_as_sudo:
-                self.control_dir = Path(f"/tmp/ssh-controlmasters-{self.sudo_user}")
-            else:
-                self.control_dir = self.ssh_config_dir / "controlmasters"
+            # Create the ControlMaster socket dir with tempfile.mkdtemp: an UNPREDICTABLE,
+            # 0700, euid-owned directory. The old predictable /tmp/ssh-controlmasters-<user>
+            # + mkdir(exist_ok=True) let a local attacker pre-create the dir and capture the
+            # control socket -- which carries root's authenticated ssh to the backup host
+            # (socket hijack -> command execution as root@remote). An unguessable name that
+            # only euid owns closes it by design; the socket name already embeds pid+tid, so
+            # nothing relied on a stable path. R12c/P2.
+            self.control_dir = Path(
+                tempfile.mkdtemp(prefix="btrfs-backup-ng-cm-", dir=_control_dir_base())
+            )
+            self._own_control_dir = True
+            # Backstop cleanup if stop_master()/cleanup_socket() is never reached.
+            atexit.register(shutil.rmtree, str(self.control_dir), ignore_errors=True)
 
-        # parents=True so a missing ~/.ssh (fresh account, CI, container) does not
-        # break endpoint construction with FileNotFoundError.
-        self.control_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
         self._instance_id = f"{os.getpid()}_{threading.get_ident()}"
         self.control_path = (
             self.control_dir
@@ -689,6 +718,7 @@ class SSHMasterManager:
             try:
                 subprocess.run(cmd, check=True, capture_output=True)
                 self._master_started = False
+                self._cleanup_control_dir()  # deterministic teardown (R12c/P2)
                 return True
             except Exception as e:
                 logger.error(f"Failed to stop SSH master: {e}")
@@ -719,12 +749,20 @@ class SSHMasterManager:
             return False
 
     def cleanup_socket(self) -> None:
-        """Clean up the control socket file."""
+        """Clean up the control socket file (and our private mkdtemp dir, if we own it)."""
         try:
             if self.control_path.exists():
                 self.control_path.unlink()
         except Exception as e:
             logger.error(f"Failed to cleanup socket: {e}")
+        self._cleanup_control_dir()
+
+    def _cleanup_control_dir(self) -> None:
+        """Remove the unpredictable per-manager control dir we created (R12c/P2), so it does
+        not linger in $XDG_RUNTIME_DIR / /tmp. Idempotent + best-effort; an explicit
+        control_dir override (``_own_control_dir`` False) is never removed."""
+        if getattr(self, "_own_control_dir", False):
+            shutil.rmtree(self.control_dir, ignore_errors=True)
 
     def get_ssh_base_cmd(self, force_tty: bool = False) -> List[str]:
         """Get the base SSH command with all necessary options.
