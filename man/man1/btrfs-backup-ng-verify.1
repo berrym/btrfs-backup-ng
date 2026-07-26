@@ -50,10 +50,15 @@ stream's sha256 and compare it to the checksum sealed in its \fB.meta\fR sidecar
 detecting at-rest corruption.
 .TP
 .B full
-For a btrfs target, a complete restore test to a temporary location: actually restores
-snapshot(s) and verifies the restored subvolume is valid \(em the most thorough check,
-but the slowest; requires \fB--temp-dir\fR for remote backups. For a raw target, \fBfull\fR
-performs the same sealed-checksum verification as \fBstream\fR.
+For a btrfs target, a complete restore test to a temporary location: actually restores the
+target snapshot with a full \fBbtrfs send\fR (reading every data block, so btrfs's own
+checksums catch at-rest corruption) and verifies the restored subvolume is valid \(em the
+most thorough check, but the slowest, and for a remote backup it pulls the whole snapshot
+over the network. Requires \fB--temp-dir\fR on a local btrfs filesystem for remote backups,
+and root or passwordless sudo (it runs \fBbtrfs receive\fR). If the restore test cannot run
+\(em no privilege, or the target does not fit in the temp filesystem \(em the snapshot is
+reported \fBunverifiable\fR, not failed. For a raw target, \fBfull\fR performs the same
+sealed-checksum verification as \fBstream\fR.
 .RE
 .TP
 .BI \-\-snapshot " " \fINAME\fR
@@ -129,17 +134,21 @@ Does not transfer actual file data
 This level catches corruption in snapshot metadata that metadata-only
 checks might miss.
 .SS Full (Thorough)
-Performs actual restore:
+Performs an actual restore of the target snapshot:
 .IP \(bu 2
-Restores snapshot to temporary location
+Full \fBbtrfs send\fR of the target into a temp subvolume (no incremental parent needed \(em
+the backup's received subvolumes are already fully materialized), reading every data block
 .IP \(bu 2
-Verifies restored path is a valid btrfs subvolume
+Verifies the restored path is a valid btrfs subvolume
 .IP \(bu 2
-Tests the complete restore pipeline
+Reports \fBunverifiable\fR (not failed) if the environment cannot run the test (no
+root/sudo, or the target does not fit in the temp filesystem)
 .IP \(bu 2
-Cleans up after verification (unless \fB--no-cleanup\fR)
+Cleans up the restored subvolume afterward (unless \fB--no-cleanup\fR); a user-supplied
+\fB--temp-dir\fR is never removed, only the restored subvolumes within it
 .PP
-This is the definitive test that a backup can be restored.
+This is the definitive test that a backup can be restored. Requires root or passwordless
+sudo, and \fB--temp-dir\fR on a local btrfs filesystem for remote backups.
 .SS Raw targets (sealed checksum)
 For a \fBraw://\fR or \fBraw+ssh://\fR target, the \fBstream\fR and \fBfull\fR levels
 recompute each stored stream's sha256 and compare it to the checksum sealed in the

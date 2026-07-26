@@ -276,7 +276,13 @@ def send_snapshot(
                 f"btrfs send/receive failed with return codes: {return_codes}"
             )
             logger.error(error_message)
-            _log_process_errors(send_process, receive_process)
+            send_err, recv_err = _log_process_errors(send_process, receive_process)
+            # Surface the real stderr in the exception so callers can classify the failure
+            # (e.g. ENOSPC vs a corrupt stream); otherwise it is lost to the log and every
+            # failure looks identical.
+            detail = (recv_err or send_err or "").strip()
+            if detail:
+                error_message = f"{error_message}: {detail}"
             raise __util__.SnapshotTransferError(error_message)
 
         # Durably publish the received data before declaring success. For raw
@@ -1131,8 +1137,16 @@ def _do_rich_progress_transfer(
         raise __util__.SnapshotTransferError(f"Transfer failed: {e}")
 
 
-def _log_process_errors(send_process, receive_process) -> None:
-    """Log stderr from send/receive processes."""
+def _log_process_errors(send_process, receive_process) -> tuple[str, str]:
+    """Log stderr from send/receive processes and RETURN it as (send_err, recv_err).
+
+    The stderr streams can only be read once, so returning what we read lets the caller
+    surface the real reason (e.g. 'No space left on device', 'cannot find parent
+    subvolume') in the raised error instead of losing it to the log -- callers that
+    classify the failure (verify's restore test) need the message, not just a return
+    code."""
+    send_err = ""
+    recv_err = ""
     if hasattr(send_process, "stderr") and send_process.stderr:
         send_err = send_process.stderr.read().decode("utf-8", errors="replace")
         if send_err:
@@ -1146,6 +1160,8 @@ def _log_process_errors(send_process, receive_process) -> None:
         recv_err = receive_process.stderr.read().decode("utf-8", errors="replace")
         if recv_err:
             logger.error("Receive process stderr: %s", recv_err)
+
+    return send_err, recv_err
 
 
 def _log_subprocess_error(e, destination_endpoint) -> None:
