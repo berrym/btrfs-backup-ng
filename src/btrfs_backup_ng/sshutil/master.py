@@ -10,6 +10,69 @@ from typing import List, Optional
 from btrfs_backup_ng.__logger__ import logger
 
 
+def operator_ssh_dir() -> Path:
+    """The ``.ssh`` directory of the INVOKING operator, even under sudo.
+
+    Under ``sudo`` (SUDO_USER set, euid 0) this resolves to the sudo user's ``~/.ssh``,
+    NOT root's -- so host-key trust (``known_hosts``) matches the keys the operator
+    curated interactively, instead of pinning into root's (usually empty) store where the
+    operator can neither see nor manage it (R12/P4)."""
+    sudo_user = os.environ.get("SUDO_USER")
+    if sudo_user and os.geteuid() == 0:
+        return Path(pwd.getpwnam(sudo_user).pw_dir) / ".ssh"
+    return Path.home() / ".ssh"
+
+
+def operator_known_hosts() -> Path:
+    """Path to the operator's ``known_hosts`` (see :func:`operator_ssh_dir`)."""
+    return operator_ssh_dir() / "known_hosts"
+
+
+def ensure_operator_known_hosts() -> Path:
+    """Return the operator's ``known_hosts`` path, creating an empty 0600 file owned by the
+    operator if it is missing.
+
+    Under sudo this runs AS ROOT inside the (untrusted) operator's home, so it must NEVER
+    follow a symlink there: a sudo user who pre-plants ``~/.ssh`` or ``~/.ssh/known_hosts``
+    as a symlink to a root-owned target could otherwise trick root into creating/chowning a
+    file OUTSIDE the home -- a privilege escalation beyond their sudo scope (own /etc/shadow).
+    So, under sudo: (1) bail if either path element is a symlink; (2) create the file with
+    ``O_CREAT|O_EXCL|O_NOFOLLOW`` (a fresh regular file, never through a symlink); (3) chown
+    via the resulting fd, so we only ever take ownership of a file we just created -- an
+    existing file (operator- or root-owned) is left exactly as-is."""
+    ssh_dir = operator_ssh_dir()
+    kh = ssh_dir / "known_hosts"
+    sudo_user = os.environ.get("SUDO_USER")
+    running_as_sudo = bool(sudo_user) and os.geteuid() == 0
+    try:
+        if running_as_sudo and (os.path.islink(ssh_dir) or os.path.islink(kh)):
+            logger.warning(
+                "Refusing to initialise %s as root: a symlink is present in the operator's "
+                ".ssh path (possible privilege-escalation attempt); using it as-is",
+                kh,
+            )
+            return kh
+        ssh_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        if not os.path.lexists(kh):  # lexists: a dangling symlink counts as present
+            # O_NOFOLLOW|O_EXCL: create a FRESH regular file; a symlink racing in at kh makes
+            # the open fail (ELOOP) rather than be written through.
+            fd = os.open(
+                kh, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW, 0o600
+            )
+            try:
+                if running_as_sudo:
+                    assert (
+                        sudo_user is not None
+                    )  # narrowing: implied by running_as_sudo
+                    pw = pwd.getpwnam(sudo_user)
+                    os.fchown(fd, pw.pw_uid, pw.pw_gid)  # fd-based -> symlink-safe
+            finally:
+                os.close(fd)
+    except OSError as e:
+        logger.warning("Could not ensure operator known_hosts at %s: %s", kh, e)
+    return kh
+
+
 class SSHMasterManager:
     """Manages SSH master connections with password fallback support.
 
@@ -41,6 +104,8 @@ class SSHMasterManager:
         self.hostname = hostname
         self.username = username or getpass.getuser()
         self.port = port
+        # Each entry is a BARE ``key=value`` ssh option (e.g. "StrictHostKeyChecking=yes"),
+        # emitted as ``-o key=value`` by _ssh_base_cmd -- NOT a pre-formatted "-o ..." token.
         self.ssh_opts = ssh_opts or []
         self.persist = persist
         self.debug = debug
@@ -66,10 +131,11 @@ class SSHMasterManager:
         )
         self.sudo_user = os.environ.get("SUDO_USER")
 
-        if self.running_as_sudo and self.sudo_user:
-            self.ssh_config_dir = Path(pwd.getpwnam(self.sudo_user).pw_dir) / ".ssh"
-        else:
-            self.ssh_config_dir = Path.home() / ".ssh"
+        self.ssh_config_dir = operator_ssh_dir()
+        # The operator's known_hosts, ensured to exist and be operator-owned. Passed as
+        # UserKnownHostsFile so accept-new/strict verify against the operator's curated
+        # trust even under sudo (was silently using root's store) -- R12/P4.
+        self.known_hosts_path = ensure_operator_known_hosts()
 
         if control_dir:
             self.control_dir = Path(control_dir)
@@ -103,8 +169,14 @@ class SSHMasterManager:
         if force_tty:
             cmd.append("-tt")
 
+        # Operator-supplied ssh_opts come FIRST so they WIN: ssh uses the first obtained
+        # value for each option, so an operator who hardens e.g. StrictHostKeyChecking=yes
+        # via config `ssh_opts` overrides the default below (was silently DROPPED here --
+        # R12/P3; it is still honored in raw+ssh, so this restores parity).
+        opts = list(self.ssh_opts)
+
         # SSH options for better reliability
-        opts = [
+        opts += [
             f"ControlPath={self.control_path}",
             "ControlMaster=auto",
             f"ControlPersist={self.persist}",
@@ -118,6 +190,14 @@ class SSHMasterManager:
             "PubkeyAuthentication=yes",
             "PreferredAuthentications=publickey,keyboard-interactive,password",
         ]
+
+        # Under sudo, ssh runs as root and would otherwise pin/verify against ROOT's
+        # known_hosts, ignoring the operator's curated trust (and defeating any TOFU the
+        # operator did as themselves). Bind it to the operator's file so accept-new lands
+        # where the operator can see and manage it -- R12/P4. Non-sudo ssh already uses the
+        # operator's ~/.ssh/known_hosts and respects their ssh_config, so it is left alone.
+        if self.running_as_sudo:
+            opts.append(f"UserKnownHostsFile={self.known_hosts_path}")
 
         # Only use BatchMode if password authentication is not needed
         if not self.allow_password_auth:

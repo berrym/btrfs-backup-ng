@@ -2626,6 +2626,32 @@ print(json.dumps(result))
             show_progress=show_progress,
         )
 
+    def _new_verified_paramiko_client(self) -> Any:
+        """Create a Paramiko SSHClient that verifies the host key against the operator's
+        known_hosts (R12/P1).
+
+        Loading the store is what closes the fail-open: with it, a CHANGED key raises
+        ``BadHostKeyException`` on connect (the MITM signal), while a genuinely new host is
+        trusted AND persisted -- accept-new parity with the subprocess transport. The old
+        code loaded NOTHING, so every key looked "missing" and ``AutoAddPolicy`` blindly
+        accepted any key, including a changed one, on the path that carries the SSH and
+        sudo passwords."""
+        assert paramiko is not None
+        client = paramiko.SSHClient()
+        try:
+            client.load_system_host_keys()
+        except OSError:
+            pass  # a missing/unreadable system known_hosts must not block the transfer
+        known_hosts = str(self.ssh_manager.known_hosts_path)
+        try:
+            # load_host_keys also sets the write-back file, so AutoAddPolicy persists a
+            # newly accepted host to the operator's known_hosts (accept-new pinning).
+            client.load_host_keys(known_hosts)
+        except OSError as e:
+            logger.warning("Could not load known_hosts %s: %s", known_hosts, e)
+        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        return client
+
     def _do_paramiko_transfer(
         self,
         source_path: str,
@@ -2729,8 +2755,9 @@ print(json.dumps(result))
             # 1. Get username (from CLI/URL - already in ssh_user)
             # 2. Get password (via getpass - in ssh_password)
             # 3. Connect with those credentials
-            client = _paramiko.SSHClient()  # type: ignore[union-attr]
-            client.set_missing_host_key_policy(_paramiko.AutoAddPolicy())  # type: ignore[union-attr]
+            # Host-key-verified client (loads the operator's known_hosts -> accept-new
+            # parity: a changed key is refused, a new host is trusted+pinned). R12/P1.
+            client = self._new_verified_paramiko_client()
 
             connect_kwargs: Dict[str, Any] = {
                 "hostname": self.hostname,
@@ -2899,6 +2926,18 @@ print(json.dumps(result))
         except Exception as e:
             # Handle paramiko-specific exceptions
             if paramiko is not None:
+                # A changed host key -> refuse LOUDLY (this is the MITM signal the R12/P1
+                # fix exists to raise). Must precede the SSHException check (subclass).
+                if isinstance(e, paramiko.BadHostKeyException):
+                    logger.error(
+                        "SSH host key for %s does NOT match the pinned key in %s -- "
+                        "refusing to transfer (possible man-in-the-middle). If the host was "
+                        "legitimately rekeyed, remove its stale entry from that known_hosts "
+                        "file and retry.",
+                        self.hostname,
+                        self.ssh_manager.known_hosts_path,
+                    )
+                    return False
                 if isinstance(e, paramiko.AuthenticationException):
                     logger.error(f"SSH authentication failed: {e}")
                     return False
