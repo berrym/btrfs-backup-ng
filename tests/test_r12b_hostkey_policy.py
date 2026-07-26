@@ -116,3 +116,31 @@ def test_raw_accept_new_emits_accept_new():
 
 def test_raw_default_is_accept_new():
     assert "StrictHostKeyChecking=accept-new" in _raw_cmd(None)
+
+
+# ------------------------------------ threading parity guard (silent-degrade regression)
+
+
+def test_every_handler_threading_ssh_sudo_also_threads_host_key_policy():
+    """Silent-degrade guard: any CLI handler that threads a target's ssh_sudo into endpoint
+    config MUST also thread ssh_host_key_policy -- else a config'd `strict` is silently
+    ignored on that command (the R12b review found exactly this gap on `run`). Scans the
+    cli/ handlers; if one reads target.ssh_sudo it must also read target.ssh_host_key_policy."""
+    import pathlib
+
+    cli_dir = pathlib.Path("src/btrfs_backup_ng/cli")
+    offenders = []
+    for f in cli_dir.glob("*.py"):
+        text = f.read_text()
+        # A handler does CONFIG-driven ssh threading if it assigns/branches on a target's
+        # ssh_sudo (not merely displays it). Such a handler must also thread the policy from
+        # the target. (Arg-driven handlers like restore thread it from args instead.)
+        threads_config_ssh = (
+            "= target.ssh_sudo" in text or "if target.ssh_sudo:" in text
+        )
+        if threads_config_ssh and "target.ssh_host_key_policy" not in text:
+            offenders.append(f.name)
+    assert offenders == [], (
+        f"these handlers thread target.ssh_sudo but not ssh_host_key_policy "
+        f"(strict would silently degrade): {offenders}"
+    )

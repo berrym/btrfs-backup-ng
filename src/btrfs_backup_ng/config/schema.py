@@ -193,7 +193,9 @@ class RawTargetConfig:
     ssh_port: int = 22
     ssh_key: Optional[str] = None
     ssh_auth_sock: Optional[str] = None
-    # Host-key verification policy: "accept-new" (default) or "strict". R12b.
+    # Host-key policy. NOTE: raw targets are represented by TargetConfig at load time
+    # (the loader does not instantiate RawTargetConfig), so the LIVE knob is
+    # TargetConfig.ssh_host_key_policy; kept here for schema parity. R12b.
     ssh_host_key_policy: str = "accept-new"
 
     def __post_init__(self):

@@ -378,6 +378,7 @@ def _backup_volume(
 
             dest_kwargs = dict(endpoint_kwargs)
             dest_kwargs["ssh_sudo"] = target.ssh_sudo
+            dest_kwargs["ssh_host_key_policy"] = target.ssh_host_key_policy
             dest_kwargs["ssh_password_fallback"] = target.ssh_password_auth
 
             if target.ssh_key:
@@ -639,6 +640,7 @@ def _backup_snapper_volume(
                 "snap_prefix": "",
                 "timestamp_format": get_timestamp_format(config),
             }
+            snapper_endpoint_config["ssh_host_key_policy"] = target.ssh_host_key_policy
             if target.ssh_sudo:
                 snapper_endpoint_config["ssh_sudo"] = True
             if target.ssh_key:

@@ -221,6 +221,8 @@ def _execute_config_restore(args: argparse.Namespace, volume_path: str) -> int:
             args.ssh_sudo = True
         if target.ssh_key:
             args.ssh_key = target.ssh_key
+        if not getattr(args, "ssh_host_key_policy", None):
+            args.ssh_host_key_policy = target.ssh_host_key_policy
         # Use volume's snapshot prefix
         if volume.snapshot_prefix and not getattr(args, "prefix", None):
             args.prefix = volume.snapshot_prefix
@@ -250,6 +252,8 @@ def _execute_config_restore(args: argparse.Namespace, volume_path: str) -> int:
         args.ssh_sudo = True
     if target.ssh_key and not getattr(args, "ssh_key", None):
         args.ssh_key = target.ssh_key
+    if not getattr(args, "ssh_host_key_policy", None):
+        args.ssh_host_key_policy = target.ssh_host_key_policy
     if target.compress != "none" and not getattr(args, "compress", None):
         args.compress = target.compress
     if target.rate_limit and not getattr(args, "rate_limit", None):
