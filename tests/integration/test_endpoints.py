@@ -519,7 +519,14 @@ class TestEndpointCommandExecution:
         )
 
         cmd = [("btrfs", False), ("subvolume", False), ("list", False)]
-        endpoint._exec_command({"command": cmd})
+        # os.geteuid() is mocked here; the R12c per-euid lock dir verifies ownership against
+        # that mocked euid, which mismatches the real-uid-owned dir on a CI runner. The lock
+        # is not under test (FileLock is mocked), so stub the path computation.
+        with patch(
+            "btrfs_backup_ng.endpoint.common._command_lock_path",
+            return_value=tmp_path / "cmd.lock",
+        ):
+            endpoint._exec_command({"command": cmd})
 
         # Verify sudo was prepended
         called_cmd = mock_exec.call_args[0][0]
