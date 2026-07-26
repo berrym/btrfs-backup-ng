@@ -229,18 +229,31 @@ def test_native_backup_stays_complete(tmp_path):
 # security: symlink handling (backfill writes while walking an untrusted dir)
 # --------------------------------------------------------------------------- #
 def test_backfill_symlinked_meta_tmp_cannot_truncate_outside_file(tmp_path):
-    """A pre-planted <name>.meta.tmp symlink must NOT let the O_CREAT|O_TRUNC write
-    redirect to an arbitrary file (O_NOFOLLOW in save_metadata). The outside file
-    stays intact and no sidecar is written for the malicious candidate."""
+    """A pre-planted <name>.meta.tmp symlink must NOT let the sidecar write redirect to
+    an arbitrary file. The shared atomic writer (R7 ``atomic_write_bytes``) unlinks the
+    stale/planted temp and re-creates it with O_EXCL|O_NOFOLLOW, so the outside file is
+    never followed or truncated -- the attacker's symlink at our OWN temp path is simply
+    reclaimed (exactly as a stale temp from a crash would be) and the legitimate sidecar
+    is still written to <name>.meta, never to the symlink target. This matches the R3
+    lock-writer's symlink contract (test_write_locks_does_not_clobber_through_symlinked_temp:
+    victim safe AND the file is still written)."""
     outside = tmp_path / "outside.secret"
     outside.write_text("DO-NOT-TRUNCATE")
     stream = tmp_path / "pwn.btrfs"
     stream.write_bytes(b"payload")
     (tmp_path / "pwn.btrfs.meta.tmp").symlink_to(outside)
 
-    _backfill(tmp_path)  # rc may be 1 (write errored); the point is no damage
-    assert outside.read_text() == "DO-NOT-TRUNCATE"  # never truncated
-    assert not (tmp_path / "pwn.btrfs.meta").exists()
+    _backfill(tmp_path)
+
+    # THE security guarantee: the outside file is never truncated or redirected through.
+    assert outside.read_text() == "DO-NOT-TRUNCATE"
+    # The sidecar landed on the REAL meta path as a fresh regular file (not a symlink),
+    # holding valid sidecar JSON for the real stream -- proving the write was not
+    # redirected to/from the victim.
+    meta = tmp_path / "pwn.btrfs.meta"
+    assert meta.exists() and not meta.is_symlink()
+    doc = json.loads(meta.read_text())
+    assert doc["name"] == "pwn"
 
 
 def test_backfill_skips_symlinked_stream(tmp_path):

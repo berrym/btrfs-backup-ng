@@ -15,7 +15,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from btrfs_backup_ng import __version__
+from btrfs_backup_ng import __util__, __version__
 from btrfs_backup_ng.__logger__ import logger
 
 # Compression tool configurations
@@ -340,26 +340,18 @@ class RawSnapshot:
         return json.dumps(self.to_dict(), indent=2).encode("utf-8")
 
     def save_metadata(self) -> None:
-        """Write the sidecar atomically (temp -> fsync -> rename -> dir fsync) at
-        mode 0600, so a crash never leaves a partial/half-written .meta and the
-        metadata dossier is not world-readable.
+        """Write the sidecar atomically at mode 0600 via the shared atomic-write
+        primitive (temp -> fsync -> os.replace -> dir fsync; R7), so a crash never
+        leaves a partial/half-written .meta and the metadata dossier is not
+        world-readable.
 
-        O_NOFOLLOW on the temp open refuses to follow a symlink at the ``.meta.tmp``
-        path: writing while walking an untrusted directory (``raw backfill-metadata``
-        over a target with foreign/legacy content, typically as root) must not let a
-        pre-planted ``<name>.meta.tmp`` symlink redirect the O_CREAT|O_TRUNC write to
-        an arbitrary file."""
-        meta = self.metadata_path
-        tmp = meta.with_name(meta.name + ".tmp")
-        payload = self.serialize()
-        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
-        try:
-            os.write(fd, payload)
-            os.fsync(fd)
-        finally:
-            os.close(fd)
-        os.replace(tmp, meta)
-        _fsync_directory(meta.parent)
+        The primitive opens the temp ``O_EXCL|O_NOFOLLOW``: writing while walking an
+        untrusted directory (``raw backfill-metadata`` over a target with foreign/legacy
+        content, typically as root) must not let a pre-planted ``<name>.meta.tmp``
+        symlink redirect the write to an arbitrary file."""
+        __util__.atomic_write_bytes(  # type: ignore[attr-defined]
+            self.metadata_path, self.serialize(), mode=0o600
+        )
 
     @classmethod
     def from_dict(cls, data: dict[str, Any], stream_path: Path) -> RawSnapshot:

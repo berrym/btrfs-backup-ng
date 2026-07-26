@@ -1087,38 +1087,14 @@ class Endpoint:
     def _write_locks(self, lock_dict: Dict[str, Any]) -> None:
         path = self._get_lock_file_path()
         data = __util__.write_locks(lock_dict)
-        tmp = path.with_name(path.name + ".tmp")
         try:
             logger.debug("Writing lock file: %s", path)
-            # Atomic: write a temp file, fsync it, then os.replace over the target, so a
-            # crash mid-write can never leave a half-written / corrupt lock file (which
-            # would then be misread as "no locks" and let retention prune a locked
-            # snapshot). O_NOFOLLOW|O_EXCL refuse a planted symlink or a stale temp at what
-            # is often a root-owned path; a leftover temp from a prior crash is cleared
-            # first.
-            with contextlib.suppress(OSError):
-                os.unlink(tmp)
-            fd = os.open(
-                str(tmp),
-                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
-                0o600,
-            )
-            with os.fdopen(fd, "w", encoding="utf-8") as f:
-                f.write(data)
-                f.flush()
-                os.fsync(f.fileno())
-            os.replace(str(tmp), str(path))
-            # fsync the parent directory so the rename itself is durable: the content
-            # fsync above does not guarantee the new directory entry survives a crash, and
-            # a lost rename would silently drop the locks R3 exists to persist.
-            with contextlib.suppress(OSError):
-                dfd = os.open(str(path.parent), os.O_RDONLY)
-                try:
-                    os.fsync(dfd)
-                finally:
-                    os.close(dfd)
+            # Atomic replace via the shared primitive (R7): a crash mid-write can never
+            # leave a half-written / corrupt lock file (which would then be misread as
+            # "no locks" and let retention prune a locked snapshot). The primitive does
+            # the temp -> fsync -> os.replace -> parent-dir fsync dance with
+            # O_EXCL|O_NOFOLLOW at 0600.
+            __util__.atomic_write_bytes(path, data, mode=0o600)
         except OSError as e:
-            with contextlib.suppress(OSError):
-                os.unlink(tmp)
             logger.error("Error on writing lock file %s: %s", path, e)
             raise __util__.AbortError

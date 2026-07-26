@@ -800,8 +800,15 @@ def _execute_unlock(args: argparse.Namespace, lock_id: str) -> int:
 
     # Write updated locks
     try:
-        with open(lock_file_path, "w", encoding="utf-8") as f:
-            f.write(__util__.write_locks(new_locks))  # type: ignore[attr-defined]
+        # Atomic replace via the shared primitive (R7): the previous plain open("w")
+        # bypassed the endpoint's crash-safe lock writer, so a crash mid-write could
+        # leave a torn lock file -- which is then misread as "no locks" and lets
+        # retention prune a snapshot that is still locked.
+        __util__.atomic_write_bytes(  # type: ignore[attr-defined]
+            lock_file_path,
+            __util__.write_locks(new_locks),  # type: ignore[attr-defined]
+            mode=0o600,
+        )
     except Exception as e:
         logger.error("Could not write lock file: %s", e)
         return 1

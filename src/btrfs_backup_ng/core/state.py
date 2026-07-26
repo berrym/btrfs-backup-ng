@@ -43,6 +43,8 @@ from enum import Enum
 from pathlib import Path
 from typing import Optional
 
+from .. import __util__
+
 logger = logging.getLogger(__name__)
 
 # Default state directory
@@ -292,11 +294,22 @@ class OperationRecord:
         return record
 
     def save(self, path: Path) -> None:
-        """Save operation record to file."""
+        """Save operation record to file.
+
+        Crash-atomic + best-effort (R7): written via the shared atomic-write primitive
+        (temp -> fsync -> os.replace), so a crash mid-write can never leave a torn JSON
+        file that ``load()`` would choke on and thereby kill resume -- a reader always
+        sees the old complete record or the new one. On an I/O failure the previous
+        complete record is left intact and we log + continue: the state file is a resume
+        optimization, never the backup itself, so a save failure must not fail a good
+        operation (the R1/R2 false-negative-safety principle)."""
         self.updated_at = datetime.now().isoformat()
         path.parent.mkdir(parents=True, exist_ok=True)
-        with open(path, "w") as f:
-            json.dump(self.to_dict(), f, indent=2)
+        payload = json.dumps(self.to_dict(), indent=2)
+        try:
+            __util__.atomic_write_bytes(path, payload)  # type: ignore[attr-defined]
+        except OSError as e:
+            logger.warning("Failed to persist operation state to %s: %s", path, e)
 
     @classmethod
     def load(cls, path: Path) -> "OperationRecord":
@@ -482,6 +495,24 @@ class OperationManager:
 
         if src_path.exists():
             operation.save(dst_path)
+            # save() is best-effort (swallows OSError), so verify the archive copy is
+            # actually written AND loadable before removing the source record. An
+            # unconditional unlink here would destroy a completed operation's record if
+            # the archive write had failed (ENOSPC, archive-dir I/O error) -- the R1
+            # principle: never delete a good record on an inconclusive write.
+            try:
+                archived_ok = (
+                    dst_path.exists() and OperationRecord.load(dst_path) is not None
+                )
+            except Exception:
+                archived_ok = False
+            if not archived_ok:
+                logger.error(
+                    "Archive write for operation %s failed or is unreadable; "
+                    "keeping the source record",
+                    operation_id,
+                )
+                return False
             src_path.unlink()
             logger.info("Archived operation %s", operation_id)
             return True
