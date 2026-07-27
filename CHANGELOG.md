@@ -7,6 +7,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+Targeted for **0.9.1** — the verification and SSH-security hardening release.
+
+### Security
+
+- **SSH host-key verification (fixes a man-in-the-middle exposure).** The password-based-sudo
+  transfer path accepted any server host key — including a *changed* one — without verification,
+  so a network attacker able to impersonate the backup destination could capture the SSH and sudo
+  passwords and the backup stream. Key-based SSH auth was unaffected. Host keys are now verified
+  on every connection (a changed key is refused loudly), and under `sudo` they are verified and
+  pinned against the invoking operator's `~/.ssh/known_hosts` rather than root's. A security
+  advisory (GHSA) accompanies this release.
+- **Configurable host-key policy.** New `ssh_host_key_policy` (config) / `--ssh-host-key-policy`
+  (CLI): `accept-new` (default — trust first contact, reject a changed key) or `strict`
+  (known_hosts-only, refuse an unknown host). An unrecognized value fails closed.
+- **Predictable-path hardening.** SSH ControlMaster sockets now live in an unpredictable, private
+  0700 directory (preferring `$XDG_RUNTIME_DIR`) and are cleaned up on close — closing a local
+  socket-hijack vector. The internal command lock and the raw+ssh remote metadata write no longer
+  use predictable, symlink-plantable paths.
+- Operator `ssh_opts` (e.g. an explicit `StrictHostKeyChecking`) are now honored on the primary
+  SSH transport (they were previously silently dropped).
+
+### Changed
+
+- **raw+ssh host-key policy is now explicit.** raw+ssh targets previously set no
+  `StrictHostKeyChecking` and inherited the ambient default (which, under `BatchMode`,
+  accidentally refused unknown hosts). They now default to `accept-new`, matching the btrfs
+  transport. If you relied on the accidental refuse-unknown behavior, set
+  `ssh_host_key_policy = strict`.
+
+### Fixed
+
+- **Verification now actually verifies.** The `verify` command previously could report success on
+  a non-subvolume, skipped data on stream checks, ran a false-negative full-restore, and never
+  consulted a raw backup's sealed checksum. Verification now validates real structure, recomputes
+  and compares sealed checksums, and does a standalone full-restore; output is honest ("checked N
+  of M", a distinct *unverifiable* state, and a top-level JSON `verdict`), with `--all` to verify
+  every snapshot.
+- **Crash-atomic persistence.** Operation state, transfer manifests, and lock files are now written
+  atomically (temp + fsync + rename), so a crash mid-write can no longer corrupt resume state or a
+  lock file.
+
+### Removed
+
+- Deleted the unused, deprecated `ssh_transfer` module and a stale `master.py.new` draft.
+
 ## [0.9.0] - 2026-07-24
 
 A large reliability release. The incremental-backup engine has been re-architected around a

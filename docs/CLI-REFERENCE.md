@@ -1274,6 +1274,51 @@ ssh_sudo = true
 
 ---
 
+## SSH Security
+
+btrfs-backup-ng verifies the remote host's SSH key on every connection.
+
+### Host-key policy
+
+| Policy | Behavior |
+|--------|----------|
+| `accept-new` (default) | Trust a host's key on first contact and pin it; **refuse to connect if that key later changes** (the usual man-in-the-middle signal). |
+| `strict` | Only connect to hosts already present in `known_hosts`; an unknown host is **refused**. |
+
+Set it in a target's config or per run:
+
+```toml
+[[volumes.targets]]
+path = "ssh://backup@server:/mnt/backups/vol"
+ssh_host_key_policy = "strict"     # or "accept-new" (default)
+```
+
+```bash
+btrfs-backup-ng restore --ssh-host-key-policy strict ...
+```
+
+An unrecognized value is a configuration error (fails closed — it never silently downgrades).
+
+### Under sudo
+
+When running under `sudo`, host keys are verified and pinned against the **invoking operator's**
+`~/.ssh/known_hosts` (not root's), so the trust you established interactively still applies.
+Operator `ssh_opts` (for example an explicit `StrictHostKeyChecking`) take precedence over the
+tool's default.
+
+### Predictable-path hardening
+
+SSH ControlMaster sockets are created in an unpredictable, private (0700) directory (preferring
+`$XDG_RUNTIME_DIR`) and removed when the connection closes, so a local user cannot hijack the
+multiplexed connection to your backup host. The internal command lock and the raw+ssh remote
+metadata write likewise avoid predictable, symlink-plantable paths.
+
+> **Upgrade note:** `raw+ssh://` targets now set an explicit `accept-new` policy (previously they
+> inherited the ambient SSH default, which under batch mode accidentally refused unknown hosts).
+> If you relied on that refuse-unknown behavior, set `ssh_host_key_policy = "strict"`.
+
+---
+
 ## Environment Variables
 
 | Variable | Description |
