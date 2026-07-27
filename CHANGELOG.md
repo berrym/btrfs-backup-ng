@@ -7,7 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-Targeted for **0.9.1** — the verification and SSH-security hardening release.
+## [0.9.1] - 2026-07-27
+
+The verification and SSH-security hardening release.
 
 ### Security
 
