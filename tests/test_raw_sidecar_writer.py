@@ -78,8 +78,10 @@ def test_local_and_remote_sidecar_bytes_are_identical(tmp_path):
 
 
 def test_ssh_write_sidecar_builds_atomic_script_at_meta_path():
-    """The remote write is atomic (temp -> sync -> mv -> chmod 600) and targets
-    exactly ``<stream>.meta``."""
+    """The remote write is atomic and targets exactly ``<stream>.meta``, via an
+    UNPREDICTABLE mktemp temp (R12d/P6) -- NOT the old predictable ``<meta>.tmp`` a
+    remote user could pre-symlink. Mutation guard: revert to ``cat > <meta>.tmp`` and the
+    'no predictable temp' assertion fails."""
     ep = SSHRawEndpoint(config={"path": "/backup", "hostname": "nas"})
     ep._exec_remote_command = MagicMock(
         return_value=MagicMock(returncode=0, stderr=b"", stdout=b"")
@@ -89,10 +91,12 @@ def test_ssh_write_sidecar_builds_atomic_script_at_meta_path():
 
     script = ep._exec_remote_command.call_args[0][0][2]
     assert str(snap.metadata_path) == "/backup/snap.btrfs.meta"
-    assert "/backup/snap.btrfs.meta.tmp" in script
-    assert "sync &&" in script
-    assert "mv -f" in script
+    # unpredictable temp + atomic mv into the real meta path; no guessable temp path
+    assert "mktemp" in script
+    assert "/backup/snap.btrfs.meta.tmp" not in script
+    assert 'mv -f -- "$tmp" /backup/snap.btrfs.meta' in script
     assert "chmod 600" in script
+    assert "trap" in script  # temp cleaned up on failure
 
 
 def test_ssh_write_sidecar_raises_on_remote_failure():

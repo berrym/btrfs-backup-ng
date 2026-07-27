@@ -239,6 +239,8 @@ def _handle_backup(args: argparse.Namespace) -> int:
         endpoint_config["ssh_key"] = args.ssh_key
     if getattr(args, "ssh_auth_sock", None):
         endpoint_config["ssh_auth_sock"] = args.ssh_auth_sock
+    if getattr(args, "ssh_host_key_policy", None):
+        endpoint_config["ssh_host_key_policy"] = args.ssh_host_key_policy
     # Encryption for raw targets. Threaded from the CLI flags; fail closed below so
     # this path can never silently write plaintext when encryption was requested.
     encrypt = getattr(args, "encrypt", None) or "none"
