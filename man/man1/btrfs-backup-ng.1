@@ -190,6 +190,27 @@ Use sudo for btrfs commands on remote host.
 .TP
 .B ssh_key
 Path to SSH private key file.
+.TP
+.B ssh_host_key_policy
+Host-key verification policy: \fBaccept-new\fR (default; trust-on-first-use, but reject a
+changed key) or \fBstrict\fR (only hosts already present in known_hosts; an unknown host is
+refused). Also settable per run with \fB--ssh-host-key-policy\fR.
+.SH SSH SECURITY
+btrfs-backup-ng verifies the remote host's SSH key on every connection. The default policy,
+\fBaccept-new\fR, trusts a host's key on first contact and pins it, then refuses to connect if
+that key later changes (the usual man-in-the-middle signal). Set \fBssh_host_key_policy =
+strict\fR (or pass \fB--ssh-host-key-policy strict\fR) to require the host already be present in
+known_hosts and refuse any unknown host.
+.PP
+Under \fBsudo\fR, host keys are verified and pinned against the invoking operator's
+\fI~/.ssh/known_hosts\fR (not root's), so trust you established interactively still applies.
+Operator \fBssh_opts\fR are honored, so an explicit \fBStrictHostKeyChecking\fR there takes
+precedence over the tool's default.
+.PP
+SSH ControlMaster sockets are created in an unpredictable, private (0700) directory (preferring
+\fB$XDG_RUNTIME_DIR\fR) and removed when the connection closes, so a local user cannot hijack the
+multiplexed connection. The internal command lock is likewise placed in a private per-user
+directory rather than a predictable \fI/tmp\fR path.
 .SH RAW TARGETS
 Raw targets write btrfs send streams directly to files instead of using
 \fBbtrfs receive\fR. This enables backups to non-btrfs filesystems (NFS, SMB,
