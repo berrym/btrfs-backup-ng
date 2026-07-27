@@ -1336,6 +1336,7 @@ Examples:
         metavar="PATH",
         help="Explicit ssh-agent socket (overrides auto-discovery; useful under sudo)",
     )
+    add_ssh_hostkey_arg(snapper_backup)
     snapper_backup.add_argument(
         "--compress",
         metavar="METHOD",
@@ -1459,6 +1460,7 @@ Examples:
         metavar="PATH",
         help="Explicit ssh-agent socket (overrides auto-discovery; useful under sudo)",
     )
+    add_ssh_hostkey_arg(snapper_restore)
     snapper_restore.add_argument(
         "-l",
         "--list",

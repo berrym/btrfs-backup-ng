@@ -144,3 +144,20 @@ def test_every_handler_threading_ssh_sudo_also_threads_host_key_policy():
         f"these handlers thread target.ssh_sudo but not ssh_host_key_policy "
         f"(strict would silently degrade): {offenders}"
     )
+
+
+# ------------------------------------ R12d: snapper subcommands get the flag (R12b deferral)
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["snapper", "backup", "--ssh-host-key-policy", "strict", "src", "ssh://h/p"],
+        ["snapper", "restore", "--ssh-host-key-policy", "strict", "ssh://h/p", "/dest"],
+    ],
+)
+def test_snapper_subcommands_accept_ssh_host_key_policy(argv):
+    from btrfs_backup_ng.cli.dispatcher import create_subcommand_parser
+
+    ns = create_subcommand_parser().parse_args(argv)
+    assert ns.ssh_host_key_policy == "strict"

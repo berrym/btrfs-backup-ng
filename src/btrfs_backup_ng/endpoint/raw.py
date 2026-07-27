@@ -1782,8 +1782,8 @@ class SSHRawEndpoint(RawEndpoint):
         # mtime only stat can give, so the preflight must promise what enumeration
         # actually depends on.
         check = (
-            'for t in cat mv chmod stat; do command -v "$t" >/dev/null 2>&1 '
-            "|| exit 1; done; echo RAWSSHOK"
+            'for t in cat mv chmod stat mktemp dirname; do command -v "$t" '
+            ">/dev/null 2>&1 || exit 1; done; echo RAWSSHOK"
         )
         res = self._exec_remote_command(["sh", "-c", check], check=False)
         out = res.stdout
@@ -2100,11 +2100,18 @@ class SSHRawEndpoint(RawEndpoint):
         return so a maintenance command can tell whether the write succeeded; the
         engine's commit path wraps this to stay best-effort."""
         meta = str(snapshot.metadata_path)
-        tmp = f"{meta}.tmp"
+        meta_q = shlex.quote(meta)
+        # Write the sidecar to an UNPREDICTABLE remote temp (mktemp), then mv it atomically
+        # into place. The old predictable ``<meta>.tmp`` let a local user ON THE REMOTE plant
+        # a symlink at that guessable path so ``cat >`` followed it and truncated an arbitrary
+        # file the remote (sudo) user can write -- an unguessable mktemp name closes that by
+        # design (R12d/P6). A ``trap`` removes the temp on any failure; the name avoids
+        # ``.btrfs``/``.meta`` so a leaked temp is never mis-enumerated as a stream/sidecar.
         script = (
-            f"cat > {shlex.quote(tmp)} && sync && "
-            f"mv -f {shlex.quote(tmp)} {shlex.quote(meta)} && "
-            f"chmod 600 {shlex.quote(meta)}"
+            f"set -e; d=$(dirname -- {meta_q}); "
+            'tmp=$(mktemp "$d/.sidecar-tmp.XXXXXX"); '
+            "trap 'rm -f -- \"$tmp\"' EXIT; "
+            f'cat > "$tmp"; chmod 600 "$tmp"; sync; mv -f -- "$tmp" {meta_q}'
         )
         result = self._exec_remote_command(
             ["sh", "-c", script], input=snapshot.serialize(), check=False
