@@ -101,6 +101,15 @@ Default: zstd for SSH targets, none for local.
 .BI \-\-rate-limit " RATE"
 Bandwidth limit for transfers. Examples: 10M, 1G, 500K.
 .TP
+.B \-\-ssh-sudo
+Use sudo for btrfs commands on the remote host (SSH / raw+ssh targets).
+.TP
+.BI \-\-ssh-key " FILE"
+Path to SSH private key file.
+.TP
+.BI \-\-ssh-host-key-policy " POLICY"
+Host-key verification: \fBaccept-new\fR (default) or \fBstrict\fR.
+.TP
 .B \-\-dry-run
 Show what would be backed up without making changes.
 .TP
@@ -130,6 +139,15 @@ Restore specific snapshot number. Can be specified multiple times.
 .TP
 .BR \-a ", " \-\-all
 Restore all available backups.
+.TP
+.B \-\-ssh-sudo
+Use sudo for btrfs commands on the remote host (SSH / raw+ssh targets).
+.TP
+.BI \-\-ssh-key " FILE"
+Path to SSH private key file.
+.TP
+.BI \-\-ssh-host-key-policy " POLICY"
+Host-key verification: \fBaccept-new\fR (default) or \fBstrict\fR.
 .TP
 .B \-\-dry-run
 Show what would be restored without making changes.
