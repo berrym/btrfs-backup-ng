@@ -1,7 +1,9 @@
 """Tests for restore functionality."""
 
 import argparse
+import json
 import time
+from dataclasses import asdict
 from pathlib import Path
 from unittest.mock import ANY, MagicMock, patch
 
@@ -15,8 +17,10 @@ from btrfs_backup_ng.core.restore import (
     find_snapshot_by_name,
     get_restore_chain,
     list_remote_snapshots,
+    list_snapper_backups,
     validate_restore_destination,
 )
+from btrfs_backup_ng.snapper.metadata import BackupMetadata, save_backup_metadata
 
 
 class MockSnapshot:
@@ -3680,3 +3684,135 @@ class TestRestoreSnapperSnapshot:
 
             # Check warning was logged
             assert "falling back to full restore" in caplog.text.lower()
+
+
+def _make_backup_meta(number, *, desc="timeline", snap_type="single", userdata=None):
+    """Build a BackupMetadata for a raw snapper sidecar (R11 Part 1 tests)."""
+    return BackupMetadata(
+        snapper_config="root",
+        snapper_number=number,
+        snapper_type=snap_type,
+        snapper_description=desc,
+        snapper_cleanup="timeline",
+        snapper_pre_num=None,
+        snapper_userdata=userdata or {},
+        snapper_date="2025-10-01 12:00:00",
+        original_info_xml=f"<?xml version='1.0'?><snapshot><num>{number}</num></snapshot>",
+    )
+
+
+class _FakeRemoteEndpoint:
+    """Minimal stand-in for SSHRawEndpoint used by the raw+ssh enumeration test.
+
+    A bare MagicMock is unusable here: _list_snapper_backups_at_destination and
+    _load_snapper_sidecar branch on hasattr(_is_remote)/getattr(_is_remote), and a
+    MagicMock answers truthy for every attribute -- so we model only what the code
+    actually reads.
+    """
+
+    _is_remote = True
+
+    def __init__(self, path, exec_fn):
+        self.config = {"path": path}
+        self._exec_remote_command = exec_fn
+
+
+class TestListRawSnapperBackups:
+    """R11 Part 1: enumerate raw:// / raw+ssh:// snapper backups via sidecars."""
+
+    def test_backup_metadata_from_dict_round_trips(self):
+        """BackupMetadata.from_dict reverses asdict() with no drift."""
+        meta = _make_backup_meta(7, desc="pre-update", userdata={"k": "v"})
+        rebuilt = BackupMetadata.from_dict(asdict(meta))
+        assert rebuilt == meta
+
+    def test_local_raw_enumeration_sorted(self, tmp_path):
+        """A raw:// dir of sidecars enumerates as number-sorted backup dicts."""
+        for num in (12, 3, 7):
+            save_backup_metadata(
+                tmp_path / f"root-{num}.snapper-meta.json", _make_backup_meta(num)
+            )
+
+        result = list_snapper_backups(f"raw://{tmp_path}")
+
+        assert [b["number"] for b in result] == [3, 7, 12]
+        for b in result:
+            assert b["raw"] is True
+            assert b["backup_name"] == f"root-{b['number']}"
+            assert b["snapshot_path"] is None
+            assert b["info_xml_path"] is None
+
+    def test_local_raw_metadata_fields_preserved(self, tmp_path):
+        """The display metadata (type/date/description/userdata) survives the sidecar."""
+        save_backup_metadata(
+            tmp_path / "root-5.snapper-meta.json",
+            _make_backup_meta(
+                5, desc="before upgrade", snap_type="pre", userdata={"reason": "test"}
+            ),
+        )
+
+        (backup,) = list_snapper_backups(f"raw://{tmp_path}")
+        meta = backup["metadata"]
+
+        assert meta.type == "pre"
+        assert meta.num == 5
+        assert meta.description == "before upgrade"
+        assert meta.userdata == {"reason": "test"}
+        assert str(meta.date).startswith("2025-10-01 12:00:00")
+
+    def test_ignores_non_snapper_sidecars(self, tmp_path):
+        """Raw stream files and .meta sidecars are not mistaken for snapper backups."""
+        save_backup_metadata(
+            tmp_path / "root-9.snapper-meta.json", _make_backup_meta(9)
+        )
+        (tmp_path / "root-9").write_bytes(b"btrfs-send-stream")
+        (tmp_path / "root-9.meta").write_text("{}")
+
+        result = list_snapper_backups(f"raw://{tmp_path}")
+
+        assert [b["number"] for b in result] == [9]
+
+    def test_bad_sidecar_is_skipped(self, tmp_path, caplog):
+        """A corrupt sidecar is warned-and-skipped; good ones still enumerate."""
+        save_backup_metadata(
+            tmp_path / "root-4.snapper-meta.json", _make_backup_meta(4)
+        )
+        (tmp_path / "root-bad.snapper-meta.json").write_text("{not valid json")
+
+        with caplog.at_level("WARNING"):
+            result = list_snapper_backups(f"raw://{tmp_path}")
+
+        assert [b["number"] for b in result] == [4]
+        assert "root-bad" in caplog.text
+
+    def test_missing_dir_returns_empty(self, tmp_path):
+        """A raw:// path with no sidecars yields no backups (no crash)."""
+        assert list_snapper_backups(f"raw://{tmp_path}/does-not-exist") == []
+
+    def test_remote_raw_ssh_enumeration(self):
+        """raw+ssh:// enumerates by ls'ing names then cat'ing each sidecar over ssh."""
+        metas = {n: _make_backup_meta(n) for n in (2, 8)}
+        sidecar_json = {
+            f"root-{n}.snapper-meta.json": json.dumps(asdict(m))
+            for n, m in metas.items()
+        }
+
+        def fake_exec(command, **kwargs):
+            cp = MagicMock()
+            cp.returncode = 0
+            if command[0] == "ls":
+                cp.stdout = ("\n".join(sidecar_json) + "\n").encode()
+            elif command[0] == "cat":
+                cp.stdout = sidecar_json[Path(command[1]).name].encode()
+            else:  # pragma: no cover - defensive
+                raise AssertionError(f"unexpected remote command: {command}")
+            return cp
+
+        fake_ep = _FakeRemoteEndpoint("/remote/backups", fake_exec)
+
+        with patch("btrfs_backup_ng.endpoint.choose_endpoint", return_value=fake_ep):
+            result = list_snapper_backups("raw+ssh://host/remote/backups")
+
+        assert [b["number"] for b in result] == [2, 8]
+        assert all(b["raw"] for b in result)
+        assert {b["backup_name"] for b in result} == {"root-2", "root-8"}

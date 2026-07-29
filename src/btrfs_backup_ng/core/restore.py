@@ -4,6 +4,7 @@ Enables pulling snapshots from backup storage (SSH or local) back to local syste
 for disaster recovery, migration, or backup verification.
 """
 
+import json
 import logging
 import subprocess
 import time
@@ -15,7 +16,7 @@ from .. import __util__
 from ..__util__ import Snapshot
 from ..transaction import log_transaction
 from . import progress as progress_utils
-from .operations import send_snapshot
+from .operations import _list_snapper_backups_at_destination, send_snapshot
 
 logger = logging.getLogger(__name__)
 
@@ -712,6 +713,13 @@ def list_snapper_backups(
             ...
         ]
     """
+    # R11: raw:// and raw+ssh:// snapper backups are flat btrfs-send streams plus a
+    # {name}.snapper-meta.json sidecar -- there is no .snapshots/{num}/info.xml layout
+    # to scan. Dispatch those to a sidecar-based enumeration so they can be listed AND
+    # restored (Part 2), instead of silently returning [] as the .snapshots scan did.
+    if str(backup_path).startswith(("raw://", "raw+ssh://")):
+        return _list_raw_snapper_backups(backup_path)
+
     from ..snapper.metadata import parse_info_xml
 
     backup_base = Path(backup_path)
@@ -749,6 +757,70 @@ def list_snapper_backups(
                 backups.append(backup_info)
 
     # Sort by number
+    backups.sort(key=lambda b: int(str(b["number"])))
+    return backups
+
+
+def _load_snapper_sidecar(endpoint: Any, name: str) -> Any:
+    """Load a ``{name}.snapper-meta.json`` sidecar into a BackupMetadata.
+
+    Local ``raw://`` reads the file directly; ``raw+ssh://`` cat's it back over
+    ssh (the argv is shlex-quoted inside ``_exec_remote_command``, so the name is
+    injection-safe). Both funnel through ``BackupMetadata.from_dict`` so the file
+    and stream paths cannot drift.
+    """
+    from ..snapper.metadata import BackupMetadata, load_backup_metadata
+
+    filename = f"{name}.snapper-meta.json"
+    dest_path = Path(endpoint.config["path"])
+
+    if getattr(endpoint, "_is_remote", False):
+        remote_path = str(dest_path / filename)
+        result = endpoint._exec_remote_command(["cat", remote_path], check=True)
+        raw = result.stdout
+        if isinstance(raw, (bytes, bytearray)):
+            raw = raw.decode("utf-8")
+        return BackupMetadata.from_dict(json.loads(raw))
+
+    return load_backup_metadata(dest_path / filename)
+
+
+def _list_raw_snapper_backups(backup_path: str) -> list[dict]:
+    """Enumerate snapper backups at a ``raw://`` / ``raw+ssh://`` target.
+
+    Raw snapper backups have no ``.snapshots/{num}/info.xml`` layout, so the
+    snapper number and metadata are recovered from each ``{name}.snapper-meta.json``
+    sidecar (reusing the proven ``_list_snapper_backups_at_destination`` name scan,
+    local and remote). Returns the same dict shape the btrfs path returns
+    (``number``/``metadata``/``snapshot_path``/``info_xml_path``) plus ``raw`` and
+    ``backup_name`` so Part 2 (materialization) can resolve the stream by name.
+    """
+    from ..endpoint import choose_endpoint
+
+    endpoint = choose_endpoint(backup_path, {"path": backup_path, "snap_prefix": ""})
+
+    backups: list[dict[str, Any]] = []
+    for name in _list_snapper_backups_at_destination(endpoint):
+        try:
+            backup_meta = _load_snapper_sidecar(endpoint, name)
+            metadata = backup_meta.to_snapper_metadata()
+        except Exception as e:
+            logger.warning(
+                "Skipping raw snapper backup %r (unreadable sidecar): %s", name, e
+            )
+            continue
+
+        backups.append(
+            {
+                "number": backup_meta.snapper_number,
+                "snapshot_path": None,
+                "info_xml_path": None,
+                "metadata": metadata,
+                "raw": True,
+                "backup_name": name,
+            }
+        )
+
     backups.sort(key=lambda b: int(str(b["number"])))
     return backups
 

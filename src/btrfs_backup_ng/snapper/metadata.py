@@ -251,6 +251,26 @@ class BackupMetadata:
             userdata=self.snapper_userdata,
         )
 
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "BackupMetadata":
+        """Create from a JSON-decoded dict.
+
+        Single construction site shared by ``load_backup_metadata`` (local file)
+        and the raw+ssh enumeration path (a ``.snapper-meta.json`` cat'd back over
+        ssh), so the two never drift.
+        """
+        return cls(
+            snapper_config=data.get("snapper_config", ""),
+            snapper_number=data.get("snapper_number", 0),
+            snapper_type=data.get("snapper_type", "single"),
+            snapper_description=data.get("snapper_description", ""),
+            snapper_cleanup=data.get("snapper_cleanup", ""),
+            snapper_pre_num=data.get("snapper_pre_num"),
+            snapper_userdata=data.get("snapper_userdata", {}),
+            snapper_date=data.get("snapper_date", ""),
+            original_info_xml=data.get("original_info_xml", ""),
+        )
+
 
 def save_backup_metadata(path: Path | str, metadata: BackupMetadata) -> None:
     """Save backup metadata to a JSON file.
@@ -294,14 +314,4 @@ def load_backup_metadata(path: Path | str) -> BackupMetadata:
     except json.JSONDecodeError as e:
         raise ValueError(f"Invalid metadata JSON: {e}") from e
 
-    return BackupMetadata(
-        snapper_config=data.get("snapper_config", ""),
-        snapper_number=data.get("snapper_number", 0),
-        snapper_type=data.get("snapper_type", "single"),
-        snapper_description=data.get("snapper_description", ""),
-        snapper_cleanup=data.get("snapper_cleanup", ""),
-        snapper_pre_num=data.get("snapper_pre_num"),
-        snapper_userdata=data.get("snapper_userdata", {}),
-        snapper_date=data.get("snapper_date", ""),
-        original_info_xml=data.get("original_info_xml", ""),
-    )
+    return BackupMetadata.from_dict(data)
