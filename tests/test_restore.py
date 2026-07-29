@@ -3816,3 +3816,196 @@ class TestListRawSnapperBackups:
         assert [b["number"] for b in result] == [2, 8]
         assert all(b["raw"] for b in result)
         assert {b["backup_name"] for b in result} == {"root-2", "root-8"}
+
+
+class TestResolveRawSnapperBackup:
+    """R11 Part 2: snapper number -> backup_name -> RawSnapshot resolution."""
+
+    def _write_sidecars(self, tmp_path, numbers):
+        for n in numbers:
+            save_backup_metadata(
+                tmp_path / f"root-{n}.snapper-meta.json", _make_backup_meta(n)
+            )
+
+    def _fake_endpoint(self, tmp_path, stream_names):
+        streams = []
+        for nm in stream_names:
+            s = MagicMock()
+            s.name = nm
+            streams.append(s)
+
+        class _Ep:
+            def __init__(self):
+                self.config = {"path": tmp_path}
+
+            def list_snapshots(self, flush_cache=False):
+                return streams
+
+        return _Ep()
+
+    def test_resolves_number_to_stream(self, tmp_path):
+        from btrfs_backup_ng.core.restore import _resolve_raw_snapper_backup
+
+        self._write_sidecars(tmp_path, [7, 12])
+        fake = self._fake_endpoint(tmp_path, ["root-7", "root-12"])
+        with patch("btrfs_backup_ng.endpoint.choose_endpoint", return_value=fake):
+            ep, snap, meta = _resolve_raw_snapper_backup(f"raw://{tmp_path}", 12)
+        assert ep is fake
+        assert snap.name == "root-12"
+        assert meta.snapper_number == 12
+
+    def test_missing_number_raises(self, tmp_path):
+        from btrfs_backup_ng.core.restore import (
+            RestoreError,
+            _resolve_raw_snapper_backup,
+        )
+
+        self._write_sidecars(tmp_path, [7])
+        fake = self._fake_endpoint(tmp_path, ["root-7"])
+        with patch("btrfs_backup_ng.endpoint.choose_endpoint", return_value=fake):
+            with pytest.raises(RestoreError, match="number 99 not found"):
+                _resolve_raw_snapper_backup(f"raw://{tmp_path}", 99)
+
+    def test_missing_stream_raises(self, tmp_path):
+        from btrfs_backup_ng.core.restore import (
+            RestoreError,
+            _resolve_raw_snapper_backup,
+        )
+
+        self._write_sidecars(tmp_path, [7])
+        fake = self._fake_endpoint(tmp_path, [])  # sidecar present, stream gone
+        with patch("btrfs_backup_ng.endpoint.choose_endpoint", return_value=fake):
+            with pytest.raises(RestoreError, match="stream for snapper backup"):
+                _resolve_raw_snapper_backup(f"raw://{tmp_path}", 7)
+
+
+class TestRestoreRawSnapperSnapshot:
+    """R11 Part 2: materialize a raw snapper stream into a fresh snapper slot."""
+
+    def _setup(self, tmp_path, *, send_rc=0):
+        from btrfs_backup_ng.snapper import SnapperConfig
+
+        config = SnapperConfig(name="root", subvolume=tmp_path / "local")
+        raw_ep = MagicMock()
+        send_proc = MagicMock()
+        send_proc.stdout = MagicMock()
+        send_proc.returncode = send_rc
+        raw_ep.send.return_value = send_proc
+        raw_snap = MagicMock()
+        raw_snap.name = "root-558"
+        recv_proc = MagicMock()
+        recv_proc.communicate.return_value = (b"", b"")
+        recv_proc.returncode = 0
+        return config, raw_ep, raw_snap, recv_proc
+
+    def test_materializes_and_regenerates_info_xml(self, tmp_path):
+        from btrfs_backup_ng.core.restore import restore_snapper_snapshot
+
+        meta = _make_backup_meta(
+            558, desc="before upgrade", snap_type="pre", userdata={"reason": "manual"}
+        )
+        config, raw_ep, raw_snap, recv_proc = self._setup(tmp_path)
+
+        with (
+            patch("btrfs_backup_ng.snapper.SnapperScanner") as scanner,
+            patch(
+                "btrfs_backup_ng.core.restore._resolve_raw_snapper_backup",
+                return_value=(raw_ep, raw_snap, meta),
+            ),
+            patch(
+                "btrfs_backup_ng.core.restore.subprocess.Popen", return_value=recv_proc
+            ),
+            patch(
+                "btrfs_backup_ng.core.restore.progress_utils.is_interactive",
+                return_value=False,
+            ),
+            patch("os.geteuid", return_value=0),
+        ):
+            scanner.return_value.get_config.return_value = config
+            scanner.return_value.get_next_snapshot_number.return_value = 42
+
+            next_num, path = restore_snapper_snapshot(
+                backup_path="raw:///backups/root",
+                backup_number=558,
+                snapper_config_name="root",
+                options={"show_progress": False},
+            )
+
+        # The raw stream was materialized via RawEndpoint.send (not btrfs send).
+        raw_ep.send.assert_called_once_with(raw_snap)
+        assert next_num == 42
+        dest_dir = config.snapshots_dir / "42"
+        assert path == dest_dir / "snapshot"
+        # info.xml regenerated from the sidecar, renumbered, metadata preserved.
+        info_xml = (dest_dir / "info.xml").read_text()
+        assert "<type>pre</type>" in info_xml
+        assert "<num>42</num>" in info_xml
+        assert "before upgrade" in info_xml
+        assert "<reason>manual</reason>" in info_xml
+
+    def test_send_failure_cleans_up_and_raises(self, tmp_path):
+        from btrfs_backup_ng.core.restore import (
+            RestoreError,
+            restore_snapper_snapshot,
+        )
+
+        meta = _make_backup_meta(558)
+        config, raw_ep, raw_snap, recv_proc = self._setup(tmp_path, send_rc=1)
+
+        with (
+            patch("btrfs_backup_ng.snapper.SnapperScanner") as scanner,
+            patch(
+                "btrfs_backup_ng.core.restore._resolve_raw_snapper_backup",
+                return_value=(raw_ep, raw_snap, meta),
+            ),
+            patch(
+                "btrfs_backup_ng.core.restore.subprocess.Popen", return_value=recv_proc
+            ),
+            patch(
+                "btrfs_backup_ng.core.restore.progress_utils.is_interactive",
+                return_value=False,
+            ),
+            patch("os.geteuid", return_value=0),
+        ):
+            scanner.return_value.get_config.return_value = config
+            scanner.return_value.get_next_snapshot_number.return_value = 42
+
+            with pytest.raises(RestoreError, match="raw stream decode failed"):
+                restore_snapper_snapshot(
+                    backup_path="raw:///backups/root",
+                    backup_number=558,
+                    snapper_config_name="root",
+                    options={"show_progress": False},
+                )
+
+        # The freshly-allocated slot is cleaned up -- no partial backup left behind.
+        assert not (config.snapshots_dir / "42").exists()
+
+    def test_dry_run_resolves_then_returns_early(self, tmp_path):
+        from btrfs_backup_ng.core.restore import restore_snapper_snapshot
+
+        meta = _make_backup_meta(558)
+        config, raw_ep, raw_snap, _ = self._setup(tmp_path)
+
+        with (
+            patch("btrfs_backup_ng.snapper.SnapperScanner") as scanner,
+            patch(
+                "btrfs_backup_ng.core.restore._resolve_raw_snapper_backup",
+                return_value=(raw_ep, raw_snap, meta),
+            ) as resolve,
+            patch("os.geteuid", return_value=0),
+        ):
+            scanner.return_value.get_config.return_value = config
+            scanner.return_value.get_next_snapshot_number.return_value = 42
+
+            next_num, path = restore_snapper_snapshot(
+                backup_path="raw:///backups/root",
+                backup_number=558,
+                snapper_config_name="root",
+                dry_run=True,
+            )
+
+        resolve.assert_called_once()  # existence validated even in dry-run
+        raw_ep.send.assert_not_called()  # but no transfer happens
+        assert next_num == 42
+        assert path == Path("/dev/null")

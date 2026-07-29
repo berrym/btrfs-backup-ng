@@ -825,6 +825,55 @@ def _list_raw_snapper_backups(backup_path: str) -> list[dict]:
     return backups
 
 
+def _resolve_raw_snapper_backup(
+    backup_path: str, backup_number: int
+) -> tuple[Any, Any, Any]:
+    """Resolve a raw snapper backup number to (endpoint, RawSnapshot, BackupMetadata).
+
+    Maps a snapper number -> backup_name (via the ``.snapper-meta.json`` sidecars)
+    -> the matching RawSnapshot (by ``.name``, the shared cross-type backup identity
+    set when the stream and sidecar were written from one ``get_backup_name()``). One
+    endpoint is built and reused for both the lookup and the later ``send()``. The
+    returned BackupMetadata carries the snapper fields used to regenerate info.xml.
+
+    Raises RestoreError if the number has no sidecar or its stream file is missing.
+    """
+    from ..endpoint import choose_endpoint
+
+    endpoint = choose_endpoint(backup_path, {"path": backup_path, "snap_prefix": ""})
+
+    match_name = None
+    match_meta = None
+    for name in _list_snapper_backups_at_destination(endpoint):
+        try:
+            backup_meta = _load_snapper_sidecar(endpoint, name)
+        except Exception as e:
+            logger.warning(
+                "Skipping raw snapper backup %r (unreadable sidecar): %s", name, e
+            )
+            continue
+        if backup_meta.snapper_number == backup_number:
+            match_name = name
+            match_meta = backup_meta
+            break
+
+    if match_name is None:
+        raise RestoreError(
+            f"Snapper backup number {backup_number} not found at {backup_path}"
+        )
+
+    raw_snapshot = next(
+        (s for s in endpoint.list_snapshots() if s.name == match_name), None
+    )
+    if raw_snapshot is None:
+        raise RestoreError(
+            f"Raw stream for snapper backup {match_name!r} not found at {backup_path} "
+            "(its .snapper-meta.json sidecar exists but the btrfs-send stream is missing)"
+        )
+
+    return endpoint, raw_snapshot, match_meta
+
+
 def restore_snapper_snapshot(
     backup_path: str,
     backup_number: int,
@@ -873,14 +922,30 @@ def restore_snapper_snapshot(
     if local_config is None:
         raise RestoreError(f"Local snapper config not found: {snapper_config_name}")
 
-    # Backup paths
+    # Backup paths / source resolution. Raw targets have no .snapshots/{n}/snapshot
+    # subvolume -- the source is a stored btrfs-send stream resolved via the sidecars
+    # (Seam 1). btrfs targets keep the existing subvolume-path check.
     backup_base = Path(backup_path)
-    backup_snapshot_dir = backup_base / ".snapshots" / str(backup_number)
-    backup_snapshot_path = backup_snapshot_dir / "snapshot"
-    backup_info_xml = backup_snapshot_dir / "info.xml"
+    is_raw = str(backup_path).startswith(("raw://", "raw+ssh://"))
 
-    if not backup_snapshot_path.exists():
-        raise RestoreError(f"Backup snapshot not found: {backup_snapshot_path}")
+    raw_endpoint = None
+    raw_snapshot = None
+    raw_backup_meta = None
+    backup_snapshot_path: Path | None = None
+    backup_info_xml: Path | None = None
+
+    if is_raw:
+        raw_endpoint, raw_snapshot, raw_backup_meta = _resolve_raw_snapper_backup(
+            backup_path, backup_number
+        )
+        source_desc = raw_snapshot.name
+    else:
+        backup_snapshot_dir = backup_base / ".snapshots" / str(backup_number)
+        backup_snapshot_path = backup_snapshot_dir / "snapshot"
+        backup_info_xml = backup_snapshot_dir / "info.xml"
+        if not backup_snapshot_path.exists():
+            raise RestoreError(f"Backup snapshot not found: {backup_snapshot_path}")
+        source_desc = str(backup_snapshot_path)
 
     # Get next available snapshot number for restore
     next_num = scanner.get_next_snapshot_number(local_config)
@@ -889,9 +954,12 @@ def restore_snapper_snapshot(
     dest_snapshot_dir = local_config.snapshots_dir / str(next_num)
     dest_snapshot_path = dest_snapshot_dir / "snapshot"
 
-    # Parent path for incremental
+    # Parent path for incremental. Not applicable to raw: the stored stream already
+    # encodes whatever it encodes (full, or incremental against a parent matched by
+    # received_uuid, which the oldest-first restore loop lands just before this one) --
+    # RawEndpoint.send replays it verbatim, there is no btrfs-send `-p` to add here.
     parent_path = None
-    if parent_backup_number:
+    if not is_raw and parent_backup_number:
         parent_path = (
             backup_base / ".snapshots" / str(parent_backup_number) / "snapshot"
         )
@@ -901,6 +969,11 @@ def restore_snapper_snapshot(
                 parent_backup_number,
             )
             parent_path = None
+    elif is_raw and parent_backup_number:
+        logger.debug(
+            "Raw source: ignoring parent %d (stream is self-contained)",
+            parent_backup_number,
+        )
 
     if parent_path:
         logger.info(
@@ -921,11 +994,14 @@ def restore_snapper_snapshot(
     log_transaction(
         action="snapper_restore",
         status="started",
-        source=str(backup_snapshot_path),
+        source=source_desc,
         destination=str(dest_snapshot_path),
         snapshot=str(backup_number),
         parent=str(parent_backup_number) if parent_backup_number else None,
     )
+
+    # Label for send-side failures: a raw stream's decode pipeline is not `btrfs send`.
+    send_label = "raw stream decode" if is_raw else "btrfs send"
 
     try:
         # Create destination directory
@@ -938,36 +1014,43 @@ def restore_snapper_snapshot(
         else:
             dest_snapshot_dir.mkdir(parents=True, exist_ok=True)
 
-        # Build btrfs send command
-        send_cmd = ["btrfs", "send"]
-        if parent_path:
-            send_cmd.extend(["-p", str(parent_path)])
-        send_cmd.append(str(backup_snapshot_path))
-
-        # Build btrfs receive command
+        # Build btrfs receive command (shared: the raw stream's embedded subvolume is
+        # named "snapshot" -- the backup source was .snapshots/{n}/snapshot -- so
+        # receive lands dest_snapshot_dir/snapshot exactly like the btrfs path).
         receive_cmd = ["btrfs", "receive", str(dest_snapshot_dir)]
-
-        # Add sudo if needed
         if os.geteuid() != 0:
-            send_cmd = ["sudo"] + send_cmd
             receive_cmd = ["sudo"] + receive_cmd
-
-        logger.debug("Send command: %s", " ".join(send_cmd))
         logger.debug("Receive command: %s", " ".join(receive_cmd))
 
-        # Estimate size for progress bar (only for full transfers)
+        # Seam 2 (send side) + Seam 3 (progress estimate).
         estimated_size = None
-        if show_progress and not parent_path:
-            estimated_size = progress_utils.estimate_snapshot_size(
-                str(backup_snapshot_path), str(parent_path) if parent_path else None
+        if is_raw:
+            # RawEndpoint.send returns a Popen whose stdout is the verified,
+            # decrypted/decompressed btrfs-send stream -- a drop-in for the send
+            # Popen below. Its integrity check fires INSIDE send() before any bytes
+            # are received, so a corrupt stream aborts before touching the slot. No
+            # size estimate: raw .size is the on-disk (compressed) size, not the
+            # decoded stream size, so a progress total would mislead (spinner only).
+            assert raw_endpoint is not None and raw_snapshot is not None
+            send_process = raw_endpoint.send(raw_snapshot)
+        else:
+            send_cmd = ["btrfs", "send"]
+            if parent_path:
+                send_cmd.extend(["-p", str(parent_path)])
+            send_cmd.append(str(backup_snapshot_path))
+            if os.geteuid() != 0:
+                send_cmd = ["sudo"] + send_cmd
+            logger.debug("Send command: %s", " ".join(send_cmd))
+            if show_progress and not parent_path:
+                estimated_size = progress_utils.estimate_snapshot_size(
+                    str(backup_snapshot_path),
+                    str(parent_path) if parent_path else None,
+                )
+            send_process = subprocess.Popen(
+                send_cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
             )
-
-        # Start send process
-        send_process = subprocess.Popen(
-            send_cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
 
         # Use Rich progress for local transfers
         use_rich_progress = show_progress and progress_utils.is_interactive()
@@ -988,7 +1071,7 @@ def restore_snapper_snapshot(
             )
 
             if send_rc != 0:
-                raise RestoreError(f"btrfs send failed with code {send_rc}")
+                raise RestoreError(f"{send_label} failed with code {send_rc}")
             if receive_rc != 0:
                 raise RestoreError(f"btrfs receive failed with code {receive_rc}")
         else:
@@ -1008,7 +1091,7 @@ def restore_snapper_snapshot(
 
             if send_process.returncode != 0:
                 raise RestoreError(
-                    f"btrfs send failed with code {send_process.returncode}"
+                    f"{send_label} failed with code {send_process.returncode}"
                 )
             if receive_process.returncode != 0:
                 raise RestoreError(
@@ -1020,7 +1103,16 @@ def restore_snapper_snapshot(
 
         # Copy or generate info.xml
         dest_info_xml = dest_snapshot_dir / "info.xml"
-        if backup_info_xml.exists():
+        if is_raw:
+            # Seam 4: regenerate info.xml from the authoritative .snapper-meta.json
+            # sidecar (renumbered to the fresh local slot), preserving the snapper
+            # type/description/cleanup/userdata that snapper restore would otherwise
+            # lose -- raw targets have no .snapshots/{n}/info.xml to copy.
+            assert raw_backup_meta is not None
+            metadata = raw_backup_meta.to_snapper_metadata()
+            metadata.num = next_num
+            xml_content = generate_info_xml(metadata)
+        elif backup_info_xml is not None and backup_info_xml.exists():
             # Copy original info.xml but update the number
             try:
                 metadata = parse_info_xml(backup_info_xml)
@@ -1073,7 +1165,7 @@ def restore_snapper_snapshot(
         log_transaction(
             action="snapper_restore",
             status="completed",
-            source=str(backup_snapshot_path),
+            source=source_desc,
             destination=str(dest_snapshot_path),
             snapshot=str(backup_number),
             parent=str(parent_backup_number) if parent_backup_number else None,
@@ -1093,7 +1185,7 @@ def restore_snapper_snapshot(
         log_transaction(
             action="snapper_restore",
             status="failed",
-            source=str(backup_snapshot_path),
+            source=source_desc,
             destination=str(dest_snapshot_path),
             snapshot=str(backup_number),
             parent=str(parent_backup_number) if parent_backup_number else None,
