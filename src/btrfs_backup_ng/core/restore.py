@@ -909,7 +909,12 @@ def restore_snapper_snapshot(
     import shutil
 
     from ..snapper import SnapperScanner
-    from ..snapper.metadata import SnapperMetadata, generate_info_xml, parse_info_xml
+    from ..snapper.metadata import (
+        SnapperMetadata,
+        generate_info_xml,
+        parse_info_xml,
+        parse_info_xml_string,
+    )
 
     if options is None:
         options = {}
@@ -1104,12 +1109,27 @@ def restore_snapper_snapshot(
         # Copy or generate info.xml
         dest_info_xml = dest_snapshot_dir / "info.xml"
         if is_raw:
-            # Seam 4: regenerate info.xml from the authoritative .snapper-meta.json
-            # sidecar (renumbered to the fresh local slot), preserving the snapper
-            # type/description/cleanup/userdata that snapper restore would otherwise
-            # lose -- raw targets have no .snapshots/{n}/info.xml to copy.
+            # Seam 4: regenerate info.xml from the sidecar (renumbered to the fresh
+            # local slot), preserving the snapper type/description/cleanup/userdata
+            # that snapper restore would otherwise lose -- raw targets have no
+            # .snapshots/{n}/info.xml to copy. Prefer the sidecar's original_info_xml
+            # (snapper's OWN xml) through the fixed parser, so multi-entry userdata and
+            # older sidecars (which stored a mis-parsed userdata dict) both restore
+            # faithfully; fall back to the parsed fields only when no original exists.
             assert raw_backup_meta is not None
-            metadata = raw_backup_meta.to_snapper_metadata()
+            metadata = None
+            if raw_backup_meta.original_info_xml:
+                try:
+                    metadata = parse_info_xml_string(raw_backup_meta.original_info_xml)
+                except Exception as e:
+                    logger.warning(
+                        "Could not parse stored info.xml for backup %d (%s); "
+                        "regenerating from sidecar fields",
+                        backup_number,
+                        e,
+                    )
+            if metadata is None:
+                metadata = raw_backup_meta.to_snapper_metadata()
             metadata.num = next_num
             xml_content = generate_info_xml(metadata)
         elif backup_info_xml is not None and backup_info_xml.exists():

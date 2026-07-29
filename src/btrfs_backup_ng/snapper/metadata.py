@@ -14,6 +14,7 @@ from typing import Any, Optional
 __all__ = [
     "SnapperMetadata",
     "parse_info_xml",
+    "parse_info_xml_string",
     "generate_info_xml",
     "load_backup_metadata",
     "save_backup_metadata",
@@ -74,29 +75,42 @@ class SnapperMetadata:
         )
 
 
-def parse_info_xml(path: Path | str) -> SnapperMetadata:
-    """Parse a snapper info.xml file.
+def _parse_userdata(userdata_elems: list[ET.Element]) -> dict[str, str]:
+    """Parse snapper's <userdata> element(s) into a {name: value} dict.
 
-    Args:
-        path: Path to the info.xml file
+    Snapper (verified on 0.13.0) writes ONE ``<userdata>`` element PER entry, each
+    holding a ``<key>NAME</key><value>VALUE</value>`` pair -- so a two-entry snapshot
+    has two sibling ``<userdata>`` blocks. Iterate every block (not just the first)
+    and pair key/value within it, so multiple entries all survive. The old code used
+    ``root.find("userdata")`` (first block only) AND the child tag as the dict key,
+    silently dropping every entry after the first -- multi-entry userdata data loss.
 
-    Returns:
-        SnapperMetadata object with parsed information
-
-    Raises:
-        FileNotFoundError: If the file doesn't exist
-        ValueError: If the XML is malformed or missing required fields
+    Also handles a single block containing several key/value pairs, and a legacy
+    ``<name>value</name>`` child, for robustness.
     """
-    path = Path(path)
-    if not path.exists():
-        raise FileNotFoundError(f"info.xml not found: {path}")
+    userdata: dict[str, str] = {}
+    for userdata_elem in userdata_elems:
+        pending_key: Optional[str] = None
+        for item in userdata_elem:
+            if item.tag == "key":
+                pending_key = item.text or ""
+            elif item.tag == "value":
+                if pending_key is not None:
+                    userdata[pending_key] = item.text or ""
+                    pending_key = None
+                # A <value> with no preceding <key> is malformed; ignore it.
+            elif item.tag and item.text:
+                # Legacy / alternative <name>value</name> form.
+                userdata[item.tag] = item.text
+    return userdata
 
-    try:
-        tree = ET.parse(path)
-        root = tree.getroot()
-    except ET.ParseError as e:
-        raise ValueError(f"Failed to parse info.xml: {e}") from e
 
+def _snapper_metadata_from_root(root: ET.Element) -> SnapperMetadata:
+    """Build a SnapperMetadata from a parsed <snapshot> element.
+
+    Shared by ``parse_info_xml`` (file) and ``parse_info_xml_string`` (a sidecar's
+    stored ``original_info_xml``) so both read snapper's format identically.
+    """
     if root.tag != "snapshot":
         raise ValueError(f"Expected <snapshot> root element, got <{root.tag}>")
 
@@ -143,14 +157,6 @@ def parse_info_xml(path: Path | str) -> SnapperMetadata:
         except ValueError:
             pass  # Ignore invalid pre_num
 
-    # Extract userdata
-    userdata = {}
-    userdata_elem = root.find("userdata")
-    if userdata_elem is not None:
-        for item in userdata_elem:
-            if item.tag and item.text:
-                userdata[item.tag] = item.text
-
     return SnapperMetadata(
         type=type_elem.text,
         num=num,
@@ -158,8 +164,52 @@ def parse_info_xml(path: Path | str) -> SnapperMetadata:
         description=description,
         cleanup=cleanup,
         pre_num=pre_num,
-        userdata=userdata,
+        userdata=_parse_userdata(root.findall("userdata")),
     )
+
+
+def parse_info_xml(path: Path | str) -> SnapperMetadata:
+    """Parse a snapper info.xml file.
+
+    Args:
+        path: Path to the info.xml file
+
+    Returns:
+        SnapperMetadata object with parsed information
+
+    Raises:
+        FileNotFoundError: If the file doesn't exist
+        ValueError: If the XML is malformed or missing required fields
+    """
+    path = Path(path)
+    if not path.exists():
+        raise FileNotFoundError(f"info.xml not found: {path}")
+
+    try:
+        tree = ET.parse(path)
+        root = tree.getroot()
+    except ET.ParseError as e:
+        raise ValueError(f"Failed to parse info.xml: {e}") from e
+
+    return _snapper_metadata_from_root(root)
+
+
+def parse_info_xml_string(xml_content: str) -> SnapperMetadata:
+    """Parse snapper info.xml from a string.
+
+    Used to reconstruct metadata from a sidecar's stored ``original_info_xml`` --
+    snapper's own XML, the authoritative source on restore (independent of the
+    parsed-dict field, which older sidecars may have stored mis-parsed).
+
+    Raises:
+        ValueError: If the XML is malformed or missing required fields
+    """
+    try:
+        root = ET.fromstring(xml_content)
+    except ET.ParseError as e:
+        raise ValueError(f"Failed to parse info.xml: {e}") from e
+
+    return _snapper_metadata_from_root(root)
 
 
 def generate_info_xml(metadata: SnapperMetadata) -> str:
@@ -192,13 +242,16 @@ def generate_info_xml(metadata: SnapperMetadata) -> str:
         lines.append(f"  <pre_num>{metadata.pre_num}</pre_num>")
 
     if metadata.userdata:
-        lines.append("  <userdata>")
+
+        def _esc(s: str) -> str:
+            return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+        # Snapper writes one <userdata> block PER entry, each a <key>/<value> pair.
         for key, value in metadata.userdata.items():
-            value = value.replace("&", "&amp;")
-            value = value.replace("<", "&lt;")
-            value = value.replace(">", "&gt;")
-            lines.append(f"    <{key}>{value}</{key}>")
-        lines.append("  </userdata>")
+            lines.append("  <userdata>")
+            lines.append(f"    <key>{_esc(key)}</key>")
+            lines.append(f"    <value>{_esc(value)}</value>")
+            lines.append("  </userdata>")
 
     lines.append("</snapshot>")
     return "\n".join(lines)

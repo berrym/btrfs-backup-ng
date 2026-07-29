@@ -3687,7 +3687,23 @@ class TestRestoreSnapperSnapshot:
 
 
 def _make_backup_meta(number, *, desc="timeline", snap_type="single", userdata=None):
-    """Build a BackupMetadata for a raw snapper sidecar (R11 Part 1 tests)."""
+    """Build a BackupMetadata for a raw snapper sidecar (R11 tests).
+
+    original_info_xml is a valid snapper info.xml (real <key>/<value> userdata
+    format) so restore's primary path (parse the stored xml) is exercised.
+    """
+    ud = userdata or {}
+    # Snapper's real format: one <userdata> block per entry (sibling blocks).
+    ud_xml = "".join(
+        f"<userdata><key>{k}</key><value>{v}</value></userdata>" for k, v in ud.items()
+    )
+    original = (
+        "<?xml version='1.0'?><snapshot>"
+        f"<type>{snap_type}</type><num>{number}</num>"
+        "<date>2025-10-01 12:00:00</date>"
+        f"<description>{desc}</description><cleanup>timeline</cleanup>"
+        f"{ud_xml}</snapshot>"
+    )
     return BackupMetadata(
         snapper_config="root",
         snapper_number=number,
@@ -3695,9 +3711,9 @@ def _make_backup_meta(number, *, desc="timeline", snap_type="single", userdata=N
         snapper_description=desc,
         snapper_cleanup="timeline",
         snapper_pre_num=None,
-        snapper_userdata=userdata or {},
+        snapper_userdata=ud,
         snapper_date="2025-10-01 12:00:00",
-        original_info_xml=f"<?xml version='1.0'?><snapshot><num>{number}</num></snapshot>",
+        original_info_xml=original,
     )
 
 
@@ -3941,7 +3957,9 @@ class TestRestoreRawSnapperSnapshot:
         assert "<type>pre</type>" in info_xml
         assert "<num>42</num>" in info_xml
         assert "before upgrade" in info_xml
-        assert "<reason>manual</reason>" in info_xml
+        # snapper's real userdata format: <key>/<value> pairs
+        assert "<key>reason</key>" in info_xml
+        assert "<value>manual</value>" in info_xml
 
     def test_send_failure_cleans_up_and_raises(self, tmp_path):
         from btrfs_backup_ng.core.restore import (
@@ -4009,3 +4027,107 @@ class TestRestoreRawSnapperSnapshot:
         raw_ep.send.assert_not_called()  # but no transfer happens
         assert next_num == 42
         assert path == Path("/dev/null")
+
+
+class TestRawRestoreUserdataFidelity:
+    """R11: restore sources info.xml from original_info_xml so userdata survives."""
+
+    def _setup(self, tmp_path):
+        from btrfs_backup_ng.snapper import SnapperConfig
+
+        config = SnapperConfig(name="root", subvolume=tmp_path / "local")
+        raw_ep = MagicMock()
+        send_proc = MagicMock()
+        send_proc.stdout = MagicMock()
+        send_proc.returncode = 0
+        raw_ep.send.return_value = send_proc
+        raw_snap = MagicMock()
+        raw_snap.name = "root-1"
+        recv_proc = MagicMock()
+        recv_proc.communicate.return_value = (b"", b"")
+        recv_proc.returncode = 0
+        return config, raw_ep, raw_snap, recv_proc
+
+    def _restore(self, tmp_path, meta):
+        from btrfs_backup_ng.core.restore import restore_snapper_snapshot
+
+        config, raw_ep, raw_snap, recv_proc = self._setup(tmp_path)
+        with (
+            patch("btrfs_backup_ng.snapper.SnapperScanner") as scanner,
+            patch(
+                "btrfs_backup_ng.core.restore._resolve_raw_snapper_backup",
+                return_value=(raw_ep, raw_snap, meta),
+            ),
+            patch(
+                "btrfs_backup_ng.core.restore.subprocess.Popen", return_value=recv_proc
+            ),
+            patch(
+                "btrfs_backup_ng.core.restore.progress_utils.is_interactive",
+                return_value=False,
+            ),
+            patch("os.geteuid", return_value=0),
+        ):
+            scanner.return_value.get_config.return_value = config
+            scanner.return_value.get_next_snapshot_number.return_value = 42
+            restore_snapper_snapshot(
+                backup_path="raw:///backups/root",
+                backup_number=1,
+                snapper_config_name="root",
+                options={"show_progress": False},
+            )
+        return (config.snapshots_dir / "42" / "info.xml").read_text()
+
+    def test_multi_entry_userdata_survives_restore(self, tmp_path):
+        """Multiple userdata entries all round-trip into the restored info.xml."""
+        meta = _make_backup_meta(1, userdata={"reason": "manual", "ticket": "ABC-123"})
+        info_xml = self._restore(tmp_path, meta)
+        assert "<key>reason</key>" in info_xml and "<value>manual</value>" in info_xml
+        assert "<key>ticket</key>" in info_xml and "<value>ABC-123</value>" in info_xml
+
+    def test_old_sidecar_prefers_original_over_misparsed_dict(self, tmp_path):
+        """A pre-fix mis-parsed userdata dict is ignored; original_info_xml wins."""
+        from btrfs_backup_ng.snapper.metadata import BackupMetadata
+
+        original = (
+            "<?xml version='1.0'?><snapshot>"
+            "<type>single</type><num>1</num><date>2025-10-01 12:00:00</date>"
+            "<userdata><key>reason</key><value>manual</value></userdata>"
+            "<userdata><key>ticket</key><value>ABC-123</value></userdata>"
+            "</snapshot>"
+        )
+        # Older sidecar stored the lossy {'key':..,'value':..} form in the dict field.
+        meta = BackupMetadata(
+            snapper_config="root",
+            snapper_number=1,
+            snapper_type="single",
+            snapper_description="",
+            snapper_cleanup="",
+            snapper_pre_num=None,
+            snapper_userdata={"key": "ticket", "value": "ABC-123"},
+            snapper_date="2025-10-01 12:00:00",
+            original_info_xml=original,
+        )
+        info_xml = self._restore(tmp_path, meta)
+        # Both entries present => original_info_xml (not the bad dict) drove info.xml.
+        assert "<key>reason</key>" in info_xml and "<value>manual</value>" in info_xml
+        assert "<key>ticket</key>" in info_xml and "<value>ABC-123</value>" in info_xml
+
+    def test_falls_back_to_dict_when_no_original(self, tmp_path):
+        """With no original_info_xml, restore uses the parsed sidecar fields."""
+        from btrfs_backup_ng.snapper.metadata import BackupMetadata
+
+        meta = BackupMetadata(
+            snapper_config="root",
+            snapper_number=1,
+            snapper_type="single",
+            snapper_description="fallback case",
+            snapper_cleanup="number",
+            snapper_pre_num=None,
+            snapper_userdata={"reason": "manual"},
+            snapper_date="2025-10-01 12:00:00",
+            original_info_xml="",  # legacy sidecar without the raw xml
+        )
+        info_xml = self._restore(tmp_path, meta)
+        assert "fallback case" in info_xml
+        assert "<key>reason</key>" in info_xml and "<value>manual</value>" in info_xml
+        assert "<num>42</num>" in info_xml

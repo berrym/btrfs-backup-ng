@@ -11,6 +11,7 @@ from btrfs_backup_ng.snapper.metadata import (
     generate_info_xml,
     load_backup_metadata,
     parse_info_xml,
+    parse_info_xml_string,
     save_backup_metadata,
 )
 
@@ -333,7 +334,7 @@ class TestGenerateInfoXml:
         assert "<pre_num>199</pre_num>" in xml
 
     def test_generate_with_userdata(self):
-        """Test generating info.xml with userdata."""
+        """Test generating info.xml with userdata (snapper <key>/<value> pairs)."""
         meta = SnapperMetadata(
             type="single",
             num=100,
@@ -342,8 +343,10 @@ class TestGenerateInfoXml:
         )
         xml = generate_info_xml(meta)
         assert "<userdata>" in xml
-        assert "<key1>value1</key1>" in xml
-        assert "<key2>value2</key2>" in xml
+        assert "<key>key1</key>" in xml
+        assert "<value>value1</value>" in xml
+        assert "<key>key2</key>" in xml
+        assert "<value>value2</value>" in xml
         assert "</userdata>" in xml
 
     def test_generate_escapes_special_chars(self):
@@ -493,3 +496,102 @@ class TestSaveLoadBackupMetadata:
             data = json.load(f)
         assert data["snapper_config"] == "test"
         assert data["snapper_number"] == 1
+
+
+class TestUserdataKeyValueFormat:
+    """R11: snapper stores userdata as <key>/<value> pairs; parse+generate round-trip."""
+
+    # Snapper's real 0.13.0 format: ONE <userdata> block per entry (siblings).
+    SNAPPER_MULTI = (
+        "<?xml version='1.0'?><snapshot>"
+        "<type>single</type><num>7</num><date>2026-07-29 03:12:48</date>"
+        "<userdata><key>reason</key><value>manual</value></userdata>"
+        "<userdata><key>ticket</key><value>ABC-123</value></userdata>"
+        "</snapshot>"
+    )
+    # An alternative single-block-multi-pair form we also accept.
+    SNAPPER_SINGLE_BLOCK = (
+        "<?xml version='1.0'?><snapshot>"
+        "<type>single</type><num>7</num><date>2026-07-29 03:12:48</date>"
+        "<userdata>"
+        "<key>reason</key><value>manual</value>"
+        "<key>ticket</key><value>ABC-123</value>"
+        "</userdata></snapshot>"
+    )
+
+    def test_parse_string_multi_entry_userdata(self):
+        """Snapper's sibling <userdata> blocks parse to a full {name: value} dict."""
+        meta = parse_info_xml_string(self.SNAPPER_MULTI)
+        assert meta.userdata == {"reason": "manual", "ticket": "ABC-123"}
+        assert meta.type == "single"
+        assert meta.num == 7
+
+    def test_parse_single_block_multi_pair_also_supported(self):
+        """A single <userdata> block with several key/value pairs also parses."""
+        meta = parse_info_xml_string(self.SNAPPER_SINGLE_BLOCK)
+        assert meta.userdata == {"reason": "manual", "ticket": "ABC-123"}
+
+    def test_parse_file_multi_entry_userdata(self, tmp_path):
+        """The file parser shares the fixed logic (not just the string variant)."""
+        xml_file = tmp_path / "info.xml"
+        xml_file.write_text(self.SNAPPER_MULTI)
+        meta = parse_info_xml(xml_file)
+        assert meta.userdata == {"reason": "manual", "ticket": "ABC-123"}
+
+    def test_generate_emits_key_value_pairs(self):
+        """generate emits snapper's <key>/<value> form, not <name>value</name>."""
+        meta = SnapperMetadata(
+            type="single",
+            num=7,
+            date=datetime(2026, 7, 29, 3, 12, 48),
+            userdata={"reason": "manual", "ticket": "ABC-123"},
+        )
+        xml = generate_info_xml(meta)
+        assert "<key>reason</key>" in xml
+        assert "<value>manual</value>" in xml
+        assert "<key>ticket</key>" in xml
+        assert "<value>ABC-123</value>" in xml
+        assert "<reason>manual</reason>" not in xml  # the old, wrong form
+
+    def test_round_trip_preserves_multi_entry(self):
+        """parse(generate(x)) == x for multi-entry userdata (the real regression)."""
+        userdata = {"reason": "manual", "ticket": "ABC-123", "important": "yes"}
+        meta = SnapperMetadata(
+            type="pre",
+            num=42,
+            date=datetime(2026, 7, 29, 3, 12, 48),
+            description="before upgrade",
+            cleanup="number",
+            userdata=userdata,
+        )
+        reparsed = parse_info_xml_string(generate_info_xml(meta))
+        assert reparsed.userdata == userdata
+        assert reparsed.type == "pre"
+        assert reparsed.description == "before upgrade"
+        assert reparsed.cleanup == "number"
+
+    def test_legacy_name_value_form_still_parses(self):
+        """A legacy <name>value</name> userdata child is still read (back-compat)."""
+        legacy = (
+            "<?xml version='1.0'?><snapshot>"
+            "<type>single</type><num>1</num><date>2026-07-29 03:12:48</date>"
+            "<userdata><reason>manual</reason></userdata></snapshot>"
+        )
+        meta = parse_info_xml_string(legacy)
+        assert meta.userdata == {"reason": "manual"}
+
+    def test_value_without_key_is_ignored(self):
+        """A malformed <value> with no preceding <key> does not corrupt the dict."""
+        malformed = (
+            "<?xml version='1.0'?><snapshot>"
+            "<type>single</type><num>1</num><date>2026-07-29 03:12:48</date>"
+            "<userdata><value>orphan</value><key>k</key><value>v</value></userdata>"
+            "</snapshot>"
+        )
+        meta = parse_info_xml_string(malformed)
+        assert meta.userdata == {"k": "v"}
+
+    def test_parse_string_rejects_malformed_xml(self):
+        """A non-XML original_info_xml raises ValueError (restore falls back)."""
+        with pytest.raises(ValueError):
+            parse_info_xml_string("{not xml")
