@@ -16,9 +16,11 @@ incremental transfers, and time-based retention.
 
 Actively developed, pre-1.0, with a strong emphasis on data integrity. Backup and restore
 across local, SSH, and raw targets are working and have been adversarially tested and
-verified byte-identical on real hardware. A reliability-hardening roadmap (lock
-persistence, retention edge cases, deeper verification, SSH hardening) is tracked in
-[#20](https://github.com/berrym/btrfs-backup-ng/issues/20). As with any backup tool, test
+verified byte-identical on real hardware. Much of the reliability-and-security hardening
+roadmap has now shipped — retention correctness and the incremental-backup engine in 0.9.0,
+and deeper verification, crash-atomic state/lock persistence, and SSH security (host-key
+verification / MITM mitigation) in 0.9.1 (tracked in
+[#20](https://github.com/berrym/btrfs-backup-ng/issues/20)). As with any backup tool, test
 your restores.
 
 ## Heritage
@@ -74,7 +76,7 @@ See the [LICENSE](LICENSE) file for full copyright attribution.
 - **Parallel Execution**: Concurrent volume and target transfers
 - **Stream Compression**: zstd, gzip, lz4, pigz, lzop support
 - **Bandwidth Throttling**: Rate limiting for remote transfers
-- **Robust SSH**: Password fallback, sudo support, Paramiko integration
+- **Robust SSH**: Host-key verification (accept-new/strict, MITM-safe), password fallback, sudo support
 
 ### Raw Targets (Non-btrfs Destinations)
 - **Write to Files**: Store btrfs send streams as files on any filesystem (NFS, SMB, cloud storage)
@@ -586,6 +588,7 @@ path = "ssh://user@host:/backups"      # SSH remote path
 ssh_sudo = true                        # Use sudo on remote
 ssh_port = 22                          # SSH port
 ssh_key = "~/.ssh/backup_key"          # SSH private key
+ssh_host_key_policy = "accept-new"     # Host-key policy: accept-new (default) | strict
 ssh_password_auth = true               # Allow password fallback
 compress = "zstd"                      # Compression (none|gzip|zstd|lz4|pigz|lzop)
 rate_limit = "10M"                     # Bandwidth limit (K|M|G suffix)
@@ -1080,6 +1083,13 @@ path = "ssh://backup@remote-server:/mnt/backups/home"
 ssh_sudo = true                           # Required for btrfs receive
 ssh_key = "~/.ssh/btrfs-backup-key"       # Path to private key
 ```
+
+> **Host-key verification:** on first connection btrfs-backup-ng trusts and pins the server's
+> SSH key (`accept-new`), then refuses to connect if that key later changes. Add
+> `ssh_host_key_policy = "strict"` to require the host already be present in `known_hosts`.
+> Under `sudo`, keys are checked against the *invoking* user's `~/.ssh/known_hosts`, so running
+> `ssh-keyscan remote-server >> ~/.ssh/known_hosts` (as your normal user) before the first
+> automated run avoids any first-contact prompt.
 
 ### Step 6: Running Backups with sudo Locally
 
