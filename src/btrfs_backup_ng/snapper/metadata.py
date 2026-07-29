@@ -259,16 +259,16 @@ def save_backup_metadata(path: Path | str, metadata: BackupMetadata) -> None:
         path: Path to the .snapper-meta.json file
         metadata: BackupMetadata object to save
     """
+    from btrfs_backup_ng import __util__
+
     path = Path(path)
     data = asdict(metadata)
-    # NOTE (R7 scope boundary): this snapper .snapper-meta.json sidecar is written
-    # non-atomically (a crash mid-write can leave a torn JSON). It was deliberately left
-    # out of R7's atomic-persistence pass -- the snapper metadata round-trip is audit
-    # root R11's territory, where the read/write path is being reworked wholesale;
-    # hardening it there (via __util__.atomic_write_bytes, like the raw .meta sidecar)
-    # avoids touching the snapper subsystem twice. Tracked, not forgotten.
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2)
+    # Write atomically (temp -> fsync -> os.replace) so a crash mid-write can never leave a
+    # torn .snapper-meta.json that load_backup_metadata would reject -- fulfilling the R7
+    # deferral for this sidecar, now that R11 reads it back on restore. R11/R7.
+    __util__.atomic_write_bytes(  # type: ignore[attr-defined]
+        path, json.dumps(data, indent=2), mode=0o600
+    )
 
 
 def load_backup_metadata(path: Path | str) -> BackupMetadata:
