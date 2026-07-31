@@ -908,7 +908,24 @@ btrfs-backup-ng snapper restore /mnt/backup/root --config root --all
 
 # Dry run
 btrfs-backup-ng snapper restore /mnt/backup/root --config root --all --dry-run
+
+# Restore a root-owned raw+ssh:// backup (written with --ssh-sudo): pass it again
+btrfs-backup-ng snapper restore raw+ssh://user@host/backups/root --config root --snapshot 559 --ssh-sudo
 ```
+
+> **Note — snapper daemon cache.** A restored snapshot is written directly into
+> `.snapshots/{N}/` (not via `snapper create`), so `snapperd` does not see it until it
+> rescans. Run `snapper -c <config> list` (or reboot) after a restore before using
+> `snapper diff`, `snapper undochange`, or a rollback against the restored snapshot; the
+> restore command prints a reminder. The on-disk snapshot is complete and correct — this
+> only affects the daemon's in-memory view. Restored slots use snapper's native `0755`
+> permissions on `.snapshots/{N}/`.
+
+> **Note — duplicate snapper numbers.** Snapper reuses snapshot numbers after a prune, so a
+> `raw://` / `raw+ssh://` target can accumulate two retained backups with the same number
+> (they differ by the date in the backup name). `--snapshot N` restores the **newest** of
+> them by date and warns; addressing an older same-number copy by name/date is a planned
+> enhancement.
 
 #### snapper generate-config
 

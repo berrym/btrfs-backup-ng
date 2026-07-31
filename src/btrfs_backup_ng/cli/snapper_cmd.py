@@ -686,6 +686,17 @@ def _handle_restore(args: argparse.Namespace) -> int:
     logger.info("  Restored: %d", restored_count)
     logger.info("  Failed: %d", failed_count)
 
+    # snapperd caches its snapshot list, so a slot created out-of-band (here, not via
+    # `snapper create`) is not visible to `snapper diff`/`undochange`/etc. until the
+    # daemon rescans. Nudge the user -- `snapper list` (or a reboot) triggers the rescan.
+    if restored_count > 0 and not args.dry_run:
+        logger.info("")
+        logger.info(
+            "Note: run 'snapper -c %s list' (or reboot) so snapper's daemon picks up "
+            "the restored snapshot(s) before 'snapper diff'/'undochange'/rollback.",
+            args.config,
+        )
+
     return 1 if failed_count > 0 else 0
 
 

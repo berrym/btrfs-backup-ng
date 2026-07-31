@@ -1685,3 +1685,55 @@ class TestSnapperEndpointRouting:
         cfg = mock_choose.call_args[0][1]
         assert cfg.get("ssh_sudo") is True
         assert cfg.get("ssh_identity_file") == "/home/u/.ssh/id"
+
+
+class TestRestoreSnapperdCacheHint:
+    """R11: restore prints a snapperd-rescan hint (a)+(c) decision."""
+
+    def _args(self, dry_run=False):
+        return argparse.Namespace(
+            source="/mnt/backup",
+            config="root",
+            snapshot=[559],
+            all=False,
+            list=False,
+            dry_run=dry_run,
+            json=False,
+            verbose=False,
+            quiet=False,
+            log_level=None,
+        )
+
+    def _run(self, args, mock_snapper_configs, capsys):
+        from pathlib import Path
+
+        from btrfs_backup_ng.cli.snapper_cmd import _handle_restore
+
+        with (
+            patch("btrfs_backup_ng.cli.snapper_cmd.SnapperScanner") as scanner_cls,
+            patch("btrfs_backup_ng.core.restore.list_snapper_backups") as mock_list,
+            patch(
+                "btrfs_backup_ng.core.restore.restore_snapper_snapshot"
+            ) as mock_restore,
+        ):
+            scanner = MagicMock()
+            scanner.get_config.return_value = mock_snapper_configs[0]
+            scanner_cls.return_value = scanner
+            mock_list.return_value = [{"number": 559, "metadata": MagicMock()}]
+            mock_restore.return_value = (1, Path("/x/.snapshots/1/snapshot"))
+            result = _handle_restore(args)
+        captured = capsys.readouterr()
+        # Rich wraps log lines; normalize whitespace before substring checks.
+        text = " ".join((captured.out + captured.err).split())
+        return result, text
+
+    def test_hint_printed_after_successful_restore(self, capsys, mock_snapper_configs):
+        result, text = self._run(self._args(), mock_snapper_configs, capsys)
+        assert result == 0
+        assert "daemon picks up the restored" in text
+        assert "snapper -c root list" in text
+
+    def test_no_hint_on_dry_run(self, capsys, mock_snapper_configs):
+        result, text = self._run(self._args(dry_run=True), mock_snapper_configs, capsys)
+        assert result == 0
+        assert "daemon picks up the restored" not in text
