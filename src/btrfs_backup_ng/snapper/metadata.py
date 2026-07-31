@@ -16,6 +16,7 @@ __all__ = [
     "parse_info_xml",
     "parse_info_xml_string",
     "generate_info_xml",
+    "renumber_info_xml",
     "load_backup_metadata",
     "save_backup_metadata",
 ]
@@ -255,6 +256,30 @@ def generate_info_xml(metadata: SnapperMetadata) -> str:
 
     lines.append("</snapshot>")
     return "\n".join(lines)
+
+
+def renumber_info_xml(original_xml: str, new_num: int) -> str:
+    """Return snapper info.xml with ONLY <num> changed to new_num.
+
+    Every other element is preserved VERBATIM -- including ones this module does not
+    model (e.g. <uid>, which snapper emits on manual snapshots). Used on restore to
+    renumber a sidecar's stored original_info_xml into a fresh local slot without the
+    fidelity loss of a parse -> SnapperMetadata -> generate round-trip (that path
+    only preserves the modeled fields).
+
+    Raises:
+        ValueError: If the XML is malformed or has no <num> element.
+    """
+    try:
+        root = ET.fromstring(original_xml)
+    except ET.ParseError as e:
+        raise ValueError(f"Failed to parse info.xml: {e}") from e
+    num_elem = root.find("num")
+    if num_elem is None:
+        raise ValueError("info.xml has no <num> element to renumber")
+    num_elem.text = str(new_num)
+    body = ET.tostring(root, encoding="unicode")
+    return f'<?xml version="1.0"?>\n{body}'
 
 
 @dataclass

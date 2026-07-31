@@ -595,3 +595,100 @@ class TestUserdataKeyValueFormat:
         """A non-XML original_info_xml raises ValueError (restore falls back)."""
         with pytest.raises(ValueError):
             parse_info_xml_string("{not xml")
+
+
+class TestRenumberInfoXml:
+    """R11 #4: renumber preserves snapper's xml verbatim (incl. unmodeled <uid>)."""
+
+    SNAP_WITH_UID = (
+        "<?xml version='1.0'?>\n<snapshot>\n"
+        "  <type>single</type>\n  <num>6052</num>\n"
+        "  <date>2026-07-31 10:40:37</date>\n"
+        "  <description>Fedora restore point</description>\n"
+        "  <cleanup>number</cleanup>\n"
+        "  <uid>1000</uid>\n"
+        "  <userdata>\n    <key>reason</key>\n    <value>manual</value>\n  </userdata>\n"
+        "  <userdata>\n    <key>ticket</key>\n    <value>OP-1</value>\n  </userdata>\n"
+        "</snapshot>\n"
+    )
+
+    def test_changes_only_num_and_preserves_uid(self):
+        from btrfs_backup_ng.snapper.metadata import renumber_info_xml
+
+        out = renumber_info_xml(self.SNAP_WITH_UID, 99)
+        assert "<num>99</num>" in out
+        assert "<num>6052</num>" not in out
+        # everything else verbatim
+        assert "<uid>1000</uid>" in out  # the unmodeled element R11 must NOT drop
+        assert "<key>reason</key>" in out and "<value>manual</value>" in out
+        assert "<key>ticket</key>" in out and "<value>OP-1</value>" in out
+        assert "Fedora restore point" in out
+        assert "<cleanup>number</cleanup>" in out
+
+    def test_reparses_to_same_metadata_with_new_num(self):
+        from btrfs_backup_ng.snapper.metadata import (
+            parse_info_xml_string,
+            renumber_info_xml,
+        )
+
+        m = parse_info_xml_string(renumber_info_xml(self.SNAP_WITH_UID, 99))
+        assert m.num == 99
+        assert m.userdata == {"reason": "manual", "ticket": "OP-1"}
+
+    def test_rejects_missing_num(self):
+        from btrfs_backup_ng.snapper.metadata import renumber_info_xml
+
+        with pytest.raises(ValueError):
+            renumber_info_xml(
+                "<?xml version='1.0'?><snapshot><type>single</type></snapshot>", 1
+            )
+
+    def test_rejects_malformed_xml(self):
+        from btrfs_backup_ng.snapper.metadata import renumber_info_xml
+
+        with pytest.raises(ValueError):
+            renumber_info_xml("{not xml", 1)
+
+
+class TestUserdataEscaping:
+    """R11 #5: userdata keys/values with XML special chars round-trip safely."""
+
+    def test_special_chars_round_trip(self):
+        meta = SnapperMetadata(
+            type="single",
+            num=1,
+            date=datetime(2026, 7, 31, 10, 40, 37),
+            userdata={"a&b": "x<y>z", "note": "tom & jerry <fwd>"},
+        )
+        xml = generate_info_xml(meta)
+        # raw xml must be escaped (not literal & < >)
+        assert "&amp;" in xml and "&lt;" in xml and "&gt;" in xml
+        assert "<value>x<y>z</value>" not in xml  # unescaped would be malformed
+        # and it must parse back to the exact original dict
+        reparsed = parse_info_xml_string(xml)
+        assert reparsed.userdata == {"a&b": "x<y>z", "note": "tom & jerry <fwd>"}
+
+
+class TestSaveBackupMetadataAtomic:
+    """R11 #6 / pt1: sidecar is written atomically at 0600."""
+
+    def test_saved_file_is_0600_and_no_temp_left(self, tmp_path):
+        import os
+
+        meta = BackupMetadata(
+            snapper_config="root",
+            snapper_number=1,
+            snapper_type="single",
+            snapper_description="d",
+            snapper_cleanup="number",
+            snapper_pre_num=None,
+            snapper_userdata={},
+            snapper_date="2026-07-31 10:40:37",
+            original_info_xml="",
+        )
+        path = tmp_path / "root-1.snapper-meta.json"
+        save_backup_metadata(path, meta)
+        # tightened mode from pt1 -- a revert to open('w') would yield 0644
+        assert oct(os.stat(path).st_mode & 0o777) == oct(0o600)
+        # atomic write leaves no stray temp sibling in the dir
+        assert [p.name for p in tmp_path.iterdir()] == ["root-1.snapper-meta.json"]

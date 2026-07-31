@@ -519,10 +519,25 @@ def _handle_restore(args: argparse.Namespace) -> int:
 
     source_path = args.source
 
+    # Thread SSH options so a raw+ssh:// source written with --ssh-sudo (root-owned
+    # remote dir/streams) is READ BACK with the same options -- else the remote
+    # ls/cat run without sudo and the backups enumerate as empty (mirrors how the
+    # backup path builds its endpoint config).
+    endpoint_options: dict[str, Any] = {}
+    if getattr(args, "ssh_sudo", False):
+        endpoint_options["ssh_sudo"] = True
+    if getattr(args, "ssh_key", None):
+        endpoint_options["ssh_identity_file"] = args.ssh_key
+        endpoint_options["ssh_key"] = args.ssh_key
+    if getattr(args, "ssh_auth_sock", None):
+        endpoint_options["ssh_auth_sock"] = args.ssh_auth_sock
+    if getattr(args, "ssh_host_key_policy", None):
+        endpoint_options["ssh_host_key_policy"] = args.ssh_host_key_policy
+
     # List mode - show available backups
     if args.list:
         try:
-            backups = list_snapper_backups(source_path)
+            backups = list_snapper_backups(source_path, endpoint_options)
         except Exception as e:
             if args.json:
                 print(json.dumps({"error": str(e)}))
@@ -589,7 +604,7 @@ def _handle_restore(args: argparse.Namespace) -> int:
 
     # Get available backups
     try:
-        backups = list_snapper_backups(source_path)
+        backups = list_snapper_backups(source_path, endpoint_options)
     except Exception as e:
         logger.error("Failed to list backups: %s", e)
         return 1
@@ -652,6 +667,7 @@ def _handle_restore(args: argparse.Namespace) -> int:
                 parent_backup_number=parent_num,
                 options=options,
                 dry_run=args.dry_run,
+                endpoint_options=endpoint_options,
             )
 
             if not args.dry_run:

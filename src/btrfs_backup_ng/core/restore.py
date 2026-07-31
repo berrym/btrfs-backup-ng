@@ -691,6 +691,7 @@ def find_parent_by_correspondence(
 
 def list_snapper_backups(
     backup_path: str,
+    endpoint_options: dict | None = None,
 ) -> list[dict]:
     """List snapper backups at a backup location.
 
@@ -718,7 +719,7 @@ def list_snapper_backups(
     # to scan. Dispatch those to a sidecar-based enumeration so they can be listed AND
     # restored (Part 2), instead of silently returning [] as the .snapshots scan did.
     if str(backup_path).startswith(("raw://", "raw+ssh://")):
-        return _list_raw_snapper_backups(backup_path)
+        return _list_raw_snapper_backups(backup_path, endpoint_options)
 
     from ..snapper.metadata import parse_info_xml
 
@@ -785,7 +786,23 @@ def _load_snapper_sidecar(endpoint: Any, name: str) -> Any:
     return load_backup_metadata(dest_path / filename)
 
 
-def _list_raw_snapper_backups(backup_path: str) -> list[dict]:
+def _raw_endpoint_config(backup_path: str, endpoint_options: dict | None) -> dict:
+    """Build the common_config for a raw:// / raw+ssh:// restore-side endpoint.
+
+    ``endpoint_options`` carries the CLI's ssh options (ssh_sudo / ssh_key /
+    ssh_auth_sock / ssh_host_key_policy) so a raw+ssh target WRITTEN with --ssh-sudo
+    (root-owned remote dir/streams) is READ BACK with the same options -- otherwise
+    the remote ls/cat run without sudo and the backups enumerate as empty.
+    """
+    config: dict[str, Any] = {"path": backup_path, "snap_prefix": ""}
+    if endpoint_options:
+        config.update(endpoint_options)
+    return config
+
+
+def _list_raw_snapper_backups(
+    backup_path: str, endpoint_options: dict | None = None
+) -> list[dict]:
     """Enumerate snapper backups at a ``raw://`` / ``raw+ssh://`` target.
 
     Raw snapper backups have no ``.snapshots/{num}/info.xml`` layout, so the
@@ -797,7 +814,9 @@ def _list_raw_snapper_backups(backup_path: str) -> list[dict]:
     """
     from ..endpoint import choose_endpoint
 
-    endpoint = choose_endpoint(backup_path, {"path": backup_path, "snap_prefix": ""})
+    endpoint = choose_endpoint(
+        backup_path, _raw_endpoint_config(backup_path, endpoint_options)
+    )
 
     backups: list[dict[str, Any]] = []
     for name in _list_snapper_backups_at_destination(endpoint):
@@ -821,12 +840,15 @@ def _list_raw_snapper_backups(backup_path: str) -> list[dict]:
             }
         )
 
-    backups.sort(key=lambda b: int(str(b["number"])))
+    # Sort by number, then by backup_name (which embeds the date) so that duplicate
+    # snapper numbers -- which snapper reuses after a prune -- have a STABLE, visible
+    # order rather than the arbitrary order of the underlying set.
+    backups.sort(key=lambda b: (int(str(b["number"])), str(b["backup_name"])))
     return backups
 
 
 def _resolve_raw_snapper_backup(
-    backup_path: str, backup_number: int
+    backup_path: str, backup_number: int, endpoint_options: dict | None = None
 ) -> tuple[Any, Any, Any]:
     """Resolve a raw snapper backup number to (endpoint, RawSnapshot, BackupMetadata).
 
@@ -840,11 +862,20 @@ def _resolve_raw_snapper_backup(
     """
     from ..endpoint import choose_endpoint
 
-    endpoint = choose_endpoint(backup_path, {"path": backup_path, "snap_prefix": ""})
+    endpoint = choose_endpoint(
+        backup_path, _raw_endpoint_config(backup_path, endpoint_options)
+    )
 
-    match_name = None
-    match_meta = None
-    for name in _list_snapper_backups_at_destination(endpoint):
+    # Collect ALL sidecars matching this snapper number, not just the first. Snapper
+    # reuses numbers after a prune (see operations.py: "the snapper number, which
+    # snapper reuses after a prune"), and raw targets accumulate streams over time, so
+    # two RETAINED sidecars can share a number, differing only by the date in their
+    # backup_name. Iterating the UNORDERED set and breaking on the first match would
+    # pick nondeterministically (Python's salted set order) -- a wrong-snapshot restore.
+    # Iterate a sorted list and, on a collision, pick the NEWEST by snapper_date and warn
+    # loudly so the ambiguity is visible (name/date-based addressing is a follow-up).
+    matches: list[tuple[str, Any]] = []
+    for name in sorted(_list_snapper_backups_at_destination(endpoint)):
         try:
             backup_meta = _load_snapper_sidecar(endpoint, name)
         except Exception as e:
@@ -853,14 +884,27 @@ def _resolve_raw_snapper_backup(
             )
             continue
         if backup_meta.snapper_number == backup_number:
-            match_name = name
-            match_meta = backup_meta
-            break
+            matches.append((name, backup_meta))
 
-    if match_name is None:
+    if not matches:
         raise RestoreError(
             f"Snapper backup number {backup_number} not found at {backup_path}"
         )
+
+    if len(matches) > 1:
+        # Deterministic: newest snapper_date wins (name breaks a date tie).
+        matches.sort(key=lambda nm: (nm[1].snapper_date, nm[0]), reverse=True)
+        logger.warning(
+            "Multiple raw snapper backups share number %d at %s: %s. Restoring the "
+            "newest (%s, %s); the older copies are not reachable by number alone.",
+            backup_number,
+            backup_path,
+            ", ".join(f"{n} ({m.snapper_date})" for n, m in matches),
+            matches[0][0],
+            matches[0][1].snapper_date,
+        )
+
+    match_name, match_meta = matches[0]
 
     raw_snapshot = next(
         (s for s in endpoint.list_snapshots() if s.name == match_name), None
@@ -881,6 +925,7 @@ def restore_snapper_snapshot(
     parent_backup_number: int | None = None,
     options: dict | None = None,
     dry_run: bool = False,
+    endpoint_options: dict | None = None,
 ) -> tuple[int, Path]:
     """Restore a snapper backup to local snapper format.
 
@@ -913,7 +958,7 @@ def restore_snapper_snapshot(
         SnapperMetadata,
         generate_info_xml,
         parse_info_xml,
-        parse_info_xml_string,
+        renumber_info_xml,
     )
 
     if options is None:
@@ -941,7 +986,7 @@ def restore_snapper_snapshot(
 
     if is_raw:
         raw_endpoint, raw_snapshot, raw_backup_meta = _resolve_raw_snapper_backup(
-            backup_path, backup_number
+            backup_path, backup_number, endpoint_options
         )
         source_desc = raw_snapshot.name
     else:
@@ -1109,29 +1154,32 @@ def restore_snapper_snapshot(
         # Copy or generate info.xml
         dest_info_xml = dest_snapshot_dir / "info.xml"
         if is_raw:
-            # Seam 4: regenerate info.xml from the sidecar (renumbered to the fresh
-            # local slot), preserving the snapper type/description/cleanup/userdata
-            # that snapper restore would otherwise lose -- raw targets have no
-            # .snapshots/{n}/info.xml to copy. Prefer the sidecar's original_info_xml
-            # (snapper's OWN xml) through the fixed parser, so multi-entry userdata and
-            # older sidecars (which stored a mis-parsed userdata dict) both restore
-            # faithfully; fall back to the parsed fields only when no original exists.
+            # Seam 4: build info.xml for the fresh slot. Raw targets have no
+            # .snapshots/{n}/info.xml to copy, so prefer RENUMBERING the sidecar's
+            # stored original_info_xml (snapper's OWN xml) in place -- only <num>
+            # changes; userdata (incl. multi-entry), <uid>, and any element we do not
+            # model are preserved VERBATIM. Fall back to regenerating from the parsed
+            # fields only when no original was stored or it will not parse (older
+            # sidecars that also stored a mis-parsed userdata dict still round-trip
+            # correctly this way, since the original xml is snapper's authoritative copy).
             assert raw_backup_meta is not None
-            metadata = None
+            xml_content = None
             if raw_backup_meta.original_info_xml:
                 try:
-                    metadata = parse_info_xml_string(raw_backup_meta.original_info_xml)
+                    xml_content = renumber_info_xml(
+                        raw_backup_meta.original_info_xml, next_num
+                    )
                 except Exception as e:
                     logger.warning(
-                        "Could not parse stored info.xml for backup %d (%s); "
+                        "Could not renumber stored info.xml for backup %d (%s); "
                         "regenerating from sidecar fields",
                         backup_number,
                         e,
                     )
-            if metadata is None:
+            if xml_content is None:
                 metadata = raw_backup_meta.to_snapper_metadata()
-            metadata.num = next_num
-            xml_content = generate_info_xml(metadata)
+                metadata.num = next_num
+                xml_content = generate_info_xml(metadata)
         elif backup_info_xml is not None and backup_info_xml.exists():
             # Copy original info.xml but update the number
             try:
@@ -1164,6 +1212,12 @@ def restore_snapper_snapshot(
             xml_content = generate_info_xml(metadata)
 
         # Write info.xml
+        #
+        # Slot dir is 0755 to match what snapper NATIVELY creates for .snapshots/{N}
+        # (verified against snapper 0.13: native slot dirs are 0755, only the parent
+        # .snapshots is 0750). 0750 here would be stricter than snapper and can block
+        # non-root snapper access under ALLOW_USERS/ALLOW_GROUPS/SYNC_ACL; the parent
+        # .snapshots (0750, root+group) still gates who can reach the slot at all.
         if os.geteuid() != 0:
             subprocess.run(
                 ["sudo", "tee", str(dest_info_xml)],
@@ -1172,13 +1226,13 @@ def restore_snapper_snapshot(
                 capture_output=True,
             )
             subprocess.run(
-                ["sudo", "chmod", "750", str(dest_snapshot_dir)],
+                ["sudo", "chmod", "755", str(dest_snapshot_dir)],
                 check=True,
                 capture_output=True,
             )
         else:
             dest_info_xml.write_text(xml_content)
-            dest_snapshot_dir.chmod(0o750)
+            dest_snapshot_dir.chmod(0o755)
 
         duration = time.monotonic() - transfer_start
 

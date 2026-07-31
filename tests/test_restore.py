@@ -3952,6 +3952,11 @@ class TestRestoreRawSnapperSnapshot:
         assert next_num == 42
         dest_dir = config.snapshots_dir / "42"
         assert path == dest_dir / "snapshot"
+        # #P: slot dir is 0755 to match snapper's native .snapshots/{N} (not 0750,
+        # which would block non-root snapper access under ALLOW_USERS/SYNC_ACL).
+        import os as _os
+
+        assert oct(_os.stat(dest_dir).st_mode & 0o777) == oct(0o755)
         # info.xml regenerated from the sidecar, renumbered, metadata preserved.
         info_xml = (dest_dir / "info.xml").read_text()
         assert "<type>pre</type>" in info_xml
@@ -4131,3 +4136,198 @@ class TestRawRestoreUserdataFidelity:
         assert "fallback case" in info_xml
         assert "<key>reason</key>" in info_xml and "<value>manual</value>" in info_xml
         assert "<num>42</num>" in info_xml
+
+    def test_uid_preserved_through_restore(self, tmp_path):
+        """#4: renumbering original_info_xml keeps unmodeled elements (<uid>)."""
+        from btrfs_backup_ng.snapper.metadata import BackupMetadata
+
+        original = (
+            "<?xml version='1.0'?><snapshot>"
+            "<type>single</type><num>1</num><date>2025-10-01 12:00:00</date>"
+            "<uid>1000</uid>"
+            "<userdata><key>reason</key><value>manual</value></userdata>"
+            "</snapshot>"
+        )
+        meta = BackupMetadata(
+            snapper_config="root",
+            snapper_number=1,
+            snapper_type="single",
+            snapper_description="",
+            snapper_cleanup="",
+            snapper_pre_num=None,
+            snapper_userdata={"reason": "manual"},
+            snapper_date="2025-10-01 12:00:00",
+            original_info_xml=original,
+        )
+        info_xml = self._restore(tmp_path, meta)
+        assert "<uid>1000</uid>" in info_xml  # would be dropped by parse->generate
+        assert "<num>42</num>" in info_xml and "<num>1</num>" not in info_xml
+        assert "<key>reason</key>" in info_xml and "<value>manual</value>" in info_xml
+
+
+def _write_named_sidecar(tmp_path, name, number, date, *, desc="d"):
+    """Write a {name}.snapper-meta.json with an explicit snapper_number + date."""
+    from btrfs_backup_ng.snapper.metadata import BackupMetadata, save_backup_metadata
+
+    meta = BackupMetadata(
+        snapper_config="root",
+        snapper_number=number,
+        snapper_type="single",
+        snapper_description=desc,
+        snapper_cleanup="number",
+        snapper_pre_num=None,
+        snapper_userdata={},
+        snapper_date=date,
+        original_info_xml="",
+    )
+    save_backup_metadata(tmp_path / f"{name}.snapper-meta.json", meta)
+
+
+class TestRawSnapperResolutionFixes:
+    """R11 #1 (duplicate snapper_number determinism) and #2 (ssh option threading)."""
+
+    def _fake_local_ep(self, tmp_path, stream_names):
+        streams = []
+        for nm in stream_names:
+            s = MagicMock()
+            s.name = nm
+            streams.append(s)
+
+        class _Ep:  # local: no _is_remote -> enumerator reads tmp_path via iterdir
+            def __init__(self):
+                self.config = {"path": tmp_path}
+
+            def list_snapshots(self, flush_cache=False):
+                return streams
+
+        return _Ep()
+
+    def test_duplicate_number_picks_newest_and_warns(self, tmp_path, caplog):
+        """Two sidecars share number 100; resolve picks the newest date + warns."""
+        from btrfs_backup_ng.core.restore import _resolve_raw_snapper_backup
+
+        _write_named_sidecar(tmp_path, "root-100-old", 100, "2024-01-01 00:00:00")
+        _write_named_sidecar(tmp_path, "root-100-new", 100, "2024-06-01 00:00:00")
+        fake = self._fake_local_ep(tmp_path, ["root-100-old", "root-100-new"])
+        with patch("btrfs_backup_ng.endpoint.choose_endpoint", return_value=fake):
+            with caplog.at_level("WARNING"):
+                _ep, snap, meta = _resolve_raw_snapper_backup(f"raw://{tmp_path}", 100)
+        assert snap.name == "root-100-new"  # newest by snapper_date
+        assert meta.snapper_date == "2024-06-01 00:00:00"
+        assert "share number 100" in caplog.text
+        assert "root-100-old" in caplog.text and "root-100-new" in caplog.text
+
+    def test_duplicate_number_resolution_is_deterministic(self, tmp_path):
+        """Repeated resolves always pick the same (newest) backup, not set-order."""
+        from btrfs_backup_ng.core.restore import _resolve_raw_snapper_backup
+
+        _write_named_sidecar(tmp_path, "root-5-a", 5, "2024-01-01 00:00:00")
+        _write_named_sidecar(tmp_path, "root-5-b", 5, "2024-02-01 00:00:00")
+        _write_named_sidecar(tmp_path, "root-5-c", 5, "2024-03-01 00:00:00")
+        names = ["root-5-a", "root-5-b", "root-5-c"]
+        picks = set()
+        for _ in range(5):
+            fake = self._fake_local_ep(tmp_path, names)
+            with patch("btrfs_backup_ng.endpoint.choose_endpoint", return_value=fake):
+                _e, snap, _m = _resolve_raw_snapper_backup(f"raw://{tmp_path}", 5)
+            picks.add(snap.name)
+        assert picks == {"root-5-c"}  # always the newest, every time
+
+    def test_list_duplicate_numbers_stable_order(self, tmp_path):
+        """list surfaces both same-number rows in a stable (number, name) order."""
+        from btrfs_backup_ng.core.restore import _list_raw_snapper_backups
+
+        _write_named_sidecar(tmp_path, "root-100-new", 100, "2024-06-01 00:00:00")
+        _write_named_sidecar(tmp_path, "root-100-old", 100, "2024-01-01 00:00:00")
+        _write_named_sidecar(tmp_path, "root-3-x", 3, "2024-01-01 00:00:00")
+        result = _list_raw_snapper_backups(f"raw://{tmp_path}")
+        assert [(b["number"], b["backup_name"]) for b in result] == [
+            (3, "root-3-x"),
+            (100, "root-100-new"),
+            (100, "root-100-old"),
+        ]
+
+    def test_endpoint_options_threaded_into_choose_endpoint(self, tmp_path):
+        """#2: ssh_sudo/ssh_key flow into choose_endpoint's common_config."""
+        from btrfs_backup_ng.core.restore import (
+            RestoreError,
+            _list_raw_snapper_backups,
+            _resolve_raw_snapper_backup,
+        )
+
+        fake = self._fake_local_ep(tmp_path, [])
+        with patch("btrfs_backup_ng.endpoint.choose_endpoint", return_value=fake) as ce:
+            _list_raw_snapper_backups(
+                "raw+ssh://h/p", {"ssh_sudo": True, "ssh_key": "/k"}
+            )
+        cfg = ce.call_args.args[1]
+        assert cfg["ssh_sudo"] is True and cfg["ssh_key"] == "/k"
+        assert cfg["path"] == "raw+ssh://h/p" and cfg["snap_prefix"] == ""
+
+        with patch("btrfs_backup_ng.endpoint.choose_endpoint", return_value=fake) as ce:
+            with pytest.raises(RestoreError):
+                _resolve_raw_snapper_backup("raw+ssh://h/p", 1, {"ssh_sudo": True})
+        assert ce.call_args.args[1]["ssh_sudo"] is True
+
+
+class TestRemoteSnapperEnumerationErrors:
+    """R11 #3: remote enumeration surfaces unreachable/denied, not a silent empty."""
+
+    def _remote_ep(self, path, rc, stdout=b"", stderr=b""):
+        class _Ep:
+            _is_remote = True
+            hostname = "host.example"
+
+            def __init__(self):
+                self.config = {"path": path}
+
+            def _exec_remote_command(self, cmd, check=False, **kw):
+                cp = MagicMock()
+                cp.returncode = rc
+                cp.stdout = stdout
+                cp.stderr = stderr
+                return cp
+
+        return _Ep()
+
+    def test_success_parses_names(self):
+        from btrfs_backup_ng.core.operations import (
+            _list_snapper_backups_at_destination,
+        )
+
+        ep = self._remote_ep(
+            "/b", 0, stdout=b"root-1.snapper-meta.json\nroot-1\nnote.txt\n"
+        )
+        assert _list_snapper_backups_at_destination(ep) == {"root-1"}
+
+    def test_missing_dir_returns_empty(self):
+        from btrfs_backup_ng.core.operations import (
+            _list_snapper_backups_at_destination,
+        )
+
+        ep = self._remote_ep(
+            "/b", 2, stderr=b"ls: cannot access '/b': No such file or directory"
+        )
+        assert _list_snapper_backups_at_destination(ep) == set()
+
+    def test_permission_denied_raises_actionable(self):
+        from btrfs_backup_ng.core.operations import (
+            _list_snapper_backups_at_destination,
+        )
+
+        ep = self._remote_ep(
+            "/b", 2, stderr=b"ls: cannot open directory '/b': Permission denied"
+        )
+        with pytest.raises(RuntimeError, match="ssh-sudo"):
+            _list_snapper_backups_at_destination(ep)
+
+    def test_unreachable_host_raises(self):
+        from btrfs_backup_ng.core.operations import (
+            _list_snapper_backups_at_destination,
+        )
+
+        ep = self._remote_ep(
+            "/b", 255, stderr=b"ssh: connect to host X port 22: No route to host"
+        )
+        with pytest.raises(RuntimeError, match="host.example"):
+            _list_snapper_backups_at_destination(ep)
