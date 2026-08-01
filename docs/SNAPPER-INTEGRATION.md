@@ -51,7 +51,7 @@ Found 2 snapper configuration(s):
 ### 2. List Available Snapshots
 
 ```bash
-btrfs-backup-ng snapper list root
+btrfs-backup-ng snapper list --config root
 ```
 
 Output:
@@ -88,7 +88,7 @@ command: a local path or `ssh://` for btrfs destinations, and `raw://` /
 ### 4. Check Backup Status
 
 ```bash
-btrfs-backup-ng snapper status --target /mnt/backup/root
+btrfs-backup-ng snapper status /mnt/backup/root
 ```
 
 ### 5. Restore When Needed
@@ -557,7 +557,7 @@ compress = "zstd"
 
 Regularly check backup health:
 ```bash
-btrfs-backup-ng snapper status --target /mnt/backup/root
+btrfs-backup-ng snapper status /mnt/backup/root
 btrfs-backup-ng doctor --check transfers
 ```
 
