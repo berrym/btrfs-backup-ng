@@ -882,6 +882,8 @@ btrfs-backup-ng snapper restore SOURCE --config NAME [OPTIONS]
 | `--config NAME` | Local snapper config to restore into (required) |
 | `--list` | List available backups instead of restoring |
 | `--snapshot NUM` | Restore specific snapshot by number (can be repeated) |
+| `--backup-name NAME` | Restore the exact raw backup by name from `--list` (can be repeated); reaches an older copy when a snapper number was reused |
+| `--date DATE` | Restrict the selection to backups whose date matches `DATE` (`YYYY-MM-DD[ HH:MM:SS]` prefix); disambiguates a reused `--snapshot NUM` |
 | `--all` | Restore all snapshots |
 | `--dry-run` | Show what would be done without making changes |
 | `--compress METHOD` | Compression method |
@@ -911,6 +913,12 @@ btrfs-backup-ng snapper restore /mnt/backup/root --config root --all --dry-run
 
 # Restore a root-owned raw+ssh:// backup (written with --ssh-sudo): pass it again
 btrfs-backup-ng snapper restore raw+ssh://user@host/backups/root --config root --snapshot 559 --ssh-sudo
+
+# Reused snapper number: restore an OLDER copy by exact name (from --list) ...
+btrfs-backup-ng snapper restore /mnt/backup/root --config root --backup-name root-559-20240101-120000
+
+# ... or by number + date
+btrfs-backup-ng snapper restore /mnt/backup/root --config root --snapshot 559 --date 2024-01-01
 ```
 
 > **Note — snapper daemon cache.** A restored snapshot is written directly into
@@ -924,8 +932,9 @@ btrfs-backup-ng snapper restore raw+ssh://user@host/backups/root --config root -
 > **Note — duplicate snapper numbers.** Snapper reuses snapshot numbers after a prune, so a
 > `raw://` / `raw+ssh://` target can accumulate two retained backups with the same number
 > (they differ by the date in the backup name). `--snapshot N` restores the **newest** of
-> them by date and warns; addressing an older same-number copy by name/date is a planned
-> enhancement.
+> them by date and warns. To reach an **older** copy, use `--backup-name NAME` (the unique
+> name is shown by `--list`, and in `--list --json` as `backup_name`) or narrow `--snapshot N`
+> with `--date YYYY-MM-DD`. `--list` shows a **NAME** column whenever names are available.
 
 #### snapper generate-config
 

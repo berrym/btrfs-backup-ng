@@ -506,6 +506,28 @@ def _handle_status(args: argparse.Namespace) -> int:
     return 0
 
 
+def _backup_date_matches(backup: dict, date_filter: str) -> bool:
+    """True if the backup's snapper date starts with date_filter (prefix match).
+
+    A prefix lets "2024-01-01" match any time that day, and a full
+    "2024-01-01 12:00:00" match exactly -- the same format shown in --list.
+    """
+    meta = backup.get("metadata")
+    if meta is None or getattr(meta, "date", None) is None:
+        return False
+    return str(meta.date).startswith(date_filter)
+
+
+def _backup_recency_key(backup: dict) -> tuple[str, str]:
+    """Sort key for choosing the newest of a colliding snapper number.
+
+    Newest snapper date wins; backup_name breaks a same-date tie for determinism.
+    """
+    meta = backup.get("metadata")
+    date = str(meta.date) if meta and getattr(meta, "date", None) else ""
+    return (date, backup.get("backup_name") or "")
+
+
 def _handle_restore(args: argparse.Namespace) -> int:
     """Handle 'snapper restore' command."""
     from ..core.restore import (
@@ -556,6 +578,9 @@ def _handle_restore(args: argparse.Namespace) -> int:
                         "description": b["metadata"].description
                         if b.get("metadata")
                         else None,
+                        # backup_name is the unique identity for raw backups (None for
+                        # btrfs) -- pass it to --backup-name to restore an exact copy.
+                        "backup_name": b.get("backup_name"),
                     }
                     for b in backups
                 ],
@@ -566,19 +591,40 @@ def _handle_restore(args: argparse.Namespace) -> int:
                 logger.info("No snapper backups found at %s", source_path)
                 return 0
 
+            # A NAME column is only meaningful for raw targets (btrfs uses the number,
+            # which is unique there); show it only when at least one backup has a name.
+            has_names = any(b.get("backup_name") for b in backups)
             logger.info("Snapper backups at %s:", source_path)
             print()
-            print(f"  {'NUM':>6}  {'TYPE':<6}  {'DATE':<19}  {'DESCRIPTION'}")
-            print(f"  {'-' * 6}  {'-' * 6}  {'-' * 19}  {'-' * 30}")
+            if has_names:
+                print(
+                    f"  {'NUM':>6}  {'TYPE':<6}  {'DATE':<19}  {'DESCRIPTION':<30}  NAME"
+                )
+                print(f"  {'-' * 6}  {'-' * 6}  {'-' * 19}  {'-' * 30}  {'-' * 24}")
+            else:
+                print(f"  {'NUM':>6}  {'TYPE':<6}  {'DATE':<19}  {'DESCRIPTION'}")
+                print(f"  {'-' * 6}  {'-' * 6}  {'-' * 19}  {'-' * 30}")
 
             for b in backups:
                 meta = b.get("metadata")
                 snap_type = meta.type if meta else "?"
                 date = str(meta.date)[:19] if meta and meta.date else "?"
                 desc = (meta.description or "")[:30] if meta else ""
-                print(f"  {b['number']:>6}  {snap_type:<6}  {date}  {desc}")
+                if has_names:
+                    # NAME is untruncated so it can be copied into --backup-name.
+                    name = b.get("backup_name") or ""
+                    print(
+                        f"  {b['number']:>6}  {snap_type:<6}  {date}  {desc:<30}  {name}"
+                    )
+                else:
+                    print(f"  {b['number']:>6}  {snap_type:<6}  {date}  {desc}")
 
             print(f"\nTotal: {len(backups)} backup(s)")
+            if has_names:
+                print(
+                    "\nTip: when a snapper number was reused, restore a specific copy "
+                    "with --backup-name <NAME> or --snapshot <NUM> --date <DATE>."
+                )
 
         return 0
 
@@ -595,10 +641,14 @@ def _handle_restore(args: argparse.Namespace) -> int:
 
     # Determine what to restore
     snapshot_numbers = args.snapshot if args.snapshot else None
+    backup_names = getattr(args, "backup_name", None) or None
     restore_all = getattr(args, "all", False)
+    date_filter = getattr(args, "date", None)
 
-    if not snapshot_numbers and not restore_all:
-        logger.error("Specify --snapshot NUM or --all to restore snapshots.")
+    if not snapshot_numbers and not backup_names and not restore_all:
+        logger.error(
+            "Specify --snapshot NUM, --backup-name NAME, or --all to restore snapshots."
+        )
         logger.info("Use --list to see available backups.")
         return 1
 
@@ -613,15 +663,75 @@ def _handle_restore(args: argparse.Namespace) -> int:
         logger.error("No backups found at %s", source_path)
         return 1
 
-    # Filter to requested snapshots
-    if restore_all:
-        to_restore = backups
-    else:
-        # snapshot_numbers is guaranteed non-None here due to early return above
-        to_restore = [b for b in backups if b["number"] in (snapshot_numbers or [])]
-        if not to_restore:
-            logger.error("None of the requested snapshots found in backup")
+    # A --date refinement narrows the candidate pool BEFORE selection, so
+    # `--snapshot N --date D` picks the D-dated copy of N rather than the newest.
+    candidates = backups
+    if date_filter:
+        candidates = [b for b in backups if _backup_date_matches(b, date_filter)]
+        if not candidates:
+            logger.error("No backups match --date %s", date_filter)
             return 1
+
+    # Build the selection.
+    #   --backup-name : EXACT identity, restored as-is (no dedup).
+    #   --snapshot    : by number; on a reused-number collision, restore the NEWEST
+    #                   and warn (Option A) -- --backup-name/--date reach an older one.
+    #   --all         : everything (after any --date filter).
+    to_restore: list[dict] = []
+    seen: set = set()
+
+    def _add(b: dict) -> None:
+        key = b.get("backup_name") or ("num", b["number"])
+        if key not in seen:
+            seen.add(key)
+            to_restore.append(b)
+
+    if restore_all:
+        for b in candidates:
+            _add(b)
+
+    if backup_names:
+        for name in backup_names:
+            matches = [b for b in candidates if b.get("backup_name") == name]
+            if not matches:
+                logger.error(
+                    "Backup name %r not found at %s%s",
+                    name,
+                    source_path,
+                    f" matching --date {date_filter}" if date_filter else "",
+                )
+                return 1
+            for b in matches:
+                _add(b)
+
+    if snapshot_numbers:
+        for num in snapshot_numbers:
+            matches = [b for b in candidates if b["number"] == num]
+            if not matches:
+                logger.error(
+                    "Snapshot number %d not found at %s%s",
+                    num,
+                    source_path,
+                    f" matching --date {date_filter}" if date_filter else "",
+                )
+                return 1
+            if len(matches) > 1:
+                # Reused number: newest wins (Option A), warn with an actionable path.
+                matches.sort(key=_backup_recency_key, reverse=True)
+                chosen = matches[0]
+                logger.warning(
+                    "Multiple backups share number %d; restoring the newest (%s). "
+                    "Use --backup-name or --date to restore an older copy.",
+                    num,
+                    chosen.get("backup_name") or chosen["number"],
+                )
+                _add(chosen)
+            else:
+                _add(matches[0])
+
+    if not to_restore:
+        logger.error("None of the requested snapshots found in backup")
+        return 1
 
     # Sort by number (oldest first for proper incremental chain)
     to_restore.sort(key=lambda b: b["number"])
@@ -668,6 +778,9 @@ def _handle_restore(args: argparse.Namespace) -> int:
                 options=options,
                 dry_run=args.dry_run,
                 endpoint_options=endpoint_options,
+                # Restore the EXACT enumerated backup (raw carries a unique name);
+                # None for btrfs -> number-based path. Fixes the collision double-restore.
+                backup_name=backup.get("backup_name"),
             )
 
             if not args.dry_run:

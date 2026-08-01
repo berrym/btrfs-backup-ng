@@ -4331,3 +4331,67 @@ class TestRemoteSnapperEnumerationErrors:
         )
         with pytest.raises(RuntimeError, match="host.example"):
             _list_snapper_backups_at_destination(ep)
+
+
+class TestRawSnapperExactNameResolution:
+    """R11b: _resolve_raw_snapper_backup resolves the EXACT backup by name."""
+
+    def _fake_local_ep(self, tmp_path, stream_names):
+        streams = []
+        for nm in stream_names:
+            s = MagicMock()
+            s.name = nm
+            streams.append(s)
+
+        class _Ep:
+            def __init__(self):
+                self.config = {"path": tmp_path}
+
+            def list_snapshots(self, flush_cache=False):
+                return streams
+
+        return _Ep()
+
+    def _two_colliding(self, tmp_path):
+        _write_named_sidecar(tmp_path, "root-100-old", 100, "2024-01-01 00:00:00")
+        _write_named_sidecar(tmp_path, "root-100-new", 100, "2024-06-01 00:00:00")
+        return self._fake_local_ep(tmp_path, ["root-100-old", "root-100-new"])
+
+    def test_backup_name_resolves_exact_older_copy(self, tmp_path, caplog):
+        from btrfs_backup_ng.core.restore import _resolve_raw_snapper_backup
+
+        fake = self._two_colliding(tmp_path)
+        with patch("btrfs_backup_ng.endpoint.choose_endpoint", return_value=fake):
+            with caplog.at_level("WARNING"):
+                _ep, snap, meta = _resolve_raw_snapper_backup(
+                    f"raw://{tmp_path}", 100, None, "root-100-old"
+                )
+        assert snap.name == "root-100-old"  # the OLDER copy, exactly
+        assert meta.snapper_date == "2024-01-01 00:00:00"
+        # exact name => no newest-by-number collision warning
+        assert "share number" not in caplog.text
+
+    def test_backup_name_not_found_raises(self, tmp_path):
+        from btrfs_backup_ng.core.restore import (
+            RestoreError,
+            _resolve_raw_snapper_backup,
+        )
+
+        fake = self._two_colliding(tmp_path)
+        with patch("btrfs_backup_ng.endpoint.choose_endpoint", return_value=fake):
+            with pytest.raises(RestoreError, match="not found"):
+                _resolve_raw_snapper_backup(
+                    f"raw://{tmp_path}", 100, None, "root-100-missing"
+                )
+
+    def test_bare_number_still_picks_newest_and_warns(self, tmp_path, caplog):
+        """Fallback (no backup_name) keeps the R11 newest+warn behavior."""
+        from btrfs_backup_ng.core.restore import _resolve_raw_snapper_backup
+
+        fake = self._two_colliding(tmp_path)
+        with patch("btrfs_backup_ng.endpoint.choose_endpoint", return_value=fake):
+            with caplog.at_level("WARNING"):
+                _ep, snap, _m = _resolve_raw_snapper_backup(f"raw://{tmp_path}", 100)
+        assert snap.name == "root-100-new"
+        assert "share number 100" in caplog.text
+        assert "--backup-name or --date" in caplog.text

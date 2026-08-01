@@ -848,17 +848,28 @@ def _list_raw_snapper_backups(
 
 
 def _resolve_raw_snapper_backup(
-    backup_path: str, backup_number: int, endpoint_options: dict | None = None
+    backup_path: str,
+    backup_number: int,
+    endpoint_options: dict | None = None,
+    backup_name: str | None = None,
 ) -> tuple[Any, Any, Any]:
-    """Resolve a raw snapper backup number to (endpoint, RawSnapshot, BackupMetadata).
+    """Resolve a raw snapper backup to (endpoint, RawSnapshot, BackupMetadata).
 
-    Maps a snapper number -> backup_name (via the ``.snapper-meta.json`` sidecars)
-    -> the matching RawSnapshot (by ``.name``, the shared cross-type backup identity
-    set when the stream and sidecar were written from one ``get_backup_name()``). One
-    endpoint is built and reused for both the lookup and the later ``send()``. The
-    returned BackupMetadata carries the snapper fields used to regenerate info.xml.
+    Two resolution modes:
 
-    Raises RestoreError if the number has no sidecar or its stream file is missing.
+    * ``backup_name`` given (EXACT) -- resolve that specific sidecar by its unique
+      name. This is what the CLI threads once it has enumerated the exact backup the
+      user selected (``--snapshot`` after collision-dedup, ``--backup-name``,
+      ``--date``), so restore materializes precisely that backup rather than
+      re-guessing by number.
+    * ``backup_name`` None (FALLBACK, bare-number API callers) -- match by
+      ``snapper_number``; on a collision (snapper reuses numbers after a prune, and
+      raw targets accumulate streams), pick the NEWEST by snapper_date and warn.
+
+    The matched name maps to a RawSnapshot by ``.name`` (the shared cross-type backup
+    identity). One endpoint is built and reused for the lookup and the later ``send()``.
+
+    Raises RestoreError if the requested backup has no sidecar or its stream is missing.
     """
     from ..endpoint import choose_endpoint
 
@@ -866,45 +877,50 @@ def _resolve_raw_snapper_backup(
         backup_path, _raw_endpoint_config(backup_path, endpoint_options)
     )
 
-    # Collect ALL sidecars matching this snapper number, not just the first. Snapper
-    # reuses numbers after a prune (see operations.py: "the snapper number, which
-    # snapper reuses after a prune"), and raw targets accumulate streams over time, so
-    # two RETAINED sidecars can share a number, differing only by the date in their
-    # backup_name. Iterating the UNORDERED set and breaking on the first match would
-    # pick nondeterministically (Python's salted set order) -- a wrong-snapshot restore.
-    # Iterate a sorted list and, on a collision, pick the NEWEST by snapper_date and warn
-    # loudly so the ambiguity is visible (name/date-based addressing is a follow-up).
-    matches: list[tuple[str, Any]] = []
-    for name in sorted(_list_snapper_backups_at_destination(endpoint)):
+    if backup_name is not None:
+        # EXACT: load this specific sidecar by its unique name (no number guessing).
         try:
-            backup_meta = _load_snapper_sidecar(endpoint, name)
+            match_meta = _load_snapper_sidecar(endpoint, backup_name)
         except Exception as e:
-            logger.warning(
-                "Skipping raw snapper backup %r (unreadable sidecar): %s", name, e
+            raise RestoreError(
+                f"Snapper backup {backup_name!r} not found at {backup_path}: {e}"
+            ) from e
+        match_name = backup_name
+    else:
+        # FALLBACK: collect ALL sidecars matching this snapper number, then pick the
+        # newest on a collision. Iterating a sorted list keeps the choice deterministic
+        # (the underlying set order is salted -> would otherwise be nondeterministic).
+        matches: list[tuple[str, Any]] = []
+        for name in sorted(_list_snapper_backups_at_destination(endpoint)):
+            try:
+                meta = _load_snapper_sidecar(endpoint, name)
+            except Exception as e:
+                logger.warning(
+                    "Skipping raw snapper backup %r (unreadable sidecar): %s", name, e
+                )
+                continue
+            if meta.snapper_number == backup_number:
+                matches.append((name, meta))
+
+        if not matches:
+            raise RestoreError(
+                f"Snapper backup number {backup_number} not found at {backup_path}"
             )
-            continue
-        if backup_meta.snapper_number == backup_number:
-            matches.append((name, backup_meta))
 
-    if not matches:
-        raise RestoreError(
-            f"Snapper backup number {backup_number} not found at {backup_path}"
-        )
+        if len(matches) > 1:
+            # Deterministic: newest snapper_date wins (name breaks a date tie).
+            matches.sort(key=lambda nm: (nm[1].snapper_date, nm[0]), reverse=True)
+            logger.warning(
+                "Multiple raw snapper backups share number %d at %s: %s. Restoring the "
+                "newest (%s, %s); use --backup-name or --date to restore an older copy.",
+                backup_number,
+                backup_path,
+                ", ".join(f"{n} ({m.snapper_date})" for n, m in matches),
+                matches[0][0],
+                matches[0][1].snapper_date,
+            )
 
-    if len(matches) > 1:
-        # Deterministic: newest snapper_date wins (name breaks a date tie).
-        matches.sort(key=lambda nm: (nm[1].snapper_date, nm[0]), reverse=True)
-        logger.warning(
-            "Multiple raw snapper backups share number %d at %s: %s. Restoring the "
-            "newest (%s, %s); the older copies are not reachable by number alone.",
-            backup_number,
-            backup_path,
-            ", ".join(f"{n} ({m.snapper_date})" for n, m in matches),
-            matches[0][0],
-            matches[0][1].snapper_date,
-        )
-
-    match_name, match_meta = matches[0]
+        match_name, match_meta = matches[0]
 
     raw_snapshot = next(
         (s for s in endpoint.list_snapshots() if s.name == match_name), None
@@ -926,6 +942,7 @@ def restore_snapper_snapshot(
     options: dict | None = None,
     dry_run: bool = False,
     endpoint_options: dict | None = None,
+    backup_name: str | None = None,
 ) -> tuple[int, Path]:
     """Restore a snapper backup to local snapper format.
 
@@ -986,7 +1003,7 @@ def restore_snapper_snapshot(
 
     if is_raw:
         raw_endpoint, raw_snapshot, raw_backup_meta = _resolve_raw_snapper_backup(
-            backup_path, backup_number, endpoint_options
+            backup_path, backup_number, endpoint_options, backup_name
         )
         source_desc = raw_snapshot.name
     else:

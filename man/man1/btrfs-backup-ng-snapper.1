@@ -135,7 +135,17 @@ Options:
 List available backups at the source location.
 .TP
 .BI \-\-snapshot " NUM"
-Restore specific snapshot number. Can be specified multiple times.
+Restore specific snapshot number. Can be specified multiple times. On a reused
+(duplicate) snapper number, restores the newest by date and warns.
+.TP
+.BI \-\-backup-name " NAME"
+Restore the exact raw backup by its unique name (shown by \fB\-\-list\fR). Can be
+specified multiple times. Use this to reach an older copy when a snapper number
+was reused after a prune.
+.TP
+.BI \-\-date " DATE"
+Restrict the selection to backups whose date matches DATE
+(\fIYYYY-MM-DD\fR[\fI HH:MM:SS\fR] prefix). Disambiguates a reused \fB\-\-snapshot\fR.
 .TP
 .BR \-a ", " \-\-all
 Restore all available backups.
@@ -166,7 +176,9 @@ For a \fBraw+ssh://\fR source written with \fB\-\-ssh-sudo\fR (root\-owned remot
 directory), pass \fB\-\-ssh-sudo\fR to \fBrestore\fR as well, or it will report a
 permission error instead of the backups. When Snapper has reused a number after a prune,
 a raw target can hold two backups with the same number; \fB\-\-snapshot \fINUM\fR restores
-the newest by date and warns.
+the newest by date and warns. To restore an older copy, use \fB\-\-backup-name \fINAME\fR
+(names are shown by \fB\-\-list\fR) or narrow \fB\-\-snapshot \fINUM\fR with
+\fB\-\-date \fIYYYY-MM-DD\fR.
 .SS status
 Show backup status for Snapper configurations.
 .PP
