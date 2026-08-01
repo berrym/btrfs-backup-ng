@@ -14,7 +14,9 @@ from typing import Any, Optional
 __all__ = [
     "SnapperMetadata",
     "parse_info_xml",
+    "parse_info_xml_string",
     "generate_info_xml",
+    "renumber_info_xml",
     "load_backup_metadata",
     "save_backup_metadata",
 ]
@@ -74,29 +76,42 @@ class SnapperMetadata:
         )
 
 
-def parse_info_xml(path: Path | str) -> SnapperMetadata:
-    """Parse a snapper info.xml file.
+def _parse_userdata(userdata_elems: list[ET.Element]) -> dict[str, str]:
+    """Parse snapper's <userdata> element(s) into a {name: value} dict.
 
-    Args:
-        path: Path to the info.xml file
+    Snapper (verified on 0.13.0) writes ONE ``<userdata>`` element PER entry, each
+    holding a ``<key>NAME</key><value>VALUE</value>`` pair -- so a two-entry snapshot
+    has two sibling ``<userdata>`` blocks. Iterate every block (not just the first)
+    and pair key/value within it, so multiple entries all survive. The old code used
+    ``root.find("userdata")`` (first block only) AND the child tag as the dict key,
+    silently dropping every entry after the first -- multi-entry userdata data loss.
 
-    Returns:
-        SnapperMetadata object with parsed information
-
-    Raises:
-        FileNotFoundError: If the file doesn't exist
-        ValueError: If the XML is malformed or missing required fields
+    Also handles a single block containing several key/value pairs, and a legacy
+    ``<name>value</name>`` child, for robustness.
     """
-    path = Path(path)
-    if not path.exists():
-        raise FileNotFoundError(f"info.xml not found: {path}")
+    userdata: dict[str, str] = {}
+    for userdata_elem in userdata_elems:
+        pending_key: Optional[str] = None
+        for item in userdata_elem:
+            if item.tag == "key":
+                pending_key = item.text or ""
+            elif item.tag == "value":
+                if pending_key is not None:
+                    userdata[pending_key] = item.text or ""
+                    pending_key = None
+                # A <value> with no preceding <key> is malformed; ignore it.
+            elif item.tag and item.text:
+                # Legacy / alternative <name>value</name> form.
+                userdata[item.tag] = item.text
+    return userdata
 
-    try:
-        tree = ET.parse(path)
-        root = tree.getroot()
-    except ET.ParseError as e:
-        raise ValueError(f"Failed to parse info.xml: {e}") from e
 
+def _snapper_metadata_from_root(root: ET.Element) -> SnapperMetadata:
+    """Build a SnapperMetadata from a parsed <snapshot> element.
+
+    Shared by ``parse_info_xml`` (file) and ``parse_info_xml_string`` (a sidecar's
+    stored ``original_info_xml``) so both read snapper's format identically.
+    """
     if root.tag != "snapshot":
         raise ValueError(f"Expected <snapshot> root element, got <{root.tag}>")
 
@@ -143,14 +158,6 @@ def parse_info_xml(path: Path | str) -> SnapperMetadata:
         except ValueError:
             pass  # Ignore invalid pre_num
 
-    # Extract userdata
-    userdata = {}
-    userdata_elem = root.find("userdata")
-    if userdata_elem is not None:
-        for item in userdata_elem:
-            if item.tag and item.text:
-                userdata[item.tag] = item.text
-
     return SnapperMetadata(
         type=type_elem.text,
         num=num,
@@ -158,8 +165,52 @@ def parse_info_xml(path: Path | str) -> SnapperMetadata:
         description=description,
         cleanup=cleanup,
         pre_num=pre_num,
-        userdata=userdata,
+        userdata=_parse_userdata(root.findall("userdata")),
     )
+
+
+def parse_info_xml(path: Path | str) -> SnapperMetadata:
+    """Parse a snapper info.xml file.
+
+    Args:
+        path: Path to the info.xml file
+
+    Returns:
+        SnapperMetadata object with parsed information
+
+    Raises:
+        FileNotFoundError: If the file doesn't exist
+        ValueError: If the XML is malformed or missing required fields
+    """
+    path = Path(path)
+    if not path.exists():
+        raise FileNotFoundError(f"info.xml not found: {path}")
+
+    try:
+        tree = ET.parse(path)
+        root = tree.getroot()
+    except ET.ParseError as e:
+        raise ValueError(f"Failed to parse info.xml: {e}") from e
+
+    return _snapper_metadata_from_root(root)
+
+
+def parse_info_xml_string(xml_content: str) -> SnapperMetadata:
+    """Parse snapper info.xml from a string.
+
+    Used to reconstruct metadata from a sidecar's stored ``original_info_xml`` --
+    snapper's own XML, the authoritative source on restore (independent of the
+    parsed-dict field, which older sidecars may have stored mis-parsed).
+
+    Raises:
+        ValueError: If the XML is malformed or missing required fields
+    """
+    try:
+        root = ET.fromstring(xml_content)
+    except ET.ParseError as e:
+        raise ValueError(f"Failed to parse info.xml: {e}") from e
+
+    return _snapper_metadata_from_root(root)
 
 
 def generate_info_xml(metadata: SnapperMetadata) -> str:
@@ -192,16 +243,43 @@ def generate_info_xml(metadata: SnapperMetadata) -> str:
         lines.append(f"  <pre_num>{metadata.pre_num}</pre_num>")
 
     if metadata.userdata:
-        lines.append("  <userdata>")
+
+        def _esc(s: str) -> str:
+            return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+        # Snapper writes one <userdata> block PER entry, each a <key>/<value> pair.
         for key, value in metadata.userdata.items():
-            value = value.replace("&", "&amp;")
-            value = value.replace("<", "&lt;")
-            value = value.replace(">", "&gt;")
-            lines.append(f"    <{key}>{value}</{key}>")
-        lines.append("  </userdata>")
+            lines.append("  <userdata>")
+            lines.append(f"    <key>{_esc(key)}</key>")
+            lines.append(f"    <value>{_esc(value)}</value>")
+            lines.append("  </userdata>")
 
     lines.append("</snapshot>")
     return "\n".join(lines)
+
+
+def renumber_info_xml(original_xml: str, new_num: int) -> str:
+    """Return snapper info.xml with ONLY <num> changed to new_num.
+
+    Every other element is preserved VERBATIM -- including ones this module does not
+    model (e.g. <uid>, which snapper emits on manual snapshots). Used on restore to
+    renumber a sidecar's stored original_info_xml into a fresh local slot without the
+    fidelity loss of a parse -> SnapperMetadata -> generate round-trip (that path
+    only preserves the modeled fields).
+
+    Raises:
+        ValueError: If the XML is malformed or has no <num> element.
+    """
+    try:
+        root = ET.fromstring(original_xml)
+    except ET.ParseError as e:
+        raise ValueError(f"Failed to parse info.xml: {e}") from e
+    num_elem = root.find("num")
+    if num_elem is None:
+        raise ValueError("info.xml has no <num> element to renumber")
+    num_elem.text = str(new_num)
+    body = ET.tostring(root, encoding="unicode")
+    return f'<?xml version="1.0"?>\n{body}'
 
 
 @dataclass
@@ -251,6 +329,26 @@ class BackupMetadata:
             userdata=self.snapper_userdata,
         )
 
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "BackupMetadata":
+        """Create from a JSON-decoded dict.
+
+        Single construction site shared by ``load_backup_metadata`` (local file)
+        and the raw+ssh enumeration path (a ``.snapper-meta.json`` cat'd back over
+        ssh), so the two never drift.
+        """
+        return cls(
+            snapper_config=data.get("snapper_config", ""),
+            snapper_number=data.get("snapper_number", 0),
+            snapper_type=data.get("snapper_type", "single"),
+            snapper_description=data.get("snapper_description", ""),
+            snapper_cleanup=data.get("snapper_cleanup", ""),
+            snapper_pre_num=data.get("snapper_pre_num"),
+            snapper_userdata=data.get("snapper_userdata", {}),
+            snapper_date=data.get("snapper_date", ""),
+            original_info_xml=data.get("original_info_xml", ""),
+        )
+
 
 def save_backup_metadata(path: Path | str, metadata: BackupMetadata) -> None:
     """Save backup metadata to a JSON file.
@@ -259,16 +357,16 @@ def save_backup_metadata(path: Path | str, metadata: BackupMetadata) -> None:
         path: Path to the .snapper-meta.json file
         metadata: BackupMetadata object to save
     """
+    from btrfs_backup_ng import __util__
+
     path = Path(path)
     data = asdict(metadata)
-    # NOTE (R7 scope boundary): this snapper .snapper-meta.json sidecar is written
-    # non-atomically (a crash mid-write can leave a torn JSON). It was deliberately left
-    # out of R7's atomic-persistence pass -- the snapper metadata round-trip is audit
-    # root R11's territory, where the read/write path is being reworked wholesale;
-    # hardening it there (via __util__.atomic_write_bytes, like the raw .meta sidecar)
-    # avoids touching the snapper subsystem twice. Tracked, not forgotten.
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2)
+    # Write atomically (temp -> fsync -> os.replace) so a crash mid-write can never leave a
+    # torn .snapper-meta.json that load_backup_metadata would reject -- fulfilling the R7
+    # deferral for this sidecar, now that R11 reads it back on restore. R11/R7.
+    __util__.atomic_write_bytes(  # type: ignore[attr-defined]
+        path, json.dumps(data, indent=2), mode=0o600
+    )
 
 
 def load_backup_metadata(path: Path | str) -> BackupMetadata:
@@ -294,14 +392,4 @@ def load_backup_metadata(path: Path | str) -> BackupMetadata:
     except json.JSONDecodeError as e:
         raise ValueError(f"Invalid metadata JSON: {e}") from e
 
-    return BackupMetadata(
-        snapper_config=data.get("snapper_config", ""),
-        snapper_number=data.get("snapper_number", 0),
-        snapper_type=data.get("snapper_type", "single"),
-        snapper_description=data.get("snapper_description", ""),
-        snapper_cleanup=data.get("snapper_cleanup", ""),
-        snapper_pre_num=data.get("snapper_pre_num"),
-        snapper_userdata=data.get("snapper_userdata", {}),
-        snapper_date=data.get("snapper_date", ""),
-        original_info_xml=data.get("original_info_xml", ""),
-    )
+    return BackupMetadata.from_dict(data)

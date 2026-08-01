@@ -2312,17 +2312,37 @@ def _list_snapper_backups_at_destination(endpoint) -> set[str]:
     if is_remote:
         # List remote directory
         if hasattr(endpoint, "_exec_remote_command"):
-            try:
-                result = endpoint._exec_remote_command(
-                    ["ls", "-1", str(dest_path)],
-                    check=False,
-                )
-                if result.returncode == 0:
-                    for name in result.stdout.decode().strip().split("\n"):
-                        if name.endswith(".snapper-meta.json"):
-                            backup_names.add(name[:-18])  # Remove suffix
-            except Exception as e:
-                logger.warning("Could not list remote backups: %s", e)
+            result = endpoint._exec_remote_command(
+                ["ls", "-1", str(dest_path)],
+                check=False,
+            )
+            if result.returncode == 0:
+                for name in result.stdout.decode().strip().split("\n"):
+                    if name.endswith(".snapper-meta.json"):
+                        backup_names.add(name[:-18])  # Remove suffix
+            else:
+                # A genuinely absent target dir is "no backups yet", not an error --
+                # return an empty set. But an unreachable host, an auth failure, or a
+                # permission-denied (e.g. a --ssh-sudo root-owned target listed without
+                # sudo) must NOT masquerade as an empty target: that reads as "no
+                # backups"/"not found" during restore -- exactly when it is most
+                # dangerous. Surface it as an error so callers (list/restore/status)
+                # report the real cause.
+                stderr = (result.stderr or b"").decode(errors="replace").strip()
+                if "No such file or directory" in stderr:
+                    logger.debug(
+                        "Remote snapper target %s does not exist yet: %s",
+                        dest_path,
+                        stderr,
+                    )
+                else:
+                    host = getattr(endpoint, "hostname", None) or "remote host"
+                    detail = stderr or f"ls exited {result.returncode}"
+                    raise RuntimeError(
+                        f"Cannot list snapper backups on {host}: {detail}. If the "
+                        "target was written with --ssh-sudo (root-owned), retry the "
+                        "command with --ssh-sudo."
+                    )
     else:
         # List local directory
         try:

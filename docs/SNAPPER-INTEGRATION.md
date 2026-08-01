@@ -101,6 +101,13 @@ btrfs-backup-ng snapper restore /mnt/backup/root --config root --list
 btrfs-backup-ng snapper restore /mnt/backup/root --config root --snapshot 559
 ```
 
+A restored snapshot lands in the config's `.snapshots/{N}/` and integrates with snapper —
+but the snapper **daemon** caches its snapshot list, so run `snapper -c root list` (or
+reboot) after a restore before `snapper diff`/`undochange`/rollback against it (the restore
+command reminds you). To roll back, prefer snapper's own flow: boot the read-only
+grub-btrfs entry, then `snapper rollback`. For a root-owned `raw+ssh://` backup written with
+`--ssh-sudo`, pass `--ssh-sudo` to `restore` too.
+
 ## Configuration
 
 ### Using Config Files
