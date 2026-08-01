@@ -1436,6 +1436,20 @@ Examples:
         help="Restore all snapper backups",
     )
     snapper_restore.add_argument(
+        "--backup-name",
+        action="append",
+        metavar="NAME",
+        help="Restore the exact raw backup by its name (from --list); can be "
+        "repeated. Use this to restore an older backup when a snapper number was "
+        "reused (see --list for names).",
+    )
+    snapper_restore.add_argument(
+        "--date",
+        metavar="DATE",
+        help="Restrict the selection to backups whose date matches DATE "
+        "(YYYY-MM-DD[ HH:MM:SS] prefix). Disambiguates a reused --snapshot NUM.",
+    )
+    snapper_restore.add_argument(
         "--from-config",
         metavar="NAME",
         help="Only restore from this snapper config in backup",

@@ -764,7 +764,7 @@ btrfs-backup-ng snapper list [OPTIONS]
 btrfs-backup-ng snapper list
 
 # List only 'root' config snapshots
-btrfs-backup-ng snapper list --config root
+btrfs-backup-ng snapper list root
 
 # List only 'single' type snapshots
 btrfs-backup-ng snapper list --type single
@@ -868,49 +868,56 @@ btrfs-backup-ng snapper status --target /mnt/backup/root
 Restore snapper snapshots from backup.
 
 ```bash
-btrfs-backup-ng snapper restore SOURCE --config NAME [OPTIONS]
+btrfs-backup-ng snapper restore SOURCE CONFIG [OPTIONS]
 ```
 
-**Arguments:**
+**Arguments** (both positional, in this order):
 | Argument | Description |
 |----------|-------------|
-| `SOURCE` | Backup source path (local or ssh://user@host:/path) |
+| `SOURCE` | Backup source: a local path, `ssh://user@host:/path` (btrfs), or `raw://path` / `raw+ssh://user@host/path` (non-btrfs) |
+| `CONFIG` | Local snapper config to restore **into** (e.g. `root`, `home`) — required |
 
 **Options:**
 | Option | Description |
 |--------|-------------|
-| `--config NAME` | Local snapper config to restore into (required) |
-| `--list` | List available backups instead of restoring |
-| `--snapshot NUM` | Restore specific snapshot by number (can be repeated) |
-| `--all` | Restore all snapshots |
+| `-l`, `--list` | List available backups instead of restoring |
+| `-s`, `--snapshot NUM` | Restore snapshot by number (can be repeated). On a reused (duplicate) number, restores the newest by date and warns |
+| `--backup-name NAME` | Restore the exact raw backup by name from `--list` (can be repeated); reaches an older copy when a snapper number was reused |
+| `--date DATE` | Restrict the selection to backups whose date matches `DATE` (`YYYY-MM-DD[ HH:MM:SS]` prefix; an ISO-8601 `T` separator is accepted); disambiguates a reused `--snapshot NUM` |
+| `-a`, `--all` | Restore all backups |
+| `--from-config NAME` | Only restore backups that were made from this snapper config (overrides the target `CONFIG` for matching) |
 | `--dry-run` | Show what would be done without making changes |
-| `--compress METHOD` | Compression method |
-| `--rate-limit RATE` | Bandwidth limit |
-| `--ssh-sudo` | Use sudo on remote host |
+| `--ssh-sudo` | Use `sudo` on the remote host (`ssh://` / `raw+ssh://`); required to read a root-owned target written with `--ssh-sudo` |
 | `--ssh-key FILE` | SSH private key file |
-| `--ssh-auth-sock PATH` | Explicit ssh-agent socket (overrides auto-discovery) |
-| `--progress` | Show progress bars |
-| `--json` | Output in JSON format (for --list) |
+| `--ssh-auth-sock PATH` | Explicit ssh-agent socket (overrides auto-discovery; useful under `sudo`) |
+| `--ssh-host-key-policy {accept-new,strict}` | Host-key verification policy (default `accept-new`) |
+| `--json` | Output in JSON format (for `--list`) |
 
 **Examples:**
 ```bash
 # List available backups
-btrfs-backup-ng snapper restore /mnt/backup/root --config root --list
+btrfs-backup-ng snapper restore /mnt/backup/root root --list
 
 # Restore specific snapshot
-btrfs-backup-ng snapper restore /mnt/backup/root --config root --snapshot 559
+btrfs-backup-ng snapper restore /mnt/backup/root root --snapshot 559
 
 # Restore multiple snapshots
-btrfs-backup-ng snapper restore /mnt/backup/root --config root --snapshot 559 --snapshot 560
+btrfs-backup-ng snapper restore /mnt/backup/root root --snapshot 559 --snapshot 560
 
 # Restore all snapshots
-btrfs-backup-ng snapper restore /mnt/backup/root --config root --all
+btrfs-backup-ng snapper restore /mnt/backup/root root --all
 
 # Dry run
-btrfs-backup-ng snapper restore /mnt/backup/root --config root --all --dry-run
+btrfs-backup-ng snapper restore /mnt/backup/root root --all --dry-run
 
 # Restore a root-owned raw+ssh:// backup (written with --ssh-sudo): pass it again
-btrfs-backup-ng snapper restore raw+ssh://user@host/backups/root --config root --snapshot 559 --ssh-sudo
+btrfs-backup-ng snapper restore raw+ssh://user@host/backups/root root --snapshot 559 --ssh-sudo
+
+# Reused snapper number: restore an OLDER copy by exact name (from --list) ...
+btrfs-backup-ng snapper restore /mnt/backup/root root --backup-name root-559-20240101-120000
+
+# ... or by number + date
+btrfs-backup-ng snapper restore /mnt/backup/root root --snapshot 559 --date 2024-01-01
 ```
 
 > **Note — snapper daemon cache.** A restored snapshot is written directly into
@@ -924,8 +931,9 @@ btrfs-backup-ng snapper restore raw+ssh://user@host/backups/root --config root -
 > **Note — duplicate snapper numbers.** Snapper reuses snapshot numbers after a prune, so a
 > `raw://` / `raw+ssh://` target can accumulate two retained backups with the same number
 > (they differ by the date in the backup name). `--snapshot N` restores the **newest** of
-> them by date and warns; addressing an older same-number copy by name/date is a planned
-> enhancement.
+> them by date and warns. To reach an **older** copy, use `--backup-name NAME` (the unique
+> name is shown by `--list`, and in `--list --json` as `backup_name`) or narrow `--snapshot N`
+> with `--date YYYY-MM-DD`. `--list` shows a **NAME** column whenever names are available.
 
 #### snapper generate-config
 
@@ -953,7 +961,7 @@ btrfs-backup-ng snapper generate-config [OPTIONS]
 btrfs-backup-ng snapper generate-config
 
 # Generate for specific config with target
-btrfs-backup-ng snapper generate-config --config root --target ssh://backup@server:/backups
+btrfs-backup-ng snapper generate-config root --target ssh://backup@server:/backups
 
 # Write to file
 btrfs-backup-ng snapper generate-config -o ~/.config/btrfs-backup-ng/snapper.toml

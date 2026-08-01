@@ -44,7 +44,7 @@ _btrfs_backup_ng() {
     local snapper_list_opts="--config --type --json"
     local snapper_backup_opts="--snapshot --type --min-age --dry-run --ssh-sudo --ssh-key --compress --rate-limit --progress --no-progress"
     local snapper_status_opts="--json"
-    local snapper_restore_opts="--snapshot --dry-run --ssh-sudo --ssh-key"
+    local snapper_restore_opts="--snapshot --backup-name --date --all --list --json --config --dry-run --ssh-sudo --ssh-key --ssh-auth-sock"
     local snapper_generate_config_opts="-o --output"
     local raw_list_opts="--json --ssh-sudo"
     local raw_verify_opts="--snapshot --json --ssh-sudo"

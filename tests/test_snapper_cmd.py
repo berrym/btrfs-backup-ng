@@ -1737,3 +1737,229 @@ class TestRestoreSnapperdCacheHint:
         result, text = self._run(self._args(dry_run=True), mock_snapper_configs, capsys)
         assert result == 0
         assert "daemon picks up the restored" not in text
+
+
+class TestRestoreNameDateSelection:
+    """R11b: --backup-name / --date selection + collision dedup + name threading."""
+
+    def _mk_backups(self):
+        from datetime import datetime
+
+        from btrfs_backup_ng.snapper.metadata import SnapperMetadata
+
+        def mk(num, name, date):
+            return {
+                "number": num,
+                "metadata": SnapperMetadata(
+                    type="single",
+                    num=num,
+                    date=datetime.fromisoformat(date),
+                    description="d",
+                ),
+                "raw": True,
+                "backup_name": name,
+            }
+
+        # two backups share number 100 (reused after prune); 3 is unique
+        return [
+            mk(3, "root-3-x", "2024-01-01T00:00:00"),
+            mk(100, "root-100-old", "2024-01-01T00:00:00"),
+            mk(100, "root-100-new", "2024-06-01T00:00:00"),
+        ]
+
+    def _args(self, **kw):
+        base = dict(
+            source="raw:///b",
+            config="root",
+            snapshot=None,
+            backup_name=None,
+            all=False,
+            date=None,
+            list=False,
+            json=False,
+            dry_run=False,
+            verbose=False,
+            quiet=False,
+            log_level=None,
+        )
+        base.update(kw)
+        return argparse.Namespace(**base)
+
+    def _run(self, args, mock_snapper_configs):
+        from pathlib import Path
+
+        from btrfs_backup_ng.cli.snapper_cmd import _handle_restore
+
+        with (
+            patch("btrfs_backup_ng.cli.snapper_cmd.SnapperScanner") as scanner_cls,
+            patch(
+                "btrfs_backup_ng.core.restore.list_snapper_backups",
+                return_value=self._mk_backups(),
+            ),
+            patch(
+                "btrfs_backup_ng.core.restore.restore_snapper_snapshot"
+            ) as mock_restore,
+        ):
+            scanner = MagicMock()
+            scanner.get_config.return_value = mock_snapper_configs[0]
+            scanner_cls.return_value = scanner
+            mock_restore.return_value = (1, Path("/x/snapshot"))
+            result = _handle_restore(args)
+        return result, mock_restore
+
+    @staticmethod
+    def _restored_names(mock_restore):
+        return [c.kwargs.get("backup_name") for c in mock_restore.call_args_list]
+
+    def test_backup_name_restores_exact_older(self, mock_snapper_configs):
+        result, mr = self._run(
+            self._args(backup_name=["root-100-old"]), mock_snapper_configs
+        )
+        assert result == 0
+        assert self._restored_names(mr) == ["root-100-old"]
+
+    def test_snapshot_collision_restores_newest_only_and_warns(
+        self, capsys, mock_snapper_configs
+    ):
+        result, mr = self._run(self._args(snapshot=[100]), mock_snapper_configs)
+        assert result == 0
+        assert self._restored_names(mr) == ["root-100-new"]  # newest only, once
+        cap = capsys.readouterr()
+        text = " ".join((cap.out + cap.err).split())
+        assert "Multiple backups share number 100" in text
+        assert "--backup-name or --date" in text
+
+    def test_snapshot_with_date_picks_dated_copy(self, mock_snapper_configs):
+        result, mr = self._run(
+            self._args(snapshot=[100], date="2024-01-01"), mock_snapper_configs
+        )
+        assert result == 0
+        assert self._restored_names(mr) == ["root-100-old"]  # the 2024-01-01 copy
+
+    def test_all_restores_each_backup_once(self, mock_snapper_configs):
+        result, mr = self._run(self._args(all=True), mock_snapper_configs)
+        assert result == 0
+        assert sorted(self._restored_names(mr)) == [
+            "root-100-new",
+            "root-100-old",
+            "root-3-x",
+        ]
+
+    def test_backup_name_not_found_errors_without_restoring(self, mock_snapper_configs):
+        result, mr = self._run(
+            self._args(backup_name=["root-does-not-exist"]), mock_snapper_configs
+        )
+        assert result == 1
+        assert mr.call_count == 0
+
+    def test_date_with_no_match_errors(self, mock_snapper_configs):
+        result, mr = self._run(
+            self._args(snapshot=[100], date="1999-12-31"), mock_snapper_configs
+        )
+        assert result == 1
+        assert mr.call_count == 0
+
+    def test_no_selection_errors(self, mock_snapper_configs):
+        result, mr = self._run(self._args(), mock_snapper_configs)
+        assert result == 1
+        assert mr.call_count == 0
+
+    def test_list_table_shows_name_column_and_tip(self, capsys, mock_snapper_configs):
+        self._run(self._args(list=True), mock_snapper_configs)
+        out = capsys.readouterr().out
+        assert "NAME" in out
+        assert "root-100-old" in out and "root-100-new" in out
+        assert "--backup-name" in out  # the disambiguation tip
+
+    def test_list_json_includes_backup_name(self, capsys, mock_snapper_configs):
+        self._run(self._args(list=True, json=True), mock_snapper_configs)
+        data = json.loads(capsys.readouterr().out)
+        names = [e["backup_name"] for e in data["backups"]]
+        assert "root-100-old" in names and "root-100-new" in names
+
+    def test_overlapping_selectors_restore_each_once(self, mock_snapper_configs):
+        """The _add() dedup guard: overlapping --backup-name + --snapshot restore once.
+
+        Kills a mutation that removes the guard (which would double-restore the newest).
+        """
+        result, mr = self._run(
+            self._args(backup_name=["root-100-new"], snapshot=[100]),
+            mock_snapper_configs,
+        )
+        assert result == 0
+        names = self._restored_names(mr)
+        assert names == ["root-100-new"]  # exactly once, not twice
+        assert len(names) == len(set(names))
+
+    def test_all_plus_snapshot_collision_no_false_warning(
+        self, capsys, mock_snapper_configs
+    ):
+        """--all --snapshot N restores each once and does NOT emit the newest-only warn."""
+        result, mr = self._run(
+            self._args(all=True, snapshot=[100]), mock_snapper_configs
+        )
+        assert result == 0
+        assert sorted(self._restored_names(mr)) == [
+            "root-100-new",
+            "root-100-old",
+            "root-3-x",
+        ]
+        cap = capsys.readouterr()
+        text = " ".join((cap.out + cap.err).split())
+        assert "Multiple backups share number" not in text  # older IS restored
+
+    def test_date_alone_errors_mentioning_date(self, capsys, mock_snapper_configs):
+        """--date with no selector explains it is a filter (not a selector)."""
+        result, mr = self._run(self._args(date="2024-01-01"), mock_snapper_configs)
+        assert result == 1
+        assert mr.call_count == 0
+        cap = capsys.readouterr()
+        text = " ".join((cap.out + cap.err).split())
+        # message names --date and points at combining it
+        assert "--date" in text
+
+    def test_iso_t_separator_date_matches(self, mock_snapper_configs):
+        """--date with an ISO 'T' separator resolves (normalized to a space)."""
+        result, mr = self._run(
+            self._args(snapshot=[100], date="2024-06-01T00:00:00"),
+            mock_snapper_configs,
+        )
+        assert result == 0
+        assert self._restored_names(mr) == ["root-100-new"]  # the 2024-06-01 copy
+
+
+class TestBackupSelectionHelpers:
+    """R11b: the date-match and recency-key helpers."""
+
+    def _b(self, name, date):
+        from datetime import datetime
+
+        from btrfs_backup_ng.snapper.metadata import SnapperMetadata
+
+        return {
+            "number": 1,
+            "backup_name": name,
+            "metadata": SnapperMetadata(
+                type="single", num=1, date=datetime.fromisoformat(date)
+            ),
+        }
+
+    def test_date_matches_prefix(self):
+        from btrfs_backup_ng.cli.snapper_cmd import _backup_date_matches
+
+        b = self._b("x", "2024-01-01T12:30:00")
+        assert _backup_date_matches(b, "2024-01-01")
+        assert _backup_date_matches(b, "2024-01-01 12:30:00")
+        assert not _backup_date_matches(b, "2024-01-02")
+
+    def test_date_matches_handles_missing_metadata(self):
+        from btrfs_backup_ng.cli.snapper_cmd import _backup_date_matches
+
+        assert not _backup_date_matches({"number": 1}, "2024-01-01")
+
+    def test_recency_key_orders_newest_last(self):
+        from btrfs_backup_ng.cli.snapper_cmd import _backup_recency_key
+
+        old = self._b("old", "2024-01-01T00:00:00")
+        new = self._b("new", "2024-06-01T00:00:00")
+        assert max([old, new], key=_backup_recency_key)["backup_name"] == "new"

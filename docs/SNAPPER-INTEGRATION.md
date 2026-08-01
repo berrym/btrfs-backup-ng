@@ -51,7 +51,7 @@ Found 2 snapper configuration(s):
 ### 2. List Available Snapshots
 
 ```bash
-btrfs-backup-ng snapper list --config root
+btrfs-backup-ng snapper list root
 ```
 
 Output:
@@ -95,10 +95,10 @@ btrfs-backup-ng snapper status --target /mnt/backup/root
 
 ```bash
 # List available backups
-btrfs-backup-ng snapper restore /mnt/backup/root --config root --list
+btrfs-backup-ng snapper restore /mnt/backup/root root --list
 
 # Restore specific snapshot
-btrfs-backup-ng snapper restore /mnt/backup/root --config root --snapshot 559
+btrfs-backup-ng snapper restore /mnt/backup/root root --snapshot 559
 ```
 
 A restored snapshot lands in the config's `.snapshots/{N}/` and integrates with snapper —
@@ -256,7 +256,7 @@ Backing up snapshot 561...
 Before restoring, list available backups:
 
 ```bash
-btrfs-backup-ng snapper restore /mnt/backup/root --config root --list
+btrfs-backup-ng snapper restore /mnt/backup/root root --list
 ```
 
 Output:
@@ -272,40 +272,111 @@ Snapper backups at /mnt/backup/root:
 Total: 3 backup(s)
 ```
 
+> **Command form.** `snapper restore` takes two **positional** arguments —
+> `snapper restore SOURCE CONFIG` — where `SOURCE` is the backup location and `CONFIG`
+> is the local snapper config to restore **into**. It is *not* `--config NAME`.
+> Restoring writes into the local snapper store, so run it with `sudo` (or as root).
+
 ### Restoring Snapshots
 
 ```bash
-# Restore single snapshot
-btrfs-backup-ng snapper restore /mnt/backup/root --config root --snapshot 559
+# Restore a single snapshot by number into the local 'root' config
+sudo btrfs-backup-ng snapper restore /mnt/backup/root root --snapshot 559
 
-# Restore multiple
-btrfs-backup-ng snapper restore /mnt/backup/root --config root --snapshot 559 --snapshot 560
+# Restore several
+sudo btrfs-backup-ng snapper restore /mnt/backup/root root --snapshot 559 --snapshot 560
 
 # Restore all
-btrfs-backup-ng snapper restore /mnt/backup/root --config root --all
+sudo btrfs-backup-ng snapper restore /mnt/backup/root root --all
+
+# Preview without changing anything
+sudo btrfs-backup-ng snapper restore /mnt/backup/root root --snapshot 559 --dry-run
 ```
 
-### How Restoration Works
+### Reused snapshot numbers on raw targets (and how to pick a specific backup)
 
-1. **Read backup info.xml** to get snapshot metadata
-2. **Determine next snapshot number** by scanning local `.snapshots/`
-3. **Create target directory** at `/.snapshots/{new_num}/`
-4. **Transfer via btrfs receive** (incremental when possible)
-5. **Copy info.xml** with updated snapshot number
-6. **Run snapper cleanup** if needed (optional)
-
-### Restored Snapshot Numbers
-
-Restored snapshots get new numbers to avoid conflicts:
+Snapper **reuses** snapshot numbers after a prune. On a `raw://` / `raw+ssh://` target,
+which accumulates backups over time, that means two retained backups can share the same
+number — they differ only by the **date** embedded in their unique **backup name**
+(`{config}-{number}-{timestamp}`, e.g. `root-559-20240101-120000`). `--list` shows a
+**NAME** column when names are available:
 
 ```
-Original (backup)         Restored (local)
-559 (timeline)      -->   890 (next available)
-560 (pre dnf)       -->   891
-561 (post dnf)      -->   892
+     NUM  TYPE    DATE                 DESCRIPTION      NAME
+  ------  ------  -------------------  ---------------  ------------------------
+     559  single  2024-01-01 12:00:00  before upgrade   root-559-20240101-120000
+     559  single  2024-06-01 09:30:00  before upgrade   root-559-20240601-093000
 ```
 
-The original metadata is preserved in `info.xml`, including the original number and description.
+- **By number (default):** `--snapshot 559` restores the **newest** matching backup and
+  prints a warning naming the ambiguity:
+  ```
+  WARNING  Multiple backups share number 559; restoring the newest
+           (root-559-20240601-093000). Use --backup-name or --date to restore an older copy.
+  ```
+- **An older copy by exact name** (copy the NAME from `--list`):
+  ```bash
+  sudo btrfs-backup-ng snapper restore /mnt/backup/root root \
+      --backup-name root-559-20240101-120000
+  ```
+- **An older copy by date** (a `YYYY-MM-DD[ HH:MM:SS]` prefix; an ISO-8601 `T` is also
+  accepted):
+  ```bash
+  sudo btrfs-backup-ng snapper restore /mnt/backup/root root --snapshot 559 --date 2024-01-01
+  ```
+
+`--date` is a *filter*, not a selector — combine it with `--snapshot`, `--backup-name`,
+or `--all`.
+
+### After a restore: refresh the snapper daemon
+
+A restored snapshot is written **directly** into `.snapshots/{N}/` (not via
+`snapper create`), so the snapper **daemon caches** its snapshot list and will not see the
+new slot until it rescans — `snapper diff`/`undochange`/rollback may report *"Snapshot 'N'
+not found"* immediately after a restore. The command prints a reminder; run `snapper list`
+(or reboot) first:
+
+```bash
+sudo btrfs-backup-ng snapper restore /mnt/backup/root root --snapshot 559
+#   -> "Restored ... Note: run 'snapper -c root list' (or reboot) so snapper's daemon
+#      picks up the restored snapshot(s) before 'snapper diff'/'undochange'/rollback."
+
+snapper -c root list          # triggers the daemon rescan
+snapper -c root diff 890..0   # now works against the restored slot (890 = new number)
+```
+
+The on-disk snapshot is complete and correct — only the daemon's in-memory view lags.
+Restored slot directories use snapper's native `0755` permissions.
+
+**To roll back**, prefer snapper's own flow: boot the read-only `grub-btrfs` entry for the
+restored snapshot, then `snapper rollback`. (For bare-metal recovery to an arbitrary
+subvolume without snapper, use the generic `btrfs-backup-ng restore` command instead.)
+
+### Restoring from raw:// and raw+ssh:// targets
+
+Raw backups restore the same way; the stream is decrypted/decompressed locally. If the
+remote target was **written** with `--ssh-sudo` (its directory/streams are root-owned),
+pass `--ssh-sudo` to `restore` as well — otherwise it reports an actionable permission
+error instead of the backups:
+
+```bash
+sudo btrfs-backup-ng snapper restore \
+    raw+ssh://backup@server/mnt/nas/root root --snapshot 559 --ssh-sudo
+```
+
+### How restoration works
+
+1. **Resolve the requested backup** (by number → newest on a collision, or by exact
+   `--backup-name` / `--date`).
+2. **Determine the next local snapshot number** by scanning the config's `.snapshots/`.
+3. **Receive the stream** into that fresh `.snapshots/{new_num}/` slot (crash-safe:
+   cleaned up on failure), verifying stream integrity first.
+4. **Write `info.xml`** renumbered to the new slot, preserving the original type,
+   description, cleanup, and **all userdata** (and any element snapper wrote, e.g.
+   `<uid>`), so the restored snapshot is a first-class snapper snapshot.
+
+Restored snapshots get **new** local numbers (the next available) to avoid conflicts; the
+original metadata — including description and userdata — is preserved in `info.xml`.
 
 ## Remote Backups
 
@@ -495,7 +566,7 @@ btrfs-backup-ng doctor --check transfers
 Periodically verify backups work:
 ```bash
 # Dry run restore
-btrfs-backup-ng snapper restore /mnt/backup/root --config root --snapshot 559 --dry-run
+btrfs-backup-ng snapper restore /mnt/backup/root root --snapshot 559 --dry-run
 ```
 
 ## See Also

@@ -339,6 +339,8 @@ complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_snapper_using_subcommand 
 # snapper restore
 complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_snapper_using_subcommand restore' -l dry-run -d 'Show what would be done without making changes'
 complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_snapper_using_subcommand restore' -l snapshot -d 'Restore specific snapshot by number' -x
+complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_snapper_using_subcommand restore' -l backup-name -d 'Restore the exact raw backup by name (from --list)' -x
+complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_snapper_using_subcommand restore' -l date -d 'Restrict to backups whose date matches DATE (YYYY-MM-DD prefix)' -x
 complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_snapper_using_subcommand restore' -l all -d 'Restore all snapshots'
 complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_snapper_using_subcommand restore' -l compress -d 'Compression method' -xa "$compress_methods"
 complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_snapper_using_subcommand restore' -l rate-limit -d 'Bandwidth limit (e.g., 10M, 1G)' -x
