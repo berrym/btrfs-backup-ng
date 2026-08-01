@@ -56,8 +56,13 @@ See the [LICENSE](LICENSE) file for full copyright attribution.
 - **Real-time Preview**: Shows configuration as you build it
 
 ### Snapper Integration
-- **Full Snapper Support**: Back up and restore Snapper-managed snapshots
-- **Metadata Preservation**: Preserves `info.xml` for seamless Snapper restoration
+- **Full Snapper Support**: Back up and restore Snapper-managed snapshots — to btrfs
+  (`ssh://`) **and** non-btrfs `raw://` / `raw+ssh://` targets
+- **Metadata Preservation**: Restores a first-class snapper snapshot — `info.xml` with the
+  original type, description, cleanup, and multi-entry `<userdata>` (and elements like
+  `<uid>`), native `0755` slot permissions
+- **Collision Addressing**: When snapper reuses a number after a prune, reach a specific
+  backup with `--backup-name` or `--date` (`--snapshot N` restores the newest and warns)
 - **Pre/Post Pairs**: Supports single, pre, and post snapshot types
 - **Incremental Transfers**: Efficient delta-based transfers between snapshots, with the parent
   matched by btrfs UUID correspondence (name for raw targets) — so a re-created snapshot with the
@@ -807,7 +812,7 @@ Check your configuration for errors before running backups:
 btrfs-backup-ng config validate
 
 # Validate a specific file
-btrfs-backup-ng config validate -c /path/to/config.toml
+btrfs-backup-ng -c /path/to/config.toml config validate
 ```
 
 #### Import btrbk Configuration
@@ -1723,7 +1728,7 @@ btrfs-backup-ng restore /mnt/backup /mnt/restore-new --no-fs-checks
 btrfs-backup-ng restore ssh://...:/backups/home /mnt/restore --compress=zstd
 
 # Check if incremental is working (should show "incremental from X")
-btrfs-backup-ng restore ssh://...:/backups/home /mnt/restore -v
+btrfs-backup-ng -v restore ssh://...:/backups/home /mnt/restore
 
 # Limit bandwidth if needed
 btrfs-backup-ng restore ssh://...:/backups/home /mnt/restore --rate-limit=50M
@@ -1845,7 +1850,7 @@ sudo btrfs-backup-ng snapper backup root /mnt/backup/root
 sudo btrfs-backup-ng snapper backup root ssh://backup@server:/backups/root
 
 # 5. Generate TOML config for automated backups
-btrfs-backup-ng snapper generate-config root --target /mnt/backup
+btrfs-backup-ng snapper generate-config --config root --target /mnt/backup
 ```
 
 ### Snapper CLI Commands
@@ -1954,30 +1959,54 @@ command: a local path or `ssh://` for btrfs destinations, and `raw://` /
 
 #### Restore Snapshots
 
+`snapper restore` takes two **positional** arguments — `SOURCE CONFIG` — where
+`CONFIG` is the local snapper config to restore **into**. Works with btrfs
+(`ssh://`) and non-btrfs `raw://` / `raw+ssh://` sources alike.
+
 ```bash
-# List available backups at a location
-btrfs-backup-ng snapper restore --list /mnt/backup/root
-btrfs-backup-ng snapper restore --list ssh://server:/backups/root
+# List available backups at a location (CONFIG is still required)
+btrfs-backup-ng snapper restore /mnt/backup/root root --list
+btrfs-backup-ng snapper restore raw:///mnt/usb/backups/root root --list
 
-# Restore a specific snapshot
-sudo btrfs-backup-ng snapper restore /mnt/backup/root --snapshot 559 root
+# Restore a specific snapshot by number
+sudo btrfs-backup-ng snapper restore /mnt/backup/root root --snapshot 559
 
-# Restore multiple snapshots
-sudo btrfs-backup-ng snapper restore /mnt/backup/root --snapshot 559 --snapshot 560 root
-
-# Restore all backups
-sudo btrfs-backup-ng snapper restore /mnt/backup/root --all root
+# Restore several, or all
+sudo btrfs-backup-ng snapper restore /mnt/backup/root root --snapshot 559 --snapshot 560
+sudo btrfs-backup-ng snapper restore /mnt/backup/root root --all
 
 # Dry run
-sudo btrfs-backup-ng snapper restore /mnt/backup/root --snapshot 559 root --dry-run
+sudo btrfs-backup-ng snapper restore /mnt/backup/root root --snapshot 559 --dry-run
+
+# raw+ssh target written with --ssh-sudo (root-owned): pass --ssh-sudo to read it back
+sudo btrfs-backup-ng snapper restore raw+ssh://backup@server/mnt/nas/root root \
+    --snapshot 559 --ssh-sudo
 ```
 
-The restore command:
-1. Lists available backups at the source location
-2. Transfers snapshots using incremental `btrfs send/receive`
-3. Creates the snapshot in your local Snapper directory (e.g., `/.snapshots/{new_num}/`)
-4. Generates `info.xml` from the backup metadata
-5. The snapshot is immediately visible to Snapper
+**Reused snapshot numbers.** Snapper reuses numbers after a prune, so a `raw://` /
+`raw+ssh://` target can hold two backups sharing a number (differing by the date in
+their unique name, shown in the `--list` **NAME** column). `--snapshot N` restores the
+**newest** and warns; reach an older copy explicitly:
+
+```bash
+# By exact name (copy the NAME from --list)
+sudo btrfs-backup-ng snapper restore /mnt/backup/root root \
+    --backup-name root-559-20240101-120000
+
+# ...or by number + date (YYYY-MM-DD[ HH:MM:SS] prefix)
+sudo btrfs-backup-ng snapper restore /mnt/backup/root root --snapshot 559 --date 2024-01-01
+```
+
+The restore command resolves the requested backup, receives it into a fresh
+`.snapshots/{new_num}/` slot, and writes a renumbered `info.xml` preserving the original
+type, description, cleanup, and **all userdata**. The restored snapshot is a first-class
+snapper snapshot (native `0755` slot permissions).
+
+> **After a restore, refresh the daemon.** The slot is written directly to disk (not via
+> `snapper create`), so the snapper **daemon caches** its list and won't see it until it
+> rescans — `snapper diff`/`undochange`/rollback may say *"Snapshot 'N' not found"*. Run
+> `snapper -c <config> list` (or reboot) first (the command prints a reminder). See
+> [Snapper Integration](docs/SNAPPER-INTEGRATION.md#restoration) for the full workflow.
 
 #### Check Backup Status
 
@@ -1986,8 +2015,8 @@ The restore command:
 btrfs-backup-ng snapper status
 
 # Check what's backed up to a target
-btrfs-backup-ng snapper status --target /mnt/backup/root
-btrfs-backup-ng snapper status --target ssh://server:/backups/root
+btrfs-backup-ng snapper status /mnt/backup/root
+btrfs-backup-ng snapper status ssh://server:/backups/root
 
 # Status for specific config
 btrfs-backup-ng snapper status --config root
@@ -2005,22 +2034,22 @@ Generate TOML configuration for automated snapper backups:
 btrfs-backup-ng snapper generate-config
 
 # Generate for specific configs
-btrfs-backup-ng snapper generate-config root home
+btrfs-backup-ng snapper generate-config --config root --config home
 
 # With target path
-btrfs-backup-ng snapper generate-config root --target ssh://server:/backups
+btrfs-backup-ng snapper generate-config --config root --target ssh://server:/backups
 
 # Save to file
-btrfs-backup-ng snapper generate-config root --target /mnt/backup -o snapper.toml
+btrfs-backup-ng snapper generate-config --config root --target /mnt/backup -o snapper.toml
 
 # Append to existing config
-btrfs-backup-ng snapper generate-config root --target /mnt/backup --append ~/.config/btrfs-backup-ng/config.toml
+btrfs-backup-ng snapper generate-config --config root --target /mnt/backup --append ~/.config/btrfs-backup-ng/config.toml
 
 # Filter snapshot types
-btrfs-backup-ng snapper generate-config root --type single --type pre
+btrfs-backup-ng snapper generate-config --config root --type single --type pre
 
 # With SSH sudo
-btrfs-backup-ng snapper generate-config root --target ssh://server:/backups --ssh-sudo
+btrfs-backup-ng snapper generate-config --config root --target ssh://server:/backups --ssh-sudo
 ```
 
 ### Configuration File Integration
@@ -2117,7 +2146,7 @@ btrfs-backup-ng snapper detect
 sudo btrfs-backup-ng snapper backup root /mnt/external-drive/backups/root
 
 # 3. Generate configuration
-btrfs-backup-ng snapper generate-config root \
+btrfs-backup-ng snapper generate-config --config root \
     --target ssh://backup@nas:/backups \
     --type single \
     --min-age 1h \
@@ -2143,7 +2172,7 @@ sudo btrfs-backup-ng install --timer=hourly
 mount /dev/sda2 /mnt/newroot
 
 # 3. List available backups
-btrfs-backup-ng snapper restore --list ssh://backup@nas:/backups/root
+btrfs-backup-ng snapper restore ssh://backup@nas:/backups/root root --list
 
 # 4. Restore the snapshot you need
 sudo btrfs-backup-ng snapper restore \
@@ -2151,9 +2180,11 @@ sudo btrfs-backup-ng snapper restore \
     --snapshot 560 \
     root
 
-# 5. The snapshot is now in /.snapshots/
-# Use snapper rollback or manual subvolume operations to restore
-snapper -c root rollback 560
+# 5. The restore reports a NEW local number, e.g. "restored as local snapshot 4".
+#    Refresh the snapper daemon so it sees the out-of-band slot, then roll back to
+#    that NEW number (not the backup's original 560).
+snapper -c root list           # refresh the daemon cache
+snapper -c root rollback 4     # use the number the restore reported
 ```
 
 ### Snapper Integration vs Native Mode
@@ -2331,9 +2362,6 @@ When quotas are enabled on the destination, the space check uses the **more rest
 ### Config-Driven Estimation
 
 ```bash
-# List configured volumes and their targets
-btrfs-backup-ng estimate --list-volumes
-
 # Estimate for a specific volume from config
 btrfs-backup-ng estimate --volume /home
 
@@ -2479,9 +2507,6 @@ btrfs-backup-ng /source/subvolume /destination/path
 
 # Remote backup
 btrfs-backup-ng /home ssh://backup@server:/backups/home
-
-# With options
-btrfs-backup-ng --ssh-sudo --num-snapshots 10 /source ssh://user@host:/dest
 ```
 
 Legacy mode is auto-detected when the first argument is a path.
@@ -2675,7 +2700,7 @@ btrfs-backup-ng performs filesystem verification checks to ensure sources are va
 btrfs-backup-ng estimate /mnt/snapshots /mnt/backup
 
 # Strict mode - fail on any check issue
-btrfs-backup-ng run --fs-checks=strict
+btrfs-backup-ng verify /mnt/backup --fs-checks=strict
 
 # Skip checks entirely (useful for listing backup directories)
 btrfs-backup-ng restore --list /mnt/backup/home --fs-checks=skip
