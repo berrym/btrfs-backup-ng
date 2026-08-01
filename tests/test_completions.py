@@ -459,3 +459,23 @@ class TestShellConfigTypes:
     def test_fish_config_has_required_keys(self):
         """Test fish config has all required keys."""
         pass
+
+
+class TestSnapperRestoreCompletionFlags:
+    """R11b: new snapper-restore flags stay in lockstep across all shell completions."""
+
+    def _completions_dir(self):
+        return Path(__file__).resolve().parent.parent / "completions"
+
+    def test_backup_name_and_date_in_all_shells(self):
+        d = self._completions_dir()
+        # bash/zsh spell long flags "--name"; fish uses "-l name".
+        expected = {
+            "btrfs-backup-ng.bash": ("--backup-name", "--date"),
+            "btrfs-backup-ng.zsh": ("--backup-name", "--date"),
+            "btrfs-backup-ng.fish": ("-l backup-name", "-l date"),
+        }
+        for fname, needles in expected.items():
+            text = (d / fname).read_text()
+            for needle in needles:
+                assert needle in text, f"{fname} missing {needle!r}"

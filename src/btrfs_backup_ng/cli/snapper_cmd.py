@@ -515,6 +515,10 @@ def _backup_date_matches(backup: dict, date_filter: str) -> bool:
     meta = backup.get("metadata")
     if meta is None or getattr(meta, "date", None) is None:
         return False
+    # Accept an ISO-8601 'T' separator (what datetime.isoformat() emits, and the
+    # intuitive form to type) even though str(meta.date) is space-separated.
+    if len(date_filter) > 10 and date_filter[10] == "T":
+        date_filter = date_filter[:10] + " " + date_filter[11:]
     return str(meta.date).startswith(date_filter)
 
 
@@ -646,9 +650,19 @@ def _handle_restore(args: argparse.Namespace) -> int:
     date_filter = getattr(args, "date", None)
 
     if not snapshot_numbers and not backup_names and not restore_all:
-        logger.error(
-            "Specify --snapshot NUM, --backup-name NAME, or --all to restore snapshots."
-        )
+        if date_filter:
+            # --date is a narrowing FILTER, not a selector -- point the user there
+            # instead of the generic message (they likely expected --date to select).
+            logger.error(
+                "--date only narrows a selection; combine it with --snapshot NUM, "
+                "--backup-name NAME, or --all (e.g. --all --date %s).",
+                date_filter,
+            )
+        else:
+            logger.error(
+                "Specify --snapshot NUM, --backup-name NAME, or --all to restore "
+                "snapshots."
+            )
         logger.info("Use --list to see available backups.")
         return 1
 
@@ -669,7 +683,11 @@ def _handle_restore(args: argparse.Namespace) -> int:
     if date_filter:
         candidates = [b for b in backups if _backup_date_matches(b, date_filter)]
         if not candidates:
-            logger.error("No backups match --date %s", date_filter)
+            logger.error(
+                "No backups match --date %s (expected a YYYY-MM-DD[ HH:MM:SS] prefix; "
+                "see --list for exact dates).",
+                date_filter,
+            )
             return 1
 
     # Build the selection.
@@ -704,7 +722,10 @@ def _handle_restore(args: argparse.Namespace) -> int:
             for b in matches:
                 _add(b)
 
-    if snapshot_numbers:
+    # --all already added every candidate, so an explicit --snapshot adds nothing --
+    # skip it to avoid a FALSE "restoring the newest, older unreachable" warning when
+    # the older copy is in fact already being restored under --all.
+    if snapshot_numbers and not restore_all:
         for num in snapshot_numbers:
             matches = [b for b in candidates if b["number"] == num]
             if not matches:

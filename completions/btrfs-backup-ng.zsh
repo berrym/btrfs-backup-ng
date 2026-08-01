@@ -378,7 +378,12 @@ _btrfs-backup-ng() {
                                     ;;
                                 restore)
                                     _arguments \
-                                        '--snapshot[Restore specific snapshot number]:snapshot number:' \
+                                        '*--snapshot[Restore specific snapshot number]:snapshot number:' \
+                                        '*--backup-name[Restore the exact raw backup by name (from --list)]:backup name:' \
+                                        '--date[Restrict to backups whose date matches DATE (YYYY-MM-DD prefix)]:date:' \
+                                        '--all[Restore all snapshots]' \
+                                        '--list[List available backups]' \
+                                        '--json[Output in JSON format]' \
                                         '--dry-run[Show what would be done]' \
                                         '--ssh-sudo[Use sudo on remote host]' \
                                         '--ssh-key[SSH private key file]:key file:_files' \

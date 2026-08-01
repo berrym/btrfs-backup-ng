@@ -1877,6 +1877,56 @@ class TestRestoreNameDateSelection:
         names = [e["backup_name"] for e in data["backups"]]
         assert "root-100-old" in names and "root-100-new" in names
 
+    def test_overlapping_selectors_restore_each_once(self, mock_snapper_configs):
+        """The _add() dedup guard: overlapping --backup-name + --snapshot restore once.
+
+        Kills a mutation that removes the guard (which would double-restore the newest).
+        """
+        result, mr = self._run(
+            self._args(backup_name=["root-100-new"], snapshot=[100]),
+            mock_snapper_configs,
+        )
+        assert result == 0
+        names = self._restored_names(mr)
+        assert names == ["root-100-new"]  # exactly once, not twice
+        assert len(names) == len(set(names))
+
+    def test_all_plus_snapshot_collision_no_false_warning(
+        self, capsys, mock_snapper_configs
+    ):
+        """--all --snapshot N restores each once and does NOT emit the newest-only warn."""
+        result, mr = self._run(
+            self._args(all=True, snapshot=[100]), mock_snapper_configs
+        )
+        assert result == 0
+        assert sorted(self._restored_names(mr)) == [
+            "root-100-new",
+            "root-100-old",
+            "root-3-x",
+        ]
+        cap = capsys.readouterr()
+        text = " ".join((cap.out + cap.err).split())
+        assert "Multiple backups share number" not in text  # older IS restored
+
+    def test_date_alone_errors_mentioning_date(self, capsys, mock_snapper_configs):
+        """--date with no selector explains it is a filter (not a selector)."""
+        result, mr = self._run(self._args(date="2024-01-01"), mock_snapper_configs)
+        assert result == 1
+        assert mr.call_count == 0
+        cap = capsys.readouterr()
+        text = " ".join((cap.out + cap.err).split())
+        # message names --date and points at combining it
+        assert "--date" in text
+
+    def test_iso_t_separator_date_matches(self, mock_snapper_configs):
+        """--date with an ISO 'T' separator resolves (normalized to a space)."""
+        result, mr = self._run(
+            self._args(snapshot=[100], date="2024-06-01T00:00:00"),
+            mock_snapper_configs,
+        )
+        assert result == 0
+        assert self._restored_names(mr) == ["root-100-new"]  # the 2024-06-01 copy
+
 
 class TestBackupSelectionHelpers:
     """R11b: the date-match and recency-key helpers."""
