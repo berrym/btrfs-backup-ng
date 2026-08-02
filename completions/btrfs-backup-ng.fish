@@ -86,10 +86,8 @@ complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_using_command run' -l com
 complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_using_command run' -l rate-limit -d 'Bandwidth limit (e.g., 10M, 1G)' -x
 complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_using_command run' -l progress -d 'Show progress bars'
 complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_using_command run' -l no-progress -d 'Disable progress bars'
-complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_using_command run' -l check-space -d 'Check destination space before transfer'
 complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_using_command run' -l no-check-space -d 'Skip destination space check'
 complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_using_command run' -l force -d 'Proceed despite insufficient space'
-complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_using_command run' -l fs-checks -d 'Filesystem validation mode' -xa "$fs_checks_modes"
 
 # snapshot command
 complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_using_command snapshot' -l dry-run -d 'Show what would be done without making changes'

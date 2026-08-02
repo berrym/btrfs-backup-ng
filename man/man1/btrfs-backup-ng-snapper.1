@@ -13,7 +13,7 @@ btrfs-backup-ng-snapper \- back up and restore snapper-managed snapshots
 \fICONFIG\fR \fITARGET\fR [\fIOPTIONS\fR]
 .br
 .B btrfs-backup-ng snapper restore
-\fISOURCE\fR [\fB\-\-list\fR | \fB\-\-snapshot\fR \fINUM\fR | \fB\-\-all\fR] \fICONFIG\fR
+\fISOURCE\fR [\fB\-\-list\fR | \fB\-\-snapshot\fR \fINUM\fR | \fB\-\-all\fR] [\fICONFIG\fR]
 .br
 .B btrfs-backup-ng snapper status
 [\fB\-\-config\fR \fINAME\fR] [\fB\-\-target\fR \fIPATH\fR] [\fB\-\-json\fR]
@@ -120,14 +120,14 @@ Restore Snapper snapshots from a backup location.
 .PP
 .RS
 .B btrfs-backup-ng snapper restore
-\fISOURCE\fR [\fIOPTIONS\fR] \fICONFIG\fR
+\fISOURCE\fR [\fIOPTIONS\fR] [\fICONFIG\fR]
 .RE
 .TP
 .I SOURCE
 Backup location to restore from. Can be local or SSH URL.
 .TP
 .I CONFIG
-Local Snapper configuration name to restore into.
+Local Snapper configuration name to restore into. Required to restore; optional with \fB\-\-list\fR (listing only reads the source).
 .PP
 Options:
 .TP

@@ -1964,9 +1964,9 @@ command: a local path or `ssh://` for btrfs destinations, and `raw://` /
 (`ssh://`) and non-btrfs `raw://` / `raw+ssh://` sources alike.
 
 ```bash
-# List available backups at a location (CONFIG is still required)
-btrfs-backup-ng snapper restore /mnt/backup/root root --list
-btrfs-backup-ng snapper restore raw:///mnt/usb/backups/root root --list
+# List available backups at a location (CONFIG is optional with --list)
+btrfs-backup-ng snapper restore /mnt/backup/root --list
+btrfs-backup-ng snapper restore raw:///mnt/usb/backups/root --list
 
 # Restore a specific snapshot by number
 sudo btrfs-backup-ng snapper restore /mnt/backup/root root --snapshot 559
@@ -2172,13 +2172,13 @@ sudo btrfs-backup-ng install --timer=hourly
 mount /dev/sda2 /mnt/newroot
 
 # 3. List available backups
-btrfs-backup-ng snapper restore ssh://backup@nas:/backups/root root --list
+btrfs-backup-ng snapper restore ssh://backup@nas:/backups/root --list
 
-# 4. Restore the snapshot you need
+# 4. Restore the snapshot you need (CONFIG comes right after SOURCE)
 sudo btrfs-backup-ng snapper restore \
     ssh://backup@nas:/backups/root \
-    --snapshot 560 \
-    root
+    root \
+    --snapshot 560
 
 # 5. The restore reports a NEW local number, e.g. "restored as local snapshot 4".
 #    Refresh the snapper daemon so it sees the out-of-band slot, then roll back to
