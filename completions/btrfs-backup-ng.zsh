@@ -68,10 +68,8 @@ _btrfs-backup-ng() {
                         '--rate-limit[Bandwidth limit]:rate:' \
                         '(--progress --no-progress)'--progress'[Show progress bars]' \
                         '(--progress --no-progress)'--no-progress'[Disable progress bars]' \
-                        '--check-space[Check destination space before transfer]' \
                         '--no-check-space[Skip destination space check]' \
-                        '--force[Proceed despite insufficient space]' \
-                        '--fs-checks[Filesystem validation mode]:mode:(${fs_checks_modes})'
+                        '--force[Proceed despite insufficient space]'
                     ;;
                 snapshot)
                     _arguments \

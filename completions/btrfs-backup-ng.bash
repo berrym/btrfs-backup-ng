@@ -17,7 +17,7 @@ _btrfs_backup_ng() {
     local global_opts="-h --help -v --verbose -q --quiet --debug -V --version -c --config"
 
     # Command-specific options
-    local run_opts="--dry-run --parallel-volumes --parallel-targets --compress --rate-limit --progress --no-progress --check-space --no-check-space --force --fs-checks"
+    local run_opts="--dry-run --parallel-volumes --parallel-targets --compress --rate-limit --progress --no-progress --no-check-space --force"
     local snapshot_opts="--dry-run --volume"
     local transfer_opts="--dry-run --volume --compress --rate-limit --progress --no-progress"
     local prune_opts="--dry-run"

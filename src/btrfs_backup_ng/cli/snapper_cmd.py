@@ -632,6 +632,16 @@ def _handle_restore(args: argparse.Namespace) -> int:
 
         return 0
 
+    # CONFIG is optional only in --list mode (listing just reads the source). For an
+    # actual restore it names the local config to restore INTO, so require it here.
+    if not args.config:
+        logger.error(
+            "CONFIG is required to restore (it is only optional with --list). "
+            "Example: btrfs-backup-ng snapper restore %s root --snapshot NUM",
+            source_path,
+        )
+        return 1
+
     # Validate local snapper config exists
     try:
         scanner = SnapperScanner()

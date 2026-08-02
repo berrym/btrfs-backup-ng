@@ -1419,7 +1419,9 @@ Examples:
     snapper_restore.add_argument(
         "config",
         metavar="CONFIG",
-        help="Local snapper config to restore to (e.g., root, home)",
+        nargs="?",
+        help="Local snapper config to restore into (e.g., root, home). Required when "
+        "restoring; optional with --list (listing only reads the source).",
     )
     snapper_restore.add_argument(
         "-s",

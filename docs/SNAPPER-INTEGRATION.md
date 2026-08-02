@@ -95,7 +95,7 @@ btrfs-backup-ng snapper status /mnt/backup/root
 
 ```bash
 # List available backups
-btrfs-backup-ng snapper restore /mnt/backup/root root --list
+btrfs-backup-ng snapper restore /mnt/backup/root --list
 
 # Restore specific snapshot
 btrfs-backup-ng snapper restore /mnt/backup/root root --snapshot 559
@@ -256,7 +256,7 @@ Backing up snapshot 561...
 Before restoring, list available backups:
 
 ```bash
-btrfs-backup-ng snapper restore /mnt/backup/root root --list
+btrfs-backup-ng snapper restore /mnt/backup/root --list
 ```
 
 Output:

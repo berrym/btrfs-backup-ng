@@ -479,3 +479,29 @@ class TestSnapperRestoreCompletionFlags:
             text = (d / fname).read_text()
             for needle in needles:
                 assert needle in text, f"{fname} missing {needle!r}"
+
+
+class TestRunCompletionNoStaleFlags:
+    """0.9.2: `run` completions must not offer flags run doesn't accept."""
+
+    def _dir(self):
+        return Path(__file__).resolve().parent.parent / "completions"
+
+    def test_run_has_no_fs_checks_or_positive_check_space(self):
+        import re
+
+        d = self._dir()
+        fish = (d / "btrfs-backup-ng.fish").read_text()
+        assert "_using_command run' -l fs-checks" not in fish
+        assert "_using_command run' -l check-space" not in fish  # positive is stale
+
+        bash = (d / "btrfs-backup-ng.bash").read_text()
+        run_opts = next(line for line in bash.splitlines() if "run_opts=" in line)
+        assert "--fs-checks" not in run_opts
+        assert "--check-space" not in run_opts.replace("--no-check-space", "")
+
+        zsh = (d / "btrfs-backup-ng.zsh").read_text()
+        block = re.search(r"\brun\)(.*?);;", zsh, re.S)
+        assert block is not None
+        assert "--fs-checks" not in block.group(1)
+        assert "--check-space" not in block.group(1).replace("--no-check-space", "")

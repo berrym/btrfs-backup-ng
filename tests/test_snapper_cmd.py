@@ -1963,3 +1963,43 @@ class TestBackupSelectionHelpers:
         old = self._b("old", "2024-01-01T00:00:00")
         new = self._b("new", "2024-06-01T00:00:00")
         assert max([old, new], key=_backup_recency_key)["backup_name"] == "new"
+
+
+class TestRestoreConfigOptionalWithList:
+    """0.9.2: CONFIG is optional with --list, required for an actual restore."""
+
+    def _args(self, **kw):
+        base = dict(
+            source="raw:///b",
+            config=None,
+            snapshot=None,
+            backup_name=None,
+            all=False,
+            date=None,
+            list=False,
+            json=False,
+            dry_run=False,
+            verbose=False,
+            quiet=False,
+            log_level=None,
+        )
+        base.update(kw)
+        return argparse.Namespace(**base)
+
+    def test_list_without_config_lists(self, capsys):
+        from btrfs_backup_ng.cli.snapper_cmd import _handle_restore
+
+        with patch(
+            "btrfs_backup_ng.core.restore.list_snapper_backups", return_value=[]
+        ) as mock_list:
+            result = _handle_restore(self._args(list=True))  # config=None
+        assert result == 0
+        mock_list.assert_called_once()  # listing proceeded without a CONFIG
+
+    def test_restore_without_config_errors(self, capsys):
+        from btrfs_backup_ng.cli.snapper_cmd import _handle_restore
+
+        result = _handle_restore(self._args(snapshot=[1]))  # config=None, not --list
+        assert result == 1
+        cap = capsys.readouterr()
+        assert "CONFIG is required" in " ".join((cap.out + cap.err).split())

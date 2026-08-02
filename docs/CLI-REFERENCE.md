@@ -868,14 +868,14 @@ btrfs-backup-ng snapper status --target /mnt/backup/root
 Restore snapper snapshots from backup.
 
 ```bash
-btrfs-backup-ng snapper restore SOURCE CONFIG [OPTIONS]
+btrfs-backup-ng snapper restore SOURCE [CONFIG] [OPTIONS]
 ```
 
-**Arguments** (both positional, in this order):
+**Arguments** (positional, in this order):
 | Argument | Description |
 |----------|-------------|
 | `SOURCE` | Backup source: a local path, `ssh://user@host:/path` (btrfs), or `raw://path` / `raw+ssh://user@host/path` (non-btrfs) |
-| `CONFIG` | Local snapper config to restore **into** (e.g. `root`, `home`) — required |
+| `CONFIG` | Local snapper config to restore **into** (e.g. `root`, `home`). Required to restore; **optional with `--list`** (listing only reads the source) |
 
 **Options:**
 | Option | Description |
@@ -896,7 +896,7 @@ btrfs-backup-ng snapper restore SOURCE CONFIG [OPTIONS]
 **Examples:**
 ```bash
 # List available backups
-btrfs-backup-ng snapper restore /mnt/backup/root root --list
+btrfs-backup-ng snapper restore /mnt/backup/root --list
 
 # Restore specific snapshot
 btrfs-backup-ng snapper restore /mnt/backup/root root --snapshot 559
