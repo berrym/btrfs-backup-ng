@@ -471,6 +471,19 @@ def _prepare_backup_endpoint(args: argparse.Namespace, source: str):
         # always resolves config["path"] during initialization
         endpoint_kwargs["path"] = Path(source).resolve()
 
+    # Decryption settings for an encrypted raw backup. Needed for both raw://
+    # (local) and raw+ssh:// sources -- neither starts with "ssh://", so thread
+    # them here (outside the ssh branch) and only when the operator supplied one
+    # so the sidecar-recorded cipher stays authoritative; the endpoint value is
+    # the fallback for a legacy sidecar. Harmless for non-raw endpoints (dropped
+    # by the base config whitelist).
+    gpg_keyring = getattr(args, "gpg_keyring", None)
+    if gpg_keyring:
+        endpoint_kwargs["gpg_keyring"] = gpg_keyring
+    openssl_cipher = getattr(args, "openssl_cipher", None)
+    if openssl_cipher:
+        endpoint_kwargs["openssl_cipher"] = openssl_cipher
+
     # Create endpoint - for restore, backup location needs to be set as "path"
     # (not "source") because list_snapshots() uses config["path"]
     # The source=False means the path will be stored in config["path"]

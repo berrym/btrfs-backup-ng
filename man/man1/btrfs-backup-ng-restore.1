@@ -92,6 +92,16 @@ Path to SSH private key file.
 .TP
 .BI \-\-ssh-host-key-policy " POLICY"
 Host-key verification for this run: \fBaccept-new\fR (default) or \fBstrict\fR.
+.SS Decryption Options
+.TP
+.BI \-\-gpg-keyring " PATH"
+GPG keyring to decrypt an encrypted raw backup (\fBraw://\fR / \fBraw+ssh://\fR).
+Must match the keyring the backup was encrypted for.
+.TP
+.BI \-\-openssl-cipher " CIPHER"
+OpenSSL cipher fallback for a legacy raw backup whose \fB.meta\fR sidecar does
+not record one. Modern sidecars record the cipher and are authoritative, so
+this is only consulted for backups written before that was sealed.
 .SS Other Options
 .TP
 .BI \-\-prefix " PREFIX"

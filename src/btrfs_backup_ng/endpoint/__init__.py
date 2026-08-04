@@ -128,7 +128,11 @@ def choose_endpoint(spec, common_config=None, source=False, excluded_types=()):
             if not parsed.hostname:
                 raise ValueError("No hostname specified for raw+ssh:// endpoint")
             config["hostname"] = parsed.hostname
-            config["port"] = parsed.port or 22
+            # Precedence: URL-embedded port > config ssh_port (threaded into
+            # common_config) > default 22. Without the config.get() fallback a
+            # non-default ssh_port never reaches the endpoint (was hardcoded to
+            # parsed.port or 22, dropping the threaded value).
+            config["port"] = parsed.port or config.get("port") or 22
             if parsed.username:
                 config["username"] = parsed.username
             config["path"] = parsed.path or "/"
@@ -172,7 +176,14 @@ def choose_endpoint(spec, common_config=None, source=False, excluded_types=()):
             logger.error("Error logging SSH URL components: %s", e)
 
         config["hostname"] = parsed.hostname
-        config["port"] = parsed.port
+        # Precedence: URL-embedded port > config ssh_port (threaded into
+        # common_config) > None (the endpoint then defaults to 22 and omits an
+        # explicit -p). Previously an unconditional ``config["port"] = parsed.port``
+        # clobbered the threaded ssh_port with None whenever the URL omitted a
+        # port, so a config ssh_port was silently dropped. No ``or 22`` here so a
+        # port-less spec keeps its prior None (preserves the endpoint's implicit
+        # default and its command construction).
+        config["port"] = parsed.port or config.get("port")
 
         # Username handling:
         # 1. Keep username from common_config (from command line) if present

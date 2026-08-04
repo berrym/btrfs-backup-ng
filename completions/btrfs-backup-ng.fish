@@ -149,6 +149,8 @@ complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_using_command restore' -l
 complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_using_command restore' -l prefix -d 'Snapshot prefix filter' -x
 complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_using_command restore' -l ssh-sudo -d 'Use sudo for btrfs commands on remote host'
 complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_using_command restore' -l ssh-key -d 'SSH private key file' -r -F
+complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_using_command restore' -l gpg-keyring -d 'GPG keyring to decrypt an encrypted raw backup' -r -F
+complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_using_command restore' -l openssl-cipher -d 'OpenSSL cipher fallback for a legacy raw backup' -x
 complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_using_command restore' -l compress -d 'Compression method' -xa "$compress_methods"
 complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_using_command restore' -l rate-limit -d 'Bandwidth limit (e.g., 10M, 1G)' -x
 complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_using_command restore' -l fs-checks -d 'Filesystem validation mode' -xa "$fs_checks_modes"
@@ -346,6 +348,8 @@ complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_snapper_using_subcommand 
 complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_snapper_using_subcommand restore' -l no-progress -d 'Disable progress bars'
 complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_snapper_using_subcommand restore' -l ssh-sudo -d 'Use sudo for btrfs commands on remote host'
 complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_snapper_using_subcommand restore' -l ssh-key -d 'SSH private key file' -r -F
+complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_snapper_using_subcommand restore' -l gpg-keyring -d 'GPG keyring to decrypt an encrypted raw backup' -r -F
+complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_snapper_using_subcommand restore' -l openssl-cipher -d 'OpenSSL cipher fallback for a legacy raw backup' -x
 
 # snapper generate-config
 complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_snapper_using_subcommand generate-config' -s o -l output -d 'Output file' -r -F

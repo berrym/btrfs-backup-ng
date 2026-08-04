@@ -15,6 +15,7 @@ from .common import (
     space_options_from_args,
     thread_raw_compression,
     thread_raw_encryption,
+    thread_ssh_target_config,
 )
 
 logger = logging.getLogger(__name__)
@@ -158,14 +159,7 @@ def execute_transfer(args: argparse.Namespace) -> int:
                         logger.debug("Mount check passed for %s", target.path)
 
                     dest_kwargs = dict(endpoint_kwargs)
-                    dest_kwargs["ssh_sudo"] = target.ssh_sudo
-                    dest_kwargs["ssh_host_key_policy"] = target.ssh_host_key_policy
-                    dest_kwargs["ssh_password_fallback"] = target.ssh_password_auth
-
-                    if target.ssh_key:
-                        dest_kwargs["ssh_identity_file"] = target.ssh_key
-                    if target.ssh_auth_sock:
-                        dest_kwargs["ssh_auth_sock"] = target.ssh_auth_sock
+                    thread_ssh_target_config(dest_kwargs, target)
 
                     thread_raw_encryption(dest_kwargs, target)
                     thread_raw_compression(

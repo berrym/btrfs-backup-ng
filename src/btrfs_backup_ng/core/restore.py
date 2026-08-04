@@ -792,7 +792,9 @@ def _raw_endpoint_config(backup_path: str, endpoint_options: dict | None) -> dic
     ``endpoint_options`` carries the CLI's ssh options (ssh_sudo / ssh_key /
     ssh_auth_sock / ssh_host_key_policy) so a raw+ssh target WRITTEN with --ssh-sudo
     (root-owned remote dir/streams) is READ BACK with the same options -- otherwise
-    the remote ls/cat run without sudo and the backups enumerate as empty.
+    the remote ls/cat run without sudo and the backups enumerate as empty. It also
+    carries the decryption options (gpg_keyring / openssl_cipher) so an encrypted
+    raw snapper backup can be decoded on restore.
     """
     config: dict[str, Any] = {"path": backup_path, "snap_prefix": ""}
     if endpoint_options:

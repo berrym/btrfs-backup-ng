@@ -15,7 +15,9 @@ from btrfs_backup_ng.cli.common import (
     is_interactive,
     resolve_timestamp_format,
     should_show_progress,
+    thread_ssh_target_config,
 )
+from btrfs_backup_ng.config.schema import TargetConfig
 
 
 class TestGetTimestampFormat:
@@ -329,3 +331,172 @@ class TestGetFsChecksMode:
         """Test that None value defaults to auto."""
         args = argparse.Namespace(fs_checks=None)
         assert get_fs_checks_mode(args) == "auto"
+
+
+class TestThreadSshTargetConfig:
+    """Tests for thread_ssh_target_config -- the single ssh_* threading helper."""
+
+    def test_threads_ssh_port_as_port(self):
+        """A non-default ssh_port MUST reach the endpoint config as 'port'.
+
+        This is the whole point: previously ssh_port was dropped and the endpoint
+        fell back to 22, silently failing to connect on a non-standard port.
+        """
+        kwargs: dict = {}
+        thread_ssh_target_config(kwargs, TargetConfig(path="ssh://h/p", ssh_port=2222))
+        assert kwargs["port"] == 2222
+
+    def test_default_port_is_22(self):
+        """The default ssh_port (22) is threaded so the value is always present."""
+        kwargs: dict = {}
+        thread_ssh_target_config(kwargs, TargetConfig(path="ssh://h/p"))
+        assert kwargs["port"] == 22
+
+    def test_identity_threaded_under_both_names(self):
+        """The key must be set under BOTH names: SSHEndpoint reads
+        ssh_identity_file, SSHRawEndpoint reads ssh_key. Setting only one leaves
+        a raw+ssh (or btrfs ssh) target using the wrong/default identity."""
+        kwargs: dict = {}
+        thread_ssh_target_config(
+            kwargs, TargetConfig(path="ssh://h/p", ssh_key="/id_ed25519")
+        )
+        assert kwargs["ssh_identity_file"] == "/id_ed25519"
+        assert kwargs["ssh_key"] == "/id_ed25519"
+
+    def test_no_key_sets_neither_identity_name(self):
+        """Without a configured key, neither identity key is injected (so
+        endpoint auto-discovery is not shadowed by a None)."""
+        kwargs: dict = {}
+        thread_ssh_target_config(kwargs, TargetConfig(path="ssh://h/p", ssh_key=None))
+        assert "ssh_identity_file" not in kwargs
+        assert "ssh_key" not in kwargs
+
+    def test_auth_sock_only_when_set(self):
+        """ssh_auth_sock is threaded only when configured."""
+        kwargs: dict = {}
+        thread_ssh_target_config(kwargs, TargetConfig(path="ssh://h/p"))
+        assert "ssh_auth_sock" not in kwargs
+
+        kwargs = {}
+        thread_ssh_target_config(
+            kwargs, TargetConfig(path="ssh://h/p", ssh_auth_sock="/run/sock")
+        )
+        assert kwargs["ssh_auth_sock"] == "/run/sock"
+
+    def test_threads_sudo_hostkey_and_password_fallback(self):
+        """sudo / host-key-policy / password-fallback map to the endpoint keys."""
+        kwargs: dict = {}
+        target = TargetConfig(
+            path="ssh://h/p",
+            ssh_sudo=True,
+            ssh_host_key_policy="strict",
+            ssh_password_auth=False,
+        )
+        thread_ssh_target_config(kwargs, target)
+        assert kwargs["ssh_sudo"] is True
+        assert kwargs["ssh_host_key_policy"] == "strict"
+        # ssh_password_auth -> ssh_password_fallback (the endpoint's key name).
+        assert kwargs["ssh_password_fallback"] is False
+
+
+class TestChooseEndpointPortPrecedence:
+    """choose_endpoint port precedence: URL port > config ssh_port > default."""
+
+    def test_ssh_config_port_used_when_url_has_none(self):
+        """A threaded ssh_port reaches an ssh:// endpoint when the URL omits one."""
+        from btrfs_backup_ng.endpoint import choose_endpoint
+
+        ep = choose_endpoint("ssh://host/path", {"port": 2222})
+        assert ep.config.get("port") == 2222
+
+    def test_ssh_url_port_wins_over_config(self):
+        """A URL-embedded port takes precedence over a threaded ssh_port."""
+        from btrfs_backup_ng.endpoint import choose_endpoint
+
+        ep = choose_endpoint("ssh://host:2200/path", {"port": 2222})
+        assert ep.config.get("port") == 2200
+
+    def test_ssh_no_port_preserved_as_none(self):
+        """With neither a URL nor a config port, port stays None (prior behavior:
+        the endpoint defaults to 22 and omits an explicit -p)."""
+        from btrfs_backup_ng.endpoint import choose_endpoint
+
+        ep = choose_endpoint("ssh://host/path", {})
+        assert ep.config.get("port") is None
+
+    def test_raw_ssh_config_port_used_when_url_has_none(self):
+        """A threaded ssh_port reaches a raw+ssh:// endpoint (self.port)."""
+        from btrfs_backup_ng.endpoint import choose_endpoint
+
+        ep = choose_endpoint("raw+ssh://host/backups", {"port": 2222})
+        assert ep.port == 2222
+
+    def test_raw_ssh_url_port_wins_over_config(self):
+        """A URL-embedded port takes precedence for raw+ssh:// too."""
+        from btrfs_backup_ng.endpoint import choose_endpoint
+
+        ep = choose_endpoint("raw+ssh://host:2200/backups", {"port": 2222})
+        assert ep.port == 2200
+
+    def test_raw_ssh_defaults_to_22(self):
+        """With neither, raw+ssh:// keeps its documented default of 22."""
+        from btrfs_backup_ng.endpoint import choose_endpoint
+
+        ep = choose_endpoint("raw+ssh://host/backups", {})
+        assert ep.port == 22
+
+
+class TestDecryptFlagsWiredIntoParsers:
+    """--gpg-keyring / --openssl-cipher must exist on restore and snapper restore
+    (the paths that DECODE an encrypted raw backup). verify must NOT expose them:
+    it checksums the stored ciphertext and never decrypts, so they'd be inert."""
+
+    def _parser(self):
+        from btrfs_backup_ng.cli.dispatcher import create_subcommand_parser
+
+        return create_subcommand_parser()
+
+    def test_restore_accepts_decrypt_flags(self):
+        args = self._parser().parse_args(
+            [
+                "restore",
+                "raw://backups",
+                "/mnt/dst",
+                "--gpg-keyring",
+                "/kr.gpg",
+                "--openssl-cipher",
+                "aes-256-cbc",
+            ]
+        )
+        assert args.gpg_keyring == "/kr.gpg"
+        assert args.openssl_cipher == "aes-256-cbc"
+
+    def test_verify_rejects_decrypt_flags(self):
+        import pytest
+
+        for flag in ("--gpg-keyring", "--openssl-cipher"):
+            with pytest.raises(SystemExit):
+                self._parser().parse_args(["verify", "raw://backups", flag, "x"])
+
+    def test_snapper_restore_accepts_decrypt_flags(self):
+        args = self._parser().parse_args(
+            [
+                "snapper",
+                "restore",
+                "raw://backups",
+                "root",
+                "--gpg-keyring",
+                "/kr.gpg",
+                "--openssl-cipher",
+                "aes-256-cbc",
+            ]
+        )
+        assert args.gpg_keyring == "/kr.gpg"
+        assert args.openssl_cipher == "aes-256-cbc"
+
+    def test_flags_default_to_none(self):
+        """Absent flags default to None so they do not disturb the
+        sidecar-authoritative cipher on restore/verify."""
+        args = self._parser().parse_args(["restore", "raw://backups", "/mnt/dst"])
+        assert args.gpg_keyring is None
+        assert args.openssl_cipher is None

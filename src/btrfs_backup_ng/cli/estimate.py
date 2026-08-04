@@ -32,6 +32,7 @@ from .common import (
     get_log_level,
     get_timestamp_format,
     resolve_timestamp_format,
+    thread_ssh_target_config,
 )
 
 logger = logging.getLogger(__name__)
@@ -150,13 +151,7 @@ def _estimate_from_config(args: argparse.Namespace, volume_path: str) -> int:
             "fs_checks": "auto",
             "timestamp_format": get_timestamp_format(config),
         }
-        dest_kwargs["ssh_host_key_policy"] = target.ssh_host_key_policy
-        if target.ssh_sudo:
-            dest_kwargs["ssh_sudo"] = True
-        if target.ssh_key:
-            dest_kwargs["ssh_identity_file"] = target.ssh_key
-        if target.ssh_auth_sock:
-            dest_kwargs["ssh_auth_sock"] = target.ssh_auth_sock
+        thread_ssh_target_config(dest_kwargs, target)
 
         dest_ep = endpoint.choose_endpoint(
             target.path,

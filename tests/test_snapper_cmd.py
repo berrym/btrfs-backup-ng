@@ -2003,3 +2003,56 @@ class TestRestoreConfigOptionalWithList:
         assert result == 1
         cap = capsys.readouterr()
         assert "CONFIG is required" in " ".join((cap.out + cap.err).split())
+
+
+class TestSnapperRestoreDecryptOptions:
+    """snapper restore threads --gpg-keyring/--openssl-cipher into endpoint_options.
+
+    These carry through _raw_endpoint_config into the raw endpoint that decodes an
+    encrypted raw snapper backup. Threaded only when supplied so the sidecar-
+    recorded cipher stays authoritative.
+    """
+
+    @staticmethod
+    def _args(**over):
+        base = dict(
+            source="raw://backup",
+            config="root",
+            snapshot=None,
+            list=True,
+            dry_run=False,
+            json=False,
+            verbose=False,
+            quiet=False,
+            log_level=None,
+            ssh_sudo=False,
+            ssh_key=None,
+            ssh_auth_sock=None,
+            ssh_host_key_policy=None,
+            gpg_keyring=None,
+            openssl_cipher=None,
+        )
+        base.update(over)
+        return argparse.Namespace(**base)
+
+    def test_keyring_and_cipher_threaded(self):
+        from btrfs_backup_ng.cli.snapper_cmd import _handle_restore
+
+        args = self._args(gpg_keyring="/kr.gpg", openssl_cipher="aes-256-cbc")
+        with patch("btrfs_backup_ng.core.restore.list_snapper_backups") as mock_list:
+            mock_list.return_value = []
+            _handle_restore(args)
+        opts = mock_list.call_args.args[1]
+        assert opts["gpg_keyring"] == "/kr.gpg"
+        assert opts["openssl_cipher"] == "aes-256-cbc"
+
+    def test_absent_flags_not_threaded(self):
+        from btrfs_backup_ng.cli.snapper_cmd import _handle_restore
+
+        args = self._args()
+        with patch("btrfs_backup_ng.core.restore.list_snapper_backups") as mock_list:
+            mock_list.return_value = []
+            _handle_restore(args)
+        opts = mock_list.call_args.args[1]
+        assert "gpg_keyring" not in opts
+        assert "openssl_cipher" not in opts

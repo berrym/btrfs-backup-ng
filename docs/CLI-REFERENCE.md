@@ -251,6 +251,15 @@ btrfs-backup-ng config validate
 btrfs-backup-ng -c /path/to/config.toml config validate
 ```
 
+> **Note — unknown keys are reported.** Loading the config warns about any key a
+> parser does not recognize, e.g. `Unknown config key 'ssh_prot' in
+> [volumes[0].targets[0]] (ignored)`. A misspelled or misplaced key (a typo, or a
+> value under the wrong table) is silently *ignored* by the loader, which would
+> quietly void a safety setting such as `retention`, `encrypt`, or
+> `ssh_host_key_policy` — the warning surfaces it so you can fix it. The warning is
+> non-fatal; the rest of the config still loads. Any command that loads the config
+> prints these warnings; `config validate` is the quickest way to check.
+
 #### config init
 
 Generate an example configuration file.
@@ -891,6 +900,8 @@ btrfs-backup-ng snapper restore SOURCE [CONFIG] [OPTIONS]
 | `--ssh-key FILE` | SSH private key file |
 | `--ssh-auth-sock PATH` | Explicit ssh-agent socket (overrides auto-discovery; useful under `sudo`) |
 | `--ssh-host-key-policy {accept-new,strict}` | Host-key verification policy (default `accept-new`) |
+| `--gpg-keyring PATH` | GPG keyring to decrypt an encrypted raw snapper backup (must match the keyring it was encrypted for) |
+| `--openssl-cipher CIPHER` | OpenSSL cipher fallback for a legacy raw backup whose `.meta` sidecar does not record one (modern sidecars are authoritative) |
 | `--json` | Output in JSON format (for `--list`) |
 
 **Examples:**
