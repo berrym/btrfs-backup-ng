@@ -120,11 +120,27 @@ btrbk's retention syntax can be confusing. Here's how it maps:
 | btrbk | btrfs-backup-ng | Notes |
 |-------|-----------------|-------|
 | `snapshot_preserve_min 2d` | `min = "2d"` | Minimum retention period |
+| `snapshot_preserve 24h` | `hourly = 24` | Hourly snapshots to keep |
 | `snapshot_preserve 14d` | `daily = 14` | Daily snapshots to keep |
 | `snapshot_preserve 4w` | `weekly = 4` | Weekly snapshots to keep |
-| `snapshot_preserve 6m` | `monthly = 6` | Monthly snapshots to keep |
-| `target_preserve_min` | `min = "..."` | Same as snapshot (applied to backups) |
-| `target_preserve` | Same as above | Same retention for targets |
+| `snapshot_preserve 6m` | `monthly = 6` | **Monthly** — btrbk's `m` is *months* |
+| `snapshot_preserve 2y` | `yearly = 2` | Yearly snapshots to keep |
+| `snapshot_preserve_min 3m` | `min = "3M"` | btrbk `m` (months) → btrfs-backup-ng `M`; note the case (`m` alone is *minutes*) |
+| `snapshot_preserve_min no` | `min = "0s"` | No age floor — count rules apply fully |
+| `target_preserve` / `target_preserve_min` | *(warned)* | See note below |
+
+> **`target_preserve` is not applied separately.** btrbk lets the destination keep a
+> *different* schedule than the source (`target_preserve` vs `snapshot_preserve`).
+> btrfs-backup-ng uses **one** retention policy per volume, so the importer maps from
+> `snapshot_preserve*` and **emits a warning** when `target_preserve*` differs, rather than
+> silently applying only one. If your source and destination schedules differed, review the
+> generated `[…].retention` and adjust.
+>
+> **Directives with no equivalent are warned, not dropped silently.** `preserve_day_of_week`
+> and `preserve_hour_of_day` (which anchor btrbk retention to a specific weekday/hour) have no
+> btrfs-backup-ng counterpart; the importer warns that they were dropped. A `snapshot_preserve`
+> value it cannot parse (e.g. `latest`) is also warned rather than silently becoming a
+> keep-nothing policy. **Always review the importer's warnings** after a migration.
 
 **Important**: btrfs-backup-ng uses a simpler mental model:
 1. `min` - Keep everything for at least this duration
