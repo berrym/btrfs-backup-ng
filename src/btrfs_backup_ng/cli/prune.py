@@ -21,7 +21,7 @@ from ..notifications import (
     NotificationConfig as NotifConfig,
 )
 from ..retention import apply_retention, parse_duration
-from .common import get_log_level, get_timestamp_format
+from .common import get_log_level, get_timestamp_format, thread_ssh_target_config
 
 logger = logging.getLogger(__name__)
 
@@ -240,9 +240,7 @@ def execute_prune(args: argparse.Namespace) -> int:
         for target in volume.targets:
             try:
                 dest_kwargs = dict(endpoint_kwargs)
-                dest_kwargs["ssh_sudo"] = target.ssh_sudo
-                dest_kwargs["ssh_host_key_policy"] = target.ssh_host_key_policy
-                dest_kwargs["ssh_password_fallback"] = target.ssh_password_auth
+                thread_ssh_target_config(dest_kwargs, target)
 
                 dest_endpoint = endpoint.choose_endpoint(
                     target.path,

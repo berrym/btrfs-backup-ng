@@ -4395,3 +4395,55 @@ class TestRawSnapperExactNameResolution:
         assert snap.name == "root-100-new"
         assert "share number 100" in caplog.text
         assert "--backup-name or --date" in caplog.text
+
+
+class TestRestoreDecryptOptions:
+    """cli.restore._prepare_backup_endpoint threads --gpg-keyring/--openssl-cipher.
+
+    An encrypted raw:// / raw+ssh:// backup cannot be decoded on restore unless
+    the keyring (and, for a legacy sidecar, the cipher) reach the endpoint config.
+    Neither raw scheme starts with 'ssh://', so the options are threaded outside
+    the ssh branch -- and only when supplied, so a modern sidecar's recorded
+    cipher stays authoritative.
+    """
+
+    @staticmethod
+    def _args(**over):
+        base = dict(
+            prefix="",
+            timestamp_format=None,
+            fs_checks="auto",
+            ssh_sudo=False,
+            ssh_host_key_policy=None,
+            ssh_password_auth=True,
+            ssh_key=None,
+            ssh_auth_sock=None,
+            skip_verify=False,
+            gpg_keyring=None,
+            openssl_cipher=None,
+        )
+        base.update(over)
+        return argparse.Namespace(**base)
+
+    @patch("btrfs_backup_ng.cli.restore.endpoint.choose_endpoint")
+    def test_keyring_and_cipher_threaded(self, mock_choose):
+        from btrfs_backup_ng.cli.restore import _prepare_backup_endpoint
+
+        mock_choose.return_value = MagicMock()
+        _prepare_backup_endpoint(
+            self._args(gpg_keyring="/kr.gpg", openssl_cipher="aes-256-cbc"),
+            "raw://backups",
+        )
+        kwargs = mock_choose.call_args.args[1]
+        assert kwargs["gpg_keyring"] == "/kr.gpg"
+        assert kwargs["openssl_cipher"] == "aes-256-cbc"
+
+    @patch("btrfs_backup_ng.cli.restore.endpoint.choose_endpoint")
+    def test_absent_flags_not_threaded(self, mock_choose):
+        from btrfs_backup_ng.cli.restore import _prepare_backup_endpoint
+
+        mock_choose.return_value = MagicMock()
+        _prepare_backup_endpoint(self._args(), "raw://backups")
+        kwargs = mock_choose.call_args.args[1]
+        assert "gpg_keyring" not in kwargs
+        assert "openssl_cipher" not in kwargs

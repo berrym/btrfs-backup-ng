@@ -9,7 +9,7 @@ from typing import Any
 from .. import endpoint
 from ..__logger__ import create_logger
 from ..config import ConfigError, find_config_file, load_config
-from .common import get_log_level, get_timestamp_format
+from .common import get_log_level, get_timestamp_format, thread_ssh_target_config
 
 logger = logging.getLogger(__name__)
 
@@ -122,9 +122,7 @@ def execute_list(args: argparse.Namespace) -> int:
 
             try:
                 dest_kwargs = dict(endpoint_kwargs)
-                dest_kwargs["ssh_sudo"] = target.ssh_sudo
-                dest_kwargs["ssh_host_key_policy"] = target.ssh_host_key_policy
-                dest_kwargs["ssh_password_fallback"] = target.ssh_password_auth
+                thread_ssh_target_config(dest_kwargs, target)
 
                 dest_endpoint = endpoint.choose_endpoint(
                     target.path,

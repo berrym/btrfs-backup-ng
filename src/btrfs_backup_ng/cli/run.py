@@ -36,6 +36,7 @@ from .common import (
     space_options_from_args,
     thread_raw_compression,
     thread_raw_encryption,
+    thread_ssh_target_config,
 )
 from .prune import (
     execute_retention_deletes,
@@ -377,14 +378,7 @@ def _backup_volume(
                 logger.debug("Mount check passed for %s", target.path)
 
             dest_kwargs = dict(endpoint_kwargs)
-            dest_kwargs["ssh_sudo"] = target.ssh_sudo
-            dest_kwargs["ssh_host_key_policy"] = target.ssh_host_key_policy
-            dest_kwargs["ssh_password_fallback"] = target.ssh_password_auth
-
-            if target.ssh_key:
-                dest_kwargs["ssh_identity_file"] = target.ssh_key
-            if target.ssh_auth_sock:
-                dest_kwargs["ssh_auth_sock"] = target.ssh_auth_sock
+            thread_ssh_target_config(dest_kwargs, target)
 
             thread_raw_encryption(dest_kwargs, target)
             thread_raw_compression(dest_kwargs, target, compress_override)
@@ -640,14 +634,7 @@ def _backup_snapper_volume(
                 "snap_prefix": "",
                 "timestamp_format": get_timestamp_format(config),
             }
-            snapper_endpoint_config["ssh_host_key_policy"] = target.ssh_host_key_policy
-            if target.ssh_sudo:
-                snapper_endpoint_config["ssh_sudo"] = True
-            if target.ssh_key:
-                snapper_endpoint_config["ssh_identity_file"] = target.ssh_key
-                snapper_endpoint_config["ssh_key"] = target.ssh_key
-            if target.ssh_auth_sock:
-                snapper_endpoint_config["ssh_auth_sock"] = target.ssh_auth_sock
+            thread_ssh_target_config(snapper_endpoint_config, target)
             thread_raw_encryption(snapper_endpoint_config, target)
             thread_raw_compression(snapper_endpoint_config, target, compress_override)
             destination_endpoint = endpoint.choose_endpoint(

@@ -72,6 +72,12 @@ def execute(args: argparse.Namespace) -> int:
         # For local paths, set 'path' for LocalEndpoint
         endpoint_kwargs["path"] = Path(args.location).resolve()
 
+    # NOTE: verify does NOT thread a decryption keyring/cipher. Raw verification
+    # recomputes the sha256 of the stored (still-encrypted) stream file and
+    # compares it to the checksum sealed in the .meta sidecar -- it never decodes
+    # the stream -- so a keyring is not needed to verify an encrypted raw backup.
+    # (restore, which does decode, threads them; see cli/restore.py.)
+
     # Create endpoint for backup location
     try:
         backup_ep = endpoint.choose_endpoint(

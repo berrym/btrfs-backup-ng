@@ -4,6 +4,8 @@ import argparse
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from btrfs_backup_ng.cli.verify import (
     _display_json,
     _display_report,
@@ -1062,3 +1064,56 @@ class TestR8eReviewFixes:
         data = json.loads(capsys.readouterr().out)
         assert data["results"][0]["status"] != "ok"
         assert data["results"][0]["status"] == "unverifiable"
+
+
+class TestVerifyNoDecryptThreading:
+    """verify does NOT thread a decryption keyring/cipher into the endpoint.
+
+    Raw verification recomputes the sha256 of the stored (encrypted) stream file
+    and compares it to the sealed sidecar checksum -- it never decodes the stream
+    -- so no keyring is needed. This guards against re-adding inert decrypt flags
+    that would silently do nothing (a regression toward CLI theater).
+    """
+
+    @staticmethod
+    def _args(**over):
+        base = dict(
+            level="metadata",
+            location="/backup",
+            prefix="",
+            fs_checks="auto",
+            snapshot=None,
+            quiet=False,
+            json=False,
+            temp_dir=None,
+            no_cleanup=False,
+            timestamp_format=None,
+            ssh_sudo=False,
+            ssh_key=None,
+            ssh_auth_sock=None,
+            ssh_host_key_policy=None,
+        )
+        base.update(over)
+        return argparse.Namespace(**base)
+
+    @patch("btrfs_backup_ng.cli.verify.verify_metadata")
+    @patch("btrfs_backup_ng.cli.verify.endpoint.choose_endpoint")
+    def test_verify_endpoint_gets_no_decrypt_keys(self, mock_choose, mock_verify):
+        mock_choose.return_value = MagicMock()
+        mock_verify.return_value = _make_report(
+            results=[_make_result("snap-1", passed=True)]
+        )
+        execute(self._args())
+        kwargs = mock_choose.call_args.args[1]
+        assert "gpg_keyring" not in kwargs
+        assert "openssl_cipher" not in kwargs
+
+    def test_verify_parser_has_no_decrypt_flags(self):
+        """The verify subcommand must not expose --gpg-keyring/--openssl-cipher."""
+        from btrfs_backup_ng.cli.dispatcher import create_subcommand_parser
+
+        parser = create_subcommand_parser()
+        # An unknown flag makes argparse exit(2); confirm both are rejected.
+        for flag in ("--gpg-keyring", "--openssl-cipher"):
+            with pytest.raises(SystemExit):
+                parser.parse_args(["verify", "raw://backups", flag, "x"])

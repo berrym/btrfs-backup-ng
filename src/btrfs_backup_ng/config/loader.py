@@ -357,6 +357,149 @@ def _parse_global(data: dict[str, Any]) -> GlobalConfig:
     )
 
 
+# Known TOML keys per section. Mirror the fields each `_parse_*` function above
+# reads -- kept adjacent so adding a field there is an obvious prompt to add it
+# here too. A key not in these sets is silently dropped by the parsers, so a
+# typo (`retenion`) or a value placed under the wrong table would quietly void a
+# safety knob (retention/encrypt/ssh_host_key_policy). We surface it as a
+# warning; see `_collect_unknown_key_warnings`.
+_KNOWN_TOPLEVEL_KEYS = {"global", "volumes"}
+_KNOWN_GLOBAL_KEYS = {
+    "snapshot_dir",
+    "timestamp_format",
+    "incremental",
+    "log_file",
+    "transaction_log",
+    "retention",
+    "notifications",
+    "parallel_volumes",
+    "parallel_targets",
+    "quiet",
+    "verbose",
+}
+_KNOWN_RETENTION_KEYS = {"min", "hourly", "daily", "weekly", "monthly", "yearly"}
+_KNOWN_NOTIFICATIONS_KEYS = {"email", "webhook"}
+_KNOWN_EMAIL_KEYS = {
+    "enabled",
+    "smtp_host",
+    "smtp_port",
+    "smtp_user",
+    "smtp_password",
+    "smtp_tls",
+    "from_addr",
+    "to_addrs",
+    "on_success",
+    "on_failure",
+}
+_KNOWN_WEBHOOK_KEYS = {
+    "enabled",
+    "url",
+    "method",
+    "headers",
+    "on_success",
+    "on_failure",
+    "timeout",
+}
+_KNOWN_VOLUME_KEYS = {
+    "path",
+    "targets",
+    "retention",
+    "source",
+    "snapper",
+    "snapshot_prefix",
+    "snapshot_dir",
+    "enabled",
+}
+_KNOWN_TARGET_KEYS = {
+    "path",
+    "ssh_sudo",
+    "ssh_port",
+    "ssh_key",
+    "ssh_auth_sock",
+    "ssh_password_auth",
+    "ssh_host_key_policy",
+    "compress",
+    "rate_limit",
+    "require_mount",
+    "encrypt",
+    "gpg_recipient",
+    "gpg_keyring",
+    "openssl_cipher",
+}
+_KNOWN_SNAPPER_KEYS = {"config_name", "include_types", "exclude_cleanup", "min_age"}
+
+
+def _unknown_keys_in(section_label: str, data: Any, known: set[str]) -> list[str]:
+    """Return a warning per key in ``data`` that is not in ``known``.
+
+    A no-op when ``data`` is not a dict (a mistyped table -- e.g. a scalar where
+    a table is expected -- is reported with a clearer message by the parser)."""
+    if not isinstance(data, dict):
+        return []
+    return [
+        f"Unknown config key '{key}' in [{section_label}] (ignored)"
+        for key in sorted(set(data) - known)
+    ]
+
+
+def _collect_unknown_key_warnings(data: dict[str, Any]) -> list[str]:
+    """Walk the raw TOML dict and warn on keys no parser recognizes.
+
+    Centralized here -- walking the raw dict rather than checking inside each
+    ``_parse_*`` -- so parser signatures stay unchanged and every section is
+    covered in one place. Section labels mirror the TOML table paths so the
+    operator can locate the offending line."""
+    warnings: list[str] = []
+    if not isinstance(data, dict):
+        return warnings
+
+    warnings += _unknown_keys_in("top level", data, _KNOWN_TOPLEVEL_KEYS)
+
+    global_data = data.get("global", {})
+    if isinstance(global_data, dict):
+        warnings += _unknown_keys_in("global", global_data, _KNOWN_GLOBAL_KEYS)
+        warnings += _unknown_keys_in(
+            "global.retention", global_data.get("retention", {}), _KNOWN_RETENTION_KEYS
+        )
+        notif = global_data.get("notifications", {})
+        if isinstance(notif, dict):
+            warnings += _unknown_keys_in(
+                "global.notifications", notif, _KNOWN_NOTIFICATIONS_KEYS
+            )
+            warnings += _unknown_keys_in(
+                "global.notifications.email",
+                notif.get("email", {}),
+                _KNOWN_EMAIL_KEYS,
+            )
+            warnings += _unknown_keys_in(
+                "global.notifications.webhook",
+                notif.get("webhook", {}),
+                _KNOWN_WEBHOOK_KEYS,
+            )
+
+    volumes = data.get("volumes", [])
+    if isinstance(volumes, list):
+        for i, vol in enumerate(volumes):
+            if not isinstance(vol, dict):
+                continue
+            label = f"volumes[{i}]"
+            warnings += _unknown_keys_in(label, vol, _KNOWN_VOLUME_KEYS)
+            warnings += _unknown_keys_in(
+                f"{label}.retention", vol.get("retention", {}), _KNOWN_RETENTION_KEYS
+            )
+            warnings += _unknown_keys_in(
+                f"{label}.snapper", vol.get("snapper", {}), _KNOWN_SNAPPER_KEYS
+            )
+            targets = vol.get("targets", [])
+            if isinstance(targets, list):
+                for j, tgt in enumerate(targets):
+                    warnings += _unknown_keys_in(
+                        f"{label}.targets[{j}]", tgt, _KNOWN_TARGET_KEYS
+                    )
+
+    return warnings
+
+
 def _validate_config(config: Config) -> list[str]:
     """Validate configuration and return list of warnings."""
     warnings = []
@@ -436,8 +579,10 @@ def load_config(path: Path | str) -> tuple[Config, list[str]]:
 
     config = Config(global_config=global_config, volumes=volumes)
 
-    # Validate and collect warnings
-    warnings = _validate_config(config)
+    # Validate and collect warnings. Unknown-key warnings first: a typo'd or
+    # misplaced key is a structural mistake worth seeing before the semantic
+    # checks, and it explains why an expected setting appears not to take effect.
+    warnings = _collect_unknown_key_warnings(data) + _validate_config(config)
 
     return config, warnings
 

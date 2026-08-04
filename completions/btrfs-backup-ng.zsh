@@ -162,6 +162,8 @@ _btrfs-backup-ng() {
                         '--prefix[Snapshot prefix filter]:prefix:' \
                         '--ssh-sudo[Use sudo for btrfs commands on remote host]' \
                         '--ssh-key[SSH private key file]:key file:_files' \
+                        '--gpg-keyring[GPG keyring to decrypt an encrypted raw backup]:keyring:_files' \
+                        '--openssl-cipher[OpenSSL cipher fallback for a legacy raw backup]:cipher:' \
                         '--compress[Compression method]:method:(${compress_methods})' \
                         '--rate-limit[Bandwidth limit]:rate:' \
                         '--fs-checks[Filesystem validation mode]:mode:(${fs_checks_modes})' \
@@ -385,6 +387,8 @@ _btrfs-backup-ng() {
                                         '--dry-run[Show what would be done]' \
                                         '--ssh-sudo[Use sudo on remote host]' \
                                         '--ssh-key[SSH private key file]:key file:_files' \
+                                        '--gpg-keyring[GPG keyring to decrypt an encrypted raw backup]:keyring:_files' \
+                                        '--openssl-cipher[OpenSSL cipher fallback for a legacy raw backup]:cipher:' \
                                         '1:source (backup location):_files -/' \
                                         '2:snapper config name:'
                                     ;;

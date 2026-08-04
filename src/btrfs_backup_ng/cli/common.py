@@ -241,6 +241,45 @@ def thread_raw_encryption(kwargs: dict, target) -> None:
     kwargs["openssl_cipher"] = getattr(target, "openssl_cipher", None)
 
 
+def thread_ssh_target_config(kwargs: dict, target) -> None:
+    """Copy a target's SSH connection settings into an endpoint config dict.
+
+    The single source of truth for turning a ``TargetConfig``'s ``ssh_*`` fields
+    into the keys ``choose_endpoint`` / the endpoints consume. Previously each CLI
+    command (run, transfer, prune, status, list, estimate) threaded these inline
+    and INCONSISTENTLY:
+
+    * ``ssh_port`` was dropped everywhere -- a non-default ``ssh_port`` in the
+      config never reached ``ssh -p`` (the endpoint fell back to 22), so a target
+      on a non-standard port silently failed to connect.
+    * ``prune``/``status``/``list`` set only sudo/host-key-policy/password-fallback
+      and dropped ``ssh_key``/``ssh_auth_sock`` entirely, so those read-only remote
+      operations could not authenticate with a configured key file.
+    * The identity file must be threaded under BOTH names: the btrfs ``SSHEndpoint``
+      reads ``ssh_identity_file`` while the ``SSHRawEndpoint`` (raw+ssh) reads
+      ``ssh_key``. Some sites set only one, so a raw+ssh target with a configured
+      key silently used the default identity.
+
+    Threading the full set here, once, fixes all three classes at every call site.
+    ``port`` is always set; ``choose_endpoint`` gives a URL-embedded port
+    (``ssh://host:2222/``) precedence over it, so this is the target-level default,
+    not an override. Harmless for local targets (dropped by the base config
+    whitelist).
+    """
+    kwargs["port"] = getattr(target, "ssh_port", 22)
+    kwargs["ssh_sudo"] = getattr(target, "ssh_sudo", False)
+    kwargs["ssh_host_key_policy"] = getattr(target, "ssh_host_key_policy", "accept-new")
+    kwargs["ssh_password_fallback"] = getattr(target, "ssh_password_auth", True)
+    ssh_key = getattr(target, "ssh_key", None)
+    if ssh_key:
+        # SSHEndpoint reads ssh_identity_file; SSHRawEndpoint reads ssh_key.
+        kwargs["ssh_identity_file"] = ssh_key
+        kwargs["ssh_key"] = ssh_key
+    ssh_auth_sock = getattr(target, "ssh_auth_sock", None)
+    if ssh_auth_sock:
+        kwargs["ssh_auth_sock"] = ssh_auth_sock
+
+
 def thread_raw_compression(kwargs: dict, target, override: str | None = None) -> None:
     """Thread the EFFECTIVE compression into an endpoint config dict.
 

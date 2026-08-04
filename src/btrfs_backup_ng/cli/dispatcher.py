@@ -675,6 +675,18 @@ Config-driven restore:
         metavar="RATE",
         help="Bandwidth limit (e.g., '10M', '1G')",
     )
+    restore_parser.add_argument(
+        "--gpg-keyring",
+        metavar="PATH",
+        help="GPG keyring to decrypt an encrypted raw backup (must match the "
+        "keyring the backup was encrypted for)",
+    )
+    restore_parser.add_argument(
+        "--openssl-cipher",
+        metavar="CIPHER",
+        help="OpenSSL cipher fallback for a legacy raw backup whose sidecar "
+        "does not record one (modern sidecars are authoritative)",
+    )
     add_fs_checks_args(restore_parser)
     add_ssh_hostkey_arg(restore_parser)
 
@@ -1475,6 +1487,18 @@ Examples:
         "--ssh-auth-sock",
         metavar="PATH",
         help="Explicit ssh-agent socket (overrides auto-discovery; useful under sudo)",
+    )
+    snapper_restore.add_argument(
+        "--gpg-keyring",
+        metavar="PATH",
+        help="GPG keyring to decrypt an encrypted raw snapper backup (must "
+        "match the keyring the backup was encrypted for)",
+    )
+    snapper_restore.add_argument(
+        "--openssl-cipher",
+        metavar="CIPHER",
+        help="OpenSSL cipher fallback for a legacy raw backup whose sidecar "
+        "does not record one (modern sidecars are authoritative)",
     )
     add_ssh_hostkey_arg(snapper_restore)
     snapper_restore.add_argument(

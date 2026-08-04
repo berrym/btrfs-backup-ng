@@ -481,6 +481,38 @@ class TestSnapperRestoreCompletionFlags:
                 assert needle in text, f"{fname} missing {needle!r}"
 
 
+class TestDecryptCompletionFlags:
+    """0.9.2 Phase 2A: --gpg-keyring/--openssl-cipher stay in lockstep across all
+    shells for restore and snapper restore (the paths that DECODE). verify must
+    NOT offer them -- it checksums ciphertext and never decrypts."""
+
+    def _completions_dir(self):
+        return Path(__file__).resolve().parent.parent / "completions"
+
+    def test_decrypt_flags_in_bash_opt_lines(self):
+        bash = (self._completions_dir() / "btrfs-backup-ng.bash").read_text()
+        for opt_var in ("restore_opts=", "snapper_restore_opts="):
+            line = next(line for line in bash.splitlines() if opt_var in line)
+            assert "--gpg-keyring" in line, f"{opt_var} missing --gpg-keyring"
+            assert "--openssl-cipher" in line, f"{opt_var} missing --openssl-cipher"
+
+    def test_verify_bash_opts_have_no_decrypt_flags(self):
+        bash = (self._completions_dir() / "btrfs-backup-ng.bash").read_text()
+        line = next(line for line in bash.splitlines() if "verify_opts=" in line)
+        assert "--gpg-keyring" not in line
+        assert "--openssl-cipher" not in line
+
+    def test_decrypt_flags_present_in_zsh_and_fish(self):
+        d = self._completions_dir()
+        # Two commands (restore, snapper restore) each declare both flags.
+        zsh = (d / "btrfs-backup-ng.zsh").read_text()
+        assert zsh.count("--gpg-keyring[") >= 2
+        assert zsh.count("--openssl-cipher[") >= 2
+        fish = (d / "btrfs-backup-ng.fish").read_text()
+        assert fish.count("-l gpg-keyring") >= 2
+        assert fish.count("-l openssl-cipher") >= 2
+
+
 class TestRunCompletionNoStaleFlags:
     """0.9.2: `run` completions must not offer flags run doesn't accept."""
 

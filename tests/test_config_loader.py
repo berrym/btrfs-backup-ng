@@ -392,6 +392,188 @@ path = "/mnt/backup"
         assert any("invalid snapper type" in w.lower() for w in warnings)
 
 
+class TestUnknownKeyWarnings:
+    """Tests for unknown/mistyped config-key warnings.
+
+    A key no parser reads is silently dropped, so a typo (`retenion`) or a value
+    under the wrong table would quietly void a safety knob. load_config surfaces
+    each as a warning; a fully-valid config must produce none (no false positives).
+    """
+
+    @staticmethod
+    def _unknown(warnings):
+        return [w for w in warnings if "Unknown config key" in w]
+
+    def test_valid_config_has_no_unknown_key_warnings(self, tmp_config_dir):
+        """A fully-populated, correct config must not warn about any key.
+
+        This is the critical false-positive guard: the known-key sets must cover
+        every field the parsers actually read, in every section.
+        """
+        config_path = tmp_config_dir / "valid_full.toml"
+        config_path.write_text("""
+[global]
+snapshot_dir = ".snapshots"
+timestamp_format = "%Y%m%d-%H%M%S"
+incremental = true
+log_file = "/var/log/bb.log"
+transaction_log = "/var/log/bb.jsonl"
+parallel_volumes = 2
+parallel_targets = 3
+quiet = false
+verbose = false
+
+[global.retention]
+min = "1d"
+hourly = 24
+daily = 7
+weekly = 4
+monthly = 12
+yearly = 0
+
+[global.notifications.email]
+enabled = false
+smtp_host = "localhost"
+smtp_port = 25
+smtp_user = "u"
+smtp_password = "p"
+smtp_tls = "none"
+from_addr = "a@b"
+to_addrs = ["c@d"]
+on_success = false
+on_failure = true
+
+[global.notifications.webhook]
+enabled = false
+url = "https://x"
+method = "POST"
+headers = { X-Token = "t" }
+on_success = false
+on_failure = true
+timeout = 30
+
+[[volumes]]
+path = "/home"
+source = "snapper"
+snapshot_prefix = "home"
+snapshot_dir = ".snapshots"
+enabled = true
+
+[volumes.retention]
+min = "2d"
+daily = 3
+
+[volumes.snapper]
+config_name = "home"
+include_types = ["single"]
+exclude_cleanup = []
+min_age = "1h"
+
+[[volumes.targets]]
+path = "raw+ssh://host/backups"
+ssh_sudo = true
+ssh_port = 2222
+ssh_key = "/id"
+ssh_auth_sock = "/sock"
+ssh_password_auth = true
+ssh_host_key_policy = "strict"
+compress = "zstd"
+rate_limit = "10M"
+require_mount = false
+encrypt = "gpg"
+gpg_recipient = "me@example.com"
+gpg_keyring = "/kr.gpg"
+openssl_cipher = "aes-256-cbc"
+""")
+        config, warnings = load_config(config_path)
+        assert self._unknown(warnings) == []
+
+    def test_unknown_top_level_key(self, tmp_config_dir):
+        config_path = tmp_config_dir / "top.toml"
+        config_path.write_text("""
+oops = 1
+
+[[volumes]]
+path = "/home"
+
+[[volumes.targets]]
+path = "/mnt/backup"
+""")
+        _, warnings = load_config(config_path)
+        assert any("'oops'" in w and "top level" in w for w in self._unknown(warnings))
+
+    def test_unknown_global_key(self, tmp_config_dir):
+        config_path = tmp_config_dir / "g.toml"
+        config_path.write_text("""
+[global]
+snpashot_dir = "typo"
+
+[[volumes]]
+path = "/home"
+
+[[volumes.targets]]
+path = "/mnt/backup"
+""")
+        _, warnings = load_config(config_path)
+        assert any(
+            "'snpashot_dir'" in w and "[global]" in w for w in self._unknown(warnings)
+        )
+
+    def test_unknown_retention_key(self, tmp_config_dir):
+        config_path = tmp_config_dir / "r.toml"
+        config_path.write_text("""
+[global.retention]
+dai1y = 7
+
+[[volumes]]
+path = "/home"
+
+[[volumes.targets]]
+path = "/mnt/backup"
+""")
+        _, warnings = load_config(config_path)
+        assert any(
+            "'dai1y'" in w and "global.retention" in w for w in self._unknown(warnings)
+        )
+
+    def test_unknown_target_key_labels_index(self, tmp_config_dir):
+        """A typo'd target key is flagged with its table path so it can be found."""
+        config_path = tmp_config_dir / "t.toml"
+        config_path.write_text("""
+[[volumes]]
+path = "/home"
+
+[[volumes.targets]]
+path = "/mnt/backup"
+ssh_prot = 2222
+""")
+        _, warnings = load_config(config_path)
+        assert any(
+            "'ssh_prot'" in w and "volumes[0].targets[0]" in w
+            for w in self._unknown(warnings)
+        )
+
+    def test_unknown_snapper_key(self, tmp_config_dir):
+        config_path = tmp_config_dir / "s.toml"
+        config_path.write_text("""
+[[volumes]]
+path = "/home"
+source = "snapper"
+
+[volumes.snapper]
+config_name = "home"
+min_agee = "1h"
+
+[[volumes.targets]]
+path = "/mnt/backup"
+""")
+        _, warnings = load_config(config_path)
+        assert any(
+            "'min_agee'" in w and "volumes[0].snapper" in w
+            for w in self._unknown(warnings)
+        )
+
+
 class TestSnapperSourceConfig:
     """Tests for snapper source configuration."""
 
