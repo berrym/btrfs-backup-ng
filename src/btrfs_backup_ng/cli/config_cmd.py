@@ -128,6 +128,79 @@ def _prompt_int(
             print("  Please enter a valid number.")
 
 
+def _toml_str(value: str) -> str:
+    """Return ``value`` as a quoted, escaped TOML basic string.
+
+    Free-text wizard inputs (a gpg keyring PATH, an openssl cipher, a gpg
+    recipient) can contain a backslash or double-quote. Interpolated raw into a
+    TOML basic string those either make the config unparseable OR -- worse --
+    silently corrupt it (``\\t`` in a path becomes a literal tab, a valid TOML
+    escape, so it loads with the WRONG value). Escaping backslash/quote/control
+    characters makes serialization lossless.
+
+    NOTE: the surrounding ``_generate_config_from_wizard`` still interpolates the
+    pre-existing string fields (path, log_file, notification fields, ...) without
+    this; that repo-wide unescaped pattern is a separate robustness sweep. This
+    helper is applied to the encryption fields added here so the new inputs are
+    safe now.
+    """
+    escaped = (
+        str(value)
+        .replace("\\", "\\\\")
+        .replace('"', '\\"')
+        .replace("\n", "\\n")
+        .replace("\r", "\\r")
+        .replace("\t", "\\t")
+    )
+    return f'"{escaped}"'
+
+
+def _prompt_target_encryption(target_path: str) -> dict[str, Any]:
+    """Prompt for a raw target's encryption settings.
+
+    Encryption is a RAW-target-only feature (the config loader rejects ``encrypt``
+    on ssh:// or local btrfs targets), so this is a no-op for anything that is not
+    ``raw://`` / ``raw+ssh://`` -- the wizard never asks an irrelevant question.
+    When encryption is chosen it enforces the same rule the loader does: ``gpg``
+    REQUIRES a ``gpg_recipient``. ``gpg_keyring`` and ``openssl_cipher`` are
+    optional (blank keeps the defaults).
+
+    Returns the encryption keys to merge into the target dict (empty when the
+    target is not raw, or encryption is declined).
+    """
+    if not target_path.startswith(("raw://", "raw+ssh://")):
+        return {}
+
+    method = prompt_choice(
+        "  Encrypt this raw target?",
+        ["none", "gpg", "openssl_enc"],
+        "none",
+    )
+    if method == "none":
+        return {}
+
+    result: dict[str, Any] = {"encrypt": method}
+    if method == "gpg":
+        # The loader fails closed if encrypt=gpg has no recipient; require it here
+        # so the wizard never emits a config that won't load.
+        recipient = ""
+        while not recipient.strip():
+            recipient = prompt("  GPG recipient (key ID or email) [required]", "")
+            if not recipient.strip():
+                console.print(
+                    "  [red]A GPG recipient is required for gpg encryption.[/red]"
+                )
+        result["gpg_recipient"] = recipient.strip()
+        keyring = prompt("  GPG keyring file (optional, blank = default keyring)", "")
+        if keyring.strip():
+            result["gpg_keyring"] = keyring.strip()
+    else:  # openssl_enc
+        cipher = prompt("  OpenSSL cipher (optional, blank = aes-256-cbc)", "")
+        if cipher.strip():
+            result["openssl_cipher"] = cipher.strip()
+    return result
+
+
 def _generate_config_from_wizard(config_data: dict[str, Any]) -> str:
     """Generate TOML config content from wizard data."""
     lines = [
@@ -253,6 +326,31 @@ def _generate_config_from_wizard(config_data: dict[str, Any]) -> str:
                 lines.append("ssh_sudo = true")
             if target.get("require_mount"):
                 lines.append("require_mount = true")
+            # Raw-target encryption. Enforce the raw-only invariant at emit time
+            # (matching the loader and _prompt_target_encryption) so the serializer
+            # is self-consistent regardless of how the target dict was populated,
+            # and only emit encrypt=gpg together with its required recipient.
+            is_raw = str(target.get("path", "")).startswith(("raw://", "raw+ssh://"))
+            encrypt = target.get("encrypt")
+            if is_raw and encrypt and encrypt != "none":
+                if encrypt == "gpg" and not target.get("gpg_recipient"):
+                    # gpg requires a recipient (loader fails closed); skip an invalid
+                    # block rather than emit an unloadable config.
+                    pass
+                else:
+                    lines.append(f"encrypt = {_toml_str(encrypt)}")
+                    if target.get("gpg_recipient"):
+                        lines.append(
+                            f"gpg_recipient = {_toml_str(target['gpg_recipient'])}"
+                        )
+                    if target.get("gpg_keyring"):
+                        lines.append(
+                            f"gpg_keyring = {_toml_str(target['gpg_keyring'])}"
+                        )
+                    if target.get("openssl_cipher"):
+                        lines.append(
+                            f"openssl_cipher = {_toml_str(target['openssl_cipher'])}"
+                        )
 
     lines.append("")
     return "\n".join(lines)
@@ -393,6 +491,9 @@ def _run_interactive_wizard() -> str:
                 target["require_mount"] = prompt_bool(
                     "  Require mount check (for external drives)?", True
                 )
+
+            # Encryption is offered only for raw:// / raw+ssh:// targets.
+            target.update(_prompt_target_encryption(target_path))
 
             volume["targets"].append(target)
             console.print(f"  [green]Added target:[/green] {target_path}")
@@ -1307,6 +1408,9 @@ def _run_detection_wizard(result) -> int:
                 target["require_mount"] = prompt_bool(
                     "  Require mount check (for external drives)?", True
                 )
+
+            # Encryption is offered only for raw:// / raw+ssh:// targets.
+            target.update(_prompt_target_encryption(target_path))
 
             volume["targets"].append(target)
             console.print(f"  [green]Added target:[/green] {target_path}")

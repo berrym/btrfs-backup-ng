@@ -775,3 +775,220 @@ class TestMigrateSystemd:
                         result = _run_interactive_wizard()
 
         assert 'path = "/mnt/backup"' in result
+
+
+class TestPromptTargetEncryption:
+    """0.9.2 Phase 2B-ii: the wizard's raw-target encryption prompt."""
+
+    def test_non_raw_targets_are_not_prompted(self):
+        """Encryption is raw-only; ssh:// and local targets must skip it entirely
+        (return {} without asking a question)."""
+        from btrfs_backup_ng.cli.config_cmd import _prompt_target_encryption
+
+        with mock.patch("btrfs_backup_ng.cli.config_cmd.prompt_choice") as mchoice:
+            assert _prompt_target_encryption("ssh://h/p") == {}
+            assert _prompt_target_encryption("/mnt/backup") == {}
+            mchoice.assert_not_called()
+
+    def test_raw_none_returns_empty(self):
+        from btrfs_backup_ng.cli.config_cmd import _prompt_target_encryption
+
+        with mock.patch(
+            "btrfs_backup_ng.cli.config_cmd.prompt_choice", return_value="none"
+        ):
+            assert _prompt_target_encryption("raw:///mnt/b") == {}
+
+    def test_raw_gpg_collects_required_recipient(self):
+        from btrfs_backup_ng.cli.config_cmd import _prompt_target_encryption
+
+        with (
+            mock.patch(
+                "btrfs_backup_ng.cli.config_cmd.prompt_choice", return_value="gpg"
+            ),
+            mock.patch(
+                "btrfs_backup_ng.cli.config_cmd.prompt",
+                side_effect=["me@example.com", ""],  # recipient, keyring (blank)
+            ),
+        ):
+            result = _prompt_target_encryption("raw+ssh://h/b")
+        assert result == {"encrypt": "gpg", "gpg_recipient": "me@example.com"}
+
+    def test_raw_gpg_reprompts_until_recipient_given(self):
+        """A blank gpg recipient must re-prompt (the loader requires it)."""
+        from btrfs_backup_ng.cli.config_cmd import _prompt_target_encryption
+
+        with (
+            mock.patch(
+                "btrfs_backup_ng.cli.config_cmd.prompt_choice", return_value="gpg"
+            ),
+            mock.patch(
+                "btrfs_backup_ng.cli.config_cmd.prompt",
+                side_effect=["", "   ", "KEYID", "/kr.gpg"],
+            ),
+        ):
+            result = _prompt_target_encryption("raw:///mnt/b")
+        assert result["encrypt"] == "gpg"
+        assert result["gpg_recipient"] == "KEYID"
+        assert result["gpg_keyring"] == "/kr.gpg"
+
+    def test_raw_openssl_optional_cipher(self):
+        from btrfs_backup_ng.cli.config_cmd import _prompt_target_encryption
+
+        # explicit cipher
+        with (
+            mock.patch(
+                "btrfs_backup_ng.cli.config_cmd.prompt_choice",
+                return_value="openssl_enc",
+            ),
+            mock.patch(
+                "btrfs_backup_ng.cli.config_cmd.prompt", return_value="aes-128-cbc"
+            ),
+        ):
+            assert _prompt_target_encryption("raw:///mnt/b") == {
+                "encrypt": "openssl_enc",
+                "openssl_cipher": "aes-128-cbc",
+            }
+        # blank cipher -> field omitted (endpoint default applies)
+        with (
+            mock.patch(
+                "btrfs_backup_ng.cli.config_cmd.prompt_choice",
+                return_value="openssl_enc",
+            ),
+            mock.patch("btrfs_backup_ng.cli.config_cmd.prompt", return_value=""),
+        ):
+            assert _prompt_target_encryption("raw:///mnt/b") == {
+                "encrypt": "openssl_enc"
+            }
+
+
+class TestGenerateConfigEncryption:
+    """0.9.2 Phase 2B-ii: wizard-emitted encrypted raw configs serialize & LOAD."""
+
+    @staticmethod
+    def _config_with_target(target):
+        return {
+            "snapshot_dir": ".snapshots",
+            "timestamp_format": "%Y%m%d-%H%M%S",
+            "incremental": True,
+            "parallel_volumes": 2,
+            "parallel_targets": 3,
+            "retention": {
+                "min": "1d",
+                "hourly": 24,
+                "daily": 7,
+                "weekly": 4,
+                "monthly": 12,
+                "yearly": 0,
+            },
+            "volumes": [
+                {"path": "/home", "snapshot_prefix": "home", "targets": [target]}
+            ],
+        }
+
+    def test_gpg_target_serializes_and_loads(self, tmp_path):
+        from btrfs_backup_ng.cli.config_cmd import _generate_config_from_wizard
+        from btrfs_backup_ng.config.loader import load_config
+
+        toml = _generate_config_from_wizard(
+            self._config_with_target(
+                {
+                    "path": "raw+ssh://user@host/backups",
+                    "ssh_sudo": True,
+                    "encrypt": "gpg",
+                    "gpg_recipient": "me@example.com",
+                    "gpg_keyring": "/etc/keys/backup.gpg",
+                }
+            )
+        )
+        assert 'encrypt = "gpg"' in toml
+        assert 'gpg_recipient = "me@example.com"' in toml
+        p = tmp_path / "c.toml"
+        p.write_text(toml)
+        cfg, warns = load_config(p)
+        t = cfg.volumes[0].targets[0]
+        assert t.encrypt == "gpg"
+        assert t.gpg_recipient == "me@example.com"
+        assert t.gpg_keyring == "/etc/keys/backup.gpg"
+        assert not [w for w in warns if "Unknown config key" in w]
+
+    def test_openssl_target_serializes_and_loads(self, tmp_path):
+        from btrfs_backup_ng.cli.config_cmd import _generate_config_from_wizard
+        from btrfs_backup_ng.config.loader import load_config
+
+        toml = _generate_config_from_wizard(
+            self._config_with_target(
+                {
+                    "path": "raw:///mnt/backup",
+                    "encrypt": "openssl_enc",
+                    "openssl_cipher": "aes-256-cbc",
+                }
+            )
+        )
+        p = tmp_path / "c.toml"
+        p.write_text(toml)
+        cfg, _ = load_config(p)
+        t = cfg.volumes[0].targets[0]
+        assert t.encrypt == "openssl_enc"
+        assert t.openssl_cipher == "aes-256-cbc"
+
+    def test_non_encrypted_target_emits_no_encrypt_key(self):
+        from btrfs_backup_ng.cli.config_cmd import _generate_config_from_wizard
+
+        toml = _generate_config_from_wizard(
+            self._config_with_target({"path": "ssh://h/p", "ssh_sudo": True})
+        )
+        assert "encrypt" not in toml
+        assert "gpg_recipient" not in toml
+
+    def test_serializer_skips_invalid_gpg_block_without_recipient(self, tmp_path):
+        """Defense-in-depth: the serializer enforces the loader's rule (encrypt=gpg
+        REQUIRES gpg_recipient) at emit time -- rather than writing an unloadable
+        `encrypt = "gpg"` with no recipient, it omits the encryption block, so the
+        generated config always loads. (The wizard already requires the recipient
+        interactively; this guards a malformed input dict.)"""
+        from btrfs_backup_ng.cli.config_cmd import _generate_config_from_wizard
+        from btrfs_backup_ng.config.loader import load_config
+
+        toml = _generate_config_from_wizard(
+            self._config_with_target({"path": "raw:///mnt/b", "encrypt": "gpg"})
+        )
+        assert 'encrypt = "gpg"' not in toml
+        p = tmp_path / "c.toml"
+        p.write_text(toml)
+        cfg, _ = load_config(p)  # loads cleanly (no invalid block emitted)
+        assert cfg.volumes[0].targets[0].encrypt == "none"
+
+    def test_serializer_enforces_raw_only_invariant(self, tmp_path):
+        """The serializer must not emit encryption keys for a NON-raw target even if
+        the dict carries them (raw-only invariant enforced at emit time)."""
+        from btrfs_backup_ng.cli.config_cmd import _generate_config_from_wizard
+
+        toml = _generate_config_from_wizard(
+            self._config_with_target(
+                {"path": "ssh://h/p", "encrypt": "gpg", "gpg_recipient": "x@y"}
+            )
+        )
+        assert "encrypt" not in toml
+        assert "gpg_recipient" not in toml
+
+    def test_backslash_keyring_path_round_trips_losslessly(self, tmp_path):
+        """A keyring path with a backslash must survive serialization -> load
+        unchanged (previously `\\t` silently became a TAB, or broke parsing)."""
+        from btrfs_backup_ng.cli.config_cmd import _generate_config_from_wizard
+        from btrfs_backup_ng.config.loader import load_config
+
+        keyring = "/keys\\thekey.gpg"
+        toml = _generate_config_from_wizard(
+            self._config_with_target(
+                {
+                    "path": "raw:///mnt/b",
+                    "encrypt": "gpg",
+                    "gpg_recipient": "me@example.com",
+                    "gpg_keyring": keyring,
+                }
+            )
+        )
+        p = tmp_path / "c.toml"
+        p.write_text(toml)
+        cfg, _ = load_config(p)
+        assert cfg.volumes[0].targets[0].gpg_keyring == keyring
