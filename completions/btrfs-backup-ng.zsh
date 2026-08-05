@@ -162,6 +162,7 @@ _btrfs-backup-ng() {
                         '--prefix[Snapshot prefix filter]:prefix:' \
                         '--ssh-sudo[Use sudo for btrfs commands on remote host]' \
                         '--ssh-key[SSH private key file]:key file:_files' \
+                        '--ssh-auth-sock[Explicit ssh-agent socket (useful under sudo)]:socket:_files' \
                         '--gpg-keyring[GPG keyring to decrypt an encrypted raw backup]:keyring:_files' \
                         '--openssl-cipher[OpenSSL cipher fallback for a legacy raw backup]:cipher:' \
                         '--compress[Compression method]:method:(${compress_methods})' \
@@ -191,6 +192,7 @@ _btrfs-backup-ng() {
                         '--prefix[Snapshot prefix filter]:prefix:' \
                         '--ssh-sudo[Use sudo for btrfs commands on remote host]' \
                         '--ssh-key[SSH private key file]:key file:_files' \
+                        '--ssh-auth-sock[Explicit ssh-agent socket (useful under sudo)]:socket:_files' \
                         '--fs-checks[Filesystem validation mode]:mode:(${fs_checks_modes})' \
                         '--json[Output results in JSON format]' \
                         '(-q --quiet)'{-q,--quiet}'[Suppress progress output]' \
@@ -204,6 +206,7 @@ _btrfs-backup-ng() {
                         '--prefix[Snapshot prefix filter]:prefix:' \
                         '--ssh-sudo[Use sudo for btrfs commands on remote host]' \
                         '--ssh-key[SSH private key file]:key file:_files' \
+                        '--ssh-auth-sock[Explicit ssh-agent socket (useful under sudo)]:socket:_files' \
                         '--fs-checks[Filesystem validation mode]:mode:(${fs_checks_modes})' \
                         '--check-space[Check destination space availability]' \
                         '--safety-margin[Safety margin percentage]:percent:' \
@@ -365,6 +368,7 @@ _btrfs-backup-ng() {
                                         '--dry-run[Show what would be done]' \
                                         '--ssh-sudo[Use sudo on remote host]' \
                                         '--ssh-key[SSH private key file]:key file:_files' \
+                                        '--ssh-auth-sock[Explicit ssh-agent socket (useful under sudo)]:socket:_files' \
                                         '--compress[Compression method]:method:(${compress_methods})' \
                                         '--rate-limit[Bandwidth limit]:rate:' \
                                         '(--progress --no-progress)'--progress'[Show progress bars]' \
@@ -387,6 +391,7 @@ _btrfs-backup-ng() {
                                         '--dry-run[Show what would be done]' \
                                         '--ssh-sudo[Use sudo on remote host]' \
                                         '--ssh-key[SSH private key file]:key file:_files' \
+                                        '--ssh-auth-sock[Explicit ssh-agent socket (useful under sudo)]:socket:_files' \
                                         '--gpg-keyring[GPG keyring to decrypt an encrypted raw backup]:keyring:_files' \
                                         '--openssl-cipher[OpenSSL cipher fallback for a legacy raw backup]:cipher:' \
                                         '1:source (backup location):_files -/' \

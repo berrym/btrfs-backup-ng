@@ -17,6 +17,28 @@ from typing import Any, Callable
 logger = logging.getLogger(__name__)
 
 
+def _ts_to_epoch(ts: Any) -> float:
+    """Coerce a transaction ``timestamp`` field to an epoch float.
+
+    The transaction log writes ``timestamp`` as an ISO-8601 STRING
+    (``datetime.now(timezone.utc).isoformat()``), but the age/recent-failure
+    checks compare it against ``time.time()``. Treating the string as a number
+    raised a ``TypeError`` (``str >= float`` / ``float - str``) that the
+    surrounding ``except`` swallowed -- silently disabling those checks. Parse the
+    ISO string (also accepting a bare epoch number for forward/backward
+    compatibility); an unparseable value sorts as oldest (0.0)."""
+    if isinstance(ts, (int, float)):
+        return float(ts)
+    if isinstance(ts, str) and ts:
+        from datetime import datetime
+
+        try:
+            return datetime.fromisoformat(ts).timestamp()
+        except ValueError:
+            return 0.0
+    return 0.0
+
+
 class DiagnosticSeverity(Enum):
     """Severity level for diagnostic findings."""
 
@@ -1175,9 +1197,11 @@ class Doctor:
             since = time.time() - (24 * 60 * 60)
             all_transactions = read_transaction_log(log_path)
 
-            # Filter to last 24 hours
+            # Filter to last 24 hours. timestamp is an ISO-8601 string; coerce it
+            # to epoch before comparing (a raw compare raised TypeError -> the check
+            # silently no-op'd).
             transactions = [
-                t for t in all_transactions if t.get("timestamp", 0) >= since
+                t for t in all_transactions if _ts_to_epoch(t.get("timestamp")) >= since
             ]
 
             failed = [t for t in transactions if t.get("status") == "failed"]
@@ -1416,9 +1440,11 @@ class Doctor:
                 )
                 return findings
 
-            # Find most recent
-            latest = max(completed, key=lambda t: t.get("timestamp", 0))
-            age_seconds = time.time() - latest.get("timestamp", 0)
+            # Find most recent. timestamp is an ISO-8601 string; coerce to epoch
+            # (a raw ``float - str`` raised TypeError -> the age check silently
+            # produced a confusing "could not determine backup age" warning).
+            latest = max(completed, key=lambda t: _ts_to_epoch(t.get("timestamp")))
+            age_seconds = time.time() - _ts_to_epoch(latest.get("timestamp"))
             age_hours = age_seconds / 3600
 
             if age_hours > 48:

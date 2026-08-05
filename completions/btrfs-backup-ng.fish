@@ -149,6 +149,7 @@ complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_using_command restore' -l
 complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_using_command restore' -l prefix -d 'Snapshot prefix filter' -x
 complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_using_command restore' -l ssh-sudo -d 'Use sudo for btrfs commands on remote host'
 complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_using_command restore' -l ssh-key -d 'SSH private key file' -r -F
+complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_using_command restore' -l ssh-auth-sock -d 'Explicit ssh-agent socket (useful under sudo)' -r -F
 complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_using_command restore' -l gpg-keyring -d 'GPG keyring to decrypt an encrypted raw backup' -r -F
 complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_using_command restore' -l openssl-cipher -d 'OpenSSL cipher fallback for a legacy raw backup' -x
 complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_using_command restore' -l compress -d 'Compression method' -xa "$compress_methods"
@@ -177,6 +178,7 @@ complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_using_command verify' -l 
 complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_using_command verify' -l prefix -d 'Snapshot prefix filter' -x
 complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_using_command verify' -l ssh-sudo -d 'Use sudo for btrfs commands on remote host'
 complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_using_command verify' -l ssh-key -d 'SSH private key file' -r -F
+complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_using_command verify' -l ssh-auth-sock -d 'Explicit ssh-agent socket (useful under sudo)' -r -F
 complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_using_command verify' -l fs-checks -d 'Filesystem validation mode' -xa "$fs_checks_modes"
 complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_using_command verify' -l json -d 'Output results in JSON format'
 complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_using_command verify' -s q -l quiet -d 'Suppress progress output'
@@ -190,6 +192,7 @@ complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_using_command estimate' -
 complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_using_command estimate' -l prefix -d 'Snapshot prefix filter' -x
 complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_using_command estimate' -l ssh-sudo -d 'Use sudo for btrfs commands on remote host'
 complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_using_command estimate' -l ssh-key -d 'SSH private key file' -r -F
+complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_using_command estimate' -l ssh-auth-sock -d 'Explicit ssh-agent socket (useful under sudo)' -r -F
 complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_using_command estimate' -l fs-checks -d 'Filesystem validation mode' -xa "$fs_checks_modes"
 complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_using_command estimate' -l check-space -d 'Check destination space availability'
 complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_using_command estimate' -l safety-margin -d 'Safety margin percentage (default 10)' -x
@@ -332,6 +335,7 @@ complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_snapper_using_subcommand 
 complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_snapper_using_subcommand backup' -l min-age -d 'Only backup snapshots older than duration (e.g., 1h, 30m)' -x
 complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_snapper_using_subcommand backup' -l ssh-sudo -d 'Use sudo for btrfs commands on remote host'
 complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_snapper_using_subcommand backup' -l ssh-key -d 'SSH private key file' -r -F
+complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_snapper_using_subcommand backup' -l ssh-auth-sock -d 'Explicit ssh-agent socket (useful under sudo)' -r -F
 
 # snapper status
 complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_snapper_using_subcommand status' -l json -d 'Output in JSON format'
@@ -348,6 +352,7 @@ complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_snapper_using_subcommand 
 complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_snapper_using_subcommand restore' -l no-progress -d 'Disable progress bars'
 complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_snapper_using_subcommand restore' -l ssh-sudo -d 'Use sudo for btrfs commands on remote host'
 complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_snapper_using_subcommand restore' -l ssh-key -d 'SSH private key file' -r -F
+complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_snapper_using_subcommand restore' -l ssh-auth-sock -d 'Explicit ssh-agent socket (useful under sudo)' -r -F
 complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_snapper_using_subcommand restore' -l gpg-keyring -d 'GPG keyring to decrypt an encrypted raw backup' -r -F
 complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_snapper_using_subcommand restore' -l openssl-cipher -d 'OpenSSL cipher fallback for a legacy raw backup' -x
 
