@@ -3447,6 +3447,12 @@ print(json.dumps(result))
         """
         logger.debug("Starting direct SSH pipe transfer for %s", snapshot)
 
+        # Reset the per-transfer diagnostic. A failing monitor records the send/
+        # receive stderr here so _do_direct_pipe_transfer can surface the actionable
+        # cause in the raised error (not just a separate ERROR log line). Reset once
+        # up front; across retries it holds the LAST attempt's cause.
+        self._last_transfer_error: Optional[str] = None
+
         # Get snapshot details
         snapshot_path = str(snapshot.get_path())
         snapshot_name = snapshot.get_name()
@@ -3860,13 +3866,15 @@ print(json.dumps(result))
             logger.error(
                 f"FAILED: Send process failed (exit code: {send_process.returncode})"
             )
-            self._log_process_error(send_process, "send")
+            self._last_transfer_error = self._log_process_error(send_process, "send")
             return False
         if receive_process.returncode != 0:
             logger.error(
                 f"FAILED: Receive process failed (exit code: {receive_process.returncode})"
             )
-            self._log_process_error(receive_process, "receive")
+            self._last_transfer_error = self._log_process_error(
+                receive_process, "receive"
+            )
             return False
 
         # Secondary confirmation only AFTER both processes exited 0.
@@ -3918,15 +3926,20 @@ print(json.dumps(result))
         if elapsed > 60:  # After 1 minute
             logger.debug("   STATUS: Transfer progressing normally...")
 
-    def _log_process_error(self, process: Any, process_name: str) -> None:
-        """Log detailed error information for a failed process."""
+    def _log_process_error(self, process: Any, process_name: str) -> Optional[str]:
+        """Log a failed process's stderr and RETURN it (stripped), or None.
+
+        Returning the text lets the caller thread the actionable cause into the
+        raised transfer error instead of leaving it only in a separate log line."""
         try:
             if process.stderr:
                 stderr_data = process.stderr.read().decode("utf-8", errors="replace")
                 if stderr_data.strip():
                     logger.error(f"{process_name} process stderr: {stderr_data}")
+                    return stderr_data.strip()
         except Exception as e:
             logger.debug(f"Could not read stderr from {process_name} process: {e}")
+        return None
 
     def _simple_transfer_monitor(
         self,
@@ -4018,7 +4031,9 @@ print(json.dumps(result))
         send_code = send_process.returncode
         if send_code != 0:
             logger.error(f"FAILED: Send process failed with exit code {send_code}")
-            self._log_simple_process_error(send_process, "send")
+            self._last_transfer_error = self._log_simple_process_error(
+                send_process, "send"
+            )
             return False
 
         logger.info("SUCCESS: Send process completed successfully")
@@ -4031,7 +4046,9 @@ print(json.dumps(result))
             logger.error(
                 f"FAILED: Receive process failed with exit code {receive_code}"
             )
-            self._log_simple_process_error(receive_process, "receive")
+            self._last_transfer_error = self._log_simple_process_error(
+                receive_process, "receive"
+            )
             return False
         logger.info("SUCCESS: Receive process completed successfully")
 
@@ -4062,12 +4079,19 @@ print(json.dumps(result))
             logger.error(f"ERROR: Final verification failed: {e}")
             return False
 
-    def _log_simple_process_error(self, process: Any, process_name: str) -> None:
-        """Log error information for a failed process in simple monitoring mode."""
+    def _log_simple_process_error(
+        self, process: Any, process_name: str
+    ) -> Optional[str]:
+        """Log a failed process's stderr and RETURN it (stripped), or None.
+
+        Simple-monitor twin of ``_log_process_error``; returning the text lets the
+        caller surface the actionable cause in the raised transfer error."""
         try:
             if hasattr(process, "stderr") and process.stderr:
                 stderr_data = process.stderr.read().decode("utf-8", errors="replace")
                 if stderr_data.strip():
                     logger.error(f"{process_name} process stderr: {stderr_data}")
+                    return stderr_data.strip()
         except Exception as e:
             logger.debug(f"Could not read stderr from {process_name} process: {e}")
+        return None
