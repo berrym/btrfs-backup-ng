@@ -39,7 +39,9 @@ def test_control_dir_is_unpredictable_and_0700():
     m = _mgr()
     try:
         assert m._own_control_dir is True
-        assert "btrfs-backup-ng-cm-" in m.control_dir.name
+        # Prefix shortened to keep the ControlPath within the Unix sun_path limit
+        # (see test_control_socket_path.py); still an mkdtemp-random, 0700, euid dir.
+        assert m.control_dir.name.startswith("bbng-cm-")
         st = m.control_dir.stat()
         assert stat.S_IMODE(st.st_mode) == 0o700
         assert st.st_uid == os.geteuid()
