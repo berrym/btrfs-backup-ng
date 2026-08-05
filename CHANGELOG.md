@@ -7,6 +7,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.2] - 2026-08-05
+
+The config, restoration, and SSH-reliability polish release.
+
+### Added
+
+- **Restore snapper snapshots from `raw://` / `raw+ssh://` backups** — snapper backups on non-btrfs or
+  remote raw destinations are now fully restorable, with snapper metadata reconstructed so the restored
+  snapshot is operationally complete (`snapper diff`/`undochange`/`cleanup` all work).
+- **Pick an exact snapper backup on restore** — `snapper restore` gains `--backup-name` and `--date` for
+  when a snapper number was reused after a prune.
+- **Encryption in the setup wizard** — `config init --interactive` now prompts for encryption on raw
+  targets (none/gpg/openssl_enc), requiring a GPG recipient when you choose gpg.
+- **Config typos are reported** — loading a config warns about any key it doesn't recognize (e.g.
+  `retenion`), so a misplaced setting can't silently do nothing.
+- **Decrypt options for restore** — `restore` / `snapper restore` accept `--gpg-keyring` /
+  `--openssl-cipher` for encrypted raw backups with a non-default keyring/cipher.
+
+### Fixed
+
+- **`ssh_port` is now honored** — a non-default port in the config was silently ignored (connections
+  always used 22).
+- **SSH could fail with a misleading "authentication failed"** — the internal ControlMaster socket path
+  could exceed the OS Unix-socket length limit and abort the connection; the path is now kept short.
+  Affected *every* remote operation on some hosts.
+- **btrbk migration preserves retention faithfully** — no longer drops yearly retention, mis-reads `3m`
+  (months) as minutes, emits an unloadable minimum, or ignores per-subvolume retention; warns clearly
+  about btrbk rules with no equivalent.
+- **Remote failures show the real reason** — a failed remote `btrfs receive` reports the actual cause
+  (e.g. "No space left on device", "cannot find parent subvolume") instead of a generic message.
+- **`doctor` backup-age & failure checks work again** — they mis-read transaction-log timestamps and
+  silently failed with a confusing warning.
+- **`install` service works outside `/usr/bin`** — the generated systemd service points at the real
+  binary (via PATH), fixing `--user` / pipx / uv / venv installs.
+- **Wizard configs handle special characters** — paths/passwords with backslashes or quotes now
+  serialize to valid config instead of a broken or silently-altered one.
+- **`snapper restore --list` no longer requires a target config.**
+
+### Security
+
+- **Shell-quoting sweep** — paths and snapshot names are consistently shell-escaped everywhere they reach
+  a remote shell, closing whitespace/metacharacter fragility and injection vectors (two ran under remote
+  sudo).
+
+### Documentation
+
+- Documented `--ssh-auth-sock` in completions and manpages for every command that accepts it.
+- Audited every README example against the real CLI; documented `ssh_host_key_policy`.
+
 ## [0.9.1] - 2026-07-27
 
 The verification and SSH-security hardening release.
