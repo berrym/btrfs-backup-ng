@@ -537,3 +537,47 @@ class TestRunCompletionNoStaleFlags:
         assert block is not None
         assert "--fs-checks" not in block.group(1)
         assert "--check-space" not in block.group(1).replace("--no-check-space", "")
+
+
+class TestSshAuthSockCompletions:
+    """CLI-polish: --ssh-auth-sock is a valid flag on 5 commands (restore, verify,
+    estimate, snapper backup, snapper restore); completions must offer it there in
+    every shell."""
+
+    def _dir(self):
+        return Path(__file__).resolve().parent.parent / "completions"
+
+    def test_bash_opt_arrays_have_it(self):
+        bash = (self._dir() / "btrfs-backup-ng.bash").read_text()
+        for opt in (
+            "restore_opts=",
+            "verify_opts=",
+            "estimate_opts=",
+            "snapper_backup_opts=",
+            "snapper_restore_opts=",
+        ):
+            line = next(line for line in bash.splitlines() if opt in line)
+            assert "--ssh-auth-sock" in line, f"{opt} missing --ssh-auth-sock"
+
+    def test_zsh_and_fish_cover_all_five(self):
+        d = self._dir()
+        zsh = (d / "btrfs-backup-ng.zsh").read_text()
+        assert zsh.count("--ssh-auth-sock[") >= 5
+        fish = (d / "btrfs-backup-ng.fish").read_text()
+        assert fish.count("-l ssh-auth-sock") >= 5
+
+
+class TestSshAuthSockManpages:
+    """CLI-polish: the flag must be documented in the manpages for the commands
+    that accept it."""
+
+    def _man(self):
+        return Path(__file__).resolve().parent.parent / "man" / "man1"
+
+    def test_manpages_document_it(self):
+        m = self._man()
+        assert "ssh-auth-sock" in (m / "btrfs-backup-ng-restore.1").read_text()
+        assert "ssh-auth-sock" in (m / "btrfs-backup-ng-verify.1").read_text()
+        assert "ssh-auth-sock" in (m / "btrfs-backup-ng-estimate.1").read_text()
+        # snapper.1 covers BOTH snapper backup and snapper restore.
+        assert (m / "btrfs-backup-ng-snapper.1").read_text().count("ssh-auth-sock") >= 2

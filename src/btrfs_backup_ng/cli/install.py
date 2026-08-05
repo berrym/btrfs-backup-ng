@@ -3,6 +3,7 @@
 import argparse
 import logging
 import os
+import shutil
 from pathlib import Path
 
 from ..__logger__ import create_logger
@@ -20,7 +21,7 @@ After=local-fs.target
 
 [Service]
 Type=oneshot
-ExecStart=/usr/bin/btrfs-backup-ng run
+ExecStart={exec_start} run
 Nice=19
 IOSchedulingClass=idle
 
@@ -49,6 +50,17 @@ TIMER_PRESETS = {
     "daily": "*-*-* 02:00:00",
     "weekly": "Sun *-*-* 02:00:00",
 }
+
+
+def _resolve_exec_start() -> str:
+    """Return the absolute path to the btrfs-backup-ng executable for ExecStart.
+
+    systemd requires an ABSOLUTE ExecStart path and does not search $PATH. The old
+    template hardcoded ``/usr/bin/btrfs-backup-ng``, which fails for any install not
+    there -- notably ``--user`` / pipx / uv / venv installs in ``~/.local/bin`` or a
+    virtualenv (the service errors with "No such file or directory"). Resolve the
+    real binary via PATH, falling back to the historical default if not found."""
+    return shutil.which("btrfs-backup-ng") or "/usr/bin/btrfs-backup-ng"
 
 
 def execute_install(args: argparse.Namespace) -> int:
@@ -103,11 +115,12 @@ def execute_install(args: argparse.Namespace) -> int:
     timer_file = systemd_dir / "btrfs-backup-ng.timer"
 
     # Generate content
+    service_content = SERVICE_TEMPLATE.format(exec_start=_resolve_exec_start())
     timer_content = TIMER_TEMPLATE.format(oncalendar=oncalendar)
 
     # Write files
     try:
-        service_file.write_text(SERVICE_TEMPLATE)
+        service_file.write_text(service_content)
         print(f"Created: {service_file}")
 
         timer_file.write_text(timer_content)

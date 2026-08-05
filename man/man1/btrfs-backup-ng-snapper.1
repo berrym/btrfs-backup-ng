@@ -107,6 +107,9 @@ Use sudo for btrfs commands on the remote host (SSH / raw+ssh targets).
 .BI \-\-ssh-key " FILE"
 Path to SSH private key file.
 .TP
+.BI \-\-ssh-auth-sock " PATH"
+Explicit ssh-agent socket (overrides auto-discovery; useful under sudo).
+.TP
 .BI \-\-ssh-host-key-policy " POLICY"
 Host-key verification: \fBaccept-new\fR (default) or \fBstrict\fR.
 .TP
@@ -155,6 +158,9 @@ Use sudo for btrfs commands on the remote host (SSH / raw+ssh targets).
 .TP
 .BI \-\-ssh-key " FILE"
 Path to SSH private key file.
+.TP
+.BI \-\-ssh-auth-sock " PATH"
+Explicit ssh-agent socket (overrides auto-discovery; useful under sudo).
 .TP
 .BI \-\-ssh-host-key-policy " POLICY"
 Host-key verification: \fBaccept-new\fR (default) or \fBstrict\fR.

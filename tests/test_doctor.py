@@ -1981,3 +1981,98 @@ class TestCliDoctorEdgeCases:
         # In quiet mode with only OK findings, category may be skipped
         # but summary should still appear
         assert "0 warnings" in captured.out or captured.out == ""
+
+
+class TestDoctorTimestampParsing:
+    """CLI-polish: doctor must read the transaction log's ISO-8601 string
+    `timestamp` correctly. It previously treated it as an epoch number, so
+    `str >= float` / `float - str` raised TypeError -> the recent-failure and
+    last-backup-age checks silently degraded to a confusing warning."""
+
+    def test_ts_to_epoch_parses_iso_and_epoch(self):
+        from datetime import datetime
+
+        from btrfs_backup_ng.core.doctor import _ts_to_epoch
+
+        iso = "2026-08-05T07:54:04+00:00"
+        expected = datetime.fromisoformat(iso).timestamp()
+        assert _ts_to_epoch(iso) == expected
+        assert _ts_to_epoch(1234.5) == 1234.5  # bare epoch passes through
+        assert _ts_to_epoch("garbage") == 0.0  # unparseable -> oldest
+        assert _ts_to_epoch(None) == 0.0
+
+    @staticmethod
+    def _doctor_with_log(tmp_path, records):
+        import json
+        from types import SimpleNamespace
+
+        from btrfs_backup_ng.core.doctor import Doctor
+
+        log = tmp_path / "tx.jsonl"
+        log.write_text("".join(json.dumps(r) + "\n" for r in records))
+        config = SimpleNamespace(
+            global_config=SimpleNamespace(transaction_log=str(log))
+        )
+        d = Doctor.__new__(Doctor)
+        d.config = config
+        d.config_path = None
+        return d
+
+    def test_last_backup_age_computes_from_iso_timestamp(self, tmp_path):
+        from datetime import datetime, timedelta, timezone
+
+        recent = (datetime.now(timezone.utc) - timedelta(hours=3)).isoformat()
+        d = self._doctor_with_log(
+            tmp_path,
+            [
+                {
+                    "timestamp": recent,
+                    "status": "completed",
+                    "action": "transfer",
+                    "snapshot": "snap-1",
+                }
+            ],
+        )
+        findings = d._check_last_backup_age()
+        ages = [f for f in findings if f.check_name == "last_backup_age"]
+        assert ages, "expected a last_backup_age finding"
+        f = ages[0]
+        # It must compute the real age (~3h), NOT the TypeError-degraded warning.
+        assert "Could not determine backup age" not in f.message
+        assert f.details is not None and f.details.get("age_hours") is not None
+        assert 2.0 <= f.details["age_hours"] <= 4.0
+
+    def test_recent_failures_filters_by_iso_timestamp(self, tmp_path):
+        from datetime import datetime, timedelta, timezone
+
+        now = datetime.now(timezone.utc)
+        records = [
+            {
+                "timestamp": (now - timedelta(hours=1)).isoformat(),
+                "status": "failed",
+                "action": "transfer",
+                "error": "boom",
+            },
+            {
+                "timestamp": (now - timedelta(hours=2)).isoformat(),
+                "status": "completed",
+                "action": "transfer",
+                "snapshot": "s",
+            },
+            {
+                "timestamp": (
+                    now - timedelta(days=5)
+                ).isoformat(),  # outside 24h window
+                "status": "failed",
+                "action": "transfer",
+                "error": "old",
+            },
+        ]
+        d = self._doctor_with_log(tmp_path, records)
+        findings = d._check_recent_failures()
+        rf = [f for f in findings if f.check_name == "recent_failures"]
+        assert rf, "expected a recent_failures finding"
+        # The check ran (no TypeError swallow): it saw the 1 recent failure, not the
+        # 5-day-old one, and reported it.
+        joined = " ".join(f.message for f in rf)
+        assert "could not" not in joined.lower()
