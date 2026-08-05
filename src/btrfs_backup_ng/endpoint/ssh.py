@@ -1652,7 +1652,13 @@ print(json.dumps(result))
         ssh_base_cmd = self.ssh_manager.get_ssh_base_cmd(force_tty=needs_tty)  # type: ignore
         logger.debug("SSH base command: %s", ssh_base_cmd)
 
-        ssh_cmd = ssh_base_cmd + ["--"] + remote_cmd
+        # shlex.quote each element: ssh space-joins the command args and the REMOTE
+        # shell re-parses them, so a path/name with a space or metacharacter would be
+        # re-split (or injected) remotely. Quoting mirrors raw.py's _exec_remote_command
+        # and is a no-op for clean tokens. All callers pass literal argv (command +
+        # flags + values), never bare shell operators, so this cannot break intended
+        # remote-shell syntax. (R9)
+        ssh_cmd = ssh_base_cmd + ["--"] + [shlex.quote(str(c)) for c in remote_cmd]
         logger.debug("Complete SSH command: %s", ssh_cmd)
 
         # Always capture stderr if not explicitly provided
@@ -3622,9 +3628,13 @@ print(json.dumps(result))
             "passwordless_sudo_available", False
         )
 
-        # Build the receive command
+        # Build the receive command. shlex.quote the destination: it is
+        # interpolated into a remote `sh -c` string by _build_receive_command
+        # (whose docstring requires a shell-escaped path), and every OTHER caller
+        # already passes shlex.quote(dest_path). Without it a target path with a
+        # space or shell metacharacter breaks the remote receive / injects. (R9)
         receive_cmd = _build_receive_command(
-            dest_path=dest_path,
+            dest_path=shlex.quote(dest_path),
             use_sudo=use_sudo,
             password_on_stdin=use_sudo and not passwordless,
         )
