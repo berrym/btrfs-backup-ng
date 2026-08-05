@@ -907,15 +907,24 @@ def _do_direct_pipe_transfer(
             timeout=3600,  # 1 hour timeout
             show_progress=show_progress,
         )
-
-        if not success:
-            raise __util__.SnapshotTransferError("SSH direct pipe transfer failed")
-
-        return [0, 0]
-
     except Exception as e:
         logger.error("Error during SSH direct pipe transfer: %s", e)
         raise __util__.SnapshotTransferError(f"SSH direct pipe transfer failed: {e}")
+
+    # A clean (non-exception) failure: surface the actionable cause the endpoint
+    # captured from the send/receive stderr (issue #10) so the raised error -- which
+    # is what the run summary and transaction log record -- names the real reason
+    # (e.g. "cannot find parent subvolume", "No space left on device") instead of a
+    # generic message. Raised OUTSIDE the try so it is not re-wrapped by the except.
+    if not success:
+        reason = getattr(destination_endpoint, "_last_transfer_error", None)
+        if reason:
+            raise __util__.SnapshotTransferError(
+                f"SSH direct pipe transfer failed: {reason}"
+            )
+        raise __util__.SnapshotTransferError("SSH direct pipe transfer failed")
+
+    return [0, 0]
 
 
 def _do_process_transfer(

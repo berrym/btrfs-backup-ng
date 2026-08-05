@@ -18,6 +18,8 @@ import time
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+import pytest
+
 import btrfs_backup_ng.endpoint.ssh as ssh_mod
 from btrfs_backup_ng.endpoint.ssh import SSHEndpoint
 
@@ -442,3 +444,95 @@ class TestReceiveChunkedCleanupGating:
         result, cleanup = self._run(monkeypatch, return_code=0, verify_result=True)
         assert result is True
         cleanup.assert_not_called()
+
+
+class TestReceiveStderrThreadedToError:
+    """Issue #10: a failed send/receive threads its stderr CAUSE into the raised
+    SnapshotTransferError, so the run summary / transaction log names the real
+    reason instead of a generic "SSH direct pipe transfer failed"."""
+
+    @staticmethod
+    def _proc_with_stderr(returncode: int, stderr: bytes = b"") -> MagicMock:
+        p = _proc(returncode)
+        p.stderr = io.BytesIO(stderr)
+        return p
+
+    def test_simple_monitor_captures_receive_stderr(self):
+        ep = _bare_endpoint()
+        ep._last_transfer_error = None
+        send = self._proc_with_stderr(0)
+        receive = self._proc_with_stderr(1, b"ERROR: cannot find parent subvolume")
+        ok = ep._simple_transfer_monitor(
+            {"send": send, "receive": receive, "buffer": None},
+            start_time=time.time(),
+            dest_path="/d",
+            snapshot_name="s",
+            max_wait_time=5,
+        )
+        assert ok is False
+        assert ep._last_transfer_error == "ERROR: cannot find parent subvolume"
+
+    def test_simple_monitor_captures_send_stderr(self):
+        ep = _bare_endpoint()
+        ep._last_transfer_error = None
+        send = self._proc_with_stderr(1, b"ERROR: could not find subvolume")
+        receive = self._proc_with_stderr(0)
+        ok = ep._simple_transfer_monitor(
+            {"send": send, "receive": receive, "buffer": None},
+            start_time=time.time(),
+            dest_path="/d",
+            snapshot_name="s",
+            max_wait_time=5,
+        )
+        assert ok is False
+        assert ep._last_transfer_error == "ERROR: could not find subvolume"
+
+    def test_enhanced_monitor_captures_receive_stderr(self):
+        ep = _bare_endpoint()
+        ep._last_transfer_error = None
+        send = self._proc_with_stderr(0)
+        receive = self._proc_with_stderr(1, b"No space left on device")
+        ok = ep._monitor_transfer_progress(
+            {"send": send, "receive": receive, "buffer": None},
+            start_time=time.time(),
+            dest_path="/d",
+            snapshot_name="s",
+            max_wait_time=5,
+        )
+        assert ok is False
+        assert ep._last_transfer_error == "No space left on device"
+
+    def test_log_helpers_return_stderr_text(self):
+        ep = _bare_endpoint()
+        p = self._proc_with_stderr(1, b"  boom  \n")
+        assert ep._log_simple_process_error(p, "receive") == "boom"
+        q = self._proc_with_stderr(1, b"kaboom")
+        assert ep._log_process_error(q, "receive") == "kaboom"
+        # No stderr -> None
+        empty = _proc(1)
+        empty.stderr = io.BytesIO(b"")
+        assert ep._log_simple_process_error(empty, "receive") is None
+
+    def test_direct_pipe_error_carries_captured_reason(self):
+        from btrfs_backup_ng import __util__
+        from btrfs_backup_ng.core import operations as ops
+
+        stub = MagicMock()
+        stub.send_receive.return_value = False
+        stub._last_transfer_error = "ERROR: cannot find parent subvolume"
+        with pytest.raises(__util__.SnapshotTransferError) as ei:
+            ops._do_direct_pipe_transfer(MagicMock(), stub, None, None, None)
+        assert "cannot find parent subvolume" in str(ei.value)
+
+    def test_direct_pipe_error_generic_without_reason_no_double_wrap(self):
+        """When no cause was captured the message is the plain generic string --
+        NOT the old self-wrapped 'failed: SSH direct pipe transfer failed'."""
+        from btrfs_backup_ng import __util__
+        from btrfs_backup_ng.core import operations as ops
+
+        stub = MagicMock()
+        stub.send_receive.return_value = False
+        stub._last_transfer_error = None
+        with pytest.raises(__util__.SnapshotTransferError) as ei:
+            ops._do_direct_pipe_transfer(MagicMock(), stub, None, None, None)
+        assert str(ei.value) == "SSH direct pipe transfer failed"
