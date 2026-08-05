@@ -1,5 +1,6 @@
 import atexit
 import getpass
+import hashlib
 import os
 import pwd
 import shutil
@@ -175,17 +176,40 @@ class SSHMasterManager:
             # only euid owns closes it by design; the socket name already embeds pid+tid, so
             # nothing relied on a stable path. R12c/P2.
             self.control_dir = Path(
-                tempfile.mkdtemp(prefix="btrfs-backup-ng-cm-", dir=_control_dir_base())
+                tempfile.mkdtemp(prefix="bbng-cm-", dir=_control_dir_base())
             )
             self._own_control_dir = True
             # Backstop cleanup if stop_master()/cleanup_socket() is never reached.
             atexit.register(shutil.rmtree, str(self.control_dir), ignore_errors=True)
 
+        # The ControlPath must fit in a Unix domain socket sun_path (108 bytes on
+        # Linux), and OpenSSH appends its own ~17-char ".<random>" suffix while
+        # CREATING the master socket. The old
+        # ``cm_{user}_{host}_{pid}_{tid}.sock`` embedded a 15-digit thread id and a
+        # variable-length hostname, so a real FQDN + the mkdtemp base overflowed the
+        # limit ("unix_listener: path ... too long for Unix domain socket") -- which
+        # aborts the master and makes EVERY ssh operation fail with a misleading
+        # "authentication failed". Use a fixed-length digest of the same identity
+        # components: unique per manager, but bounded regardless of user/host length.
         self._instance_id = f"{os.getpid()}_{threading.get_ident()}"
-        self.control_path = (
-            self.control_dir
-            / f"cm_{self.username}_{self.hostname}_{self._instance_id}.sock"
-        )
+        digest = hashlib.sha1(
+            f"{self.username}_{self.hostname}_{self._instance_id}".encode()
+        ).hexdigest()[:12]
+        self.control_path = self.control_dir / f"cm-{digest}.sock"
+
+        # Belt-and-suspenders: the shortening keeps the real cases well under the
+        # limit, but an operator-supplied ``control_dir`` could still be pathological.
+        # Budget for OpenSSH's socket-creation suffix and warn (multiplexing would
+        # silently fail otherwise). 108 = Linux sun_path; leave margin for the suffix.
+        _effective_len = len(str(self.control_path)) + 20
+        if _effective_len > 108:
+            logger.warning(
+                "ControlMaster socket path is %d bytes (+suffix), near the ~108-byte "
+                "Unix-socket limit; connection multiplexing may fail. Use a shorter "
+                "control_dir. Path: %s",
+                _effective_len,
+                self.control_path,
+            )
         self._lock = threading.Lock()
         self._master_started = False
 
