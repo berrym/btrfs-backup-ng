@@ -7,6 +7,7 @@ that may prevent btrfs-backup-ng from successfully transferring backups.
 import argparse
 import logging
 import os
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -153,7 +154,7 @@ def test_write_permissions(
 
     # First check if path exists
     cmd = ssh_command_base(host, port, identity_file)
-    cmd.append(f"test -e '{path}'")
+    cmd.append(f"test -e {shlex.quote(path)}")
 
     returncode, stdout, stderr = run_command(cmd)
 
@@ -163,7 +164,8 @@ def test_write_permissions(
         # Check if parent directory exists and is writable
         parent_path = str(Path(path).parent)
         cmd = ssh_command_base(host, port, identity_file)
-        cmd.append(f"test -d '{parent_path}' && test -w '{parent_path}'")
+        quoted_parent = shlex.quote(parent_path)
+        cmd.append(f"test -d {quoted_parent} && test -w {quoted_parent}")
 
         returncode, stdout, stderr = run_command(cmd)
 
@@ -178,7 +180,7 @@ def test_write_permissions(
 
     # Check if path is writable
     cmd = ssh_command_base(host, port, identity_file)
-    cmd.append(f"test -w '{path}'")
+    cmd.append(f"test -w {shlex.quote(path)}")
 
     returncode, stdout, stderr = run_command(cmd)
 
@@ -190,7 +192,7 @@ def test_write_permissions(
 
         # Check if it's writable with sudo
         cmd = ssh_command_base(host, port, identity_file)
-        cmd.append(f"sudo -n test -w '{path}'")
+        cmd.append(f"sudo -n test -w {shlex.quote(path)}")
 
         returncode, stdout, stderr = run_command(cmd)
 
@@ -212,8 +214,11 @@ def test_btrfs_filesystem(
     logger.debug(f"Testing if {path} is on a btrfs filesystem...")
 
     cmd = ssh_command_base(host, port, identity_file)
+    quoted_path = shlex.quote(path)
+    quoted_parent = shlex.quote(str(Path(path).parent))
     cmd.append(
-        f"stat -f -c '%T' '{path}' 2>/dev/null || stat -f -c '%T' '{str(Path(path).parent)}' 2>/dev/null"
+        f"stat -f -c '%T' {quoted_path} 2>/dev/null || "
+        f"stat -f -c '%T' {quoted_parent} 2>/dev/null"
     )
 
     returncode, stdout, stderr = run_command(cmd)
@@ -265,8 +270,10 @@ def test_btrfs_receive(
         else:
             test_path = f"{path}.test_receive"
 
+        quoted_test_path = shlex.quote(test_path)
         cmd.append(
-            f"sudo -n btrfs subvolume create '{test_path}' && sudo -n btrfs subvolume delete '{test_path}'"
+            f"sudo -n btrfs subvolume create {quoted_test_path} && "
+            f"sudo -n btrfs subvolume delete {quoted_test_path}"
         )
 
         returncode, stdout, stderr = run_command(cmd, timeout=60)
