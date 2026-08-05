@@ -992,3 +992,119 @@ class TestGenerateConfigEncryption:
         p.write_text(toml)
         cfg, _ = load_config(p)
         assert cfg.volumes[0].targets[0].gpg_keyring == keyring
+
+
+class TestGenerateConfigEscaping:
+    """R9 follow-up: EVERY string field in _generate_config_from_wizard is emitted
+    through _toml_str, so a backslash / double-quote / control char round-trips
+    losslessly instead of producing an unparseable or silently-corrupted config."""
+
+    # backslash-t (silent-corruption vector: \t is a valid TOML escape -> TAB) +
+    # a double-quote (breaks the basic string).
+    NASTY = 'x\\ty"z'
+
+    def _full_config(self, n):
+        return {
+            "snapshot_dir": "/snaps" + n,
+            "timestamp_format": "%Y" + n,
+            "incremental": True,
+            "log_file": "/log" + n,
+            "transaction_log": "/tx" + n,
+            "parallel_volumes": 2,
+            "parallel_targets": 3,
+            "retention": {
+                "min": "1d",
+                "hourly": 24,
+                "daily": 7,
+                "weekly": 4,
+                "monthly": 12,
+                "yearly": 0,
+            },
+            "email": {
+                "enabled": True,
+                "smtp_host": "h" + n,
+                "smtp_port": 587,
+                "smtp_tls": "starttls",
+                "smtp_user": "u" + n,
+                "smtp_password": "p" + n,
+                "from_addr": "a" + n,
+                "to_addrs": ["to" + n],
+                "on_success": False,
+                "on_failure": True,
+            },
+            "webhook": {
+                "enabled": True,
+                "url": "https://x" + n,
+                "method": "POST",
+                "on_success": False,
+                "on_failure": True,
+            },
+            "volumes": [
+                {
+                    "path": "/vol" + n,
+                    "source": "snapper",
+                    "snapper": {
+                        "config_name": "root" + n,
+                        "include_types": ["single"],
+                        "min_age": "1h",
+                    },
+                    "targets": [{"path": "/tgt" + n}],
+                }
+            ],
+        }
+
+    def test_nasty_values_round_trip_losslessly(self, tmp_path):
+        from btrfs_backup_ng.cli.config_cmd import _generate_config_from_wizard
+        from btrfs_backup_ng.config.loader import load_config
+
+        n = self.NASTY
+        toml = _generate_config_from_wizard(self._full_config(n))
+        p = tmp_path / "c.toml"
+        p.write_text(toml)
+        cfg, warns = load_config(p)  # must not raise (unescaped would break parsing)
+
+        g = cfg.global_config
+        assert g.snapshot_dir == "/snaps" + n
+        assert g.timestamp_format == "%Y" + n
+        assert g.log_file == "/log" + n
+        assert g.transaction_log == "/tx" + n
+        assert g.notifications.email.smtp_host == "h" + n
+        assert g.notifications.email.smtp_user == "u" + n
+        assert g.notifications.email.smtp_password == "p" + n
+        assert g.notifications.email.from_addr == "a" + n
+        assert g.notifications.email.to_addrs == ["to" + n]
+        assert g.notifications.webhook.url == "https://x" + n
+        v = cfg.volumes[0]
+        assert v.path == "/vol" + n
+        assert v.snapper.config_name == "root" + n
+        assert v.targets[0].path == "/tgt" + n
+        assert not [w for w in warns if "Unknown config key" in w]
+
+    def test_backslash_path_not_silently_corrupted(self, tmp_path):
+        """The specific silent-corruption case: a path with \\t must NOT become a
+        literal tab on load."""
+        from btrfs_backup_ng.cli.config_cmd import _generate_config_from_wizard
+        from btrfs_backup_ng.config.loader import load_config
+
+        cfg_in = self._full_config("")
+        cfg_in["volumes"][0]["path"] = "/mnt/keys\\there"  # backslash-t
+        toml = _generate_config_from_wizard(cfg_in)
+        p = tmp_path / "c.toml"
+        p.write_text(toml)
+        cfg, _ = load_config(p)
+        assert cfg.volumes[0].path == "/mnt/keys\\there"
+        assert "\t" not in cfg.volumes[0].path
+
+    def test_clean_config_still_valid_and_faithful(self, tmp_path):
+        """No regression: a clean config loads with exactly its values."""
+        from btrfs_backup_ng.cli.config_cmd import _generate_config_from_wizard
+        from btrfs_backup_ng.config.loader import load_config
+
+        toml = _generate_config_from_wizard(self._full_config(""))
+        p = tmp_path / "c.toml"
+        p.write_text(toml)
+        cfg, warns = load_config(p)
+        assert cfg.global_config.snapshot_dir == "/snaps"
+        assert cfg.volumes[0].targets[0].path == "/tgt"
+        assert cfg.volumes[0].snapper.config_name == "root"
+        assert not [w for w in warns if "Unknown config key" in w]
