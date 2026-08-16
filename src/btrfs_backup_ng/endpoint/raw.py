@@ -651,7 +651,18 @@ class RawEndpoint(Endpoint):
         output_path = Path(self.config["path"]) / f"{snapshot_name}{extension}"
         # Write to a temporary ".part" sibling; commit_receive() renames it to
         # output_path only after the engine confirms the pipeline succeeded.
-        part_path = Path(f"{output_path}{PARTIAL_SUFFIX}")
+        #
+        # The name carries this transfer's pid and a monotonic stamp. Deriving it
+        # from the snapshot name alone gave two concurrent runs against the same
+        # target -- a cron run overlapping a manual one -- the SAME temp file, and
+        # nothing serialized the write: target_lock is taken only around the rename
+        # and sidecar. Their bytes interleaved into one published stream whose
+        # sha256 was then sealed over the corruption, so both processes exited 0,
+        # the engine's return-code gate passed, `raw verify` reported ok, and the
+        # damage surfaced only at restore.
+        part_path = Path(
+            f"{output_path}.{os.getpid()}.{time.monotonic_ns():x}{PARTIAL_SUFFIX}"
+        )
 
         logger.info("Writing raw stream to: %s", part_path)
 
@@ -747,13 +758,16 @@ class RawEndpoint(Endpoint):
         # For a single command, execute directly
         if len(pipeline) == 1:
             output_path = self._pending_metadata["part_path"]
-            with open(output_path, "wb") as outfile:
+            fd = self._open_part_file(output_path)
+            try:
                 proc = subprocess.Popen(
                     pipeline[0],
                     stdin=stdin,
-                    stdout=outfile,
+                    stdout=fd,
                     stderr=subprocess.PIPE,
                 )
+            finally:
+                os.close(fd)
             return proc
 
         # For multiple commands, chain them together
@@ -762,17 +776,45 @@ class RawEndpoint(Endpoint):
         # metacharacters) so nothing word-splits or injects into the shell string.
         output_path = self._pending_metadata["part_path"]
         cmd_strs = [" ".join(shlex.quote(a) for a in cmd) for cmd in pipeline]
-        shell_cmd = " | ".join(cmd_strs) + f" > {shlex.quote(str(output_path))}"
+        # No `> path` redirect: the shell would re-open the destination by name,
+        # reintroducing the symlink race that _open_part_file exists to close.
+        # The pipeline's last stage inherits the already-guarded descriptor.
+        shell_cmd = " | ".join(cmd_strs)
 
         logger.debug("Executing pipeline: %s", shell_cmd)
 
-        proc = _popen_pipeline_pipefail(
-            shell_cmd,
-            stdin=stdin,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
-        )
+        part_fd = self._open_part_file(output_path)
+        try:
+            proc = _popen_pipeline_pipefail(
+                shell_cmd,
+                stdin=stdin,
+                stdout=part_fd,
+                stderr=subprocess.PIPE,
+            )
+        finally:
+            os.close(part_fd)
         return proc
+
+    @staticmethod
+    def _open_part_file(part_path: Path) -> int:
+        """Open this transfer's ``.part`` file, refusing to follow or reuse anything.
+
+        ``O_EXCL`` means the file must not already exist, so a concurrent transfer
+        cannot be handed the same descriptor, and ``O_NOFOLLOW`` means a symlink
+        planted at the path is refused rather than followed -- which, running as
+        root against a target directory that untrusted users can write, would
+        otherwise truncate whatever the link pointed at.
+
+        Mode 0600 matches every other durable artifact this endpoint writes
+        (``__util__.atomic_write_bytes`` and the ``.meta`` sidecars). The stream
+        previously landed at the umask default, typically 0644, which left the
+        most sensitive file the least protected.
+        """
+        return os.open(
+            part_path,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+            0o600,
+        )
 
     @staticmethod
     def _fsync_dir(directory: Path) -> None:
@@ -810,10 +852,11 @@ class RawEndpoint(Endpoint):
                 f"cannot publish {final_path}"
             )
         # Flush the stream's bytes to disk BEFORE renaming, so the final name can
-        # never refer to unflushed data. Done OUTSIDE the lock: the ``.part`` name is
-        # unique to this transfer so no peer touches it, and this fsync can take a
-        # long time on a multi-GB stream -- holding the lock across it would make a
-        # legitimately parallel commit exceed the wait and FAIL instead of serialize.
+        # never refer to unflushed data. Done OUTSIDE the lock: the ``.part`` name
+        # carries this transfer's pid and monotonic stamp and was created O_EXCL, so
+        # no peer can touch it, and this fsync can take a long time on a multi-GB
+        # stream -- holding the lock across it would make a legitimately parallel
+        # commit exceed the wait and FAIL instead of serialize.
         fd = os.open(part_path, os.O_RDONLY)
         try:
             os.fsync(fd)

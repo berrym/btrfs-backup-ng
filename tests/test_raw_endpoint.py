@@ -573,15 +573,17 @@ class TestRawEndpointReceive:
 
         assert proc.returncode == 0
         out = tmp_path / "snap-1.btrfs"
-        part = tmp_path / "snap-1.btrfs.part"
+        # The .part name carries this transfer's pid and a monotonic stamp, so two
+        # concurrent runs cannot be handed the same temp file; matched by glob.
+        parts = list(tmp_path.glob("snap-1.btrfs.*.part"))
         # Before commit, only the .part file exists -- the final name must not
         # appear until commit_receive() atomically publishes it.
-        assert part.exists()
+        assert len(parts) == 1, parts
         assert not out.exists()
 
         endpoint.commit_receive()
         assert out.exists()
-        assert not part.exists()
+        assert not list(tmp_path.glob("snap-1.btrfs.*.part"))
         assert out.read_bytes() == b"hello-raw-stream"
 
     def test_receive_with_compression(self, tmp_path):
