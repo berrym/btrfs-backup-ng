@@ -205,7 +205,10 @@ def prompt_selection(
 
     for i, item in enumerate(items):
         num = str(i + 1)
-        marker = "[green]★[/green]" if i in recommended_indices else ""
+        # ASCII marker: the column is 3 wide, and a non-ASCII glyph raises
+        # UnicodeEncodeError on a minimal-locale stream. The legend below spells
+        # out what it means.
+        marker = "[green]*[/green]" if i in recommended_indices else ""
 
         row = [num, marker]
         for key, _ in columns:
@@ -223,7 +226,7 @@ def prompt_selection(
     console.print(table)
 
     if recommended_indices:
-        console.print("  [green]★[/green] = recommended for backup")
+        console.print("  [green]*[/green] = recommended for backup")
     if footer_notes:
         for note in footer_notes:
             console.print(f"  {note}")
@@ -387,7 +390,10 @@ def display_section_header(title: str) -> None:
         title: Section title
     """
     console.print()
-    console.print(f"[bold cyan]── {title} ──[/bold cyan]")
+    # console.rule() rather than hand-drawn box characters: Rich substitutes
+    # ASCII automatically when the output stream cannot encode them, and it
+    # sizes the rule to the terminal width.
+    console.rule(f"[bold cyan]{title}[/bold cyan]")
     console.print()
 
 

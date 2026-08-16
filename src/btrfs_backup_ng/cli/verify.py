@@ -263,18 +263,29 @@ def _display_report(report: VerifyReport, args: argparse.Namespace):
             f"pass --all to verify every snapshot.[/dim]"
         )
 
+    # Plain-ASCII verdict words, not glyphs. Rich strips colour when stdout is
+    # not a terminal, so in a redirected log a glyph loses its only meaning;
+    # "OK"/"WARNING"/"FAILED" stay greppable and survive a non-UTF-8 stream
+    # (a non-ASCII character raises UnicodeEncodeError there).
+    # highlight=False keeps Rich's repr highlighter from styling the brackets.
     verdict = report.verdict
     if verdict == "pass":
         console.print(
-            f"\n[green bold]✓ All {report.total} checked snapshot(s) verified[/green bold]"
+            f"\n[green bold][OK][/green bold] All {report.total} checked "
+            f"snapshot(s) verified",
+            highlight=False,
         )
     elif verdict == "unverifiable":
         console.print(
-            f"\n[yellow bold]⚠ {report.verified_ok} verified, {report.unverifiable} "
-            f"could not be verified (no failures)[/yellow bold]"
+            f"\n[yellow bold][WARNING][/yellow bold] {report.verified_ok} verified, "
+            f"{report.unverifiable} could not be verified (no failures)",
+            highlight=False,
         )
     else:  # fail
-        console.print("\n[red bold]✗ Verification found issues[/red bold]")
+        console.print(
+            "\n[red bold][FAILED][/red bold] Verification found issues",
+            highlight=False,
+        )
 
 
 def _display_json(report: VerifyReport):
