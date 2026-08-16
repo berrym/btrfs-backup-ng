@@ -3,6 +3,7 @@
 Extracted from __main__.py for modularity and reuse.
 """
 
+import contextlib
 import logging
 import os
 import shlex
@@ -1633,57 +1634,131 @@ class _SnapperBtrfsBackup:
         return f".snapshots/{self.number}/snapshot"
 
 
-def _snapper_run_shell(destination_endpoint, script: str):
-    """Run a ``/bin/sh`` script on the destination WITH ROOT (local or over ssh), honoring the
-    endpoint's sudo strategy, capturing output. Returns ``(returncode, stdout_text)``.
+_SNAPPER_UNPRIVILEGED_ATTR = "_snapper_unprivileged_shell_ok"
 
-    Snapper's btrfs slot operations -- ``subvolume show`` (enumeration), and the ``mv`` /
-    ``subvolume delete`` of the numbered layout (publish/cleanup) -- all need CAP_SYS_ADMIN and
-    write access to a root-owned ``.snapshots`` tree, so the WHOLE script runs under sudo (not
-    just the ``btrfs`` verbs, which is why the endpoint's own per-command sudo-prepend is
-    insufficient here). For a password-sudo remote, credentials are primed first so ``sudo -n``
-    succeeds with cached creds. Best-effort: never raises; a non-zero return is handled by the
-    caller (enumeration degrades to fewer backups; publish raises a clean transfer error).
 
-    Over ssh the script MUST be passed as a single ``shlex.quote``-d argument: ssh joins the
-    remote argv with spaces and the remote shell re-splits it, so an unquoted multi-word script
-    would be torn apart -- ``sudo`` would bind only its first token and the real work would run
-    unprivileged (or not at all). Quoting keeps ``sh -c`` receiving the whole script intact.
+def _snapper_btrfs(destination_endpoint) -> str:
+    """The ``btrfs`` invocation to embed in a snapper script.
+
+    Only the btrfs verbs need privilege, so they carry ``sudo -n`` themselves instead of the
+    whole script running under sudo. That keeps the destination workable under a sudoers policy
+    granting nothing but ``/usr/bin/btrfs`` -- the policy this project documents, and under which
+    ``sudo sh`` is refused outright.
     """
-    is_remote = getattr(destination_endpoint, "_is_remote", False)
+    if getattr(destination_endpoint, "_is_remote", False):
+        cfg = getattr(destination_endpoint, "config", {}) or {}
+        return "sudo -n btrfs" if cfg.get("ssh_sudo", False) else "btrfs"
+    return "btrfs" if os.geteuid() == 0 else "sudo -n btrfs"
+
+
+def _snapper_exec_shell(destination_endpoint, script: str, *, privileged: bool):
+    """Run ``sh -c script`` on the destination, optionally wrapping the shell in sudo.
+
+    The script is one RAW argv element: ``_exec_remote_command`` shlex.quotes every element it
+    is handed (endpoint/ssh.py, endpoint/raw.py), so quoting here too would escape it twice and
+    the remote shell would run the whole script as a single command name (rc 127). Words
+    interpolated INSIDE the script text are the caller's to quote -- a different level.
+    """
+    argv = ["sudo", "-n", "sh", "-c", script] if privileged else ["sh", "-c", script]
+    if getattr(destination_endpoint, "_is_remote", False) and hasattr(
+        destination_endpoint, "_exec_remote_command"
+    ):
+        result = destination_endpoint._exec_remote_command(
+            argv, check=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+        )
+        out = (
+            result.stdout.decode(errors="replace")
+            if getattr(result, "stdout", None)
+            else ""
+        )
+        return getattr(result, "returncode", 1), out
+    if not privileged or os.geteuid() == 0:
+        argv = ["sh", "-c", script]
+    result = subprocess.run(argv, capture_output=True, text=True)
+    return result.returncode, result.stdout
+
+
+def _snapper_dest_is_user_writable(destination_endpoint) -> bool:
+    """Can the connecting user manipulate the destination ``.snapshots`` tree unprivileged?
+
+    Decides the execution mode ONCE per endpoint. The slot layout is manipulated with plain
+    directory renames (``mv``) and removals, which need no privilege at all when the tree is
+    reachable by the connecting user -- either because it belongs to them, or because an ACL
+    grants access (``setfacl -m u:<user>:rwx``), the same mechanism snapper itself uses for
+    ALLOW_USERS. Only the btrfs verbs then need sudo, and those are covered by a policy granting
+    ``/usr/bin/btrfs``.
+
+    Probing once, rather than reacting to a failure, avoids re-running a mutating script whose
+    first attempt may have partially applied.
+    """
+    cached = getattr(destination_endpoint, _SNAPPER_UNPRIVILEGED_ATTR, None)
+    if cached is not None:
+        return bool(cached)
+
+    base = str(destination_endpoint.config["path"]).rstrip("/")
+    snap_dir = f"{base}/.snapshots"
+    # Walk up to the deepest ancestor that exists: on a first backup .snapshots is not there
+    # yet, and what matters is whether we may create it.
+    probe = (
+        f"d={shlex.quote(snap_dir)}; "
+        'while [ ! -d "$d" ] && [ "$d" != "/" ]; do d=$(dirname "$d"); done; '
+        '[ -w "$d" ] && [ -x "$d" ]'
+    )
     try:
-        if is_remote and hasattr(destination_endpoint, "_exec_remote_command"):
+        rc, _out = _snapper_exec_shell(destination_endpoint, probe, privileged=False)
+        ok = rc == 0
+    except Exception as e:  # noqa: BLE001 - best-effort; fall back to the privileged path
+        logger.debug("snapper writability probe failed: %s", e)
+        ok = False
+
+    if not ok:
+        logger.info(
+            "Destination %s is not writable by the connecting user, so the snapper slot "
+            "operations need a shell under sudo. Granting access instead lets this work with "
+            "sudo access to btrfs alone: sudo setfacl -m u:<user>:rwx -m d:u:<user>:rwx %s",
+            snap_dir,
+            snap_dir,
+        )
+    with contextlib.suppress(AttributeError):
+        setattr(destination_endpoint, _SNAPPER_UNPRIVILEGED_ATTR, ok)
+    return ok
+
+
+def _snapper_run_shell(destination_endpoint, script: str):
+    """Run a ``/bin/sh`` script against the destination's snapper layout, capturing output.
+
+    Returns ``(returncode, stdout_text)``. Best-effort: never raises; a non-zero return is
+    handled by the caller (enumeration degrades to fewer backups; publish raises a clean
+    transfer error).
+
+    Privilege is applied as narrowly as the destination allows. The slot layout is manipulated
+    with directory renames and removals, which need no privilege when the connecting user can
+    write the ``.snapshots`` tree; the btrfs verbs inside the script carry their own ``sudo -n``
+    (see :func:`_snapper_btrfs`). Only when the tree is unreachable unprivileged does the whole
+    shell run under sudo, which requires a sudoers policy permitting ``sh`` -- broader than the
+    ``/usr/bin/btrfs`` this project documents, and therefore the fallback rather than the norm.
+    """
+    try:
+        privileged = not _snapper_dest_is_user_writable(destination_endpoint)
+        if (
+            privileged
+            and getattr(destination_endpoint, "_is_remote", False)
+            and hasattr(destination_endpoint, "_prime_remote_sudo")
+        ):
+            # Only the fallback path needs a password-capable sudo; probe with btrfs, which is
+            # what a btrfs-only policy actually grants (`sudo -n true` fails there and would
+            # trigger pointless priming on a perfectly healthy host).
             probe = destination_endpoint._exec_remote_command(
-                ["sudo", "-n", "true"], check=False
+                ["sudo", "-n", "btrfs", "--version"], check=False
             )
-            if getattr(probe, "returncode", 1) != 0 and hasattr(
-                destination_endpoint, "_prime_remote_sudo"
-            ):
+            if getattr(probe, "returncode", 1) != 0:
                 try:
                     destination_endpoint._prime_remote_sudo()
                 except Exception as e:  # noqa: BLE001 - best-effort priming
                     logger.debug("Could not prime remote sudo: %s", e)
-            # shlex.quote so the whole script survives ssh's join + remote re-split as one
-            # argument to ``sh -c`` (otherwise sudo binds only the first word -- see docstring).
-            result = destination_endpoint._exec_remote_command(
-                ["sudo", "-n", "sh", "-c", shlex.quote(script)],
-                check=False,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-            )
-            out = (
-                result.stdout.decode(errors="replace")
-                if getattr(result, "stdout", None)
-                else ""
-            )
-            return getattr(result, "returncode", 1), out
-        sudo = [] if os.geteuid() == 0 else ["sudo", "-n"]
-        result = subprocess.run(
-            [*sudo, "sh", "-c", script], capture_output=True, text=True
-        )
-        return result.returncode, result.stdout
+        return _snapper_exec_shell(destination_endpoint, script, privileged=privileged)
     except Exception as e:  # noqa: BLE001 - best-effort; never crash the caller
-        logger.debug("snapper privileged shell failed: %s", e)
+        logger.debug("snapper shell failed: %s", e)
         return 1, ""
 
 
@@ -1701,7 +1776,7 @@ def _enumerate_snapper_btrfs_backups(destination_endpoint) -> list:
         "for n in */; do n=${n%/}; "
         'case "$n" in ""|*[!0-9]*) continue ;; esac; '
         '[ -e "$n/snapshot" ] || continue; '
-        'ru=$(btrfs subvolume show "$n/snapshot" 2>/dev/null '
+        f'ru=$({_snapper_btrfs(destination_endpoint)} subvolume show "$n/snapshot" 2>/dev/null '
         '| sed -n "s/.*Received UUID:[[:space:]]*//p" | head -1); '
         '[ -n "$ru" ] && [ "$ru" != "-" ] && printf "%s %s\\n" "$n" "$ru"; '
         "done"
@@ -1738,6 +1813,7 @@ def _snapper_publish_slot(destination_endpoint, snapshot_num) -> None:
     """
     base = f"{str(destination_endpoint.config['path']).rstrip('/')}/.snapshots"
     q = shlex.quote
+    btrfs = _snapper_btrfs(destination_endpoint)
     final_dir = f"{base}/{snapshot_num}"
     incoming_dir = f"{base}/{snapshot_num}.incoming"
     stale_dir = f"{base}/{snapshot_num}.stale"
@@ -1753,7 +1829,7 @@ def _snapper_publish_slot(destination_endpoint, snapshot_num) -> None:
         # otherwise the slot is empty and ``.stale`` holds the old backup, so restore it.
         f"if [ -e {q(stale_dir)} ]; then "
         f"if [ -e {q(final_dir)}/snapshot ]; then "
-        f"btrfs subvolume delete {q(stale_dir)}/snapshot >/dev/null 2>&1 || true; "
+        f"{btrfs} subvolume delete {q(stale_dir)}/snapshot >/dev/null 2>&1 || true; "
         f"rm -rf {q(stale_dir)} 2>/dev/null || true; "
         f"else rm -rf {q(final_dir)} 2>/dev/null || true; mv {q(stale_dir)} {q(final_dir)}; fi; "
         "fi; "
@@ -1762,7 +1838,7 @@ def _snapper_publish_slot(destination_endpoint, snapshot_num) -> None:
         f"mv {q(incoming_dir)} {q(final_dir)}; "  # publish the new backup (dir rename)
         # Now that the new backup is in place, delete the moved-aside stale one (if any).
         f"if [ -e {q(stale_dir)}/snapshot ]; then "
-        f"btrfs subvolume delete {q(stale_dir)}/snapshot >/dev/null 2>&1 || true; fi; "
+        f"{btrfs} subvolume delete {q(stale_dir)}/snapshot >/dev/null 2>&1 || true; fi; "
         f"rm -rf {q(stale_dir)} 2>/dev/null || true"
     )
     rc, _out = _snapper_run_shell(destination_endpoint, script)
@@ -1859,11 +1935,12 @@ def _cleanup_snapper_backup(destination_endpoint, snapshot_num, is_raw) -> None:
 
     base = f"{str(destination_endpoint.config['path']).rstrip('/')}/.snapshots"
     q = shlex.quote
+    btrfs = _snapper_btrfs(destination_endpoint)
     incoming_dir = f"{base}/{snapshot_num}.incoming"
     incoming_sub = f"{incoming_dir}/snapshot"
     script = (
         f"if [ -e {q(incoming_sub)} ]; then "
-        f"btrfs subvolume delete {q(incoming_sub)} >/dev/null 2>&1 || "
+        f"{btrfs} subvolume delete {q(incoming_sub)} >/dev/null 2>&1 || "
         f"rm -rf {q(incoming_sub)}; fi; "
         f"rm -rf {q(incoming_dir)} 2>/dev/null || true"
     )
