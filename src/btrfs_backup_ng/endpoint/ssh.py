@@ -80,17 +80,11 @@ __all__ = ["SSHEndpoint"]
 # Type variable for self in SSHEndpoint
 _Self = TypeVar("_Self", bound="SSHEndpoint")
 
-# Default idle timeout for remote btrfs receive (seconds).
-# If no data arrives on stdin for this long, the receive process will terminate.
-# This prevents zombie processes when the SSH connection is interrupted.
-RECEIVE_IDLE_TIMEOUT = 300  # 5 minutes
-
 
 def _build_receive_command(
     dest_path: str,
     use_sudo: bool = False,
     password_on_stdin: bool = False,
-    idle_timeout: int = RECEIVE_IDLE_TIMEOUT,
 ) -> str:
     """Build a btrfs receive command with orphan process protection.
 
@@ -98,44 +92,48 @@ def _build_receive_command(
     This prevents zombie processes when the SSH connection is interrupted.
 
     Args:
-        dest_path: Destination path for btrfs receive (should be shell-escaped)
+        dest_path: Destination path for btrfs receive, RAW and unquoted. This
+                   function owns the escaping; callers must not pre-quote.
         use_sudo: Whether to run with sudo
         password_on_stdin: If True, use 'sudo -S' (read password from stdin).
                           If False, use 'sudo -n' (passwordless sudo).
-        idle_timeout: Seconds of stdin inactivity before terminating (default 300)
 
     Returns:
         Shell command string with orphan protection
     """
+    # Escape exactly once, here. The result is embedded in a shell script that is
+    # itself quoted as a single argument below, so the destination survives both
+    # levels of shell parsing regardless of spaces, quotes or metacharacters.
+    quoted_dest = shlex.quote(dest_path)
+
     # Build the base btrfs receive command
     if use_sudo:
         if password_on_stdin:
             # sudo -S reads password from stdin first, then btrfs receive reads data
-            base_receive = f"sudo -S btrfs receive {dest_path}"
+            base_receive = f"sudo -S btrfs receive {quoted_dest}"
         else:
             # sudo -n for passwordless sudo
-            base_receive = f"sudo -n btrfs receive {dest_path}"
+            base_receive = f"sudo -n btrfs receive {quoted_dest}"
     else:
-        base_receive = f"btrfs receive {dest_path}"
+        base_receive = f"btrfs receive {quoted_dest}"
 
-    # Use a simple wrapper that sets up signal traps for cleanup.
-    # When SSH disconnects, SIGHUP is sent to the shell, which triggers the trap.
+    # Set up a cleanup trap for disconnect signals. When SSH disconnects, SIGHUP
+    # is sent to the shell, which triggers the trap.
     #
     # We run the receive command directly (not backgrounded) so stdin flows
-    # through properly. The trap ensures cleanup on signals.
+    # through properly, and `exec` replaces the shell with btrfs receive so
+    # signals are delivered directly to it.
     #
     # Note: We don't use the named pipe approach as it can cause issues with
     # SSH's stdin handling and buffering.
-    wrapped_cmd = (
-        f"sh -c '"
-        # Set up cleanup trap for disconnect signals
-        # Using exec to replace the shell with btrfs receive ensures signals
-        # are delivered directly to btrfs receive
-        f'trap "" PIPE; exec {base_receive}'
-        f"'"
-    )
+    script = f'trap "" PIPE; exec {base_receive}'
 
-    return wrapped_cmd
+    # Quote the whole script as ONE argument to `sh -c`. Building this by
+    # wrapping the script in literal single quotes would cancel the escaping of
+    # any single-quoted destination inside it: a path with a space would be
+    # truncated, an apostrophe would be a remote syntax error, and a `;` would
+    # run an injected command whose exit status masks a failing btrfs receive.
+    return f"sh -c {shlex.quote(script)}"
 
 
 class SSHEndpoint(Endpoint):
@@ -1911,11 +1909,11 @@ print(json.dumps(result))
         if ssh_port:
             ssh_cmd.extend(["-p", str(ssh_port)])
 
-        # Build remote command with orphan protection
-        escaped_dest = shlex.quote(destination)
+        # Build remote command with orphan protection.
+        # _build_receive_command escapes the destination itself; do not pre-quote.
         use_sudo = self.config.get("ssh_sudo", False)
         remote_cmd = _build_receive_command(
-            escaped_dest, use_sudo=use_sudo, password_on_stdin=False
+            destination, use_sudo=use_sudo, password_on_stdin=False
         )
         ssh_cmd.extend([remote_host, remote_cmd])
 
@@ -2746,10 +2744,10 @@ print(json.dumps(result))
         send_cmd.append(source_path)
 
         # Remote command with orphan protection
-        # sudo -S reads password from stdin, then receives btrfs stream
-        escaped_dest = shlex.quote(dest_path)
+        # sudo -S reads password from stdin, then receives btrfs stream.
+        # _build_receive_command escapes the destination itself; do not pre-quote.
         remote_cmd = _build_receive_command(
-            escaped_dest, use_sudo=True, password_on_stdin=True
+            dest_path, use_sudo=True, password_on_stdin=True
         )
 
         # Ensure paramiko is available
@@ -3041,10 +3039,11 @@ print(json.dumps(result))
             ssh_parts.extend(["-p", str(ssh_port)])
         ssh_parts.append(remote_host)
 
-        # Build remote command with orphan protection (passwordless sudo)
-        escaped_dest = shlex.quote(dest_path)
+        # Build remote command with orphan protection (passwordless sudo).
+        # _build_receive_command escapes the destination itself; do not pre-quote.
+        # The extra shlex.quote below is for the LOCAL bash pipeline, not the remote.
         remote_cmd = _build_receive_command(
-            escaped_dest, use_sudo=use_sudo, password_on_stdin=False
+            dest_path, use_sudo=use_sudo, password_on_stdin=False
         )
         ssh_parts.append(shlex.quote(remote_cmd))
         ssh_cmd = " ".join(ssh_parts)
@@ -3628,13 +3627,11 @@ print(json.dumps(result))
             "passwordless_sudo_available", False
         )
 
-        # Build the receive command. shlex.quote the destination: it is
-        # interpolated into a remote `sh -c` string by _build_receive_command
-        # (whose docstring requires a shell-escaped path), and every OTHER caller
-        # already passes shlex.quote(dest_path). Without it a target path with a
-        # space or shell metacharacter breaks the remote receive / injects. (R9)
+        # Build the receive command. _build_receive_command escapes the
+        # destination itself and quotes the whole remote script as one argument,
+        # so a path with a space or shell metacharacter is safe here. (R9)
         receive_cmd = _build_receive_command(
-            dest_path=shlex.quote(dest_path),
+            dest_path=dest_path,
             use_sudo=use_sudo,
             password_on_stdin=use_sudo and not passwordless,
         )

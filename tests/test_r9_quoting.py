@@ -2,9 +2,15 @@
 context must be shlex.quote'd so a space / single-quote / shell metacharacter can
 neither break the command nor inject into the remote shell.
 
-Mutation-verified: reverting any one quote (the chunked-receive dest, the central
-``_exec_remote_command`` element quoting, or a diagnose.py path) makes the matching
-test fail. Clean paths are unchanged (no regression).
+Mutation-verified: reverting any one quote (the central ``_exec_remote_command``
+element quoting, or a diagnose.py path) makes the matching test fail. Clean paths
+are unchanged (no regression).
+
+The chunked-receive destination is no longer quoted here: ``_build_receive_command``
+owns that escaping. What this file now pins for that path is the inverse -- that the
+caller passes the destination RAW. The end-to-end guarantee lives in
+tests/test_ssh_receive_command_quoting.py, which runs the produced command through a
+real shell.
 """
 
 from __future__ import annotations
@@ -24,8 +30,15 @@ CLEAN = "/mnt/backup/home"
 
 
 class TestReceiveChunkedQuotesDest:
-    """HIGH: receive_chunked passes shlex.quote(dest_path) to _build_receive_command
-    (parity with the other three callers)."""
+    """HIGH: receive_chunked passes the RAW dest_path to _build_receive_command
+    (parity with the other three callers).
+
+    Quoting moved into the producer: it escapes the destination and quotes the
+    whole remote script as one argument. Pre-quoting here would double-escape and
+    send btrfs the literal quote characters. The end-to-end guarantee this used to
+    stand in for -- that the destination survives remote shell parsing intact --
+    is asserted against a real shell in tests/test_ssh_receive_command_quoting.py.
+    """
 
     def _capture_dest(self, configured_path):
         ep = SSHEndpoint.__new__(SSHEndpoint)
@@ -45,11 +58,12 @@ class TestReceiveChunkedQuotesDest:
                 ep.receive_chunked(chunk_reader=None, manifest=manifest)
         return captured["dest_path"]
 
-    def test_nasty_path_is_quoted(self):
-        assert self._capture_dest(NASTY) == shlex.quote(NASTY)
+    def test_nasty_path_passed_raw(self):
+        # Raw, not shlex.quote'd: the producer escapes exactly once.
+        assert self._capture_dest(NASTY) == NASTY
+        assert self._capture_dest(NASTY) != shlex.quote(NASTY)
 
     def test_clean_path_unchanged(self):
-        # shlex.quote is a no-op for a clean path -> no regression.
         assert self._capture_dest(CLEAN) == CLEAN
 
 
