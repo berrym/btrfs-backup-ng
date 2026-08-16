@@ -1645,10 +1645,13 @@ def _snapper_run_shell(destination_endpoint, script: str):
     succeeds with cached creds. Best-effort: never raises; a non-zero return is handled by the
     caller (enumeration degrades to fewer backups; publish raises a clean transfer error).
 
-    Over ssh the script MUST be passed as a single ``shlex.quote``-d argument: ssh joins the
-    remote argv with spaces and the remote shell re-splits it, so an unquoted multi-word script
-    would be torn apart -- ``sudo`` would bind only its first token and the real work would run
-    unprivileged (or not at all). Quoting keeps ``sh -c`` receiving the whole script intact.
+    Over ssh the script is passed as ONE RAW argv element. ``_exec_remote_command`` owns the
+    escaping -- it ``shlex.quote``s every element it is given, because ssh joins the remote argv
+    with spaces and the remote shell re-splits it. Quoting the script here as well double-escapes
+    it into a single literal word, which the remote shell then tries to execute as a command name:
+    ``sh: <the whole script>: command not found``, rc 127, on every privileged snapper call.
+    Paths interpolated INSIDE the script text still need ``shlex.quote`` -- that is a different
+    level, escaping a word within the script rather than the script itself.
     """
     is_remote = getattr(destination_endpoint, "_is_remote", False)
     try:
@@ -1663,10 +1666,9 @@ def _snapper_run_shell(destination_endpoint, script: str):
                     destination_endpoint._prime_remote_sudo()
                 except Exception as e:  # noqa: BLE001 - best-effort priming
                     logger.debug("Could not prime remote sudo: %s", e)
-            # shlex.quote so the whole script survives ssh's join + remote re-split as one
-            # argument to ``sh -c`` (otherwise sudo binds only the first word -- see docstring).
+            # Raw script: _exec_remote_command quotes each argv element itself (see docstring).
             result = destination_endpoint._exec_remote_command(
-                ["sudo", "-n", "sh", "-c", shlex.quote(script)],
+                ["sudo", "-n", "sh", "-c", script],
                 check=False,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
