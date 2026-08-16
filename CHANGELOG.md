@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.3] - 2026-08-16
+
+### Fixed
+
+- **Docs are now included in the source tarball** — `docs/` was omitted from the sdist, so building
+  from the source distribution and running the test suite failed at collection when
+  `test_docs_commands.py` read `docs/SNAPPER-INTEGRATION.md`. The docs now ship, fixing distribution
+  builds. Thanks to Michael J Gruber (@mjg) for the detailed report (#91).
+
 ## [0.9.2] - 2026-08-05
 
 The config, restoration, and SSH-reliability polish release.
