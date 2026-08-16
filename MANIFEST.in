@@ -13,6 +13,7 @@ include README.md
 include LICENSE
 include CHANGELOG.md
 include CONTRIBUTING.md
+recursive-include docs *.md
 
 # Include config example
 include config.example.toml
