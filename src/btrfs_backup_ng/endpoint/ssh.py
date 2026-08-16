@@ -547,8 +547,14 @@ class SSHEndpoint(Endpoint):
             # Ensure the path is properly normalized for remote execution
             remote_path = self._normalize_path(remote_path)
 
-            # Verify the path exists before attempting deletion
-            test_cmd = ["test", "-d", remote_path]
+            # Verify the subvolume exists before attempting deletion. Asked as a
+            # btrfs subcommand, not `test -d`: the remote sudoers policy grants
+            # btrfs only, so an elevated `test` fails for lack of privilege and
+            # is indistinguishable from a missing path -- which skipped every
+            # snapshot and made remote pruning silently delete nothing. It is
+            # also the stricter precondition for the `btrfs subvolume delete`
+            # below, since it fails on a plain directory rather than passing it.
+            test_cmd = ["btrfs", "subvolume", "show", remote_path]
             try:
                 test_result = self._exec_remote_command(
                     test_cmd,
@@ -558,7 +564,7 @@ class SSHEndpoint(Endpoint):
                 )
                 if test_result.returncode != 0:
                     logger.warning(
-                        f"Snapshot path does not exist for deletion: {remote_path}"
+                        f"Not an existing btrfs subvolume, skipping deletion: {remote_path}"
                     )
                     continue
             except Exception as e:
@@ -1189,14 +1195,15 @@ print(json.dumps(result))
         # Ensure all elements are strings
         command = [str(c) for c in command]
 
-        # Check if the ssh_sudo flag is set and command needs sudo
+        # Only ever elevate btrfs itself. The documented remote setup grants
+        # NOPASSWD on /usr/bin/btrfs and nothing else, so elevating any other
+        # binary makes sudo demand a password on a connection that has no way to
+        # supply one: the command fails and its caller reads that as "the path is
+        # not there". Anything that needs privilege must be expressed as a btrfs
+        # subcommand (see delete_snapshots, which asks `btrfs subvolume show`
+        # instead of `test -d`); anything that does not runs unprivileged.
         needs_sudo = (
-            self.config.get("ssh_sudo", False)
-            and command
-            and (
-                command[0] == "btrfs"
-                or (command[0] == "test" and len(command) > 2 and "-d" in command)
-            )
+            self.config.get("ssh_sudo", False) and command and command[0] == "btrfs"
         )
 
         if needs_sudo:
@@ -1244,22 +1251,10 @@ print(json.dumps(result))
                         "Using sudo for btrfs receive command with password support"
                     )
                     return ["sudo", "-S", "-P", "-p", ""] + command
-            elif command[0] == "btrfs":
-                logger.debug("Using sudo for regular btrfs command")
-                if passwordless_mode:
-                    return ["sudo", "-n"] + command
-                else:
-                    return ["sudo", "-S"] + command
-            elif command[0] in ["mkdir", "touch", "rm", "test"]:
-                # Directory operations and basic file operations that commonly need sudo privileges
-                logger.debug("Using sudo for directory/file operation: %s", command[0])
-                if passwordless_mode:
-                    return ["sudo", "-n"] + command
-                else:
-                    return ["sudo", "-S"] + command
             else:
-                # For other commands, respect the password mode setting
-                logger.debug("Using sudo for other command: %s", command[0])
+                # needs_sudo admits only btrfs, so this is every other btrfs
+                # subcommand.
+                logger.debug("Using sudo for regular btrfs command")
                 if passwordless_mode:
                     return ["sudo", "-n"] + command
                 else:
