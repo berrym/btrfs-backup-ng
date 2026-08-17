@@ -54,6 +54,10 @@ jobs:
           modprobe btrfs || echo "btrfs module load failed (may be built-in)"
           btrfs --version
           mkfs.btrfs --version
+          if [ "$(id -u)" -ne 0 ]; then
+            echo "Tier 2 requires root; the suite would skip every test"
+            exit 1
+          fi
           echo "=== btrfs support OK ==="
 
       - name: Checkout code
@@ -66,7 +70,35 @@ jobs:
 
       - name: Run Tier 2 integration tests
         run: |
-          pytest tests/integration/tier2/ -v -m tier2 --tb=long ${{ inputs.debug == 'true' && '-s' || '' }}
+          pytest tests/integration/tier2/ -v -m tier2 --tb=long \
+            --junitxml=tier2-results.xml ${{ inputs.debug == 'true' && '-s' || '' }}
+
+      - name: Verify Tier 2 tests actually executed
+        run: |
+          echo "=== Verifying Tier 2 execution ==="
+          python3 - <<'PYEOF'
+          import sys
+          import xml.etree.ElementTree as ET
+
+          root = ET.parse("tier2-results.xml").getroot()
+          suite = root if root.tag == "testsuite" else root.find("testsuite")
+          if suite is None:
+              sys.exit("no <testsuite> element in tier2-results.xml")
+
+          def count(key):
+              return int(suite.attrib.get(key, 0))
+
+          collected = count("tests")
+          skipped = count("skipped")
+          executed = collected - skipped - count("failures") - count("errors")
+          print(f"collected={collected} skipped={skipped} executed={executed}")
+          if executed == 0:
+              sys.exit(
+                  "Tier 2 executed 0 tests - btrfs support or root privileges are "
+                  "missing, so this job proves nothing"
+              )
+          PYEOF
+          echo "=== Tier 2 execution OK ==="
 
       - name: Run Tier 2 tests with coverage
         if: success()
@@ -99,12 +131,19 @@ jobs:
         run: |
           echo "Tier 2 test job result: ${{ needs.tier2-tests.result }}"
           if [ "${{ needs.tier2-tests.result }}" == "success" ]; then
-            echo "✅ Tier 2 integration tests passed"
+            echo "Tier 2 integration tests passed"
             exit 0
           elif [ "${{ needs.tier2-tests.result }}" == "skipped" ]; then
-            echo "⏭️ Tier 2 tests were skipped"
-            exit 0
+            # A hardware gate that did not run has proved nothing, so it must not
+            # report success. Reachable only if tier2-tests gains an `if:` or a
+            # skipped dependency; failing here keeps that change from silently
+            # turning this required check green.
+            echo "Tier 2 tests did not run; the hardware gate proved nothing"
+            exit 1
+          elif [ "${{ needs.tier2-tests.result }}" == "cancelled" ]; then
+            echo "Tier 2 tests were cancelled"
+            exit 1
           else
-            echo "❌ Tier 2 integration tests failed"
+            echo "Tier 2 integration tests failed"
             exit 1
           fi
