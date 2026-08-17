@@ -125,7 +125,7 @@ def test_send_ssh_sudo_wraps_remote_cat_in_sudo_sh_c():
         pp.return_value = MagicMock()
         ep.send(snap)
     shell_cmd = pp.call_args[0][0]
-    assert "sudo sh -c" in shell_cmd
+    assert "sudo -n sh -c" in shell_cmd
 
 
 def test_list_second_pass_stat_is_portable_and_sudo_scoped():
@@ -143,7 +143,7 @@ def test_list_second_pass_stat_is_portable_and_sudo_scoped():
     # Quote-insensitive (the sudo wrapping shlex-escapes the inner quotes):
     assert "stat -c" in stat_str and "%Y %s" in stat_str  # GNU branch
     assert "stat -f" in stat_str and "%m %z" in stat_str  # BSD/macOS fallback
-    assert "sudo sh -c" in stat_str  # whole fallback under one sudo
+    assert "sudo -n sh -c" in stat_str  # whole fallback under one sudo
 
 
 def test_remote_sidecar_size_cmd_is_portable():

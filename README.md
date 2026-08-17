@@ -1036,6 +1036,46 @@ sudo -n btrfs --version
 # Should print version without prompting for password
 ```
 
+#### This sudoers policy is for `ssh://` targets, not `raw+ssh://`
+
+The rule above grants `btrfs` only, which is exactly what an `ssh://` target
+needs: the remote runs `btrfs receive`, and nothing else requires privilege.
+
+A `raw+ssh://` target is different. It stores send streams as **ordinary files**,
+so no `btrfs` command ever runs on the remote — the work is `mkdir`, `find`,
+`cat`, `stat`, `mv` and `rm`. Enabling `ssh_sudo` on a raw target therefore asks
+sudo for the *file* utilities, which this policy refuses. The check above still
+passes, so the mismatch only shows up when a backup runs.
+
+**For `raw+ssh://`, prefer ownership over sudo.** Step 1 already did the useful
+part:
+
+```bash
+sudo chown backup:backup /mnt/backups
+```
+
+With the destination owned by the SSH user, leave `ssh_sudo` unset (the default)
+and every operation is an ordinary file operation. This is simpler and strictly
+safer than the alternative — see below.
+
+If you genuinely need `ssh_sudo` for a raw target (an existing root-owned
+destination you cannot chown), be aware of what it costs. Most remote steps are
+multi-command, so they run as `sudo -n sh -c '...'` rather than as a single named
+utility — listing a set of utilities in sudoers does **not** authorize them. The
+only policy that actually covers every operation is:
+
+```sudoers
+backup ALL=(ALL) NOPASSWD: /bin/sh
+```
+
+which is unrestricted root. There is no meaningfully restricted sudoers policy
+for `raw+ssh://`, and that is the argument for `chown`: it grants strictly less.
+
+Also note that a raw+ssh backup **written** with `ssh_sudo` is root-owned, so
+reading it back requires `ssh_sudo` too. Choosing ownership up front avoids that
+permanently. If the rights are missing, the tool now fails loudly and says so
+rather than reporting the target as empty.
+
 ### Step 3: Set Up SSH Key Authentication (Local Machine)
 
 On your **local machine**, generate a dedicated SSH key for backups:

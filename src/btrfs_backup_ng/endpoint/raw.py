@@ -227,6 +227,66 @@ def _open_failure_reason(e: OSError) -> str:
     return reasons.get(e.errno, str(e))
 
 
+def _is_sudo_denial(stderr: str) -> bool:
+    """Whether stderr shows sudo refusing to elevate, rather than the command failing.
+
+    Matched on sudo's own diagnostics because the exit status cannot distinguish
+    them: sudo exits 1 on an authentication refusal, and ``find`` also exits 1
+    for perfectly ordinary reasons. Only the text separates "we were not allowed
+    to look" from "we looked and there was nothing".
+
+    ``sudo -n`` makes this reliable -- without it, sudo tries to prompt on a
+    connection that has no tty and reports "a terminal is required" instead, or
+    hangs.
+
+    Matching English wording is safe here ONLY because :meth:`_elevate` pins
+    ``LC_ALL=C``: sudo localises these messages, and the same refusal otherwise
+    reads "Ein Passwort ist notwendig", "il est nécessaire de saisir un mot de
+    passe" or "パスワードが必要です" (all measured on a real host). Without that
+    pin, an English-only match would restore the false all-clear for every
+    server not configured in English. The two must stay together.
+
+    Matching the ``sudo:`` prefix instead was tried and is wrong in BOTH
+    directions:
+
+    * sudo prints diagnostics about itself and then runs the command anyway --
+      "unable to load /usr/lib64/libsss_sudo.so" and "unable to initialize SSS
+      source" on any RHEL/Fedora host whose nsswitch.conf still lists ``sss``
+      after sssd was removed, and "setrlimit(RLIMIT_CORE)" inside containers.
+      Reading those as refusals turns a working elevation into a hard abort.
+    * the authorization denials do not all carry the prefix: sudo's own catalog
+      has "Sorry, user %s is not allowed to execute ..." and "%s is not in the
+      sudoers file." So a genuinely denied user would slip through, which is the
+      very false all-clear this exists to prevent.
+
+    Callers must also require a NON-ZERO exit before consulting this. A command
+    that succeeded was obviously permitted, whatever sudo muttered on the way.
+    """
+    lowered = (stderr or "").lower()
+    return any(
+        marker in lowered
+        for marker in (
+            # Authentication refused (sudo -n, no tty, or a wrong password).
+            "a password is required",
+            "a terminal is required",
+            "no askpass",
+            "no tty present",
+            "incorrect password",
+            "authentication failure",
+            "sorry, try again",
+            # Authorization refused: this user may not run this command.
+            "not allowed to execute",
+            "is not in the sudoers file",
+            "may not run sudo",
+            "not allowed to run sudo",
+            # sudo refused before exec for its own reasons (these DENY: the
+            # audit callback and the fqdn callback both fail closed).
+            "unable to send audit message",
+            "unable to resolve host",
+        )
+    )
+
+
 def _check_remote_listing(
     result: subprocess.CompletedProcess, host: str, path: Any
 ) -> None:
@@ -253,6 +313,21 @@ def _check_remote_listing(
             f"Cannot reach raw+ssh target {host}: {stderr or 'ssh connection failed'}. "
             "Its backups could NOT be listed -- this is NOT an empty target. Check the "
             "host is up and reachable, then retry."
+        )
+    # A refused sudo is the same false all-clear wearing different clothes: the
+    # backups are present and readable by root, we simply were not allowed to
+    # look. Measured against a real host whose sudoers grants NOPASSWD for
+    # /usr/bin/btrfs alone -- the policy this project's own README recommends --
+    # a target holding one backup listed as ZERO snapshots and exited 0.
+    if _is_sudo_denial(stderr):
+        raise RuntimeError(
+            f"Cannot list raw+ssh target {path} on {host}: {stderr}. Its backups "
+            "could NOT be read -- this is NOT an empty target. A raw+ssh target "
+            "stores plain files, so with ssh_sudo the remote user needs "
+            "passwordless sudo for the FILE tools (find, cat, stat, mkdir, mv, "
+            "rm), not for btrfs. Either grant those in sudoers, or -- simpler and "
+            "safer -- give the user ownership of the backup directory "
+            "(chown/setfacl) and turn ssh_sudo off."
         )
     logger.warning(
         "Listing raw+ssh target %s returned rc=%s (%s); reporting only the backups "
@@ -1730,11 +1805,58 @@ class SSHRawEndpoint(RawEndpoint):
 
         return cmd
 
+    def _elevate(self, remote_command: str) -> str:
+        """Wrap a remote command in sudo when ``ssh_sudo`` is set.
+
+        ``-n`` (non-interactive) because the ssh connection carries no tty: sudo
+        would otherwise try to prompt and report "a terminal is required to read
+        the password", which describes the transport rather than the problem. With
+        ``-n`` it exits 1 immediately and writes "sudo: a password is required",
+        which :func:`_is_sudo_denial` can tell apart from a command that ran and
+        found nothing.
+
+        Callers must not redirect this command's stderr away (``2>/dev/null``
+        applied to the whole string discards sudo's diagnostic along with the
+        inner command's noise); put any such redirect INSIDE, so it applies to the
+        inner command only. Losing that text is what let a refused sudo be
+        reported as an empty target.
+        """
+        # LC_ALL=C so sudo's own diagnostic is emitted in a predictable language:
+        # a German remote otherwise reports "sudo: Ein Passwort ist notwendig",
+        # which is correct but unhelpful in a log the operator forwards. sudo
+        # reads the caller's LC_ALL for its own messages (measured), and stock
+        # sudoers keeps LC_ALL in env_keep, so the inner command generally sees
+        # it too -- harmless here and mildly desirable, since the numeric output
+        # this code parses (stat's mtime/size) then carries no locale formatting.
+        # Correctness does not rest on any of this: _is_sudo_denial keys on the
+        # untranslated "sudo:" prefix, not on the wording.
+        if not self.ssh_sudo:
+            return remote_command
+        return f"LC_ALL=C sudo -n {remote_command}"
+
+    def _elevate_shell(self, inner: str) -> str:
+        """Elevate a command that carries its own ``2>/dev/null``.
+
+        Such a redirect, written flat, binds to the whole ``sudo find ...`` and so
+        discards sudo's refusal message along with find's permission noise --
+        leaving the listing guard with rc=1 and no evidence, which it then reads
+        as "empty target". Running the inner command under ``sh -c`` keeps the
+        redirect on the inner command only.
+
+        When not elevating, the command is returned UNCHANGED: there is no sudo
+        stderr to protect, and rewriting the wire format for no reason would be a
+        gratuitous behaviour change on the path that already works.
+        """
+        if not self.ssh_sudo:
+            return inner
+        return self._elevate(f"sh -c {shlex.quote(inner)}")
+
     def _exec_remote_command(
         self,
         command: list[str],
         input: bytes | None = None,
         check: bool = True,
+        elevate: bool = True,
         **kwargs: Any,
     ) -> subprocess.CompletedProcess:
         """Run a command on the remote host over SSH.
@@ -1744,12 +1866,18 @@ class SSHRawEndpoint(RawEndpoint):
         as a list plus optional stdin bytes, and returns the CompletedProcess.
         Output is captured by default; callers may override stdout/stderr (e.g.
         ``stdout=subprocess.DEVNULL`` to discard a ``tee`` echo).
+
+        ``elevate=False`` runs unprivileged even when ``ssh_sudo`` is set. Use it
+        for commands that do not touch backup data -- a capability probe gains
+        nothing from root, and elevating it means a restrictive sudoers policy
+        fails the probe before any real work, producing an error about the wrong
+        thing entirely.
         """
         import shlex
 
         remote = " ".join(shlex.quote(str(c)) for c in command)
-        if self.ssh_sudo:
-            remote = f"sudo {remote}"
+        if elevate:
+            remote = self._elevate(remote)
         full_cmd = self._build_ssh_command() + [remote]
         if "stdout" not in kwargs and "stderr" not in kwargs:
             kwargs["capture_output"] = True
@@ -1760,9 +1888,7 @@ class SSHRawEndpoint(RawEndpoint):
         path = self.config["path"]
         ssh_cmd = self._build_ssh_command()
 
-        mkdir_cmd = f"mkdir -p {shlex.quote(str(path))}"
-        if self.ssh_sudo:
-            mkdir_cmd = f"sudo {mkdir_cmd}"
+        mkdir_cmd = self._elevate(f"mkdir -p {shlex.quote(str(path))}")
 
         full_cmd = ssh_cmd + [mkdir_cmd]
         logger.debug("Creating remote directory: %s", full_cmd)
@@ -1770,7 +1896,22 @@ class SSHRawEndpoint(RawEndpoint):
         try:
             subprocess.run(full_cmd, check=True, capture_output=True)
         except subprocess.CalledProcessError as e:
-            logger.error("Failed to create remote directory: %s", e.stderr.decode())
+            stderr = (e.stderr or b"").decode(errors="replace").strip()
+            if _is_sudo_denial(stderr):
+                # Say what raw+ssh actually needs. The README's sudoers recipe
+                # grants NOPASSWD for /usr/bin/btrfs, which is right for ssh://
+                # and useless here: a raw target stores plain files, so no btrfs
+                # command ever runs on the remote.
+                raise __util__.AbortError(
+                    f"Cannot prepare raw+ssh target {path} on {self.hostname}: "
+                    f"{stderr}. ssh_sudo is enabled, but a raw+ssh target stores "
+                    "plain files -- the remote user needs passwordless sudo for "
+                    "the FILE tools (mkdir, find, cat, stat, mv, rm), not for "
+                    "btrfs. Either grant those in sudoers, or -- simpler and "
+                    "safer -- give the user ownership of the backup directory "
+                    "(chown/setfacl) and turn ssh_sudo off."
+                ) from e
+            logger.error("Failed to create remote directory: %s", stderr)
             raise
 
         # Preflight: raw+ssh runs POSIX shell commands on the remote (cat/mv/chmod
@@ -1785,7 +1926,11 @@ class SSHRawEndpoint(RawEndpoint):
             'for t in cat mv chmod stat mktemp dirname; do command -v "$t" '
             ">/dev/null 2>&1 || exit 1; done; echo RAWSSHOK"
         )
-        res = self._exec_remote_command(["sh", "-c", check], check=False)
+        # Unelevated on purpose: this only asks whether the tools EXIST, which
+        # root does not change. Elevating it meant a sudoers policy that omits
+        # the file utilities failed here first, and the user was told the remote
+        # "does not provide the POSIX tools raw+ssh needs" -- which is false.
+        res = self._exec_remote_command(["sh", "-c", check], check=False, elevate=False)
         out = res.stdout
         if isinstance(out, (bytes, bytearray)):
             out = out.decode(errors="replace")
@@ -1821,8 +1966,7 @@ class SSHRawEndpoint(RawEndpoint):
         # receive-write and commit_receive halves quote identically (they must
         # agree on the target or a valid config could fail at commit).
         remote_cmd = f"cat > {shlex.quote(str(output_path))}"
-        if self.ssh_sudo:
-            remote_cmd = f"sudo sh -c {shlex.quote(remote_cmd)}"
+        remote_cmd = self._elevate(f"sh -c {shlex.quote(remote_cmd)}")
 
         if not pipeline or pipeline == [["cat"]]:
             # No local processing, pipe directly to SSH
@@ -1949,15 +2093,31 @@ class SSHRawEndpoint(RawEndpoint):
     def sidecar_exists(self, snapshot: RawSnapshot) -> bool:
         """Whether ``snapshot``'s ``.meta`` sidecar exists on the remote now (a
         pre-write re-check; see the base method)."""
+        # Elevation belongs to _exec_remote_command alone. Wrapping the command
+        # here as well produced `sudo -n sh -c 'sudo -n sh -c ...'`, so a sudoers
+        # policy permitting the outer invocation still failed on the inner one.
         meta = shlex.quote(str(snapshot.metadata_path))
-        cmd = f"test -f {meta}"
-        if self.ssh_sudo:
-            cmd = f"sudo sh -c {shlex.quote(cmd)}"
-        try:
-            res = self._exec_remote_command(["sh", "-c", cmd], check=False)
-            return res.returncode == 0
-        except Exception:
-            return False
+        res = self._exec_remote_command(["sh", "-c", f"test -f {meta}"], check=False)
+        stderr = res.stderr
+        if isinstance(stderr, (bytes, bytearray)):
+            stderr = stderr.decode(errors="replace")
+        # The exit code first: not every `sudo:` line is a refusal. sudo prints
+        # benign warnings on stderr -- "sudo: unable to resolve host <name>" is
+        # the common one, on any box whose hostname is missing from /etc/hosts --
+        # and runs the command anyway. Consulting the text on a command that
+        # SUCCEEDED would abort a working backup over a cosmetic warning.
+        if res.returncode != 0 and _is_sudo_denial((stderr or "").strip()):
+            # `test -f` exits 1 for a missing file, and so does a refused sudo.
+            # Reading the second as the first tells backfill-metadata that no
+            # sidecar exists, and it then overwrites the one that does -- the
+            # exact clobber this pre-write re-check exists to prevent.
+            raise RuntimeError(
+                f"Cannot check for the sidecar {snapshot.metadata_path} on "
+                f"{self.hostname}: {(stderr or '').strip()}. Refusing to treat a "
+                "permission failure as 'no sidecar present', because that would "
+                "overwrite an existing record."
+            )
+        return res.returncode == 0
 
     def _remote_find(self, pattern: str) -> list[str]:
         """Return remote file paths that are DIRECT CHILDREN of the target dir and
@@ -1968,12 +2128,13 @@ class SSHRawEndpoint(RawEndpoint):
         a second, out-of-target path into the result set; and each path is checked to
         be a direct child of the target dir as defense in depth."""
         base = str(self.config["path"]).rstrip("/") or "/"
-        find_cmd = (
+        # The redirect goes INSIDE the sh -c so it silences find's
+        # permission-denied noise without also silencing sudo's refusal.
+        inner = (
             f"find {shlex.quote(base)} -maxdepth 1 "
             f"-name {shlex.quote(pattern)} -type f -print0 2>/dev/null"
         )
-        if self.ssh_sudo:
-            find_cmd = f"sudo {find_cmd}"
+        find_cmd = self._elevate_shell(inner)
         res = subprocess.run(
             self._build_ssh_command() + [find_cmd],
             check=False,
@@ -1996,8 +2157,7 @@ class SSHRawEndpoint(RawEndpoint):
         Returns ``(created_utc, size)`` or ``(None, 0)`` if it cannot be stat'd."""
         q = shlex.quote(remote_path)
         stat_cmd = f"stat -c '%Y %s' {q} 2>/dev/null || stat -f '%m %z' {q}"
-        if self.ssh_sudo:
-            stat_cmd = f"sudo sh -c {shlex.quote(stat_cmd)}"
+        stat_cmd = self._elevate(f"sh -c {shlex.quote(stat_cmd)}")
         try:
             res = subprocess.run(
                 self._build_ssh_command() + [stat_cmd],
@@ -2161,8 +2321,7 @@ class SSHRawEndpoint(RawEndpoint):
 
         ssh_cmd = self._build_ssh_command()
         remote_cat = f"cat {shlex.quote(remote)}"
-        if self.ssh_sudo:
-            remote_cat = f"sudo sh -c {shlex.quote(remote_cat)}"
+        remote_cat = self._elevate(f"sh -c {shlex.quote(remote_cat)}")
         # Quote every argv element: this string is run by a local bash. ssh_cmd
         # carries operator config (ssh_opts, key path) that may contain spaces.
         ssh_part = (
@@ -2202,9 +2361,8 @@ class SSHRawEndpoint(RawEndpoint):
         ssh_cmd = self._build_ssh_command()
 
         # List .meta files
-        find_cmd = f"find {shlex.quote(str(path))} -name '*.meta' -type f 2>/dev/null"
-        if self.ssh_sudo:
-            find_cmd = f"sudo {find_cmd}"
+        inner = f"find {shlex.quote(str(path))} -name '*.meta' -type f 2>/dev/null"
+        find_cmd = self._elevate_shell(inner)
 
         full_cmd = ssh_cmd + [find_cmd]
 
@@ -2220,8 +2378,7 @@ class SSHRawEndpoint(RawEndpoint):
                 continue
             try:
                 cat_cmd = f"cat {shlex.quote(meta_path)}"
-                if self.ssh_sudo:
-                    cat_cmd = f"sudo {cat_cmd}"
+                cat_cmd = self._elevate(cat_cmd)
                 result = subprocess.run(
                     ssh_cmd + [cat_cmd],
                     check=True,
@@ -2268,11 +2425,8 @@ class SSHRawEndpoint(RawEndpoint):
         # discover_raw_snapshots' filename-fallback pass.
         loaded_names = {s.name for s in snapshots}
         prefix = self.config.get("snap_prefix", "")
-        find_stream_cmd = (
-            f"find {shlex.quote(str(path))} -name '*.btrfs*' -type f 2>/dev/null"
-        )
-        if self.ssh_sudo:
-            find_stream_cmd = f"sudo {find_stream_cmd}"
+        inner = f"find {shlex.quote(str(path))} -name '*.btrfs*' -type f 2>/dev/null"
+        find_stream_cmd = self._elevate_shell(inner)
         result = subprocess.run(
             ssh_cmd + [find_stream_cmd], check=False, capture_output=True, text=True
         )
@@ -2322,8 +2476,7 @@ class SSHRawEndpoint(RawEndpoint):
             # Portable mtime+size: GNU/busybox `stat -c`, else BSD/macOS `stat -f`.
             q = shlex.quote(stream_path_str)
             stat_cmd = f"stat -c '%Y %s' {q} 2>/dev/null || stat -f '%m %z' {q}"
-            if self.ssh_sudo:
-                stat_cmd = f"sudo sh -c {shlex.quote(stat_cmd)}"
+            stat_cmd = self._elevate(f"sh -c {shlex.quote(stat_cmd)}")
             try:
                 stat_result = subprocess.run(
                     ssh_cmd + [stat_cmd],
@@ -2334,7 +2487,18 @@ class SSHRawEndpoint(RawEndpoint):
                 mtime_str, size_str = stat_result.stdout.strip().split()
                 created = datetime.fromtimestamp(int(mtime_str), tz=timezone.utc)
                 size = int(size_str)
-            except (subprocess.CalledProcessError, ValueError):
+            except (subprocess.CalledProcessError, ValueError) as e:
+                stderr = getattr(e, "stderr", "") or ""
+                if isinstance(stderr, (bytes, bytearray)):
+                    stderr = stderr.decode(errors="replace")
+                if _is_sudo_denial(stderr.strip()):
+                    # Not a per-file accident: sudo will refuse every stat in this
+                    # loop, so the listing would silently shrink to nothing and
+                    # look like a target holding no backups.
+                    raise RuntimeError(
+                        f"Cannot stat backups on {self.hostname}: {stderr.strip()}. "
+                        "The listing is INCOMPLETE -- this is not an empty target."
+                    ) from e
                 # A committed stream we cannot stat (removed mid-list, permission
                 # error) must NOT be surfaced with a fabricated created=now, which
                 # would sort as newest and distort prune / parent selection. Skip it.
@@ -2393,8 +2557,7 @@ class SSHRawEndpoint(RawEndpoint):
                     f"rm -f {shlex.quote(str(snapshot.stream_path))} "
                     f"{shlex.quote(str(snapshot.metadata_path))}"
                 )
-                if self.ssh_sudo:
-                    rm_cmd = f"sudo {rm_cmd}"
+                rm_cmd = self._elevate(rm_cmd)
 
                 full_cmd = ssh_cmd + [rm_cmd]
                 subprocess.run(full_cmd, check=True, capture_output=True)
@@ -2406,6 +2569,22 @@ class SSHRawEndpoint(RawEndpoint):
                         s for s in self._cached_snapshots if s.name != snapshot.name
                     ]
             except subprocess.CalledProcessError as e:
+                stderr = (e.stderr or b"").decode(errors="replace").strip()
                 logger.error(
-                    "Failed to delete remote snapshot %s: %s", snapshot.name, e
+                    "Failed to delete remote snapshot %s: %s",
+                    snapshot.name,
+                    stderr or e,
                 )
+                if _is_sudo_denial(stderr):
+                    # Every delete in this run will fail for the same reason, and
+                    # prune would otherwise finish "successfully" having removed
+                    # nothing -- so the retention policy silently stops applying
+                    # while the operator is told it ran.
+                    raise __util__.AbortError(
+                        f"Cannot delete backups on {self.hostname}: {stderr}. "
+                        "Retention did NOT run. A raw+ssh target stores plain "
+                        "files, so with ssh_sudo the remote user needs "
+                        "passwordless sudo for rm (and find/cat/stat), not for "
+                        "btrfs; alternatively give the user ownership of the "
+                        "backup directory and turn ssh_sudo off."
+                    ) from e
