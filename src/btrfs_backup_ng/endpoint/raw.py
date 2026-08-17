@@ -1972,7 +1972,15 @@ class SSHRawEndpoint(RawEndpoint):
         # as a substring. The remote shell concatenates it before echoing, so a
         # command that really runs still prints the marker intact.
         head, tail = _ELEVATION_SENTINEL[:6], _ELEVATION_SENTINEL[6:]
-        probed = f'{inner}; __bbng_rc=$?; echo {head}"{tail}" >&2; exit $__bbng_rc'
+        # printf with a LEADING newline, not echo: the marker must both end its
+        # line and START one. echo only terminates, so an inner command that left
+        # an unterminated write on stderr -- measured with a large listing --
+        # gets the marker appended to its partial line. No line then equals the
+        # sentinel, and a perfectly healthy run is reported as never elevated.
+        probed = (
+            f"{inner}; __bbng_rc=$?; "
+            f"printf '\\n%s\\n' {head}\"{tail}\" >&2; exit $__bbng_rc"
+        )
         return self._elevate(f"sh -c {shlex.quote(probed)}")
 
     def _exec_remote_command(

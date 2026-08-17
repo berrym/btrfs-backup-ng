@@ -608,8 +608,8 @@ class TestTheSentinelDoesNotMaskTheInnerExitStatus:
         # echo sits between them; matched on its head because the marker literal
         # is split in the emitted text.
         head = _ELEVATION_SENTINEL[:6]
-        assert wrapped.index("__bbng_rc=$?") < wrapped.index(f"echo {head}")
-        assert wrapped.index(f"echo {head}") < wrapped.index("exit $__bbng_rc")
+        assert wrapped.index("__bbng_rc=$?") < wrapped.index(head)
+        assert wrapped.index(head) < wrapped.index("exit $__bbng_rc")
 
     @pytest.mark.parametrize(
         ("inner", "expected_rc"),
@@ -730,9 +730,13 @@ class TestElevationIsProvenNotReGuessed:
             )
 
 
-# Verbatim from real sudo (1.9.13p3 / 1.9.15p5 / 1.9.16p2) refusing the exact
-# command this module emits. sudo quotes the WHOLE refused command back, so the
-# marker appears in stderr although nothing ran.
+# Captured from real sudo (1.9.13p3 / 1.9.15p5 / 1.9.16p2) refusing this module's
+# command, before the marker literal was split in the emitted text. sudo quotes
+# the WHOLE refused command back, so the marker appears in stderr although
+# nothing ran. Kept in this pre-split form deliberately: it pins the PREDICATE
+# independently of how the command is emitted, so the predicate stays correct
+# even if the splitting is ever changed or dropped. Today's refusal echo carries
+# the split form instead, which cannot contain the literal at all.
 SUDO_ECHOES_THE_COMMAND_BACK = (
     "Sorry, user bbng is not allowed to execute '/usr/bin/sh -c find /backup "
     '-maxdepth 1 -name "*.meta" -type f -print0 2>/dev/null; __bbng_rc=$?; '
@@ -792,3 +796,49 @@ class TestARefusalCannotForgeTheProof:
         script = wrapped.split("sudo -n sh -c ", 1)[1]
         proc = sp.run(["sh", "-c", f"sh -c {script}"], capture_output=True, text=True)
         assert raw_mod._elevation_proven(proc.stderr), proc.stderr
+
+
+class TestTheMarkerAlwaysStartsItsOwnLine:
+    """The proof must survive an inner command that left stderr mid-line.
+
+    `echo X >&2` terminates the marker's line but does not start one. An inner
+    command whose last stderr write has no trailing newline -- measured with a
+    large listing -- gets the marker appended to that partial line. No line then
+    equals the sentinel, so a perfectly healthy elevated run is reported as
+    never having been elevated, and the backup aborts.
+    """
+
+    def test_a_partial_stderr_line_before_the_marker_does_not_suppress_it(self):
+        assert (
+            raw_mod._elevation_proven(f"partial-no-newline{_ELEVATION_SENTINEL}")
+            is False
+        ), "a marker glued to a partial line is correctly NOT proof"
+        # ...which is why the emitter must start a fresh line itself:
+        assert (
+            raw_mod._elevation_proven(f"partial-no-newline\n{_ELEVATION_SENTINEL}\n")
+            is True
+        )
+
+    def test_the_emitter_starts_a_fresh_line(self):
+        """Runs the emitted string after an unterminated write, in a real shell."""
+        import subprocess as sp
+
+        wrapped = _endpoint()._elevate_shell("true")
+        script = wrapped.split("sudo -n sh -c ", 1)[1]
+        proc = sp.run(
+            ["sh", "-c", f"printf 'partial-no-newline' >&2; sh -c {script}"],
+            capture_output=True,
+            text=True,
+        )
+        assert raw_mod._elevation_proven(proc.stderr), repr(proc.stderr)
+        assert "partial-no-newline" in proc.stderr
+
+    def test_the_command_stays_a_single_line(self):
+        """A literal newline in the wire command is fragile over ssh and in logs."""
+        wrapped = _endpoint()._elevate_shell("true")
+        assert "\n" not in wrapped
+        assert "\\n" in wrapped  # escapes, interpreted by the remote printf
+
+    def test_splitting_the_literal_still_holds(self):
+        """The round-4 forge must stay closed by this change."""
+        assert _ELEVATION_SENTINEL not in _endpoint()._elevate_shell("true")
