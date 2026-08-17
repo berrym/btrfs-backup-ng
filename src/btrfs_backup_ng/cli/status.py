@@ -209,14 +209,15 @@ def execute_status(args: argparse.Namespace) -> int:
                     action = record.get("action", "?")
                     snapshot = record.get("snapshot", "N/A")
 
-                    status_icon = (
-                        "✓"
-                        if status == "completed"
-                        else "✗"
-                        if status == "failed"
-                        else "…"
-                    )
-                    line = f"  {status_icon} {ts} {action:10} {snapshot}"
+                    # Plain-ASCII status words, not glyphs: this output is read
+                    # from cron/systemd logs where the stream may not be UTF-8
+                    # (a non-ASCII character raises UnicodeEncodeError there) and
+                    # where "grep FAILED" has to work.
+                    status_label = {
+                        "completed": "[OK]",
+                        "failed": "[FAILED]",
+                    }.get(status, "[STARTED]")
+                    line = f"  {status_label:<9} {ts} {action:10} {snapshot}"
 
                     if record.get("duration_seconds"):
                         line += f" ({_format_duration(record['duration_seconds'])})"
