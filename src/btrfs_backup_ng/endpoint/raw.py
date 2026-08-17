@@ -293,12 +293,18 @@ def _is_sudo_denial(stderr: str) -> bool:
       would report "no sidecar" and let backfill OVERWRITE a real record;
     * calling a benign warning a denial aborts loudly, visibly, and recoverably.
 
-    So where sudo's own behaviour is genuinely ambiguous, this errs toward
-    "denial". "unable to resolve host" is the known ambiguous one: it is emitted
-    only under ``Defaults fqdn`` (absent from stock sudoers, and it produced no
-    such message on a measured host), and sudo's NEWS records it becoming a fatal
-    error in 1.8.26 while it has historically been reported as warn-and-continue.
-    Treating it as a denial is the conservative reading for these three sites.
+    That asymmetry argues for erring toward "denial" -- but only where sudo's
+    behaviour is genuinely unknown, never against measurement. Two messages were
+    on the deny side for exactly that reason and have been removed, because
+    measurement settled them: with real sudo in stock Debian (1.9.13p3) and
+    Ubuntu (1.9.15p5) containers, with no ``Defaults fqdn`` configured, a host
+    whose name does not resolve emits "sudo: unable to resolve host <name>" and
+    then RUNS the command; "unable to send audit message" is likewise non-fatal
+    by default (``ignore_logfile_errors`` is on). Treating either as a refusal
+    turned an ordinary command failure into a hard abort that blamed a sudoers
+    policy which was already correct.
+
+    So: only messages that mean sudo did NOT run the command belong here.
     """
     lowered = (stderr or "").lower()
     return any(
@@ -329,9 +335,6 @@ def _is_sudo_denial(stderr: str) -> bool:
             # equally impossible, so it belongs here rather than in the routine
             # bucket -- an earlier test wrongly pinned this as an ordinary failure.
             "sudo: command not found",
-            # Ambiguous; see SCOPE above for why these land on the deny side.
-            "unable to send audit message",
-            "unable to resolve host",
         )
     )
 
@@ -365,6 +368,17 @@ def _check_remote_listing(
     "0 ok, 0 corrupt" and exit 0 for a target full of backups it never read.
     """
     stderr = (result.stderr or "").strip()
+    if result.returncode == 255 and _ELEVATION_SENTINEL not in (result.stderr or ""):
+        raise RuntimeError(
+            f"Cannot reach raw+ssh target {host}: "
+            f"{_strip_sentinel(stderr) or 'ssh connection failed'}. "
+            "Its backups could NOT be listed -- this is NOT an empty target. Check the "
+            "host is up and reachable, then retry."
+        )
+    # Only then elevation: a 255 above is the transport, and its sentinel is
+    # legitimately absent because the remote never ran anything. Checking
+    # elevation first would tell an operator whose host is simply DOWN that
+    # their sudoers policy is wrong.
     if elevated and _ELEVATION_SENTINEL not in (result.stderr or ""):
         raise RuntimeError(
             f"Cannot list raw+ssh target {path} on {host}: the remote command was "
@@ -381,33 +395,21 @@ def _check_remote_listing(
         return
     # Invariant: 255 is attributed to an ssh transport/auth/DNS failure. This relies on
     # the remote enumeration command never itself exiting 255 -- true for the commands
-    # here (find exits 0/1/2, or 127 if absent; sudo exits 1 on auth failure). Note
-    # _elevate_shell re-raises the INNER status as the wrapper's own, so this invariant
-    # now also depends on no inner command ever exiting 255; keep that in mind before
-    # routing anything but find/stat through it. ssh's default BatchMode +
-    # ConnectTimeout (see _build_ssh_command) make a down/black-holing host reach this
-    # 255 path fast rather than hanging.
-    if result.returncode == 255:
-        raise RuntimeError(
-            f"Cannot reach raw+ssh target {host}: {stderr or 'ssh connection failed'}. "
-            "Its backups could NOT be listed -- this is NOT an empty target. Check the "
-            "host is up and reachable, then retry."
-        )
-    # A refused sudo is the same false all-clear wearing different clothes: the
-    # backups are present and readable by root, we simply were not allowed to
-    # look. Measured against a real host whose sudoers grants NOPASSWD for
-    # /usr/bin/btrfs alone -- the policy this project's own README recommends --
-    # a target holding one backup listed as ZERO snapshots and exited 0.
-    if _is_sudo_denial(stderr):
-        raise RuntimeError(
-            f"Cannot list raw+ssh target {path} on {host}: {stderr}. Its backups "
-            "could NOT be read -- this is NOT an empty target. A raw+ssh target "
-            "stores plain files, so with ssh_sudo the remote user needs "
-            "passwordless sudo for the FILE tools (find, cat, stat, mkdir, mv, "
-            "rm), not for btrfs. Either grant those in sudoers, or -- simpler and "
-            "safer -- give the user ownership of the backup directory "
-            "(chown/setfacl) and turn ssh_sudo off."
-        )
+    # here (find exits 0/1/2, or 127 if absent; sudo exits 1 on auth failure). Since
+    # _elevate_shell re-raises the INNER status as the wrapper's own, the sentinel is
+    # also required: if the remote shell demonstrably ran, a 255 came from the command,
+    # not from the transport, and must not be reported as an unreachable host. ssh's
+    # default BatchMode + ConnectTimeout (see _build_ssh_command) make a down or
+    # black-holing host reach this path fast rather than hanging.
+    # Deliberately no sudo-message classification here. Reaching this point with
+    # elevated=True means the sentinel was present, which is positive proof that
+    # sudo handed over the shell -- so the command RAN, and a non-zero status is
+    # the command's own. Re-guessing that from sudo's text can only overrule the
+    # proof, and did: measured with real sudo in stock Debian and Ubuntu
+    # containers (no `Defaults fqdn` anywhere), a host whose name does not resolve
+    # gets "sudo: unable to resolve host <name>" AND the command runs regardless.
+    # Classifying that as a refusal turned an ordinary find failure into a hard
+    # abort telling the operator to fix a sudoers policy that was already correct.
     logger.warning(
         "Listing raw+ssh target %s returned rc=%s (%s); reporting only the backups "
         "that were readable",

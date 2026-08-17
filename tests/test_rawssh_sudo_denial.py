@@ -152,9 +152,11 @@ class TestListingRefusesToReportAnEmptyTarget:
     """The safety-critical case: backups exist, sudo says no, listing said zero."""
 
     def test_a_refused_find_raises_instead_of_returning_no_snapshots(self):
+        # elevated=True with the sentinel ABSENT is what a refusal looks like:
+        # sudo never handed over the shell, so nothing echoed the marker.
         result = MagicMock(returncode=1, stdout="", stderr=SUDO_DENIED)
         with pytest.raises(RuntimeError) as excinfo:
-            raw_mod._check_remote_listing(result, "nas", "/backup")
+            raw_mod._check_remote_listing(result, "nas", "/backup", elevated=True)
 
         message = str(excinfo.value)
         assert "NOT an empty target" in message
@@ -343,18 +345,20 @@ class TestSidecarCheckDoesNotInventAbsence:
             assert ep.sidecar_exists(snapshot) is True
 
     def test_a_benign_warning_with_a_real_absence_still_reports_absent(self):
-        """rc=1 from `test -f` plus a resolve warning is a missing file."""
+        """rc=1 from `test -f` plus a resolve warning is a missing file.
+
+        Measured with real sudo in stock Debian and Ubuntu containers, with no
+        `Defaults fqdn`: an unresolvable hostname produces this warning and sudo
+        RUNS the command anyway. Treating it as a refusal would abort every
+        backfill on such a host, blaming a sudoers policy that is already fine.
+        """
         ep = _endpoint()
         snapshot = MagicMock(metadata_path=Path("/backup/x.meta"))
         warned = MagicMock(
             returncode=1, stdout="", stderr="sudo: unable to resolve host nas"
         )
         with patch.object(ep, "_exec_remote_command", return_value=warned):
-            # Conservative: an ambiguous rc=1 with a sudo line is treated as a
-            # denial rather than an absence, because inventing an absence here
-            # lets backfill overwrite a real sidecar.
-            with pytest.raises(RuntimeError, match="overwrite"):
-                ep.sidecar_exists(snapshot)
+            assert ep.sidecar_exists(snapshot) is False
 
     def test_a_genuinely_missing_sidecar_is_still_reported_absent(self):
         ep = _endpoint()
@@ -640,3 +644,79 @@ class TestTheSentinelDoesNotMaskTheInnerExitStatus:
             "a failing elevated find produced no warning; its exit status was "
             "masked and the empty result looks authoritative"
         )
+
+
+class TestNoMessageLeaksTheInternalMarker:
+    """Every operator-facing string must be sanitised, not just the warning.
+
+    The marker is an implementation detail of the elevation probe. Leaking it
+    into an error puts it in bug reports and support threads, where it reads as
+    part of the failure.
+    """
+
+    @pytest.mark.parametrize(
+        ("returncode", "stderr", "match"),
+        [
+            (255, "No route to host", "Cannot reach"),
+            (1, "sudo: a password is required", "never run"),
+            (1, "anything at all", "never run"),
+        ],
+    )
+    def test_error_messages_are_sanitised(self, returncode, stderr, match):
+        """Both surviving raise-sites fire only when the sentinel is ABSENT."""
+        result = MagicMock(returncode=returncode, stdout="", stderr=stderr)
+        with pytest.raises(RuntimeError) as excinfo:
+            raw_mod._check_remote_listing(result, "nas", "/backup", elevated=True)
+        assert match in str(excinfo.value)
+        assert _ELEVATION_SENTINEL not in str(excinfo.value)
+
+
+class TestElevationIsProvenNotReGuessed:
+    """Once the sentinel is present, elevation is proven -- do not overrule it.
+
+    The guard used to consult sudo's message text even after the sentinel had
+    demonstrated the shell ran. That branch was unreachable while the wrapper
+    always exited 0; re-raising the inner status made it live, and it then
+    turned ordinary failures into false sudo diagnoses. Measured with real sudo
+    in stock Debian (1.9.13p3) and Ubuntu (1.9.15p5) containers with no
+    `Defaults fqdn`: a host whose name does not resolve emits "sudo: unable to
+    resolve host <name>" and RUNS the command. A find failure there was reported
+    as a permissions problem and told the operator to fix a correct sudoers.
+    """
+
+    @pytest.mark.parametrize(
+        "stderr",
+        [
+            "sudo: unable to resolve host nas: Name or service not known",
+            "sudo: unable to send audit message: Operation not permitted",
+            "sudo: a password is required",  # even this: the shell demonstrably ran
+        ],
+    )
+    def test_a_sudo_message_never_overrules_the_sentinel(self, stderr):
+        """With the sentinel present the command ran; a non-zero status is its own."""
+        result = MagicMock(
+            returncode=1, stdout="", stderr=f"{stderr}\n{_ELEVATION_SENTINEL}"
+        )
+        raw_mod._check_remote_listing(result, "nas", "/backup", elevated=True)
+
+    def test_an_inner_255_is_not_blamed_on_the_transport(self):
+        """255 means "ssh could not connect" only if the shell never ran.
+
+        _elevate_shell re-raises the inner status, so a command exiting 255 would
+        otherwise be reported as an unreachable host while the sentinel proves
+        the host was reached.
+        """
+        result = MagicMock(
+            returncode=255, stdout="", stderr=f"tool exited 255\n{_ELEVATION_SENTINEL}"
+        )
+        raw_mod._check_remote_listing(result, "nas", "/backup", elevated=True)
+
+    def test_a_transport_failure_without_the_sentinel_still_raises(self):
+        """Guard against over-correcting: a real 255 must stay loud."""
+        with pytest.raises(RuntimeError, match="Cannot reach"):
+            raw_mod._check_remote_listing(
+                MagicMock(returncode=255, stdout="", stderr="No route to host"),
+                "nas",
+                "/backup",
+                elevated=True,
+            )
