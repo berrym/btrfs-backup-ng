@@ -152,7 +152,9 @@ def test_ssh_commit_wraps_in_sudo_when_configured():
 
     # First remote call is the sudoed mv; the sidecar stat/write calls follow.
     remote = mrun.call_args_list[0][0][0][-1]  # last element of the ssh argv
-    assert remote.startswith("sudo ")
+    # LC_ALL=C pins sudo's (localised) diagnostic; -n fails fast rather than
+    # prompting on a connection that has no tty.
+    assert remote.startswith("LC_ALL=C sudo -n ")
     assert "sync && mv -f" in remote
     assert "&& sync" in remote
 

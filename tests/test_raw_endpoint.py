@@ -822,7 +822,10 @@ class TestSSHRawEndpointMethods:
                 endpoint._prepare()
 
         call_args = mock_run.call_args_list[0][0][0]  # first call = mkdir
-        assert "sudo mkdir" in call_args[-1]
+        # `-n` is load-bearing: the ssh connection has no tty, so an
+        # interactive sudo can only hang or report "a terminal is required"
+        # instead of the actual refusal.
+        assert "sudo -n mkdir" in call_args[-1]
 
     def test_prepare_failure(self):
         """Test prepare handles SSH failure."""
