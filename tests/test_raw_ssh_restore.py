@@ -133,10 +133,15 @@ def test_list_second_pass_stat_is_portable_and_sudo_scoped():
     fallback runs inside one `sudo sh -c` (not just the first stat)."""
     ep = SSHRawEndpoint(config={"path": "/backup", "hostname": "nas", "ssh_sudo": True})
     with patch("subprocess.run") as mrun:
+        from btrfs_backup_ng.endpoint.raw import _ELEVATION_SENTINEL
+
         mrun.side_effect = [
-            MagicMock(returncode=0, stdout=""),  # find *.meta -> none
-            MagicMock(returncode=0, stdout="/backup/x.btrfs\n"),  # find stream
-            MagicMock(returncode=0, stdout="1700000000 4096\n"),  # stat
+            # Elevated finds carry the sentinel that proves the remote shell ran.
+            MagicMock(returncode=0, stdout="", stderr=_ELEVATION_SENTINEL),
+            MagicMock(
+                returncode=0, stdout="/backup/x.btrfs\n", stderr=_ELEVATION_SENTINEL
+            ),
+            MagicMock(returncode=0, stdout="1700000000 4096\n", stderr=""),
         ]
         ep.list_snapshots()
     stat_str = " ".join(mrun.call_args_list[2][0][0])  # the stat call's argv

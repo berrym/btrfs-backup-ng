@@ -227,6 +227,26 @@ def _open_failure_reason(e: OSError) -> str:
     return reasons.get(e.errno, str(e))
 
 
+_ELEVATION_SENTINEL = "__BBNG_ELEVATED__"
+"""Printed to stderr by an elevated shell AFTER the wrapped command has run.
+
+Positive evidence beats enumeration. sudo's ways of refusing are open-ended --
+localised, version-dependent, distro-patched, and it may not be installed at all
+-- so a guard keyed on recognising failure will always have a gap, and each gap
+is a target reported as empty. A guard keyed on recognising SUCCESS has none: if
+the sentinel is absent, the shell did not run, full stop.
+"""
+
+
+def _strip_sentinel(stderr: str) -> str:
+    """Remove the sentinel so it never reaches a user-facing message or log."""
+    return "\n".join(
+        line
+        for line in (stderr or "").splitlines()
+        if line.strip() != _ELEVATION_SENTINEL
+    ).strip()
+
+
 def _is_sudo_denial(stderr: str) -> bool:
     """Whether stderr shows sudo refusing to elevate, rather than the command failing.
 
@@ -288,7 +308,11 @@ def _is_sudo_denial(stderr: str) -> bool:
 
 
 def _check_remote_listing(
-    result: subprocess.CompletedProcess, host: str, path: Any
+    result: subprocess.CompletedProcess,
+    host: str,
+    path: Any,
+    *,
+    elevated: bool = False,
 ) -> None:
     """Guard a remote enumeration so a CONNECTION failure is never reported as an
     empty target.
@@ -299,10 +323,33 @@ def _check_remote_listing(
     connection/auth/DNS failures, so that is raised as a clear error. A ``find`` on an
     empty but reachable directory exits 0 (a genuinely empty target); any other
     non-zero (e.g. a missing directory) is logged and treated as "no snapshots" rather
-    than swallowed silently."""
+    than swallowed silently.
+
+    ``elevated`` says the command was wrapped by :meth:`SSHRawEndpoint._elevate_shell`,
+    which appends a sentinel that only prints if the wrapped shell actually ran. Its
+    ABSENCE proves elevation failed, whatever sudo said and whatever it exited with --
+    so this needs no list of sudo's failure messages, and cannot be defeated by a
+    refusal wording nobody enumerated. Trying to enumerate them was the previous
+    approach and it missed, among others, "you must have a tty to run sudo"
+    (requiretty), "no valid sudoers sources found" (a broken sudoers), and
+    "sudo: command not found" -- each of which made ``raw verify`` report
+    "0 ok, 0 corrupt" and exit 0 for a target full of backups it never read.
+    """
+    stderr = (result.stderr or "").strip()
+    if elevated and _ELEVATION_SENTINEL not in (result.stderr or ""):
+        raise RuntimeError(
+            f"Cannot list raw+ssh target {path} on {host}: the remote command was "
+            f"never run"
+            + (f" ({_strip_sentinel(stderr)})" if stderr else "")
+            + ". Its backups could NOT be read -- this is NOT an empty target. "
+            "ssh_sudo is enabled, and a raw+ssh target stores plain files, so the "
+            "remote user needs passwordless sudo for the FILE tools (find, cat, "
+            "stat, mkdir, mv, rm), not for btrfs. Either grant those in sudoers, "
+            "or -- simpler and safer -- give the user ownership of the backup "
+            "directory (chown/setfacl) and turn ssh_sudo off."
+        )
     if result.returncode == 0:
         return
-    stderr = (result.stderr or "").strip()
     # Invariant: 255 is attributed to an ssh transport/auth/DNS failure. This relies on
     # the remote enumeration command never itself exiting 255 -- true for the commands
     # here (find exits 0/1/2; sudo exits 1 on auth failure). ssh's default BatchMode +
@@ -334,7 +381,7 @@ def _check_remote_listing(
         "that were readable",
         path,
         result.returncode,
-        stderr or "no stderr",
+        _strip_sentinel(stderr) or "no stderr",
     )
 
 
@@ -1849,7 +1896,12 @@ class SSHRawEndpoint(RawEndpoint):
         """
         if not self.ssh_sudo:
             return inner
-        return self._elevate(f"sh -c {shlex.quote(inner)}")
+        # The sentinel runs only if sudo actually handed the shell over, and is
+        # emitted regardless of the inner command's exit status (find exits 1/2
+        # routinely). Its absence therefore means "elevation failed", which the
+        # listing guard can act on without knowing how sudo phrases refusal.
+        probed = f"{inner}; echo {_ELEVATION_SENTINEL} >&2"
+        return self._elevate(f"sh -c {shlex.quote(probed)}")
 
     def _exec_remote_command(
         self,
@@ -2142,7 +2194,7 @@ class SSHRawEndpoint(RawEndpoint):
             text=True,
         )
         # Never let an unreachable host look like an empty target (false all-clear).
-        _check_remote_listing(res, self.hostname, base)
+        _check_remote_listing(res, self.hostname, base, elevated=self.ssh_sudo)
         out: list[str] = []
         for p in res.stdout.split("\x00"):
             if not p or "\n" in p:
@@ -2368,7 +2420,7 @@ class SSHRawEndpoint(RawEndpoint):
 
         result = subprocess.run(full_cmd, check=False, capture_output=True, text=True)
         # Never let an unreachable host look like an empty target (false all-clear).
-        _check_remote_listing(result, self.hostname, path)
+        _check_remote_listing(result, self.hostname, path, elevated=self.ssh_sudo)
         meta_files = result.stdout.strip().split("\n") if result.stdout.strip() else []
 
         # For each metadata file, fetch and parse
@@ -2434,7 +2486,7 @@ class SSHRawEndpoint(RawEndpoint):
         # but DROPS before/at this second pass (e.g. a ServerAlive keepalive timeout
         # mid-listing) must still fail loudly rather than truncate the legacy-stream
         # pass to [] and under-report the target's backups.
-        _check_remote_listing(result, self.hostname, path)
+        _check_remote_listing(result, self.hostname, path, elevated=self.ssh_sudo)
         stream_files = (
             result.stdout.strip().split("\n") if result.stdout.strip() else []
         )

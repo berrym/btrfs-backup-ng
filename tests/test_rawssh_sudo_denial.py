@@ -28,7 +28,11 @@ import pytest
 
 from btrfs_backup_ng import __util__
 from btrfs_backup_ng.endpoint import raw as raw_mod
-from btrfs_backup_ng.endpoint.raw import SSHRawEndpoint, _is_sudo_denial
+from btrfs_backup_ng.endpoint.raw import (
+    _ELEVATION_SENTINEL,
+    SSHRawEndpoint,
+    _is_sudo_denial,
+)
 
 # What sudo actually writes when it refuses; captured from a real remote.
 SUDO_DENIED = "sudo: a password is required"
@@ -127,7 +131,6 @@ class TestSudoDenialIsRecognised:
             "",
             "find: '/backup/gone': No such file or directory",
             "cat: /backup/x.btrfs: Permission denied",
-            "bash: sudo: command not found",
             "ssh: connect to host nas port 22: No route to host",
         ],
     )
@@ -198,7 +201,9 @@ class TestSudoStderrSurvivesTheRedirect:
 
         def fake_run(cmd, **_):
             sent.append(cmd[-1])
-            return MagicMock(returncode=0, stdout="", stderr="")
+            # A real elevated shell prints the sentinel; without it the guard
+            # correctly refuses to believe the listing.
+            return MagicMock(returncode=0, stdout="", stderr=_ELEVATION_SENTINEL)
 
         with patch.object(raw_mod.subprocess, "run", side_effect=fake_run):
             ep.list_snapshots(flush_cache=True, **kwargs)
@@ -390,9 +395,13 @@ class TestPerFileStatFailuresAreClassified:
     def _list_with_stat_result(stat_result):
         ep = _endpoint()
         calls = [
-            MagicMock(returncode=0, stdout="", stderr=""),  # find *.meta -> none
-            MagicMock(returncode=0, stdout="/backup/x.btrfs\n", stderr=""),  # streams
-            stat_result,  # the per-stream stat
+            # The two finds are elevated, so they carry the sentinel proving the
+            # remote shell ran; only the per-stream stat varies.
+            MagicMock(returncode=0, stdout="", stderr=_ELEVATION_SENTINEL),
+            MagicMock(
+                returncode=0, stdout="/backup/x.btrfs\n", stderr=_ELEVATION_SENTINEL
+            ),
+            stat_result,
         ]
         with patch.object(raw_mod.subprocess, "run", side_effect=calls):
             return ep.list_snapshots(flush_cache=True)
@@ -451,4 +460,111 @@ class TestSudoMessagesArePinnedToAPredictableLanguage:
         """No sudo means no message to pin; do not perturb the working path."""
         assert (
             _endpoint(ssh_sudo=False)._elevate("rm -f /backup/x") == "rm -f /backup/x"
+        )
+
+
+class TestElevationIsProvenNotGuessed:
+    """The listing guard requires POSITIVE evidence that the remote shell ran.
+
+    Enumerating sudo's refusals was tried and lost. The marker list missed
+    "sorry, you must have a tty to run sudo" (a requiretty policy), "no valid
+    sudoers sources found, quitting" (a fat-fingered /etc/sudoers), and
+    "sudo: command not found" (sudo not installed) -- all real strings from
+    sudo 1.9.17's own catalog. Each made `raw verify` print "0 ok, 0 corrupt"
+    and exit 0 for a target holding backups it never read, which is the precise
+    false all-clear this module exists to prevent. `cli/raw_cmd.py` never calls
+    prepare(), so `raw list`/`verify`/`backfill-metadata` reach this guard with
+    no earlier gate to catch the failure.
+
+    So the rule is inverted: the elevated wrapper prints a sentinel after the
+    inner command, and its ABSENCE means elevation failed -- independent of
+    wording, locale, exit status, sudo version, and whether sudo exists at all.
+    """
+
+    @pytest.mark.parametrize(
+        "stderr",
+        [
+            "sudo: a password is required",
+            "sudo: sorry, you must have a tty to run sudo",
+            "sudo: no valid sudoers sources found, quitting",
+            "sudo: sudoers specifies that root is not allowed to sudo",
+            "sudo: effective uid is not 0, is /usr/bin/sudo on a nosuid filesystem?",
+            "bash: sudo: command not found",
+            "sudo: irgendein unbekannter fehler",  # never-seen wording, any language
+            "",  # no diagnostic at all
+        ],
+    )
+    def test_any_failure_to_run_the_command_is_an_error_not_an_empty_target(
+        self, stderr
+    ):
+        result = MagicMock(returncode=1, stdout="", stderr=stderr)
+        with pytest.raises(RuntimeError, match="NOT an empty target"):
+            raw_mod._check_remote_listing(result, "nas", "/backup", elevated=True)
+
+    def test_the_sentinel_makes_an_empty_target_genuinely_empty(self):
+        """Elevation succeeded and there was nothing there: not an error."""
+        raw_mod._check_remote_listing(
+            MagicMock(returncode=0, stdout="", stderr=_ELEVATION_SENTINEL),
+            "nas",
+            "/backup",
+            elevated=True,
+        )
+
+    def test_an_ordinary_find_failure_after_a_real_run_still_only_warns(self):
+        """find exits 1/2 routinely; once the shell demonstrably ran, that is
+        a listing detail rather than a permission failure."""
+        raw_mod._check_remote_listing(
+            MagicMock(
+                returncode=1,
+                stdout="",
+                stderr=f"find: '/backup/x': No such file\n{_ELEVATION_SENTINEL}",
+            ),
+            "nas",
+            "/backup",
+            elevated=True,
+        )
+
+    def test_an_unelevated_listing_is_unaffected(self):
+        """No sudo means no sentinel to expect; the working path must not break."""
+        raw_mod._check_remote_listing(
+            MagicMock(returncode=0, stdout="", stderr=""), "nas", "/backup"
+        )
+
+    def test_the_sentinel_never_leaks_into_a_user_facing_message(self):
+        """An internal marker in an operator-facing log is noise that gets
+        pasted into bug reports.
+
+        Asserts on what reaches the logger rather than on caplog: this project
+        configures logging itself, so caplog captures nothing here.
+        """
+        recorded = []
+        with patch.object(
+            raw_mod.logger, "warning", lambda msg, *a, **k: recorded.append(a)
+        ):
+            raw_mod._check_remote_listing(
+                MagicMock(
+                    returncode=1, stdout="", stderr=f"find: oops\n{_ELEVATION_SENTINEL}"
+                ),
+                "nas",
+                "/backup",
+                elevated=True,
+            )
+        assert recorded, "no warning was emitted"
+        text = " ".join(str(x) for x in recorded[0])
+        assert _ELEVATION_SENTINEL not in text
+        assert "find: oops" in text
+
+    def test_the_elevated_command_actually_emits_the_sentinel(self):
+        """The guard is only sound if the wrapper really appends it."""
+        ep = _endpoint()
+        wrapped = ep._elevate_shell("find /backup -name '*.meta' 2>/dev/null")
+        assert _ELEVATION_SENTINEL in wrapped
+        # After the inner command, and on stderr, so a failing find still proves
+        # the shell ran.
+        assert wrapped.index("find") < wrapped.index(_ELEVATION_SENTINEL)
+        assert ">&2" in wrapped
+
+    def test_the_unelevated_command_carries_no_sentinel(self):
+        assert (
+            _endpoint(ssh_sudo=False)._elevate_shell("find /backup") == "find /backup"
         )
