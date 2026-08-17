@@ -901,3 +901,64 @@ class TestTargetPathIsNormalisedAtLoad:
     def test_interior_whitespace_is_preserved(self, tmp_path):
         """Only the padding is noise; a directory may legitimately contain a space."""
         assert self._load_target(tmp_path, "/mnt/my backups").path == "/mnt/my backups"
+
+
+class TestRawSshWithSudoIsFlaggedNotBlocked:
+    """`raw+ssh://` + `ssh_sudo` is supported; it is also the classic footgun.
+
+    A raw target stores plain files, so the remote runs mkdir/find/cat/stat/mv/rm
+    and never btrfs -- which means the sudoers recipe written for `ssh://`
+    (`NOPASSWD: /usr/bin/btrfs`) authorises none of it. Measured on a real host
+    with exactly that policy: `sudo btrfs --version` is allowed and `sudo mkdir`
+    is refused. The config must load and run, and say so once.
+    """
+
+    @staticmethod
+    def _load(tmp_path, target_line, extra=""):
+        config_path = tmp_path / "bbng.toml"
+        config_path.write_text(
+            "[global]\n\n"
+            "[[volumes]]\n"
+            'path = "/home"\n\n'
+            "[[volumes.targets]]\n"
+            f'path = "{target_line}"\n{extra}'
+        )
+        return load_config(config_path)
+
+    def test_the_combination_still_loads(self, tmp_path):
+        """A warning, never a rejection: this configuration is supported."""
+        config, _ = self._load(
+            tmp_path, "raw+ssh://backup@nas:/mnt/store", "ssh_sudo = true\n"
+        )
+        target = config.get_enabled_volumes()[0].targets[0]
+        assert target.path == "raw+ssh://backup@nas:/mnt/store"
+        assert target.ssh_sudo is True
+
+    def test_it_warns_and_names_the_file_tools(self, tmp_path):
+        _, warnings = self._load(
+            tmp_path, "raw+ssh://backup@nas:/mnt/store", "ssh_sudo = true\n"
+        )
+        matching = [w for w in warnings if "ssh_sudo" in w]
+        assert matching, f"no ssh_sudo warning was emitted; got {warnings}"
+        text = matching[0]
+        # The whole point is telling them it is NOT btrfs they need to grant.
+        assert "btrfs" in text
+        assert "mkdir" in text or "FILE tools" in text
+        assert "chown" in text or "setfacl" in text
+
+    def test_raw_ssh_without_sudo_is_not_warned_about(self, tmp_path):
+        """The recommended setup must not nag."""
+        _, warnings = self._load(tmp_path, "raw+ssh://backup@nas:/mnt/store")
+        assert not [w for w in warnings if "ssh_sudo" in w], warnings
+
+    def test_plain_ssh_with_sudo_is_not_warned_about(self, tmp_path):
+        """ssh:// + ssh_sudo is the documented, correct pairing."""
+        _, warnings = self._load(
+            tmp_path, "ssh://backup@nas:/mnt/store", "ssh_sudo = true\n"
+        )
+        assert not [w for w in warnings if "ssh_sudo" in w], warnings
+
+    def test_local_raw_with_sudo_is_not_warned_about(self, tmp_path):
+        """A local raw target runs no remote commands at all."""
+        _, warnings = self._load(tmp_path, "raw:///mnt/store", "ssh_sudo = true\n")
+        assert not [w for w in warnings if "ssh_sudo" in w], warnings

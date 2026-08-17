@@ -4,11 +4,13 @@
 that prefix treated a remote raw target as a local path. Two consequences are
 pinned here, one per site, because both were user-visible and neither had a test:
 
-* ``cli/restore.py`` gives a ``raw+ssh://`` source none of the ``--ssh-*``
-  options, so its remote listing runs unprivileged. STILL PRESENT: the two tests
-  below are strict xfails, not fixes. Threading the options through as-is makes
-  the command worse rather than better, because ``SSHRawEndpoint`` elevates
-  *every* remote command it runs -- see their skip reasons.
+* ``cli/restore.py`` gave a ``raw+ssh://`` source none of the ``--ssh-*``
+  options, so its remote listing ran as whoever ssh logged in as and the
+  identity file was threaded under a key ``SSHRawEndpoint`` does not read.
+  Fixed here. This landed only after the endpoint stopped reporting a refused
+  sudo as an empty target: threading the options earlier turned a working
+  ``restore --list`` into a silent "No snapshots found" with exit 0, so the
+  two tests below were strict xfails until that was corrected.
 * ``cli/transfer.py`` handed ``Path()`` the whole URI when checking
   ``require_mount``. ``Path("raw:///mnt/usb")`` can never be a mount point, so
   the check aborted every raw transfer that asked for it -- the opposite of the
@@ -22,7 +24,7 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -50,25 +52,6 @@ def _restore_args(**overrides):
     return argparse.Namespace(**defaults)
 
 
-_RAWSSH_SUDO_BLOCKED = pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "Known defect, deliberately NOT fixed by threading the options through. "
-        "SSHRawEndpoint._exec_remote_command prefixes sudo onto every remote "
-        "command, not just the btrfs ones -- the POSIX-tool preflight and the "
-        "'find' that lists snapshots included. Measured against 192.168.0.70 "
-        "with the sudoers policy the README recommends (NOPASSWD limited to "
-        "/usr/bin/btrfs): honouring ssh_sudo here turns a working "
-        "'restore --list raw+ssh://...' into 'sudo: a password is required', "
-        "and then, once _prepare stops mkdir-ing, into a silent 'No snapshots "
-        "found' with exit 0. The endpoint must learn to elevate only the "
-        "commands that need it before the option can be threaded; until then "
-        "the working command stays working. Strict, so it fails the moment that "
-        "lands and this note goes stale."
-    ),
-)
-
-
 class TestRestoreThreadsSshOptionsToRemoteSources:
     """A remote source must receive the SSH options, whichever scheme it uses."""
 
@@ -84,7 +67,6 @@ class TestRestoreThreadsSshOptionsToRemoteSources:
         ):
             return _prepare_backup_endpoint(_restore_args(), source)
 
-    @_RAWSSH_SUDO_BLOCKED
     def test_rawssh_source_receives_ssh_sudo(self):
         """The bug: raw+ssh:// got no ssh_sudo, so the remote find ran unprivileged."""
         ep = self._endpoint_for("raw+ssh://backup@nas:/mnt/store")
@@ -99,7 +81,6 @@ class TestRestoreThreadsSshOptionsToRemoteSources:
             "run unprivileged and report no snapshots"
         )
 
-    @_RAWSSH_SUDO_BLOCKED
     def test_rawssh_source_receives_the_identity_file_under_the_key_it_reads(self):
         """SSHRawEndpoint reads ssh_key and ignores ssh_identity_file.
 
@@ -136,15 +117,37 @@ class TestRestoreThreadsSshOptionsToRemoteSources:
         assert Path(ep.config["path"]) == backups.resolve()
 
     def test_local_raw_source_keeps_the_path_parsed_from_its_uri(self, tmp_path):
-        """A raw source must not have its path overwritten with Path(uri).resolve().
-
-        choose_endpoint parses the path out of the URI itself; the old code also
-        assigned Path("raw:///x").resolve(), which resolves against the CWD.
-        """
+        """A raw source must not have its path overwritten with Path(uri).resolve()."""
         backups = tmp_path / "backups"
         backups.mkdir()
         ep = self._endpoint_for(f"raw://{backups}")
         assert Path(ep.config["path"]) == backups
+
+    @pytest.mark.parametrize(
+        "source", ["raw:///mnt/store", "raw+ssh://backup@nas:/mnt/store"]
+    )
+    def test_a_raw_source_is_never_handed_a_cwd_resolved_path(self, source):
+        """Pin what is COMPUTED, not only what survives.
+
+        choose_endpoint parses a raw URI itself and overwrites config["path"],
+        so passing it `Path("raw:///mnt/store").resolve()` -- a nonsense path
+        under the working directory -- is invisible today. It is still wrong to
+        compute, and it would become visible the moment choose_endpoint stopped
+        overriding. Asserting on the kwargs keeps the intent enforceable.
+        """
+        captured = {}
+
+        def fake_choose(path, kwargs, source=False):
+            captured.update(kwargs)
+            return MagicMock(config={})
+
+        with patch("btrfs_backup_ng.cli.restore.endpoint.choose_endpoint", fake_choose):
+            _prepare_backup_endpoint(_restore_args(), source)
+
+        assert "path" not in captured, (
+            f"a raw source was handed path={captured.get('path')!r}, which "
+            "resolves against the working directory"
+        )
 
 
 class TestRequireMountGate:

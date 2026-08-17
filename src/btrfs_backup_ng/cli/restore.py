@@ -14,6 +14,7 @@ from typing import Any
 from .. import __util__, endpoint
 from ..__logger__ import create_logger
 from ..config import ConfigError, find_config_file, load_config
+from ..core.target import parse_target
 from ..core.restore import (
     RestoreError,
     list_remote_snapshots,
@@ -451,8 +452,11 @@ def _prepare_backup_endpoint(args: argparse.Namespace, source: str):
         ),
     }
 
-    # SSH options
-    if source.startswith("ssh://"):
+    # SSH options. Dispatch on the scheme, not on a "ssh://" prefix: raw+ssh://
+    # does not start with it, so a remote raw source used to be given none of the
+    # --ssh-* options and its remote listing ran as whoever ssh logged in as.
+    scheme = parse_target(source)
+    if scheme.needs_ssh_options:
         endpoint_kwargs["ssh_sudo"] = getattr(args, "ssh_sudo", False)
         _hkp = getattr(args, "ssh_host_key_policy", None)
         if _hkp:
@@ -462,13 +466,22 @@ def _prepare_backup_endpoint(args: argparse.Namespace, source: str):
         )
         ssh_key = getattr(args, "ssh_key", None)
         if ssh_key:
-            endpoint_kwargs["ssh_identity_file"] = ssh_key
+            # The two remote endpoints read the identity file under DIFFERENT
+            # config keys: SSHEndpoint accepts either name, SSHRawEndpoint reads
+            # only "ssh_key". Threading one name for both silently drops
+            # --ssh-key for raw+ssh://, producing an ssh invocation with no -i
+            # flag and no error.
+            endpoint_kwargs[scheme.ssh_identity_config_key or "ssh_identity_file"] = (
+                ssh_key
+            )
         ssh_auth_sock = getattr(args, "ssh_auth_sock", None)
         if ssh_auth_sock:
             endpoint_kwargs["ssh_auth_sock"] = ssh_auth_sock
-    else:
+    elif not scheme.is_raw:
         # For local paths, we need to set 'path' as well since LocalEndpoint
-        # always resolves config["path"] during initialization
+        # always resolves config["path"] during initialization. A raw:// source
+        # is excluded: choose_endpoint parses the path out of the URI itself, and
+        # Path("raw:///x").resolve() would resolve against the working directory.
         endpoint_kwargs["path"] = Path(source).resolve()
 
     # Decryption settings for an encrypted raw backup. Needed for both raw://
