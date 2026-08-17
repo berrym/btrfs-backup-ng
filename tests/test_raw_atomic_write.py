@@ -47,10 +47,12 @@ def test_receive_then_commit_publishes_atomically(tmp_path):
     assert proc.returncode == 0
 
     final = tmp_path / "snap.btrfs"
-    part = tmp_path / "snap.btrfs.part"
+    # The .part name carries this transfer's pid and a monotonic stamp so two
+    # concurrent runs cannot share one temp file, so it is matched by glob.
+    parts = list(tmp_path.glob("snap.btrfs.*.part"))
     # Uncommitted: only the .part exists, and discovery ignores it -- so a crash
     # here leaves nothing that looks like a complete backup.
-    assert part.exists()
+    assert len(parts) == 1, parts
     assert not final.exists()
     assert discover_raw_snapshots(tmp_path) == []
 
@@ -58,7 +60,7 @@ def test_receive_then_commit_publishes_atomically(tmp_path):
     # Committed: the final name exists, the .part is gone, and it is now the only
     # discoverable snapshot.
     assert final.exists()
-    assert not part.exists()
+    assert not list(tmp_path.glob("snap.btrfs.*.part"))
     assert final.read_bytes() == b"payload-bytes"
     assert [s.name for s in discover_raw_snapshots(tmp_path)] == ["snap"]
 
