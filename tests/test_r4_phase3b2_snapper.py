@@ -139,44 +139,42 @@ def test_enumerate_degrades_to_empty_on_shell_failure(monkeypatch):
 
 
 def test_run_shell_remote_passes_script_as_single_raw_arg():
-    """Over ssh the privileged script reaches ``sh -c`` as ONE RAW argv element.
+    """Over ssh the script reaches ``sh -c`` as ONE RAW argv element.
 
     It must survive ssh's join and the remote shell's re-split as a single token, or sudo binds
     only its first word and the real work (enumeration / publish / stale cleanup) never runs.
     ``_exec_remote_command`` achieves that by quoting every element it is handed, so the script
     is passed here unquoted.
 
-    HISTORY, because this test is why the regression lasted a release: it originally asserted
-    the caller pre-quoted, which was right when the producer did not quote. PR #86 added
-    per-element quoting to ``_exec_remote_command``; the script was then escaped twice and the
-    remote shell ran the whole thing as one command name (rc 127), breaking every privileged
-    snapper call over ssh. This test kept passing throughout, because it asserts only what the
-    caller hands to a MOCKED producer -- it cannot see the composition where the contract lives.
-    The end-to-end guard is tests/test_remote_command_escaping_contract.py, which runs the
-    produced command through a real shell.
+    HISTORY, because this test is why a regression lasted a release: it originally asserted the
+    caller pre-quoted, which was right when the producer did not quote. PR #86 added per-element
+    quoting to ``_exec_remote_command``; the script was then escaped twice and the remote shell
+    ran the whole thing as one command name (rc 127), breaking every privileged snapper call
+    over ssh. This test kept passing throughout, because it asserts only what the caller hands
+    to a MOCKED producer -- it cannot see the composition where the contract lives. The
+    end-to-end guard is tests/test_remote_command_escaping_contract.py.
     """
     import shlex
 
     ep = MagicMock()
     ep._is_remote = True
-    captured = {}
+    ep.config = {"path": "/mnt/backup", "ssh_sudo": True}
+    calls: list[list] = []
 
     def fake_exec(cmd, **kwargs):
-        if "sh" in cmd and "-c" in cmd:  # the real script call, not the sudo probe
-            captured["cmd"] = list(cmd)
+        calls.append(list(cmd))
         return MagicMock(returncode=0, stdout=b"")
 
     ep._exec_remote_command = fake_exec
-    # A realistic multi-word script (spaces, quotes, ';', '$n', globs) -- the exact shape that
-    # gets shredded without quoting.
     script = (
         'set -e; for n in */; do btrfs subvolume delete "$n/snapshot" || true; done'
     )
     ops._snapper_run_shell(ep, script)
 
-    assert captured["cmd"][:4] == ["sudo", "-n", "sh", "-c"]
-    assert captured["cmd"][4] == script  # raw: the producer does the escaping
-    assert captured["cmd"][4] != shlex.quote(script)  # not escaped twice
+    sent = [c for c in calls if c[-1] == script]
+    assert sent, f"the script was altered before dispatch: {calls}"
+    assert sent[0][-1] == script  # raw: the producer does the escaping
+    assert sent[0][-1] != shlex.quote(script)  # not escaped twice
 
 
 # --------------------------------------------------------------------------- #

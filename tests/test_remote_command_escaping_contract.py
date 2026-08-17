@@ -145,17 +145,33 @@ class TestSnapperRunShellHonoursTheContract:
         operations._snapper_run_shell(endpoint, script)
         return captured["commands"]
 
+    @staticmethod
+    def _sh_bodies(commands):
+        """Every `sh -c <body>` body sent, in order."""
+        return [c[c.index("-c") + 1] for c in commands if "sh" in c and "-c" in c]
+
     @pytest.mark.parametrize("script", SCRIPTS)
     def test_script_is_passed_raw(self, script):
-        commands = self._capture_argv(script)
-        sh_calls = [c for c in commands if "sh" in c and "-c" in c]
-        assert sh_calls, commands
-        argv = sh_calls[0]
-        passed = argv[argv.index("-c") + 1]
-        assert passed == script, (
-            f"script was pre-escaped before the producer: {passed!r} != {script!r}"
+        """The caller's script reaches the producer unescaped.
+
+        Asserted over ALL sh calls rather than the first, because
+        _snapper_run_shell may probe the destination's writability first (see
+        _snapper_dest_is_user_writable) and that probe is a script of its own.
+        Pinning index 0 pinned the probe and said nothing about the payload.
+
+        Both directions are checked: the script must appear raw somewhere, and
+        its shlex.quote'd form must appear NOWHERE -- pre-escaping is the defect
+        this file exists to catch (it made the remote shell run the whole script
+        as one command name, rc 127).
+        """
+        bodies = self._sh_bodies(self._capture_argv(script))
+        assert bodies, "no sh -c call was made"
+        assert script in bodies, (
+            f"the caller's script never reached the producer raw; sent: {bodies!r}"
         )
-        assert passed != shlex.quote(script)
+        assert shlex.quote(script) not in bodies, (
+            f"script was pre-escaped before the producer; sent: {bodies!r}"
+        )
 
     @pytest.mark.parametrize("script", SCRIPTS)
     def test_captured_argv_executes_through_a_real_shell(self, script):
@@ -165,7 +181,11 @@ class TestSnapperRunShellHonoursTheContract:
         under test here, escaping is -- but the argv is otherwise the real one.
         """
         commands = self._capture_argv(script)
-        argv = next(c for c in commands if "sh" in c and "-c" in c)
+        argv = next(
+            c
+            for c in commands
+            if "sh" in c and "-c" in c and c[c.index("-c") + 1] == script
+        )
         argv = argv[argv.index("sh") :]  # strip the sudo prefix
         proc = run_through_remote_shell(argv)
         assert proc.returncode == 0, (

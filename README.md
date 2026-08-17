@@ -1012,15 +1012,22 @@ sudo visudo -f /etc/sudoers.d/btrfs-backup
 Add one of these configurations:
 
 ```sudoers
-# Option 1: Full btrfs access (simplest, recommended)
 backup ALL=(ALL) NOPASSWD: /usr/bin/btrfs
-
-# Option 2: Restricted to specific btrfs subcommands (more secure)
-backup ALL=(ALL) NOPASSWD: /usr/bin/btrfs receive *
-backup ALL=(ALL) NOPASSWD: /usr/bin/btrfs subvolume *
-backup ALL=(ALL) NOPASSWD: /usr/bin/btrfs send *
-backup ALL=(ALL) NOPASSWD: /usr/bin/btrfs filesystem *
 ```
+
+This grants `btrfs` and nothing else, which is all btrfs-backup-ng asks for: every
+privileged operation it performs on the destination is a `btrfs` subcommand.
+
+Restricting further by subcommand is not worth doing. A rule like
+`NOPASSWD: /usr/bin/btrfs subvolume *` still permits
+`btrfs subvolume delete` on any path on the system, so it buys little, and sudo's
+wildcards do not stop at argument boundaries. It also breaks the capability check
+below, since `btrfs --version` matches no such rule. Scope the access with the
+destination path and its permissions instead of with sudoers patterns.
+
+Do **not** add `mv`, `rm`, `mkdir` or `sh` to this file. Any of them as root is
+equivalent to full root, and btrfs-backup-ng does not need them: it performs the
+destination's directory work as the connecting user (see the next step).
 
 **Important:** Set correct permissions on the sudoers file (required by most distros):
 
@@ -1084,6 +1091,33 @@ fails immediately with the reason, instead of hanging on a password prompt that
 no one can answer. (`ssh -t` does not help — with a pipe on stdin ssh declines to
 allocate the terminal, and `ssh -tt` corrupts the binary stream outright.) A
 refused sudo is reported as an error, never as an empty backup target.
+
+### Step 2b: Grant the Backup User Access to the Destination (snapper sources only)
+
+Skip this unless you are backing up a **snapper** source to a btrfs target.
+
+Snapper backups reproduce snapper's numbered layout on the destination
+(`.snapshots/<number>/snapshot`). Maintaining that layout means creating, renaming
+and removing plain directories. btrfs-backup-ng does that work as the connecting
+user rather than as root, so that the sudoers rule above can stay limited to
+`btrfs`. The backup user therefore needs write access to the destination's
+`.snapshots` directory.
+
+If the destination belongs to the backup user already, there is nothing to do. If
+it is root-owned, grant access with an ACL rather than changing its ownership:
+
+```bash
+# On the remote server, once, as root
+sudo setfacl -m u:backup:rwx -m d:u:backup:rwx /mnt/backups/.snapshots
+```
+
+The `d:` entry is the default ACL, so directories created later inherit the grant.
+This is the same mechanism snapper uses for its own `ALLOW_USERS` setting, and it
+leaves ownership untouched.
+
+Without it, btrfs-backup-ng falls back to running its slot operations under
+`sudo sh`, which the sudoers rule above deliberately does not permit. You will see
+a log line naming the exact `setfacl` command for your destination.
 
 ### Step 3: Set Up SSH Key Authentication (Local Machine)
 
