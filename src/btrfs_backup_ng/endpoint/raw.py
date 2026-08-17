@@ -238,6 +238,32 @@ the sentinel is absent, the shell did not run, full stop.
 """
 
 
+def _elevation_proven(stderr: str) -> bool:
+    """Whether an elevated shell demonstrably ran, i.e. printed the sentinel ALONE.
+
+    Whole-line equality, never a substring. sudo's authorization refusal quotes
+    the entire refused command back, so the marker appears in stderr even though
+    nothing ran -- measured verbatim against real sudo 1.9.13p3, 1.9.15p5 and
+    1.9.16p2:
+
+        Sorry, user bbng is not allowed to execute '/usr/bin/sh -c find ... ;
+        echo __BBNG_ELEVATED__ >&2; exit $__bbng_rc' as root on <host>.
+
+    A substring test reads that as proof of success and reports a populated
+    target as empty -- the sentinel defeating itself. It is reachable under an
+    ordinary hardening policy, because this code elevates via `sudo -n sh -c`
+    and a service account is commonly denied shells:
+
+        backup ALL=(ALL) NOPASSWD: ALL, !/usr/bin/sh, !/bin/sh
+
+    Only a line that is exactly the sentinel can have come from the echo this
+    module appends, so that is what is tested.
+    """
+    return any(
+        line.strip() == _ELEVATION_SENTINEL for line in (stderr or "").splitlines()
+    )
+
+
 def _strip_sentinel(stderr: str) -> str:
     """Remove the sentinel so it never reaches a user-facing message or log."""
     return "\n".join(
@@ -368,7 +394,7 @@ def _check_remote_listing(
     "0 ok, 0 corrupt" and exit 0 for a target full of backups it never read.
     """
     stderr = (result.stderr or "").strip()
-    if result.returncode == 255 and _ELEVATION_SENTINEL not in (result.stderr or ""):
+    if result.returncode == 255 and not _elevation_proven(result.stderr or ""):
         raise RuntimeError(
             f"Cannot reach raw+ssh target {host}: "
             f"{_strip_sentinel(stderr) or 'ssh connection failed'}. "
@@ -379,7 +405,7 @@ def _check_remote_listing(
     # legitimately absent because the remote never ran anything. Checking
     # elevation first would tell an operator whose host is simply DOWN that
     # their sudoers policy is wrong.
-    if elevated and _ELEVATION_SENTINEL not in (result.stderr or ""):
+    if elevated and not _elevation_proven(result.stderr or ""):
         raise RuntimeError(
             f"Cannot list raw+ssh target {path} on {host}: the remote command was "
             f"never run"
@@ -1941,9 +1967,12 @@ class SSHRawEndpoint(RawEndpoint):
         # unreadable target) as a successful listing of an empty target, which is
         # the very failure this guard exists to prevent, reintroduced by the fix
         # for it.
-        probed = (
-            f"{inner}; __bbng_rc=$?; echo {_ELEVATION_SENTINEL} >&2; exit $__bbng_rc"
-        )
+        # The marker is split in the emitted text so that sudo's refusal echo --
+        # which quotes the whole command back -- cannot contain the literal even
+        # as a substring. The remote shell concatenates it before echoing, so a
+        # command that really runs still prints the marker intact.
+        head, tail = _ELEVATION_SENTINEL[:6], _ELEVATION_SENTINEL[6:]
+        probed = f'{inner}; __bbng_rc=$?; echo {head}"{tail}" >&2; exit $__bbng_rc'
         return self._elevate(f"sh -c {shlex.quote(probed)}")
 
     def _exec_remote_command(

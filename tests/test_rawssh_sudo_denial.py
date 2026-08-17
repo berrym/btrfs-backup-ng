@@ -568,14 +568,19 @@ class TestElevationIsProvenNotGuessed:
         assert "find: oops" in text
 
     def test_the_elevated_command_actually_emits_the_sentinel(self):
-        """The guard is only sound if the wrapper really appends it."""
-        ep = _endpoint()
-        wrapped = ep._elevate_shell("find /backup -name '*.meta' 2>/dev/null")
-        assert _ELEVATION_SENTINEL in wrapped
-        # After the inner command, and on stderr, so a failing find still proves
-        # the shell ran.
-        assert wrapped.index("find") < wrapped.index(_ELEVATION_SENTINEL)
+        """The guard is only sound if the wrapper really appends it.
+
+        Asserted by RUNNING the emitted string, not by finding the literal in
+        it: the literal is deliberately split so sudo's refusal echo cannot
+        carry it (see TestARefusalCannotForgeTheProof).
+        """
+        import subprocess as sp
+
+        wrapped = _endpoint()._elevate_shell("find /backup -name '*.meta' 2>/dev/null")
         assert ">&2" in wrapped
+        script = wrapped.split("sudo -n sh -c ", 1)[1]
+        proc = sp.run(["sh", "-c", f"sh -c {script}"], capture_output=True, text=True)
+        assert raw_mod._elevation_proven(proc.stderr), proc.stderr
 
     def test_the_unelevated_command_carries_no_sentinel(self):
         assert (
@@ -599,9 +604,12 @@ class TestTheSentinelDoesNotMaskTheInnerExitStatus:
         wrapped = _endpoint()._elevate_shell("find /backup -type f")
         assert "__bbng_rc=$?" in wrapped
         assert "exit $__bbng_rc" in wrapped
-        # Order matters: capture immediately after the command, exit last.
-        assert wrapped.index("__bbng_rc=$?") < wrapped.index(_ELEVATION_SENTINEL)
-        assert wrapped.index(_ELEVATION_SENTINEL) < wrapped.index("exit $__bbng_rc")
+        # Order matters: capture immediately after the command, exit last. The
+        # echo sits between them; matched on its head because the marker literal
+        # is split in the emitted text.
+        head = _ELEVATION_SENTINEL[:6]
+        assert wrapped.index("__bbng_rc=$?") < wrapped.index(f"echo {head}")
+        assert wrapped.index(f"echo {head}") < wrapped.index("exit $__bbng_rc")
 
     @pytest.mark.parametrize(
         ("inner", "expected_rc"),
@@ -720,3 +728,67 @@ class TestElevationIsProvenNotReGuessed:
                 "/backup",
                 elevated=True,
             )
+
+
+# Verbatim from real sudo (1.9.13p3 / 1.9.15p5 / 1.9.16p2) refusing the exact
+# command this module emits. sudo quotes the WHOLE refused command back, so the
+# marker appears in stderr although nothing ran.
+SUDO_ECHOES_THE_COMMAND_BACK = (
+    "Sorry, user bbng is not allowed to execute '/usr/bin/sh -c find /backup "
+    '-maxdepth 1 -name "*.meta" -type f -print0 2>/dev/null; __bbng_rc=$?; '
+    f"echo {_ELEVATION_SENTINEL} >&2; exit $__bbng_rc' as root on nas."
+)
+
+
+class TestARefusalCannotForgeTheProof:
+    """sudo echoing the command back must not read as the command having run.
+
+    Reachable under an ordinary hardening policy, because this code elevates via
+    `sudo -n sh -c` and a backup service account is commonly denied shells:
+
+        backup ALL=(ALL) NOPASSWD: ALL, !/usr/bin/sh, !/bin/sh
+
+    Measured end to end: with a substring test this refusal produced
+    list_snapshots() == [] on a populated target, and `raw verify --ssh-sudo`
+    printed "0 ok, 0 corrupt" and exited 0.
+    """
+
+    def test_the_echoed_command_does_not_count_as_proof(self):
+        assert _ELEVATION_SENTINEL in SUDO_ECHOES_THE_COMMAND_BACK  # substring: yes
+        assert raw_mod._elevation_proven(SUDO_ECHOES_THE_COMMAND_BACK) is False
+
+    def test_a_genuine_run_does_count_as_proof(self):
+        assert raw_mod._elevation_proven(f"find: oops\n{_ELEVATION_SENTINEL}") is True
+        assert raw_mod._elevation_proven(f"  {_ELEVATION_SENTINEL}  ") is True
+
+    def test_the_listing_guard_raises_on_the_echoed_refusal(self):
+        result = MagicMock(returncode=1, stdout="", stderr=SUDO_ECHOES_THE_COMMAND_BACK)
+        with pytest.raises(RuntimeError, match="NOT an empty target"):
+            raw_mod._check_remote_listing(result, "nas", "/backup", elevated=True)
+
+    def test_list_snapshots_does_not_return_empty_on_the_echoed_refusal(self):
+        ep = _endpoint()
+        refused = MagicMock(
+            returncode=1, stdout="", stderr=SUDO_ECHOES_THE_COMMAND_BACK
+        )
+        with patch.object(raw_mod.subprocess, "run", return_value=refused):
+            with pytest.raises(RuntimeError, match="NOT an empty target"):
+                ep.list_snapshots(flush_cache=True)
+
+    def test_the_emitted_command_never_contains_the_literal_marker(self):
+        """Belt and braces: if the literal is absent, the echo cannot carry it.
+
+        The remote shell concatenates the halves before echoing, so a command
+        that really runs still prints the marker on its own line.
+        """
+        wrapped = _endpoint()._elevate_shell("find /backup -type f")
+        assert _ELEVATION_SENTINEL not in wrapped
+
+    def test_a_real_shell_still_prints_the_marker_intact(self):
+        """Splitting the literal must not break the mechanism it protects."""
+        import subprocess as sp
+
+        wrapped = _endpoint()._elevate_shell("true")
+        script = wrapped.split("sudo -n sh -c ", 1)[1]
+        proc = sp.run(["sh", "-c", f"sh -c {script}"], capture_output=True, text=True)
+        assert raw_mod._elevation_proven(proc.stderr), proc.stderr
