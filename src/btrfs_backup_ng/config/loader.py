@@ -175,7 +175,14 @@ def _parse_target(data: dict[str, Any]) -> TargetConfig:
     if "path" not in data:
         raise ConfigError("Target missing required 'path' field")
 
-    path = data["path"]
+    # Normalise here, at the producer, so every consumer sees one string.
+    # endpoint.choose_endpoint does not strip: a stray space in a quoted TOML
+    # path made ' ssh://user@host:/mnt/usb' build a LOCAL endpoint writing to
+    # '<cwd>/ ssh:/user@host:/mnt/usb', and '/mnt/usb ' resolve to a directory
+    # on the root filesystem rather than the mount point. Any consumer that
+    # stripped on its own would then disagree with the endpoint actually built,
+    # which is how a safety check ends up guarding a path nothing writes to.
+    path = str(data["path"]).strip() if isinstance(data["path"], str) else data["path"]
     is_raw = str(path).startswith(("raw://", "raw+ssh://"))
 
     # Validate compression against what the target's transport ACTUALLY supports.
@@ -523,6 +530,23 @@ def _validate_config(config: Config) -> list[str]:
                     warnings.append(
                         f"SSH target '{target.path}' may be missing path separator ':'"
                     )
+
+            # raw+ssh with ssh_sudo is fully supported, and it is also the
+            # combination operators most often configure by analogy with ssh://
+            # and then cannot use. A raw target stores plain files, so the remote
+            # runs mkdir/find/cat/stat/mv/rm -- never btrfs -- and the sudoers
+            # recipe written for ssh:// (NOPASSWD: /usr/bin/btrfs) authorises
+            # none of them. Say so once, at load, rather than at 3am.
+            if target.path.startswith("raw+ssh://") and target.ssh_sudo:
+                warnings.append(
+                    f"Target '{target.path}' uses ssh_sudo: a raw+ssh target "
+                    "stores plain files, so the remote needs passwordless sudo "
+                    "for the FILE tools (mkdir, find, cat, stat, mv, rm), not "
+                    "for btrfs. Backups written this way are root-owned and need "
+                    "ssh_sudo to read back. Owning the destination "
+                    "(chown/setfacl) and leaving ssh_sudo off is simpler and "
+                    "grants less; both are supported."
+                )
 
         # Validate snapper configuration
         if volume.is_snapper_source():

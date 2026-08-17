@@ -842,3 +842,123 @@ class TestGetDefaultConfigPath:
 
         result = get_default_config_path()
         assert result == sudo_user_home / ".config" / "btrfs-backup-ng" / "config.toml"
+
+
+class TestTargetPathIsNormalisedAtLoad:
+    """A quoted TOML path may carry stray whitespace; only the loader may strip it.
+
+    ``endpoint.choose_endpoint`` does not strip, so an unnormalised value is
+    built as written: ``" ssh://user@host:/mnt/usb"`` produces a LOCAL endpoint
+    writing to ``<cwd>/ ssh:/user@host:/mnt/usb`` -- under systemd, under ``/`` --
+    and ``"/mnt/usb "`` resolves to a directory on the root filesystem rather
+    than the mount point. Stripping in a consumer instead would be worse: the
+    safety check would then judge a different string than the endpoint builds,
+    so ``require_mount`` would pass on the mount while the write went elsewhere.
+    """
+
+    @staticmethod
+    def _load_target(tmp_path, raw_path):
+        config_path = tmp_path / "bbng.toml"
+        config_path.write_text(
+            "[global]\n\n"
+            "[[volumes]]\n"
+            'path = "/home"\n\n'
+            "[[volumes.targets]]\n"
+            f'path = "{raw_path}"\n'
+        )
+        config, _ = load_config(config_path)
+        return config.get_enabled_volumes()[0].targets[0]
+
+    @pytest.mark.parametrize(
+        ("written", "expected"),
+        [
+            (" ssh://user@host:/mnt/usb ", "ssh://user@host:/mnt/usb"),
+            ("  /mnt/usb  ", "/mnt/usb"),
+            (" raw:///mnt/usb", "raw:///mnt/usb"),
+            (" raw+ssh://user@nas:/mnt/usb", "raw+ssh://user@nas:/mnt/usb"),
+            ("/mnt/usb", "/mnt/usb"),
+        ],
+    )
+    def test_surrounding_whitespace_is_removed(self, tmp_path, written, expected):
+        assert self._load_target(tmp_path, written).path == expected
+
+    def test_the_normalised_path_builds_the_endpoint_the_scheme_predicts(
+        self, tmp_path, monkeypatch
+    ):
+        """Normalising at the producer is only useful if consumers then agree."""
+        from btrfs_backup_ng.core.target import parse_target
+        from btrfs_backup_ng.endpoint import choose_endpoint
+
+        monkeypatch.setenv("HOME", str(tmp_path))
+        target = self._load_target(tmp_path, " ssh://user@host:/mnt/usb ")
+
+        scheme = parse_target(target.path)
+        endpoint = choose_endpoint(target.path, {}, source=False)
+
+        assert scheme.is_remote is True
+        assert "SSH" in type(endpoint).__name__
+
+    def test_interior_whitespace_is_preserved(self, tmp_path):
+        """Only the padding is noise; a directory may legitimately contain a space."""
+        assert self._load_target(tmp_path, "/mnt/my backups").path == "/mnt/my backups"
+
+
+class TestRawSshWithSudoIsFlaggedNotBlocked:
+    """`raw+ssh://` + `ssh_sudo` is supported; it is also the classic footgun.
+
+    A raw target stores plain files, so the remote runs mkdir/find/cat/stat/mv/rm
+    and never btrfs -- which means the sudoers recipe written for `ssh://`
+    (`NOPASSWD: /usr/bin/btrfs`) authorises none of it. Measured on a real host
+    with exactly that policy: `sudo btrfs --version` is allowed and `sudo mkdir`
+    is refused. The config must load and run, and say so once.
+    """
+
+    @staticmethod
+    def _load(tmp_path, target_line, extra=""):
+        config_path = tmp_path / "bbng.toml"
+        config_path.write_text(
+            "[global]\n\n"
+            "[[volumes]]\n"
+            'path = "/home"\n\n'
+            "[[volumes.targets]]\n"
+            f'path = "{target_line}"\n{extra}'
+        )
+        return load_config(config_path)
+
+    def test_the_combination_still_loads(self, tmp_path):
+        """A warning, never a rejection: this configuration is supported."""
+        config, _ = self._load(
+            tmp_path, "raw+ssh://backup@nas:/mnt/store", "ssh_sudo = true\n"
+        )
+        target = config.get_enabled_volumes()[0].targets[0]
+        assert target.path == "raw+ssh://backup@nas:/mnt/store"
+        assert target.ssh_sudo is True
+
+    def test_it_warns_and_names_the_file_tools(self, tmp_path):
+        _, warnings = self._load(
+            tmp_path, "raw+ssh://backup@nas:/mnt/store", "ssh_sudo = true\n"
+        )
+        matching = [w for w in warnings if "ssh_sudo" in w]
+        assert matching, f"no ssh_sudo warning was emitted; got {warnings}"
+        text = matching[0]
+        # The whole point is telling them it is NOT btrfs they need to grant.
+        assert "btrfs" in text
+        assert "mkdir" in text or "FILE tools" in text
+        assert "chown" in text or "setfacl" in text
+
+    def test_raw_ssh_without_sudo_is_not_warned_about(self, tmp_path):
+        """The recommended setup must not nag."""
+        _, warnings = self._load(tmp_path, "raw+ssh://backup@nas:/mnt/store")
+        assert not [w for w in warnings if "ssh_sudo" in w], warnings
+
+    def test_plain_ssh_with_sudo_is_not_warned_about(self, tmp_path):
+        """ssh:// + ssh_sudo is the documented, correct pairing."""
+        _, warnings = self._load(
+            tmp_path, "ssh://backup@nas:/mnt/store", "ssh_sudo = true\n"
+        )
+        assert not [w for w in warnings if "ssh_sudo" in w], warnings
+
+    def test_local_raw_with_sudo_is_not_warned_about(self, tmp_path):
+        """A local raw target runs no remote commands at all."""
+        _, warnings = self._load(tmp_path, "raw:///mnt/store", "ssh_sudo = true\n")
+        assert not [w for w in warnings if "ssh_sudo" in w], warnings

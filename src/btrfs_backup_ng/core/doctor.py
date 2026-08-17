@@ -14,6 +14,8 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Callable
 
+from .target import TargetKind, TargetScheme, parse_target
+
 logger = logging.getLogger(__name__)
 
 
@@ -638,12 +640,35 @@ class Doctor:
                     continue
                 checked_targets.add(target.path)
 
-                if target.path.startswith("ssh://"):
-                    # SSH target - check connectivity
-                    findings.extend(self._check_ssh_target(target))
+                scheme = parse_target(target.path)
+
+                if scheme.is_remote:
+                    # Reached over SSH, so a filesystem call cannot inspect it.
+                    # startswith("ssh://") missed raw+ssh:// and sent it here.
+                    findings.extend(self._check_ssh_target(target, scheme))
+                elif scheme.kind is TargetKind.UNSUPPORTED or not scheme.path:
+                    # No usable filesystem path. Both branches must be caught
+                    # here or Path("") becomes Path(".") -- which always exists,
+                    # so an unusable target (shell://, whose path is empty and
+                    # which choose_endpoint cannot even construct) would be
+                    # reported healthy.
+                    findings.append(
+                        DiagnosticFinding(
+                            category=DiagnosticCategory.CONFIG,
+                            severity=DiagnosticSeverity.ERROR,
+                            check_name="target_reachability",
+                            message=f"Target path is not usable: {target.path}",
+                            details={
+                                "error": scheme.reason
+                                or f"{scheme.kind.value} targets have no inspectable path"
+                            },
+                        )
+                    )
                 else:
-                    # Local target - check path exists
-                    target_path = Path(target.path)
+                    # Local target. Check the filesystem PATH, not the URI: a
+                    # raw:// target reported "does not exist" for a directory
+                    # that was plainly there, because Path() was handed the URI.
+                    target_path = Path(scheme.path)
                     if not target_path.exists():
                         findings.append(
                             DiagnosticFinding(
@@ -665,15 +690,44 @@ class Doctor:
 
         return findings
 
-    def _check_ssh_target(self, target: Any) -> list[DiagnosticFinding]:
-        """Check SSH target connectivity."""
+    def _check_ssh_target(
+        self, target: Any, scheme: TargetScheme | None = None
+    ) -> list[DiagnosticFinding]:
+        """Check SSH target connectivity.
+
+        Two bugs made this report an error for every remote target, healthy or
+        not. It passed the whole URI where ``test_ssh_connection`` expects a
+        host, so the probe ran ``ssh ssh://user@host:/backups echo ...`` and
+        failed; and it branched on ``isinstance(result, dict)`` while that
+        function returns ``bool``, so a successful probe fell through to the
+        final "check failed" branch. Measured: the full URI returns False and
+        ``user@host`` returns True, and ``isinstance(True, dict)`` is False --
+        so a reachable, working target was always reported unreachable.
+        """
         findings: list[DiagnosticFinding] = []
+        scheme = scheme or parse_target(target.path)
+        destination = scheme.ssh_destination
+
+        if not destination:
+            findings.append(
+                DiagnosticFinding(
+                    category=DiagnosticCategory.CONFIG,
+                    severity=DiagnosticSeverity.ERROR,
+                    check_name="target_reachability",
+                    message=f"Could not determine a host for: {target.path}",
+                )
+            )
+            return findings
 
         try:
             from ..sshutil.diagnose import test_ssh_connection
 
-            result = test_ssh_connection(target.path)
-            if isinstance(result, dict) and result.get("success"):
+            reachable = test_ssh_connection(
+                destination,
+                scheme.port or getattr(target, "ssh_port", None),
+                getattr(target, "ssh_key", None),
+            )
+            if reachable:
                 findings.append(
                     DiagnosticFinding(
                         category=DiagnosticCategory.CONFIG,
@@ -682,23 +736,22 @@ class Doctor:
                         message=f"SSH target reachable: {target.path}",
                     )
                 )
-            elif isinstance(result, dict):
-                findings.append(
-                    DiagnosticFinding(
-                        category=DiagnosticCategory.CONFIG,
-                        severity=DiagnosticSeverity.ERROR,
-                        check_name="target_reachability",
-                        message=f"SSH target unreachable: {target.path}",
-                        details={"error": result.get("error", "Unknown error")},
-                    )
-                )
             else:
                 findings.append(
                     DiagnosticFinding(
                         category=DiagnosticCategory.CONFIG,
                         severity=DiagnosticSeverity.ERROR,
                         check_name="target_reachability",
-                        message=f"SSH target check failed: {target.path}",
+                        # The target as configured, so that two targets on the
+                        # same host stay distinguishable; the probed destination
+                        # goes in details.
+                        message=f"SSH target unreachable: {target.path}",
+                        details={
+                            "probed": destination,
+                            "hint": "check the host is up, the key is accepted, "
+                            "and the destination is spelled as "
+                            "ssh://user@host:/path",
+                        },
                     )
                 )
         except ImportError:
@@ -1272,11 +1325,21 @@ class Doctor:
                     continue
                 checked_targets.add(target.path)
 
-                if target.path.startswith("ssh://"):
-                    # Skip SSH targets for now - requires connection
+                scheme = parse_target(target.path)
+                if scheme.is_remote:
+                    # Skip remote targets - a space check requires a connection.
+                    # startswith("ssh://") let raw+ssh:// through to the local
+                    # branch below, where Path() was handed a URI.
+                    continue
+                if scheme.kind is TargetKind.UNSUPPORTED or not scheme.path:
+                    # Same hazard as above: Path("") is ".", so a shell:// target
+                    # would have the CHECKOUT's free space reported as its own.
                     continue
 
-                target_path = Path(target.path)
+                # The filesystem path, not the URI: a raw:// target checked
+                # Path("raw:///mnt/x"), which never exists, so its space was
+                # silently never checked at all.
+                target_path = Path(scheme.path)
                 if not target_path.exists():
                     continue
 
