@@ -1036,45 +1036,54 @@ sudo -n btrfs --version
 # Should print version without prompting for password
 ```
 
-#### This sudoers policy is for `ssh://` targets, not `raw+ssh://`
+#### Sudo for `raw+ssh://` targets works differently
 
 The rule above grants `btrfs` only, which is exactly what an `ssh://` target
 needs: the remote runs `btrfs receive`, and nothing else requires privilege.
 
 A `raw+ssh://` target is different. It stores send streams as **ordinary files**,
 so no `btrfs` command ever runs on the remote — the work is `mkdir`, `find`,
-`cat`, `stat`, `mv` and `rm`. Enabling `ssh_sudo` on a raw target therefore asks
-sudo for the *file* utilities, which this policy refuses. The check above still
-passes, so the mismatch only shows up when a backup runs.
+`cat`, `stat`, `mv` and `rm`. `ssh_sudo` on a raw target therefore asks sudo for
+the *file* utilities, and the btrfs-only policy above authorizes none of them.
+The verification step above still passes, so the mismatch only shows up when a
+backup runs.
 
-**For `raw+ssh://`, prefer ownership over sudo.** Step 1 already did the useful
+Both setups below are fully supported. Option A is recommended because it grants
+strictly less privilege, but Option B is a first-class configuration.
+
+**Option A — own the destination (recommended).** Step 1 already did the useful
 part:
 
 ```bash
-sudo chown backup:backup /mnt/backups
+sudo chown -R backup:backup /mnt/backups
 ```
 
-With the destination owned by the SSH user, leave `ssh_sudo` unset (the default)
-and every operation is an ordinary file operation. This is simpler and strictly
-safer than the alternative — see below.
+With the destination owned by the SSH user, leave `ssh_sudo` unset (the default).
+Every operation is an ordinary file operation, backups are readable by that same
+user forever, and no sudo rights are needed on the remote at all.
 
-If you genuinely need `ssh_sudo` for a raw target (an existing root-owned
-destination you cannot chown), be aware of what it costs. Most remote steps are
-multi-command, so they run as `sudo -n sh -c '...'` rather than as a single named
-utility — listing a set of utilities in sudoers does **not** authorize them. The
-only policy that actually covers every operation is:
+**Option B — elevate with `ssh_sudo`.** Use this when the destination is
+root-owned and cannot be chowned, or when policy requires the files be root's.
+Note that most remote steps are multi-command, so they run as
+`sudo -n sh -c '...'` rather than as a single named utility — listing individual
+utilities in sudoers does **not** authorize them. The policy that covers every
+operation is:
 
 ```sudoers
-backup ALL=(ALL) NOPASSWD: /bin/sh
+backup ALL=(ALL) NOPASSWD: ALL
 ```
 
-which is unrestricted root. There is no meaningfully restricted sudoers policy
-for `raw+ssh://`, and that is the argument for `chown`: it grants strictly less.
+Two consequences worth knowing before choosing it. That grant is effectively
+unrestricted root, so unlike `ssh://` there is no meaningful least-privilege
+policy available. And a raw+ssh backup **written** with `ssh_sudo` is root-owned,
+so every later list, verify, restore and prune against that target needs
+`ssh_sudo` as well — the choice is sticky.
 
-Also note that a raw+ssh backup **written** with `ssh_sudo` is root-owned, so
-reading it back requires `ssh_sudo` too. Choosing ownership up front avoids that
-permanently. If the rights are missing, the tool now fails loudly and says so
-rather than reporting the target as empty.
+Either way the failure mode is legible: `sudo -n` is used so a missing right
+fails immediately with the reason, instead of hanging on a password prompt that
+no one can answer. (`ssh -t` does not help — with a pipe on stdin ssh declines to
+allocate the terminal, and `ssh -tt` corrupts the binary stream outright.) A
+refused sudo is reported as an error, never as an empty backup target.
 
 ### Step 3: Set Up SSH Key Authentication (Local Machine)
 
