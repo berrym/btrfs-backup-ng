@@ -307,3 +307,137 @@ class TestIdentityFileKeyPerScheme:
             assert seen == "/key/path", (
                 f"{uri}: threading {key!r} did not reach the endpoint (saw {seen!r})"
             )
+
+
+class TestWhitespaceIsNotNormalisedHere:
+    """parse_target must classify the string it is given, byte for byte.
+
+    Stripping inside the predicate looks harmless and is not: choose_endpoint
+    does not strip, so a padded path would be CLASSIFIED as one thing and BUILT
+    as another. Measured before the fix: ``' ssh://user@host:/mnt/usb'`` was
+    judged remote -- and therefore exempt from the require_mount gate -- while
+    choose_endpoint built a LocalEndpoint writing under the working directory.
+    Under systemd that directory is ``/``.
+
+    Normalisation is the config loader's job (see TestConfigLoaderNormalises...
+    in tests/test_config.py), so one string reaches every consumer.
+    """
+
+    @pytest.mark.parametrize(
+        "padded",
+        [
+            " ssh://user@host:/mnt/usb",
+            " raw+ssh://user@nas:/mnt/usb",
+            " raw:///mnt/usb",
+            "/mnt/usb ",
+            "\t/mnt/usb\n",
+        ],
+    )
+    def test_a_padded_path_is_not_silently_cleaned(self, padded):
+        scheme = parse_target(padded)
+        assert scheme.uri == padded
+        # Padding makes it not a recognised scheme, so it is treated as a local
+        # path exactly as choose_endpoint treats it. The point is agreement, not
+        # any particular verdict.
+        assert scheme.kind is TargetKind.LOCAL
+        assert scheme.is_remote is False
+
+    @pytest.mark.parametrize(
+        "padded", [" ssh://user@host:/mnt/usb", "/mnt/usb ", " raw:///mnt/usb"]
+    )
+    def test_a_padded_path_agrees_with_choose_endpoint(
+        self, padded, tmp_path, monkeypatch
+    ):
+        """The invariant this module claims: never disagree with the builder."""
+        from btrfs_backup_ng.endpoint import choose_endpoint
+
+        monkeypatch.setenv("HOME", str(tmp_path))
+        scheme = parse_target(padded)
+        endpoint = choose_endpoint(padded, {}, source=False)
+        built_remote = "SSH" in type(endpoint).__name__
+        assert scheme.is_remote == built_remote, (
+            f"{padded!r}: parse_target says remote={scheme.is_remote} but "
+            f"choose_endpoint built {type(endpoint).__name__}"
+        )
+
+    @pytest.mark.parametrize("blank", ["", "   ", "\t\n"])
+    def test_a_blank_path_is_still_unsupported(self, blank):
+        """Refusing to strip must not make whitespace look like a real path."""
+        scheme = parse_target(blank)
+        assert scheme.kind is TargetKind.UNSUPPORTED
+        assert scheme.path == ""
+
+
+class TestIPv6LiteralsAreHandedToSshUnbracketed:
+    """``ssh`` cannot resolve a bracketed literal.
+
+    Measured: ``ssh '[::1]' echo hi`` fails with "Could not resolve hostname
+    [::1]", while ``ssh '::1' echo hi`` connects. Brackets delimit the literal
+    from a ``:port`` suffix inside a URI and have no meaning past parsing, so
+    carrying them into ssh_destination made doctor report a working IPv6 target
+    unreachable.
+    """
+
+    @pytest.mark.parametrize(
+        ("uri", "host", "port", "destination"),
+        [
+            ("ssh://[::1]:/tmp", "::1", None, "::1"),
+            ("raw+ssh://[::1]:/tmp", "::1", None, "::1"),
+            ("ssh://[2001:db8::5]:2222/b", "2001:db8::5", 2222, "2001:db8::5"),
+            ("ssh://user@[::1]/b", "::1", None, "user@::1"),
+            (
+                "raw+ssh://user@[2001:db8::5]:2222/b",
+                "2001:db8::5",
+                2222,
+                "user@2001:db8::5",
+            ),
+        ],
+    )
+    def test_brackets_are_stripped_but_the_port_still_parses(
+        self, uri, host, port, destination
+    ):
+        scheme = parse_target(uri)
+        assert scheme.host == host
+        assert scheme.port == port
+        assert scheme.ssh_destination == destination
+        assert "[" not in (scheme.ssh_destination or "")
+
+    def test_an_ipv6_path_is_still_extracted(self):
+        assert parse_target("ssh://[::1]:2222/mnt/backups").path == "/mnt/backups"
+        assert parse_target("ssh://[::1]:/mnt/backups").path == "/mnt/backups"
+
+
+class TestPortIsParsedNotGuessed:
+    """A separator colon is not a port, and a real port must survive.
+
+    Dropping the port silently sends every probe and transfer to 22. The
+    ``host:/path`` form the README and shipped examples use must not be read as
+    a port, and ``host:2222/path`` must be.
+    """
+
+    @pytest.mark.parametrize(
+        ("uri", "expected_port"),
+        [
+            ("ssh://host:/backups", None),
+            ("ssh://host/backups", None),
+            ("ssh://host:2222/backups", 2222),
+            ("ssh://user@host:2222/backups", 2222),
+            ("raw+ssh://user@host:2222/backups", 2222),
+            ("raw+ssh://user@host:/backups", None),
+        ],
+    )
+    def test_port(self, uri, expected_port):
+        assert parse_target(uri).port == expected_port
+
+    @pytest.mark.parametrize(
+        ("uri", "expected_host"),
+        [
+            ("ssh://host:2222/backups", "host"),
+            ("ssh://user@host:2222/backups", "host"),
+            ("ssh://host:/backups", "host"),
+        ],
+    )
+    def test_the_port_does_not_leak_into_the_host(self, uri, expected_host):
+        scheme = parse_target(uri)
+        assert scheme.host == expected_host
+        assert ":" not in (scheme.ssh_destination or "").split("@")[-1]

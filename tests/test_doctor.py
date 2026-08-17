@@ -4,6 +4,8 @@ import argparse
 import time
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from btrfs_backup_ng.cli.doctor import (
     _get_severity_prefix,
     _print_fix_results,
@@ -1263,8 +1265,16 @@ class TestDoctorSSHTarget:
 
     @patch("btrfs_backup_ng.sshutil.diagnose.test_ssh_connection")
     def test_check_ssh_target_success(self, mock_test_ssh):
-        """Test SSH target check when connection succeeds."""
-        mock_test_ssh.return_value = {"success": True}
+        """Test SSH target check when connection succeeds.
+
+        The mock returns a bool because that is what test_ssh_connection really
+        returns. These tests previously mocked a {"success": ...} dict, an API
+        the function has never had, and the production code branched on
+        isinstance(result, dict) to match -- so a SUCCESSFUL probe fell through
+        to the failure branch and doctor reported an error for every reachable
+        SSH target. Mocking a fictional contract is what hid that.
+        """
+        mock_test_ssh.return_value = True
 
         mock_target = MagicMock()
         mock_target.path = "ssh://user@host:/backup"
@@ -1280,7 +1290,7 @@ class TestDoctorSSHTarget:
     @patch("btrfs_backup_ng.sshutil.diagnose.test_ssh_connection")
     def test_check_ssh_target_failure(self, mock_test_ssh):
         """Test SSH target check when connection fails."""
-        mock_test_ssh.return_value = {"success": False, "error": "Connection refused"}
+        mock_test_ssh.return_value = False
 
         mock_target = MagicMock()
         mock_target.path = "ssh://user@host:/backup"
@@ -2076,3 +2086,244 @@ class TestDoctorTimestampParsing:
         # 5-day-old one, and reported it.
         joined = " ".join(f.message for f in rf)
         assert "could not" not in joined.lower()
+
+
+class TestDoctorSSHProbeContract:
+    """The probe must be called the way it is actually defined.
+
+    Two independent bugs made doctor report an error for every remote target on
+    a healthy system: it passed the whole URI where a host is expected, so the
+    probe ran `ssh ssh://user@host:/backup echo ...`; and it branched on
+    isinstance(result, dict) while the function returns bool. Both are pinned
+    here against the real signature rather than a mock's imagination.
+    """
+
+    def test_test_ssh_connection_returns_bool_not_dict(self):
+        """If this ever becomes a dict, doctor's branching must change with it."""
+        import inspect
+
+        from btrfs_backup_ng.sshutil.diagnose import test_ssh_connection
+
+        assert inspect.signature(test_ssh_connection).return_annotation is bool
+
+    @patch("btrfs_backup_ng.sshutil.diagnose.test_ssh_connection")
+    def test_probe_receives_a_host_not_a_uri(self, mock_test_ssh):
+        """`ssh <uri>` is not a valid invocation; it must get user@host."""
+        from btrfs_backup_ng.core.doctor import Doctor
+
+        mock_test_ssh.return_value = True
+        target = MagicMock()
+        target.path = "ssh://user@host:/backup"
+        target.ssh_port = None
+        target.ssh_key = None
+
+        Doctor()._check_ssh_target(target)
+
+        called_with = mock_test_ssh.call_args[0][0]
+        assert called_with == "user@host", called_with
+        assert "://" not in called_with
+
+    @patch("btrfs_backup_ng.sshutil.diagnose.test_ssh_connection")
+    def test_rawssh_target_is_probed_over_ssh_too(self, mock_test_ssh):
+        """raw+ssh:// is remote; it used to fall through to a local Path check."""
+        from btrfs_backup_ng.core.doctor import Doctor
+
+        mock_test_ssh.return_value = True
+        target = MagicMock()
+        target.path = "raw+ssh://backup@nas:/mnt/store"
+        target.ssh_port = None
+        target.ssh_key = None
+
+        findings = Doctor()._check_ssh_target(target)
+
+        assert mock_test_ssh.call_args[0][0] == "backup@nas"
+        assert any(f.severity == DiagnosticSeverity.OK for f in findings)
+
+
+class TestTargetReachabilityRoutesByScheme:
+    """Which branch a target takes, and which path that branch inspects.
+
+    Both were wrong. `startswith("ssh://")` sent raw+ssh:// down the local
+    branch, and that branch called Path() on the URI rather than on the
+    destination path -- so on a healthy system doctor reported an error for
+    raw://, ssh:// and raw+ssh:// alike, and only a plain local path could pass.
+    """
+
+    @staticmethod
+    def _doctor_for(target_path):
+        from btrfs_backup_ng.core.doctor import Doctor
+
+        target = MagicMock()
+        target.path = target_path
+        target.ssh_port = None
+        target.ssh_key = None
+        volume = MagicMock()
+        volume.path = "/home"
+        volume.targets = [target]
+        config = MagicMock()
+        config.get_enabled_volumes.return_value = [volume]
+
+        doctor = Doctor(config=config)
+        return doctor
+
+    @patch("btrfs_backup_ng.sshutil.diagnose.test_ssh_connection")
+    def test_rawssh_is_probed_over_ssh_not_stat_ed_locally(self, mock_test_ssh):
+        """The dispatch bug: raw+ssh:// took the local branch."""
+        mock_test_ssh.return_value = True
+        doctor = self._doctor_for("raw+ssh://backup@nas:/mnt/store")
+
+        findings = doctor._check_target_reachability()
+
+        assert mock_test_ssh.called, (
+            "raw+ssh:// was not probed over SSH; it fell through to the local "
+            "branch, where Path() is handed a URI that can never exist"
+        )
+        assert mock_test_ssh.call_args[0][0] == "backup@nas"
+        assert all(f.severity != DiagnosticSeverity.ERROR for f in findings), [
+            f.message for f in findings
+        ]
+
+    def test_local_raw_target_checks_the_filesystem_path(self, tmp_path):
+        """The path bug: Path("raw:///real/dir") never exists, so a present
+        directory was reported missing."""
+        backups = tmp_path / "backups"
+        backups.mkdir()
+        doctor = self._doctor_for(f"raw://{backups}")
+
+        findings = doctor._check_target_reachability()
+
+        errors = [f for f in findings if f.severity == DiagnosticSeverity.ERROR]
+        assert not errors, (
+            f"a raw:// target whose directory exists was reported unreachable: "
+            f"{[f.message for f in errors]}"
+        )
+
+    def test_a_genuinely_missing_local_raw_target_is_still_an_error(self, tmp_path):
+        """The fix must not turn the check into a rubber stamp."""
+        doctor = self._doctor_for(f"raw://{tmp_path}/definitely-absent")
+
+        findings = doctor._check_target_reachability()
+
+        assert any(f.severity == DiagnosticSeverity.ERROR for f in findings)
+
+    @patch("btrfs_backup_ng.sshutil.diagnose.test_ssh_connection")
+    def test_ssh_target_still_routes_to_the_ssh_check(self, mock_test_ssh):
+        """Guards against over-correcting: ssh:// must not become a local stat."""
+        mock_test_ssh.return_value = True
+        doctor = self._doctor_for("ssh://user@host:/backups")
+
+        doctor._check_target_reachability()
+
+        assert mock_test_ssh.called
+        assert mock_test_ssh.call_args[0][0] == "user@host"
+
+    @pytest.mark.parametrize(
+        "uri",
+        [
+            "shell://cat > /dev/null",  # path is empty; not constructible at all
+            "raw://mnt/usb/backups",  # two slashes; three disagreeing readings
+            "backup@nas:/mnt/store",  # bare form; choose_endpoint raises
+        ],
+    )
+    def test_a_target_with_no_usable_path_is_an_error_not_a_pass(self, uri):
+        """Path("") is PosixPath("."), which always exists.
+
+        So a target doctor cannot inspect at all -- one choose_endpoint would
+        refuse to build -- gets stat'd against the current working directory and
+        reported healthy. Reporting OK for a target that cannot work is worse
+        than reporting nothing: doctor exists so that a broken config is caught
+        here rather than at 3am.
+        """
+        doctor = self._doctor_for(uri)
+
+        findings = doctor._check_target_reachability()
+
+        assert any(f.severity == DiagnosticSeverity.ERROR for f in findings), (
+            f"{uri} was not reported as an error; doctor stat'd '.' instead of a "
+            f"real path and called it healthy. Findings: {[f.message for f in findings]}"
+        )
+
+    @patch("btrfs_backup_ng.sshutil.diagnose.test_ssh_connection")
+    def test_an_unreachable_target_is_named_as_configured(self, mock_test_ssh):
+        """Two targets can share a host, so the message must carry the target.
+
+        Reporting only the probed 'user@host' makes 'ssh://u@h:/a' and
+        'raw+ssh://u@h:/b' produce two identical error lines, and neither names
+        the config entry to fix.
+        """
+        mock_test_ssh.return_value = False
+        doctor = self._doctor_for("raw+ssh://backup@nas:/mnt/store")
+
+        findings = doctor._check_target_reachability()
+
+        errors = [f for f in findings if f.severity == DiagnosticSeverity.ERROR]
+        assert errors, "an unreachable target produced no error"
+        assert "raw+ssh://backup@nas:/mnt/store" in errors[0].message, errors[0].message
+        assert errors[0].details.get("probed") == "backup@nas"
+
+    @patch("btrfs_backup_ng.sshutil.diagnose.test_ssh_connection")
+    def test_the_probe_receives_the_port_and_the_identity_file(self, mock_test_ssh):
+        """Dropping either argument sends every probe to port 22 with no key.
+
+        The failure is invisible: doctor reports the target unreachable and the
+        operator goes looking at the network, not at a diagnostic that never
+        used their configured port or key.
+        """
+        mock_test_ssh.return_value = True
+        doctor = self._doctor_for("ssh://user@host:2222/backups")
+        target = doctor.config.get_enabled_volumes()[0].targets[0]
+        target.ssh_key = "/keys/backup_ed25519"
+
+        doctor._check_target_reachability()
+
+        args = mock_test_ssh.call_args[0]
+        assert args[0] == "user@host"
+        assert args[1] == 2222, f"port from the URI was not passed (got {args[1]!r})"
+        assert args[2] == "/keys/backup_ed25519", (
+            f"identity file was not passed (got {args[2]!r})"
+        )
+
+    @patch("btrfs_backup_ng.sshutil.diagnose.test_ssh_connection")
+    def test_a_configured_ssh_port_is_used_when_the_uri_omits_one(self, mock_test_ssh):
+        """ssh_port in the config must not be shadowed by the URI's absence."""
+        mock_test_ssh.return_value = True
+        doctor = self._doctor_for("ssh://user@host:/backups")
+        target = doctor.config.get_enabled_volumes()[0].targets[0]
+        target.ssh_port = 2200
+
+        doctor._check_target_reachability()
+
+        assert mock_test_ssh.call_args[0][1] == 2200
+
+    @patch("btrfs_backup_ng.sshutil.diagnose.test_ssh_connection")
+    def test_an_ipv6_target_is_probed_without_brackets(self, mock_test_ssh):
+        """ssh cannot resolve '[::1]'; it resolves '::1'.
+
+        Measured against the real binary: `ssh '[::1]' echo hi` fails with
+        "Could not resolve hostname [::1]" while `ssh '::1' echo hi` connects,
+        so carrying the URI's delimiters into the probe reported a working
+        target unreachable.
+        """
+        mock_test_ssh.return_value = True
+        doctor = self._doctor_for("raw+ssh://[::1]:/mnt/store")
+
+        doctor._check_target_reachability()
+
+        assert mock_test_ssh.call_args[0][0] == "::1"
+
+    @pytest.mark.parametrize("uri", ["shell://cat", "backup@nas:/mnt/store"])
+    def test_space_check_skips_a_target_with_no_usable_path(self, uri, tmp_path):
+        """Same hazard in the space check: '.' reports the CHECKOUT's free space.
+
+        A target that cannot be inspected must be skipped, not silently answered
+        with the numbers from whatever directory doctor happens to run in.
+        """
+        doctor = self._doctor_for(uri)
+
+        with patch("btrfs_backup_ng.core.space.get_space_info") as mock_space:
+            doctor._check_destination_space()
+
+        assert not mock_space.called, (
+            f"{uri} reached the space check; the free space of '.' would be "
+            f"reported as the target's"
+        )

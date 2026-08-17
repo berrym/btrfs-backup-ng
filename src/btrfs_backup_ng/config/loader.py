@@ -175,7 +175,14 @@ def _parse_target(data: dict[str, Any]) -> TargetConfig:
     if "path" not in data:
         raise ConfigError("Target missing required 'path' field")
 
-    path = data["path"]
+    # Normalise here, at the producer, so every consumer sees one string.
+    # endpoint.choose_endpoint does not strip: a stray space in a quoted TOML
+    # path made ' ssh://user@host:/mnt/usb' build a LOCAL endpoint writing to
+    # '<cwd>/ ssh:/user@host:/mnt/usb', and '/mnt/usb ' resolve to a directory
+    # on the root filesystem rather than the mount point. Any consumer that
+    # stripped on its own would then disagree with the endpoint actually built,
+    # which is how a safety check ends up guarding a path nothing writes to.
+    path = str(data["path"]).strip() if isinstance(data["path"], str) else data["path"]
     is_raw = str(path).startswith(("raw://", "raw+ssh://"))
 
     # Validate compression against what the target's transport ACTUALLY supports.

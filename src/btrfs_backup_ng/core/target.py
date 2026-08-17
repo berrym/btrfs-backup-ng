@@ -79,6 +79,25 @@ class TargetScheme:
     reason: str = ""
     """Why an UNSUPPORTED path was rejected. Empty otherwise."""
 
+    user: str | None = None
+    """Username from the authority, if the URI carried one."""
+
+    host: str | None = None
+    """Hostname alone, without the user, port, or IPv6 brackets.
+
+    Stored unbracketed because that is what ``ssh`` accepts as a destination:
+    ``ssh '[::1]' echo hi`` fails with "Could not resolve hostname [::1]", while
+    ``ssh '::1' echo hi`` connects. Brackets exist in a URI only to delimit the
+    literal from a ``:port`` suffix, and that job is done once parsing is.
+    """
+
+    port: int | None = None
+    """Explicit port from ``ssh://host:2222/path``. None when unspecified.
+
+    A colon that is only a separator -- ``ssh://host:/path``, the form the README
+    and the shipped examples use -- is not a port and must not be read as one.
+    """
+
     # -- capabilities ------------------------------------------------------ #
 
     @property
@@ -109,6 +128,23 @@ class TargetScheme:
         endpoint ignores and authentication will fail with no explanation.
         """
         return self.is_remote
+
+    @property
+    def ssh_destination(self) -> str | None:
+        """What to hand ``ssh`` as its destination: ``user@host`` or ``host``.
+
+        Exists because callers were passing the whole URI where a host was
+        expected. ``core/doctor.py`` called
+        ``test_ssh_connection("ssh://user@host:/backups")``, which runs
+        ``ssh ssh://user@host:/backups echo ...`` and always fails -- so a
+        reachable target was reported unreachable. Measured: the full URI returns
+        False, ``user@host`` returns True.
+
+        None for targets that are not reached over SSH.
+        """
+        if not self.is_remote or not self.host:
+            return None
+        return f"{self.user}@{self.host}" if self.user else self.host
 
     @property
     def ssh_identity_config_key(self) -> str | None:
@@ -167,15 +203,24 @@ def parse_target(uri: str | None) -> TargetScheme:
     if uri is None:
         return TargetScheme("", TargetKind.UNSUPPORTED, "", "target path is not set")
 
-    text = str(uri).strip()
-    if not text:
+    # Deliberately NOT stripped. choose_endpoint does not strip, so stripping
+    # here would classify a padded path differently from the endpoint actually
+    # built from it: ' ssh://user@host:/mnt/usb' would be judged remote (and so
+    # exempt from the require_mount gate) while choose_endpoint builds a LOCAL
+    # endpoint writing under the working directory. Normalisation belongs to the
+    # producer -- config/loader.py strips when it reads the config -- so that one
+    # string reaches every consumer. A padded path that reaches here anyway is
+    # classified as written, which fails closed.
+    text = str(uri)
+    if not text.strip():
         return TargetScheme(text, TargetKind.UNSUPPORTED, "", "target path is empty")
 
     # Order matters: raw+ssh:// must be tested before raw://, or it is misread as
     # a local raw target whose path begins with "ssh://".
     if text.startswith(_RAW_SSH_PREFIX):
+        user, host, port, path = _parse_remote(text, _RAW_SSH_PREFIX)
         return TargetScheme(
-            text, TargetKind.RAW_SSH, _remote_path(text, _RAW_SSH_PREFIX)
+            text, TargetKind.RAW_SSH, path, user=user, host=host, port=port
         )
     if text.startswith(_RAW_PREFIX):
         remainder = text[len(_RAW_PREFIX) :]
@@ -195,7 +240,8 @@ def parse_target(uri: str | None) -> TargetScheme:
             )
         return TargetScheme(text, TargetKind.RAW, remainder)
     if text.startswith(_SSH_PREFIX):
-        return TargetScheme(text, TargetKind.SSH, _remote_path(text, _SSH_PREFIX))
+        user, host, port, path = _parse_remote(text, _SSH_PREFIX)
+        return TargetScheme(text, TargetKind.SSH, path, user=user, host=host, port=port)
     if text.startswith(_SHELL_PREFIX):
         return TargetScheme(text, TargetKind.SHELL, "")
 
@@ -225,19 +271,59 @@ def _local_path(uri: str, prefix: str) -> str:
     return remainder if remainder.startswith("/") else "/" + remainder
 
 
-def _remote_path(uri: str, prefix: str) -> str:
-    """Strip scheme and ``[user@]host[:port]``, leaving the destination path.
+def _parse_remote(
+    uri: str, prefix: str
+) -> tuple[str | None, str | None, int | None, str]:
+    """Split ``[user@]host[:port]/path`` into (user, host, port, path).
 
-    Accepts both ``ssh://host:/path`` and ``ssh://host/path``; the colon form is
-    what the README uses and what the config examples carry.
+    Both ``ssh://host:/path`` and ``ssh://host/path`` are accepted; the colon
+    form is what the README and the shipped examples use. A trailing colon is a
+    separator, not an empty port, and a numeric segment after the host is a port.
+    IPv6 literals are bracketed, so the brackets delimit the host and any colon
+    after ``]`` is the port.
     """
     remainder = uri[len(prefix) :]
     if not remainder:
-        return ""
-    # Split off the authority: everything up to the first '/' or ':/'.
-    for index, char in enumerate(remainder):
-        if char == "/":
-            return remainder[index:]
-        if char == ":" and remainder[index + 1 : index + 2] == "/":
-            return remainder[index + 1 :]
-    return ""
+        return None, None, None, ""
+
+    slash = remainder.find("/")
+    if slash == -1:
+        authority, path = remainder, ""
+    else:
+        authority, path = remainder[:slash], remainder[slash:]
+
+    user: str | None = None
+    if "@" in authority:
+        user, _, authority = authority.partition("@")
+        user = user or None
+
+    port: int | None = None
+    if authority.endswith("]"):
+        # Bracketed IPv6 with no port.
+        host: str | None = authority
+    elif "]" in authority:
+        # Bracketed IPv6 followed by ':' -- either ':port' or the bare separator.
+        head, _, tail = authority.rpartition(":")
+        if tail == "":
+            host = head  # `[::1]:` -- separator, not a port
+        elif tail.isdigit():
+            host, port = head, int(tail)
+        else:
+            host = authority
+    elif ":" in authority:
+        head, _, tail = authority.rpartition(":")
+        if tail == "":
+            host = head  # `host:` -- the separator form, no port
+        elif tail.isdigit():
+            host, port = head, int(tail)
+        else:
+            host = authority  # not a port; leave the authority intact
+    else:
+        host = authority
+
+    # Drop the delimiters now that they have done their job; ssh cannot resolve
+    # a bracketed literal.
+    if host and host.startswith("[") and host.endswith("]"):
+        host = host[1:-1]
+
+    return user, (host or None), port, path

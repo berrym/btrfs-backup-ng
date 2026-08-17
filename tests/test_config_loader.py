@@ -842,3 +842,62 @@ class TestGetDefaultConfigPath:
 
         result = get_default_config_path()
         assert result == sudo_user_home / ".config" / "btrfs-backup-ng" / "config.toml"
+
+
+class TestTargetPathIsNormalisedAtLoad:
+    """A quoted TOML path may carry stray whitespace; only the loader may strip it.
+
+    ``endpoint.choose_endpoint`` does not strip, so an unnormalised value is
+    built as written: ``" ssh://user@host:/mnt/usb"`` produces a LOCAL endpoint
+    writing to ``<cwd>/ ssh:/user@host:/mnt/usb`` -- under systemd, under ``/`` --
+    and ``"/mnt/usb "`` resolves to a directory on the root filesystem rather
+    than the mount point. Stripping in a consumer instead would be worse: the
+    safety check would then judge a different string than the endpoint builds,
+    so ``require_mount`` would pass on the mount while the write went elsewhere.
+    """
+
+    @staticmethod
+    def _load_target(tmp_path, raw_path):
+        config_path = tmp_path / "bbng.toml"
+        config_path.write_text(
+            "[global]\n\n"
+            "[[volumes]]\n"
+            'path = "/home"\n\n'
+            "[[volumes.targets]]\n"
+            f'path = "{raw_path}"\n'
+        )
+        config, _ = load_config(config_path)
+        return config.get_enabled_volumes()[0].targets[0]
+
+    @pytest.mark.parametrize(
+        ("written", "expected"),
+        [
+            (" ssh://user@host:/mnt/usb ", "ssh://user@host:/mnt/usb"),
+            ("  /mnt/usb  ", "/mnt/usb"),
+            (" raw:///mnt/usb", "raw:///mnt/usb"),
+            (" raw+ssh://user@nas:/mnt/usb", "raw+ssh://user@nas:/mnt/usb"),
+            ("/mnt/usb", "/mnt/usb"),
+        ],
+    )
+    def test_surrounding_whitespace_is_removed(self, tmp_path, written, expected):
+        assert self._load_target(tmp_path, written).path == expected
+
+    def test_the_normalised_path_builds_the_endpoint_the_scheme_predicts(
+        self, tmp_path, monkeypatch
+    ):
+        """Normalising at the producer is only useful if consumers then agree."""
+        from btrfs_backup_ng.core.target import parse_target
+        from btrfs_backup_ng.endpoint import choose_endpoint
+
+        monkeypatch.setenv("HOME", str(tmp_path))
+        target = self._load_target(tmp_path, " ssh://user@host:/mnt/usb ")
+
+        scheme = parse_target(target.path)
+        endpoint = choose_endpoint(target.path, {}, source=False)
+
+        assert scheme.is_remote is True
+        assert "SSH" in type(endpoint).__name__
+
+    def test_interior_whitespace_is_preserved(self, tmp_path):
+        """Only the padding is noise; a directory may legitimately contain a space."""
+        assert self._load_target(tmp_path, "/mnt/my backups").path == "/mnt/my backups"
