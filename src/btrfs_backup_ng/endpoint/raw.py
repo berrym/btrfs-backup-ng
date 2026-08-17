@@ -281,6 +281,24 @@ def _is_sudo_denial(stderr: str) -> bool:
 
     Callers must also require a NON-ZERO exit before consulting this. A command
     that succeeded was obviously permitted, whatever sudo muttered on the way.
+
+    SCOPE. The listing path no longer depends on this at all -- it uses the
+    sentinel, which cannot be defeated by an unenumerated wording. This remains
+    the classifier for the three sites that run a single binary through
+    :meth:`_elevate` rather than a wrapped shell, and so have no sentinel:
+    ``sidecar_exists``, the per-stream stat, and the delete loop. There the two
+    ways to be wrong are NOT symmetric, which decides the ambiguous cases below:
+
+    * calling a real denial benign is silent and destructive -- ``sidecar_exists``
+      would report "no sidecar" and let backfill OVERWRITE a real record;
+    * calling a benign warning a denial aborts loudly, visibly, and recoverably.
+
+    So where sudo's own behaviour is genuinely ambiguous, this errs toward
+    "denial". "unable to resolve host" is the known ambiguous one: it is emitted
+    only under ``Defaults fqdn`` (absent from stock sudoers, and it produced no
+    such message on a measured host), and sudo's NEWS records it becoming a fatal
+    error in 1.8.26 while it has historically been reported as warn-and-continue.
+    Treating it as a denial is the conservative reading for these three sites.
     """
     lowered = (stderr or "").lower()
     return any(
@@ -299,8 +317,19 @@ def _is_sudo_denial(stderr: str) -> bool:
             "is not in the sudoers file",
             "may not run sudo",
             "not allowed to run sudo",
-            # sudo refused before exec for its own reasons (these DENY: the
-            # audit callback and the fqdn callback both fail closed).
+            # Refused before exec, from sudo's own catalog. These were missed by
+            # the first cut and each one made a populated target list as empty:
+            # a requiretty policy, a syntactically broken sudoers, a root-denying
+            # sudoers, and a sudo binary that cannot elevate at all.
+            "must have a tty to run sudo",
+            "no valid sudoers sources",
+            "root is not allowed to sudo",
+            "effective uid is not 0",
+            # Not sudo speaking: the shell reporting sudo is absent. Elevation is
+            # equally impossible, so it belongs here rather than in the routine
+            # bucket -- an earlier test wrongly pinned this as an ordinary failure.
+            "sudo: command not found",
+            # Ambiguous; see SCOPE above for why these land on the deny side.
             "unable to send audit message",
             "unable to resolve host",
         )
@@ -352,7 +381,10 @@ def _check_remote_listing(
         return
     # Invariant: 255 is attributed to an ssh transport/auth/DNS failure. This relies on
     # the remote enumeration command never itself exiting 255 -- true for the commands
-    # here (find exits 0/1/2; sudo exits 1 on auth failure). ssh's default BatchMode +
+    # here (find exits 0/1/2, or 127 if absent; sudo exits 1 on auth failure). Note
+    # _elevate_shell re-raises the INNER status as the wrapper's own, so this invariant
+    # now also depends on no inner command ever exiting 255; keep that in mind before
+    # routing anything but find/stat through it. ssh's default BatchMode +
     # ConnectTimeout (see _build_ssh_command) make a down/black-holing host reach this
     # 255 path fast rather than hanging.
     if result.returncode == 255:
@@ -1900,7 +1932,16 @@ class SSHRawEndpoint(RawEndpoint):
         # emitted regardless of the inner command's exit status (find exits 1/2
         # routinely). Its absence therefore means "elevation failed", which the
         # listing guard can act on without knowing how sudo phrases refusal.
-        probed = f"{inner}; echo {_ELEVATION_SENTINEL} >&2"
+        #
+        # The inner status is captured and re-raised as the shell's own, because
+        # `sh -c 'cmd; echo ...'` otherwise exits with the ECHO's status -- always
+        # 0. That would mask a genuine find failure (a missing directory, an
+        # unreadable target) as a successful listing of an empty target, which is
+        # the very failure this guard exists to prevent, reintroduced by the fix
+        # for it.
+        probed = (
+            f"{inner}; __bbng_rc=$?; echo {_ELEVATION_SENTINEL} >&2; exit $__bbng_rc"
+        )
         return self._elevate(f"sh -c {shlex.quote(probed)}")
 
     def _exec_remote_command(

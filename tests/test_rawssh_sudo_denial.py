@@ -54,6 +54,15 @@ class TestSudoDenialIsRecognised:
             "sudo: user is not in the sudoers file",
             "sudo: sorry, user backup is not allowed to execute '/bin/find' as root",
             "sudo: no tty present and no askpass program specified",
+            # Verbatim from sudo 1.9.17's catalog. Each of these was MISSED by the
+            # first marker list, and each made a populated target list as empty at
+            # the three sites that have no sentinel.
+            "sudo: sorry, you must have a tty to run sudo",
+            "sudo: no valid sudoers sources found, quitting",
+            "sudo: sudoers specifies that root is not allowed to sudo",
+            "sudo: effective uid is not 0, is /usr/bin/sudo on a nosuid filesystem?",
+            # Not sudo speaking, but elevation is equally impossible.
+            "bash: sudo: command not found",
         ],
     )
     def test_real_sudo_refusals_are_detected(self, stderr):
@@ -567,4 +576,67 @@ class TestElevationIsProvenNotGuessed:
     def test_the_unelevated_command_carries_no_sentinel(self):
         assert (
             _endpoint(ssh_sudo=False)._elevate_shell("find /backup") == "find /backup"
+        )
+
+
+class TestTheSentinelDoesNotMaskTheInnerExitStatus:
+    """Appending the sentinel must not swallow the wrapped command's status.
+
+    `sh -c 'find ...; echo S >&2'` exits with the ECHO's status -- always 0. That
+    would turn a genuine find failure (a missing directory, an unreadable target)
+    into a successful listing of an empty target, which is exactly the false
+    all-clear the sentinel was added to prevent. Measured: without the capture,
+    a find over a nonexistent directory returned rc=0 and the guard reported an
+    empty target with no warning at all -- strictly worse than before the
+    sentinel, because the unelevated path still logged one.
+    """
+
+    def test_the_wrapper_captures_and_reraises_the_inner_status(self):
+        wrapped = _endpoint()._elevate_shell("find /backup -type f")
+        assert "__bbng_rc=$?" in wrapped
+        assert "exit $__bbng_rc" in wrapped
+        # Order matters: capture immediately after the command, exit last.
+        assert wrapped.index("__bbng_rc=$?") < wrapped.index(_ELEVATION_SENTINEL)
+        assert wrapped.index(_ELEVATION_SENTINEL) < wrapped.index("exit $__bbng_rc")
+
+    @pytest.mark.parametrize(
+        ("inner", "expected_rc"),
+        # `(exit 2)` not `exit 2`: the bare builtin terminates the wrapper shell
+        # before the sentinel prints. That is a real limitation -- an inner
+        # command that exits the shell is reported as "never run" -- but the only
+        # inner commands are `find ... 2>/dev/null`, which cannot do it.
+        [("false", 1), ("true", 0), ("(exit 2)", 2)],
+    )
+    def test_a_real_shell_propagates_the_inner_status(self, inner, expected_rc):
+        """Runs the actual emitted string through a real shell.
+
+        Asserting on the string alone would pass for a wrapper that is subtly
+        wrong; this executes it.
+        """
+        import subprocess as sp
+
+        wrapped = _endpoint()._elevate_shell(inner)
+        # Strip the sudo prefix; the shell semantics are what is under test.
+        script = wrapped.split("sudo -n sh -c ", 1)[1]
+        proc = sp.run(["sh", "-c", f"sh -c {script}"], capture_output=True, text=True)
+        assert proc.returncode == expected_rc, proc
+        assert _ELEVATION_SENTINEL in proc.stderr
+
+    def test_a_failed_elevated_listing_is_not_reported_as_an_empty_target(self):
+        """End to end: find failed, the shell ran, so this is not 'empty'."""
+        ep = _endpoint()
+        failed = MagicMock(
+            returncode=1,
+            stdout="",
+            stderr=f"find: '/backup': No such file or directory\n{_ELEVATION_SENTINEL}",
+        )
+        recorded = []
+        with patch.object(
+            raw_mod.logger, "warning", lambda msg, *a, **k: recorded.append(a)
+        ):
+            with patch.object(raw_mod.subprocess, "run", return_value=failed):
+                assert ep.list_snapshots(flush_cache=True) == []
+        assert recorded, (
+            "a failing elevated find produced no warning; its exit status was "
+            "masked and the empty result looks authoritative"
         )
