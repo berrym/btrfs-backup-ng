@@ -1,12 +1,12 @@
 """Tests for SSH endpoint utilities."""
 
+import shlex
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
 
 from btrfs_backup_ng.endpoint.ssh import (
-    RECEIVE_IDLE_TIMEOUT,
     SSHEndpoint,
     _build_receive_command,
 )
@@ -49,15 +49,18 @@ class TestBuildReceiveCommand:
         assert "trap" in cmd
         assert "PIPE" in cmd
 
-    def test_escaped_path_preserved(self):
-        """Test that already-escaped paths are preserved."""
-        # Path with spaces (pre-escaped)
-        cmd = _build_receive_command("'/mnt/my backup'")
-        assert "'/mnt/my backup'" in cmd
+    def test_producer_escapes_raw_path_itself(self):
+        """The producer owns escaping; callers pass a raw, unquoted path.
 
-    def test_default_idle_timeout_constant(self):
-        """Test that default idle timeout is defined."""
-        assert RECEIVE_IDLE_TIMEOUT == 300  # 5 minutes
+        Substring assertions cannot distinguish correct quoting from broken
+        quoting -- see tests/test_ssh_receive_command_quoting.py, which executes
+        the produced command through a real shell and asserts on the argv btrfs
+        actually receives. This test only pins the caller contract.
+        """
+        cmd = _build_receive_command("/mnt/my backup")
+        # The raw path must NOT appear unquoted: it would split into two words.
+        assert "receive /mnt/my backup" not in cmd
+        assert shlex.quote("/mnt/my backup") in cmd
 
     def test_no_password_uses_sudo_n(self):
         """Test that passwordless mode uses sudo -n flag."""
