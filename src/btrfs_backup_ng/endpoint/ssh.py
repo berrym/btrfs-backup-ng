@@ -2018,13 +2018,34 @@ print(json.dumps(result))
                     )
                     self._run_diagnostics(path, force_refresh=True)
 
-                return []
+                # An enumeration that FAILED is not an empty target. Returning []
+                # here reported "No snapshots found" with exit 0 for a location
+                # holding backups -- measured against a real host where the
+                # listing died with "ERROR: can't perform the search: Operation
+                # not permitted" because the connecting user lacks btrfs
+                # privileges. During a restore that is the most dangerous moment
+                # to be told the backups do not exist.
+                raise RuntimeError(
+                    f"Cannot list snapshots at {self.hostname}:{path}: "
+                    f"{stderr.strip() or f'btrfs subvolume list exited {result.returncode}'}. "
+                    "The location could NOT be enumerated -- this is NOT an empty "
+                    "target. `btrfs subvolume list` needs root on the remote, so "
+                    "either enable ssh_sudo (with passwordless sudo for "
+                    "/usr/bin/btrfs) or connect as a user that can read it."
+                )
             output = result.stdout.decode(errors="replace") if result.stdout else ""
             return self._parse_snapshot_list(output, path)
+        except RuntimeError:
+            raise
         except Exception as e:
             logger.error(f"Exception while listing remote snapshots: {e}")
             self._run_diagnostics(path, force_refresh=True)
-            return []
+            # Same reasoning as above: an exception means we do not know what is
+            # there, which must never be presented as "nothing is there".
+            raise RuntimeError(
+                f"Cannot list snapshots at {self.hostname}:{path}: {e}. The "
+                "location could NOT be enumerated -- this is NOT an empty target."
+            ) from e
 
     def _parse_snapshot_list(self, output: str, path: str) -> List[Any]:
         """Parse btrfs subvolume list output into Snapshot objects.
