@@ -14,6 +14,39 @@ These options can be used with any command:
 -q, --quiet         Suppress non-essential output
 ```
 
+## Where SSH Options Live
+
+Two kinds of command, two places to put SSH settings:
+
+| command shape | examples | SSH options come from |
+|---|---|---|
+| names a target on the command line | `restore`, `verify`, `estimate`, `snapper backup`, `snapper restore`, `raw list`, `raw verify` | `--ssh-sudo`, `--ssh-key`, `--ssh-auth-sock`, `--ssh-host-key-policy` |
+| runs against the configuration | `run`, `snapshot`, `transfer`, `prune` | the target's own keys in the config file |
+
+This is deliberate, not an omission. A config-driven command can fan out to several
+targets in one invocation -- an offsite server and a local NAS, with different
+users and different keys -- so a single `--ssh-key` on the command line would have
+no unambiguous meaning. Those commands therefore read `ssh_sudo`, `ssh_key`,
+`ssh_auth_sock` and `ssh_host_key_policy` from each `[[volumes.targets]]` entry,
+where they can differ per target:
+
+```toml
+[[volumes.targets]]
+path = "ssh://backup@offsite:/mnt/backups"
+ssh_key = "/home/user/.ssh/id_ed25519_offsite"
+ssh_sudo = true
+
+[[volumes.targets]]
+path = "raw+ssh://archive@nas:/srv/archive"
+ssh_key = "/home/user/.ssh/id_ed25519_nas"
+```
+
+Where a command names one target, the flag is unambiguous and is accepted.
+
+Note that `--ssh-sudo` does NOT mean the same thing on every scheme: on `ssh://`
+it elevates only `btrfs`, while on `raw+ssh://` it elevates every remote command.
+See the Permissions section of the README for what each scheme needs.
+
 ## Commands
 
 ### run

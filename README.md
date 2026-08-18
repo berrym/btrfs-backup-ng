@@ -1300,6 +1300,169 @@ sudo -E btrfs-backup-ng run
 
 **Warning:** Password-based authentication is not suitable for automated/unattended backups.
 
+## Permissions: Who Needs What, and Where
+
+Every question of the form "why does it say permission denied" comes down to three
+independent things: what runs **locally**, what runs **on the remote**, and who owns
+the **destination**. They are separate, and getting one right does not fix another.
+
+This section is written from measured behaviour, not from intent. Where a command
+is shown, it is one that was run.
+
+### The one distinction that surprises everyone
+
+`--ssh-sudo` does **not** mean the same thing on `ssh://` and `raw+ssh://`.
+
+| target | what runs on the remote | what `--ssh-sudo` elevates |
+|---|---|---|
+| `ssh://` | `btrfs receive`, `btrfs subvolume list`, plus `find`/`cat`/`test` for snapper layouts | **only `btrfs`** — `find`, `cat` and `test` are passed through unchanged |
+| `raw+ssh://` | ordinary file tools: `mkdir`, `find`, `cat`, `stat`, `mv`, `rm`, `sh` | **every remote command** |
+
+Consequences worth knowing before you debug:
+
+- On `ssh://`, adding `--ssh-sudo` will **not** let you read a root-owned directory.
+  The listing still runs as the connecting user. Grant that user access instead
+  (see [Non-root setup](#running-as-a-non-root-user)).
+- On `raw+ssh://`, `--ssh-sudo` does exactly what you expect — and a backup
+  **written** with it is root-owned, so every later list, verify, restore and prune
+  against that target needs it too. That choice is sticky.
+- No `btrfs` command ever runs on a `raw+ssh://` remote. It is a plain file store.
+  A sudoers rule granting `/usr/bin/btrfs` authorises nothing it needs.
+
+### Running as root
+
+The simplest setup, and the one to reach for if you are not sure.
+
+```bash
+# Local: run under sudo. btrfs snapshot/send need root.
+sudo btrfs-backup-ng run
+
+# Remote: the connecting user needs passwordless sudo for btrfs
+#   on the REMOTE, in /etc/sudoers.d/btrfs-backup-ng:
+backup ALL=(ALL) NOPASSWD: /usr/bin/btrfs
+```
+
+That rule is correct for `ssh://` targets and is all they need. It is **not**
+sufficient for `raw+ssh://` with `ssh_sudo` — see the table above.
+
+### Running as a non-root user
+
+Possible, and worth it: it keeps root out of the loop on both machines. It needs
+three separate grants, and missing any one of them produces a different error.
+
+#### 1. Local btrfs operations
+
+`btrfs subvolume snapshot` and `btrfs send` need root even for your own subvolumes.
+
+```bash
+# On the SOURCE machine, /etc/sudoers.d/btrfs-backup-ng:
+youruser ALL=(ALL) NOPASSWD: /usr/bin/btrfs
+```
+
+```bash
+sudo chmod 0440 /etc/sudoers.d/btrfs-backup-ng
+```
+
+> A sudoers file with the wrong mode is ignored, and `visudo -c` reports
+> `bad permissions, should be mode 0440`. Check it if passwordless sudo silently
+> stops working.
+
+#### 2. Snapper access (snapper sources only)
+
+btrfs-backup-ng reads the snapper config **file** directly *and* calls the
+`snapper` CLI. Those are two different permissions.
+
+```bash
+# Let your user drive snapper over D-Bus, and let snapper maintain the ACL
+sudo snapper -c <config> set-config ALLOW_USERS="youruser" SYNC_ACL=yes
+
+# Let btrfs-backup-ng read the config file itself
+sudo chmod 0644 /etc/snapper/configs/<config>
+```
+
+| missing grant | what you see |
+|---|---|
+| config file unreadable | `Failed to parse snapper config <name>: [Errno 13] Permission denied`, then `Snapper config not found` — the config exists, it just cannot be read |
+| `ALLOW_USERS` not set | `snapper -c <config> list` prints `No permissions.` and no snapshots are found |
+
+#### 3. Destination access
+
+The backup user must be able to write the destination. How you grant that depends
+on whether **snapper** owns the directory:
+
+| directory | owner | how to grant access |
+|---|---|---|
+| **source** `.snapshots` (snapper-managed) | must stay `root:root` | `ALLOW_USERS` + `SYNC_ACL=yes`; snapper maintains the ACL itself |
+| **destination** `.snapshots` (btrfs-backup-ng-managed) | may be the SSH user | `chown -R user:user /mnt/backups`, or `setfacl -m u:user:rwx -m d:u:user:rwx` |
+
+Chowning a **source** `.snapshots` does not work and snapper will tell you so:
+
+```
+IO Error (.snapshots must have owner root).
+```
+
+Snapper requires ownership of the directory it manages; `SYNC_ACL` is how it hands
+your user access. A manual `chown` there is also undone the next time snapper
+touches the directory.
+
+### SSH authentication
+
+Use keys. btrfs-backup-ng runs non-interactively, and a password prompt has nowhere
+to appear.
+
+```bash
+ssh-keygen -t ed25519 -f ~/.ssh/id_ed25519_bbng -N ""
+ssh-copy-id -i ~/.ssh/id_ed25519_bbng.pub backup@server
+```
+
+```toml
+[[volumes.targets]]
+path = "ssh://backup@server:/mnt/backups"
+ssh_key = "/home/youruser/.ssh/id_ed25519_bbng"
+```
+
+`ssh -t` does not help: with a pipe on stdin, ssh declines to allocate a terminal
+at all (`Pseudo-terminal will not be allocated because stdin is not a terminal`),
+and `ssh -tt` corrupts the stream — a measured 4096-byte transfer arrived as
+**zero bytes**. Elevation therefore uses `sudo -n`, which fails immediately and
+legibly rather than hanging on a prompt nothing can answer.
+
+#### Running under `sudo` with an ssh-agent key
+
+`sudo` strips `SSH_AUTH_SOCK`, so an agent-held key becomes invisible and the
+connection fails with `Permission denied (publickey)`. Either point at the key file
+explicitly, or preserve the socket:
+
+```bash
+sudo --preserve-env=SSH_AUTH_SOCK btrfs-backup-ng run
+```
+
+Or avoid the agent entirely by naming the key in the config, which is what `run`
+reads (it takes no `--ssh-*` flags of its own):
+
+```toml
+[[volumes.targets]]
+path = "ssh://backup@server:/mnt/backups"
+ssh_key = "/home/youruser/.ssh/id_ed25519_bbng"
+ssh_auth_sock = "/run/user/1000/keyring/ssh"   # optional, if you prefer the agent
+```
+
+### Error messages and what they actually mean
+
+| message | cause | fix |
+|---|---|---|
+| `sudo: a password is required` | passwordless sudo missing for the command being run — note `raw+ssh://` needs the FILE tools, not `btrfs` | add the right sudoers rule, or own the destination and drop `ssh_sudo` |
+| `ERROR: can't perform the search: Operation not permitted` | `btrfs subvolume list` on the remote without root | enable `ssh_sudo` (with `NOPASSWD: /usr/bin/btrfs`) |
+| `Snapper config not found` after a `Permission denied` warning | the snapper config file is `0640 root:root` | `chmod 0644 /etc/snapper/configs/<config>` |
+| `No permissions.` from snapper | `ALLOW_USERS` not set for your user | `snapper -c <config> set-config ALLOW_USERS="user" SYNC_ACL=yes` |
+| `IO Error (.snapshots must have owner root)` | a source `.snapshots` was chowned away from root | `chown root:root` it and use `SYNC_ACL=yes` |
+| `this is NOT an empty target` | a listing failed and was refused rather than reported as "no backups" | read the rest of the message; it names the path and the underlying error |
+
+That last one is deliberate. A location that cannot be read is never reported as a
+location with no backups — during a restore, being told your backups do not exist
+is the most dangerous possible thing to get wrong.
+
+
 ## Restoring from Backups
 
 The `restore` command enables pulling snapshots from backup storage back to local systems. This is essential for disaster recovery, migration, and backup verification.
