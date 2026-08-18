@@ -20,7 +20,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -190,58 +190,307 @@ class TestThePlanIsReadable:
         assert "date unknown" in text
 
 
-class TestStageOneDeletesNothing:
-    def test_the_run_phase_never_calls_a_delete(self):
-        """Stage 1 is a report. If this ever fails, deletion arrived early."""
-        from btrfs_backup_ng.cli import run as run_cli
+class TestTheRunPhaseContract:
+    """The retention phase now DELETES, so it takes the native phase's strict
+    contract: anything that stops retention happening fails the run rather than
+    passing quietly."""
 
-        volume = SimpleNamespace(path="/home", targets=[])
-        config = SimpleNamespace(get_effective_retention=lambda v: _retention())
-        target = SimpleNamespace(path="/backups")
-        backups = [_backup(n, days_ago=n * 40) for n in range(1, 13)]
-
-        with patch(
-            "btrfs_backup_ng.core.restore.list_snapper_backups", return_value=backups
-        ):
-            with patch(
-                "btrfs_backup_ng.cli.prune.execute_retention_deletes"
-            ) as deletes:
-                run_cli._report_snapper_retention_plan(volume, config, [(target, {})])
-        assert not deletes.called, "stage 1 must not delete"
-
-    def test_a_degenerate_policy_warns_without_failing_the_run(self, caplog):
+    def _phase(self, backups=None, targets=None, retention=None, side_effect=None):
         from btrfs_backup_ng.cli import run as run_cli
 
         volume = SimpleNamespace(path="/home", targets=[])
         config = SimpleNamespace(
-            get_effective_retention=lambda v: _retention(daily=0, min="1h")
+            get_effective_retention=lambda v: retention or _retention()
         )
-        result = run_cli._report_snapper_retention_plan(
-            volume, config, [(SimpleNamespace(path="/backups"), {})]
+        if targets is None:
+            targets = [(SimpleNamespace(path="/backups"), {})]
+        errors: list = []
+        patcher = patch(
+            "btrfs_backup_ng.core.restore.list_snapper_backups",
+            side_effect=side_effect,
+            **({} if side_effect else {"return_value": backups or []}),
         )
-        assert result is None, "a report phase returns nothing and fails nothing"
+        with patcher:
+            with patch(
+                "btrfs_backup_ng.cli.prune.delete_snapper_backups",
+                return_value=(len(backups or []), []),
+            ) as deletes:
+                ok = run_cli._prune_snapper_after_transfer(
+                    volume, config, targets, errors
+                )
+        return ok, errors, deletes
 
-    def test_an_enumeration_failure_does_not_fail_the_run(self):
+    def test_old_backups_are_actually_deleted(self):
+        backups = [_backup(n, days_ago=n * 20) for n in range(1, 13)]
+        ok, errors, deletes = self._phase(backups)
+        assert ok and not errors
+        assert deletes.called, "the phase must delete, not just plan"
+        _path, to_delete, _opts = deletes.call_args[0]
+        assert to_delete, "something should have been selected"
+
+    def test_a_degenerate_policy_fails_the_run(self):
+        """The report-only stage warned; a stage that deletes must refuse and
+        say so, exactly as the native phase does."""
+        ok, errors, deletes = self._phase(
+            [_backup(1, days_ago=1)], retention=_retention(daily=0, min="1h")
+        )
+        assert ok is False
+        assert any("Degenerate" in e for e in errors)
+        assert not deletes.called, "a refused policy must not delete"
+
+    def test_an_enumeration_failure_fails_the_run(self):
+        """A destination that could not be read is not an empty one. Pruning
+        nothing is safe; reporting success is not."""
+        ok, errors, deletes = self._phase(side_effect=RuntimeError("unreachable"))
+        assert ok is False
+        assert any("unreachable" in e for e in errors)
+        assert not deletes.called
+
+    def test_nothing_to_delete_is_a_success(self):
+        ok, errors, deletes = self._phase([_backup(1, days_ago=1)])
+        assert ok is True and not errors
+        assert not deletes.called
+
+    def test_no_successful_targets_prunes_nothing(self):
+        from btrfs_backup_ng.cli import run as run_cli
+
+        with patch("btrfs_backup_ng.core.restore.list_snapper_backups") as listing:
+            ok = run_cli._prune_snapper_after_transfer(
+                SimpleNamespace(path="/home"), SimpleNamespace(), [], []
+            )
+        assert ok is True
+        assert not listing.called, "a failed transfer's target must not be pruned"
+
+    def test_a_delete_failure_fails_the_run(self):
         from btrfs_backup_ng.cli import run as run_cli
 
         volume = SimpleNamespace(path="/home", targets=[])
         config = SimpleNamespace(get_effective_retention=lambda v: _retention())
+        errors: list = []
+        backups = [_backup(n, days_ago=n * 20) for n in range(1, 13)]
         with patch(
-            "btrfs_backup_ng.core.restore.list_snapper_backups",
-            side_effect=RuntimeError("unreachable"),
+            "btrfs_backup_ng.core.restore.list_snapper_backups", return_value=backups
         ):
-            assert (
-                run_cli._report_snapper_retention_plan(
-                    volume, config, [(SimpleNamespace(path="/backups"), {})]
+            with patch(
+                "btrfs_backup_ng.cli.prune.delete_snapper_backups",
+                return_value=(0, ["Delete slot 12: permission denied"]),
+            ):
+                ok = run_cli._prune_snapper_after_transfer(
+                    volume, config, [(SimpleNamespace(path="/backups"), {})], errors
                 )
-                is None
-            )
+        assert ok is False
+        assert any("permission denied" in e for e in errors)
 
-    def test_no_successful_targets_means_no_plan(self):
+    def test_the_source_is_never_pruned(self):
+        """snapper owns its own timeline. Only destination paths are planned."""
         from btrfs_backup_ng.cli import run as run_cli
 
-        with patch("btrfs_backup_ng.core.restore.list_snapper_backups") as listing:
-            run_cli._report_snapper_retention_plan(
-                SimpleNamespace(path="/home"), SimpleNamespace(), []
+        seen = []
+        volume = SimpleNamespace(path="/home", targets=[])
+        config = SimpleNamespace(get_effective_retention=lambda v: _retention())
+
+        def record(path, options):
+            seen.append(path)
+            return []
+
+        with patch("btrfs_backup_ng.core.restore.list_snapper_backups", record):
+            run_cli._prune_snapper_after_transfer(
+                volume, config, [(SimpleNamespace(path="/backups"), {})], []
             )
-        assert not listing.called
+        assert seen == ["/backups"]
+        assert "/home" not in seen, "the snapper source must never be planned"
+
+
+class TestTheDeletePrimitive:
+    """Two artifacts per slot, two privilege regimes. Measured on a real host:
+    `btrfs subvolume delete` is covered by the documented NOPASSWD rule, and
+    `sudo rm` is refused because rm is not btrfs."""
+
+    def _endpoint(self, path="/backups"):
+        return SimpleNamespace(config={"path": path})
+
+    def test_the_subvolume_is_deleted_before_the_slot_directory(self):
+        """If the subvolume delete fails there is still data in the slot;
+        removing info.xml first would strand it."""
+        from btrfs_backup_ng.cli import prune
+
+        order = []
+        endpoint = self._endpoint()
+
+        def exec_remote(cmd, **kw):
+            order.append(cmd[0] if cmd[0] != "btrfs" else " ".join(cmd[:3]))
+            return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
+
+        endpoint._exec_remote_command = exec_remote
+        prune._delete_snapper_slot_btrfs(endpoint, "/backups/.snapshots/9", True)
+        assert order == ["btrfs subvolume delete", "rm"], order
+
+    def test_a_failed_subvolume_delete_leaves_the_slot_alone(self):
+        from btrfs_backup_ng.cli import prune
+
+        calls = []
+        endpoint = self._endpoint()
+
+        def exec_remote(cmd, **kw):
+            calls.append(cmd)
+            rc = 1 if cmd[0] == "btrfs" else 0
+            return SimpleNamespace(returncode=rc, stdout=b"", stderr=b"nope")
+
+        endpoint._exec_remote_command = exec_remote
+        with pytest.raises(Exception, match="could not delete"):
+            prune._delete_snapper_slot_btrfs(endpoint, "/backups/.snapshots/9", True)
+        assert not any(c[0] == "rm" for c in calls), (
+            "info.xml removed despite live data"
+        )
+
+    def test_a_failed_directory_removal_is_not_fatal(self):
+        """The space is already reclaimed; a leftover empty directory is litter,
+        and enumeration ignores a slot with no published snapshot."""
+        from btrfs_backup_ng.cli import prune
+
+        endpoint = self._endpoint()
+        endpoint._exec_remote_command = lambda cmd, **kw: SimpleNamespace(
+            returncode=0 if cmd[0] == "btrfs" else 1, stdout=b"", stderr=b"denied"
+        )
+        prune._delete_snapper_slot_btrfs(endpoint, "/backups/.snapshots/9", True)
+
+    def test_it_targets_the_exact_slot_path(self):
+        from btrfs_backup_ng.cli import prune
+
+        seen = []
+        endpoint = self._endpoint()
+        endpoint._exec_remote_command = lambda cmd, **kw: (
+            seen.append(cmd) or SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
+        )
+        prune._delete_snapper_slot_btrfs(endpoint, "/backups/.snapshots/9", True)
+        assert seen[0][-1] == "/backups/.snapshots/9/snapshot"
+        assert seen[1][-1] == "/backups/.snapshots/9"
+
+    def test_a_raw_target_reuses_the_endpoint_delete(self):
+        """Not reimplemented here: RawEndpoint.delete_snapshots already holds the
+        per-target lock and enforces the chain guard that refuses to orphan an
+        incremental child."""
+        from btrfs_backup_ng.cli import prune
+
+        snap = SimpleNamespace(get_name=lambda: "home-1")
+        endpoint = SimpleNamespace(
+            config={"path": "raw:///backups"},
+            list_snapshots=lambda: [snap],
+            delete_snapshots=MagicMock(),
+        )
+        with patch("btrfs_backup_ng.endpoint.choose_endpoint", return_value=endpoint):
+            deleted, errors = prune.delete_snapper_backups(
+                "raw:///backups", [{"number": 1, "backup_name": "home-1"}]
+            )
+        assert deleted == 1 and not errors
+        endpoint.delete_snapshots.assert_called_once()
+
+    def test_a_raw_backup_with_no_matching_stream_is_an_error_not_a_silent_skip(self):
+        from btrfs_backup_ng.cli import prune
+
+        endpoint = SimpleNamespace(
+            config={"path": "raw:///backups"},
+            list_snapshots=lambda: [],
+            delete_snapshots=MagicMock(),
+        )
+        with patch("btrfs_backup_ng.endpoint.choose_endpoint", return_value=endpoint):
+            deleted, errors = prune.delete_snapper_backups(
+                "raw:///backups", [{"number": 1, "backup_name": "gone"}]
+            )
+        assert deleted == 0
+        assert errors and "gone" in errors[0]
+        assert not endpoint.delete_snapshots.called
+
+    def test_one_bad_delete_does_not_abort_the_rest(self):
+        from btrfs_backup_ng.cli import prune
+
+        endpoint = self._endpoint()
+        with patch("btrfs_backup_ng.endpoint.choose_endpoint", return_value=endpoint):
+            with patch.object(
+                prune,
+                "_delete_snapper_slot_btrfs",
+                side_effect=[RuntimeError("boom"), None, None],
+            ):
+                deleted, errors = prune.delete_snapper_backups(
+                    "/backups", [{"number": n} for n in (1, 2, 3)]
+                )
+        assert deleted == 2
+        assert len(errors) == 1 and "slot 1" in errors[0]
+
+    def test_deleting_nothing_is_a_no_op(self):
+        from btrfs_backup_ng.cli import prune
+
+        with patch("btrfs_backup_ng.endpoint.choose_endpoint") as ce:
+            assert prune.delete_snapper_backups("/backups", []) == (0, [])
+        assert not ce.called
+
+
+class TestSlotNumbersDoNotDecideAnything:
+    """Real snapper numbers slots ASCENDING with time -- slot 12 is newer than
+    slot 1. An early fixture here had it backwards (slot 1 newest), and while the
+    result was correct by date, it meant the realistic ordering was never
+    exercised. If anything in this path ever starts reasoning about the number
+    instead of the date, these fail.
+    """
+
+    AGES = [0, 1, 2, 3, 5, 9, 16, 30, 60, 90, 120, 150]
+
+    def _decide(self, backups):
+        keep, delete = apply_retention(
+            backups,
+            _retention(daily=7, weekly=4, monthly=3, min="2d"),
+            now=NOW,
+            get_timestamp=snapper_backup_timestamp,
+        )
+        ages = sorted((NOW - b["metadata"].date).days for b in delete)
+        return sorted(b["number"] for b in delete), ages
+
+    def _ascending_with_time(self):
+        """Real snapper: the highest number is the newest."""
+        return [
+            _backup(len(self.AGES) - i, days_ago=d) for i, d in enumerate(self.AGES)
+        ]
+
+    def _descending_with_time(self):
+        """The inverted layout, kept as a control."""
+        return [_backup(i + 1, days_ago=d) for i, d in enumerate(self.AGES)]
+
+    def test_the_same_snapshots_are_chosen_under_either_numbering(self):
+        _nums_a, ages_a = self._decide(self._ascending_with_time())
+        _nums_b, ages_b = self._decide(self._descending_with_time())
+        assert ages_a == ages_b, "the decision moved when only the numbering did"
+
+    def test_with_real_snapper_numbering_the_low_numbers_go(self):
+        numbers, ages = self._decide(self._ascending_with_time())
+        assert numbers and max(numbers) < 6, (
+            f"expected the OLDEST (low-numbered) slots, got {numbers}"
+        )
+        assert min(ages) >= 90, f"only genuinely old backups may go, got {ages}"
+
+    def test_the_newest_slot_is_never_deleted(self):
+        numbers, _ages = self._decide(self._ascending_with_time())
+        assert 12 not in numbers, "the newest backup was selected for deletion"
+
+    def test_it_is_the_date_not_the_number_that_orders_them(self):
+        """Numbers deliberately scrambled against dates: snapper reuses numbers
+        after its own pruning, so a low number can be newer than a high one.
+        Enough backups to overflow the buckets, otherwise even a very old lone
+        snapshot is legitimately kept as the sole occupant of its bucket."""
+        # number 99 is the OLDEST, number 1 is the NEWEST -- the opposite of what
+        # the numbers suggest.
+        scrambled = [99, 3, 77, 12, 5, 41, 8, 60, 2, 33, 17, 1]
+        ages = sorted(self.AGES, reverse=True)  # oldest first, matching the numbers
+        backups = [_backup(n, days_ago=a) for n, a in zip(scrambled, ages)]
+
+        _keep, delete = apply_retention(
+            backups,
+            _retention(daily=7, weekly=4, monthly=3, min="2d"),
+            now=NOW,
+            get_timestamp=snapper_backup_timestamp,
+        )
+        deleted_ages = sorted((NOW - b["metadata"].date).days for b in delete)
+        assert deleted_ages, "nothing was selected"
+        # Whatever went, it must be the OLDEST backups -- never the newest.
+        assert min(deleted_ages) >= 90, deleted_ages
+        assert 99 in [b["number"] for b in delete], "the oldest backup survived"
+        assert 1 not in [b["number"] for b in delete], "the newest was deleted"

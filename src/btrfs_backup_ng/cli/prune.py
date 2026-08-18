@@ -2,6 +2,8 @@
 
 import argparse
 import logging
+import os
+import subprocess
 import sys
 import time
 from datetime import datetime, timedelta
@@ -20,7 +22,7 @@ from ..notifications import (
 from ..notifications import (
     NotificationConfig as NotifConfig,
 )
-from ..retention import apply_retention, parse_duration
+from ..retention import RetentionError, apply_retention, parse_duration
 from .common import get_log_level, get_timestamp_format, thread_ssh_target_config
 
 logger = logging.getLogger(__name__)
@@ -129,6 +131,139 @@ def plan_snapper_retention(
         now=now,
         get_timestamp=snapper_backup_timestamp,
     )
+
+
+def _delete_snapper_slot_btrfs(endpoint: Any, slot_dir: str, remote: bool) -> None:
+    """Remove one ``.snapshots/{n}`` slot from a btrfs destination.
+
+    Two artifacts, two privilege regimes, and the order matters:
+
+    1. ``btrfs subvolume delete {slot}/snapshot`` reclaims the SPACE, which is
+       the entire point of retention. btrfs is the one binary the documented
+       sudoers elevates, so this works even against a root-owned destination.
+    2. Removing the slot directory (which holds info.xml) is NOT a btrfs
+       operation, so ``--ssh-sudo`` does not cover it and ``sudo rm`` is refused
+       under the documented policy -- measured. It succeeds when the connecting
+       user owns the slot, which is the normal case.
+
+    The subvolume goes first: if step 1 fails there is still data in the slot and
+    removing info.xml would strand it. If step 2 fails after step 1 succeeded,
+    the space is already reclaimed and an empty slot directory remains -- that is
+    reported, not raised, because a leftover directory is litter while a failed
+    retention is a full disk. The enumeration skips a slot with no published
+    snapshot, so the leftover cannot present as a restorable backup.
+    """
+    subvolume = f"{slot_dir}/snapshot"
+    if remote:
+        result = endpoint._exec_remote_command(
+            ["btrfs", "subvolume", "delete", subvolume],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        if result.returncode != 0:
+            stderr = (result.stderr or b"").decode(errors="replace").strip()
+            raise RetentionError(f"could not delete {subvolume}: {stderr}")
+        cleanup = endpoint._exec_remote_command(
+            ["rm", "-rf", slot_dir],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        if cleanup.returncode != 0:
+            stderr = (cleanup.stderr or b"").decode(errors="replace").strip()
+            logger.warning(
+                "Deleted the backup at %s but could not remove the now-empty slot "
+                "directory (%s). The space is reclaimed; the empty directory "
+                "remains and is ignored by enumeration. Removing it needs write "
+                "access to the parent -- --ssh-sudo elevates only btrfs.",
+                subvolume,
+                stderr or f"rm exited {cleanup.returncode}",
+            )
+        return
+
+    argv = ["btrfs", "subvolume", "delete", subvolume]
+    if os.geteuid() != 0:
+        argv = ["sudo", "-n", *argv]
+    result = subprocess.run(argv, capture_output=True)
+    if result.returncode != 0:
+        stderr = (result.stderr or b"").decode(errors="replace").strip()
+        raise RetentionError(f"could not delete {subvolume}: {stderr}")
+    try:
+        __util__.privileged_rmtree(slot_dir)
+    except Exception as e:  # noqa: BLE001 - the space is already reclaimed
+        logger.warning(
+            "Deleted the backup at %s but could not remove the now-empty slot "
+            "directory: %s. The space is reclaimed and enumeration ignores the "
+            "leftover.",
+            subvolume,
+            e,
+        )
+
+
+def delete_snapper_backups(
+    backup_path: str, backups: list, endpoint_options: dict | None = None
+) -> tuple[int, list[str]]:
+    """Delete snapper destination backups. Returns ``(deleted_count, errors)``.
+
+    The snapper twin of ``execute_retention_deletes``, and like it a per-backup
+    failure is recorded rather than raised, so one bad delete does not abort the
+    rest of the pass.
+
+    Raw targets are routed through ``RawEndpoint.delete_snapshots``, deliberately
+    rather than removing files here: that path already holds the per-target lock
+    (so a delete cannot race a concurrent backup) and enforces the chain guard
+    that refuses to orphan an incremental child. A second implementation would
+    have neither. btrfs targets have no such existing primitive, which is what
+    ``_delete_snapper_slot_btrfs`` supplies.
+    """
+    if not backups:
+        return 0, []
+
+    from ..core.target import TargetKind, parse_target
+    from ..endpoint import choose_endpoint
+
+    scheme = parse_target(backup_path)
+    config: dict[str, Any] = {"path": backup_path, "snap_prefix": ""}
+    if endpoint_options:
+        config.update(endpoint_options)
+    endpoint_obj = choose_endpoint(backup_path, config)
+
+    deleted = 0
+    errors: list[str] = []
+
+    if scheme.is_raw:
+        by_name = {s.get_name(): s for s in endpoint_obj.list_snapshots()}
+        wanted = []
+        for backup in backups:
+            name = backup.get("backup_name")
+            if name in by_name:
+                wanted.append(by_name[name])
+            else:
+                errors.append(
+                    f"Delete slot {backup.get('number')}: no raw stream named "
+                    f"{name!r} at the destination"
+                )
+        if wanted:
+            try:
+                endpoint_obj.delete_snapshots(
+                    wanted, delete_session={s.get_name() for s in wanted}
+                )
+                deleted += len(wanted)
+            except Exception as e:  # noqa: BLE001 - record, do not abort
+                errors.append(f"Delete raw snapper backups: {e}")
+        return deleted, errors
+
+    base = str(endpoint_obj.config["path"]).rstrip("/")
+    remote = scheme.kind is TargetKind.SSH
+    for backup in backups:
+        slot_dir = f"{base}/.snapshots/{backup.get('number')}"
+        try:
+            _delete_snapper_slot_btrfs(endpoint_obj, slot_dir, remote)
+            deleted += 1
+        except Exception as e:  # noqa: BLE001 - record and continue
+            errors.append(f"Delete slot {backup.get('number')}: {e}")
+    return deleted, errors
 
 
 def format_snapper_retention_plan(
