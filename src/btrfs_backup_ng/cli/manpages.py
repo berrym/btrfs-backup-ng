@@ -14,20 +14,27 @@ def get_manpages_dir() -> Path | None:
     Returns:
         Path to man/man1 directory, or None if not found
     """
-    # Try to find man pages in the package
-    try:
-        # When installed as a package
-        pkg_files = files("btrfs_backup_ng")
-        man_path = Path(str(pkg_files)).parent.parent.parent / "man" / "man1"
-        if man_path.exists():
-            return man_path
-    except Exception:
-        pass
+    # Installed: pyproject ships these as data-files under the environment prefix.
+    # sys.prefix is the venv root under a venv and /usr (or /usr/local) otherwise.
+    for prefix in (sys.prefix, sys.base_prefix, "/usr/local", "/usr"):
+        installed = Path(prefix) / "share" / "man" / "man1"
+        if (installed / "btrfs-backup-ng.1").is_file():
+            return installed
 
-    # Try relative to this file (development mode)
+    # Running from a source checkout.
     dev_path = Path(__file__).parent.parent.parent.parent / "man" / "man1"
-    if dev_path.exists():
+    if dev_path.is_dir():
         return dev_path
+
+    # Last resort: alongside the installed package, for layouts that place data
+    # next to the module rather than under the prefix.
+    try:
+        pkg_dir = Path(str(files("btrfs_backup_ng")))
+        for candidate in (pkg_dir / "man" / "man1", pkg_dir.parent / "man" / "man1"):
+            if candidate.is_dir():
+                return candidate
+    except Exception:  # noqa: BLE001 - importlib failures must not break the command
+        pass
 
     return None
 

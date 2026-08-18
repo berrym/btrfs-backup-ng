@@ -5,6 +5,20 @@ build-backend = "setuptools.build_meta"
 [tool.setuptools.packages.find]
 where = ["src"]
 
+# Ship the man pages and shell completions in the wheel, not only the sdist.
+# MANIFEST.in governs the source tarball alone, so `pip install btrfs-backup-ng`
+# delivered neither, and `manpages install` / `completions install` had nothing to
+# copy from. Installed under the environment prefix on the standard FHS paths, which
+# is where get_manpages_dir()/get_completions_dir() look. The top-level directories
+# stay put so distribution packaging can keep referencing them directly.
+[tool.setuptools.data-files]
+"share/man/man1" = ["man/man1/*.1"]
+"share/btrfs-backup-ng/completions" = [
+    "completions/btrfs-backup-ng.bash",
+    "completions/btrfs-backup-ng.zsh",
+    "completions/btrfs-backup-ng.fish",
+]
+
 [project]
 name = "btrfs-backup-ng"
 version = "0.9.3"

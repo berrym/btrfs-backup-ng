@@ -22,20 +22,27 @@ def get_completions_dir() -> Path | None:
     Returns:
         Path to completions directory, or None if not found
     """
-    # Try to find completions in the package
-    try:
-        # When installed as a package
-        pkg_files = files("btrfs_backup_ng")
-        completions_path = Path(str(pkg_files)).parent.parent.parent / "completions"
-        if completions_path.exists():
-            return completions_path
-    except Exception:
-        pass
+    # Installed: pyproject ships these as data-files under the environment prefix.
+    # sys.prefix is the venv root under a venv and /usr (or /usr/local) otherwise.
+    for prefix in (sys.prefix, sys.base_prefix, "/usr/local", "/usr"):
+        installed = Path(prefix) / "share" / "btrfs-backup-ng" / "completions"
+        if installed.is_dir():
+            return installed
 
-    # Try relative to this file (development mode)
+    # Running from a source checkout.
     dev_path = Path(__file__).parent.parent.parent.parent / "completions"
-    if dev_path.exists():
+    if dev_path.is_dir():
         return dev_path
+
+    # Last resort: alongside the installed package, for layouts that place data
+    # next to the module rather than under the prefix.
+    try:
+        pkg_dir = Path(str(files("btrfs_backup_ng")))
+        for candidate in (pkg_dir / "completions", pkg_dir.parent / "completions"):
+            if candidate.is_dir():
+                return candidate
+    except Exception:  # noqa: BLE001 - importlib failures must not break the command
+        pass
 
     return None
 
