@@ -255,6 +255,7 @@ def apply_retention(
     prefix: str = "",
     now: datetime | None = None,
     timestamp_format: str | None = None,
+    get_timestamp: Callable[[Any], datetime | None] | None = None,
 ) -> tuple[list, list]:
     """Apply retention policy to a list of snapshots.
 
@@ -266,6 +267,15 @@ def apply_retention(
         now: Current time (default: datetime.now())
         timestamp_format: Configured timestamp_format, tried first when parsing
             snapshot times so custom-named snapshots are bucketed (not kept forever)
+        get_timestamp: Where a snapshot's time comes from, when it does NOT come
+            from its name. Defaults to parsing the name, which is right for
+            native backups (``prefix`` + timestamp). Snapper destination backups
+            are NUMBERED slots -- ``.snapshots/558`` -- whose date lives in
+            ``info.xml``, so every one of them fails name parsing, lands in the
+            quarantine branch below, and is kept forever. Retention would then
+            report success having deleted nothing, which is a worse answer than
+            not running at all. Returning None from this callable means the same
+            thing an unparseable name means: quarantine and keep.
 
     Returns:
         Tuple of (snapshots_to_keep, snapshots_to_delete)
@@ -304,11 +314,14 @@ def apply_retention(
     quarantined_infos: list[SnapshotInfo] = []
     for snap in snapshots:
         name = name_func(snap)
-        timestamp = extract_timestamp(name, prefix, timestamp_format)
+        if get_timestamp is not None:
+            timestamp = get_timestamp(snap)
+        else:
+            timestamp = extract_timestamp(name, prefix, timestamp_format)
 
         if timestamp is None:
             logger.warning(
-                "Retention: cannot parse a timestamp from %r; keeping it, excluded from "
+                "Retention: no usable timestamp for %r; keeping it, excluded from "
                 "retention counting",
                 name,
             )

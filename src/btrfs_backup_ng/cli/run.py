@@ -600,6 +600,7 @@ def _backup_snapper_volume(
         return True, stats, errors
 
     all_success = True
+    succeeded_targets: list[tuple[Any, dict[str, Any]]] = []
     for target in volume.targets:
         try:
             # Check mount requirement for local targets
@@ -657,6 +658,9 @@ def _backup_snapper_volume(
 
             stats["completed"] += transferred
             logger.info("Transferred %d snapshot(s) to %s", transferred, target.path)
+            # Only a target whose transfer SUCCEEDED is eligible for retention,
+            # matching the native pipeline's fate-sharing rule.
+            succeeded_targets.append((target, snapper_endpoint_config))
 
         except __util__.AbortError as e:
             logger.error("Backup to %s aborted: %s", target.path, e)
@@ -669,7 +673,86 @@ def _backup_snapper_volume(
             all_success = False
             stats["failed"] += 1
 
+    _report_snapper_retention_plan(volume, config, succeeded_targets)
     return all_success, stats, errors
+
+
+def _report_snapper_retention_plan(
+    volume: VolumeConfig,
+    config: Config,
+    succeeded_targets: list,
+) -> None:
+    """The snapper pipeline's retention phase -- REPORTING ONLY, stage 1 of 2.
+
+    `run` on a native volume ends with `_prune_after_transfer`; the snapper path
+    ended without any retention phase at all, so snapper destinations grew
+    without bound and nothing said so.
+
+    This stage plans and prints; it deletes nothing. Deleting backups is the
+    first destructive behaviour in this area, and the plan is worth having in
+    front of operators for a release before it starts removing things.
+
+    Two deliberate differences from the native phase, both to be revisited when
+    stage 2 makes this destructive:
+
+    * The SOURCE is never considered. snapper owns its own timeline through its
+      cleanup algorithms, and bbng deleting source snapshots would fight it.
+      Only destinations are planned.
+    * A bad policy warns rather than failing the run. The native phase exits
+      non-zero on a degenerate policy because it is about to delete; a phase that
+      only prints has not earned the right to fail someone's backup run. Stage 2
+      adopts the strict contract along with the deletes.
+    """
+    if not succeeded_targets:
+        return
+
+    from .prune import (
+        format_snapper_retention_plan,
+        is_degenerate_policy,
+        plan_snapper_retention,
+    )
+
+    retention = config.get_effective_retention(volume)
+    if is_degenerate_policy(retention):
+        logger.warning(
+            "Snapper retention policy for %s keeps ONLY the latest backup (all "
+            "buckets 0, min=%s). Not planning retention for it; fix the policy.",
+            volume.path,
+            retention.min,
+        )
+        return
+
+    for target, endpoint_config in succeeded_targets:
+        try:
+            to_keep, to_delete = plan_snapper_retention(
+                target.path, retention, endpoint_config
+            )
+        except Exception as e:  # noqa: BLE001 - a report must not fail the run
+            logger.warning(
+                "Could not plan snapper retention for %s: %s", target.path, e
+            )
+            continue
+
+        if not to_keep and not to_delete:
+            continue
+        if to_delete:
+            logger.info(
+                "Snapper retention for %s would keep %d and delete %d backup(s). "
+                "Retention does not delete yet; this is a report.",
+                target.path,
+                len(to_keep),
+                len(to_delete),
+            )
+            for line in format_snapper_retention_plan(
+                target.path, to_keep, to_delete
+            ).splitlines():
+                logger.info("  %s", line)
+        else:
+            logger.info(
+                "Snapper retention for %s: all %d backup(s) are within policy.",
+                target.path,
+                len(to_keep),
+            )
 
 
 def _transfer_to_target(

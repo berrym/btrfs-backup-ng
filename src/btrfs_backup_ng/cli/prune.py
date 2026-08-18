@@ -4,7 +4,7 @@ import argparse
 import logging
 import sys
 import time
-from datetime import timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Literal
 
@@ -70,6 +70,96 @@ def plan_endpoint_retention(
     # Never prune a snapshot a kept one still needs as an incremental parent (no-op for btrfs;
     # protects raw stream chains from becoming unrestorable).
     return endpoint_obj.protect_incremental_parents(to_keep, to_delete)
+
+
+def snapper_backup_timestamp(backup: dict) -> Any:
+    """The creation time of a snapper DESTINATION backup, or None if unknown.
+
+    Snapper backups are numbered slots -- ``.snapshots/558`` -- so there is no
+    timestamp in the name to parse. The date lives in the slot's ``info.xml``
+    (or, for raw targets, in the sidecar), which the enumeration has already
+    read into ``metadata``.
+
+    None means the same thing an unparseable name means to ``apply_retention``:
+    quarantine the backup and keep it. A backup whose date cannot be established
+    must never be selected for deletion.
+    """
+    metadata = backup.get("metadata")
+    date = getattr(metadata, "date", None)
+    return date if isinstance(date, datetime) else None
+
+
+def plan_snapper_retention(
+    backup_path: str,
+    retention: Any,
+    endpoint_options: dict | None = None,
+    now: Any = None,
+) -> tuple[list, list]:
+    """The retention PLAN for snapper backups at one destination: ``(keep, delete)``.
+
+    The snapper twin of ``plan_endpoint_retention``, and deliberately built on the
+    same ``apply_retention`` engine so the two can never drift on what "keep 7
+    daily" means. Two things differ, and only two:
+
+    * Enumeration goes through ``list_snapper_backups``, the same scheme-aware
+      function ``snapper restore --list`` uses, so what retention reasons about
+      is exactly what a restore would find -- local, ssh://, raw:// and
+      raw+ssh:// alike.
+    * Timestamps come from ``info.xml`` rather than the name, because the name is
+      a slot number. Without that, every backup fails name parsing, is
+      quarantined, and is kept -- retention would report success having deleted
+      nothing, which is a worse answer than not running.
+
+    This plans only. Nothing here deletes, and the caller decides what to do with
+    the plan.
+
+    Raises ``RetentionError`` on an invalid ``min`` (fail-closed: the caller
+    prunes nothing), and propagates an enumeration failure rather than treating a
+    location it could not read as an empty one.
+    """
+    from ..core.restore import list_snapper_backups
+
+    backups = list_snapper_backups(backup_path, endpoint_options)
+    if not backups:
+        return [], []
+    return apply_retention(
+        backups,
+        retention,
+        get_name=lambda b: f"slot {b.get('number')}",
+        now=now,
+        get_timestamp=snapper_backup_timestamp,
+    )
+
+
+def format_snapper_retention_plan(
+    backup_path: str, to_keep: list, to_delete: list
+) -> str:
+    """Render a snapper retention plan for a human, newest first.
+
+    Reports the KEEP side too, not only the deletions. A plan that lists what it
+    would remove and stays silent about what survives cannot be checked by the
+    person approving it.
+    """
+    lines = [f"Snapper retention plan for {backup_path}:", ""]
+
+    def render(title: str, backups: list) -> None:
+        lines.append(f"  {title}: {len(backups)}")
+        for backup in sorted(
+            backups,
+            key=lambda b: snapper_backup_timestamp(b) or datetime.min,
+            reverse=True,
+        ):
+            stamp = snapper_backup_timestamp(backup)
+            when = stamp.strftime("%Y-%m-%d %H:%M:%S") if stamp else "date unknown"
+            metadata = backup.get("metadata")
+            description = getattr(metadata, "description", "") or ""
+            suffix = f"  {description}" if description else ""
+            lines.append(f"    slot {backup.get('number')}  {when}{suffix}")
+        lines.append("")
+
+    render("Keep", to_keep)
+    render("Would delete", to_delete)
+    return "\n".join(lines).rstrip() + "\n"
 
 
 def execute_retention_deletes(
