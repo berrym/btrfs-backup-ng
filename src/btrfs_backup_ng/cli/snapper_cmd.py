@@ -561,7 +561,7 @@ def _handle_restore(args: argparse.Namespace) -> int:
         endpoint_options["ssh_host_key_policy"] = args.ssh_host_key_policy
     # Decryption settings for an encrypted raw snapper backup. Threaded only when
     # supplied so the sidecar-recorded cipher stays authoritative; carried through
-    # _raw_endpoint_config into the raw endpoint that decodes the stream.
+    # _restore_endpoint_config into the raw endpoint that decodes the stream.
     if getattr(args, "gpg_keyring", None):
         endpoint_options["gpg_keyring"] = args.gpg_keyring
     if getattr(args, "openssl_cipher", None):

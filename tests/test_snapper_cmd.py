@@ -2008,7 +2008,7 @@ class TestRestoreConfigOptionalWithList:
 class TestSnapperRestoreDecryptOptions:
     """snapper restore threads --gpg-keyring/--openssl-cipher into endpoint_options.
 
-    These carry through _raw_endpoint_config into the raw endpoint that decodes an
+    These carry through _restore_endpoint_config into the raw endpoint that decodes an
     encrypted raw snapper backup. Threaded only when supplied so the sidecar-
     recorded cipher stays authoritative.
     """
