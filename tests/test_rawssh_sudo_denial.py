@@ -171,13 +171,23 @@ class TestListingRefusesToReportAnEmptyTarget:
             MagicMock(returncode=0, stdout="", stderr=""), "nas", "/backup"
         )
 
-    def test_an_ordinary_nonzero_still_only_warns(self):
-        """A missing directory is not a refusal; it must not abort the run."""
-        raw_mod._check_remote_listing(
-            MagicMock(returncode=1, stdout="", stderr="find: no such file"),
-            "nas",
-            "/backup",
-        )
+    def test_an_ordinary_nonzero_is_a_failed_listing_not_a_refusal(self):
+        """A missing directory is not a refusal -- and not an empty target.
+
+        find exits 0 whenever it finished looking, including over an empty
+        directory, so non-zero means the search did not complete. The error must
+        say so and carry find's own words, without blaming sudo.
+        """
+        with pytest.raises(RuntimeError) as excinfo:
+            raw_mod._check_remote_listing(
+                MagicMock(returncode=1, stdout="", stderr="find: no such file"),
+                "nas",
+                "/backup",
+            )
+        message = str(excinfo.value)
+        assert "listing command failed" in message
+        assert "find: no such file" in message
+        assert "never run" not in message
 
     def test_an_unreachable_host_still_raises(self):
         with pytest.raises(RuntimeError, match="NOT an empty target"):
@@ -523,19 +533,23 @@ class TestElevationIsProvenNotGuessed:
             elevated=True,
         )
 
-    def test_an_ordinary_find_failure_after_a_real_run_still_only_warns(self):
-        """find exits 1/2 routinely; once the shell demonstrably ran, that is
-        a listing detail rather than a permission failure."""
-        raw_mod._check_remote_listing(
-            MagicMock(
-                returncode=1,
-                stdout="",
-                stderr=f"find: '/backup/x': No such file\n{_ELEVATION_SENTINEL}",
-            ),
-            "nas",
-            "/backup",
-            elevated=True,
-        )
+    def test_a_find_failure_after_a_real_run_blames_the_listing(self):
+        """Elevation provably worked, so the error must name the listing.
+
+        It is still not an empty target: the search did not complete, so the
+        result cannot be trusted.
+        """
+        with pytest.raises(RuntimeError, match="listing command failed"):
+            raw_mod._check_remote_listing(
+                MagicMock(
+                    returncode=1,
+                    stdout="",
+                    stderr=f"find: '/backup/x': No such file\n{_ELEVATION_SENTINEL}",
+                ),
+                "nas",
+                "/backup",
+                elevated=True,
+            )
 
     def test_an_unelevated_listing_is_unaffected(self):
         """No sudo means no sentinel to expect; the working path must not break."""
@@ -550,10 +564,7 @@ class TestElevationIsProvenNotGuessed:
         Asserts on what reaches the logger rather than on caplog: this project
         configures logging itself, so caplog captures nothing here.
         """
-        recorded = []
-        with patch.object(
-            raw_mod.logger, "warning", lambda msg, *a, **k: recorded.append(a)
-        ):
+        with pytest.raises(RuntimeError) as excinfo:
             raw_mod._check_remote_listing(
                 MagicMock(
                     returncode=1, stdout="", stderr=f"find: oops\n{_ELEVATION_SENTINEL}"
@@ -562,8 +573,7 @@ class TestElevationIsProvenNotGuessed:
                 "/backup",
                 elevated=True,
             )
-        assert recorded, "no warning was emitted"
-        text = " ".join(str(x) for x in recorded[0])
+        text = str(excinfo.value)
         assert _ELEVATION_SENTINEL not in text
         assert "find: oops" in text
 
@@ -642,16 +652,9 @@ class TestTheSentinelDoesNotMaskTheInnerExitStatus:
             stdout="",
             stderr=f"find: '/backup': No such file or directory\n{_ELEVATION_SENTINEL}",
         )
-        recorded = []
-        with patch.object(
-            raw_mod.logger, "warning", lambda msg, *a, **k: recorded.append(a)
-        ):
-            with patch.object(raw_mod.subprocess, "run", return_value=failed):
-                assert ep.list_snapshots(flush_cache=True) == []
-        assert recorded, (
-            "a failing elevated find produced no warning; its exit status was "
-            "masked and the empty result looks authoritative"
-        )
+        with patch.object(raw_mod.subprocess, "run", return_value=failed):
+            with pytest.raises(RuntimeError, match="NOT an empty target"):
+                ep.list_snapshots(flush_cache=True)
 
 
 class TestNoMessageLeaksTheInternalMarker:
@@ -701,11 +704,20 @@ class TestElevationIsProvenNotReGuessed:
         ],
     )
     def test_a_sudo_message_never_overrules_the_sentinel(self, stderr):
-        """With the sentinel present the command ran; a non-zero status is its own."""
+        """With the sentinel present the command ran, so sudo is not the cause.
+
+        The listing still failed, so this raises -- but it must blame the
+        LISTING, never elevation. Blaming sudo here sent operators to fix a
+        sudoers policy that was already correct.
+        """
         result = MagicMock(
             returncode=1, stdout="", stderr=f"{stderr}\n{_ELEVATION_SENTINEL}"
         )
-        raw_mod._check_remote_listing(result, "nas", "/backup", elevated=True)
+        with pytest.raises(RuntimeError) as excinfo:
+            raw_mod._check_remote_listing(result, "nas", "/backup", elevated=True)
+        message = str(excinfo.value)
+        assert "listing command failed" in message
+        assert "never run" not in message
 
     def test_an_inner_255_is_not_blamed_on_the_transport(self):
         """255 means "ssh could not connect" only if the shell never ran.
@@ -717,7 +729,11 @@ class TestElevationIsProvenNotReGuessed:
         result = MagicMock(
             returncode=255, stdout="", stderr=f"tool exited 255\n{_ELEVATION_SENTINEL}"
         )
-        raw_mod._check_remote_listing(result, "nas", "/backup", elevated=True)
+        with pytest.raises(RuntimeError) as excinfo:
+            raw_mod._check_remote_listing(result, "nas", "/backup", elevated=True)
+        assert "Cannot reach" not in str(excinfo.value), (
+            "the sentinel proves the host was reached; do not blame the transport"
+        )
 
     def test_a_transport_failure_without_the_sentinel_still_raises(self):
         """Guard against over-correcting: a real 255 must stay loud."""
@@ -842,3 +858,51 @@ class TestTheMarkerAlwaysStartsItsOwnLine:
     def test_splitting_the_literal_still_holds(self):
         """The round-4 forge must stay closed by this change."""
         assert _ELEVATION_SENTINEL not in _endpoint()._elevate_shell("true")
+
+
+class TestFindsStderrReachesTheGuard:
+    """The listing commands must not discard find's own diagnostics.
+
+    A `2>/dev/null` on the find makes every failure look identical: the guard
+    still raises (the exit status is non-zero either way), but the operator is
+    told only "the listing command failed" with no reason. On real hardware the
+    difference is between a bare exit code and
+
+        find: '/home/mberry/bbng-p1': Permission denied
+
+    which is the whole diagnosis. The suppression is also what made the original
+    bug invisible: rc=1 with an empty stderr looked like an empty target.
+    """
+
+    @staticmethod
+    def _listing_commands(ep):
+        sent = []
+
+        def fake_run(cmd, **_):
+            sent.append(cmd[-1])
+            return MagicMock(returncode=0, stdout="", stderr=_ELEVATION_SENTINEL)
+
+        with patch.object(raw_mod.subprocess, "run", side_effect=fake_run):
+            ep.list_snapshots(flush_cache=True)
+        return [c for c in sent if "find" in c]
+
+    @pytest.mark.parametrize("sudo", [False, True])
+    def test_no_listing_command_discards_stderr(self, sudo):
+        commands = self._listing_commands(_endpoint(ssh_sudo=sudo))
+        assert commands, "no find command was issued"
+        for cmd in commands:
+            assert "2>/dev/null" not in cmd, (
+                f"find's stderr is discarded, so a failure cannot be explained: {cmd}"
+            )
+
+    def test_the_guard_repeats_finds_reason(self):
+        """Whatever find said must appear in the error the operator reads."""
+        with pytest.raises(RuntimeError) as excinfo:
+            raw_mod._check_remote_listing(
+                MagicMock(
+                    returncode=1, stdout="", stderr="find: '/b': Permission denied"
+                ),
+                "nas",
+                "/b",
+            )
+        assert "Permission denied" in str(excinfo.value)

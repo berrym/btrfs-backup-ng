@@ -35,13 +35,25 @@ def test_guard_noop_on_success():
     _check_remote_listing(_cp(0), "nas", "/b")  # reachable + ran -> no raise
 
 
-def test_guard_warns_but_does_not_raise_on_other_nonzero(monkeypatch):
-    """A reachable host whose listing command failed for another reason (e.g. a
-    missing dir) is logged, not raised -- and never silently swallowed."""
-    calls = []
-    monkeypatch.setattr(raw_mod.logger, "warning", lambda *a, **k: calls.append(a))
-    _check_remote_listing(_cp(1, ""), "nas", "/b")  # must not raise
-    assert calls  # a warning was emitted (not silently swallowed)
+def test_guard_raises_when_the_listing_command_itself_failed():
+    """A reachable host whose listing command failed is an ERROR, not an empty target.
+
+    This used to warn and return, which meant `raw verify` on a root-owned or
+    missing directory printed "0 ok, 0 corrupt" and exited 0 -- measured on real
+    hardware against a target holding two backups. find exits 0 whenever it
+    finished looking, including over an empty directory, so any non-zero status
+    means the enumeration did not complete and its result cannot be trusted.
+    """
+    with pytest.raises(RuntimeError) as excinfo:
+        _check_remote_listing(_cp(1, "find: '/b': Permission denied"), "nas", "/b")
+    message = str(excinfo.value)
+    assert "NOT an empty target" in message
+    assert "Permission denied" in message
+
+
+def test_guard_accepts_a_genuinely_empty_target():
+    """Exit 0 with no output is the one case that IS an empty target."""
+    _check_remote_listing(_cp(0, ""), "nas", "/b")  # must not raise
 
 
 # --- endpoint behaviour ------------------------------------------------------

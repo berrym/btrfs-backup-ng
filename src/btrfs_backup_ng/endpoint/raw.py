@@ -427,21 +427,27 @@ def _check_remote_listing(
     # not from the transport, and must not be reported as an unreachable host. ssh's
     # default BatchMode + ConnectTimeout (see _build_ssh_command) make a down or
     # black-holing host reach this path fast rather than hanging.
-    # Deliberately no sudo-message classification here. Reaching this point with
-    # elevated=True means the sentinel was present, which is positive proof that
-    # sudo handed over the shell -- so the command RAN, and a non-zero status is
-    # the command's own. Re-guessing that from sudo's text can only overrule the
-    # proof, and did: measured with real sudo in stock Debian and Ubuntu
-    # containers (no `Defaults fqdn` anywhere), a host whose name does not resolve
-    # gets "sudo: unable to resolve host <name>" AND the command runs regardless.
-    # Classifying that as a refusal turned an ordinary find failure into a hard
-    # abort telling the operator to fix a sudoers policy that was already correct.
-    logger.warning(
-        "Listing raw+ssh target %s returned rc=%s (%s); reporting only the backups "
-        "that were readable",
-        path,
-        result.returncode,
-        _strip_sentinel(stderr) or "no stderr",
+    # Anything still non-zero means the SEARCH ITSELF did not complete. find exits
+    # 0 whenever it finished looking -- including over an empty directory -- so a
+    # non-zero status is never "there are no backups", it is "we do not know what
+    # is there". Reporting it as an empty target is the false all-clear this guard
+    # exists to prevent, and it was reachable on both paths: unelevated, a
+    # root-owned target gave rc=1 and `raw verify` printed "0 ok, 0 corrupt" and
+    # exited 0; elevated, the same happened once the sentinel proved the shell ran.
+    #
+    # Deliberately no sudo-message classification: with the sentinel present the
+    # command demonstrably ran, and re-guessing from sudo's text overruled that
+    # proof. Measured with real sudo in stock Debian and Ubuntu containers (no
+    # `Defaults fqdn`), a host whose name does not resolve emits "sudo: unable to
+    # resolve host <name>" and runs the command anyway.
+    raise RuntimeError(
+        f"Cannot list raw+ssh target {path} on {host}: the listing command failed "
+        f"(exit {result.returncode})"
+        + (f": {_strip_sentinel(stderr)}" if _strip_sentinel(stderr) else "")
+        + ". Its backups could NOT be enumerated -- this is NOT an empty target. "
+        "A directory that exists and is readable returns exit 0 even when it holds "
+        "nothing, so check that the path is correct, present, and readable by the "
+        "user connecting (or by root, if ssh_sudo is set)."
     )
 
 
@@ -2303,11 +2309,13 @@ class SSHRawEndpoint(RawEndpoint):
         a second, out-of-target path into the result set; and each path is checked to
         be a direct child of the target dir as defense in depth."""
         base = str(self.config["path"]).rstrip("/") or "/"
-        # The redirect goes INSIDE the sh -c so it silences find's
-        # permission-denied noise without also silencing sudo's refusal.
+        # find's stderr is NOT discarded. It is the only thing that explains why a
+        # search failed, and a failed search must never be presented as an empty
+        # target. The old `2>/dev/null` silenced "Permission denied" and "No such
+        # file or directory" alike, leaving rc=1 with no evidence.
         inner = (
             f"find {shlex.quote(base)} -maxdepth 1 "
-            f"-name {shlex.quote(pattern)} -type f -print0 2>/dev/null"
+            f"-name {shlex.quote(pattern)} -type f -print0"
         )
         find_cmd = self._elevate_shell(inner)
         res = subprocess.run(
@@ -2536,7 +2544,7 @@ class SSHRawEndpoint(RawEndpoint):
         ssh_cmd = self._build_ssh_command()
 
         # List .meta files
-        inner = f"find {shlex.quote(str(path))} -name '*.meta' -type f 2>/dev/null"
+        inner = f"find {shlex.quote(str(path))} -name '*.meta' -type f"
         find_cmd = self._elevate_shell(inner)
 
         full_cmd = ssh_cmd + [find_cmd]
@@ -2600,7 +2608,7 @@ class SSHRawEndpoint(RawEndpoint):
         # discover_raw_snapshots' filename-fallback pass.
         loaded_names = {s.name for s in snapshots}
         prefix = self.config.get("snap_prefix", "")
-        inner = f"find {shlex.quote(str(path))} -name '*.btrfs*' -type f 2>/dev/null"
+        inner = f"find {shlex.quote(str(path))} -name '*.btrfs*' -type f"
         find_stream_cmd = self._elevate_shell(inner)
         result = subprocess.run(
             ssh_cmd + [find_stream_cmd], check=False, capture_output=True, text=True
