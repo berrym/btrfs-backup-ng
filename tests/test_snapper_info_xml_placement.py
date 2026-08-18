@@ -15,14 +15,11 @@ type or userdata.
 
 from __future__ import annotations
 
-import os
 import shutil
 import subprocess
-from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
-import pytest
 
 from btrfs_backup_ng.core import operations
 

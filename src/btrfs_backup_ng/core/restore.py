@@ -721,6 +721,15 @@ def list_snapper_backups(
     if str(backup_path).startswith(("raw://", "raw+ssh://")):
         return _list_raw_snapper_backups(backup_path, endpoint_options)
 
+    # A btrfs target reached over ssh has the SAME .snapshots/{num} layout as a
+    # local one, but Path("ssh://host:/p") is a nonexistent LOCAL path: the scan
+    # below stat'd it, missed, and returned [] without ever opening a connection.
+    # `snapper restore --list ssh://...` therefore reported "No snapper backups
+    # found" -- exit 0 -- for a destination holding backups, which is the README's
+    # flagship disaster-recovery walkthrough.
+    if str(backup_path).startswith("ssh://"):
+        return _list_remote_snapper_backups(backup_path, endpoint_options)
+
     from ..snapper.metadata import parse_info_xml
 
     backup_base = Path(backup_path)
@@ -728,7 +737,16 @@ def list_snapper_backups(
     backups: list[dict[str, Any]] = []
 
     if not snapshots_dir.exists():
-        return backups
+        # Same rule as the ssh:// and raw:// branches: a location that cannot be
+        # enumerated is an error, not an empty result. Both callers are
+        # restore-side, where the source is something the operator has told us
+        # holds backups -- a mistyped path must not come back as "no backups".
+        raise RuntimeError(
+            f"Cannot list snapper backups at {backup_path}: {snapshots_dir} does "
+            "not exist. The location could NOT be enumerated -- this is NOT an "
+            "empty target. Check the path is correct and that it holds a snapper "
+            "backup layout (.snapshots/<number>/snapshot)."
+        )
 
     for item in snapshots_dir.iterdir():
         if item.is_dir() and item.name.isdigit():
@@ -802,6 +820,156 @@ def _raw_endpoint_config(backup_path: str, endpoint_options: dict | None) -> dic
     return config
 
 
+def _list_remote_snapper_backups(
+    backup_path: str, endpoint_options: dict | None = None
+) -> list[dict]:
+    """Enumerate snapper backups at an ``ssh://`` btrfs target.
+
+    Same ``.snapshots/{num}/snapshot`` + ``info.xml`` layout as a local btrfs
+    target -- only the filesystem is remote, so the scan runs over the endpoint
+    instead of over ``Path``. Returns the dict shape the local path returns.
+
+    ``endpoint_options`` carries the CLI's ssh options for the same reason the raw
+    sibling takes them: a destination written with ``--ssh-sudo`` is root-owned,
+    and reading it back without them enumerates as empty.
+
+    A listing that FAILS raises. "We could not look" must never be reported as
+    "there is nothing there" -- during a restore that is the most dangerous
+    moment to be wrong.
+    """
+    from ..endpoint import choose_endpoint
+    from ..snapper.metadata import parse_info_xml_string
+
+    endpoint = choose_endpoint(
+        backup_path, _raw_endpoint_config(backup_path, endpoint_options)
+    )
+    base = f"{str(endpoint.config['path']).rstrip('/')}/.snapshots"
+
+    # -maxdepth/-mindepth 1 -type d keeps this to the numbered slot dirs and does
+    # not descend into the received subvolumes. stderr is NOT discarded: it is the
+    # only explanation of a failure, and discarding it is what made the raw
+    # equivalent of this bug invisible.
+    # stdout/stderr must be requested explicitly: SSHEndpoint._exec_remote_command
+    # passes kwargs straight to subprocess and captures nothing by default (unlike
+    # SSHRawEndpoint). Without this the find output goes to the console and the
+    # scan sees an empty result -- an empty listing produced by not looking.
+    result = endpoint._exec_remote_command(
+        ["find", base, "-mindepth", "1", "-maxdepth", "1", "-type", "d"],
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    stdout = result.stdout or b""
+    stderr = result.stderr or b""
+    if isinstance(stdout, bytes):
+        stdout = stdout.decode(errors="replace")
+    if isinstance(stderr, bytes):
+        stderr = stderr.decode(errors="replace")
+
+    if result.returncode != 0:
+        # find exits 0 whenever it finished looking, including over an empty or
+        # absent-but-readable tree, so non-zero means the scan did not complete.
+        # No special case for "No such file or directory". The raw path raises for
+        # exactly this condition, and a mistyped path produces it just as readily
+        # as a never-written destination -- telling someone "no backups" because
+        # the location does not exist is the same lie in a different costume. The
+        # two schemes must answer identically; see _check_remote_listing.
+        raise RuntimeError(
+            f"Cannot list snapper backups at {backup_path}: "
+            f"{stderr.strip() or f'find exited {result.returncode}'}. The location "
+            "could NOT be enumerated -- this is NOT an empty target. Check the path "
+            "is correct and readable by the CONNECTING USER: on an ssh:// target "
+            "--ssh-sudo elevates only btrfs, so it does not help here (measured: "
+            "SSHEndpoint._build_remote_command passes find/test/cat through "
+            "unchanged). Grant the user access instead, e.g. "
+            "setfacl -m u:<user>:rx on the .snapshots directory."
+        )
+
+    backups: list[dict[str, Any]] = []
+    for line in stdout.splitlines():
+        slot = line.strip()
+        if not slot:
+            continue
+        name = slot.rsplit("/", 1)[-1]
+        if not name.isdigit():
+            # .incoming / .stale are this run's transactional temps, never backups.
+            continue
+
+        snapshot_path = f"{slot}/snapshot"
+        info_xml_path = f"{slot}/info.xml"
+
+        # The slot only counts if the received subvolume is actually there; a
+        # publish that never completed must not present as a restorable backup.
+        probe = endpoint._exec_remote_command(
+            ["test", "-d", snapshot_path],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        if probe.returncode != 0:
+            logger.debug("Skipping snapper slot %s: no published snapshot", slot)
+            continue
+
+        metadata = None
+        info = endpoint._exec_remote_command(
+            ["cat", info_xml_path],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        if info.returncode == 0:
+            raw_xml = info.stdout or b""
+            if isinstance(raw_xml, bytes):
+                raw_xml = raw_xml.decode(errors="replace")
+            try:
+                metadata = parse_info_xml_string(raw_xml)
+            except Exception as e:
+                logger.debug("Could not parse remote info.xml for %s: %s", name, e)
+        else:
+            # Absent info.xml is a known outcome of an older backup, not an error.
+            logger.debug("No info.xml in remote snapper slot %s", slot)
+
+        backups.append(
+            {
+                "number": int(name),
+                "snapshot_path": snapshot_path,
+                "info_xml_path": info_xml_path if info.returncode == 0 else None,
+                "metadata": metadata,
+            }
+        )
+
+    backups.sort(key=lambda b: b["number"])
+    return backups
+
+
+def _assert_raw_location_exists(endpoint: Any, backup_path: str) -> None:
+    """Raise unless the raw backup location is actually present and readable.
+
+    Restore-side only. See the call site for why this is not folded into
+    _list_snapper_backups_at_destination, which the backup side needs to tolerate.
+    """
+    dest_path = str(endpoint.config["path"])
+    if getattr(endpoint, "_is_remote", False):
+        probe = endpoint._exec_remote_command(
+            ["test", "-d", dest_path],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        missing = probe.returncode != 0
+    else:
+        missing = not Path(dest_path).is_dir()
+    if missing:
+        raise RuntimeError(
+            f"Cannot list snapper backups at {backup_path}: {dest_path} is not a "
+            "readable directory. The location could NOT be enumerated -- this is "
+            "NOT an empty target. Check the path is correct and readable by the "
+            "connecting user. Unlike ssh://, a raw+ssh target written with "
+            "--ssh-sudo IS read back with it -- SSHRawEndpoint elevates every "
+            "remote command, not just btrfs -- so pass the same option here."
+        )
+
+
 def _list_raw_snapper_backups(
     backup_path: str, endpoint_options: dict | None = None
 ) -> list[dict]:
@@ -819,6 +987,15 @@ def _list_raw_snapper_backups(
     endpoint = choose_endpoint(
         backup_path, _raw_endpoint_config(backup_path, endpoint_options)
     )
+
+    # _list_snapper_backups_at_destination is shared with the BACKUP side, where a
+    # missing destination legitimately means "first run, nothing here yet" and is
+    # tolerated. On the RESTORE side the same absence means the operator gave us a
+    # path that does not hold backups, and answering "no backups" is the lie this
+    # series exists to eliminate. The shared primitive keeps its semantics; the
+    # distinction belongs here, where the caller's intent is known -- matching the
+    # local and ssh:// branches, which raise for the same condition.
+    _assert_raw_location_exists(endpoint, backup_path)
 
     backups: list[dict[str, Any]] = []
     for name in _list_snapper_backups_at_destination(endpoint):

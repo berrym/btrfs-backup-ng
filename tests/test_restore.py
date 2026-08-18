@@ -3436,19 +3436,25 @@ class TestExecuteMainRestoreExtended:
 class TestListSnapperBackups:
     """Tests for list_snapper_backups function."""
 
-    def test_empty_directory(self, tmp_path):
-        """Should return empty list when no snapshots exist."""
+    def test_a_directory_without_a_snapper_layout_raises(self, tmp_path):
+        """No .snapshots means "not a snapper backup location", not "no backups".
+
+        Both callers are restore-side, where the operator has asserted this path
+        holds backups. Answering "no backups found" for a mistyped or wrong path
+        sends them looking for missing data instead of a typo -- the same false
+        all-clear the ssh:// and raw:// branches now refuse.
+        """
         from btrfs_backup_ng.core.restore import list_snapper_backups
 
-        result = list_snapper_backups(str(tmp_path))
-        assert result == []
+        with pytest.raises(RuntimeError, match="NOT an empty target"):
+            list_snapper_backups(str(tmp_path))
 
-    def test_no_snapshots_dir(self, tmp_path):
-        """Should return empty list when .snapshots doesn't exist."""
+    def test_an_empty_snapshots_dir_is_genuinely_empty(self, tmp_path):
+        """A real snapper layout holding nothing IS an empty result, not an error."""
         from btrfs_backup_ng.core.restore import list_snapper_backups
 
-        result = list_snapper_backups(str(tmp_path))
-        assert result == []
+        (tmp_path / ".snapshots").mkdir()
+        assert list_snapper_backups(str(tmp_path)) == []
 
     def test_finds_numbered_snapshots(self, tmp_path):
         """Should find snapshots in numbered directories."""
@@ -3801,9 +3807,20 @@ class TestListRawSnapperBackups:
         assert [b["number"] for b in result] == [4]
         assert "root-bad" in caplog.text
 
-    def test_missing_dir_returns_empty(self, tmp_path):
-        """A raw:// path with no sidecars yields no backups (no crash)."""
-        assert list_snapper_backups(f"raw://{tmp_path}/does-not-exist") == []
+    def test_missing_dir_raises(self, tmp_path):
+        """A raw:// path that does not exist is a wrong path, not an empty target.
+
+        The shared _list_snapper_backups_at_destination still TOLERATES absence,
+        because the backup side needs that for a first run. The restore-side
+        wrapper asserts existence instead, so all four schemes answer alike.
+        """
+        with pytest.raises(RuntimeError, match="NOT an empty target"):
+            list_snapper_backups(f"raw://{tmp_path}/does-not-exist")
+
+    def test_an_existing_raw_dir_with_no_sidecars_is_empty(self, tmp_path):
+        """Present but holding nothing IS empty."""
+        (tmp_path / "present").mkdir()
+        assert list_snapper_backups(f"raw://{tmp_path}/present") == []
 
     def test_remote_raw_ssh_enumeration(self):
         """raw+ssh:// enumerates by ls'ing names then cat'ing each sidecar over ssh."""
@@ -3816,7 +3833,10 @@ class TestListRawSnapperBackups:
         def fake_exec(command, **kwargs):
             cp = MagicMock()
             cp.returncode = 0
-            if command[0] == "ls":
+            if command[0] == "test":
+                # restore-side existence assertion (_assert_raw_location_exists)
+                cp.stdout = b""
+            elif command[0] == "ls":
                 cp.stdout = ("\n".join(sidecar_json) + "\n").encode()
             elif command[0] == "cat":
                 cp.stdout = sidecar_json[Path(command[1]).name].encode()
