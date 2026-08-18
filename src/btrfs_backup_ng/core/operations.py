@@ -1886,8 +1886,6 @@ def _place_info_xml(snapper_snapshot, destination_endpoint) -> None:
     ``destination_endpoint.config["path"]`` is the ``.snapshots/{num}`` directory
     at call time (btrfs targets only; raw folds info.xml into the metadata sidecar).
     """
-    import os
-    import shutil
 
     info_xml_src = snapper_snapshot.info_xml_path
     if not info_xml_src.exists():
@@ -1906,23 +1904,14 @@ def _place_info_xml(snapper_snapshot, destination_endpoint) -> None:
             )
         else:
             dst = Path(dest_dir) / "info.xml"
-            # Try the plain copy FIRST, whatever our uid. Assuming "not root =>
+            # Try the plain write FIRST, whatever our uid. Assuming "not root =>
             # must sudo" broke every non-root backup under the sudoers policy this
-            # project documents (NOPASSWD limited to /usr/bin/btrfs), where
-            # `sudo cp` is refused outright -- measured on a real host, where the
+            # project documents (NOPASSWD limited to /usr/bin/btrfs), where the
+            # shell-out is refused outright -- measured on a real host, where the
             # destination slot was owned by the running user and a plain copy
-            # would have succeeded. Elevation is a fallback for a destination we
-            # genuinely cannot write, not the default.
-            try:
-                shutil.copy2(info_xml_src, dst)
-            except (PermissionError, OSError):
-                if os.geteuid() == 0:
-                    raise
-                subprocess.run(
-                    ["sudo", "-n", "cp", str(info_xml_src), str(dst)],
-                    check=True,
-                    capture_output=True,
-                )
+            # would have succeeded. That rule now lives in one place; see
+            # __util__._privileged_fs, which the restore side uses too.
+            __util__.privileged_write_bytes(dst, info_xml_src.read_bytes())  # type: ignore[attr-defined]
         logger.debug("Placed info.xml at %s", dest_dir)
     except Exception as e:
         # Soft-fail by design: the backup DATA is already published, and info.xml

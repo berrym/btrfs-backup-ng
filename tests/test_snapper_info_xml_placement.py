@@ -15,13 +15,33 @@ type or userdata.
 
 from __future__ import annotations
 
-import shutil
+import os
 import subprocess
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
 
+from btrfs_backup_ng import __util__
 from btrfs_backup_ng.core import operations
+
+
+def _sealed(path):
+    """A real directory the current user genuinely cannot write into.
+
+    Better than patching the write to raise: these tests exist because the code
+    guessed at permission from the uid instead of attempting the operation, and
+    a fake failure would let that guess back in.
+    """
+    path.mkdir(parents=True, exist_ok=True)
+    path.chmod(0o500)
+    return path
+
+
+_needs_non_root = pytest.mark.skipif(
+    os.geteuid() == 0,
+    reason="pins NON-root behaviour; root writes regardless of mode bits",
+)
 
 
 def _snapshot(tmp_path):
@@ -62,57 +82,49 @@ class TestAWritableDestinationNeedsNoSudo:
 
 
 class TestElevationIsAFallbackNotADefault:
-    def test_sudo_is_tried_only_when_the_plain_copy_fails(self, tmp_path):
-        dest = tmp_path / "slot"
-        dest.mkdir()
-        with patch.object(shutil, "copy2", side_effect=PermissionError("denied")):
-            with patch("os.geteuid", return_value=1000):
-                with patch.object(operations.subprocess, "run") as run:
-                    operations._place_info_xml(_snapshot(tmp_path), _endpoint(dest))
+    @_needs_non_root
+    def test_sudo_is_tried_only_when_the_plain_write_fails(self, tmp_path):
+        dest = _sealed(tmp_path / "slot")
+        with patch.object(__util__.subprocess, "run") as run:
+            operations._place_info_xml(_snapshot(tmp_path), _endpoint(dest))
         assert run.called, "no fallback was attempted for an unwritable destination"
         argv = run.call_args[0][0]
-        assert argv[:3] == ["sudo", "-n", "cp"], argv
+        assert argv[:3] == ["sudo", "-n", "tee"], argv
 
+    @_needs_non_root
     def test_the_fallback_is_non_interactive(self, tmp_path):
         """A backup runs headless; an interactive sudo can only hang."""
-        dest = tmp_path / "slot"
-        dest.mkdir()
-        with patch.object(shutil, "copy2", side_effect=PermissionError("x")):
-            with patch("os.geteuid", return_value=1000):
-                with patch.object(operations.subprocess, "run") as run:
-                    operations._place_info_xml(_snapshot(tmp_path), _endpoint(dest))
+        dest = _sealed(tmp_path / "slot")
+        with patch.object(__util__.subprocess, "run") as run:
+            operations._place_info_xml(_snapshot(tmp_path), _endpoint(dest))
         assert "-n" in run.call_args[0][0]
 
+    @_needs_non_root
     def test_root_does_not_shell_out_at_all(self, tmp_path):
-        dest = tmp_path / "slot"
-        dest.mkdir()
-        with patch.object(shutil, "copy2", side_effect=PermissionError("x")):
-            with patch("os.geteuid", return_value=0):
-                with patch.object(operations.subprocess, "run") as run:
-                    operations._place_info_xml(_snapshot(tmp_path), _endpoint(dest))
+        dest = _sealed(tmp_path / "slot")
+        with patch("os.geteuid", return_value=0):
+            with patch.object(__util__.subprocess, "run") as run:
+                operations._place_info_xml(_snapshot(tmp_path), _endpoint(dest))
         assert not run.called, "root cannot fix a failure by sudo-ing to root"
 
 
 class TestFailureIsReportedUsefully:
+    @_needs_non_root
     def test_a_total_failure_warns_and_says_what_was_lost(self, tmp_path, caplog):
         """Soft-fail is deliberate -- the backup data is already published -- but
         the operator must be able to trace a later metadata-less listing to here."""
-        dest = tmp_path / "slot"
-        dest.mkdir()
+        dest = _sealed(tmp_path / "slot")
         recorded = []
-        with patch.object(shutil, "copy2", side_effect=PermissionError("denied")):
-            with patch("os.geteuid", return_value=1000):
-                with patch.object(
-                    operations.subprocess,
-                    "run",
-                    side_effect=subprocess.CalledProcessError(1, "sudo"),
-                ):
-                    with patch.object(
-                        operations.logger,
-                        "warning",
-                        lambda m, *a, **k: recorded.append((m, a)),
-                    ):
-                        operations._place_info_xml(_snapshot(tmp_path), _endpoint(dest))
+        refused = subprocess.CompletedProcess(
+            ["sudo"], 1, b"", b"sudo: a password is required\n"
+        )
+        with patch.object(__util__.subprocess, "run", return_value=refused):
+            with patch.object(
+                operations.logger,
+                "warning",
+                lambda m, *a, **k: recorded.append((m, a)),
+            ):
+                operations._place_info_xml(_snapshot(tmp_path), _endpoint(dest))
         assert recorded, "a total failure produced no warning"
         text = recorded[0][0] % recorded[0][1] if recorded[0][1] else recorded[0][0]
         assert "backup itself is intact" in text

@@ -1247,7 +1247,6 @@ def restore_snapper_snapshot(
         RestoreError: If restore fails
     """
     import os
-    import shutil
 
     from ..snapper import SnapperScanner
     from ..snapper.metadata import (
@@ -1402,15 +1401,12 @@ def restore_snapper_snapshot(
         send_label = "btrfs send"
 
     try:
-        # Create destination directory
-        if os.geteuid() != 0:
-            subprocess.run(
-                ["sudo", "mkdir", "-p", str(dest_snapshot_dir)],
-                check=True,
-                capture_output=True,
-            )
-        else:
-            dest_snapshot_dir.mkdir(parents=True, exist_ok=True)
+        # Create destination directory. Direct first, sudo only if that is
+        # refused: a snapper destination under SYNC_ACL is frequently writable by
+        # the backup user, and the documented sudoers (NOPASSWD: /usr/bin/btrfs)
+        # does not cover mkdir at all -- so the unconditional shell-out failed a
+        # restore that needed no privilege whatsoever.
+        __util__.privileged_mkdir(dest_snapshot_dir, allow_prompt=True)  # type: ignore[attr-defined]
 
         # Build btrfs receive command (shared: the raw stream's embedded subvolume is
         # named "snapshot" -- the backup source was .snapshots/{n}/snapshot -- so
@@ -1625,21 +1621,8 @@ def restore_snapper_snapshot(
         # .snapshots is 0750). 0750 here would be stricter than snapper and can block
         # non-root snapper access under ALLOW_USERS/ALLOW_GROUPS/SYNC_ACL; the parent
         # .snapshots (0750, root+group) still gates who can reach the slot at all.
-        if os.geteuid() != 0:
-            subprocess.run(
-                ["sudo", "tee", str(dest_info_xml)],
-                input=xml_content.encode(),
-                check=True,
-                capture_output=True,
-            )
-            subprocess.run(
-                ["sudo", "chmod", "755", str(dest_snapshot_dir)],
-                check=True,
-                capture_output=True,
-            )
-        else:
-            dest_info_xml.write_text(xml_content)
-            dest_snapshot_dir.chmod(0o755)
+        __util__.privileged_write_bytes(dest_info_xml, xml_content, allow_prompt=True)  # type: ignore[attr-defined]
+        __util__.privileged_chmod(dest_snapshot_dir, 0o755, allow_prompt=True)  # type: ignore[attr-defined]
 
         duration = time.monotonic() - transfer_start
 
@@ -1716,13 +1699,7 @@ def restore_snapper_snapshot(
                     )
                     __util__.delete_subvolume(dest_snapshot_path)  # type: ignore[attr-defined]
             if dest_snapshot_dir.exists():
-                if os.geteuid() != 0:
-                    subprocess.run(
-                        ["sudo", "rm", "-rf", str(dest_snapshot_dir)],
-                        capture_output=True,
-                    )
-                else:
-                    shutil.rmtree(dest_snapshot_dir)
+                __util__.privileged_rmtree(dest_snapshot_dir, allow_prompt=True)  # type: ignore[attr-defined]
         except Exception as cleanup_e:
             logger.warning("Cleanup failed: %s", cleanup_e)
 

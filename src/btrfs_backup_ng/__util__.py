@@ -523,6 +523,132 @@ def atomic_write_bytes(path, data, *, mode=0o600, fsync=True):
         raise
 
 
+def _privileged_fs(direct, argv, *, action, path, stdin_bytes=None, allow_prompt=False):
+    """Perform a filesystem operation directly, elevating only if that fails.
+
+    Try the plain operation FIRST, whatever our uid. "Not root, therefore must
+    sudo" is wrong twice over: it shells out for a path the running user already
+    owns, and under the sudoers policy this project documents -- NOPASSWD limited
+    to ``/usr/bin/btrfs`` -- that shell-out is REFUSED, because mkdir, tee and
+    chmod are not btrfs. Measured on a real host: `sudo -n btrfs` allowed,
+    `sudo -n mkdir` answered "a password is required", and a restore into a
+    destination the user could have written directly died on the mkdir.
+
+    Elevation is the fallback for a path we genuinely cannot write, not the
+    default. Running as root skips the fallback entirely: root failing to write
+    is a real filesystem error and escalating it would only obscure that.
+
+    When both routes fail the raised ``PermissionError`` says what was attempted,
+    what sudo said, and what would make it work -- as opposed to a bare
+    ``CalledProcessError`` repr naming an argv the operator never typed.
+
+    ``allow_prompt`` decides whether the fallback may ask for a password. It
+    defaults to False -- ``sudo -n`` -- because most callers run headless, where
+    an interactive sudo does not ask anyone anything, it just hangs. Foreground
+    commands where a person is already waiting (a restore) pass True, so a user
+    with full sudo is prompted exactly as they were before rather than being told
+    to start over as root.
+    """
+    try:
+        return direct()
+    except (PermissionError, OSError) as direct_error:
+        if os.geteuid() == 0:
+            raise
+        first_error = direct_error
+
+    sudo = ["sudo"] if allow_prompt else ["sudo", "-n"]
+    proc = subprocess.run(
+        [*sudo, *argv],
+        input=stdin_bytes,
+        capture_output=True,
+    )
+    if proc.returncode == 0:
+        return None
+
+    stderr_lines = (proc.stderr or b"").decode(errors="replace").strip().splitlines()
+    detail = stderr_lines[-1] if stderr_lines else f"sudo exited {proc.returncode}"
+    reason = getattr(first_error, "strerror", None) or str(first_error)
+    raise PermissionError(
+        f"Cannot {action} {path}: {reason}. Elevation was refused as well "
+        f"({detail}). Either run this command as root, or give {_current_user()} "
+        f"write access to {Path(path).parent}. Note that the sudoers rule this "
+        f"project documents grants NOPASSWD for /usr/bin/btrfs only, which does "
+        f"not cover {argv[0]}."
+    )
+
+
+def _current_user():
+    """The running user's name, for error messages; the uid if it has no name."""
+    try:
+        import pwd
+
+        return pwd.getpwuid(os.geteuid()).pw_name
+    except Exception:
+        return f"uid {os.geteuid()}"
+
+
+def privileged_mkdir(path, *, parents=True, exist_ok=True, allow_prompt=False):
+    """Create ``path``, elevating only if the direct mkdir is refused."""
+    path = Path(path)
+    return _privileged_fs(
+        lambda: path.mkdir(parents=parents, exist_ok=exist_ok),
+        ["mkdir", "-p", str(path)] if parents else ["mkdir", str(path)],
+        action="create directory",
+        path=path,
+        allow_prompt=allow_prompt,
+    )
+
+
+def privileged_write_bytes(path, data, *, allow_prompt=False):
+    """Write ``data`` to ``path``, elevating only if the direct write is refused."""
+    path = Path(path)
+    if isinstance(data, str):
+        data = data.encode("utf-8")
+
+    def _direct():
+        path.write_bytes(data)
+
+    return _privileged_fs(
+        _direct,
+        ["tee", str(path)],
+        action="write",
+        path=path,
+        stdin_bytes=data,
+        allow_prompt=allow_prompt,
+    )
+
+
+def privileged_chmod(path, mode, *, allow_prompt=False):
+    """chmod ``path``, elevating only if the direct chmod is refused."""
+    path = Path(path)
+    return _privileged_fs(
+        lambda: path.chmod(mode),
+        ["chmod", format(mode, "o"), str(path)],
+        action="set permissions on",
+        path=path,
+        allow_prompt=allow_prompt,
+    )
+
+
+def privileged_rmtree(path, *, allow_prompt=False):
+    """Remove ``path`` recursively, elevating only if the direct remove fails.
+
+    Best-effort by nature -- every caller is already cleaning up after a failure
+    -- so callers keep their own guard around it rather than this swallowing the
+    error and reporting a cleanup that did not happen.
+    """
+    import shutil
+
+    path = Path(path)
+    return _privileged_fs(
+        lambda: shutil.rmtree(path),
+        ["rm", "-rf", str(path)],
+        action="remove",
+        path=path,
+        allow_prompt=allow_prompt,
+    )
+
+
 def read_locks(s):
     """Reads locks from lock file content given as string.
     Returns ``{'snap_name': {'locks': ['lock', ...], ...}, 'parent_locks': ['lock', ...]}``.
