@@ -3283,6 +3283,7 @@ print(json.dumps(result))
                 # We'll handle incremental logic in the actual send call
             else:
                 logger.info("Using full transfer")
+                max_wait_time = 10 * max_wait_time
         except Exception as e:
             logger.error(f"Error setting up transfer parameters: {e}")
             return False
