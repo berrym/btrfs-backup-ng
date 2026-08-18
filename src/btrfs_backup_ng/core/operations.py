@@ -1911,7 +1911,7 @@ def _place_info_xml(snapper_snapshot, destination_endpoint) -> None:
             # destination slot was owned by the running user and a plain copy
             # would have succeeded. That rule now lives in one place; see
             # __util__._privileged_fs, which the restore side uses too.
-            __util__.privileged_write_bytes(dst, info_xml_src.read_bytes())  # type: ignore[attr-defined]
+            __util__.privileged_write_bytes(dst, info_xml_src.read_bytes())
         logger.debug("Placed info.xml at %s", dest_dir)
     except Exception as e:
         # Soft-fail by design: the backup DATA is already published, and info.xml

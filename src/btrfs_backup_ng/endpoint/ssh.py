@@ -2151,6 +2151,61 @@ print(json.dumps(result))
         logger.debug(f"Remote snapshots: {[str(s) for s in snapshots]}")
         return snapshots
 
+    def describe_empty_listing(self) -> Optional[str]:
+        """Explain an empty remote listing (see ``Endpoint.describe_empty_listing``).
+
+        The base version enumerates locally, which for an ssh:// endpoint would
+        stat a path on the WRONG machine. This re-runs the remote subvolume
+        listing, which is filesystem-wide, and then separates snapshot names that
+        are really at this destination from ones that only exist elsewhere on the
+        remote filesystem -- pointing at the wrong directory is the most common
+        reason a destination looks empty, and saying so is more useful than
+        naming a prefix that would not have helped.
+
+        One exact-path probe per candidate prefix, not per name: this runs only
+        when a listing already came back empty, and the number of distinct
+        prefixes on a filesystem is small.
+        """
+        try:
+            result = self._exec_remote_command(
+                ["btrfs", "subvolume", "list", "-o", str(self.config["path"])],
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            if result.returncode != 0:
+                return None
+            output = result.stdout.decode(errors="replace") if result.stdout else ""
+        except Exception as e:  # noqa: BLE001 - a diagnostic must never itself abort
+            logger.debug("Could not enumerate the remote for a prefix hint: %s", e)
+            return None
+
+        dest = str(self.config["path"]).rstrip("/")
+        fmt = self.config.get("timestamp_format")
+        by_prefix: Dict[str, List[str]] = {}
+        for line in output.splitlines():
+            parts = line.split("path ", 1)
+            if len(parts) != 2:
+                continue
+            name = os.path.basename(parts[1].strip())
+            inferred = __util__.infer_snapshot_prefix(name, fmt)
+            if inferred is None:
+                continue
+            by_prefix.setdefault(inferred, []).append(name)
+
+        here: List[str] = []
+        elsewhere: List[str] = []
+        for _prefix, names in by_prefix.items():
+            # One probe decides the whole prefix: if any representative is at the
+            # destination the prefix belongs to "here". Bounded at a few names so
+            # a large filesystem cannot turn a diagnostic into a long stall.
+            present = any(
+                self._subvolume_exists_at(f"{dest}/{name}") for name in names[:3]
+            )
+            (here if present else elsewhere).extend(names)
+
+        return self._explain_prefix_mismatch(here, elsewhere)
+
     def _scope_to_destination(self, snapshots: List[Any], path: str) -> List[Any]:
         """Keep only snapshots that really exist AT ``path``.
 

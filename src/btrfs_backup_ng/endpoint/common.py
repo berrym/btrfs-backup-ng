@@ -1120,6 +1120,87 @@ class Endpoint:
             )
             raise __util__.AbortError from e
 
+    def describe_empty_listing(self) -> Optional[str]:
+        """Explain an empty listing, or return None if the location really is empty.
+
+        A listing filters on ``snap_prefix`` and then requires the rest of each
+        name to parse as a timestamp, so the wrong prefix -- or none -- discards
+        every real snapshot and the location reports as empty. Measured: a
+        destination holding a backup answered `restore --list` with "No snapshots
+        found at backup location" and exit 0, and supplying the exact prefix
+        listed it immediately. During disaster recovery that is the worst
+        possible time to be told your backups are not there.
+
+        This does not change what is listed. It only distinguishes "nothing is
+        here" from "something is here that your prefix did not match", and names
+        the prefixes that would have matched.
+        """
+        path = self.config.get("path")
+        if not path:
+            return None
+        try:
+            entries = [
+                str(entry).rstrip("/").rsplit("/", 1)[-1]
+                for entry in self._listdir(path)
+            ]
+        except Exception as e:  # noqa: BLE001 - a diagnostic must never itself abort
+            logger.debug("Could not enumerate %s for a prefix hint: %s", path, e)
+            return None
+        return self._explain_prefix_mismatch(entries)
+
+    def _explain_prefix_mismatch(
+        self, names: List[str], elsewhere: Optional[List[str]] = None
+    ) -> Optional[str]:
+        """Wording shared by every endpoint's ``describe_empty_listing``.
+
+        ``names`` are entries AT the location; ``elsewhere`` are snapshot-shaped
+        names that exist but not at this location (an ssh:// listing sees the
+        whole filesystem). Naming those separately turns "no snapshots" into
+        "you are pointed at the wrong directory", which is usually the truth.
+        """
+        configured = self.config.get("snap_prefix", "") or ""
+        fmt = self.config.get("timestamp_format")
+
+        def prefixes(candidates: List[str]) -> Dict[str, int]:
+            found: Dict[str, int] = {}
+            for name in candidates or []:
+                inferred = __util__.infer_snapshot_prefix(name, fmt)
+                if inferred is None or inferred == configured:
+                    continue
+                found[inferred] = found.get(inferred, 0) + 1
+            return found
+
+        here = prefixes(names)
+        there = prefixes(elsewhere or [])
+        if not here and not there:
+            return None
+
+        def render(counts: Dict[str, int]) -> str:
+            return ", ".join(
+                f"{prefix!r} ({count} snapshot{'s' if count != 1 else ''})"
+                for prefix, count in sorted(counts.items(), key=lambda kv: -kv[1])
+            )
+
+        lines = []
+        if here:
+            lines.append(
+                f"This location is NOT empty: it holds snapshots, but none use the "
+                f"prefix {configured!r} that was searched for."
+            )
+            lines.append(f"Prefixes actually present here: {render(here)}.")
+            best = max(here.items(), key=lambda kv: kv[1])[0]
+            lines.append(f"Re-run with --prefix {best!r} to list them.")
+        else:
+            lines.append(
+                f"No snapshots are at this location under any prefix, but snapshots "
+                f"DO exist elsewhere on the same filesystem: {render(there)}."
+            )
+            lines.append(
+                "That usually means the path points somewhere other than the "
+                "destination the backups were written to."
+            )
+        return "\n".join(lines)
+
     def _get_lock_file_path(self) -> Path:
         # Lock file lives at the endpoint's path (backup location), not a source.
         if self.config["path"] is None:

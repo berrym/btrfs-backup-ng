@@ -2305,15 +2305,19 @@ class TestExecuteList:
 
     @patch("btrfs_backup_ng.cli.restore.list_remote_snapshots")
     @patch("btrfs_backup_ng.cli.restore._prepare_backup_endpoint")
-    def test_list_empty(self, mock_prepare, mock_list):
-        """Test --list with no snapshots."""
+    def test_list_empty(self, mock_prepare, mock_list, tmp_path):
+        """A location that really IS empty exits 0.
+
+        Uses a real endpoint over an empty directory rather than a MagicMock:
+        a mock answers describe_empty_listing() with a truthy Mock, which would
+        make this pass or fail for reasons unrelated to the behaviour."""
         from btrfs_backup_ng.cli.restore import _execute_list
 
-        mock_prepare.return_value = MagicMock()
+        mock_prepare.return_value = _lock_endpoint(tmp_path)
         mock_list.return_value = []
 
         args = MagicMock()
-        args.source = "/backup"
+        args.source = str(tmp_path)
 
         result = _execute_list(args)
 

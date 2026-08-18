@@ -31,6 +31,7 @@ __all__ = [
     "delete_subvolume",
     "DATE_FORMAT",
     "MOUNTS_FILE",
+    "infer_snapshot_prefix",
     "parse_snapshot_time",
 ]
 
@@ -316,6 +317,29 @@ def parse_snapshot_time(time_string, preferred_fmt=None):
         except ValueError as e:
             last_error = e
     raise last_error or ValueError(f"unparseable snapshot timestamp: {time_string!r}")
+
+
+def infer_snapshot_prefix(name, preferred_fmt=None):
+    """Return the snapshot prefix ``name`` would need to parse, or None.
+
+    A snapshot name is ``<prefix><timestamp>``, and every listing filters on the
+    prefix then requires the remainder to parse as a timestamp. When an operator
+    supplies the wrong prefix -- or none -- every real snapshot is silently
+    discarded and the location reports as empty. Recovering the prefix from the
+    names actually present turns that dead end into an instruction.
+
+    Splits are tried left to right, so the FIRST match is the one with the
+    longest timestamp, which is the intended reading: ``home-20260818-021031``
+    yields ``home-`` rather than a longer prefix and a shorter, coincidental
+    timestamp. Returns None when no split parses under any candidate format.
+    """
+    for i in range(len(name) + 1):
+        try:
+            parse_snapshot_time(name[i:], preferred_fmt)
+        except (ValueError, TypeError):
+            continue
+        return name[:i]
+    return None
 
 
 def is_btrfs(path):

@@ -407,6 +407,19 @@ def _execute_list(args: argparse.Namespace) -> int:
         return 1
 
     if not snapshots:
+        # "No snapshots found" is only honest when the location really is empty.
+        # A prefix that matched nothing produces the identical message, and an
+        # operator reading it during a restore concludes their backups are gone.
+        explanation = None
+        try:
+            explanation = backup_endpoint.describe_empty_listing()
+        except Exception as e:  # noqa: BLE001 - never fail because a hint failed
+            logger.debug("Could not build an empty-listing explanation: %s", e)
+        if explanation:
+            print(f"No snapshots matched at {source}.")
+            print("")
+            print(explanation)
+            return 1
         print("No snapshots found at backup location")
         return 0
 

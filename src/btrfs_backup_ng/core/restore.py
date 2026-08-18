@@ -1406,7 +1406,7 @@ def restore_snapper_snapshot(
         # the backup user, and the documented sudoers (NOPASSWD: /usr/bin/btrfs)
         # does not cover mkdir at all -- so the unconditional shell-out failed a
         # restore that needed no privilege whatsoever.
-        __util__.privileged_mkdir(dest_snapshot_dir, allow_prompt=True)  # type: ignore[attr-defined]
+        __util__.privileged_mkdir(dest_snapshot_dir, allow_prompt=True)
 
         # Build btrfs receive command (shared: the raw stream's embedded subvolume is
         # named "snapshot" -- the backup source was .snapshots/{n}/snapshot -- so
@@ -1621,8 +1621,8 @@ def restore_snapper_snapshot(
         # .snapshots is 0750). 0750 here would be stricter than snapper and can block
         # non-root snapper access under ALLOW_USERS/ALLOW_GROUPS/SYNC_ACL; the parent
         # .snapshots (0750, root+group) still gates who can reach the slot at all.
-        __util__.privileged_write_bytes(dest_info_xml, xml_content, allow_prompt=True)  # type: ignore[attr-defined]
-        __util__.privileged_chmod(dest_snapshot_dir, 0o755, allow_prompt=True)  # type: ignore[attr-defined]
+        __util__.privileged_write_bytes(dest_info_xml, xml_content, allow_prompt=True)
+        __util__.privileged_chmod(dest_snapshot_dir, 0o755, allow_prompt=True)
 
         duration = time.monotonic() - transfer_start
 
@@ -1699,7 +1699,7 @@ def restore_snapper_snapshot(
                     )
                     __util__.delete_subvolume(dest_snapshot_path)  # type: ignore[attr-defined]
             if dest_snapshot_dir.exists():
-                __util__.privileged_rmtree(dest_snapshot_dir, allow_prompt=True)  # type: ignore[attr-defined]
+                __util__.privileged_rmtree(dest_snapshot_dir, allow_prompt=True)
         except Exception as cleanup_e:
             logger.warning("Cleanup failed: %s", cleanup_e)
 
