@@ -1906,17 +1906,36 @@ def _place_info_xml(snapper_snapshot, destination_endpoint) -> None:
             )
         else:
             dst = Path(dest_dir) / "info.xml"
-            if os.geteuid() != 0:
+            # Try the plain copy FIRST, whatever our uid. Assuming "not root =>
+            # must sudo" broke every non-root backup under the sudoers policy this
+            # project documents (NOPASSWD limited to /usr/bin/btrfs), where
+            # `sudo cp` is refused outright -- measured on a real host, where the
+            # destination slot was owned by the running user and a plain copy
+            # would have succeeded. Elevation is a fallback for a destination we
+            # genuinely cannot write, not the default.
+            try:
+                shutil.copy2(info_xml_src, dst)
+            except (PermissionError, OSError):
+                if os.geteuid() == 0:
+                    raise
                 subprocess.run(
-                    ["sudo", "cp", str(info_xml_src), str(dst)],
+                    ["sudo", "-n", "cp", str(info_xml_src), str(dst)],
                     check=True,
                     capture_output=True,
                 )
-            else:
-                shutil.copy2(info_xml_src, dst)
         logger.debug("Placed info.xml at %s", dest_dir)
     except Exception as e:
-        logger.warning("Failed to place info.xml: %s", e)
+        # Soft-fail by design: the backup DATA is already published, and info.xml
+        # is descriptive metadata. Say what was lost, so a later "restore --list
+        # shows no description" is traceable to here rather than looking like a
+        # second bug.
+        logger.warning(
+            "Failed to place info.xml at %s: %s. The backup itself is intact; its "
+            "snapper metadata (description, type, userdata) will be missing when "
+            "the backup is listed or restored.",
+            dest_dir,
+            e,
+        )
 
 
 def _cleanup_snapper_backup(destination_endpoint, snapshot_num, is_raw) -> None:
