@@ -2037,7 +2037,12 @@ print(json.dumps(result))
                     "/usr/bin/btrfs) or connect as a user that can read it."
                 )
             output = result.stdout.decode(errors="replace") if result.stdout else ""
-            return self._parse_snapshot_list(output, path)
+            # Parse, then keep only what is really AT this destination. The list
+            # command is filesystem-wide, so the second step is what stops a
+            # never-transferred source snapshot being reported as a backup.
+            return self._scope_to_destination(
+                self._parse_snapshot_list(output, path), path
+            )
         except RuntimeError:
             raise
         except Exception as e:
@@ -2050,59 +2055,137 @@ print(json.dumps(result))
                 "location could NOT be enumerated -- this is NOT an empty target."
             ) from e
 
+    @staticmethod
+    def _common_suffix_len(a: str, b: str) -> int:
+        """How many trailing characters ``a`` and ``b`` share."""
+        n = 0
+        for x, y in zip(reversed(a), reversed(b)):
+            if x != y:
+                break
+            n += 1
+        return n
+
     def _parse_snapshot_list(self, output: str, path: str) -> List[Any]:
-        """Parse btrfs subvolume list output into Snapshot objects.
+        """Parse ``btrfs subvolume list`` output into Snapshot objects.
 
-        Args:
-            output: Raw output from btrfs subvolume list command
-            path: The path where snapshots are located
+        Only subvolumes that really live AT ``path`` are returned.
 
-        Returns:
-            List of Snapshot objects, sorted by time
+        ``btrfs subvolume list -o <path>`` does not scope to ``<path>``: measured
+        on a real host, listing a destination directory and listing an unrelated
+        sibling directory returned byte-identical output, because the command
+        enumerates the whole FILESYSTEM. This parser used to discard the location
+        with ``os.path.basename()`` and record every hit as living at
+        ``config["path"]``.
+
+        The result was a phantom backup, which is worse than a missing one: a
+        snapshot that existed only at the SOURCE and had never been transferred
+        was reported as present at the destination. Measured -- a destination
+        holding exactly one backup listed as holding three, one of them never
+        transferred. An operator can read that as "my data is safe" and delete
+        the source.
+
+        Two things therefore changed. Same-named subvolumes are resolved to the
+        ONE line whose path best matches the destination, so identity (uuid /
+        received_uuid) is taken from the destination's copy rather than the
+        source's -- picking the source's line would leave received_uuid empty and
+        make ``verify_structure`` call a good backup "unverifiable". And every
+        surviving candidate is confirmed at its exact path (see
+        ``_scope_to_destination``), the same rule ``_verify_snapshot_exists``
+        already applies and whose docstring already explains why a name-only
+        search is wrong; that rule simply never reached the listing.
+
+        Parsing stays free of remote I/O; the confirmation is applied by
+        ``_scope_to_destination`` in ``list_snapshots``.
         """
         from btrfs_backup_ng import __util__
 
-        snapshots: List[Any] = []
         snap_prefix = self.config.get("snap_prefix", "")
+        dest = str(self.config["path"]).rstrip("/")
 
+        # Group candidate lines by name, keeping the one whose reported path is
+        # closest to the destination.
+        best: dict = {}
         for line in output.splitlines():
             parts = line.split("path ", 1)
-            if len(parts) == 2:
-                snap_path = parts[1].strip()
-                snap_name = os.path.basename(snap_path)
-                if snap_name.startswith(snap_prefix):
-                    date_part = snap_name[len(snap_prefix) :]
-                    try:
-                        time_obj, matched_fmt = __util__.parse_snapshot_time(
-                            date_part, self.config.get("timestamp_format")
-                        )
-                        snapshot = __util__.Snapshot(
-                            self.config["path"],
-                            snap_prefix,
-                            self,
-                            time_obj=time_obj,
-                            time_format=matched_fmt,
-                        )
-                        # Parse THIS line for its own uuid/received_uuid (the -u -R
-                        # columns) so identity comes from the same subvolume, never a
-                        # same-named one elsewhere on the filesystem.
-                        line_ids = __util__.parse_subvolume_list(line)
-                        if line_ids:
-                            snapshot.uuid = line_ids[0]["uuid"]
-                            snapshot.received_uuid = line_ids[0]["received_uuid"]
-                        snapshots.append(snapshot)
-                    except Exception as e:
-                        # Debug level - it's normal for directories to contain
-                        # files that don't match the snapshot naming pattern
-                        logger.debug(
-                            "Skipping non-snapshot item: %r (%s)", snap_name, e
-                        )
-                        continue
+            if len(parts) != 2:
+                continue
+            snap_path = parts[1].strip()
+            snap_name = os.path.basename(snap_path)
+            if not snap_name.startswith(snap_prefix):
+                continue
+            score = self._common_suffix_len(snap_path, f"{dest}/{snap_name}")
+            previous = best.get(snap_name)
+            if previous is None or score > previous[0]:
+                best[snap_name] = (score, line, snap_path)
+
+        snapshots: List[Any] = []
+        for snap_name, (_score, line, _snap_path) in best.items():
+            date_part = snap_name[len(snap_prefix) :]
+            try:
+                time_obj, matched_fmt = __util__.parse_snapshot_time(
+                    date_part, self.config.get("timestamp_format")
+                )
+            except Exception as e:
+                # Debug level - it's normal for a directory to hold items that do
+                # not match the snapshot naming pattern.
+                logger.debug("Skipping non-snapshot item: %r (%s)", snap_name, e)
+                continue
+
+            snapshot = __util__.Snapshot(
+                self.config["path"],
+                snap_prefix,
+                self,
+                time_obj=time_obj,
+                time_format=matched_fmt,
+            )
+            # Identity comes from the chosen line, which is the destination's own
+            # copy -- never a same-named subvolume elsewhere on the filesystem.
+            line_ids = __util__.parse_subvolume_list(line)
+            if line_ids:
+                snapshot.uuid = line_ids[0]["uuid"]
+                snapshot.received_uuid = line_ids[0]["received_uuid"]
+            snapshots.append(snapshot)
 
         snapshots.sort()
         logger.info(f"Found {len(snapshots)} remote snapshots at {path}")
         logger.debug(f"Remote snapshots: {[str(s) for s in snapshots]}")
         return snapshots
+
+    def _scope_to_destination(self, snapshots: List[Any], path: str) -> List[Any]:
+        """Keep only snapshots that really exist AT ``path``.
+
+        ``btrfs subvolume list`` enumerates the whole filesystem (see
+        ``_parse_snapshot_list``), so a name matching there proves nothing about
+        this destination. Each candidate is confirmed at its exact path with
+        ``btrfs subvolume show`` -- one remote command per candidate, run only
+        after the cheap prefix and timestamp filters have cut the list down.
+
+        ``btrfs`` is the one binary ``--ssh-sudo`` elevates, so this probe always
+        has the privilege that produced the listing itself: a probe failure means
+        the subvolume is not there, not that we were not allowed to look.
+        """
+        dest = str(path).rstrip("/")
+        kept = []
+        for snapshot in snapshots:
+            name = snapshot.get_name()
+            if self._subvolume_exists_at(f"{dest}/{name}"):
+                kept.append(snapshot)
+            else:
+                logger.debug(
+                    "Ignoring %s: a subvolume of that name exists on the remote "
+                    "filesystem but not at %s",
+                    name,
+                    dest,
+                )
+        if len(kept) != len(snapshots):
+            logger.info(
+                "%d of %d subvolumes matching the prefix are not at %s and were "
+                "excluded (they exist elsewhere on the remote filesystem)",
+                len(snapshots) - len(kept),
+                len(snapshots),
+                dest,
+            )
+        return kept
 
     def verify_structure(self, snapshot: Any) -> StructureVerdict:
         """Confirm ``snapshot`` is a real received backup on the remote (the ``verify``
@@ -2178,6 +2261,40 @@ print(json.dumps(result))
                 f"{result.returncode} with no stderr)"
             )
             raise VerifyError(f"Send stream test failed (remote): {stderr}")
+
+    def _subvolume_exists_at(self, absolute_path: str) -> bool:
+        """True when a real subvolume exists at EXACTLY ``absolute_path``.
+
+        The quiet core of ``_verify_snapshot_exists``, shared with the listing
+        path. A plain directory is deliberately not accepted: an interrupted
+        ``btrfs receive`` can leave one, and only ``btrfs subvolume show``
+        succeeding proves a real subvolume is there.
+
+        Elevation matches the rest of this endpoint: ``btrfs`` is the one binary
+        ``--ssh-sudo`` elevates, so this probe has exactly the privilege that
+        ``btrfs subvolume list`` had. A caller that got a listing can run this.
+        """
+        use_sudo = self.config.get("ssh_sudo", False)
+        try:
+            if use_sudo:
+                result = self._exec_remote_command_with_retry(
+                    ["btrfs", "subvolume", "show", absolute_path],
+                    max_retries=2,
+                    check=False,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                )
+            else:
+                result = self._exec_remote_command(
+                    ["btrfs", "subvolume", "show", absolute_path],
+                    check=False,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                )
+            return bool(result.returncode == 0)
+        except Exception as e:
+            logger.debug("subvolume show failed for %s: %s", absolute_path, e)
+            return False
 
     def _verify_snapshot_exists(self, dest_path: str, snapshot_name: str) -> bool:
         """Verify a snapshot exists on the remote host at its exact path.

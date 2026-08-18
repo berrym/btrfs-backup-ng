@@ -92,14 +92,20 @@ class TestAFailedListingIsNotAnEmptyLocation:
             assert ep.list_snapshots() == []
 
     def test_a_successful_listing_still_parses(self):
-        """Guard against over-correcting: real output must survive."""
+        """Guard against over-correcting: real output must survive.
+
+        The pipeline is parse -> scope-to-destination, so a snapshot that IS at
+        the destination has to come back. The scoping probe is stubbed True here;
+        the probe's own behaviour is pinned in test_ssh_listing_scope.py."""
         ep = _endpoint()
-        parsed = [object()]
+        snap = MagicMock()
+        snap.get_name.return_value = "home-20240101-000000"
         with patch.object(
             ep, "_exec_remote_command", return_value=_result(0, b"x", b"")
         ):
-            with patch.object(ep, "_parse_snapshot_list", return_value=parsed) as parse:
-                assert ep.list_snapshots() is parsed
+            with patch.object(ep, "_parse_snapshot_list", return_value=[snap]) as parse:
+                with patch.object(ep, "_subvolume_exists_at", return_value=True):
+                    assert ep.list_snapshots() == [snap]
         assert parse.called
 
 
