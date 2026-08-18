@@ -646,6 +646,9 @@ class SSHEndpoint(Endpoint):
             logger.info("Deleting old remote snapshot: %s", str(snap))  # type: ignore
             self.delete_snapshots([snap])
 
+    #: Declared beside the override that makes it true, so the two cannot drift.
+    persists_locks: bool = False
+
     def set_lock(
         self,
         snapshot: Any,

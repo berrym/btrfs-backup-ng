@@ -684,18 +684,36 @@ def _execute_status(args: argparse.Namespace) -> int:
     print("=" * 60)
     print()
 
-    # Read locks from the backup location
+    # Endpoints whose set_lock is in-memory only never write a lock file, so
+    # there is nothing here to inspect. Reporting "no active locks" would be
+    # technically true and actively misleading: it reads as "we looked, and the
+    # target is clean" when nothing was ever recorded to look at.
+    if not backup_endpoint.persists_locks:
+        print("This target does not persist locks.")
+        print()
+        print("Locks on ssh://, raw:// and raw+ssh:// targets are held in memory for")
+        print("the duration of a single run, so no lock file is written. An")
+        print("interrupted run leaves nothing behind here to inspect or unlock.")
+        return 0
+
+    # Read through the endpoint rather than rebuilding the path here. The
+    # endpoint already coerces config['path'] to a Path -- SSH endpoints keep it
+    # a str -- and this duplicate build did not, so it raised
+    # "unsupported operand type(s) for /: 'str' and 'str'", swallowed it, and
+    # printed "No active locks found." for a target it had never opened.
     try:
-        lock_file_path = backup_endpoint.config["path"] / backup_endpoint.config.get(
-            "lock_file_name", ".btrfs-backup-ng.locks"
-        )
-        locks = {}
-        if lock_file_path.exists():
-            with open(lock_file_path, encoding="utf-8") as f:
-                locks = __util__.read_locks(f.read())  # type: ignore[attr-defined]
+        locks = backup_endpoint._read_locks()
     except Exception as e:
-        logger.warning("Could not read lock file: %s", e)
-        locks = {}
+        # AbortError carries no message of its own -- the specific cause was
+        # already logged by _read_locks -- so name the type rather than printing
+        # a sentence that trails off after a colon.
+        detail = str(e) or f"{type(e).__name__}; see the error logged above"
+        print(f"Error: the lock state at {source} could not be read ({detail}).")
+        print()
+        print("This is NOT a report of zero locks. Nothing was read, so nothing is")
+        print("known about what is locked; resolve the error above before treating")
+        print("this target as unlocked.")
+        return 1
 
     # Display locks
     if locks:
@@ -774,19 +792,23 @@ def _execute_unlock(args: argparse.Namespace, lock_id: str) -> int:
         logger.error("Failed to prepare backup endpoint: %s", e)
         return 1
 
-    # Read current locks
-    try:
-        lock_file_path = backup_endpoint.config["path"] / backup_endpoint.config.get(
-            "lock_file_name", ".btrfs-backup-ng.locks"
-        )
-        if not lock_file_path.exists():
-            print("No lock file found - nothing to unlock.")
-            return 0
+    # Endpoints whose set_lock is in-memory only never write a lock file, so
+    # there is nothing here to inspect. Reporting "no active locks" would be
+    # technically true and actively misleading: it reads as "we looked, and the
+    # target is clean" when nothing was ever recorded to look at.
+    if not backup_endpoint.persists_locks:
+        print("This target does not persist locks, so there is nothing to unlock.")
+        print()
+        print("Locks on ssh://, raw:// and raw+ssh:// targets are held in memory for")
+        print("the duration of a single run, so no lock file is written. An")
+        print("interrupted run leaves nothing behind here to inspect or unlock.")
+        return 0
 
-        with open(lock_file_path, encoding="utf-8") as f:
-            locks = __util__.read_locks(f.read())  # type: ignore[attr-defined]
+    # Same endpoint API as --status, for the same reason.
+    try:
+        locks = backup_endpoint._read_locks()
     except Exception as e:
-        logger.error("Could not read lock file: %s", e)
+        logger.error("The lock state could not be read, so nothing was unlocked: %s", e)
         return 1
 
     if not locks:
@@ -831,19 +853,15 @@ def _execute_unlock(args: argparse.Namespace, lock_id: str) -> int:
                 new_entry["parent_locks"] = list(parent_locks)
             new_locks[snap_name] = new_entry
 
-    # Write updated locks
+    # Write through the endpoint's own writer, which does the atomic replace
+    # (R7: temp -> fsync -> os.replace -> parent fsync, 0600). A torn lock file
+    # is misread as "no locks" and lets retention prune a snapshot that is still
+    # locked, so this must not be a plain open("w") -- and must not be a second
+    # copy of the careful version either.
     try:
-        # Atomic replace via the shared primitive (R7): the previous plain open("w")
-        # bypassed the endpoint's crash-safe lock writer, so a crash mid-write could
-        # leave a torn lock file -- which is then misread as "no locks" and lets
-        # retention prune a snapshot that is still locked.
-        __util__.atomic_write_bytes(  # type: ignore[attr-defined]
-            lock_file_path,
-            __util__.write_locks(new_locks),  # type: ignore[attr-defined]
-            mode=0o600,
-        )
+        backup_endpoint._write_locks(new_locks)
     except Exception as e:
-        logger.error("Could not write lock file: %s", e)
+        logger.error("Could not write the lock file: %s", e)
         return 1
 
     if unlocked_count > 0:

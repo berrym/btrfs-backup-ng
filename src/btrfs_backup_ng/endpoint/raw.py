@@ -1643,6 +1643,10 @@ class RawEndpoint(Endpoint):
         logger.debug("Found %d raw snapshots in %s", len(snapshots), path)
         return list(snapshots)
 
+    #: Declared beside the override that makes it true, so the two cannot drift.
+    #: SSHRawEndpoint inherits this, which is correct: it does not persist either.
+    persists_locks: bool = False
+
     def set_lock(
         self,
         snapshot: Any,

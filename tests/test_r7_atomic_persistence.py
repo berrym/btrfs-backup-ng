@@ -23,6 +23,7 @@ import types
 import pytest
 
 from btrfs_backup_ng import __util__
+from btrfs_backup_ng.endpoint.common import Endpoint
 from btrfs_backup_ng.cli import restore as restore_cli
 from btrfs_backup_ng.core.chunked_transfer import TransferManifest
 from btrfs_backup_ng.core.state import (
@@ -208,7 +209,10 @@ def test_manifest_save_torn_write_preserves_old(tmp_path, monkeypatch):
 # ------------------------------------------------- G3: restore-unlock lock write (restore.py)
 
 
-class _FakeEndpoint:
+class _FakeEndpoint(Endpoint):
+    """A real Endpoint, so the atomic write under test is the endpoint's own
+    _write_locks -- which is what the CLI now calls."""
+
     def __init__(self, path):
         self.config = {"path": path, "lock_file_name": ".btrfs-backup-ng.locks"}
 

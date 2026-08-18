@@ -602,6 +602,14 @@ class Endpoint:
                 f"{result.stderr.decode(errors='replace').strip()}"
             )
 
+    #: Whether ``set_lock`` writes the lock to durable storage. True here because
+    #: the base implementation persists to a lock file at ``config['path']``.
+    #: Endpoints that override ``set_lock`` to mutate only the in-memory lock set
+    #: set this False, so callers can tell "no locks are held" apart from "locks
+    #: are never recorded here" -- reporting the second as the first is a false
+    #: all-clear, and `restore --status` did exactly that.
+    persists_locks: bool = True
+
     def set_lock(
         self, snapshot: Any, lock_id: Any, lock_state: bool, parent: bool = False
     ) -> None:
@@ -1124,8 +1132,27 @@ class Endpoint:
     def _read_locks(self) -> Dict[str, Any]:
         path = self._get_lock_file_path()
         try:
-            if not path.is_file():
+            # ABSENT means genuinely no locks: nothing has ever locked this
+            # target. PRESENT BUT NOT A REGULAR FILE does not -- it means the
+            # lock state cannot be read, and "no locks" is the one answer that
+            # must never be invented here, because retention trusts it and would
+            # prune a snapshot that is still locked. `is_file()` alone conflated
+            # the two: a directory, a device or a dangling symlink at this path
+            # all read back as zero locks.
+            #
+            # lstat, not stat: the writer opens with O_NOFOLLOW (via
+            # atomic_write_bytes), so it never writes THROUGH a symlink. A reader
+            # that followed one would return something the writer never wrote,
+            # and this file can live in a backup target that untrusted users can
+            # write to.
+            try:
+                st = os.lstat(path)
+            except FileNotFoundError:
                 return {}
+            if not stat.S_ISREG(st.st_mode):
+                raise ValueError(
+                    f"lock file is not a regular file (mode {st.st_mode:o})"
+                )
             with open(path, encoding="utf-8") as f:
                 return __util__.read_locks(f.read())
         except (OSError, ValueError) as e:

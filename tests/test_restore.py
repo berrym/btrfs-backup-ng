@@ -122,6 +122,24 @@ class TestFindOlderParent:
         assert result.get_name() == "snap-1"
 
 
+def _lock_endpoint(path):
+    """A REAL endpoint carrying only the config these lock tests need.
+
+    These previously used MagicMock with config["path"] set to a Path. That is a
+    shape production never produces for ssh://, where the endpoint keeps ``path``
+    as a str -- so the mock made the CLI's hand-rolled ``config["path"] / name``
+    look correct while it raised TypeError against a real SSH endpoint, and the
+    command reported "No active locks found." for a target it never opened.
+    Using the real class means these tests exercise the same _read_locks /
+    _write_locks the CLI now calls.
+    """
+    from btrfs_backup_ng.endpoint.common import Endpoint
+
+    endpoint = Endpoint.__new__(Endpoint)
+    endpoint.config = {"path": path, "lock_file_name": ".btrfs-backup-ng.locks"}
+    return endpoint
+
+
 class TestGetRestoreChain:
     """Tests for get_restore_chain function."""
 
@@ -955,12 +973,7 @@ class TestValidateRestoreDestinationEdgeCases:
         from btrfs_backup_ng.cli.restore import _execute_status
 
         # Setup mock endpoint
-        mock_endpoint = MagicMock()
-        mock_endpoint.config = {
-            "path": tmp_path,
-            "lock_file_name": ".btrfs-backup-ng.locks",
-        }
-        mock_prepare.return_value = mock_endpoint
+        mock_prepare.return_value = _lock_endpoint(tmp_path)
         mock_list.return_value = []
 
         args = MagicMock()
@@ -986,12 +999,7 @@ class TestValidateRestoreDestinationEdgeCases:
         lock_file.write_text(__util__.write_locks(locks))
 
         # Setup mock endpoint
-        mock_endpoint = MagicMock()
-        mock_endpoint.config = {
-            "path": tmp_path,
-            "lock_file_name": ".btrfs-backup-ng.locks",
-        }
-        mock_prepare.return_value = mock_endpoint
+        mock_prepare.return_value = _lock_endpoint(tmp_path)
         mock_list.return_value = []
 
         args = MagicMock()
@@ -1022,12 +1030,7 @@ class TestExecuteUnlock:
         """Test --unlock when no lock file exists."""
         from btrfs_backup_ng.cli.restore import _execute_unlock
 
-        mock_endpoint = MagicMock()
-        mock_endpoint.config = {
-            "path": tmp_path,
-            "lock_file_name": ".btrfs-backup-ng.locks",
-        }
-        mock_prepare.return_value = mock_endpoint
+        mock_prepare.return_value = _lock_endpoint(tmp_path)
 
         args = MagicMock()
         args.source = "/backup"
@@ -1050,12 +1053,7 @@ class TestExecuteUnlock:
         }
         lock_file.write_text(__util__.write_locks(locks))
 
-        mock_endpoint = MagicMock()
-        mock_endpoint.config = {
-            "path": tmp_path,
-            "lock_file_name": ".btrfs-backup-ng.locks",
-        }
-        mock_prepare.return_value = mock_endpoint
+        mock_prepare.return_value = _lock_endpoint(tmp_path)
 
         args = MagicMock()
         args.source = "/backup"
@@ -1085,12 +1083,7 @@ class TestExecuteUnlock:
         }
         lock_file.write_text(__util__.write_locks(locks))
 
-        mock_endpoint = MagicMock()
-        mock_endpoint.config = {
-            "path": tmp_path,
-            "lock_file_name": ".btrfs-backup-ng.locks",
-        }
-        mock_prepare.return_value = mock_endpoint
+        mock_prepare.return_value = _lock_endpoint(tmp_path)
 
         args = MagicMock()
         args.source = "/backup"
@@ -1115,12 +1108,7 @@ class TestExecuteUnlock:
         locks = {"snap-1": {"locks": ["restore:session-123"]}}
         lock_file.write_text(__util__.write_locks(locks))
 
-        mock_endpoint = MagicMock()
-        mock_endpoint.config = {
-            "path": tmp_path,
-            "lock_file_name": ".btrfs-backup-ng.locks",
-        }
-        mock_prepare.return_value = mock_endpoint
+        mock_prepare.return_value = _lock_endpoint(tmp_path)
 
         args = MagicMock()
         args.source = "/backup"
@@ -2976,9 +2964,7 @@ class TestExecuteStatusDetailed:
         lock_content = """{"snap-1": {"locks": ["restore:abc123", "backup:xyz"]}, "snap-2": {"parent_locks": ["restore:def456"]}}"""
         lock_file.write_text(lock_content)
 
-        mock_ep = MagicMock()
-        mock_ep.config = {"path": tmp_path, "lock_file_name": ".btrfs-backup-ng.locks"}
-        mock_prepare.return_value = mock_ep
+        mock_prepare.return_value = _lock_endpoint(tmp_path)
         mock_list.return_value = [MockSnapshot("snap-1"), MockSnapshot("snap-2")]
 
         args = argparse.Namespace(source=str(tmp_path), fs_checks="skip", prefix="")
@@ -2991,16 +2977,17 @@ class TestExecuteStatusDetailed:
         assert "restore:abc123" in captured.out or "abc123" in captured.out
         assert "Available snapshots: 2" in captured.out
 
+    @patch("btrfs_backup_ng.cli.restore.list_remote_snapshots")
     @patch("btrfs_backup_ng.cli.restore._prepare_backup_endpoint")
-    def test_status_lock_read_exception(self, mock_prepare, tmp_path, capsys):
-        """Test status when lock file read fails."""
+    def test_status_with_no_lock_file_reports_no_locks(
+        self, mock_prepare, mock_list, tmp_path, capsys
+    ):
+        """An ABSENT lock file on a target that persists locks genuinely means
+        no locks -- distinct from a lock file that could not be READ."""
         from btrfs_backup_ng.cli.restore import _execute_status
 
-        mock_ep = MagicMock()
-        mock_ep.config = {"path": tmp_path, "lock_file_name": ".btrfs-backup-ng.locks"}
-        mock_prepare.return_value = mock_ep
-
-        # Don't create lock file - reading will fail gracefully
+        mock_prepare.return_value = _lock_endpoint(tmp_path)
+        mock_list.return_value = []
 
         args = argparse.Namespace(source=str(tmp_path), fs_checks="skip", prefix="")
         result = _execute_status(args)
@@ -3008,6 +2995,26 @@ class TestExecuteStatusDetailed:
         assert result == 0
         captured = capsys.readouterr()
         assert "No active locks found" in captured.out
+
+    @patch("btrfs_backup_ng.cli.restore._prepare_backup_endpoint")
+    def test_status_that_cannot_read_the_locks_is_not_a_clean_report(
+        self, mock_prepare, tmp_path, capsys
+    ):
+        """A corrupt lock file must never come back as "no active locks". During
+        a restore that is the most dangerous possible moment to be wrong about
+        what is locked."""
+        from btrfs_backup_ng.cli.restore import _execute_status
+
+        (tmp_path / ".btrfs-backup-ng.locks").write_text("not json at all {{{")
+        mock_prepare.return_value = _lock_endpoint(tmp_path)
+
+        args = argparse.Namespace(source=str(tmp_path), fs_checks="skip", prefix="")
+        result = _execute_status(args)
+
+        assert result == 1, "an unreadable lock file exited 0"
+        captured = capsys.readouterr()
+        assert "No active locks found" not in captured.out
+        assert "NOT a report of zero locks" in captured.out
 
 
 class TestExecuteUnlockDetailed:
@@ -3034,9 +3041,7 @@ class TestExecuteUnlockDetailed:
         lock_path = tmp_path / ".btrfs-backup-ng.locks"
         lock_path.mkdir()
 
-        mock_ep = MagicMock()
-        mock_ep.config = {"path": tmp_path, "lock_file_name": ".btrfs-backup-ng.locks"}
-        mock_prepare.return_value = mock_ep
+        mock_prepare.return_value = _lock_endpoint(tmp_path)
 
         args = argparse.Namespace(source=str(tmp_path), fs_checks="skip", prefix="")
         result = _execute_unlock(args, "all")
@@ -3051,9 +3056,7 @@ class TestExecuteUnlockDetailed:
         lock_file = tmp_path / ".btrfs-backup-ng.locks"
         lock_file.write_text("{}")
 
-        mock_ep = MagicMock()
-        mock_ep.config = {"path": tmp_path, "lock_file_name": ".btrfs-backup-ng.locks"}
-        mock_prepare.return_value = mock_ep
+        mock_prepare.return_value = _lock_endpoint(tmp_path)
 
         args = argparse.Namespace(source=str(tmp_path), fs_checks="skip", prefix="")
         result = _execute_unlock(args, "all")
@@ -3073,9 +3076,7 @@ class TestExecuteUnlockDetailed:
         )
         lock_file.write_text(lock_content)
 
-        mock_ep = MagicMock()
-        mock_ep.config = {"path": tmp_path, "lock_file_name": ".btrfs-backup-ng.locks"}
-        mock_prepare.return_value = mock_ep
+        mock_prepare.return_value = _lock_endpoint(tmp_path)
 
         args = argparse.Namespace(source=str(tmp_path), fs_checks="skip", prefix="")
         result = _execute_unlock(args, "session123")
@@ -3098,9 +3099,7 @@ class TestExecuteUnlockDetailed:
         lock_content = """{"snap-1": {"locks": ["restore:a", "restore:b"], "parent_locks": ["restore:c"]}, "snap-2": {"locks": ["backup:keep"]}}"""
         lock_file.write_text(lock_content)
 
-        mock_ep = MagicMock()
-        mock_ep.config = {"path": tmp_path, "lock_file_name": ".btrfs-backup-ng.locks"}
-        mock_prepare.return_value = mock_ep
+        mock_prepare.return_value = _lock_endpoint(tmp_path)
 
         args = argparse.Namespace(source=str(tmp_path), fs_checks="skip", prefix="")
         result = _execute_unlock(args, "all")
