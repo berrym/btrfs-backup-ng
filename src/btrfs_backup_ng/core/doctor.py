@@ -1038,15 +1038,25 @@ class Doctor:
         if not self.config:
             return findings
 
-        # This would require accessing endpoints and listing snapshots
-        # For now, return a placeholder
+        # NOT IMPLEMENTED -- and it says so. This reported OK, which told an
+        # operator their parent chains were verified intact when nothing had
+        # looked at them. `doctor` exists to be believed; a green line for a check
+        # that is a comment is the worst thing it can print.
+        #
+        # INFO rather than OK: visible in the output, distinct from a check that
+        # actually passed, and it leaves the exit code alone, because "not
+        # checked" is a gap in coverage rather than a fault in the system.
         findings.append(
             DiagnosticFinding(
                 category=DiagnosticCategory.SNAPSHOTS,
-                severity=DiagnosticSeverity.OK,
+                severity=DiagnosticSeverity.INFO,
                 check_name="snapshot_parent_chains",
-                message="Parent chain check requires endpoint access",
-                details={"note": "Full implementation pending"},
+                message=(
+                    "Parent chain integrity was NOT checked -- this check is not "
+                    "implemented yet (it needs endpoint access and a snapshot "
+                    "listing)"
+                ),
+                details={"implemented": False},
             )
         )
 
@@ -1059,14 +1069,20 @@ class Doctor:
         if not self.config:
             return findings
 
-        # Placeholder - would need endpoint access
+        # NOT IMPLEMENTED -- see _check_parent_chains for the reasoning. Same
+        # defect, same fix: say that nothing was checked instead of reporting a
+        # pass nobody earned.
         findings.append(
             DiagnosticFinding(
                 category=DiagnosticCategory.SNAPSHOTS,
-                severity=DiagnosticSeverity.OK,
+                severity=DiagnosticSeverity.INFO,
                 check_name="snapshot_dates",
-                message="Snapshot date check requires endpoint access",
-                details={"note": "Full implementation pending"},
+                message=(
+                    "Snapshot timestamps were NOT checked -- this check is not "
+                    "implemented yet (it needs endpoint access and a snapshot "
+                    "listing)"
+                ),
+                details={"implemented": False},
             )
         )
 
