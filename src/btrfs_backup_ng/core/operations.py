@@ -140,13 +140,37 @@ def send_snapshot(
     # chunked nor the standard path can double-compress. This single choke point keeps
     # every backup path safe, including ones that never thread compress into the
     # endpoint -- those simply do not compress, but stay restorable.
+    #
+    # A NON-raw destination is neutralised too, for the opposite reason: the
+    # transfer layer compresses the send stream and nothing reverses it. There is
+    # no receive-side decompression anywhere in this codebase --
+    # core.transfer.build_receive_pipeline exists but has no callers -- so
+    # `btrfs receive` gets compressed bytes and blocks forever. Measured against
+    # a real local btrfs target: no error, no output, no backup, and under a
+    # systemd timer every later run queues behind it.
+    #
+    # Between the two branches, transfer-layer compression is never usable today,
+    # so it is always turned off here. Raw targets still compress -- inside the
+    # endpoint, where it is recorded and reversible. Non-raw targets warn, because
+    # an option the operator asked for is not being honoured and a larger backup
+    # is a surprise worth explaining. Neutralising beats refusing: an uncompressed
+    # backup is still correct and still restorable, whereas a hang is neither.
     from ..endpoint.raw import RawEndpoint
 
-    if (
-        isinstance(destination_endpoint, RawEndpoint)
-        and options.get("compress", "none") != "none"
-    ):
-        options = {**options, "compress": "none"}
+    if options.get("compress", "none") != "none":
+        if isinstance(destination_endpoint, RawEndpoint):
+            options = {**options, "compress": "none"}
+        else:
+            logger.warning(
+                "Ignoring compress=%r for this destination: compression is "
+                "supported only on raw:// and raw+ssh:// targets, where the raw "
+                "endpoint records it so a restore can reverse it. A btrfs "
+                "destination has no decompression step, and honouring this would "
+                "hang the transfer rather than fail it. This backup will be "
+                "uncompressed.",
+                options.get("compress"),
+            )
+            options = {**options, "compress": "none"}
 
     # Check if chunked transfer is requested
     use_chunked = options.get("use_chunked", False)

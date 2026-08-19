@@ -614,11 +614,21 @@ def _backup_snapper_volume(
                         f"Ensure the drive is connected and mounted."
                     )
 
-            # Build transfer options
-            # For local transfers, use no compression (Rich progress bar)
-            # For remote transfers, use zstd compression
-            is_remote = target.path.startswith(("ssh://", "raw+ssh://"))
-            default_compress = "zstd" if is_remote else "none"
+            # Build transfer options.
+            #
+            # Compression defaults ON only for raw+ssh://, where the raw endpoint
+            # owns it, records it in the .meta sidecar, and a restore can reverse
+            # it -- so it is a real saving over the wire.
+            #
+            # It must NOT default on for ssh://. Nothing decompresses a non-raw
+            # receive stream, so `btrfs receive` gets compressed bytes and blocks
+            # forever. This default meant a snapper backup to an ssh:// target
+            # hung out of the box, for users who never asked for compression at
+            # all. An explicit `compress` on such a target is now refused at
+            # config load; this is the implicit half of the same bug.
+            default_compress = (
+                "zstd" if target.path.startswith("raw+ssh://") else "none"
+            )
 
             options = {
                 "compress": compress_override or target.compress or default_compress,

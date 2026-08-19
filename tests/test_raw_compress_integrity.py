@@ -172,11 +172,25 @@ def test_send_snapshot_suppresses_transfer_compress_for_raw(tmp_path, monkeypatc
     assert captured["compress"] == "none"
 
 
-def test_send_snapshot_preserves_transfer_compress_for_non_raw(tmp_path, monkeypatch):
-    """The raw suppression must NOT strip transfer-layer compression from non-raw
-    targets (local/ssh btrfs) -- they legitimately compress at the transfer layer and
-    decompress symmetrically on receive. Guards against a future edit widening the
-    isinstance check."""
+def test_send_snapshot_neutralises_transfer_compress_for_non_raw(tmp_path, monkeypatch):
+    """Non-raw destinations get transfer-layer compression turned OFF, with a warning.
+
+    This asserted the opposite until it was measured, on the stated grounds that
+    non-raw targets "compress at the transfer layer and decompress symmetrically
+    on receive". That symmetry does not exist: core.transfer.build_receive_pipeline
+    is the only receive-side decompressor and it has no callers anywhere in src.
+    The send stream was compressed and nothing reversed it, so `btrfs receive` got
+    compressed bytes and blocked.
+
+    Measured on a real host, local btrfs target, compress=zstd:
+
+        exit=124 (timed out)   backups landed: 0   error lines: 0
+        last log line: "Transfer compression enabled: zstd"
+
+    An indefinite hang, not a degraded transfer. The suppression is therefore
+    deliberately wide now: raw compresses inside the endpoint, everything else
+    does not compress at all. Do not narrow it back without wiring up a
+    receive-side decompressor first."""
     captured: dict = {}
 
     class _Stop(Exception):
@@ -202,7 +216,8 @@ def test_send_snapshot_preserves_transfer_compress_for_non_raw(tmp_path, monkeyp
         operations.send_snapshot(
             snap, _NotRaw(), options={"compress": "zstd", "show_progress": False}
         )
-    assert captured["compress"] == "zstd"  # preserved for non-raw
+    # Neutralised -- honouring it would hang the transfer (see docstring).
+    assert captured["compress"] == "none"
 
 
 def test_ssh_raw_receive_pipeline_is_compress_then_encrypt(monkeypatch):
