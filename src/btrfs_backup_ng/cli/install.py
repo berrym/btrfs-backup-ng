@@ -52,6 +52,55 @@ TIMER_PRESETS = {
 }
 
 
+def _config_visibility_warning(user_mode: bool) -> str | None:
+    """Warn when the unit being installed will not see the config that exists.
+
+    A SYSTEM unit runs as root with no SUDO_USER, so config discovery searches
+    /root/.config and then /etc -- never the home of whoever ran `install`. Since
+    `sudo btrfs-backup-ng install` DOES see the invoking user's config (discovery
+    honours SUDO_USER), the install succeeds and the timer then fails with "No
+    configuration file found" while the operator is looking straight at their
+    config file.
+
+    The unit deliberately does NOT get `--config /home/<user>/...` baked in. A
+    root service reading its configuration from a user-writable path hands
+    whoever can write that file control over what root backs up, and where to.
+    Copying it to /etc, or running the timer as the user, are both safe; silently
+    widening root's trust to a home directory is not.
+
+    Returns operator-facing text, or None when the unit will find its config.
+    """
+    from ..config import find_config_file
+
+    if user_mode:
+        return None
+    try:
+        found = find_config_file(None)
+    except Exception:  # noqa: BLE001 - a warning must not break the install
+        return None
+    if found is None:
+        return (
+            "No configuration file was found. The timer will fail until one "
+            "exists at /etc/btrfs-backup-ng/config.toml (create it with "
+            "`btrfs-backup-ng config init`)."
+        )
+
+    system_config = Path("/etc/btrfs-backup-ng/config.toml")
+    if found == system_config:
+        return None
+
+    return (
+        f"The configuration in use is {found}, but a SYSTEM timer runs as root "
+        f"and only looks in /root/.config and /etc -- it will not read that "
+        f"file, and will fail with 'No configuration file found'.\n"
+        f"  Either:  sudo cp {found} {system_config}\n"
+        f"  Or:      btrfs-backup-ng install --user   (runs the timer as you)\n"
+        f"The unit is deliberately not pointed at a file in a home directory: a "
+        f"root service must not take its configuration from a path other users "
+        f"may be able to write."
+    )
+
+
 def _resolve_exec_start() -> str:
     """Return the absolute path to the btrfs-backup-ng executable for ExecStart.
 
@@ -114,6 +163,10 @@ def execute_install(args: argparse.Namespace) -> int:
     service_file = systemd_dir / "btrfs-backup-ng.service"
     timer_file = systemd_dir / "btrfs-backup-ng.timer"
 
+    # Say now, at install time, if this unit will not be able to find the config
+    # -- rather than letting the operator discover it from a failed timer later.
+    visibility = _config_visibility_warning(user_mode)
+
     # Generate content
     service_content = SERVICE_TEMPLATE.format(exec_start=_resolve_exec_start())
     timer_content = TIMER_TEMPLATE.format(oncalendar=oncalendar)
@@ -129,6 +182,13 @@ def execute_install(args: argparse.Namespace) -> int:
     except OSError as e:
         logger.error("Failed to write systemd files: %s", e)
         return 1
+
+    if visibility:
+        print("")
+        print("WARNING: this timer will not find your configuration.")
+        print("")
+        for line in visibility.splitlines():
+            print(f"  {line}")
 
     print("")
     print("To enable the timer:")
