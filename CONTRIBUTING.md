@@ -39,6 +39,19 @@ Tests are organized into two tiers:
 | **Tier 1** | Unit tests and mocked integration tests | Python only | Every push |
 | **Tier 2** | Real btrfs integration tests | btrfs-progs, root, Linux | Weekly/manual |
 
+### What a test needs to do
+
+A test has to **fail when the code is wrong**. A test that passes against a
+broken implementation is worse than no test, because it makes the next person
+confident for no reason. A quick way to check your own: break the code
+deliberately and confirm the test notices.
+
+Prefer testing behaviour over implementation -- what the code produces, rather
+than which functions it called on the way. Where something touches real
+filesystem or privilege behaviour, a real temporary directory usually pins it
+better than a mock, because a mock will agree with a wrong assumption without
+complaint.
+
 ### Running Tier 1 Tests (Default)
 
 Standard tests run without special privileges:
@@ -152,11 +165,44 @@ tests/
 
 ## Pull Request Guidelines
 
+Small, focused changes are easiest to review and land fastest.
+
 1. **Tests**: Add tests for new functionality
 2. **Type hints**: Include type annotations for new code
 3. **Linting**: Ensure `ruff check` passes
 4. **Formatting**: Run `ruff format` before committing
 5. **Documentation**: Update README/docstrings as needed
+
+Commit style:
+
+- Conventional-commit prefixes: `fix:`, `feat:`, `docs:`, `refactor:`, `chore:`
+- Explain **why** in the message. What changed is in the diff; why it changed is
+  not, and that is what the next reader needs.
+- No AI or tool attribution anywhere -- not in commits, code, comments or docs.
+  The author line is the only attribution this project carries.
+
+### Work in progress is welcome
+
+If you have found the cause of something but are unsure about the right fix,
+open a draft PR or title it WIP and say what you are unsure about. That is a
+useful contribution on its own, and it is usually the fastest way to agree on a
+direction before you spend more time on it. It will not be merged in that state,
+and it will not be closed for being unfinished.
+
+The checklist above applies to work intended to land, not to a WIP that exists
+to start a conversation.
+
+### On the review bar
+
+This is a backup tool. People point it at data they cannot afford to lose, so
+changes get read closely and may go through a few rounds. That reflects the
+blast radius of a mistake here, not a judgement of the contribution.
+
+### First-time contributors
+
+GitHub holds Actions workflows on pull requests from first-time contributors
+until a maintainer approves the run, so there may be a delay before you see CI
+results. That is normal and is not a problem with your PR.
 
 ## CI Workflows
 
@@ -172,4 +218,17 @@ Please include:
 - btrfs-progs version (`btrfs --version`)
 - Linux kernel version (`uname -r`)
 - Configuration file (sanitized)
-- Full error output
+- Full error output (add `--debug` if you can reproduce it)
+
+Two more things narrow a report down faster than anything else:
+
+- **Which target scheme**: local, `ssh://`, `raw://` or `raw+ssh://`
+- **Which privilege level**: running as root, or as a normal user with `sudo`
+
+Behaviour genuinely differs across those combinations, so knowing which one you
+hit usually points straight at the relevant code path. `--ssh-sudo` in
+particular does not mean the same thing on every scheme; the Permissions section
+of README.md covers that.
+
+A question that turns out to be a documentation gap is a bug report, and gets
+treated as one.
