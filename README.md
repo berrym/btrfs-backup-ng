@@ -219,7 +219,6 @@ path = "/mnt/backup/home"
 [[volumes.targets]]
 path = "ssh://backup@server:/backups/home"
 ssh_sudo = true
-compress = "zstd"
 rate_limit = "50M"
 ```
 
@@ -595,7 +594,10 @@ ssh_port = 22                          # SSH port
 ssh_key = "~/.ssh/backup_key"          # SSH private key
 ssh_host_key_policy = "accept-new"     # Host-key policy: accept-new (default) | strict
 ssh_password_auth = true               # Allow password fallback
-compress = "zstd"                      # Compression (none|gzip|zstd|lz4|pigz|lzop)
+compress = "zstd"                      # Compression -- raw:// and raw+ssh:// ONLY
+                                       # (none|gzip|zstd|lz4|pigz|lzop). Ignored on
+                                       # btrfs targets, local or ssh://: nothing
+                                       # decompresses on the receive side there.
 rate_limit = "10M"                     # Bandwidth limit (K|M|G suffix)
 require_mount = false                  # Require path to be a mount point (safety check)
 ```
@@ -2315,7 +2317,6 @@ min_age = "1h"                              # Skip snapshots younger than 1 hour
 [[volumes.targets]]
 path = "ssh://backup@server:/backups/root"
 ssh_sudo = true
-compress = "zstd"
 ```
 
 Then run backups normally:

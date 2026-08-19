@@ -134,7 +134,6 @@ min_age = "1h"
 [[volumes.targets]]
 path = "ssh://backup@server:/backups/root"
 ssh_sudo = true
-compress = "zstd"
 ```
 
 ### Configuration Options
@@ -546,12 +545,16 @@ include_types = ["single"]  # Skip pre/post pairs
 
 ### 3. Use Compression for Remote
 
-Enable compression for remote transfers:
+Compression applies to **raw** targets only. The raw endpoint compresses the
+stream itself and records the method in the `.meta` sidecar, so a restore can
+reverse it:
 ```toml
 [[volumes.targets]]
-path = "ssh://backup@server:/backups/root"
+path = "raw+ssh://backup@server:/backups/root"
 compress = "zstd"
 ```
+On a btrfs target -- local or `ssh://` -- `compress` is ignored and warned
+about, because there is no decompression step on the receive side.
 
 ### 4. Monitor Backup Status
 
