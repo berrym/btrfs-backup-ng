@@ -554,6 +554,37 @@ def execute_config(args: argparse.Namespace) -> int:
         return 1
 
 
+def _volume_readiness_problems(volume: Any) -> list[str]:
+    """Local, cheap reasons this volume could not actually be backed up.
+
+    Deliberately limited to what can be answered on THIS machine without opening
+    a connection: does the source exist, is it a directory, is it on btrfs.
+    Remote targets are not probed -- that is `doctor`'s job, which is allowed to
+    reach the network; `validate` stays fast and offline.
+
+    Returns a list of human-readable problems; empty means "nothing local says
+    this cannot work".
+    """
+    from pathlib import Path
+
+    from .. import __util__
+
+    problems: list[str] = []
+    path = Path(str(volume.path))
+    if not path.exists():
+        problems.append(f"source path does not exist: {path}")
+        return problems
+    if not path.is_dir():
+        problems.append(f"source path is not a directory: {path}")
+        return problems
+    try:
+        if not __util__.is_btrfs(path):
+            problems.append(f"source path is not on a btrfs filesystem: {path}")
+    except Exception as e:  # noqa: BLE001 - a probe failure is not a verdict
+        logger.debug("Could not determine filesystem for %s: %s", path, e)
+    return problems
+
+
 def _validate_config(args: argparse.Namespace) -> int:
     """Validate configuration file."""
     try:
@@ -574,14 +605,44 @@ def _validate_config(args: argparse.Namespace) -> int:
             for warning in warnings:
                 print(f"  - {warning}")
 
+        # Structure is only half the question. A config can parse perfectly and
+        # still be unable to back anything up, and "Configuration is valid." was
+        # printed for one whose every path was fictional -- measured. The word
+        # "valid" is what an operator checks before trusting this tool, so it now
+        # covers whether the sources could actually be read.
+        readiness: list[tuple[str, list[str]]] = []
+        for volume in config.get_enabled_volumes():
+            problems = _volume_readiness_problems(volume)
+            if problems:
+                readiness.append((str(volume.path), problems))
+
         print("")
-        print("Configuration is valid.")
+        print("Configuration syntax and structure: valid.")
         print(f"  Volumes: {len(config.volumes)}")
         print(f"  Enabled: {len(config.get_enabled_volumes())}")
 
         total_targets = sum(len(v.targets) for v in config.volumes)
         print(f"  Targets: {total_targets}")
 
+        if readiness:
+            print("")
+            print("These volumes cannot be backed up from this machine:")
+            for path, problems in readiness:
+                for problem in problems:
+                    print(f"  - {path}: {problem}")
+            print("")
+            print(
+                "The file itself is fine. Checked locally only -- remote targets "
+                "are not probed here; run `doctor` for that."
+            )
+            # Non-zero, because a config that cannot back up its sources is not
+            # something to hand a green light to. A machine that merely does not
+            # host these volumes (editing a config elsewhere) reports the same
+            # way, which is honest: it cannot run this config either.
+            return 1
+
+        print("")
+        print("All enabled volumes look usable from this machine.")
         return 0
 
     except ConfigError as e:
