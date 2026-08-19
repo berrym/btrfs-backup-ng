@@ -494,3 +494,84 @@ class TestSlotNumbersDoNotDecideAnything:
         assert min(deleted_ages) >= 90, deleted_ages
         assert 99 in [b["number"] for b in delete], "the oldest backup survived"
         assert 1 not in [b["number"] for b in delete], "the newest was deleted"
+
+
+class TestTheRunPathActuallyInvokesRetention:
+    """Pinning the two lines that connect the phase to the pipeline.
+
+    Everything else here drives _prune_snapper_after_transfer directly, so
+    deleting its call from _backup_snapper_volume -- and the `and prune_ok` on
+    the return -- left the whole suite green while retention silently stopped
+    running. That is the same defect shape this series exists to remove, so it
+    does not get to live in the code that fixes it.
+    """
+
+    def _run_snapper_backup(self, monkeypatch, prune_result=True):
+        from pathlib import Path
+
+        from btrfs_backup_ng.cli import run as run_mod
+        from btrfs_backup_ng.config.schema import (
+            Config,
+            GlobalConfig,
+            TargetConfig,
+            VolumeConfig,
+        )
+        from btrfs_backup_ng.core import operations as ops
+        from btrfs_backup_ng.snapper.scanner import SnapperConfig
+
+        monkeypatch.setattr(ops, "sync_snapper_snapshots", lambda *a, **k: 1)
+        monkeypatch.setattr(
+            run_mod.endpoint,
+            "choose_endpoint",
+            lambda *a, **k: MagicMock(_is_remote=False),
+        )
+
+        volume = VolumeConfig(path="/", snapshot_prefix="root-")
+        volume.source = "snapper"
+        volume.snapper = MagicMock(config_name="root")
+        volume.targets = [TargetConfig(path="/mnt/backup")]
+        config = Config(global_config=GlobalConfig(), volumes=[volume])
+
+        calls = []
+
+        def fake_phase(vol, cfg, succeeded, errors):
+            calls.append((vol, succeeded))
+            if not prune_result:
+                errors.append("Prune /mnt/backup: boom")
+            return prune_result
+
+        monkeypatch.setattr(run_mod, "_prune_snapper_after_transfer", fake_phase)
+
+        with patch("btrfs_backup_ng.snapper.SnapperScanner") as scanner_cls:
+            scanner = MagicMock()
+            scanner.find_config_for_path.return_value = SnapperConfig(
+                name="root", subvolume=Path("/")
+            )
+            scanner_cls.return_value = scanner
+            ok, stats, errors = run_mod._backup_snapper_volume(volume, config)
+        return ok, stats, errors, calls
+
+    def test_the_retention_phase_is_called(self, monkeypatch):
+        _ok, _stats, _errors, calls = self._run_snapper_backup(monkeypatch)
+        assert calls, "the snapper run path never invoked retention"
+
+    def test_it_is_given_the_targets_that_succeeded(self, monkeypatch):
+        _ok, _stats, _errors, calls = self._run_snapper_backup(monkeypatch)
+        _volume, succeeded = calls[0]
+        assert succeeded, "retention was called with no successful targets"
+        target, endpoint_config = succeeded[0]
+        assert target.path == "/mnt/backup"
+        assert "path" in endpoint_config, endpoint_config
+
+    def test_a_successful_prune_leaves_the_run_successful(self, monkeypatch):
+        ok, _stats, errors, _calls = self._run_snapper_backup(monkeypatch)
+        assert ok is True and not errors
+
+    def test_a_failed_prune_fails_the_run(self, monkeypatch):
+        """Mutation guard for `and prune_ok`: drop it and a retention failure is
+        reported as a clean backup."""
+        ok, _stats, errors, _calls = self._run_snapper_backup(
+            monkeypatch, prune_result=False
+        )
+        assert ok is False, "a failed retention was reported as a successful run"
+        assert any("boom" in e for e in errors)
