@@ -777,6 +777,77 @@ class Doctor:
 
         return findings
 
+    def _check_remote_decompressor(
+        self, method: str, program: str, remote_methods: dict[str, list[Any]]
+    ) -> list[DiagnosticFinding]:
+        """Is the decompressor present on the hosts that must run it?
+
+        Reporting only the local side is the failure this whole area keeps
+        producing: a check that could not see the thing it was judging, reported
+        as a clean result. If the remote cannot be probed, that is said plainly
+        rather than counted as a pass.
+        """
+        findings: list[DiagnosticFinding] = []
+        for target in remote_methods.get(method, []):
+            scheme = parse_target(target.path)
+            destination = scheme.ssh_destination
+            if not destination:
+                continue
+            try:
+                from ..sshutil.diagnose import check_remote_program
+
+                ok, detail = check_remote_program(
+                    destination,
+                    program,
+                    scheme.port or getattr(target, "ssh_port", None),
+                    getattr(target, "ssh_key", None),
+                )
+            except Exception as e:  # noqa: BLE001 - inability to check is not a pass
+                ok, detail = None, str(e)
+
+            if ok is None:
+                findings.append(
+                    DiagnosticFinding(
+                        category=DiagnosticCategory.CONFIG,
+                        severity=DiagnosticSeverity.WARN,
+                        check_name="compression_programs",
+                        message=(
+                            f"Could not check for {program} on {destination}: "
+                            f"the remote must decompress this stream"
+                        ),
+                        details={"hint": detail},
+                    )
+                )
+            elif ok:
+                findings.append(
+                    DiagnosticFinding(
+                        category=DiagnosticCategory.CONFIG,
+                        severity=DiagnosticSeverity.OK,
+                        check_name="compression_programs",
+                        message=f"{program} present on {destination} (decompresses)",
+                    )
+                )
+            else:
+                findings.append(
+                    DiagnosticFinding(
+                        category=DiagnosticCategory.CONFIG,
+                        severity=DiagnosticSeverity.ERROR,
+                        check_name="compression_programs",
+                        message=(
+                            f"{program} is NOT installed on {destination}, which "
+                            f"has to decompress this stream"
+                        ),
+                        details={
+                            "hint": (
+                                f"Install {program} on {destination}, or set "
+                                f'compress = "none" for {target.path}. The '
+                                f"transfer would otherwise fail at receive time."
+                            )
+                        },
+                    )
+                )
+        return findings
+
     def _check_compression_programs(self) -> list[DiagnosticFinding]:
         """Check that compression programs are available."""
         import shutil
@@ -786,8 +857,13 @@ class Doctor:
         if not self.config:
             return findings
 
-        # Collect all compression methods used
+        # Collect all compression methods used, and note which of them have to
+        # exist on a REMOTE host as well. Stream compression over ssh:// runs the
+        # compressor here and the DEcompressor there, so a purely local check
+        # reports "available" for a program the receiving side does not have --
+        # the transfer then fails at receive time, after the data has moved.
         compression_methods: set[str] = set()
+        remote_methods: dict[str, list[Any]] = {}
         if hasattr(self.config.global_config, "compress") and getattr(
             self.config.global_config, "compress", None
         ):
@@ -797,6 +873,15 @@ class Doctor:
             for target in volume.targets:
                 if hasattr(target, "compress") and target.compress:
                     compression_methods.add(target.compress)
+                    if target.compress != "none":
+                        try:
+                            target_scheme = parse_target(target.path)
+                        except Exception:  # noqa: BLE001 - reported elsewhere
+                            continue
+                        if target_scheme.ssh_destination:
+                            remote_methods.setdefault(target.compress, []).append(
+                                target
+                            )
 
         # Check each compression program
         program_map = {
@@ -833,6 +918,10 @@ class Doctor:
                         },
                     )
                 )
+
+            findings.extend(
+                self._check_remote_decompressor(method, program, remote_methods)
+            )
 
         if not compression_methods or compression_methods == {"none"}:
             findings.append(

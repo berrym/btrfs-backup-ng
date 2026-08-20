@@ -84,6 +84,39 @@ def test_ssh_connection(
         return False
 
 
+def check_remote_program(
+    host: str,
+    program: str,
+    port: Optional[int] = None,
+    identity_file: Optional[str] = None,
+) -> Tuple[Optional[bool], str]:
+    """Is ``program`` on the remote host's PATH?
+
+    Returns (True, path) if present, (False, "") if the host answered and does
+    not have it, and (None, reason) when the question could not be asked at all.
+
+    The tri-state is the point. Collapsing "could not connect" into "not
+    installed" reports a configuration error the operator does not have, and
+    collapsing it into "present" reports a clean result for a check that never
+    ran -- the failure this diagnostic exists to prevent.
+    """
+    cmd = ssh_command_base(host, port, identity_file)
+    cmd.append(f"command -v {shlex.quote(program)}")
+
+    returncode, stdout, stderr = run_command(cmd)
+
+    if returncode == 0:
+        return True, stdout.strip()
+    # 127 is the shell's "not found"; ssh itself reports 255 for its own errors.
+    if (
+        returncode == 255
+        or "Permission denied" in stderr
+        or "Could not resolve" in stderr
+    ):
+        return None, (stderr.strip() or f"ssh exited {returncode}")
+    return False, ""
+
+
 def test_sudo_access(
     host: str, port: Optional[int] = None, identity_file: Optional[str] = None
 ) -> bool:

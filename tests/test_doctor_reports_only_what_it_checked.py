@@ -112,3 +112,84 @@ class TestNoCheckClaimsAPassItDidNotEarn:
         doctor = Doctor(config=None)
         assert doctor._check_parent_chains() == []
         assert doctor._check_snapshot_dates() == []
+
+
+class TestTheRemoteDecompressorIsActuallyChecked:
+    """Stream compression over ssh:// runs the DEcompressor on the remote.
+
+    The compression check only ran `shutil.which` locally, so a laptop with
+    zstd installed reported "Compression program available: zstd" for a target
+    whose receiving host had no zstd at all. The transfer then failed at receive
+    time, after the data had crossed the network -- and `doctor`, the command
+    whose job is to catch this beforehand, had said everything was fine.
+    """
+
+    def _doctor_with_remote_zstd_target(self):
+        from types import SimpleNamespace
+
+        target = SimpleNamespace(
+            path="ssh://user@nas:/backups",
+            compress="zstd",
+            ssh_port=None,
+            ssh_key=None,
+        )
+        volume = SimpleNamespace(targets=[target])
+        config = SimpleNamespace(
+            global_config=SimpleNamespace(compress=None),
+            get_enabled_volumes=lambda: [volume],
+        )
+        return Doctor(config=config)
+
+    def _findings(self, monkeypatch, probe_result):
+        from btrfs_backup_ng.sshutil import diagnose
+
+        monkeypatch.setattr(
+            diagnose, "check_remote_program", lambda *a, **k: probe_result
+        )
+        doctor = self._doctor_with_remote_zstd_target()
+        return doctor._check_compression_programs()
+
+    def test_a_missing_remote_decompressor_is_an_error(self, monkeypatch):
+        findings = self._findings(monkeypatch, (False, ""))
+        remote = [f for f in findings if "nas" in f.message]
+        assert remote, "the remote host was never mentioned; it was not checked"
+        assert any(f.severity == DiagnosticSeverity.ERROR for f in remote), [
+            f"{f.severity}: {f.message}" for f in remote
+        ]
+
+    def test_an_unreachable_remote_is_not_reported_as_fine(self, monkeypatch):
+        """'Could not check' must never be rendered as a pass."""
+        findings = self._findings(monkeypatch, (None, "ssh exited 255"))
+        remote = [f for f in findings if "nas" in f.message]
+        assert remote
+        assert all(f.severity != DiagnosticSeverity.OK for f in remote), [
+            f"{f.severity}: {f.message}" for f in remote
+        ]
+        assert any("Could not check" in f.message for f in remote)
+
+    def test_a_present_remote_decompressor_passes(self, monkeypatch):
+        findings = self._findings(monkeypatch, (True, "/usr/bin/zstd"))
+        remote = [f for f in findings if "nas" in f.message]
+        assert remote
+        assert any(f.severity == DiagnosticSeverity.OK for f in remote)
+
+    def test_a_local_only_target_is_not_probed_over_ssh(self, monkeypatch):
+        """A raw:// or local target has no remote half to check."""
+        from types import SimpleNamespace
+
+        from btrfs_backup_ng.sshutil import diagnose
+
+        called = []
+        monkeypatch.setattr(
+            diagnose,
+            "check_remote_program",
+            lambda *a, **k: called.append(a) or (True, "/usr/bin/zstd"),
+        )
+        target = SimpleNamespace(path="/mnt/backups", compress="zstd")
+        volume = SimpleNamespace(targets=[target])
+        config = SimpleNamespace(
+            global_config=SimpleNamespace(compress=None),
+            get_enabled_volumes=lambda: [volume],
+        )
+        Doctor(config=config)._check_compression_programs()
+        assert not called
