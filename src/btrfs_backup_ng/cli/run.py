@@ -1,7 +1,10 @@
 """Run command: Execute all configured backup jobs."""
 
 import argparse
+import contextlib
+import hashlib
 import logging
+import os
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -45,6 +48,87 @@ from .prune import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+#: How long a starting run waits for a run already in progress. Short on purpose:
+#: it lets two runs that started together sort themselves out, while a transfer
+#: that has been going for hours is not worth queueing behind -- the waiting run
+#: would just repeat work the running one is already doing.
+RUN_LOCK_WAIT_SECONDS = 10.0
+
+
+def _run_lock_path(config_path: Path | str) -> Path:
+    """Where this configuration's run lock lives.
+
+    A runtime directory, not the config directory or the backup target: the
+    config directory may be read-only, and the target may be remote, which is
+    the case that cannot hold a lock at all.
+
+    Keyed by a digest of the resolved config path so two different
+    configurations never share a lock, while the same configuration always
+    resolves to the same one however it was spelled on the command line. The
+    stem is kept in the name too, so an operator looking at the directory can
+    tell what the file belongs to.
+    """
+    if os.geteuid() == 0:
+        base = Path("/run/btrfs-backup-ng")
+    else:
+        runtime = os.environ.get("XDG_RUNTIME_DIR")
+        base = (
+            Path(runtime) / "btrfs-backup-ng"
+            if runtime
+            else Path.home() / ".cache" / "btrfs-backup-ng"
+        )
+    # Coerce: config discovery returns a str on some paths and a Path on others,
+    # and a lock that raises AttributeError would take down every run.
+    candidate = Path(config_path)
+    try:
+        resolved = candidate.resolve()
+    except OSError:
+        resolved = candidate
+    digest = hashlib.sha256(str(resolved).encode("utf-8")).hexdigest()[:16]
+    # 0o700: the lock coordinates work that often runs as root, so it must not
+    # sit in a directory other users can write ([[root symlink safety]] -- the
+    # lock open itself is O_NOFOLLOW, but the directory should not invite the
+    # attempt).
+    base.mkdir(parents=True, exist_ok=True, mode=0o700)
+    return base / f"run-{resolved.stem}-{digest}.lock"
+
+
+@contextlib.contextmanager
+def _run_lock(config_path: Path | str) -> Any:
+    """Hold the run lock, or say clearly why there is none.
+
+    Two failures that must not be treated alike:
+
+    * Another run holds it, or the lock file is not something we will use (a
+      planted symlink or FIFO). Both raise RuntimeError out of this, and the
+      caller refuses to run -- a second concurrent run over the same volumes is
+      exactly what this exists to prevent.
+    * The lock machinery cannot be set up at all, because the runtime directory
+      cannot be created (a read-only home, a stripped-down container). Failing
+      the backup for that would turn a missing guard into an outage, which is
+      worse than the race it guards against. So it warns loudly and continues
+      WITHOUT the lock, rather than pretending it has one.
+    """
+    try:
+        lock_file = _run_lock_path(config_path)
+    except OSError as e:
+        logger.warning(
+            "Could not create the run-lock directory (%s). This run is NOT "
+            "protected against overlapping with another run of the same "
+            "configuration; if one is already in progress, both will proceed. "
+            "Continuing anyway.",
+            e,
+        )
+        yield
+        return
+    with __util__.exclusive_lock(  # type: ignore[attr-defined]
+        lock_file,
+        timeout=RUN_LOCK_WAIT_SECONDS,
+        subject=f"a run for {config_path}",
+    ):
+        yield
 
 
 def execute_run(args: argparse.Namespace) -> int:
@@ -100,6 +184,38 @@ def execute_run(args: argparse.Namespace) -> int:
     if getattr(args, "dry_run", False):
         return _dry_run(config)
 
+    # Only one run at a time on this machine, for this config. A timer firing
+    # while the previous transfer is still going used to start a second run on
+    # the same volumes and targets, with nothing to stop the two colliding:
+    # systemd declines to start a second copy of the same unit, so the packaged
+    # timer was covered by systemd rather than by us, and a manual run racing a
+    # timer run was not covered at all. Local raw:// targets take a per-target
+    # flock, but ssh:// has none and raw+ssh:// cannot hold one (its target_lock
+    # is a documented no-op), so the guard belongs here, where it works for every
+    # target type. Raised by mjg in #93.
+    #
+    # Keyed on the config file, so unrelated configs do not block each other. The
+    # wait is short deliberately: it lets two runs starting together sort
+    # themselves out, while a transfer that has been going for hours is not worth
+    # queueing behind.
+    try:
+        with _run_lock(config_path):
+            return _run_configured_backups(args, config)
+    except RuntimeError as e:
+        # Not a backup failure, but no backup was made either, so it is reported
+        # as a failure rather than a silent success -- a run that did not happen
+        # must never exit 0.
+        logger.error("%s", e)
+        logger.error(
+            "Another btrfs-backup-ng run is using this configuration. Nothing was "
+            "backed up by THIS run. If a scheduled timer reports this repeatedly, "
+            "the schedule is firing faster than a run takes to finish."
+        )
+        return 1
+
+
+def _run_configured_backups(args: argparse.Namespace, config: Config) -> int:
+    """Run every configured volume. Split out so the run lock wraps one call."""
     # Get parallelism settings
     parallel_volumes = (
         getattr(args, "parallel_volumes", None) or config.global_config.parallel_volumes
