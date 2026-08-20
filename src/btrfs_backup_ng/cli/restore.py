@@ -547,9 +547,15 @@ def _prepare_backup_endpoint(args: argparse.Namespace, source: str):
         endpoint_kwargs["ssh_sudo"] = getattr(args, "ssh_sudo", False) or bool(
             configured.get("ssh_sudo", False)
         )
+        # `port`, not `ssh_port`: that is the key choose_endpoint and the
+        # endpoints read. Threaded under the config's own spelling it was
+        # dropped by the endpoint's key whitelist, so a restore against a
+        # non-standard port quietly used 22 -- while the log said the target's
+        # ssh_port had been applied. cli/common.py already maps it this way for
+        # the backup path, and records the same bug being fixed there before.
         _port = configured.get("ssh_port")
         if _port:
-            endpoint_kwargs["ssh_port"] = _port
+            endpoint_kwargs["port"] = _port
         _hkp = getattr(args, "ssh_host_key_policy", None) or configured.get(
             "ssh_host_key_policy"
         )

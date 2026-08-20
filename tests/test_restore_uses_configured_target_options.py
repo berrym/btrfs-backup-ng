@@ -9,6 +9,8 @@ be listed, and passing ``--ssh-key`` by hand was the only way through.
 from __future__ import annotations
 
 import argparse
+from unittest.mock import patch
+import contextlib
 
 import pytest
 
@@ -143,3 +145,66 @@ ssh_port = 2222
         "ssh_sudo": True,
         "ssh_port": 2222,
     }
+
+
+class TestTheOptionsReachTheEndpointNotJustTheDict:
+    """Collected is not the same as applied.
+
+    The configured ssh_port was gathered, logged to the operator as an option
+    being used, and threaded under the config's own spelling -- which the
+    endpoint's key whitelist drops. A restore against a remote on a
+    non-standard port therefore connected to 22 while reporting that the
+    target's port had been applied. cli/common.py maps it to `port` for the
+    backup path and carries a comment about this exact bug being fixed there;
+    the restore path reintroduced it.
+    """
+
+    def _endpoint_kwargs(self, tmp_path, port):
+        """Capture what _prepare_backup_endpoint hands to choose_endpoint."""
+        from btrfs_backup_ng.cli import restore as restore_cli
+
+        config = tmp_path / "config.toml"
+        config.write_text(
+            f'[[volumes]]\npath = "/data"\nsnapshot_dir = "/data/.snapshots"\n\n'
+            f'[[volumes.targets]]\npath = "ssh://user@host:/backups"\n'
+            f"ssh_port = {port}\n",
+            encoding="utf-8",
+        )
+        captured = {}
+
+        def fake_choose(uri, cfg, *a, **k):
+            captured.update(cfg)
+            raise RuntimeError("stop here")
+
+        args = argparse.Namespace(config=str(config))
+        # restore.py calls it as `endpoint.choose_endpoint`, so patch it there.
+        with patch.object(restore_cli.endpoint, "choose_endpoint", fake_choose):
+            with contextlib.suppress(Exception):
+                restore_cli._prepare_backup_endpoint(args, "ssh://user@host:/backups")
+        return captured
+
+    def test_the_configured_port_is_threaded_under_the_key_endpoints_read(
+        self, tmp_path
+    ):
+        kwargs = self._endpoint_kwargs(tmp_path, 2222)
+        assert kwargs.get("port") == 2222, (
+            f"port not threaded; got keys {sorted(kwargs)}"
+        )
+
+    def test_it_actually_reaches_a_real_endpoint(self, tmp_path):
+        """End to end through choose_endpoint, not just the kwargs dict."""
+        from btrfs_backup_ng.endpoint import choose_endpoint
+
+        kwargs = self._endpoint_kwargs(tmp_path, 2222)
+        uri = "ssh://user@host:/backups"
+        endpoint = choose_endpoint(uri, {**kwargs, "path": uri, "snap_prefix": ""})
+        assert endpoint.config.get("port") == 2222, (
+            "the endpoint fell back to the default port"
+        )
+
+    def test_a_port_in_the_url_still_wins(self):
+        from btrfs_backup_ng.endpoint import choose_endpoint
+
+        uri = "ssh://user@host:2200/backups"
+        endpoint = choose_endpoint(uri, {"path": uri, "snap_prefix": "", "port": 2222})
+        assert endpoint.config.get("port") == 2200
