@@ -4495,3 +4495,106 @@ class TestRestoreDecryptOptions:
         kwargs = mock_choose.call_args.args[1]
         assert "gpg_keyring" not in kwargs
         assert "openssl_cipher" not in kwargs
+
+
+class TestRestoreInfersTheSnapshotPrefix:
+    """A restore must not fail to find backups it can plainly see.
+
+    A listing filters on `snap_prefix` and then requires the rest of each name to
+    parse as a timestamp, so the default empty prefix discards every real
+    snapshot and the location reports as empty. The endpoint already worked out
+    which prefixes ARE there -- it printed "re-run with --prefix X" and gave up.
+    Measured on real hardware: a destination holding a verified backup answered a
+    restore with "Found 0 remote snapshots", and (before this) exit 0.
+    """
+
+    def _endpoint(self, present, under_prefix=None):
+        endpoint = MagicMock()
+        endpoint.config = {"snap_prefix": ""}
+        endpoint.prefixes_present.return_value = present
+
+        def list_snapshots():
+            # Empty until a prefix is set, exactly like the real endpoint.
+            return list(under_prefix or []) if endpoint.config["snap_prefix"] else []
+
+        endpoint.list_snapshots.side_effect = list_snapshots
+        endpoint.describe_empty_listing.return_value = None
+        return endpoint
+
+    def test_a_single_present_prefix_is_applied_and_finds_the_backups(self):
+        from btrfs_backup_ng.core.restore import _retry_with_inferred_prefix
+
+        endpoint = self._endpoint({"srv-": 3}, ["snapshot-object"])
+        found = _retry_with_inferred_prefix(endpoint)
+
+        assert found == ["snapshot-object"], "the retry found nothing"
+        assert endpoint.config["snap_prefix"] == "srv-"
+
+    def test_two_prefixes_are_ambiguous_and_must_not_be_guessed(self):
+        """Two prefixes at one location usually means two different volumes
+        backed up side by side. Restoring the wrong one is worse than stopping."""
+        from btrfs_backup_ng.core.restore import _retry_with_inferred_prefix
+
+        endpoint = self._endpoint({"srv-": 5, "home-": 2}, ["x"])
+        assert _retry_with_inferred_prefix(endpoint) == []
+        assert endpoint.config["snap_prefix"] == "", "it guessed between two prefixes"
+
+    def test_a_genuinely_empty_location_infers_nothing(self):
+        from btrfs_backup_ng.core.restore import _retry_with_inferred_prefix
+
+        endpoint = self._endpoint({}, [])
+        assert _retry_with_inferred_prefix(endpoint) == []
+        assert endpoint.config["snap_prefix"] == ""
+
+    def test_the_prefix_is_put_back_if_it_still_finds_nothing(self):
+        """A retry that does not help must leave the endpoint as it found it."""
+        from btrfs_backup_ng.core.restore import _retry_with_inferred_prefix
+
+        endpoint = self._endpoint({"srv-": 1}, [])
+        endpoint.list_snapshots.side_effect = lambda: []
+        assert _retry_with_inferred_prefix(endpoint) == []
+        assert endpoint.config["snap_prefix"] == ""
+
+    def test_an_endpoint_without_the_capability_does_not_break(self):
+        from btrfs_backup_ng.core.restore import _retry_with_inferred_prefix
+
+        endpoint = MagicMock()
+        endpoint.config = {"snap_prefix": ""}
+        endpoint.prefixes_present.return_value = "not-a-dict"
+        assert _retry_with_inferred_prefix(endpoint) == []
+
+        bare = MagicMock(spec=[])
+        assert _retry_with_inferred_prefix(bare) == []
+
+    def test_a_restore_that_still_finds_nothing_fails(self):
+        from btrfs_backup_ng.core.restore import restore_snapshots
+
+        endpoint = self._endpoint({}, [])
+        stats = restore_snapshots(endpoint, MagicMock())
+        assert stats["failed"] == 1
+        assert stats["errors"]
+
+    def test_restore_snapshots_actually_calls_the_inference(self):
+        """The wiring, not just the helper.
+
+        Testing `_retry_with_inferred_prefix` on its own passes happily while
+        nothing calls it -- deleting the call from `restore_snapshots` broke no
+        test. This drives the real entry point and asserts the prefix reached the
+        endpoint.
+        """
+        from btrfs_backup_ng.core.restore import restore_snapshots
+
+        endpoint = self._endpoint({"srv-": 2}, [])
+        applied = {}
+
+        def list_snapshots():
+            applied["prefix"] = endpoint.config["snap_prefix"]
+            return []
+
+        endpoint.list_snapshots.side_effect = list_snapshots
+
+        restore_snapshots(endpoint, MagicMock())
+
+        assert applied.get("prefix") == "srv-", (
+            "restore_snapshots never retried with the inferred prefix"
+        )

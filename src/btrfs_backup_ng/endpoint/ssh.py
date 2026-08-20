@@ -2264,8 +2264,10 @@ print(json.dumps(result))
         logger.debug(f"Remote snapshots: {[str(s) for s in snapshots]}")
         return snapshots
 
-    def describe_empty_listing(self) -> Optional[str]:
-        """Explain an empty remote listing (see ``Endpoint.describe_empty_listing``).
+    def _snapshot_names_here_and_elsewhere(
+        self,
+    ) -> Optional[Tuple[List[str], List[str]]]:
+        """Snapshot-shaped names AT this destination, and ones only elsewhere.
 
         The base version enumerates locally, which for an ssh:// endpoint would
         stat a path on the WRONG machine. This re-runs the remote subvolume
@@ -2317,7 +2319,39 @@ print(json.dumps(result))
             )
             (here if present else elsewhere).extend(names)
 
+        return here, elsewhere
+
+    def describe_empty_listing(self) -> Optional[str]:
+        """Explain an empty remote listing (see ``Endpoint.describe_empty_listing``)."""
+        gathered = self._snapshot_names_here_and_elsewhere()
+        if gathered is None:
+            return None
+        here, elsewhere = gathered
         return self._explain_prefix_mismatch(here, elsewhere)
+
+    def prefixes_present(self) -> Dict[str, int]:
+        """Prefixes actually AT this destination (see ``Endpoint.prefixes_present``).
+
+        The base version enumerates locally, which for an ssh:// endpoint would
+        read the wrong machine and quietly return nothing -- so a restore could
+        not act on a prefix the diagnostic had just named on screen. Shares the
+        one remote enumeration with ``describe_empty_listing`` rather than
+        running a second, differently-written one.
+        """
+        gathered = self._snapshot_names_here_and_elsewhere()
+        if gathered is None:
+            return {}
+        here, _elsewhere = gathered
+
+        configured = self.config.get("snap_prefix", "") or ""
+        fmt = self.config.get("timestamp_format")
+        found: Dict[str, int] = {}
+        for name in here:
+            inferred = __util__.infer_snapshot_prefix(name, fmt)
+            if inferred is None or inferred == configured:
+                continue
+            found[inferred] = found.get(inferred, 0) + 1
+        return found
 
     def _scope_to_destination(self, snapshots: List[Any], path: str) -> List[Any]:
         """Keep only snapshots that really exist AT ``path``.

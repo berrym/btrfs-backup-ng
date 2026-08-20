@@ -365,6 +365,55 @@ def restore_snapshot(
             backup_endpoint.set_lock(parent, lock_id, False, parent=True)
 
 
+def _retry_with_inferred_prefix(backup_endpoint: Any) -> list[Any]:
+    """List again under the prefix the location actually uses, if there is one.
+
+    Returns the snapshots found, or an empty list when nothing can be inferred
+    or the choice is ambiguous. Ambiguity is deliberately NOT resolved by
+    picking the most populous prefix: two prefixes at one location usually means
+    two different volumes backed up side by side, and restoring the wrong one is
+    worse than stopping to ask.
+    """
+    discover = getattr(backup_endpoint, "prefixes_present", None)
+    if not callable(discover):
+        return []
+    try:
+        present = discover() or {}
+    except Exception as e:  # noqa: BLE001 - a convenience retry must not mask the real error
+        logger.debug("Could not infer a snapshot prefix: %s", e)
+        return []
+
+    # An endpoint that does not implement this (or a stand-in that returns
+    # something else) must degrade to "cannot infer", not crash the restore.
+    if not isinstance(present, dict) or not present:
+        return []
+    if len(present) > 1:
+        logger.error(
+            "This location holds snapshots under more than one prefix (%s), so "
+            "which set to restore is ambiguous. Re-run with --prefix to choose.",
+            ", ".join(f"{p!r} ({n})" for p, n in sorted(present.items())),
+        )
+        return []
+
+    prefix = next(iter(present))
+    logger.info(
+        "No snapshots matched the configured prefix; this location uses %r, so "
+        "listing again with it. Pass --prefix to select a different set.",
+        prefix,
+    )
+    previous = backup_endpoint.config.get("snap_prefix", "")
+    backup_endpoint.config["snap_prefix"] = prefix
+    try:
+        found = backup_endpoint.list_snapshots()
+    except Exception as e:  # noqa: BLE001 - restore the prefix, then report normally
+        backup_endpoint.config["snap_prefix"] = previous
+        logger.debug("Listing under inferred prefix %r failed: %s", prefix, e)
+        return []
+    if not found:
+        backup_endpoint.config["snap_prefix"] = previous
+    return found or []
+
+
 def restore_snapshots(
     backup_endpoint,
     local_endpoint,
@@ -411,6 +460,16 @@ def restore_snapshots(
     # List snapshots at backup location
     logger.info("Listing snapshots at backup location...")
     backup_snapshots = backup_endpoint.list_snapshots()
+
+    if not backup_snapshots:
+        # Before giving up: a listing filters on `snap_prefix` and then requires
+        # the rest of each name to parse as a timestamp, so the wrong prefix --
+        # or none, which is the default -- discards every real snapshot and the
+        # location reports as empty. The endpoint can already say which prefixes
+        # ARE there; it said so in a message telling the operator to re-run with
+        # --prefix. Doing that for them is the whole fix, and when it is
+        # ambiguous the answer is an error naming the choices, never a guess.
+        backup_snapshots = _retry_with_inferred_prefix(backup_endpoint)
 
     if not backup_snapshots:
         # A restore that restored nothing is a FAILED restore. This returned

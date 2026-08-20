@@ -1128,6 +1128,37 @@ class Endpoint:
             )
             raise __util__.AbortError from e
 
+    def prefixes_present(self) -> Dict[str, int]:
+        """Snapshot prefixes actually at this location, and how many use each.
+
+        ``describe_empty_listing`` already works this out in order to say "re-run
+        with --prefix X", but it returns prose. A caller that wants to ACT on the
+        answer -- rather than print it and give up -- needs the values, so both
+        share one computation instead of the answer existing only inside a
+        sentence.
+        """
+        path = self.config.get("path")
+        if not path:
+            return {}
+        try:
+            entries = [
+                str(entry).rstrip("/").rsplit("/", 1)[-1]
+                for entry in self._listdir(path)
+            ]
+        except Exception as e:  # noqa: BLE001 - a diagnostic must never itself abort
+            logger.debug("Could not enumerate %s for a prefix hint: %s", path, e)
+            return {}
+
+        configured = self.config.get("snap_prefix", "") or ""
+        fmt = self.config.get("timestamp_format")
+        found: Dict[str, int] = {}
+        for name in entries:
+            inferred = __util__.infer_snapshot_prefix(name, fmt)
+            if inferred is None or inferred == configured:
+                continue
+            found[inferred] = found.get(inferred, 0) + 1
+        return found
+
     def describe_empty_listing(self) -> Optional[str]:
         """Explain an empty listing, or return None if the location really is empty.
 
