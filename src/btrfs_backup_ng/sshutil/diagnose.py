@@ -23,6 +23,13 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+#: Returned by :func:`run_command` when the command could not be run at all --
+#: it timed out, or ssh itself could not be started. Distinct from any exit
+#: status a real command could produce, so a caller can tell "no answer" from
+#: "an answer that was no".
+LOCAL_FAILURE = -1
+
+
 def run_command(cmd: List[str], timeout: int = 30) -> Tuple[int, str, str]:
     """Run a command and return returncode, stdout, stderr."""
     logger.debug(f"Running command: {' '.join(cmd)}")
@@ -35,10 +42,18 @@ def run_command(cmd: List[str], timeout: int = 30) -> Tuple[int, str, str]:
             text=True,
         )
         return proc.returncode, proc.stdout, proc.stderr
+    # LOCAL_FAILURE, not 1: a timeout or a failure to spawn ssh means the command
+    # never ran, which is different from the command running and failing.
+    # Returning 1 made those indistinguishable from a remote answer, so a probe
+    # that timed out was read as a definite answer ABOUT the remote.
     except subprocess.TimeoutExpired:
-        return 1, "", f"Command timed out after {timeout} seconds: {' '.join(cmd)}"
+        return (
+            LOCAL_FAILURE,
+            "",
+            f"Command timed out after {timeout} seconds: {' '.join(cmd)}",
+        )
     except Exception as e:
-        return 1, "", f"Error running command: {e}"
+        return LOCAL_FAILURE, "", f"Error running command: {e}"
 
 
 def ssh_command_base(
@@ -108,8 +123,10 @@ def check_remote_program(
     if returncode == 0:
         return True, stdout.strip()
     # 127 is the shell's "not found"; ssh itself reports 255 for its own errors.
+    # 255 is ssh's own error; LOCAL_FAILURE means the probe never ran. Neither
+    # says anything about what is installed on the remote.
     if (
-        returncode == 255
+        returncode in (255, LOCAL_FAILURE)
         or "Permission denied" in stderr
         or "Could not resolve" in stderr
     ):

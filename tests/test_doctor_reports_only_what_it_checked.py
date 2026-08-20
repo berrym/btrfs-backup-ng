@@ -193,3 +193,110 @@ class TestTheRemoteDecompressorIsActuallyChecked:
         )
         Doctor(config=config)._check_compression_programs()
         assert not called
+
+
+class TestTheProgramNamesComeFromTheCanonicalTable:
+    """A method name is not always its program name.
+
+    The check restated five methods in a hardcoded map and fell back to using
+    the METHOD name as the command for anything else. `lzo` is a format whose
+    binary is `lzop`, so doctor looked for a command called "lzo", never found
+    it, and reported a missing program for a method that works.
+    """
+
+    def test_every_method_maps_to_a_real_program(self):
+        import shutil
+
+        from btrfs_backup_ng.core.compression import COMPRESSION_METHODS
+
+        for name, entry in COMPRESSION_METHODS.items():
+            program = entry["program"]
+            # The mapping must be to a plausible binary name, and where the
+            # binary happens to be installed here it must actually resolve.
+            assert program, name
+            if name != program:
+                assert shutil.which(program) or not shutil.which(name), (
+                    f"{name} maps to {program}, but a command named {name} "
+                    f"exists and would have masked the mismatch"
+                )
+
+    def test_lzo_is_checked_as_lzop(self):
+        from btrfs_backup_ng.core.compression import COMPRESSION_METHODS
+
+        assert COMPRESSION_METHODS["lzo"]["program"] == "lzop"
+
+    def test_doctor_uses_that_mapping(self):
+        """Pin the wiring: the check must not restate the names itself."""
+        import inspect
+
+        from btrfs_backup_ng.core import doctor as doctor_mod
+
+        body = inspect.getsource(doctor_mod.Doctor._check_compression_programs)
+        assert "COMPRESSION_METHODS" in body, (
+            "the compression check builds its own program map again"
+        )
+
+
+class TestAProbeThatNeverRanSaysSo:
+    """ "Could not ask" must not be reported as an answer.
+
+    run_command returned 1 both for a command that ran and failed AND for one
+    that never ran -- a timeout, or ssh missing locally. check_remote_program
+    read 1 as "the program is not installed on the remote", making a definite
+    claim about a host it had not reached. A timeout during a preflight would
+    have told the operator to install a package that was already there.
+    """
+
+    def test_a_timeout_is_not_an_answer_about_the_remote(self, monkeypatch):
+        from btrfs_backup_ng.sshutil import diagnose
+
+        monkeypatch.setattr(
+            diagnose,
+            "run_command",
+            lambda *a, **k: (
+                diagnose.LOCAL_FAILURE,
+                "",
+                "Command timed out after 30 seconds",
+            ),
+        )
+        present, detail = diagnose.check_remote_program("nas", "zstd")
+        assert present is None, f"a timeout was reported as {present!r}"
+        assert "timed out" in detail
+
+    def test_ssh_failing_to_start_is_not_an_answer_either(self, monkeypatch):
+        from btrfs_backup_ng.sshutil import diagnose
+
+        monkeypatch.setattr(
+            diagnose,
+            "run_command",
+            lambda *a, **k: (
+                diagnose.LOCAL_FAILURE,
+                "",
+                "Error running command: no ssh",
+            ),
+        )
+        assert diagnose.check_remote_program("nas", "zstd")[0] is None
+
+    def test_a_genuine_absence_is_still_reported(self, monkeypatch):
+        """The useful answer must survive: the host answered, and said no."""
+        from btrfs_backup_ng.sshutil import diagnose
+
+        monkeypatch.setattr(diagnose, "run_command", lambda *a, **k: (127, "", ""))
+        assert diagnose.check_remote_program("nas", "zstd")[0] is False
+
+    def test_a_present_program_is_still_reported(self, monkeypatch):
+        from btrfs_backup_ng.sshutil import diagnose
+
+        monkeypatch.setattr(
+            diagnose, "run_command", lambda *a, **k: (0, "/usr/bin/zstd\n", "")
+        )
+        present, path = diagnose.check_remote_program("nas", "zstd")
+        assert present is True
+        assert path == "/usr/bin/zstd"
+
+    def test_local_failure_is_distinct_from_every_real_exit_status(self):
+        from btrfs_backup_ng.sshutil import diagnose
+
+        assert diagnose.LOCAL_FAILURE < 0, (
+            "LOCAL_FAILURE must not collide with an exit status a command can return"
+        )

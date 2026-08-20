@@ -884,12 +884,16 @@ class Doctor:
                             )
 
         # Check each compression program
+        # Derived from the one compression table rather than restated here. The
+        # hardcoded map named only five methods, so anything else fell back to
+        # using the METHOD name as the program name -- and `lzo` is a format
+        # whose binary is `lzop`. doctor therefore looked for a command named
+        # "lzo", never found it, and reported a missing program for a method
+        # that works perfectly well.
+        from ..core.compression import COMPRESSION_METHODS
+
         program_map = {
-            "gzip": "gzip",
-            "zstd": "zstd",
-            "lz4": "lz4",
-            "pigz": "pigz",
-            "lzop": "lzop",
+            name: entry["program"] for name, entry in COMPRESSION_METHODS.items()
         }
 
         for method in compression_methods:
