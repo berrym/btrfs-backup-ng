@@ -493,7 +493,14 @@ def _configured_target_options(args: argparse.Namespace, source: str) -> dict:
                 "openssl_cipher",
             ):
                 value = getattr(target, key, None)
-                if value in (None, "", False):
+                # Only unset values are skipped here. False is a SETTING, not an
+                # absence: ssh_password_auth defaults to True, so `false` -- the
+                # only useful thing to write -- was dropped as "unset" on the way
+                # in and dropped again below as "same as default" if it were
+                # true. The option could not be returned under any value it
+                # could hold. Booleans that merely restate the schema default are
+                # still skipped by the check that follows.
+                if value is None or value == "":
                     continue
                 # Only what this target actually says. Schema defaults are not
                 # choices the user made, and reporting them as "configured" turns
@@ -561,9 +568,14 @@ def _prepare_backup_endpoint(args: argparse.Namespace, source: str):
         )
         if _hkp:
             endpoint_kwargs["ssh_host_key_policy"] = _hkp
-        endpoint_kwargs["ssh_password_fallback"] = getattr(
-            args, "ssh_password_auth", True
-        )
+        # There is no --ssh-password-auth flag, so the args lookup is a constant
+        # True unless a caller sets the attribute directly; reading only it meant
+        # a configured `ssh_password_auth = false` had no effect on a restore at
+        # all, while the same setting was honoured for backups. Either side may
+        # disable the fallback and neither can re-enable what the other refused.
+        endpoint_kwargs["ssh_password_fallback"] = bool(
+            getattr(args, "ssh_password_auth", True)
+        ) and bool(configured.get("ssh_password_auth", True))
         ssh_key = getattr(args, "ssh_key", None) or configured.get("ssh_key")
         if ssh_key:
             # The two remote endpoints read the identity file under DIFFERENT
