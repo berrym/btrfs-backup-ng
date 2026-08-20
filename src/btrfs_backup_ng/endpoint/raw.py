@@ -2036,6 +2036,31 @@ class SSHRawEndpoint(RawEndpoint):
         )
         return self._elevate(f"sh -c {shlex.quote(probed)}")
 
+    def _listdir(self, location: Any) -> list[str]:
+        """Enumerate a directory ON THE REMOTE HOST.
+
+        The base implementation reads the LOCAL filesystem -- its own comment
+        says a remote endpoint should provide its own -- and raw+ssh had none.
+        Anything built on it therefore looked at the wrong machine: the snapshot
+        prefixes a restore infers from, and the diagnosis explaining why a
+        location looks empty, were both drawn from this host's filesystem. Where
+        no local path of that name exists it silently produced nothing; where one
+        did, it produced answers about entirely unrelated files.
+        """
+        path = str(location)
+        result = self._exec_remote_command(
+            ["sh", "-c", f"ls -1 {shlex.quote(path)} 2>/dev/null || true"],
+            check=False,
+            elevate=False,
+        )
+        if getattr(result, "returncode", 1) != 0:
+            logger.debug("Remote listing of %s failed", path)
+            return []
+        output = result.stdout or b""
+        if isinstance(output, bytes):
+            output = output.decode(errors="replace")
+        return [f"{path.rstrip('/')}/{name}" for name in output.split() if name]
+
     def _exec_remote_command(
         self,
         command: list[str],

@@ -4598,3 +4598,29 @@ class TestRestoreInfersTheSnapshotPrefix:
         assert applied.get("prefix") == "srv-", (
             "restore_snapshots never retried with the inferred prefix"
         )
+
+    def test_an_explicit_prefix_is_never_replaced(self):
+        """Inference is for the DEFAULT case, not a second guess.
+
+        An operator who passed --prefix named the set they want. Quietly listing
+        a different one hands back another volume's snapshots and reports
+        success -- restoring the wrong data, which is worse than restoring
+        nothing.
+        """
+        from btrfs_backup_ng.core.restore import _retry_with_inferred_prefix
+
+        endpoint = self._endpoint({"srv-": 3}, ["srv-snapshot"])
+        endpoint.config["snap_prefix"] = "home-"
+
+        assert _retry_with_inferred_prefix(endpoint) == []
+        assert endpoint.config["snap_prefix"] == "home-", (
+            "the prefix the operator asked for was replaced"
+        )
+
+    def test_inference_still_runs_when_no_prefix_was_given(self):
+        from btrfs_backup_ng.core.restore import _retry_with_inferred_prefix
+
+        endpoint = self._endpoint({"srv-": 3}, ["srv-snapshot"])
+        endpoint.config["snap_prefix"] = ""
+        assert _retry_with_inferred_prefix(endpoint) == ["srv-snapshot"]
+        assert endpoint.config["snap_prefix"] == "srv-"

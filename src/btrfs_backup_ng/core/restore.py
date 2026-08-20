@@ -373,7 +373,20 @@ def _retry_with_inferred_prefix(backup_endpoint: Any) -> list[Any]:
     picking the most populous prefix: two prefixes at one location usually means
     two different volumes backed up side by side, and restoring the wrong one is
     worse than stopping to ask.
+
+    Inference applies ONLY when no prefix was asked for. An operator who passed
+    --prefix named the set they want, and quietly listing a different one hands
+    back another volume's snapshots while reporting success -- the exact harm the
+    ambiguity rule above exists to prevent, arrived at from the other direction.
+    A prefix that was given and matches nothing is a mismatch to report, not a
+    guess to make.
     """
+    config = getattr(backup_endpoint, "config", None)
+    configured = (config or {}).get("snap_prefix", "") or ""
+    if configured:
+        logger.debug("Not inferring a prefix: %r was asked for explicitly", configured)
+        return []
+
     discover = getattr(backup_endpoint, "prefixes_present", None)
     if not callable(discover):
         return []
@@ -404,6 +417,12 @@ def _retry_with_inferred_prefix(backup_endpoint: Any) -> list[Any]:
     previous = backup_endpoint.config.get("snap_prefix", "")
     backup_endpoint.config["snap_prefix"] = prefix
     try:
+        # flush_cache: the base endpoint memoises its listing, and the caller has
+        # already listed once under the old prefix. Without this the retry gets
+        # that cached (empty) result back and the whole inference is a no-op.
+        found = backup_endpoint.list_snapshots(flush_cache=True)
+    except TypeError:
+        # An endpoint or stand-in whose list_snapshots takes no flush argument.
         found = backup_endpoint.list_snapshots()
     except Exception as e:  # noqa: BLE001 - restore the prefix, then report normally
         backup_endpoint.config["snap_prefix"] = previous
