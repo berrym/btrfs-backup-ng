@@ -81,10 +81,42 @@ __all__ = ["SSHEndpoint"]
 _Self = TypeVar("_Self", bound="SSHEndpoint")
 
 
+def _guarded_pipeline(pipeline: str) -> str:
+    """Wrap a remote pipeline so a dropped connection kills all of it.
+
+    `exec` gives the single-command case its orphan protection: the shell is
+    replaced by `btrfs receive`, so a signal reaches it directly. A pipeline
+    cannot be exec'd, and the two obvious substitutes both fail, measured
+    against the exact strings this module emits:
+
+      * `trap "kill 0" HUP INT TERM; cmd | cmd` -- a shell defers a trap until
+        the running FOREGROUND command finishes, so nothing is signalled while
+        the transfer is in flight. SIGHUP and SIGTERM both left the shell, the
+        decompressor and `btrfs receive` running: precisely the orphans the
+        exec was preventing.
+      * `kill 0` from inside the handler also signals the trapping shell, whose
+        handler runs `kill 0` again. That recursion exhausts the stack and the
+        shell dies of SIGSEGV -- reproduced on sh, dash and bash alike.
+
+    Backgrounding the pipeline and blocking in `wait` fixes the first problem,
+    because `wait` is interruptible and the handler runs immediately. Resetting
+    the trap before `kill 0` fixes the second, because by the time the group is
+    signalled this shell has default disposition and simply dies. `wait` then
+    yields the pipeline's own exit status, so a failing `btrfs receive` is still
+    reported as a failure rather than swallowed.
+    """
+    return (
+        f"{pipeline} & pid=$!; "
+        f'trap "trap - HUP INT TERM; kill 0" HUP INT TERM; '
+        f'wait "$pid"'
+    )
+
+
 def _build_receive_command(
     dest_path: str,
     use_sudo: bool = False,
     password_on_stdin: bool = False,
+    decompress: str | None = None,
 ) -> str:
     """Build a btrfs receive command with orphan process protection.
 
@@ -97,6 +129,11 @@ def _build_receive_command(
         use_sudo: Whether to run with sudo
         password_on_stdin: If True, use 'sudo -S' (read password from stdin).
                           If False, use 'sudo -n' (passwordless sudo).
+        decompress: Compression method the stream was compressed with, or None.
+                    When given, the remote runs `<decompressor> | btrfs receive`
+                    so the compression applied before the wire is undone after
+                    it. This is the half of stream compression that was missing:
+                    the sender could compress, and nothing decompressed.
 
     Returns:
         Shell command string with orphan protection
@@ -126,7 +163,40 @@ def _build_receive_command(
     #
     # Note: We don't use the named pipe approach as it can cause issues with
     # SSH's stdin handling and buffering.
-    script = f'trap "" PIPE; exec {base_receive}'
+    if decompress:
+        from ..core.transfer import COMPRESSION_PROGRAMS
+
+        program = COMPRESSION_PROGRAMS.get(decompress)
+        if program is None:
+            raise ValueError(
+                f"Unknown compression method {decompress!r}; expected one of "
+                f"{sorted(COMPRESSION_PROGRAMS)}"
+            )
+        decompressor = " ".join(shlex.quote(part) for part in program["decompress"])
+
+        if use_sudo and password_on_stdin:
+            # `sudo -S` reads the password from ITS stdin. Putting the
+            # decompressor in front of sudo would feed the password line into the
+            # decompressor instead, so sudo would never receive it and the
+            # decompressor would choke on plaintext. Nesting the pipeline INSIDE
+            # sudo keeps the ordering the caller relies on: sudo consumes the
+            # password line, then the remaining stdin -- the compressed stream --
+            # reaches the decompressor.
+            #
+            # Gated on use_sudo, not on password_on_stdin alone: a caller that
+            # asked for no elevation must not be handed a `sudo -S` command
+            # merely because it offered a password. The uncompressed branch has
+            # always honoured use_sudo, and this branch has to agree with it.
+            inner = _guarded_pipeline(f"{decompressor} | btrfs receive {quoted_dest}")
+            script = f'trap "" PIPE; exec sudo -S sh -c {shlex.quote(inner)}'
+            return f"sh -c {shlex.quote(script)}"
+        script = (
+            f'trap "" PIPE; {_guarded_pipeline(f"{decompressor} | {base_receive}")}'
+        )
+    else:
+        # Unchanged: with no pipeline, exec replaces the shell with btrfs receive
+        # so signals reach it directly.
+        script = f'trap "" PIPE; exec {base_receive}'
 
     # Quote the whole script as ONE argument to `sh -c`. Building this by
     # wrapping the script in literal single quotes would cancel the escaping of
@@ -1867,7 +1937,7 @@ print(json.dumps(result))
             return False
 
     def _btrfs_receive(
-        self, destination: str, stdin_pipe: Any
+        self, destination: str, stdin_pipe: Any, decompress: Optional[str] = None
     ) -> subprocess.Popen[Any]:
         """Run btrfs receive on the remote host.
 
@@ -1880,6 +1950,15 @@ print(json.dumps(result))
         Args:
             destination: Remote path to receive the snapshot
             stdin_pipe: Pipe providing btrfs send stream data
+            decompress: The method the caller actually compressed the stream
+                with, or None if it sent plain bytes.
+
+        The caller states what it did rather than this method re-deciding from
+        config, because the two halves must agree exactly: a decompressor added
+        here for a stream nobody compressed feeds plain bytes to `zstd -dc`, and
+        a compressor with no decompressor feeds compressed bytes to `btrfs
+        receive`. Both hang rather than fail. One decision, passed down, cannot
+        disagree with itself.
 
         Returns:
             Popen process for the receive command
@@ -1911,7 +1990,10 @@ print(json.dumps(result))
         # _build_receive_command escapes the destination itself; do not pre-quote.
         use_sudo = self.config.get("ssh_sudo", False)
         remote_cmd = _build_receive_command(
-            destination, use_sudo=use_sudo, password_on_stdin=False
+            destination,
+            use_sudo=use_sudo,
+            password_on_stdin=False,
+            decompress=decompress,
         )
         ssh_cmd.extend([remote_host, remote_cmd])
 
@@ -2487,6 +2569,32 @@ print(json.dumps(result))
     #: change the memory footprint.
     BUFFER_SIZE = "32M"
 
+    def _stream_compress_method(self) -> Optional[str]:
+        """The compression method for this transfer, or None.
+
+        Every transfer strategy has to ask the same question, and there are
+        several: the direct pipe, the password-sudo path via paramiko, and the
+        shell pipeline. Wiring only one of them is how `compress` came to work
+        on some setups and silently do nothing on others.
+        """
+        method = self.config.get("compress") or "none"
+        if method == "none":
+            return None
+        from ..core.transfer import COMPRESSION_PROGRAMS
+
+        if method not in COMPRESSION_PROGRAMS:
+            # Every destination accepts the same set now, so reaching here means
+            # the name is simply not one this project knows -- worth saying
+            # plainly, because the result is a larger backup than was asked for.
+            logger.warning(
+                "Unknown compression method %r; this transfer will be "
+                "UNCOMPRESSED. Supported: %s.",
+                method,
+                ", ".join(sorted(COMPRESSION_PROGRAMS)),
+            )
+            return None
+        return str(method)
+
     def _find_buffer_program(self) -> Tuple[Optional[str], Optional[str]]:
         """Pick a program to buffer the transfer, preferring pv.
 
@@ -2971,7 +3079,9 @@ print(json.dumps(result))
         logger.info(f"Transferring {snapshot_name} to {self.hostname}:{dest_path}")
         logger.info("Using Paramiko for secure password-based transfer")
 
-        # Build local btrfs send command
+        # Build local btrfs send command. When compressing, the stream is piped
+        # through the compressor before it reaches the channel; the remote
+        # command above carries the matching decompressor.
         send_cmd = ["sudo", "btrfs", "send"]
         if is_incremental and parent_path is not None:
             send_cmd.extend(["-p", parent_path])
@@ -2981,8 +3091,12 @@ print(json.dumps(result))
         # Remote command with orphan protection
         # sudo -S reads password from stdin, then receives btrfs stream.
         # _build_receive_command escapes the destination itself; do not pre-quote.
+        compress_method = self._stream_compress_method()
         remote_cmd = _build_receive_command(
-            dest_path, use_sudo=True, password_on_stdin=True
+            dest_path,
+            use_sudo=True,
+            password_on_stdin=True,
+            decompress=compress_method,
         )
 
         # Ensure paramiko is available
@@ -2996,6 +3110,7 @@ print(json.dumps(result))
 
         client: Optional[Any] = None
         send_proc: Optional[subprocess.Popen[bytes]] = None
+        compress_proc: Optional[subprocess.Popen[bytes]] = None
 
         try:
             # Connect via Paramiko using the pattern:
@@ -3052,6 +3167,32 @@ print(json.dumps(result))
                 stderr=subprocess.PIPE,
             )
 
+            # Compress before the bytes reach the channel. The remote command
+            # built above already carries the matching decompressor, and this
+            # half was missing: the remote ran `zstd -dc` over a plain `btrfs
+            # send` stream, which fails with "unsupported format" and delivers
+            # nothing to `btrfs receive`. Every other strategy compresses; this
+            # one only claimed to in a comment.
+            stream = send_proc.stdout
+            if compress_method:
+                from ..core.transfer import COMPRESSION_PROGRAMS
+
+                logger.info(
+                    "Compressing the transfer with %s (decompressed on the "
+                    "remote before btrfs receive)",
+                    compress_method,
+                )
+                compress_proc = subprocess.Popen(
+                    COMPRESSION_PROGRAMS[compress_method]["compress"],
+                    stdin=send_proc.stdout,
+                    stdout=subprocess.PIPE,
+                    bufsize=0,
+                )
+                if send_proc.stdout:
+                    # Let btrfs send see SIGPIPE if the compressor dies.
+                    send_proc.stdout.close()
+                stream = compress_proc.stdout
+
             # Send password first (sudo -S reads from stdin)
             channel.sendall((sudo_password + "\n").encode())
             logger.debug("Sent sudo password to remote")
@@ -3089,9 +3230,9 @@ print(json.dumps(result))
                     )
 
                     while True:
-                        if send_proc.stdout is None:
+                        if stream is None:
                             break
-                        chunk = send_proc.stdout.read(chunk_size)
+                        chunk = stream.read(chunk_size)
                         if not chunk:
                             break
                         channel.sendall(chunk)
@@ -3100,9 +3241,9 @@ print(json.dumps(result))
             else:
                 # No progress bar - just stream the data
                 while True:
-                    if send_proc.stdout is None:
+                    if stream is None:
                         break
-                    chunk = send_proc.stdout.read(chunk_size)
+                    chunk = stream.read(chunk_size)
                     if not chunk:
                         break
                     channel.sendall(chunk)
@@ -3124,6 +3265,19 @@ print(json.dumps(result))
                     f"btrfs send failed (exit {send_proc.returncode}): {send_stderr}"
                 )
                 return False
+
+            # A compressor that died mid-stream truncates the backup, and the
+            # remote may still exit 0 on the prefix it managed to receive. Check
+            # it, or a partial snapshot passes for a complete one.
+            if compress_proc is not None:
+                compress_proc.wait()
+                if compress_proc.returncode != 0:
+                    logger.error(
+                        "Compressor %s failed (exit %s); the transfer is incomplete",
+                        compress_method,
+                        compress_proc.returncode,
+                    )
+                    return False
 
             # Wait for remote command to complete
             exit_status = channel.recv_exit_status()
@@ -3545,6 +3699,16 @@ print(json.dumps(result))
                 logger.debug(f"Using incremental send with parent: {parent_path}")
             send_cmd.append(source_path)
 
+            # `btrfs send` reads the subvolume tree and needs root, so a non-root
+            # run has to elevate exactly as every other local btrfs call in this
+            # codebase does. Without this, no ssh:// backup worked as an ordinary
+            # user at all -- measured, the send died with
+            # "ERROR: cannot open '/home'" before a byte moved, whatever else was
+            # configured. `sudo -n` is what the documented sudoers grants
+            # (NOPASSWD: /usr/bin/btrfs); running as root skips it entirely.
+            if os.geteuid() != 0:
+                send_cmd = ["sudo", "-n"] + send_cmd
+
             logger.debug(f"Local send command: {' '.join(send_cmd)}")
 
             # Start the local btrfs send process
@@ -3569,9 +3733,39 @@ print(json.dumps(result))
                 pipe_output = send_process.stdout
                 buffer_process = None
 
+            # Stream compression: compress BEFORE the wire, decompress after it.
+            # The decompressor is added to the remote command by _btrfs_receive,
+            # so the two halves are always configured from the same value -- the
+            # missing half is what made this option a no-op for ssh:// targets.
+            # Nothing changes when compression is off.
+            compress_process = None
+            compress_method = self._stream_compress_method()
+            if compress_method:
+                from ..core.transfer import COMPRESSION_PROGRAMS
+
+                logger.info(
+                    "Compressing the transfer with %s (decompressed on the "
+                    "remote before btrfs receive)",
+                    compress_method,
+                )
+                compress_process = subprocess.Popen(
+                    COMPRESSION_PROGRAMS[compress_method]["compress"],
+                    stdin=pipe_output,
+                    stdout=subprocess.PIPE,
+                    bufsize=0,
+                )
+                if pipe_output:
+                    # Let the upstream process see SIGPIPE if the compressor dies.
+                    pipe_output.close()
+                pipe_output = compress_process.stdout
+
             # Start the remote receive process
             logger.debug("Starting remote btrfs receive process")
-            receive_process = self._btrfs_receive(dest_path, pipe_output)
+            # Pass the method that was actually used, not the configured one:
+            # if compression was skipped, the remote must not decompress.
+            receive_process = self._btrfs_receive(
+                dest_path, pipe_output, decompress=compress_method
+            )
 
             if not receive_process:
                 logger.error("Failed to start remote receive process")
@@ -3582,6 +3776,12 @@ print(json.dumps(result))
                 "send": send_process,
                 "receive": receive_process,
                 "buffer": buffer_process,
+                # Monitors read send/receive and .get("buffer"); this is carried
+                # for cleanup and for the exit-status check below. "It exits on
+                # EOF when the send finishes" is only the HAPPY path: a
+                # compressor that dies mid-stream truncates the backup, and its
+                # status has to be looked at rather than assumed.
+                "compress": compress_process,
             }
 
             # Choose monitoring system based on configuration
@@ -3618,10 +3818,29 @@ print(json.dumps(result))
             # false-success bug (a partial/failed receive that left a directory was
             # reported as a valid backup).
 
+            # A compressor that failed truncates the stream, and a truncated
+            # stream can still leave the monitor satisfied. Demote the result
+            # rather than report a backup that is missing its tail.
+            if compress_process is not None:
+                try:
+                    compress_process.wait(timeout=10)
+                except Exception:  # noqa: BLE001 - handled by the terminate loop below
+                    logger.warning("Compressor did not exit; terminating it")
+                    compress_process.kill()
+                if compress_process.returncode not in (0, None):
+                    logger.error(
+                        "Compressor %s exited %s; the stream sent was incomplete",
+                        compress_method,
+                        compress_process.returncode,
+                    )
+                    transfer_succeeded = False
+
             # Clean up any lingering processes.
             all_processes = [send_process, receive_process]
             if buffer_process:
                 all_processes.append(buffer_process)
+            if compress_process:
+                all_processes.append(compress_process)
             for proc in all_processes:
                 if proc.poll() is None:
                     logger.debug("Terminating remaining process...")
@@ -3851,6 +4070,20 @@ print(json.dumps(result))
         Returns:
             bool: True if transfer was successful, False otherwise
         """
+
+        # Compression is not applied on the chunked path. It writes the sudo
+        # password and then chunk bytes into the same stdin from a Python loop,
+        # so a compressor cannot simply be spliced in without the password going
+        # through it too. Say so rather than accepting the option and quietly
+        # sending the stream uncompressed -- the feature is not removed, it is
+        # not wired here yet.
+        if self._stream_compress_method():
+            logger.warning(
+                "compress=%r is not applied to chunked transfers; this stream "
+                "will be sent uncompressed. The ordinary (non-chunked) ssh "
+                "transfer does compress.",
+                self.config.get("compress"),
+            )
 
         logger.info(
             "Starting chunked SSH receive for %s (%d chunks)",

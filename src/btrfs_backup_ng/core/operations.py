@@ -149,25 +149,46 @@ def send_snapshot(
     # a real local btrfs target: no error, no output, no backup, and under a
     # systemd timer every later run queues behind it.
     #
-    # Between the two branches, transfer-layer compression is never usable today,
-    # so it is always turned off here. Raw targets still compress -- inside the
-    # endpoint, where it is recorded and reversible. Non-raw targets warn, because
-    # an option the operator asked for is not being honoured and a larger backup
-    # is a surprise worth explaining. Neutralising beats refusing: an uncompressed
-    # backup is still correct and still restorable, whereas a hang is neither.
+    # Compression is owned by the ENDPOINT, never by the generic transfer layer.
+    #
+    #   raw / raw+ssh : the raw endpoint compresses into its stream file and
+    #                   records the method in the .meta sidecar, so a restore can
+    #                   reverse it.
+    #   ssh           : the ssh endpoint compresses before the wire and puts the
+    #                   matching decompressor into the remote command, so `btrfs
+    #                   receive` is handed a plain stream.
+    #
+    # Both are suppressed here so the stream is never compressed twice. The
+    # transfer layer's own compressor has no decompression counterpart -- nothing
+    # calls core.transfer.build_receive_pipeline -- so applying it on top would
+    # hand compressed bytes to `btrfs receive` and hang.
+    #
+    # A LOCAL btrfs destination is the remaining case: compressing only to
+    # decompress on the same machine buys nothing, so it is dropped with a note
+    # rather than burned on CPU.
     from ..endpoint.raw import RawEndpoint
 
     if options.get("compress", "none") != "none":
-        if isinstance(destination_endpoint, RawEndpoint):
+        requested = options.get("compress", "none")
+        remote_btrfs = getattr(destination_endpoint, "_is_remote", False)
+        if isinstance(destination_endpoint, RawEndpoint) or remote_btrfs:
+            # Hand the method to the endpoint HERE, in the same breath as taking
+            # it away from the transfer layer. Doing it further down let the
+            # suppression run first, so the endpoint was handed "none" and
+            # compression silently did nothing -- measured end to end: the
+            # transfer succeeded, the bytes matched, and not a byte was
+            # compressed. A raw endpoint already carries its own compress from
+            # config threading, so only the ssh endpoint is set here.
+            if remote_btrfs and not isinstance(destination_endpoint, RawEndpoint):
+                destination_endpoint.config["compress"] = requested
             options = {**options, "compress": "none"}
         else:
-            logger.warning(
-                "Ignoring compress=%r for this destination: compression is "
-                "supported only on raw:// and raw+ssh:// targets, where the raw "
-                "endpoint records it so a restore can reverse it. A btrfs "
-                "destination has no decompression step, and honouring this would "
-                "hang the transfer rather than fail it. This backup will be "
-                "uncompressed.",
+            logger.info(
+                "Not compressing this transfer: compress=%r was requested for a "
+                "LOCAL btrfs destination, where the stream would be compressed "
+                "and immediately decompressed on the same machine for no saving. "
+                "Compression applies to ssh:// (compressed over the wire) and to "
+                "raw:// / raw+ssh:// (compressed at rest).",
                 options.get("compress"),
             )
             options = {**options, "compress": "none"}
