@@ -911,11 +911,27 @@ def convert_to_toml(btrbk_config: BtrbkConfig) -> tuple[str, list[str]]:
                 # raw_target_compress / raw_target_encrypt turned every plain
                 # send-receive destination into a raw stream-file one -- a
                 # completely different backup format, chosen silently.
-                is_raw_target = bool(
-                    (raw_compress and not _is_disabled(raw_compress))
-                    or (raw_encrypt and not _is_disabled(raw_encrypt))
-                    or target.target_type == "raw"
-                )
+                # A declared type is the operator's explicit statement about the
+                # destination FORMAT, so an inherited raw_target_* option must not
+                # silently overrule it: `target send-receive <url>` under a global
+                # `raw_target_compress` was being converted to raw+ssh://, turning
+                # a browsable subvolume backup into stream files.
+                if target.target_type == "send-receive":
+                    is_raw_target = False
+                    if (raw_compress and not _is_disabled(raw_compress)) or (
+                        raw_encrypt and not _is_disabled(raw_encrypt)
+                    ):
+                        warnings.append(
+                            f"Line {target.line}: this target is declared "
+                            f"send-receive, so the inherited raw_target_* options "
+                            f"do not apply to it and were not carried over"
+                        )
+                else:
+                    is_raw_target = bool(
+                        (raw_compress and not _is_disabled(raw_compress))
+                        or (raw_encrypt and not _is_disabled(raw_encrypt))
+                        or target.target_type == "raw"
+                    )
 
                 # Convert btrbk target path format
                 target_path = target.path
@@ -1078,7 +1094,6 @@ def convert_to_toml(btrbk_config: BtrbkConfig) -> tuple[str, list[str]]:
 
                     if raw_encrypt and raw_encrypt != "no":
                         if raw_encrypt == "gpg":
-                            lines.append('encrypt = "gpg"')
                             # Get GPG recipient (inherited)
                             gpg_recipient = (
                                 target.options.get("gpg_recipient")
@@ -1087,10 +1102,23 @@ def convert_to_toml(btrbk_config: BtrbkConfig) -> tuple[str, list[str]]:
                                 or btrbk_config.global_options.get("gpg_recipient")
                             )
                             if gpg_recipient:
+                                lines.append('encrypt = "gpg"')
                                 lines.append(f'gpg_recipient = "{gpg_recipient}"')
                             else:
+                                # The loader REFUSES encrypt=gpg without a
+                                # recipient, so emitting it produced a file that
+                                # could not be loaded at all: the migration
+                                # appeared to succeed and every later command
+                                # failed on its own output. Leaving it out keeps
+                                # the rest of the config usable and says what is
+                                # missing.
                                 warnings.append(
-                                    f"Line {target.line}: GPG encryption enabled but no gpg_recipient found"
+                                    f"Line {target.line}: raw_target_encrypt gpg "
+                                    f"needs a gpg_recipient and none was set, so "
+                                    f"encryption was NOT carried over -- this "
+                                    f"target will be stored UNENCRYPTED. Add "
+                                    f'gpg_recipient and encrypt = "gpg" to '
+                                    f"restore it."
                                 )
                             # Optional keyring
                             gpg_keyring = (

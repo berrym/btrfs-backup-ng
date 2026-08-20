@@ -442,3 +442,94 @@ class TestGlobalTargetsAreInherited:
         path.write_text(toml, encoding="utf-8")
         loaded, _warn = load_config(path)
         assert loaded.volumes[0].targets, "the migrated volume has no destination"
+
+
+class TestADeclaredTargetTypeIsRespected:
+    """`target <type> <url>` states the destination FORMAT explicitly.
+
+    An inherited `raw_target_compress` silently overruled it, converting a
+    declared send-receive target into raw+ssh://. A raw target is a stream file
+    plus a sidecar rather than a browsable subvolume, so the operator got a
+    different kind of backup than the one they wrote down.
+    """
+
+    def _paths(self, text):
+        toml, warnings = convert_to_toml(parse_btrbk_config(text))
+        return re.findall(r'^path = "((?:ssh|raw)[^"]+)"', toml, re.M), warnings
+
+    def test_an_explicit_send_receive_is_not_converted_to_raw(self):
+        paths, _ = self._paths(
+            "raw_target_compress zstd\n"
+            "volume /mnt/pool\n  subvolume home\n"
+            "    target send-receive ssh://nas.local/backup\n"
+        )
+        assert paths == ["ssh://nas.local/backup"], paths
+
+    def test_the_ignored_raw_options_are_reported(self):
+        _paths, warnings = self._paths(
+            "raw_target_compress zstd\n"
+            "volume /mnt/pool\n  subvolume home\n"
+            "    target send-receive ssh://nas.local/backup\n"
+        )
+        assert any("send-receive" in w for w in warnings), warnings
+
+    def test_an_explicit_raw_type_is_still_raw(self):
+        paths, _ = self._paths(
+            "volume /mnt/pool\n  subvolume home\n"
+            "    target raw ssh://nas.local/backup\n"
+        )
+        assert paths == ["raw+ssh://nas.local:/backup"], paths
+
+    def test_an_undeclared_target_still_follows_raw_options(self):
+        """Without an explicit type, raw_target_* is what makes it raw."""
+        paths, _ = self._paths(
+            "volume /mnt/pool\n  subvolume home\n"
+            "    target ssh://nas.local/backup\n"
+            "      raw_target_compress zstd\n"
+        )
+        assert paths == ["raw+ssh://nas.local:/backup"], paths
+
+
+class TestEncryptionIsNeverEmittedUnloadable:
+    """The loader REFUSES encrypt=gpg without a recipient.
+
+    Emitting it anyway produced a config file that could not be loaded at all:
+    `config import` reported success and every later command died on its own
+    output. Leaving encryption out keeps the rest of the migration usable and
+    says exactly what is missing and how to restore it.
+    """
+
+    def _convert(self, text):
+        return convert_to_toml(parse_btrbk_config(text))
+
+    GPG_NO_RECIPIENT = (
+        "volume /mnt/pool\n  subvolume home\n"
+        "    target raw /mnt/backup\n      raw_target_encrypt gpg\n"
+    )
+
+    def test_gpg_without_a_recipient_is_not_emitted(self):
+        toml, _ = self._convert(self.GPG_NO_RECIPIENT)
+        assert 'encrypt = "gpg"' not in toml, toml
+
+    def test_the_result_still_loads(self, tmp_path):
+        from btrfs_backup_ng.config import load_config
+
+        toml, _ = self._convert(self.GPG_NO_RECIPIENT)
+        path = tmp_path / "config.toml"
+        path.write_text(toml, encoding="utf-8")
+        load_config(path)  # must not raise
+
+    def test_dropping_it_is_reported_loudly(self):
+        _toml, warnings = self._convert(self.GPG_NO_RECIPIENT)
+        assert any("UNENCRYPTED" in w and "gpg_recipient" in w for w in warnings), (
+            warnings
+        )
+
+    def test_gpg_with_a_recipient_is_carried(self):
+        toml, _ = self._convert(
+            "volume /mnt/pool\n  subvolume home\n"
+            "    target raw /mnt/backup\n      raw_target_encrypt gpg\n"
+            "      gpg_recipient me@example.com\n"
+        )
+        assert 'encrypt = "gpg"' in toml
+        assert 'gpg_recipient = "me@example.com"' in toml
