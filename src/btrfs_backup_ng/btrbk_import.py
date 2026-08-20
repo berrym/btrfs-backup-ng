@@ -22,6 +22,22 @@ import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from .core.transfer import COMPRESSION_PROGRAMS
+from .endpoint.raw_metadata import COMPRESSION_CONFIG
+
+# Compression methods the btrfs transfer path can actually run, taken from the
+# authoritative table so this cannot drift from what the config loader accepts.
+_STREAM_COMPRESS_SUPPORTED = frozenset(COMPRESSION_PROGRAMS)
+
+#: What a raw target can actually run, which is a different set from the btrfs
+#: transfer path: it adds xz, lzo, bzip2 and pbzip2, and has no lzop.
+_RAW_COMPRESS_SUPPORTED = frozenset(COMPRESSION_CONFIG)
+
+#: btrbk spells some methods differently from the program they run. `lzo` is the
+#: lzop program, which this project lists under its program name, so an import
+#: that compared the names directly dropped a perfectly usable setting.
+_BTRBK_METHOD_ALIASES = {"lzo": "lzop"}
+
 logger = logging.getLogger(__name__)
 
 
@@ -69,6 +85,10 @@ class BtrbkTarget:
     path: str
     options: dict[str, str] = field(default_factory=dict)
     line: int = 0
+    #: btrbk's optional target type token: ``send-receive`` (the default) or
+    #: ``raw``. Written as ``target <type> <url>``, which is the form btrbk's own
+    #: documentation uses.
+    target_type: str | None = None
 
 
 @dataclass
@@ -200,6 +220,11 @@ class BtrbkLexer:
             "ssh_port",
             "ssh_compression",
             "stream_compress",
+            # Recognised so the converter can say they are not carried over. An
+            # unrecognised keyword is skipped silently, which is how a tuning the
+            # user deliberately set disappeared without a word.
+            "stream_compress_level",
+            "stream_compress_threads",
             "stream_buffer",
             "rate_limit",
             "timestamp_format",
@@ -266,6 +291,13 @@ class BtrbkParser:
         self.config = BtrbkConfig()
         self.current_volume: BtrbkVolume | None = None
         self.current_subvolume: BtrbkSubvolume | None = None
+        # btrbk scopes an option to the section it follows, and `target` opens a
+        # section like `volume` and `subvolume` do. Without tracking it, every
+        # option written under one target was stored on the enclosing subvolume
+        # and therefore applied to that subvolume's OTHER targets too -- a
+        # `stream_compress` meant for one destination silently turned itself on
+        # for the rest.
+        self.current_target: BtrbkTarget | None = None
 
     def parse(self) -> BtrbkConfig:
         """Parse tokens into configuration structure."""
@@ -287,6 +319,12 @@ class BtrbkParser:
         token = self._current()
         self.pos += 1
         return token
+
+    def _peek_next(self) -> Token:
+        """The token after the current one, for deciding on optional tokens."""
+        if self.pos + 1 < len(self.tokens):
+            return self.tokens[self.pos + 1]
+        return Token(TokenType.EOF, "", 0, 0)
 
     def _skip_newlines(self) -> None:
         while not self._is_at_end() and self._current().type in (
@@ -333,6 +371,7 @@ class BtrbkParser:
         self._advance()
         self.current_volume = BtrbkVolume(path=path_token.value, line=path_token.line)
         self.current_subvolume = None
+        self.current_target = None
         self.config.volumes.append(self.current_volume)
 
     def _parse_subvolume(self) -> None:
@@ -352,6 +391,7 @@ class BtrbkParser:
             )
             return
 
+        self.current_target = None
         self.current_subvolume = BtrbkSubvolume(
             path=path_token.value, line=path_token.line
         )
@@ -360,14 +400,32 @@ class BtrbkParser:
     def _parse_target(self) -> None:
         """Parse a target section."""
         path_token = self._current()
-        if path_token.type != TokenType.VALUE:
+        if path_token.type not in (TokenType.VALUE, TokenType.KEYWORD):
             self.config.warnings.append(
                 f"Line {path_token.line}: Expected path after 'target'"
             )
             return
 
+        # `target <type> <url>` is btrbk's documented form, and the type token
+        # was being taken as the destination: `target send-receive ssh://nas/b`
+        # produced a target called "send-receive" and dropped the real URL, so an
+        # imported config silently had nowhere to back up to.
+        target_type = None
+        if path_token.value in ("send-receive", "raw"):
+            following = self._peek_next()
+            if following.type in (
+                TokenType.VALUE,
+                TokenType.KEYWORD,
+            ):
+                target_type = path_token.value
+                self._advance()
+                path_token = self._current()
+
         self._advance()
-        target = BtrbkTarget(path=path_token.value, line=path_token.line)
+        target = BtrbkTarget(
+            path=path_token.value, line=path_token.line, target_type=target_type
+        )
+        self.current_target = target
 
         # Add to current scope
         if self.current_subvolume is not None:
@@ -399,8 +457,12 @@ class BtrbkParser:
 
         value = " ".join(values)
 
-        # Store in current scope
-        if self.current_subvolume is not None:
+        # Store in the innermost open scope. Target first: it is the narrowest,
+        # and the inheritance chain further down reads target -> subvolume ->
+        # volume -> global in that order.
+        if self.current_target is not None:
+            self.current_target.options[keyword] = value
+        elif self.current_subvolume is not None:
             self.current_subvolume.options[keyword] = value
         elif self.current_volume is not None:
             self.current_volume.options[keyword] = value
@@ -768,6 +830,24 @@ def convert_to_toml(btrbk_config: BtrbkConfig) -> tuple[str, list[str]]:
                     or volume.options.get("raw_target_compress")
                     or btrbk_config.global_options.get("raw_target_compress")
                 )
+                # btrbk's stream_compress compresses the send stream over the wire --
+                # the same thing btrfs-backup-ng's `compress` now does for an ssh://
+                # target. Dropping it on import silently removed the bandwidth saving
+                # from whoever was migrating over a slow link -- exactly the person who
+                # had configured it in the first place.
+                stream_compress = (
+                    target.options.get("stream_compress")
+                    or subvolume.options.get("stream_compress")
+                    or volume.options.get("stream_compress")
+                    or btrbk_config.global_options.get("stream_compress")
+                )
+                # ssh_compression is ssh's own -C: a different mechanism entirely.
+                ssh_compression = (
+                    target.options.get("ssh_compression")
+                    or subvolume.options.get("ssh_compression")
+                    or volume.options.get("ssh_compression")
+                    or btrbk_config.global_options.get("ssh_compression")
+                )
                 raw_encrypt = (
                     target.options.get("raw_target_encrypt")
                     or subvolume.options.get("raw_target_encrypt")
@@ -775,8 +855,32 @@ def convert_to_toml(btrbk_config: BtrbkConfig) -> tuple[str, list[str]]:
                     or btrbk_config.global_options.get("raw_target_encrypt")
                 )
 
-                # Determine if this is a raw target
-                is_raw_target = bool(raw_compress or raw_encrypt)
+                # btrbk resolves an option at the narrowest scope that sets it.
+                # These four were recognised by the parser -- so they never looked
+                # unknown -- stored, and then never read back, which dropped them
+                # silently at EVERY scope. The migration guide promises three of
+                # them by name, so a user read the table, believed their key and
+                # username had come across, and got authentication failures
+                # against a host btrbk had been backing up to correctly.
+                def inherited(name: str) -> str | None:
+                    return (
+                        target.options.get(name)
+                        or subvolume.options.get(name)
+                        or volume.options.get(name)
+                        or btrbk_config.global_options.get(name)
+                    )
+
+                ssh_identity = inherited("ssh_identity")
+                ssh_user = inherited("ssh_user")
+                ssh_port = inherited("ssh_port")
+                target_rate_limit = inherited("rate_limit")
+
+                # Determine if this is a raw target. The declared type counts:
+                # `target raw <url>` is a raw target even when no raw_target_*
+                # option is set anywhere.
+                is_raw_target = bool(
+                    raw_compress or raw_encrypt or target.target_type == "raw"
+                )
 
                 # Convert btrbk target path format
                 target_path = target.path
@@ -797,6 +901,21 @@ def convert_to_toml(btrbk_config: BtrbkConfig) -> tuple[str, list[str]]:
                     warnings.append(
                         f"Line {target.line}: Converted '{target.path}' to '{target_path}'"
                     )
+                elif is_raw_target and target_path.startswith("ssh://"):
+                    # A REMOTE raw target already in URL form. Prefixing "raw://"
+                    # blindly produced `raw:///ssh://host/path` -- a nonsense
+                    # local directory, so a remote raw backup silently became a
+                    # local one pointed at a path that cannot exist.
+                    remainder = target_path[len("ssh://") :]
+                    if ":" not in remainder.split("/", 1)[0]:
+                        host, _, path = remainder.partition("/")
+                        target_path = f"raw+ssh://{host}:/{path}"
+                    else:
+                        target_path = f"raw+ssh://{remainder}"
+                    warnings.append(
+                        f"Line {target.line}: Converted raw target "
+                        f"'{target.path}' to '{target_path}'"
+                    )
                 elif is_raw_target and not target_path.startswith("raw://"):
                     # Local raw target
                     if target_path.startswith("/"):
@@ -804,7 +923,91 @@ def convert_to_toml(btrbk_config: BtrbkConfig) -> tuple[str, list[str]]:
                     else:
                         target_path = f"raw:///{target_path}"
 
+                # btrbk carries the remote user as its own option; this project
+                # puts it in the URL. Without this the target authenticated as
+                # whoever ran the backup rather than as the configured user.
+                if ssh_user and "@" not in target_path:
+                    for scheme in ("raw+ssh://", "ssh://"):
+                        if target_path.startswith(scheme):
+                            rest = target_path[len(scheme) :]
+                            target_path = f"{scheme}{ssh_user}@{rest}"
+                            break
+
                 lines.append(f'path = "{target_path}"')
+
+                if ssh_identity:
+                    lines.append(f'ssh_key = "{ssh_identity}"')
+                if ssh_port:
+                    port = str(ssh_port).strip()
+                    if port.isdigit():
+                        lines.append(f"ssh_port = {port}")
+                    else:
+                        warnings.append(
+                            f"Line {target.line}: ssh_port {ssh_port!r} is not a "
+                            f"number and was not carried over"
+                        )
+                if target_rate_limit and str(target_rate_limit) not in ("no", "0"):
+                    lines.append(f'rate_limit = "{target_rate_limit}"')
+
+                # stream_compress -> compress, for targets that are not raw. A raw
+                # target takes its method from raw_target_compress below, and setting
+                # both would be ambiguous.
+                if stream_compress and stream_compress != "no" and is_raw_target:
+                    # A raw target takes its method from raw_target_compress, so
+                    # say that this one is being dropped rather than let the
+                    # migrated config quietly compress differently.
+                    warnings.append(
+                        f"Line {target.line}: stream_compress "
+                        f"'{stream_compress}' is not applied to this raw target; "
+                        f"a raw target compresses at rest using "
+                        f"raw_target_compress"
+                        + (
+                            f" (currently '{raw_compress}')"
+                            if raw_compress
+                            else ", which is not set -- this backup will be "
+                            "stored uncompressed"
+                        )
+                    )
+
+                if stream_compress and stream_compress != "no" and not is_raw_target:
+                    method = str(stream_compress)
+                    method = _BTRBK_METHOD_ALIASES.get(method, method)
+                    if method in _STREAM_COMPRESS_SUPPORTED:
+                        lines.append(f'compress = "{method}"')
+                    else:
+                        warnings.append(
+                            f"Line {target.line}: stream_compress '{method}' is not "
+                            f"a method btrfs-backup-ng knows (supported: "
+                            f"{', '.join(sorted(_STREAM_COMPRESS_SUPPORTED))}). "
+                            f"This target will be backed up UNCOMPRESSED."
+                        )
+
+                for tuning in ("stream_compress_level", "stream_compress_threads"):
+                    configured = (
+                        target.options.get(tuning)
+                        or subvolume.options.get(tuning)
+                        or volume.options.get(tuning)
+                        or btrbk_config.global_options.get(tuning)
+                    )
+                    if configured and str(configured) not in ("no", "default"):
+                        warnings.append(
+                            f"Line {target.line}: {tuning} '{configured}' is not "
+                            f"carried over; btrfs-backup-ng runs the compressor at "
+                            f"its default settings. Compression still works, the "
+                            f"ratio and CPU use may differ."
+                        )
+
+                if (
+                    ssh_compression
+                    and str(ssh_compression) not in ("no", "false")
+                    and ("ssh://" in target_path or "@" in target_path)
+                ):
+                    warnings.append(
+                        f"Line {target.line}: ssh_compression is set, which uses ssh's "
+                        f"own -C. btrfs-backup-ng does not pass -C; set `Compression yes` "
+                        f"for this host in ~/.ssh/config, or use `compress` to compress "
+                        f"the stream itself."
+                    )
 
                 # Raw target options
                 if is_raw_target:
@@ -821,7 +1024,22 @@ def convert_to_toml(btrbk_config: BtrbkConfig) -> tuple[str, list[str]]:
                             "zstd": "zstd",
                         }
                         compress = compress_map.get(raw_compress, raw_compress)
-                        lines.append(f'compress = "{compress}"')
+                        # btrbk supports methods a raw target here does not (bzip3,
+                        # for one). Emitting the name unchecked produced a config
+                        # file that the loader then REFUSED, so the migration
+                        # appeared to succeed and the first run died on its own
+                        # output. Say so here, and leave the setting out.
+                        if compress in _RAW_COMPRESS_SUPPORTED:
+                            lines.append(f'compress = "{compress}"')
+                        else:
+                            warnings.append(
+                                f"Line {target.line}: raw_target_compress "
+                                f"'{raw_compress}' is not supported for a raw "
+                                f"target (supported: "
+                                f"{', '.join(sorted(_RAW_COMPRESS_SUPPORTED))}). "
+                                f"It has been left out; this target will be stored "
+                                f"UNCOMPRESSED until you choose another method."
+                            )
 
                     if raw_encrypt and raw_encrypt != "no":
                         if raw_encrypt == "gpg":
