@@ -119,6 +119,11 @@ class BtrbkConfig:
     global_options: dict[str, str] = field(default_factory=dict)
     volumes: list[BtrbkVolume] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+    #: Targets declared at GLOBAL scope. btrbk.conf(5) permits this and its own
+    #: shipped example uses it: every subvolume inherits them. Discarding them
+    #: produced volumes with no destination -- a migrated config that backs up
+    #: nowhere.
+    global_targets: list["BtrbkTarget"] = field(default_factory=list)
 
 
 class BtrbkLexer:
@@ -432,6 +437,9 @@ class BtrbkParser:
             self.current_subvolume.targets.append(target)
         elif self.current_volume is not None:
             self.current_volume.targets.append(target)
+        elif self.current_volume is None and self.current_subvolume is None:
+            # Global scope: inherited by every subvolume, as btrbk does.
+            self.config.global_targets.append(target)
         else:
             self.config.warnings.append(
                 f"Line {path_token.line}: 'target' outside of 'volume' or 'subvolume' section"
@@ -827,7 +835,13 @@ def convert_to_toml(btrbk_config: BtrbkConfig) -> tuple[str, list[str]]:
             lines.append("")
 
             # Targets - from subvolume, volume, or both
-            all_targets = subvolume.targets + volume.targets
+            # Global targets are inherited by every subvolume, exactly as btrbk
+            # applies them. Without this a config whose only `target` is declared
+            # at global scope -- legal, and the form btrbk's own example uses --
+            # migrated to volumes with no destination at all.
+            all_targets = (
+                subvolume.targets + volume.targets + btrbk_config.global_targets
+            )
 
             for target in all_targets:
                 lines.append("[[volumes.targets]]")

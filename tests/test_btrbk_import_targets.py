@@ -369,3 +369,76 @@ class TestBtrbkOffValuesAreNotSettings:
         )[0]
         assert "raw+ssh://" in toml, toml
         assert 'compress = "zstd"' in toml, toml
+
+
+class TestGlobalTargetsAreInherited:
+    """btrbk.conf(5) permits `target` at global scope; its own example uses it.
+
+    Those targets were parsed, warned about as "outside of volume or subvolume
+    section", and thrown away. A config whose only destination is declared
+    globally therefore migrated to volumes with NO targets at all: a config that
+    backs up nowhere. The warning was there, but the emitted file was useless.
+    """
+
+    def _targets(self, text):
+        toml, _warnings = convert_to_toml(parse_btrbk_config(text))
+        return [
+            block.split('path = "')[1].split('"')[0]
+            for block in toml.split("[[volumes.targets]]")[1:]
+        ]
+
+    def test_a_global_target_reaches_every_subvolume(self):
+        targets = self._targets(
+            "target send-receive ssh://nas.local/backup\n"
+            "volume /mnt/pool\n"
+            "  subvolume home\n"
+            "  subvolume data\n"
+        )
+        assert targets == [
+            "ssh://nas.local/backup",
+            "ssh://nas.local/backup",
+        ], targets
+
+    def test_a_global_target_no_longer_warns_as_misplaced(self):
+        _toml, warnings = convert_to_toml(
+            parse_btrbk_config(
+                "target send-receive ssh://nas.local/backup\n"
+                "volume /mnt/pool\n  subvolume home\n"
+            )
+        )
+        assert not any("outside of" in w for w in warnings), warnings
+
+    def test_subvolume_targets_are_added_to_the_global_one(self):
+        """btrbk accumulates targets across scopes rather than overriding."""
+        targets = self._targets(
+            "target send-receive ssh://nas.local/global\n"
+            "volume /mnt/pool\n"
+            "  subvolume home\n"
+            "    target send-receive ssh://nas.local/home\n"
+        )
+        assert set(targets) == {
+            "ssh://nas.local/home",
+            "ssh://nas.local/global",
+        }, targets
+
+    def test_a_config_with_no_global_target_is_unchanged(self):
+        targets = self._targets(
+            "volume /mnt/pool\n"
+            "  subvolume home\n"
+            "    target send-receive ssh://nas.local/home\n"
+        )
+        assert targets == ["ssh://nas.local/home"], targets
+
+    def test_the_migrated_config_still_loads(self, tmp_path):
+        from btrfs_backup_ng.config import load_config
+
+        toml, _warnings = convert_to_toml(
+            parse_btrbk_config(
+                "target send-receive ssh://nas.local/backup\n"
+                "volume /mnt/pool\n  subvolume home\n"
+            )
+        )
+        path = tmp_path / "config.toml"
+        path.write_text(toml, encoding="utf-8")
+        loaded, _warn = load_config(path)
+        assert loaded.volumes[0].targets, "the migrated volume has no destination"

@@ -303,11 +303,16 @@ class TestBtrbkParserMore:
         result = parse_btrbk_config(config)
         assert len(result.warnings) > 0
 
-    def test_parse_target_outside_section(self):
-        """Test parsing target outside volume/subvolume."""
+    def test_parse_target_at_global_scope_is_kept_not_warned(self):
+        """btrbk.conf(5) permits `target` at global scope, and its own shipped
+        example uses it: every subvolume inherits it. This previously warned it
+        away as misplaced and discarded it, so a config whose only destination
+        was global migrated to volumes with nowhere to back up to."""
         config = "target /backup"
         result = parse_btrbk_config(config)
-        assert len(result.warnings) > 0
+        assert result.global_targets, "the global target was discarded"
+        assert result.global_targets[0].path == "/backup"
+        assert not any("outside of" in w for w in result.warnings), result.warnings
 
     def test_parse_subvolume_outside_volume(self):
         """Test parsing subvolume outside volume."""
