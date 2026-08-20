@@ -509,6 +509,11 @@ def _collect_unknown_key_warnings(data: dict[str, Any]) -> list[str]:
 
 def _validate_config(config: Config) -> list[str]:
     """Validate configuration and return list of warnings."""
+    # Imported here rather than at module scope: core/__init__ pulls in
+    # core.execution, which imports this package, so a top-level import is a
+    # cycle. core.target itself has no such dependency.
+    from ..core.target import TargetKind, parse_target
+
     warnings = []
 
     if not config.volumes:
@@ -529,6 +534,30 @@ def _validate_config(config: Config) -> list[str]:
                 if ":" not in target.path[6:]:
                     warnings.append(
                         f"SSH target '{target.path}' may be missing path separator ':'"
+                    )
+
+            # `compress` is accepted for every target and then dropped for a
+            # destination whose endpoint does not implement it: core.operations
+            # refuses to compress a stream only to decompress it on the same
+            # machine, which is right, but nothing said so and the config still
+            # read as though the backup were compressed. Collected and quietly
+            # ignored is the shape of defect this project keeps finding, so it is
+            # named at load. Non-fatal: the config is valid and the backup runs.
+            compress = getattr(target, "compress", "none")
+            if compress and compress != "none":
+                scheme = parse_target(target.path)
+                if (
+                    not scheme.supports_compress
+                    and scheme.kind is not TargetKind.UNSUPPORTED
+                ):
+                    warnings.append(
+                        f"Target '{target.path}' sets compress = '{compress}', "
+                        "which will not be applied: this destination is on the "
+                        "same machine, so the stream would be compressed and "
+                        "immediately decompressed again for no saving. The "
+                        "backup still runs, uncompressed. Compression applies to "
+                        "ssh:// (compressed over the wire) and to raw:// and "
+                        "raw+ssh:// (compressed at rest)."
                     )
 
             # raw+ssh with ssh_sudo is fully supported, and it is also the

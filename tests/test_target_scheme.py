@@ -445,3 +445,61 @@ class TestPortIsParsedNotGuessed:
         scheme = parse_target(uri)
         assert scheme.host == expected_host
         assert ":" not in (scheme.ssh_destination or "").split("@")[-1]
+
+
+class TestCompressIsNotSilentlyDroppedAtLoad:
+    """A local btrfs target accepted `compress` and ignored it without a word.
+
+    core.operations is right to drop it -- compressing a stream only to
+    decompress it on the same machine buys nothing -- but nothing said so, and
+    the config still read as though the backup were compressed. That is the
+    collected-then-ignored shape this project keeps finding, so it is named at
+    load. supports_compress is the authority; this is what consumes it.
+    """
+
+    def _warnings(self, tmp_path, target, compress):
+        from btrfs_backup_ng.config.loader import load_config
+
+        config_file = tmp_path / "config.toml"
+        config_file.write_text(
+            "[[volumes]]\n"
+            'path = "/home"\n'
+            "\n"
+            "[[volumes.targets]]\n"
+            f'path = "{target}"\n'
+            f'compress = "{compress}"\n'
+        )
+        _config, warnings = load_config(config_file)
+        return [w for w in warnings if "compress" in w]
+
+    def test_a_local_target_is_told_it_will_not_be_applied(self, tmp_path):
+        found = self._warnings(tmp_path, "/mnt/backup", "zstd")
+        assert found, "compress was dropped for a local target with no warning"
+        assert "will not be applied" in found[0]
+        assert "zstd" in found[0]
+
+    def test_the_warning_says_where_compression_does_work(self, tmp_path):
+        """A warning that only says no is a dead end."""
+        found = self._warnings(tmp_path, "/mnt/backup", "zstd")
+        assert "ssh://" in found[0] and "raw://" in found[0]
+
+    def test_it_is_a_warning_and_not_a_rejection(self, tmp_path):
+        """The config is valid and the backup still runs, uncompressed."""
+        from btrfs_backup_ng.config.loader import load_config
+
+        config_file = tmp_path / "config.toml"
+        config_file.write_text(
+            '[[volumes]]\npath = "/home"\n\n'
+            '[[volumes.targets]]\npath = "/mnt/backup"\ncompress = "zstd"\n'
+        )
+        config, _warnings = load_config(config_file)
+        assert config.volumes[0].targets[0].compress == "zstd"
+
+    @pytest.mark.parametrize(
+        "target", ["ssh://nas/backup", "raw:///mnt/usb", "raw+ssh://nas/backups"]
+    )
+    def test_a_target_that_does_compress_is_not_warned_about(self, tmp_path, target):
+        assert not self._warnings(tmp_path, target, "zstd"), target
+
+    def test_no_compression_asked_for_means_nothing_to_say(self, tmp_path):
+        assert not self._warnings(tmp_path, "/mnt/backup", "none")
