@@ -20,8 +20,11 @@ verified byte-identical on real hardware. Much of the reliability-and-security h
 roadmap has now shipped — retention correctness and the incremental-backup engine in 0.9.0,
 and deeper verification, crash-atomic state/lock persistence, and SSH security (host-key
 verification / MITM mitigation) in 0.9.1 (tracked in
-[#20](https://github.com/berrym/btrfs-backup-ng/issues/20)). As with any backup tool, test
-your restores.
+[#20](https://github.com/berrym/btrfs-backup-ng/issues/20)). 0.9.2 brought config and
+restoration polish, and 0.9.4 was a correctness release: it fixed two ways a restore could
+return the wrong volume while reporting success, and a class of bugs that only appear when
+the remote's `/bin/sh` is `dash` or `busybox ash` — which is most Debian, Ubuntu, Alpine and
+NAS targets. As with any backup tool, test your restores.
 
 ## Heritage
 
@@ -3075,6 +3078,39 @@ ssh user@remote 'which zstd'
 ```bash
 # Install pv (pipe viewer)
 sudo dnf install pv
+```
+
+**A run exits non-zero saying another run is in progress:**
+
+Only one run at a time may use a given configuration, so a scheduled run that starts
+while the previous one is still transferring stops instead of running alongside it.
+Nothing was backed up by the run that stopped, so it reports failure rather than
+success — but the cause is benign. Seeing it repeatedly from a timer means the
+schedule fires faster than a run takes to finish; lengthen the interval.
+
+```bash
+# How long the last runs actually took
+systemctl status btrfs-backup-ng.service
+```
+
+**`compress` is set but the backup is not compressed:**
+
+Compression is applied by the destination, and a **local** btrfs target deliberately
+drops it — the stream would be compressed and immediately decompressed on the same
+machine for no saving. Loading the config warns when this applies. Compression does
+apply over `ssh://` (compressed on the wire) and to `raw://` / `raw+ssh://`
+(compressed at rest).
+
+**A large first transfer stops after about an hour:**
+
+That is btrfs-backup-ng's own transfer timeout, not an ssh idle or keepalive timeout —
+a distinction worth making before searching `sshd_config`, since ssh commonly defaults
+to an hour as well. Since 0.9.4 the failure says so explicitly and names the limit. A
+full first sync of a large subvolume over a slow link can legitimately exceed it; use
+`estimate` to see what the transfer will actually move.
+
+```bash
+btrfs-backup-ng estimate /path/to/snapshots ssh://user@host:/backup
 ```
 
 ### Validate Configuration
