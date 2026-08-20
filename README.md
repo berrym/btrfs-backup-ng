@@ -219,6 +219,7 @@ path = "/mnt/backup/home"
 [[volumes.targets]]
 path = "ssh://backup@server:/backups/home"
 ssh_sudo = true
+compress = "zstd"
 rate_limit = "50M"
 ```
 
@@ -594,10 +595,20 @@ ssh_port = 22                          # SSH port
 ssh_key = "~/.ssh/backup_key"          # SSH private key
 ssh_host_key_policy = "accept-new"     # Host-key policy: accept-new (default) | strict
 ssh_password_auth = true               # Allow password fallback
-compress = "zstd"                      # Compression -- raw:// and raw+ssh:// ONLY
-                                       # (none|gzip|zstd|lz4|pigz|lzop). Ignored on
-                                       # btrfs targets, local or ssh://: nothing
-                                       # decompresses on the receive side there.
+compress = "zstd"                      # Stream compression. On ssh:// the stream
+                                       # is compressed before the wire and
+                                       # decompressed on the remote before btrfs
+                                       # receive (the REMOTE needs the program
+                                       # installed -- `doctor` checks). On raw://
+                                       # and raw+ssh:// it is compressed at rest
+                                       # and the method is recorded in the .meta
+                                       # sidecar. Skipped for a LOCAL btrfs
+                                       # target, where it would only be undone
+                                       # again.
+                                       # none | gzip | pigz | zstd | lz4 | xz |
+                                       # lzo (= lzop) | bzip2 | pbzip2
+                                       # The same set applies to every kind of
+                                       # destination.
 rate_limit = "10M"                     # Bandwidth limit (K|M|G suffix)
 require_mount = false                  # Require path to be a mount point (safety check)
 ```
@@ -1031,6 +1042,19 @@ Do **not** add `mv`, `rm`, `mkdir` or `sh` to this file. Any of them as root is
 equivalent to full root, and btrfs-backup-ng does not need them: it performs the
 destination's directory work as the connecting user (see the next step).
 
+This grant is enough for `compress` on an `ssh://` target. The remote runs
+`<decompressor> | sudo -n btrfs receive ...`, so the decompressor runs as the
+connecting user and only `btrfs` is elevated.
+
+The one exception is a remote whose sudo requires a **password**. There the
+remote command becomes `sudo -S sh -c '<decompressor> | btrfs receive ...'`,
+because `sudo -S` reads the password from its own stdin and the pipeline has to
+sit inside it -- which needs sudo rights to `sh`, not just to `btrfs`. That is
+already the case for such a setup (a password-based rule is normally
+`ALL=(ALL) ALL`), but it is worth knowing that this path elevates a shell where
+the passwordless path elevates one binary. Prefer the passwordless `btrfs` grant
+above.
+
 **Important:** Set correct permissions on the sudoers file (required by most distros):
 
 ```bash
@@ -1293,12 +1317,38 @@ ssh_sudo = true
 ssh_password_auth = true    # Enable SSH password prompts
 ```
 
+**Non-interactive password LOGIN needs `sshpass`.** OpenSSH deliberately refuses to
+read a password from anywhere but a terminal, so without it the only password
+route is an interactive prompt. If you are scripting this, install it first:
+
+```bash
+sudo dnf install sshpass      # Fedora / RHEL
+sudo apt install sshpass      # Debian / Ubuntu
+```
+
+Without `sshpass` and without a terminal, authentication fails with
+"All SSH authentication methods failed" and a note naming this requirement.
+Key-based login needs none of this and is the better answer where you can use it.
+
 For sudo passwords on remote:
 ```bash
-# Set via environment variable (insecure - visible in process list)
+# Set via environment variable
 export BTRFS_BACKUP_SUDO_PASSWORD="password"
-sudo -E btrfs-backup-ng run
+btrfs-backup-ng run
 ```
+
+`BTRFS_BACKUP_SUDO_PASSWORD` is read from the environment, which on Linux is
+readable only by the owning user (`/proc/<pid>/environ` is 0400) -- unlike a
+command line, which every user on the machine can read. It is still a secret in
+a variable: prefer passwordless sudo for `/usr/bin/btrfs` on the remote where
+you can, and see the sudoers guidance below.
+
+Both halves are exercised on real hardware: a remote whose sudo genuinely
+demands a password backs up AND restores, over ssh:// with and without stream
+compression, through both the paramiko and shell-pipeline transfer strategies.
+Restore in particular used to fail there -- the remote `btrfs send` was asked for
+a password that nothing supplied -- so a destination could be written to and
+never read back.
 
 **Warning:** Password-based authentication is not suitable for automated/unattended backups.
 
@@ -2317,6 +2367,7 @@ min_age = "1h"                              # Skip snapshots younger than 1 hour
 [[volumes.targets]]
 path = "ssh://backup@server:/backups/root"
 ssh_sudo = true
+compress = "zstd"
 ```
 
 Then run backups normally:

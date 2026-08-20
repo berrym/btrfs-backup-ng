@@ -30,9 +30,8 @@ path = "/mnt/backup/www"
 path = "ssh://backup@offsite:/backups/server/www"
 ssh_sudo = true
 ssh_key = "/root/.ssh/backup_key"
-# compress is not set here: compression is supported only on raw:// and
-# raw+ssh:// targets, where it is recorded in the .meta sidecar so a restore
-# can reverse it. On a btrfs target it is ignored (it used to hang).
+compress = "zstd"    # compressed over the wire, decompressed on the
+                     # remote before btrfs receive
 rate_limit = "50M"
 
 # Database storage
@@ -55,9 +54,8 @@ path = "/mnt/backup/mysql"
 path = "ssh://backup@offsite:/backups/server/mysql"
 ssh_sudo = true
 ssh_key = "/root/.ssh/backup_key"
-# compress is not set here: compression is supported only on raw:// and
-# raw+ssh:// targets, where it is recorded in the .meta sidecar so a restore
-# can reverse it. On a btrfs target it is ignored (it used to hang).
+compress = "zstd"    # compressed over the wire, decompressed on the
+                     # remote before btrfs receive
 
 # Mail storage
 [[volumes]]
@@ -71,6 +69,5 @@ path = "/mnt/backup/mail"
 path = "ssh://backup@offsite:/backups/server/mail"
 ssh_sudo = true
 ssh_key = "/root/.ssh/backup_key"
-# compress is not set here: compression is supported only on raw:// and
-# raw+ssh:// targets, where it is recorded in the .meta sidecar so a restore
-# can reverse it. On a btrfs target it is ignored (it used to hang).
+compress = "gzip"    # compressed over the wire, decompressed on the
+                     # remote before btrfs receive

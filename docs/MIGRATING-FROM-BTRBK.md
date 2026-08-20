@@ -211,6 +211,40 @@ path = "ssh://backup@server:/backups/home"
 | `ssh_port 2222` | `ssh_port = 2222` |
 | `backend btrfs-progs-sudo` | `ssh_sudo = true` |
 
+### Stream Compression Mapping
+
+btrbk's `stream_compress` compresses the send stream on its way over the wire.
+btrfs-backup-ng calls the same thing `compress`, and the importer carries it
+across:
+
+| btrbk | btrfs-backup-ng | Notes |
+|-------|-----------------|-------|
+| `stream_compress zstd` | `compress = "zstd"` | |
+| `stream_compress gzip` | `compress = "gzip"` | |
+| `stream_compress pigz` | `compress = "pigz"` | |
+| `stream_compress lz4` | `compress = "lz4"` | |
+| `stream_compress lzo` | `compress = "lzop"` | btrbk names the format, this names the program |
+| `stream_compress xz` | `compress = "xz"` | |
+| `stream_compress bzip2` | `compress = "bzip2"` | |
+| `stream_compress pbzip2` | `compress = "pbzip2"` | |
+| `stream_compress no` | omit `compress` | |
+| `stream_compress_level 15` | *(not carried over)* | The compressor runs at its default level |
+| `stream_compress_threads 4` | *(not carried over)* | |
+| `ssh_compression yes` | *(not carried over)* | That is ssh's own `-C`; set `Compression yes` in `~/.ssh/config`, or use `compress` to compress the stream itself |
+
+Every destination accepts the same methods: `gzip`, `pigz`, `zstd`, `lz4`, `xz`,
+`lzo` (also spelled `lzop`), `bzip2`, `pbzip2`. What differs is *where* the
+compression happens:
+
+- **btrfs targets** (`ssh://`, local): compressed before the wire and
+  decompressed on the remote before `btrfs receive`. **The remote needs the
+  decompressor installed**; `doctor` checks for it.
+- **raw targets** (`raw://`, `raw+ssh://`): compressed at rest, with the method
+  recorded in the `.meta` sidecar so a restore can reverse it.
+
+Anything the importer cannot carry over is reported as a warning rather than
+dropped silently, so `config import` output is worth reading.
+
 ### Raw Target Migration
 
 btrbk's "raw targets" write btrfs send streams to files instead of using `btrfs receive`. This enables backups to non-btrfs filesystems (NFS, SMB, cloud storage) with optional compression and encryption.

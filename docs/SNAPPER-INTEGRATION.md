@@ -134,6 +134,7 @@ min_age = "1h"
 [[volumes.targets]]
 path = "ssh://backup@server:/backups/root"
 ssh_sudo = true
+compress = "zstd"
 ```
 
 ### Configuration Options
@@ -452,6 +453,7 @@ min_age = "1h"
 [[volumes.targets]]
 path = "ssh://backup@server:/backups/root"
 ssh_sudo = true
+compress = "zstd"
 ```
 
 ### Verifying Timer
@@ -545,16 +547,28 @@ include_types = ["single"]  # Skip pre/post pairs
 
 ### 3. Use Compression for Remote
 
-Compression applies to **raw** targets only. The raw endpoint compresses the
-stream itself and records the method in the `.meta` sidecar, so a restore can
-reverse it:
+Enable compression for remote transfers:
 ```toml
 [[volumes.targets]]
-path = "raw+ssh://backup@server:/backups/root"
+path = "ssh://backup@server:/backups/root"
 compress = "zstd"
 ```
-On a btrfs target -- local or `ssh://` -- `compress` is ignored and warned
-about, because there is no decompression step on the receive side.
+
+The stream is compressed before it goes over the wire and decompressed on the
+remote host before `btrfs receive`, so it saves bandwidth without changing what
+lands on the destination. Available methods: `gzip`, `zstd`, `lz4`, `pigz`,
+`lzop`.
+
+On a **raw** target (`raw://` / `raw+ssh://`) compression does something
+different and also useful: the raw endpoint compresses the stream into its file
+and records the method in the `.meta` sidecar, so the backup stays compressed
+*at rest* and a restore reverses it. Raw supports a wider set, adding `xz`,
+`lzo`, `bzip2` and `pbzip2`.
+
+For a **local** btrfs target `compress` is skipped -- the stream would only be
+decompressed again on the same machine.
+
+Migrating from btrbk: `stream_compress` maps onto this option.
 
 ### 4. Monitor Backup Status
 

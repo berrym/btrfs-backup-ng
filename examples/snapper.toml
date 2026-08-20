@@ -44,9 +44,8 @@ min_age = "1h"                              # Skip snapshots less than 1 hour ol
 [[volumes.targets]]
 path = "ssh://backup@nas.local:/backups/root"
 ssh_sudo = true
-# compress is not set here: compression is supported only on raw:// and
-# raw+ssh:// targets, where it is recorded in the .meta sidecar so a restore
-# can reverse it. On a btrfs target it is ignored (it used to hang).
+compress = "zstd"    # compressed over the wire, decompressed on the
+                     # remote before btrfs receive
 
 
 # -----------------------------------------------------------------------------
@@ -67,9 +66,8 @@ min_age = "30m"
 
 [[volumes.targets]]
 path = "ssh://backup@nas.local:/backups/home"
-# compress is not set here: compression is supported only on raw:// and
-# raw+ssh:// targets, where it is recorded in the .meta sidecar so a restore
-# can reverse it. On a btrfs target it is ignored (it used to hang).
+compress = "lz4"    # compressed over the wire, decompressed on the
+                     # remote before btrfs receive
 
 
 # -----------------------------------------------------------------------------

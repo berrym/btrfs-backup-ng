@@ -1,6 +1,11 @@
 # btrfs-backup-ng Remote Backup Configuration
 #
 # Backup multiple volumes to a remote NAS over SSH with compression.
+#
+# `compress` on an ssh:// target compresses the stream before the wire and
+# decompresses it on the remote before btrfs receive -- bandwidth saved, same
+# result on disk. The /data volume also shows a raw+ssh:// target, where
+# compression instead applies at rest and is recorded in the .meta sidecar.
 # Copy to ~/.config/btrfs-backup-ng/config.toml
 
 [global]
@@ -23,9 +28,8 @@ snapshot_prefix = "home-"
 [[volumes.targets]]
 path = "ssh://backup@nas:/backups/workstation/home"
 ssh_sudo = true
-# compress is not set here: compression is supported only on raw:// and
-# raw+ssh:// targets, where it is recorded in the .meta sidecar so a restore
-# can reverse it. On a btrfs target it is ignored (it used to hang).
+compress = "zstd"    # compressed over the wire, decompressed on the
+                     # remote before btrfs receive
 rate_limit = "100M"
 
 # Root filesystem
@@ -41,9 +45,8 @@ weekly = 2
 [[volumes.targets]]
 path = "ssh://backup@nas:/backups/workstation/root"
 ssh_sudo = true
-# compress is not set here: compression is supported only on raw:// and
-# raw+ssh:// targets, where it is recorded in the .meta sidecar so a restore
-# can reverse it. On a btrfs target it is ignored (it used to hang).
+compress = "zstd"    # compressed over the wire, decompressed on the
+                     # remote before btrfs receive
 rate_limit = "100M"
 
 # Data volume
@@ -54,7 +57,26 @@ snapshot_prefix = "data-"
 [[volumes.targets]]
 path = "ssh://backup@nas:/backups/workstation/data"
 ssh_sudo = true
-# compress is not set here: compression is supported only on raw:// and
-# raw+ssh:// targets, where it is recorded in the .meta sidecar so a restore
-# can reverse it. On a btrfs target it is ignored (it used to hang).
+compress = "lz4"    # compressed over the wire, decompressed on the
+                     # remote before btrfs receive
+rate_limit = "100M"
+
+# A second target for the same volume, showing how to get COMPRESSED remote
+# backups: send to a raw target instead of a btrfs one.
+#
+# A raw target stores each backup as a `btrfs send` stream in a plain file
+# beside a .meta sidecar, so the destination does not need to be btrfs at all --
+# it can be any filesystem the remote can write to. The raw endpoint compresses
+# the stream itself and records the method in that sidecar, which is what lets a
+# restore reverse it. A btrfs target compresses too, but over the wire rather
+# than at rest: the remote decompresses before `btrfs receive`, so what lands is
+# a normal subvolume.
+#
+# The trade-off: a raw backup is a stream file rather than a browsable
+# subvolume, so you restore it with `btrfs-backup-ng restore` instead of reading
+# it in place.
+[[volumes.targets]]
+path = "raw+ssh://backup@nas:/backups/workstation/data-raw"
+ssh_sudo = true
+compress = "zstd"
 rate_limit = "100M"
