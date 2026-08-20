@@ -2461,8 +2461,48 @@ print(json.dumps(result))
                 "Partial-subvolume cleanup failed for %s: %s", expected_path, e
             )
 
+    #: How much of a smoothing buffer to put between `btrfs send` and the
+    #: network. `btrfs send` emits in bursts, and without a buffer every pause on
+    #: the receiving side stalls the sender.
+    #:
+    #: A buffer only has to hold what the sender produces DURING a stall, so the
+    #: benefit saturates and then stops. Measured on real hardware, 100 MB from a
+    #: ~58 MB/s producer through a consumer that stalls periodically (best of 3):
+    #:
+    #:     buffer   0.4s stalls   1.2s stalls   pv resident
+    #:     none        3.58s         6.65s          2.6 MB
+    #:       8M        3.06s         6.27s         ~10 MB
+    #:      16M        2.51s         5.87s         ~18 MB
+    #:      32M        2.73s         5.48s         34.5 MB
+    #:      64M        2.76s         5.45s         ~66 MB
+    #:     128M        2.79s         5.52s        130.7 MB
+    #:
+    #: Buffering is clearly worth it -- roughly 25-30% -- but 128 MiB was never
+    #: the best figure in either profile, and pv reserves it UNCONDITIONALLY: a
+    #: transfer that never stalls still holds 130 MB resident. 32 MiB is within
+    #: noise of the best result in both profiles at a quarter of the memory,
+    #: which matters on the NAS and SBC hosts these backups often run on.
+    #:
+    #: Both buffer programs use the same figure so the choice of tool does not
+    #: change the memory footprint.
+    BUFFER_SIZE = "32M"
+
     def _find_buffer_program(self) -> Tuple[Optional[str], Optional[str]]:
-        """Find pv program to use for transfer progress display.
+        """Pick a program to buffer the transfer, preferring pv.
+
+        pv is preferred: it is more widely installed, more portable across
+        platforms, and has not carried the buffer-allocation quirks mbuffer has
+        historically had. mbuffer is kept as a fallback for hosts without pv.
+
+        Both are OPTIONAL. With neither installed the stream goes through a plain
+        pipe and the transfer works normally -- it just relies on the kernel pipe
+        buffer (~64 KiB) rather than a large one, so a bursty send over a slow
+        link may stall the sender more often.
+
+        pv must be given ``-B`` explicitly. Its default buffer is around 400 KiB,
+        so ``pv -q`` alone provides essentially no smoothing -- it was selected as
+        the "buffer program" while doing almost none of the buffering the caller
+        expects.
 
         Returns:
             A tuple of (program_name, command_string) or (None, None) if not found
@@ -2476,20 +2516,24 @@ print(json.dumps(result))
                     "Found pv - using it in simple mode (no progress indicators)"
                 )
                 # Use pv quietly without progress display in simple mode
-                return "pv", "pv -q"
+                return "pv", f"pv -q -B {self.BUFFER_SIZE}"
             else:
                 logger.debug("Found pv - using it for transfer progress")
                 # Use pv with progress display (don't use -q for quiet, we want progress)
-                return "pv", "pv -p -t -e -r -b"
+                return "pv", f"pv -p -t -e -r -b -B {self.BUFFER_SIZE}"
 
         # Check for mbuffer as fallback
         if self._check_command_exists("mbuffer"):
             logger.debug("Found mbuffer - using it for transfer buffering")
-            return "mbuffer", "mbuffer -q -s 128k -m 1G"
+            # -m matches pv's -B so the tool in use does not change how much
+            # memory a transfer takes. The previous 1G could OOM a small host.
+            return "mbuffer", f"mbuffer -q -s 128k -m {self.BUFFER_SIZE}"
 
         # No buffer program found
         logger.debug(
-            "No buffer program (pv/mbuffer) found - transfers may be less reliable"
+            "Neither pv nor mbuffer found; transferring through a plain pipe. This "
+            "works normally -- a bursty send over a slow link may just stall more "
+            "often without a smoothing buffer."
         )
         return None, None
 
@@ -3208,14 +3252,20 @@ print(json.dumps(result))
         send_parts.append(shlex.quote(source_path))
         send_cmd = " ".join(send_parts)
 
-        # Build pv command for progress (only if show_progress is enabled)
+        # Build pv command for progress (only if show_progress is enabled).
+        # -B matches _find_buffer_program: pv's default buffer is around 400 KiB,
+        # so without it this pv smooths almost nothing while the other path's
+        # does. One figure, wherever pv is invoked.
         if show_progress:
             has_pv = self._check_command_exists("pv")
             if has_pv:
                 if estimated_size:
-                    pv_cmd = f"pv -f -p -t -e -r -b -s {estimated_size}"
+                    pv_cmd = (
+                        f"pv -f -p -t -e -r -b -B {self.BUFFER_SIZE} "
+                        f"-s {estimated_size}"
+                    )
                 else:
-                    pv_cmd = "pv -f -p -t -e -r -b"
+                    pv_cmd = f"pv -f -p -t -e -r -b -B {self.BUFFER_SIZE}"
             else:
                 pv_cmd = "cat"
                 logger.warning("pv not found - progress display unavailable")
