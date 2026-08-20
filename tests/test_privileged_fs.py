@@ -164,8 +164,8 @@ class TestWhenBothRoutesFail:
                     # and must NOT reach the elevation fallback at all.
                     target = sealed / "f"
                     with patch.object(
-                        __util__.Path,
-                        "chmod",
+                        __util__,
+                        "_chmod_nofollow",
                         side_effect=PermissionError(errno.EACCES, "Permission denied"),
                     ):
                         __util__.privileged_chmod(target, 0o755)
@@ -226,7 +226,9 @@ class TestOnlyPermissionFailuresEscalate:
             )
 
         with (
-            patch.object(__util__.Path, "chmod", side_effect=exc),
+            # chmod's direct route is now os.open(O_NOFOLLOW) + os.fchmod, so the
+            # refusal is injected there rather than at Path.chmod.
+            patch.object(__util__, "_chmod_nofollow", side_effect=exc),
             patch.object(__util__.subprocess, "run", side_effect=fake_run),
         ):
             try:
@@ -297,7 +299,7 @@ class TestElevationDoesNotFollowASymlink:
         refusal = PermissionError(errno.EACCES, "Permission denied")
         with (
             patch.object(__util__.subprocess, "run", side_effect=fake_run),
-            patch.object(__util__.Path, "chmod", side_effect=refusal),
+            patch.object(__util__, "_chmod_nofollow", side_effect=refusal),
         ):
             with pytest.raises(PermissionError) as excinfo:
                 if op == "write":
@@ -318,3 +320,59 @@ class TestElevationDoesNotFollowASymlink:
     def test_the_message_names_where_the_link_pointed(self, tmp_path):
         _calls, message, victim = self._attempt(tmp_path, "write")
         assert str(victim) in message
+
+
+class TestTheDirectRouteCannotBeRaced:
+    """The kernel does the symlink check, not a preceding syscall.
+
+    `islink()` then operate is two syscalls, so a link swapped in between them
+    wins and the operation follows it. O_NOFOLLOW moves the check INTO the open:
+    if the path is a link the open fails and nothing is touched, whatever
+    happened a microsecond earlier.
+
+    These bypass the islink() guard entirely -- patched out -- so what is being
+    tested is the operation itself, not the check in front of it.
+    """
+
+    def test_a_write_refuses_a_link_even_with_the_guard_disabled(self, tmp_path):
+        victim = tmp_path / "victim"
+        victim.write_text("original", encoding="utf-8")
+        link = tmp_path / "link"
+        link.symlink_to(victim)
+
+        with patch.object(__util__.os.path, "islink", return_value=False):
+            with pytest.raises(OSError) as excinfo:
+                __util__.privileged_write_bytes(link, b"attacker")
+
+        assert excinfo.value.errno in (errno.ELOOP, errno.EMLINK), excinfo.value
+        assert victim.read_text(encoding="utf-8") == "original", (
+            "the linked-to file was modified despite O_NOFOLLOW"
+        )
+
+    def test_a_chmod_refuses_a_link_even_with_the_guard_disabled(self, tmp_path):
+        victim = tmp_path / "victim"
+        victim.write_text("x", encoding="utf-8")
+        victim.chmod(0o600)
+        link = tmp_path / "link"
+        link.symlink_to(victim)
+
+        with patch.object(__util__.os.path, "islink", return_value=False):
+            with pytest.raises(OSError) as excinfo:
+                __util__.privileged_chmod(link, 0o777)
+
+        assert excinfo.value.errno in (errno.ELOOP, errno.EMLINK), excinfo.value
+        assert victim.stat().st_mode & 0o777 == 0o600, "the mode was changed"
+
+    def test_a_real_file_is_still_written_and_chmodded(self, tmp_path):
+        """The guard must not break the ordinary case."""
+        target = tmp_path / "real"
+        __util__.privileged_write_bytes(target, b"hello")
+        assert target.read_bytes() == b"hello"
+        __util__.privileged_chmod(target, 0o640)
+        assert target.stat().st_mode & 0o777 == 0o640
+
+    def test_an_existing_file_is_truncated_not_appended(self, tmp_path):
+        target = tmp_path / "real"
+        __util__.privileged_write_bytes(target, b"aaaaaaaaaa")
+        __util__.privileged_write_bytes(target, b"bb")
+        assert target.read_bytes() == b"bb", "stale bytes survived the rewrite"

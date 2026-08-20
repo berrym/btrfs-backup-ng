@@ -607,13 +607,17 @@ def _privileged_fs(
     with full sudo is prompted exactly as they were before rather than being told
     to start over as root.
     """
-    # Checked BEFORE the direct attempt, not only before the fallback: neither
-    # `Path.write_bytes` nor `Path.chmod` uses O_NOFOLLOW, and `sudo tee` and
-    # `sudo chmod` certainly do not, so a link planted where this tool expects
-    # to write gets followed by whichever route runs. Under root -- which is how
-    # backups usually run -- the direct route succeeds and follows it silently.
-    # Anyone able to create a name in a backup directory could otherwise
-    # redirect a write, or a mode change, onto a file they do not own.
+    # The DIRECT route no longer needs this: it opens O_NOFOLLOW, so the kernel
+    # refuses a symlink as part of the operation and there is no window at all.
+    #
+    # This check exists for the ELEVATED route, which shells out to `sudo tee` /
+    # `sudo chmod` -- separate processes that follow links and cannot be handed
+    # an already-opened descriptor, since the whole reason we are escalating is
+    # that this user could not open it. That check is therefore BEST EFFORT: it
+    # closes the common case (a link already sitting there) and narrows, but
+    # cannot close, a link swapped in after the check and before sudo runs.
+    # Refusing early also means the usual outcome is a clear error rather than a
+    # root-privileged write to someone else's file.
     if refuse_symlink and os.path.islink(path):
         raise PermissionError(
             f"Refusing to {action} {path}: it is a symbolic link pointing at "
@@ -697,7 +701,16 @@ def privileged_write_bytes(
         data = data.encode("utf-8")
 
     def _direct():
-        path.write_bytes(data)
+        # O_NOFOLLOW makes the kernel do the symlink check AS PART OF the open,
+        # so there is no window between deciding the path is safe and using it.
+        # `Path.write_bytes` follows links, which left a race the separate
+        # islink() guard could only narrow, never close.
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+        try:
+            os.ftruncate(fd, 0)
+            os.write(fd, data)
+        finally:
+            os.close(fd)
 
     return _privileged_fs(
         _direct,
@@ -710,13 +723,28 @@ def privileged_write_bytes(
     )
 
 
+def _chmod_nofollow(path: Path, mode: int) -> None:
+    """chmod without following a symlink, atomically.
+
+    `Path.chmod` follows links, so a separate islink() check leaves a window in
+    which the path can be replaced. Opening O_NOFOLLOW and using fchmod moves the
+    check into the kernel: if it is a link the open fails outright and nothing is
+    changed.
+    """
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    try:
+        os.fchmod(fd, mode)
+    finally:
+        os.close(fd)
+
+
 def privileged_chmod(
     path: str | Path, mode: int, *, allow_prompt: bool = False
 ) -> None:
     """chmod ``path``, elevating only if the direct chmod is refused."""
     path = Path(path)
     return _privileged_fs(
-        lambda: path.chmod(mode),
+        lambda: _chmod_nofollow(path, mode),
         ["chmod", format(mode, "o"), str(path)],
         action="set permissions on",
         path=path,
