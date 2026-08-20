@@ -3,10 +3,12 @@ Common utility code shared between modules.
 """
 
 import contextlib
+import fcntl
 import functools
 import json
 import errno
 import os
+import stat as stat_module
 import subprocess
 import time
 from pathlib import Path
@@ -805,3 +807,110 @@ def read_locks(s: str) -> dict[str, Any]:
 def write_locks(lock_dict: dict[str, Any]) -> str:
     """Converts ``lock_dict`` back to the string readable by ``read_locks``."""
     return json.dumps(lock_dict, indent=4)
+
+
+def open_failure_reason(e: OSError) -> str:
+    """A plain-language reason opening a path failed, for a user-facing message.
+
+    Translates the errno so a regular user sees why the file could not be opened
+    and what to check, instead of a bare ``[Errno NN]`` repr (whose default text
+    is sometimes misleading -- e.g. ELOOP prints 'Too many levels of symbolic
+    links' for a single planted symlink). Used by every O_NOFOLLOW open, which is
+    what surfaces ELOOP for a planted symlink.
+    """
+    reasons = {
+        errno.ELOOP: "it is a symlink (refused for safety)",
+        errno.EISDIR: "it is a directory, not a file",
+        errno.ENXIO: "it is a FIFO/special file with no reader (refused)",
+        errno.EACCES: (
+            "permission denied -- check the directory's ownership and permissions"
+        ),
+        errno.EPERM: (
+            "operation not permitted -- check the directory's ownership and permissions"
+        ),
+        errno.EROFS: "the filesystem is read-only",
+        errno.ENOTDIR: "a parent path component is not a directory",
+    }
+    if e.errno is None:
+        return str(e)
+    return reasons.get(e.errno, str(e))
+
+
+@contextlib.contextmanager
+def exclusive_lock(lockfile: Path, *, timeout: float, subject: str) -> Any:
+    """Hold an exclusive ``flock`` on ``lockfile``, or fail in a bounded way.
+
+    The one implementation of "only one of these at a time", so a second caller
+    cannot arrive with a weaker version of the same idea. ``subject`` names what
+    is being locked and appears in every message ("raw target /mnt/x", "this
+    run"), which is the only thing that differs between callers.
+
+    A bounded-blocking wait: it retries for up to ``timeout`` seconds so
+    legitimate contention SERIALISES rather than fails, then raises RuntimeError.
+    The lock is released when the fd closes and is auto-released if the process
+    dies, so it can never go stale.
+
+    Failure posture -- every one of these raises RuntimeError with a plain
+    reason rather than escaping as an uncaught OSError, so a hostile or
+    mis-created lock file degrades to the same bounded failure as ordinary
+    contention instead of crashing (or hanging) the caller:
+
+      * ``O_NOFOLLOW`` refuses a planted symlink, which could otherwise redirect
+        an often-root open somewhere else entirely;
+      * ``O_NONBLOCK`` makes a planted FIFO return ENXIO at once instead of
+        blocking the open forever waiting for a reader -- without it a single
+        FIFO wedges every run silently, which is a permanent denial of service;
+      * anything that opens but is not a REGULAR file (a FIFO that happened to
+        have a reader, a device, a socket) is refused after an fstat, because it
+        must not be trusted to coordinate anything;
+      * an errno other than EAGAIN/EWOULDBLOCK from ``flock`` (ENOLCK on a
+        filesystem that cannot lock, say) will never clear, so it fails at once
+        rather than polling for the full timeout and calling it "busy".
+    """
+    try:
+        fd = os.open(
+            lockfile,
+            os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK,
+            0o600,
+        )
+    except OSError as e:
+        raise RuntimeError(
+            f"{subject}: cannot acquire its lock file {lockfile} -- "
+            f"{open_failure_reason(e)}. The directory must not be writable by "
+            "untrusted users."
+        ) from e
+    try:
+        is_regular = stat_module.S_ISREG(os.fstat(fd).st_mode)
+    except OSError as e:
+        os.close(fd)
+        raise RuntimeError(
+            f"{subject}: cannot stat its lock file {lockfile} -- "
+            f"{open_failure_reason(e)}"
+        ) from e
+    if not is_regular:
+        os.close(fd)
+        raise RuntimeError(
+            f"{subject}: lock file {lockfile} is not a regular file (a FIFO, "
+            "device, or socket may have been planted); refusing to use it"
+        )
+    deadline = time.monotonic() + max(0.0, timeout)
+    try:
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError as e:
+                if e.errno not in (errno.EAGAIN, errno.EWOULDBLOCK):
+                    raise RuntimeError(
+                        f"{subject}: cannot lock {lockfile} ({e}); the filesystem "
+                        "may not support flock"
+                    ) from e
+                if time.monotonic() >= deadline:
+                    raise RuntimeError(
+                        f"{subject} is busy (another operation holds the lock); "
+                        "retry when it finishes"
+                    ) from None
+                time.sleep(0.2)
+        yield
+    finally:
+        os.close(fd)  # releases the flock

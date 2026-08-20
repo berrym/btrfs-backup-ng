@@ -14,15 +14,12 @@ Encryption methods:
 from __future__ import annotations
 
 import contextlib
-import errno
-import fcntl
 import hashlib
 import json
 import os
 import re
 import shlex
 import shutil
-import stat
 import subprocess
 import time
 from collections.abc import Iterator
@@ -200,31 +197,9 @@ LOCK_FILENAME = ".btrfs-backup-ng.lock"
 
 
 def _open_failure_reason(e: OSError) -> str:
-    """A plain-language reason opening a path failed, for a user-facing message.
-
-    Translates the errno so a regular user sees why the file could not be opened and
-    what to check, instead of a bare ``[Errno NN]`` repr (whose default text is
-    sometimes misleading -- e.g. ELOOP prints 'Too many levels of symbolic links'
-    for a single planted symlink). Shared by the lock open and the checksum open,
-    both of which use O_NOFOLLOW and so surface ELOOP for a planted symlink."""
-    reasons = {
-        errno.ELOOP: "it is a symlink (refused for safety)",
-        errno.EISDIR: "it is a directory, not a file",
-        errno.ENXIO: "it is a FIFO/special file with no reader (refused)",
-        errno.EACCES: (
-            "permission denied -- check the target directory's ownership and "
-            "permissions"
-        ),
-        errno.EPERM: (
-            "operation not permitted -- check the target directory's ownership and "
-            "permissions"
-        ),
-        errno.EROFS: "the filesystem is read-only",
-        errno.ENOTDIR: "a parent path component is not a directory",
-    }
-    if e.errno is None:
-        return str(e)
-    return reasons.get(e.errno, str(e))
+    """See ``__util__.open_failure_reason`` -- kept as a local name for the
+    call sites here (the checksum open as well as the lock open)."""
+    return __util__.open_failure_reason(e)  # type: ignore[attr-defined]
 
 
 _ELEVATION_SENTINEL = "__BBNG_ELEVATED__"
@@ -700,74 +675,12 @@ class RawEndpoint(Endpoint):
             timeout = float(self.config.get("lock_timeout", 30.0))
         path = Path(self.config["path"])
         path.mkdir(parents=True, exist_ok=True, mode=0o700)
-        lockfile = path / LOCK_FILENAME
-        # Harden the lock-file open against a hostile/mis-created lock:
-        #   O_NOFOLLOW  -- refuse a planted symlink (cannot redirect the often-root open)
-        #   O_NONBLOCK  -- a planted FIFO/named-pipe returns ENXIO immediately instead of
-        #                  blocking the open FOREVER waiting for a reader; without it a
-        #                  single FIFO wedges every backup/prune/maintenance op silently
-        #                  (a permanent DoS). No-op for a regular file.
-        # Any open failure is mapped to a bounded RuntimeError (with a plain-language
-        # reason) so it can never escape as an uncaught OSError.
-        try:
-            fd = os.open(
-                lockfile,
-                os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK,
-                0o600,
-            )
-        except OSError as e:
-            raise RuntimeError(
-                f"raw target {path}: cannot acquire its lock file {lockfile} -- "
-                f"{_open_failure_reason(e)}. The target directory must not be writable by "
-                "untrusted users."
-            ) from e
-        # Even if the open succeeded, refuse to trust anything that is not a REGULAR
-        # file: a FIFO that happened to have a reader, or a device/socket planted as
-        # the lock, must not be used to coordinate (or for any I/O).
-        try:
-            is_regular = stat.S_ISREG(os.fstat(fd).st_mode)
-        except OSError as e:
-            # Map to RuntimeError like every other branch here, so a stat failure on
-            # an exotic/hostile lock degrades to the bounded fail/skip posture rather
-            # than escaping as an uncaught OSError (which the prune path would not
-            # catch, and the CLI would misreport on stdout).
-            os.close(fd)
-            raise RuntimeError(
-                f"raw target {path}: cannot stat its lock file {lockfile} -- "
-                f"{_open_failure_reason(e)}"
-            ) from e
-        if not is_regular:
-            os.close(fd)
-            raise RuntimeError(
-                f"raw target {path}: lock file {lockfile} is not a regular file (a "
-                "FIFO, device, or socket may have been planted); refusing to use it"
-            )
-        deadline = time.monotonic() + max(0.0, timeout)
-        try:
-            while True:
-                try:
-                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                    break
-                except OSError as e:
-                    # EAGAIN/EWOULDBLOCK (BlockingIOError) is the real contention
-                    # signal -- retry until the deadline. Any other errno (e.g. ENOLCK
-                    # from a filesystem that cannot flock) will never clear, so fail
-                    # immediately with an accurate message instead of polling for the
-                    # full timeout and mislabelling it "busy".
-                    if e.errno not in (errno.EAGAIN, errno.EWOULDBLOCK):
-                        raise RuntimeError(
-                            f"raw target {path}: cannot lock {lockfile} ({e}); the "
-                            "filesystem may not support flock"
-                        ) from e
-                    if time.monotonic() >= deadline:
-                        raise RuntimeError(
-                            f"raw target {path} is busy (another operation holds the "
-                            "lock); retry when it finishes"
-                        ) from None
-                    time.sleep(0.2)
+        with __util__.exclusive_lock(  # type: ignore[attr-defined]
+            path / LOCK_FILENAME,
+            timeout=timeout,
+            subject=f"raw target {path}",
+        ):
             yield
-        finally:
-            os.close(fd)  # releases the flock
 
     def _prepare(self) -> None:
         """Prepare the endpoint for use."""
