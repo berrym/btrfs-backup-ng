@@ -1128,6 +1128,40 @@ class Endpoint:
             )
             raise __util__.AbortError from e
 
+    def _entry_snapshot_name(self, entry: str) -> Optional[str]:
+        """The snapshot name a directory entry represents, or None if it is not one.
+
+        Where one snapshot is one subvolume the entry IS the name, so this is
+        identity. A raw destination stores FILES -- ``<name>.btrfs`` plus
+        compression and encryption suffixes -- and overrides this. Without the
+        seam, the prefix diagnostics tried to parse ``home-20260810-101010.btrfs``
+        as ``<prefix><timestamp>``, which never parses, so a raw location full of
+        backups had nothing to report and answered a prefix mismatch with silence.
+        """
+        return entry
+
+    def _snapshot_names_at_location(self) -> Optional[List[str]]:
+        """Entries at this location as snapshot names, or None if unreadable.
+
+        Shared by both prefix diagnostics so they cannot disagree about what is
+        there: one enumerates to decide, the other to explain, and an endpoint
+        that answered one but not the other would name a prefix on screen that
+        the restore could not then act on.
+        """
+        path = self.config.get("path")
+        if not path:
+            return None
+        try:
+            entries = [
+                str(entry).rstrip("/").rsplit("/", 1)[-1]
+                for entry in self._listdir(path)
+            ]
+        except Exception as e:  # noqa: BLE001 - a diagnostic must never itself abort
+            logger.debug("Could not enumerate %s for a prefix hint: %s", path, e)
+            return None
+        names = [self._entry_snapshot_name(entry) for entry in entries]
+        return [name for name in names if name]
+
     def prefixes_present(self) -> Dict[str, int]:
         """Snapshot prefixes actually at this location, and how many use each.
 
@@ -1137,22 +1171,14 @@ class Endpoint:
         share one computation instead of the answer existing only inside a
         sentence.
         """
-        path = self.config.get("path")
-        if not path:
-            return {}
-        try:
-            entries = [
-                str(entry).rstrip("/").rsplit("/", 1)[-1]
-                for entry in self._listdir(path)
-            ]
-        except Exception as e:  # noqa: BLE001 - a diagnostic must never itself abort
-            logger.debug("Could not enumerate %s for a prefix hint: %s", path, e)
+        names = self._snapshot_names_at_location()
+        if names is None:
             return {}
 
         configured = self.config.get("snap_prefix", "") or ""
         fmt = self.config.get("timestamp_format")
         found: Dict[str, int] = {}
-        for name in entries:
+        for name in names:
             inferred = __util__.infer_snapshot_prefix(name, fmt)
             if inferred is None or inferred == configured:
                 continue
@@ -1174,18 +1200,10 @@ class Endpoint:
         here" from "something is here that your prefix did not match", and names
         the prefixes that would have matched.
         """
-        path = self.config.get("path")
-        if not path:
+        names = self._snapshot_names_at_location()
+        if names is None:
             return None
-        try:
-            entries = [
-                str(entry).rstrip("/").rsplit("/", 1)[-1]
-                for entry in self._listdir(path)
-            ]
-        except Exception as e:  # noqa: BLE001 - a diagnostic must never itself abort
-            logger.debug("Could not enumerate %s for a prefix hint: %s", path, e)
-            return None
-        return self._explain_prefix_mismatch(entries)
+        return self._explain_prefix_mismatch(names)
 
     def _explain_prefix_mismatch(
         self, names: List[str], elsewhere: Optional[List[str]] = None

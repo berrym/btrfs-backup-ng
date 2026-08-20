@@ -1618,6 +1618,26 @@ class RawEndpoint(Endpoint):
             stderr=subprocess.PIPE,
         )
 
+    def _entry_snapshot_name(self, entry: str) -> str | None:
+        """A raw entry is a FILE, not a subvolume: strip the stream suffixes.
+
+        The base implementation treats the entry name as the snapshot name,
+        which holds where one snapshot is one subvolume. A raw destination holds
+        ``<name>.btrfs`` with compression and encryption suffixes on top, so
+        every entry failed to parse as ``<prefix><timestamp>`` and both prefix
+        diagnostics came back empty. Measured on a raw:// destination holding two
+        good backups: asked for a prefix that matched neither, it listed zero,
+        offered no explanation, and could not infer the prefix that would have
+        worked -- a location full of backups reporting a clean empty result, at
+        the one moment that answer does the most damage.
+
+        Sidecars describe a stream rather than being one; counting them would
+        report every prefix twice.
+        """
+        if entry.endswith(".meta"):
+            return None
+        return parse_stream_filename(entry).get("name") or None
+
     def list_snapshots(self, flush_cache: bool = False) -> list[RawSnapshot]:
         """List all raw snapshots in the target directory.
 
