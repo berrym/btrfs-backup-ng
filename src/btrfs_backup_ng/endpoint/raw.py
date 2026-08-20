@@ -816,7 +816,7 @@ class RawEndpoint(Endpoint):
         return missing
 
     def receive(
-        self, stdin_pipe: Any, snapshot_name: str = "", parent_name: str | None = None
+        self, stdin: Any, snapshot_name: str = "", parent_name: str | None = None
     ) -> Any:
         """Write a btrfs send stream to a file.
 
@@ -824,7 +824,7 @@ class RawEndpoint(Endpoint):
         instead of piping to 'btrfs receive'.
 
         Args:
-            stdin_pipe: Input stream (from btrfs send)
+            stdin: Input stream (from btrfs send)
             snapshot_name: Name for the snapshot file
             parent_name: Parent snapshot name (for metadata)
 
@@ -875,7 +875,7 @@ class RawEndpoint(Endpoint):
 
         # Build and execute the pipeline (writes to the .part file)
         pipeline = self._build_receive_pipeline(part_path)
-        proc = self._execute_pipeline(pipeline, stdin_pipe)
+        proc = self._execute_pipeline(pipeline, stdin)
 
         return proc
 
