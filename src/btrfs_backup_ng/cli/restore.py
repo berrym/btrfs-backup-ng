@@ -5,6 +5,7 @@ for disaster recovery, migration, or backup verification.
 """
 
 import argparse
+import dataclasses
 import logging
 import time
 from datetime import datetime
@@ -442,6 +443,74 @@ def _execute_list(args: argparse.Namespace) -> int:
     return 0
 
 
+def _configured_target_options(args: argparse.Namespace, source: str) -> dict:
+    """SSH/decryption options configured for ``source`` in the user's config.
+
+    A restore names its source as a URI on the command line, so nothing tied it
+    back to the target entry that produced those backups -- the options lived in
+    the config file and only ``--ssh-*`` flags were consulted. The result was a
+    backup that wrote successfully for months and then could not be READ:
+
+        $ btrfs-backup-ng -c config.toml restore --list raw+ssh://host:/backups
+        ERROR  Failed to create remote directory: ...
+
+    while the identical target backed up fine, because `run` reads the config and
+    `restore` did not. Passing --ssh-key by hand made it work, which is the whole
+    diagnosis. Measured on a real host.
+
+    Matching is on the target path as written, after stripping a trailing slash.
+    Returns {} when there is no config, no match, or anything goes wrong -- a
+    convenience lookup must never be the reason a restore cannot start.
+    """
+    try:
+        config_file = find_config_file(getattr(args, "config", None))
+        if config_file is None:
+            return {}
+        config, _warnings = load_config(config_file)
+    except Exception as e:  # noqa: BLE001 - a lookup failure must not block a restore
+        logger.debug("Could not read config for target options: %s", e)
+        return {}
+
+    wanted = source.rstrip("/")
+    for volume in getattr(config, "volumes", []) or []:
+        for target in getattr(volume, "targets", []) or []:
+            if str(getattr(target, "path", "")).rstrip("/") != wanted:
+                continue
+            defaults = {
+                field.name: field.default
+                for field in dataclasses.fields(target)
+                if field.default is not dataclasses.MISSING
+            }
+            found = {}
+            for key in (
+                "ssh_key",
+                "ssh_sudo",
+                "ssh_port",
+                "ssh_auth_sock",
+                "ssh_host_key_policy",
+                "ssh_password_auth",
+                "gpg_keyring",
+                "openssl_cipher",
+            ):
+                value = getattr(target, key, None)
+                if value in (None, "", False):
+                    continue
+                # Only what this target actually says. Schema defaults are not
+                # choices the user made, and reporting them as "configured" turns
+                # a local restore into a claim about SSH settings it never had.
+                if key in defaults and value == defaults[key]:
+                    continue
+                found[key] = value
+            if found:
+                logger.info(
+                    "Using the options configured for this target in %s: %s",
+                    config_file,
+                    ", ".join(sorted(found)),
+                )
+            return found
+    return {}
+
+
 def _prepare_backup_endpoint(args: argparse.Namespace, source: str):
     """Prepare the backup endpoint for restore.
 
@@ -469,15 +538,27 @@ def _prepare_backup_endpoint(args: argparse.Namespace, source: str):
     # does not start with it, so a remote raw source used to be given none of the
     # --ssh-* options and its remote listing ran as whoever ssh logged in as.
     scheme = parse_target(source)
+    # What the config says about THIS target. Command-line flags still win; this
+    # only fills what was not given, so a restore works with the same settings
+    # that produced the backup instead of demanding they be retyped.
+    configured = _configured_target_options(args, source)
+
     if scheme.needs_ssh_options:
-        endpoint_kwargs["ssh_sudo"] = getattr(args, "ssh_sudo", False)
-        _hkp = getattr(args, "ssh_host_key_policy", None)
+        endpoint_kwargs["ssh_sudo"] = getattr(args, "ssh_sudo", False) or bool(
+            configured.get("ssh_sudo", False)
+        )
+        _port = configured.get("ssh_port")
+        if _port:
+            endpoint_kwargs["ssh_port"] = _port
+        _hkp = getattr(args, "ssh_host_key_policy", None) or configured.get(
+            "ssh_host_key_policy"
+        )
         if _hkp:
             endpoint_kwargs["ssh_host_key_policy"] = _hkp
         endpoint_kwargs["ssh_password_fallback"] = getattr(
             args, "ssh_password_auth", True
         )
-        ssh_key = getattr(args, "ssh_key", None)
+        ssh_key = getattr(args, "ssh_key", None) or configured.get("ssh_key")
         if ssh_key:
             # The two remote endpoints read the identity file under DIFFERENT
             # config keys: SSHEndpoint accepts either name, SSHRawEndpoint reads
@@ -487,7 +568,9 @@ def _prepare_backup_endpoint(args: argparse.Namespace, source: str):
             endpoint_kwargs[scheme.ssh_identity_config_key or "ssh_identity_file"] = (
                 ssh_key
             )
-        ssh_auth_sock = getattr(args, "ssh_auth_sock", None)
+        ssh_auth_sock = getattr(args, "ssh_auth_sock", None) or configured.get(
+            "ssh_auth_sock"
+        )
         if ssh_auth_sock:
             endpoint_kwargs["ssh_auth_sock"] = ssh_auth_sock
     elif not scheme.is_raw:
@@ -503,10 +586,12 @@ def _prepare_backup_endpoint(args: argparse.Namespace, source: str):
     # so the sidecar-recorded cipher stays authoritative; the endpoint value is
     # the fallback for a legacy sidecar. Harmless for non-raw endpoints (dropped
     # by the base config whitelist).
-    gpg_keyring = getattr(args, "gpg_keyring", None)
+    gpg_keyring = getattr(args, "gpg_keyring", None) or configured.get("gpg_keyring")
     if gpg_keyring:
         endpoint_kwargs["gpg_keyring"] = gpg_keyring
-    openssl_cipher = getattr(args, "openssl_cipher", None)
+    openssl_cipher = getattr(args, "openssl_cipher", None) or configured.get(
+        "openssl_cipher"
+    )
     if openssl_cipher:
         endpoint_kwargs["openssl_cipher"] = openssl_cipher
 
