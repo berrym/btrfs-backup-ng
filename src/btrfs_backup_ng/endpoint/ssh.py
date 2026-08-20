@@ -2997,12 +2997,14 @@ print(json.dumps(result))
                 show_progress=show_progress,
             )
 
-        # Fall back to shell pipeline for passwordless sudo or no-sudo cases
+        # Fall back to the shell pipeline: passwordless sudo, no sudo at all, or
+        # password sudo on a host without paramiko. Only this caller knows which.
         return self._do_shell_pipeline_transfer(
             source_path=source_path,
             dest_path=dest_path,
             snapshot_name=snapshot_name,
             parent_path=parent_path,
+            password_sudo=bool(use_sudo) and not passwordless_available,
             show_progress=show_progress,
         )
 
@@ -3391,8 +3393,9 @@ print(json.dumps(result))
         snapshot_name: str,
         parent_path: Optional[str] = None,
         show_progress: bool = False,
+        password_sudo: bool = False,
     ) -> bool:
-        """Execute transfer using shell pipeline (for passwordless sudo).
+        """Execute transfer using a shell pipeline.
 
         Args:
             source_path: Path to the source snapshot
@@ -3465,16 +3468,76 @@ print(json.dumps(result))
             ssh_parts.extend(["-p", str(ssh_port)])
         ssh_parts.append(remote_host)
 
-        # Build remote command with orphan protection (passwordless sudo).
+        # Build remote command with orphan protection.
         # _build_receive_command escapes the destination itself; do not pre-quote.
         # The extra shlex.quote below is for the LOCAL bash pipeline, not the remote.
+        #
+        # This path is reached for password-based sudo too, whenever paramiko is
+        # not installed -- `_do_piped_transfer` sends it here as its fallback.
+        # It used to hardcode password_on_stdin=False, emitting `sudo -n` at a
+        # remote that wants a password: sudo refused, the receive died, and the
+        # operator saw `zstd: Broken pipe` from the local end of the pipeline
+        # with nothing naming the real cause.
+        # The CALLER states whether a password is needed rather than this method
+        # guessing from config. `passwordless_sudo_available` is only populated
+        # once diagnostics have run, so re-deriving it here made every caller
+        # that had not run them look like a password remote and demand a
+        # password where `sudo -n` had always worked.
+        needs_password = bool(use_sudo) and password_sudo
+        sudo_password = self._get_sudo_password() if needs_password else None
+        if needs_password and not sudo_password:
+            logger.error(
+                "This remote's sudo requires a password and none is available. "
+                "Set BTRFS_BACKUP_SUDO_PASSWORD, install paramiko (which handles "
+                "the password prompt directly), or grant the remote user "
+                "passwordless sudo for /usr/bin/btrfs."
+            )
+            return False
+
+        compress_method = self._stream_compress_method()
         remote_cmd = _build_receive_command(
-            dest_path, use_sudo=use_sudo, password_on_stdin=False
+            dest_path,
+            use_sudo=use_sudo,
+            password_on_stdin=needs_password,
+            decompress=compress_method,
         )
         ssh_parts.append(shlex.quote(remote_cmd))
         ssh_cmd = " ".join(ssh_parts)
 
-        full_pipeline = f"{send_cmd} | {pv_cmd} | {ssh_cmd}"
+        # Compression, when configured, sits between the progress meter and ssh
+        # so only compressed bytes cross the wire. _build_receive_command puts
+        # the matching decompressor on the remote side.
+        if compress_method:
+            from ..core.transfer import COMPRESSION_PROGRAMS
+
+            compressor = " ".join(
+                shlex.quote(part)
+                for part in COMPRESSION_PROGRAMS[compress_method]["compress"]
+            )
+            logger.info(
+                "Compressing the transfer with %s (decompressed on the remote "
+                "before btrfs receive)",
+                compress_method,
+            )
+            stream = f"{send_cmd} | {pv_cmd} | {compressor}"
+        else:
+            stream = f"{send_cmd} | {pv_cmd}"
+
+        if needs_password:
+            # `sudo -S` reads the password from the first line of ITS stdin, and
+            # its stdin is whatever crosses the wire. The line therefore has to be
+            # OUTSIDE the compression: prepended to the compressed stream, not fed
+            # through the compressor, or the remote sudo would be handed
+            # compressed bytes where it expects a password and the operator would
+            # be told the password was wrong.
+            #
+            # The password reaches the shell through the environment rather than
+            # the command line, so it does not appear in `ps` for other users.
+            full_pipeline = (
+                f'{{ printf "%s\\n" "$BTRFS_BACKUP_SUDO_PW"; {stream}; }} | {ssh_cmd}'
+            )
+        else:
+            full_pipeline = f"{stream} | {ssh_cmd}"
 
         logger.info(f"Transferring {snapshot_name} to {self.hostname}:{dest_path}")
         logger.debug(f"Pipeline: {full_pipeline}")
@@ -3485,6 +3548,13 @@ print(json.dumps(result))
         # upstream send failure and yields a truncated/empty backup reported as
         # success. Degrade to plain sh (with a warning) only if bash is absent.
         bash_path = shutil.which("bash")
+        # The password travels in the environment of this one subprocess, never
+        # in an argument vector: /proc/<pid>/environ is readable only by its own
+        # user, whereas /proc/<pid>/cmdline is world-readable, so a command line
+        # would show the password to every user on the machine.
+        pipeline_env = dict(os.environ)
+        if needs_password and sudo_password:
+            pipeline_env["BTRFS_BACKUP_SUDO_PW"] = sudo_password
         try:
             if bash_path:
                 proc = subprocess.Popen(
@@ -3494,6 +3564,7 @@ print(json.dumps(result))
                     stdin=subprocess.DEVNULL,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
+                    env=pipeline_env,
                 )
             else:
                 logger.warning(
@@ -3506,6 +3577,7 @@ print(json.dumps(result))
                     stdin=subprocess.DEVNULL,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
+                    env=pipeline_env,
                 )
 
             stderr_lines: List[str] = []
