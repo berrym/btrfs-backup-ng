@@ -767,6 +767,26 @@ class SSHEndpoint(Endpoint):
         remote_str = " ".join(shlex.quote(str(a)) for a in remote_cmd)
         ssh_cmd = self.ssh_manager.get_ssh_base_cmd(force_tty=False) + [remote_str]
         logger.debug("Remote btrfs send over ssh: %s", " ".join(ssh_cmd))
+        # When the remote's sudo wants a password, _build_remote_command has just
+        # produced `sudo -S btrfs send ...`, which reads that password from ITS
+        # stdin. Nothing used to write one: the process was opened with no stdin
+        # at all, so sudo read EOF, exited 1, and the restore reported
+        # "btrfs send/receive failed with return codes: [1, 1]".
+        #
+        # That made a whole class of destination back up but never restore --
+        # measured against a real remote whose sudo requires a password. Backing
+        # up to a host you cannot restore from is the worst way for this to fail,
+        # because nothing reveals it until the day it matters.
+        needs_password = any(part == "-S" for part in remote_cmd)
+        password = self._get_sudo_password() if needs_password else None
+        if needs_password and not password:
+            raise __util__.AbortError(
+                f"Restoring from {self.hostname} needs a sudo password for the "
+                f"remote `btrfs send`, and none is available. Set "
+                f"BTRFS_BACKUP_SUDO_PASSWORD, or grant the remote user "
+                f"passwordless sudo for /usr/bin/btrfs."
+            )
+
         # stderr -> DEVNULL, matching the base send and every other send in the codebase.
         # The transfer supervisor blocks on the RECEIVE and does NOT drain the send's
         # stderr during the stream, so a PIPE here could (pathologically) fill -- ssh also
@@ -775,9 +795,20 @@ class SSHEndpoint(Endpoint):
         # exits non-zero and the receive fails, and the supervisor terminates the send and
         # reports the failure. (Never redirect remote stderr into stdout -- it corrupts the
         # btrfs stream.)
-        return subprocess.Popen(
-            ssh_cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
+        process = subprocess.Popen(
+            ssh_cmd,
+            stdin=subprocess.PIPE if password else None,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
         )
+        if password and process.stdin:
+            # The password line, then EOF. ssh forwards our stdin to the remote
+            # command; sudo consumes the line and `btrfs send` never reads stdin,
+            # so closing immediately is correct and stops the remote waiting.
+            process.stdin.write(f"{password}\n".encode())
+            process.stdin.flush()
+            process.stdin.close()
+        return process
 
     def _apply_agent_forwarding(self) -> None:
         """
