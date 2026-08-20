@@ -78,6 +78,13 @@ class BtrbkOption:
     line: int
 
 
+#: A target is remote when it carries an ssh URL scheme (``ssh://``, and the
+#: ``raw+ssh://`` family) or is written in ``user@host:path`` form. Anchored at
+#: the start so that an "@" inside a local path -- ``/mnt/backup/@snapshots``,
+#: the standard btrfs subvolume layout -- is not mistaken for a login.
+_REMOTE_TARGET_RE = re.compile(r"(?:[a-z0-9+.-]*\+)?ssh://|[^/\s]+@[^/\s]+:", re.I)
+
+
 @dataclass
 class BtrbkTarget:
     """A btrbk target section."""
@@ -899,6 +906,16 @@ def convert_to_toml(btrbk_config: BtrbkConfig) -> tuple[str, list[str]]:
                     # key file called "no".
                     return None if _is_disabled(value) else value
 
+                # btrbk's `backend` says whether it elevates on the remote:
+                # btrfs-progs-sudo does, btrfs-progs does not. ssh_sudo was
+                # hardcoded true for every ssh target regardless, so a config
+                # that explicitly chose the non-sudo backend was migrated to one
+                # that elevates -- the operator's explicit choice reversed
+                # without a word. Unset, the previous default is kept, because
+                # connecting as a non-root user usually does need it and that is
+                # what the trailing hint says.
+                backend = inherited("backend") or inherited("backend_remote")
+                ssh_sudo = True if not backend else "sudo" in str(backend).lower()
                 ssh_identity = inherited("ssh_identity")
                 ssh_user = inherited("ssh_user")
                 ssh_port = inherited("ssh_port")
@@ -986,9 +1003,16 @@ def convert_to_toml(btrbk_config: BtrbkConfig) -> tuple[str, list[str]]:
 
                 lines.append(f'path = "{target_path}"')
 
-                if ssh_identity:
+                # A local target has no ssh connection to configure. Emitting
+                # these put irrelevant credentials in the block and made the
+                # local case look remote to anyone reading the file. Matched
+                # structurally rather than by searching for "@": "@" appears in
+                # the middle of ordinary local paths under the standard btrfs
+                # layout (/mnt/backup/@snapshots), which is not a remote target.
+                is_remote_target = bool(_REMOTE_TARGET_RE.match(target_path))
+                if ssh_identity and is_remote_target:
                     lines.append(f'ssh_key = "{ssh_identity}"')
-                if ssh_port:
+                if ssh_port and is_remote_target:
                     port = str(ssh_port).strip()
                     if port.isdigit():
                         lines.append(f"ssh_port = {port}")
@@ -1147,10 +1171,54 @@ def convert_to_toml(btrbk_config: BtrbkConfig) -> tuple[str, list[str]]:
                     # Check if sudo might be needed
                     if not is_raw_target:
                         lines.append(
-                            "ssh_sudo = true  # May be required for btrfs receive"
+                            f"ssh_sudo = {'true' if ssh_sudo else 'false'}"
+                            + (
+                                ""
+                                if backend
+                                else "  # May be required for btrfs receive"
+                            )
                         )
 
                 lines.append("")
+
+    # Options btrbk understands that this project has no equivalent for. They
+    # were in the lexer's keyword set -- so they never looked unknown -- stored,
+    # and never read again: the operator set something deliberately and was told
+    # nothing. Saying so is the whole difference between "not supported" and
+    # "quietly ignored".
+    _UNMAPPED = {
+        "snapshot_create": (
+            "controls WHEN btrbk creates snapshots (always/onchange/ondemand/no); "
+            "btrfs-backup-ng always creates one per run"
+        ),
+        "stream_buffer": (
+            "sets the transfer buffer size; btrfs-backup-ng sizes its own buffer "
+            "and does not expose it"
+        ),
+        "lockfile": "btrfs-backup-ng manages its own locking",
+        "transaction_log": "btrfs-backup-ng writes its own transaction log",
+        "btrfs_commit_delete": "has no equivalent",
+        "group": "target grouping has no equivalent",
+    }
+    unmapped_scopes: list[tuple[str, dict[str, str]]] = [
+        ("global", btrbk_config.global_options)
+    ]
+    for volume in btrbk_config.volumes:
+        unmapped_scopes.append((f"volume {volume.path}", volume.options))
+        for subvolume in volume.subvolumes:
+            unmapped_scopes.append((f"subvolume {subvolume.path}", subvolume.options))
+            # Target scope is where `group` is usually set, so leaving it out
+            # would have reproduced the same silence one level down.
+            for target in subvolume.targets:
+                unmapped_scopes.append((f"target {target.path}", target.options))
+
+    for scope_name, scope in unmapped_scopes:
+        for key, why in _UNMAPPED.items():
+            value = scope.get(key)
+            if value and not _is_disabled(value):
+                warnings.append(
+                    f"{key} {value!r} ({scope_name}) is not carried over: {why}"
+                )
 
     # Warn about btrbk retention directives that have NO btrfs-backup-ng equivalent
     # (rather than silently dropping them). Scan every scope where they can appear.

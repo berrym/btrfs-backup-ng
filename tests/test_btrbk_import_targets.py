@@ -533,3 +533,164 @@ class TestEncryptionIsNeverEmittedUnloadable:
         )
         assert 'encrypt = "gpg"' in toml
         assert 'gpg_recipient = "me@example.com"' in toml
+
+
+class TestTheBackendChoiceIsRespected:
+    """btrbk's `backend` says whether it elevates on the remote.
+
+    ssh_sudo was hardcoded true for every ssh target regardless, so a config
+    that explicitly chose the non-sudo backend migrated to one that elevates --
+    the operator's explicit choice reversed silently. The migration guide
+    promises this mapping by name.
+    """
+
+    def _sudo_line(self, text):
+        toml, _ = convert_to_toml(
+            parse_btrbk_config(
+                text + "volume /mnt/pool\n  subvolume home\n"
+                "    target send-receive ssh://nas/backup\n"
+            )
+        )
+        return next(
+            (line.strip() for line in toml.splitlines() if "ssh_sudo" in line), ""
+        )
+
+    def test_the_sudo_backend_elevates(self):
+        assert self._sudo_line("backend btrfs-progs-sudo\n").startswith(
+            "ssh_sudo = true"
+        )
+
+    def test_the_plain_backend_does_not(self):
+        assert self._sudo_line("backend btrfs-progs\n").startswith("ssh_sudo = false")
+
+    def test_an_unset_backend_keeps_the_previous_default(self):
+        """Connecting as a non-root user usually does need it, and the hint says so."""
+        line = self._sudo_line("")
+        assert line.startswith("ssh_sudo = true")
+        assert "May be required" in line
+
+    def test_backend_remote_is_honoured_too(self):
+        assert self._sudo_line("backend_remote btrfs-progs\n").startswith(
+            "ssh_sudo = false"
+        )
+
+
+class TestLocalTargetsGetNoSshOptions:
+    """A local target has no connection to configure."""
+
+    def _block(self, text):
+        toml, _ = convert_to_toml(parse_btrbk_config(text))
+        return toml.split("[[volumes.targets]]")[1]
+
+    def test_a_local_target_carries_no_key_or_port(self):
+        block = self._block(
+            "ssh_identity /keys/id\nssh_port 2222\n"
+            "volume /mnt/pool\n  subvolume home\n    target /mnt/backup\n"
+        )
+        assert "ssh_key" not in block, block
+        assert "ssh_port" not in block, block
+
+    def test_a_remote_target_still_carries_them(self):
+        block = self._block(
+            "ssh_identity /keys/id\nssh_port 2222\n"
+            "volume /mnt/pool\n  subvolume home\n"
+            "    target send-receive ssh://nas/backup\n"
+        )
+        assert 'ssh_key = "/keys/id"' in block, block
+        assert "ssh_port = 2222" in block, block
+
+
+class TestUnmappedOptionsAreReported:
+    """Recognised, stored, never read -- and never mentioned.
+
+    These are in the lexer's keyword set, so they do not trigger the
+    unknown-keyword path, and the converter never looks at them again. The
+    operator set something deliberately and heard nothing about it.
+    """
+
+    @pytest.mark.parametrize(
+        ("option", "value"),
+        [
+            ("snapshot_create", "onchange"),
+            ("stream_buffer", "256m"),
+            ("lockfile", "/var/lock/btrbk.lock"),
+            ("transaction_log", "/var/log/btrbk.log"),
+            ("btrfs_commit_delete", "after"),
+            ("group", "nightly"),
+        ],
+    )
+    def test_each_is_named_in_the_warnings(self, option, value):
+        _toml, warnings = convert_to_toml(
+            parse_btrbk_config(
+                f"{option} {value}\nvolume /mnt/pool\n  subvolume home\n"
+                f"    target send-receive ssh://nas/backup\n"
+            )
+        )
+        assert any(option in w and "not carried over" in w for w in warnings), warnings
+
+    def test_a_disabled_one_is_not_reported(self):
+        """`no` means the operator turned it off; nothing is being lost."""
+        _toml, warnings = convert_to_toml(
+            parse_btrbk_config(
+                "snapshot_create no\nvolume /mnt/pool\n  subvolume home\n"
+                "    target send-receive ssh://nas/backup\n"
+            )
+        )
+        assert not any("snapshot_create" in w for w in warnings), warnings
+
+
+class TestRemoteDetectionIsStructural:
+    """ "@" appears in ordinary local paths; it does not make a target remote.
+
+    The standard btrfs layout puts subvolumes at @, @home, @snapshots, so a
+    substring test for "@" reads /mnt/backup/@snapshots as a login and writes
+    ssh credentials into a local target block.
+    """
+
+    def _block(self, target_line):
+        toml, _ = convert_to_toml(
+            parse_btrbk_config(
+                "ssh_identity /keys/id\nssh_port 2222\n"
+                f"volume /mnt/pool\n  subvolume home\n    target {target_line}\n"
+            )
+        )
+        return toml.split("[[volumes.targets]]")[1]
+
+    @pytest.mark.parametrize(
+        "local_path",
+        [
+            "/mnt/backup/@snapshots",
+            "/mnt/backup/@home",
+            "/srv/backups@2026",
+        ],
+    )
+    def test_an_at_sign_inside_a_local_path_is_not_a_login(self, local_path):
+        block = self._block(local_path)
+        assert "ssh_key" not in block, block
+        assert "ssh_port" not in block, block
+
+    @pytest.mark.parametrize(
+        "remote",
+        [
+            "send-receive ssh://nas/backup",
+            "raw ssh://nas/backup",
+            "send-receive backup@nas:/srv/backup",
+        ],
+    )
+    def test_real_remotes_are_still_detected(self, remote):
+        block = self._block(remote)
+        assert "ssh_key" in block or "ssh_port" in block, block
+
+
+class TestUnmappedOptionsAtTargetScope:
+    """`group` is normally set per target, which is where silence would persist."""
+
+    def test_a_target_scoped_option_is_reported(self):
+        _toml, warnings = convert_to_toml(
+            parse_btrbk_config(
+                "volume /mnt/pool\n  subvolume home\n"
+                "    target send-receive ssh://nas/backup\n"
+                "      group nightly\n"
+            )
+        )
+        assert any("group" in w and "not carried over" in w for w in warnings), warnings
