@@ -4488,7 +4488,8 @@ print(json.dumps(result))
             [buffer_process] if buffer_process else []
         )
         if any(proc.poll() is None for proc in procs):
-            logger.error("FAILED: Transfer timed out; terminating processes")
+            self._last_transfer_error = self._timeout_failure_reason(max_wait_time)
+            logger.error("FAILED: %s Terminating processes.", self._last_transfer_error)
             for proc in procs:
                 if proc.poll() is None:
                     proc.terminate()
@@ -4564,6 +4565,27 @@ print(json.dumps(result))
 
         if elapsed > 60:  # After 1 minute
             logger.debug("   STATUS: Transfer progressing normally...")
+
+    def _timeout_failure_reason(self, limit: float) -> str:
+        """Why the transfer was killed, in words that name the culprit.
+
+        Both monitors used to log "Transfer timed out" and return, without
+        recording a reason anywhere the run summary or the transaction log
+        would find it. The operator saw a generic failure, so the obvious
+        suspect was an ssh idle or keepalive timeout -- which commonly defaults
+        to an hour too, and sends people into sshd_config for an afternoon.
+        Reported by mjg in #93, who did exactly that before finding it was ours.
+
+        A limit we impose has to say so, say what it was, and say that being
+        slow is not the same as being stuck.
+        """
+        return (
+            f"btrfs-backup-ng's own transfer timeout of {limit:.0f}s elapsed while "
+            f"the transfer was still running, so it was terminated and the backup "
+            f"is incomplete. This is a btrfs-backup-ng limit, NOT an ssh idle or "
+            f"keepalive timeout: a large first transfer over a slow link can pass "
+            f"it while working perfectly."
+        )
 
     def _log_process_error(self, process: Any, process_name: str) -> Optional[str]:
         """Log a failed process's stderr and RETURN it (stripped), or None.
@@ -4653,8 +4675,10 @@ print(json.dumps(result))
         # everything and fail — a still-running receive has NOT completed, and
         # accepting it here (on path existence) is exactly the false-success bug.
         if any(proc.poll() is None for proc in processes_to_wait):
+            self._last_transfer_error = self._timeout_failure_reason(max_wait_time)
             logger.error(
-                "FAILED: Transfer timed out after %.1fs; terminating processes",
+                "FAILED: %s Ran for %.1fs. Terminating processes.",
+                self._last_transfer_error,
                 elapsed_final,
             )
             for proc in processes_to_wait:
