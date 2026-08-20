@@ -18,6 +18,8 @@ fix is to say so at install time and offer the two safe options.
 
 from __future__ import annotations
 
+from unittest.mock import patch
+
 from pathlib import Path
 
 import pytest
@@ -112,3 +114,48 @@ class TestTheUnitDoesNotPointAtAHomeDirectory:
         `--config {config_path}` here, this fails and they have to read why."""
         assert "--config" not in SERVICE_TEMPLATE
         assert "{exec_start} run" in SERVICE_TEMPLATE
+
+
+class TestARootTimerDoesNotRunAUserWritableBinary:
+    """The unit's executable is the stronger version of the config warning.
+
+    This module already refuses to point a root service at a config in a home
+    directory, because a root service must not take its input from a path other
+    users may write. The ExecStart path was resolved through PATH, so a
+    `--user`/pipx/uv install put `~/.local/bin/btrfs-backup-ng` into a SYSTEM
+    unit: whoever can write that file decides what root runs, every night.
+    """
+
+    def _warning(self, path, user_mode=False):
+        from btrfs_backup_ng.cli.install import _exec_start_trust_warning
+
+        return _exec_start_trust_warning(str(path), user_mode)
+
+    def test_a_home_directory_binary_is_flagged_for_a_system_unit(self, tmp_path):
+        binary = tmp_path / "btrfs-backup-ng"
+        binary.write_text("#!/bin/sh\n")
+        binary.chmod(0o755)
+        with patch("btrfs_backup_ng.cli.install.Path.home", return_value=tmp_path):
+            warning = self._warning(binary)
+        assert warning is not None
+        assert str(binary) in warning
+        assert "--user" in warning
+
+    def test_a_world_writable_binary_is_flagged(self, tmp_path):
+        binary = tmp_path / "btrfs-backup-ng"
+        binary.write_text("#!/bin/sh\n")
+        binary.chmod(0o777)
+        assert self._warning(binary) is not None
+
+    def test_a_user_unit_is_not_flagged(self, tmp_path):
+        """A user timer runs as that user; there is no trust boundary to cross."""
+        binary = tmp_path / "btrfs-backup-ng"
+        binary.write_text("#!/bin/sh\n")
+        binary.chmod(0o755)
+        assert self._warning(binary, user_mode=True) is None
+
+    def test_a_root_owned_system_path_is_not_flagged(self):
+        assert self._warning("/usr/bin/env") is None
+
+    def test_a_missing_binary_does_not_break_the_install(self, tmp_path):
+        assert self._warning(tmp_path / "does-not-exist") is None

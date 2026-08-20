@@ -101,6 +101,49 @@ def _config_visibility_warning(user_mode: bool) -> str | None:
     )
 
 
+def _exec_start_trust_warning(exec_start: str, user_mode: bool) -> str | None:
+    """Warn when a ROOT unit would run a binary ordinary users can replace.
+
+    ``_config_visibility_warning`` already refuses to point a root service at a
+    config in a home directory, on the grounds that a root service must not take
+    its input from a path other users may write. The executable is the stronger
+    version of the same trust: a `--user`/pipx/uv install resolves through PATH
+    to something like ``~/.local/bin/btrfs-backup-ng``, and baking that into a
+    SYSTEM unit means whoever can write that file chooses what root runs, nightly.
+
+    A user unit runs as the user and is not affected.
+    """
+    if user_mode:
+        return None
+
+    path = Path(exec_start)
+    try:
+        info = path.stat()
+    except OSError:
+        return None
+
+    home_dirs = (Path.home(), Path("/home"), Path("/root"))
+    in_home = any(
+        path == home or home in path.parents for home in home_dirs if str(home) != "/"
+    )
+    # Writable by group or other, or owned by someone other than root.
+    loosely_owned = info.st_uid != 0 or bool(info.st_mode & 0o022)
+
+    if not (in_home or loosely_owned):
+        return None
+
+    owner = f"uid {info.st_uid}"
+    return (
+        f"The system timer would run {exec_start}, which is not a root-owned "
+        f"system path (owner: {owner}, mode: {info.st_mode & 0o777:04o}).\n"
+        f"A SYSTEM unit runs as root, so whoever can write that file decides "
+        f"what root executes on every run.\n"
+        f"  Either:  install btrfs-backup-ng system-wide (e.g. into "
+        f"/usr/local/bin, owned by root)\n"
+        f"  Or:      btrfs-backup-ng install --user   (runs the timer as you)"
+    )
+
+
 def _resolve_exec_start() -> str:
     """Return the absolute path to the btrfs-backup-ng executable for ExecStart.
 
@@ -168,7 +211,9 @@ def execute_install(args: argparse.Namespace) -> int:
     visibility = _config_visibility_warning(user_mode)
 
     # Generate content
-    service_content = SERVICE_TEMPLATE.format(exec_start=_resolve_exec_start())
+    exec_start = _resolve_exec_start()
+    trust = _exec_start_trust_warning(exec_start, user_mode)
+    service_content = SERVICE_TEMPLATE.format(exec_start=exec_start)
     timer_content = TIMER_TEMPLATE.format(oncalendar=oncalendar)
 
     # Write files
@@ -188,6 +233,13 @@ def execute_install(args: argparse.Namespace) -> int:
         print("WARNING: this timer will not find your configuration.")
         print("")
         for line in visibility.splitlines():
+            print(f"  {line}")
+
+    if trust:
+        print("")
+        print("WARNING: this timer would run a binary others may be able to replace.")
+        print("")
+        for line in trust.splitlines():
             print(f"  {line}")
 
     print("")
