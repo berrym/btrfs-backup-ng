@@ -42,6 +42,70 @@ TRANSFER_METHODS = frozenset(COMPRESSION_PROGRAMS)
 RAW_METHODS = frozenset(COMPRESSION_CONFIG)
 
 
+#: One separator for both forms the docs use: `none|gzip|zstd` in a config
+#: comment, and `Compression: gzip, pigz, zstd` in a markdown table cell.
+_SEPARATOR = re.compile(r"[|,]")
+#: A bare method name. Anything carrying a space, or punctuation beyond what a
+#: method name can hold, is prose and ends the enumeration it sits next to.
+_METHOD_TOKEN = re.compile(r"^[a-z][a-z0-9_.+-]{1,11}$")
+
+
+def _runnable_methods() -> frozenset[str]:
+    """Every method some code path implements, from the authoritative tables."""
+    return frozenset(TRANSFER_METHODS | RAW_METHODS | {"none"})
+
+
+def _method_enumerations(line: str) -> list[list[str]]:
+    """The runs of method names in ``line``, trimmed to what it is enumerating.
+
+    A run is bounded by the FIRST and LAST name the code can actually run.
+    Trimming to that span is what makes the check general rather than a list of
+    names to watch for: a word outside the span is the prose or the table cell
+    beside the enumeration, while anything inside it is being offered as a
+    method, whether or not anyone anticipated that particular name.
+    """
+    runnable = _runnable_methods()
+    fields: list[str | None] = []
+    for field in _SEPARATOR.split(line):
+        text = field.strip().strip("`'\"*").strip()
+        if ":" in text:
+            # "Compression: gzip" -- keep what is being enumerated, not the label.
+            text = text.rsplit(":", 1)[-1].strip()
+        text = text.lstrip("#").strip().strip("`'\"").strip()
+        fields.append(text if _METHOD_TOKEN.match(text) else None)
+
+    runs: list[list[str]] = []
+    current: list[str] = []
+    for field in [*fields, None]:
+        if field is None:
+            if current:
+                runs.append(current)
+            current = []
+        else:
+            current.append(field)
+
+    enumerations = []
+    for run in runs:
+        known = [i for i, token in enumerate(run) if token in runnable]
+        # Two names settle that this is a list of methods rather than one word
+        # that happens to be a method name.
+        if len(known) < 2:
+            continue
+        enumerations.append(run[known[0] : known[-1] + 1])
+    return enumerations
+
+
+def _unrunnable_methods_named(line: str) -> list[str]:
+    """Methods ``line`` offers that no code path implements."""
+    runnable = _runnable_methods()
+    return [
+        token
+        for enumeration in _method_enumerations(line)
+        for token in enumeration
+        if token not in runnable
+    ]
+
+
 def _targets():
     for path in EXAMPLES:
         data = tomllib.loads(path.read_text())
@@ -161,19 +225,61 @@ class TestTheProseAgreesWithTheCode:
     @pytest.mark.parametrize("path", DOCS, ids=lambda p: str(p))
     def test_no_file_advertises_a_method_the_code_cannot_run(self, path):
         """Drift in the other direction: naming a method nothing implements."""
-        runnable = set(COMPRESSION_PROGRAMS) | set(COMPRESSION_CONFIG) | {"none"}
-        text = path.read_text(encoding="utf-8")
-        for line in text.splitlines():
-            # A method enumeration, e.g. "none|gzip|zstd|lz4".
-            if line.count("|") < 2:
-                continue
-            candidates = re.findall(r"[a-z0-9]{2,8}", line.split("#")[-1])
-            named = {c for c in candidates if c in runnable}
-            if len(named) < 3:
-                continue
-            unknown = {
-                c
-                for c in candidates
-                if c not in runnable and c in {"lzma", "bzip3", "brotli", "lz4hc"}
-            }
-            assert not unknown, f"{path}: {line.strip()!r} names {unknown}"
+        offenders = []
+        for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+            for method in _unrunnable_methods_named(line):
+                offenders.append(f"{path}:{number} names {method!r}: {line.strip()!r}")
+        assert not offenders, "\n  ".join(
+            ["documented compression methods nothing implements:"] + offenders
+        )
+
+    def test_the_scan_examines_real_enumerations(self):
+        """Guard the guard: a parser that matched nothing would pass every file.
+
+        This is the failure mode the check it replaced already had in a milder
+        form -- it ran, but could only ever fail on four method names someone
+        had thought of in advance.
+        """
+        found = [
+            line
+            for path in self.DOCS
+            for line in path.read_text(encoding="utf-8").splitlines()
+            if _method_enumerations(line)
+        ]
+        assert len(found) >= 5, (
+            f"only {len(found)} method enumerations were recognised in the docs; "
+            f"the parser is not reading them and the check above is vacuous"
+        )
+
+    @pytest.mark.parametrize(
+        "line",
+        [
+            '# compress = "none|gzip|brotli|zstd"',
+            "| `compress` | Compression: gzip, snappy, zstd, lz4 |",
+            "Compression method: none, gzip, lzma, zstd",
+            "# none | gzip | bzip3 | zstd | lz4 | xz |",
+        ],
+    )
+    def test_the_check_detects_a_method_nothing_implements(self, line):
+        """The detector itself, against names it was never told about.
+
+        The version this replaces compared against a hardcoded set of four
+        names, so documenting `snappy` -- or anything else nobody had listed --
+        passed silently while the test read as though it checked the claim.
+        """
+        assert _unrunnable_methods_named(line), line
+
+    @pytest.mark.parametrize(
+        "line",
+        [
+            "| `compress` | Compression: gzip, pigz, zstd, lz4, xz, lzo, bzip2 |",
+            "# none | gzip | pigz | zstd | lz4 | xz |",
+            "Use `--compress zstd` for a fast, well-supported default.",
+            "| `--ssh-host-key-policy` | accept-new, strict |",
+            "The importer maps snapshot_create always, onchange, ondemand or no.",
+        ],
+    )
+    def test_ordinary_prose_is_not_flagged(self, line):
+        """A check that cries wolf gets deleted, so the quiet cases are pinned
+        too: real enumerations, unrelated ones, and plain sentences."""
+        assert not _unrunnable_methods_named(line), line
