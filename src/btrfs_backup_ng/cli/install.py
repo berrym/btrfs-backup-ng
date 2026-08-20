@@ -101,6 +101,67 @@ def _config_visibility_warning(user_mode: bool) -> str | None:
     )
 
 
+#: Directories whose contents only root can change, by convention. Used only to
+#: describe the fix in the warning text, never to decide it -- the decision is
+#: made from the actual ownership and mode on disk.
+_SYSTEM_BIN_HINT = "/usr/local/bin"
+
+
+def _untrusted_ancestor(path: Path) -> str | None:
+    """Return why one of ``path``'s directories is not root-controlled, or None.
+
+    The mode and owner of the executable alone do not settle who controls it. A
+    root-owned 0755 binary sitting in a directory an ordinary user can write is
+    still theirs to choose: replacing a file is unlink plus create, which is a
+    write to the DIRECTORY, not to the file. Checking the file and stopping
+    there answers a question nobody asked.
+
+    A sticky directory is exempt from the write test, since the sticky bit is
+    exactly the rule that stops one user removing another user's files -- /tmp
+    is 1777 and is not, by itself, a way to replace a root-owned binary.
+    """
+    for parent in path.parents:
+        try:
+            info = os.stat(parent)
+        except OSError as err:
+            # A directory that cannot be examined has not been cleared; saying
+            # so is the point. Reporting nothing here would be the same silent
+            # pass this function exists to remove.
+            return f"its directory {parent} could not be examined ({err.strerror})"
+        if info.st_uid != 0:
+            return f"its directory {parent} is owned by uid {info.st_uid}"
+        if info.st_mode & 0o022 and not info.st_mode & 0o1000:
+            return (
+                f"its directory {parent} is writable by others "
+                f"(mode {info.st_mode & 0o777:04o}), so the executable can be "
+                f"replaced without ever writing to it"
+            )
+    return None
+
+
+def _exec_start_missing_warning(exec_start: str, user_mode: bool) -> str | None:
+    """Warn when the unit would point at an executable that is not there.
+
+    ``_resolve_exec_start`` falls back to the historical /usr/bin path when the
+    binary is not on PATH, so an install can write a perfectly valid-looking
+    unit aimed at nothing. The failure then surfaces at the first timer run, as
+    a systemd status nobody is watching. The config warning already reports a
+    missing config at install time; this is the same courtesy for the binary.
+
+    Applies to user units too: a user timer pointed at a missing binary fails
+    just as completely. This is correctness, not a trust boundary.
+    """
+    if Path(exec_start).exists():
+        return None
+    return (
+        f"The timer would run {exec_start}, which does not exist.\n"
+        f"Every run will fail with 'No such file or directory'.\n"
+        f"  Install btrfs-backup-ng somewhere on PATH, then run "
+        f"`btrfs-backup-ng install` again"
+        + ("" if user_mode else f" -- for a system timer, into {_SYSTEM_BIN_HINT}")
+    )
+
+
 def _exec_start_trust_warning(exec_start: str, user_mode: bool) -> str | None:
     """Warn when a ROOT unit would run a binary ordinary users can replace.
 
@@ -119,8 +180,22 @@ def _exec_start_trust_warning(exec_start: str, user_mode: bool) -> str | None:
     path = Path(exec_start)
     try:
         info = path.stat()
-    except OSError:
+    except FileNotFoundError:
+        # Nothing to vouch for, and not silence either: the missing path is
+        # reported by _exec_start_missing_warning, which is always consulted
+        # alongside this one.
         return None
+    except OSError as err:
+        # The check did not run. Previously this returned None, which an
+        # operator reads as "checked, fine" -- a failed check reported as a
+        # clean result, which is worse than no check at all.
+        return (
+            f"The system timer would run {exec_start}, which could not be "
+            f"examined ({err.strerror}), so it was NOT checked.\n"
+            f"A SYSTEM unit runs as root, so this cannot confirm the binary is "
+            f"one only root can change.\n"
+            f"  Check it yourself:  ls -ld {exec_start} $(dirname {exec_start})"
+        )
 
     home_dirs = (Path.home(), Path("/home"), Path("/root"))
     in_home = any(
@@ -128,18 +203,19 @@ def _exec_start_trust_warning(exec_start: str, user_mode: bool) -> str | None:
     )
     # Writable by group or other, or owned by someone other than root.
     loosely_owned = info.st_uid != 0 or bool(info.st_mode & 0o022)
+    ancestor = _untrusted_ancestor(path)
 
-    if not (in_home or loosely_owned):
+    if not (in_home or loosely_owned or ancestor):
         return None
 
-    owner = f"uid {info.st_uid}"
+    detail = ancestor or f"owner: uid {info.st_uid}, mode: {info.st_mode & 0o777:04o}"
     return (
         f"The system timer would run {exec_start}, which is not a root-owned "
-        f"system path (owner: {owner}, mode: {info.st_mode & 0o777:04o}).\n"
+        f"system path ({detail}).\n"
         f"A SYSTEM unit runs as root, so whoever can write that file decides "
         f"what root executes on every run.\n"
         f"  Either:  install btrfs-backup-ng system-wide (e.g. into "
-        f"/usr/local/bin, owned by root)\n"
+        f"{_SYSTEM_BIN_HINT}, owned by root)\n"
         f"  Or:      btrfs-backup-ng install --user   (runs the timer as you)"
     )
 
@@ -212,6 +288,7 @@ def execute_install(args: argparse.Namespace) -> int:
 
     # Generate content
     exec_start = _resolve_exec_start()
+    missing = _exec_start_missing_warning(exec_start, user_mode)
     trust = _exec_start_trust_warning(exec_start, user_mode)
     service_content = SERVICE_TEMPLATE.format(exec_start=exec_start)
     timer_content = TIMER_TEMPLATE.format(oncalendar=oncalendar)
@@ -233,6 +310,13 @@ def execute_install(args: argparse.Namespace) -> int:
         print("WARNING: this timer will not find your configuration.")
         print("")
         for line in visibility.splitlines():
+            print(f"  {line}")
+
+    if missing:
+        print("")
+        print("WARNING: this timer's executable does not exist.")
+        print("")
+        for line in missing.splitlines():
             print(f"  {line}")
 
     if trust:

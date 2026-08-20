@@ -18,6 +18,8 @@ fix is to say so at install time and offer the two safe options.
 
 from __future__ import annotations
 
+import argparse
+import os
 from unittest.mock import patch
 
 from pathlib import Path
@@ -159,3 +161,158 @@ class TestARootTimerDoesNotRunAUserWritableBinary:
 
     def test_a_missing_binary_does_not_break_the_install(self, tmp_path):
         assert self._warning(tmp_path / "does-not-exist") is None
+
+
+class TestTheDirectoryDecidesWhoCanReplaceTheBinary:
+    """Checking the file's own mode answers a question nobody asked.
+
+    Replacing an executable is unlink plus create -- a write to the DIRECTORY,
+    not to the file. A root-owned 0755 binary in a directory an ordinary user
+    can write is still that user's to choose, and the check passed it.
+    """
+
+    def _ancestor(self, path):
+        from btrfs_backup_ng.cli.install import _untrusted_ancestor
+
+        return _untrusted_ancestor(Path(path))
+
+    def test_a_root_owned_system_chain_is_clean(self):
+        assert self._ancestor("/usr/bin/env") is None
+
+    def test_a_user_owned_directory_is_named(self, tmp_path):
+        binary = tmp_path / "btrfs-backup-ng"
+        binary.write_text("#!/bin/sh\n")
+        reason = self._ancestor(binary)
+        assert reason is not None
+        assert str(tmp_path) in reason
+
+    def test_a_sticky_directory_is_not_itself_a_way_in(self):
+        """/tmp is 1777; sticky is precisely what stops one user removing
+        another's files, so it must not be reported as replaceable."""
+        assert self._ancestor("/tmp/btrfs-backup-ng") is None
+
+    @pytest.mark.skipif(os.geteuid() == 0, reason="running as root sees no EACCES")
+    def test_an_unreadable_directory_is_reported_not_skipped(self, tmp_path):
+        # The blocked directory itself still stats fine; it is TRAVERSAL that
+        # is denied, so the unexaminable path has to be one level further in.
+        blocked = tmp_path / "blocked"
+        inner = blocked / "inner"
+        inner.mkdir(parents=True)
+        binary = inner / "btrfs-backup-ng"
+        binary.write_text("#!/bin/sh\n")
+        blocked.chmod(0o000)
+        try:
+            reason = self._ancestor(binary)
+        finally:
+            blocked.chmod(0o755)
+        assert reason is not None
+        assert "could not be examined" in reason, reason
+
+    def test_a_world_writable_root_directory_is_flagged(self, tmp_path, monkeypatch):
+        """The case that cannot be built without root: a root-owned binary in a
+        root-owned but world-writable, non-sticky directory. Only the filesystem
+        metadata is substituted; the decision under test is the real one."""
+        import os as os_mod
+
+        from btrfs_backup_ng.cli import install as install_mod
+
+        binary = tmp_path / "bin" / "btrfs-backup-ng"
+        binary.parent.mkdir()
+        binary.write_text("#!/bin/sh\n")
+        real_stat = os_mod.stat
+
+        class FakeStat:
+            def __init__(self, uid, mode):
+                self.st_uid = uid
+                self.st_mode = mode
+
+        def fake_stat(target, *a, **kw):
+            # Every ancestor looks root-owned; the immediate directory is 0777
+            # with no sticky bit.
+            if str(target) == str(binary.parent):
+                return FakeStat(0, 0o777)
+            if str(target) in {str(p) for p in binary.parents}:
+                return FakeStat(0, 0o755)
+            return real_stat(target, *a, **kw)
+
+        monkeypatch.setattr(install_mod.os, "stat", fake_stat)
+        reason = install_mod._untrusted_ancestor(binary)
+        assert reason is not None, "a world-writable directory was passed as trusted"
+        assert str(binary.parent) in reason
+        assert "replaced" in reason
+
+    def test_the_warning_names_the_directory(self, tmp_path):
+        """End to end: the reason reaches the operator, not just the helper."""
+        from btrfs_backup_ng.cli.install import _exec_start_trust_warning
+
+        binary = tmp_path / "btrfs-backup-ng"
+        binary.write_text("#!/bin/sh\n")
+        binary.chmod(0o755)
+        warning = _exec_start_trust_warning(str(binary), user_mode=False)
+        assert warning is not None
+        # Assert on the REASON clause, not merely on the directory name: the
+        # message echoes the full binary path, which contains the directory, so
+        # a substring test for the directory alone passes even when the
+        # directory was never examined.
+        assert f"its directory {tmp_path} is owned by uid" in warning, warning
+
+
+class TestAFailedTrustCheckIsNotAPass:
+    """The recurring defect: a check that could not run, reported as clean."""
+
+    @pytest.mark.skipif(os.geteuid() == 0, reason="running as root sees no EACCES")
+    def test_an_unreadable_binary_says_it_was_not_checked(self, tmp_path):
+        from btrfs_backup_ng.cli.install import _exec_start_trust_warning
+
+        blocked = tmp_path / "blocked"
+        blocked.mkdir()
+        binary = blocked / "btrfs-backup-ng"
+        binary.write_text("#!/bin/sh\n")
+        blocked.chmod(0o000)
+        try:
+            warning = _exec_start_trust_warning(str(binary), user_mode=False)
+        finally:
+            blocked.chmod(0o755)
+        assert warning is not None, "an unexaminable binary was reported as trusted"
+        assert "NOT checked" in warning
+
+
+class TestAMissingExecutableIsReportedAtInstallTime:
+    """_resolve_exec_start falls back to /usr/bin/btrfs-backup-ng when the binary
+    is not on PATH, so a valid-looking unit can be written aimed at nothing. The
+    failure otherwise surfaces at the first timer run, in a status nobody reads.
+    """
+
+    def _warning(self, path, user_mode=False):
+        from btrfs_backup_ng.cli.install import _exec_start_missing_warning
+
+        return _exec_start_missing_warning(str(path), user_mode)
+
+    def test_a_missing_binary_is_reported(self, tmp_path):
+        warning = self._warning(tmp_path / "does-not-exist")
+        assert warning is not None
+        assert "does not exist" in warning
+
+    def test_a_user_unit_is_reported_too(self, tmp_path):
+        """A user timer pointed at a missing binary fails just as completely."""
+        assert self._warning(tmp_path / "does-not-exist", user_mode=True) is not None
+
+    def test_an_existing_binary_is_not_reported(self):
+        assert self._warning("/usr/bin/env") is None
+
+    def test_the_install_still_succeeds_and_says_so(self, tmp_path, capsys):
+        """Warning, not failing: the unit is still written."""
+        import btrfs_backup_ng.cli.install as install_mod
+
+        args = argparse.Namespace(timer="daily", user=True, verbose=0, quiet=False)
+        with (
+            patch.object(install_mod.Path, "home", return_value=tmp_path),
+            patch.object(
+                install_mod, "_resolve_exec_start", return_value="/nonexistent/bbng"
+            ),
+        ):
+            rc = install_mod.execute_install(args)
+        out = capsys.readouterr().out
+        assert rc == 0
+        assert "does not exist" in out
+        assert "/nonexistent/bbng" in out
