@@ -102,7 +102,15 @@ class Snapshot:
         self.uuid = ""
         self.received_uuid = ""
 
-    def __eq__(self, other):
+    def __eq__(self, other: object) -> bool:
+        # NotImplemented, not an AttributeError. Annotating this signature (which
+        # must take `object` -- Python compares a Snapshot against anything)
+        # exposed that the body assumed the other side was a Snapshot, so
+        # `snapshot == None` raised AttributeError instead of returning False.
+        # Returning NotImplemented lets Python fall back to identity, which is
+        # the documented contract and what every caller already assumed.
+        if not isinstance(other, Snapshot):
+            return NotImplemented
         return self.prefix == other.prefix and self.time_obj == other.time_obj
 
     def __lt__(self, other: "Snapshot") -> bool:
