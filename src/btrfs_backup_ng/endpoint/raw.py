@@ -2591,6 +2591,10 @@ class SSHRawEndpoint(RawEndpoint):
 
         path = self.config["path"]
         ssh_cmd = self._build_ssh_command()
+        # Read once, for BOTH passes below. The sidecar pass used to ignore it
+        # entirely while the filename pass honoured it, so which snapshots a
+        # prefix selected depended on whether they had a .meta beside them.
+        prefix = self.config.get("snap_prefix", "")
 
         # List .meta files
         inner = f"find {shlex.quote(str(path))} -name '*.meta' -type f"
@@ -2630,6 +2634,16 @@ class SSHRawEndpoint(RawEndpoint):
                         meta_path,
                     )
                     continue
+                # Filter on the sidecar's recorded name, exactly as the local
+                # listing does. Without this the prefix was ignored for every
+                # sidecar-backed stream -- which is all of them -- so a
+                # destination shared by two volumes handed back BOTH sets to
+                # whichever one asked. Measured .203 -> .70: `restore --prefix
+                # sweep-` restored another volume's snapshot as well, called it
+                # "Restored: 2, Failed: 0", and used one volume's snapshot as
+                # the incremental parent of the other's stream.
+                if prefix and not snapshot.name.startswith(prefix):
+                    continue
                 snapshots.append(snapshot)
             except subprocess.CalledProcessError as e:
                 # The `cat` failed (file vanished between find and cat, or a mid-listing
@@ -2656,7 +2670,6 @@ class SSHRawEndpoint(RawEndpoint):
         # .meta sidecars are invisible -- unlistable and unrestorable. Mirrors
         # discover_raw_snapshots' filename-fallback pass.
         loaded_names = {s.name for s in snapshots}
-        prefix = self.config.get("snap_prefix", "")
         inner = f"find {shlex.quote(str(path))} -name '*.btrfs*' -type f"
         find_stream_cmd = self._elevate_shell(inner)
         result = subprocess.run(
