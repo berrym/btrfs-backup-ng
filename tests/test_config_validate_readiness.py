@@ -86,7 +86,11 @@ class TestValidateReportsBothHalves:
         )
         rc = _validate_config(_args(cfg))
         out = capsys.readouterr().out
-        assert rc == 1, "an unusable config exited 0"
+        # Not zero: this is not a green light. Specifically 2, which says the
+        # FILE is fine and this machine cannot run it -- distinct from 1, which
+        # means the file itself must be edited.
+        assert rc != 0, "an unusable config exited 0"
+        assert rc == 2, rc
         assert "cannot be backed up from this machine" in out
         assert "/definitely/not/here" in out
 
@@ -161,3 +165,46 @@ class TestValidateReportsBothHalves:
     def test_a_broken_config_file_still_errors(self, tmp_path, capsys):
         cfg = _write(tmp_path, "this is not toml {{{")
         assert _validate_config(_args(cfg)) == 1
+
+
+class TestTheExitStatusDistinguishesTheTwoFailures:
+    """ "Cannot run here" is not the same as "your file is wrong".
+
+    Both returned 1, so a caller could not tell a config that must be edited
+    from a perfectly good config being checked on a machine that does not host
+    its volumes -- which is the normal case when editing a NAS's config on a
+    laptop, or validating in CI. A correct configuration failed its own check
+    with nothing to fix.
+    """
+
+    def _validate(self, tmp_path, body, name="config.toml"):
+        config = tmp_path / name
+        config.write_text(body, encoding="utf-8")
+        return _validate_config(_args(config))
+
+    def test_an_invalid_file_exits_1(self, tmp_path):
+        assert self._validate(tmp_path, "[[volumes]]\npath =\n") == 1
+
+    def test_a_valid_file_this_machine_cannot_run_exits_2(self, tmp_path):
+        source = tmp_path / "not-a-subvolume"
+        source.mkdir()
+        code = self._validate(
+            tmp_path,
+            f'[[volumes]]\npath = "{source}"\n'
+            f'snapshot_dir = "{source}/.snapshots"\n\n'
+            f'[[volumes.targets]]\npath = "{tmp_path / "dest"}"\n',
+        )
+        assert code == 2, "a valid file was reported the same way as a broken one"
+
+    def test_the_two_codes_are_different(self, tmp_path):
+        source = tmp_path / "plain"
+        source.mkdir()
+        unusable = self._validate(
+            tmp_path,
+            f'[[volumes]]\npath = "{source}"\n'
+            f'snapshot_dir = "{source}/.snapshots"\n\n'
+            f'[[volumes.targets]]\npath = "{tmp_path / "d"}"\n',
+            name="usable.toml",
+        )
+        invalid = self._validate(tmp_path, "[[volumes]]\npath =\n", name="invalid.toml")
+        assert unusable != invalid

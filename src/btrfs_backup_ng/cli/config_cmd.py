@@ -635,11 +635,15 @@ def _validate_config(args: argparse.Namespace) -> int:
                 "The file itself is fine. Checked locally only -- remote targets "
                 "are not probed here; run `doctor` for that."
             )
-            # Non-zero, because a config that cannot back up its sources is not
-            # something to hand a green light to. A machine that merely does not
-            # host these volumes (editing a config elsewhere) reports the same
-            # way, which is honest: it cannot run this config either.
-            return 1
+            print("(Exit status 2: the file is valid, this machine cannot run it.)")
+            # Distinct from 1. Both situations are "not ready to run", but they
+            # need different actions and a caller cannot tell them apart from a
+            # single code: 1 means the FILE is wrong and must be edited, 2 means
+            # the file is right and this machine is not the one that hosts these
+            # volumes -- the normal case when editing a NAS's config on a laptop,
+            # or validating in CI. Collapsing them made a correct config fail its
+            # own check with nothing wrong.
+            return 2
 
         print("")
         print("All enabled volumes look usable from this machine.")
