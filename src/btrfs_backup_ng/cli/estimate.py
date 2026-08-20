@@ -326,6 +326,10 @@ def _print_json(
         "skipped_count": estimate.skipped_count,
         "total_transfer_bytes": estimate.total_incremental_size,
         "total_transfer_human": format_size(estimate.total_incremental_size),
+        # A consumer scripting against this must be able to tell a measurement
+        # from a floor; the human output says so in words, and dropping it here
+        # would leave the machine-readable form the more misleading of the two.
+        "total_transfer_is_lower_bound": estimate.total_is_lower_bound,
         "total_full_bytes": estimate.total_full_size,
         "total_full_human": format_size(estimate.total_full_size),
         "estimation_time_seconds": round(estimate.estimation_time, 2),

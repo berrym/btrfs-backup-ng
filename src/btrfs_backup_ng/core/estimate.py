@@ -17,6 +17,19 @@ from typing import Optional
 logger = logging.getLogger(__name__)
 
 
+#: Methods whose result is a LOWER BOUND, not an estimate.
+#:
+#: ``send_no_data`` measures a ``btrfs send --no-data`` stream, which carries
+#: metadata and no file contents -- the real transfer runs roughly 10-100x it.
+#: ``size_diff`` subtracts two exclusive subvolume sizes, which misses anything
+#: rewritten in place and ignores what a send stream actually encodes.
+#:
+#: Both are useful for "is this change big or small". Neither is a number to
+#: plan bandwidth or a maintenance window against, and presenting one as though
+#: it were is the reason this constant exists rather than being inlined.
+UNDERESTIMATING_METHODS = frozenset({"send_no_data", "size_diff"})
+
+
 @dataclass
 class SnapshotEstimate:
     """Size estimate for a single snapshot transfer.
@@ -72,6 +85,22 @@ class TransferEstimate:
             self.total_incremental_size += estimate.incremental_size
         elif estimate.full_size:
             self.total_incremental_size += estimate.full_size
+
+    @property
+    def total_is_lower_bound(self) -> bool:
+        """Whether the transfer total is a floor rather than an estimate.
+
+        True as soon as ONE incremental contributed an underestimating method:
+        the sum is then at least this, and there is no honest way to say by how
+        much it might exceed it. Reported so the caller can label the number
+        instead of quoting it with a confidence it does not have.
+        """
+        return any(
+            snapshot.is_incremental
+            and snapshot.incremental_size
+            and snapshot.method in UNDERESTIMATING_METHODS
+            for snapshot in self.snapshots
+        )
 
 
 def format_size(size_bytes: Optional[int]) -> str:
@@ -381,6 +410,10 @@ def print_estimate(
     for snap in estimate.snapshots:
         if snap.is_incremental and snap.incremental_size:
             size_str = format_size(snap.incremental_size)
+            if snap.method in UNDERESTIMATING_METHODS:
+                # Marked per row as well as in the total: a reader scanning the
+                # table for the big one must not take these at face value.
+                size_str = f">= {size_str}"
             type_str = "incremental"
             parent_str = snap.parent_name or ""
         else:
@@ -395,7 +428,18 @@ def print_estimate(
 
     print()
     print(f"{'-' * 60}")
-    print(f"Total data to transfer: {format_size(estimate.total_incremental_size)}")
+    if estimate.total_is_lower_bound:
+        print(
+            f"Total data to transfer: AT LEAST "
+            f"{format_size(estimate.total_incremental_size)}"
+        )
+        print("  Incremental sizes are measured with `btrfs send --no-data`, which")
+        print("  carries metadata and no file contents, so the real transfer is")
+        print("  larger -- often by a factor of 10-100. Treat this as a floor, not")
+        print("  a figure to size a link or a maintenance window against. A full")
+        print("  transfer (no parent) is measured directly and is not affected.")
+    else:
+        print(f"Total data to transfer: {format_size(estimate.total_incremental_size)}")
     print(f"Full size (uncompressed): {format_size(estimate.total_full_size)}")
     print(f"Estimation time: {estimate.estimation_time:.2f}s")
 
