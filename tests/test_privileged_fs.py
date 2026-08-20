@@ -21,6 +21,7 @@ naming an argv the operator never typed and suggesting no remedy.
 
 from __future__ import annotations
 
+import errno
 import os
 import subprocess
 from unittest.mock import patch
@@ -156,7 +157,18 @@ class TestWhenBothRoutesFail:
                 elif op == "mkdir":
                     __util__.privileged_mkdir(sealed / "d")
                 elif op == "chmod":
-                    __util__.privileged_chmod(sealed / "f", 0o755)
+                    # A real refusal (EACCES), not a missing file. chmod on a
+                    # path you own succeeds whatever the directory permissions,
+                    # so the refusal is injected directly; using a nonexistent
+                    # path would raise ENOENT, which is not a permission problem
+                    # and must NOT reach the elevation fallback at all.
+                    target = sealed / "f"
+                    with patch.object(
+                        __util__.Path,
+                        "chmod",
+                        side_effect=PermissionError(errno.EACCES, "Permission denied"),
+                    ):
+                        __util__.privileged_chmod(target, 0o755)
         return str(excinfo.value), sealed
 
     def test_it_names_the_path_that_could_not_be_written(self, tmp_path):
@@ -190,3 +202,119 @@ class TestWhenBothRoutesFail:
         msg, _ = self._fail(tmp_path)
         assert "returned non-zero exit status" not in msg
         assert "Command '[" not in msg
+
+
+class TestOnlyPermissionFailuresEscalate:
+    """Root is for "you are not allowed", not for "that did not work".
+
+    The fallback caught `(PermissionError, OSError)` -- which is simply
+    `OSError` -- so EVERY failure of the direct attempt was retried as root: a
+    full filesystem, a mistyped path, a file where a directory belongs. None of
+    those become correct by being root, and one of them is actively worse:
+    ENOSPC retried as root succeeds by consuming the reserved blocks an ordinary
+    user is correctly denied.
+    """
+
+    def _direct_raises(self, exc):
+        """Run a privileged_* call whose direct attempt raises `exc`."""
+        calls = []
+
+        def fake_run(*args, **kwargs):
+            calls.append(args[0] if args else kwargs.get("args"))
+            return subprocess.CompletedProcess(
+                args=[], returncode=0, stdout=b"", stderr=b""
+            )
+
+        with (
+            patch.object(__util__.Path, "chmod", side_effect=exc),
+            patch.object(__util__.subprocess, "run", side_effect=fake_run),
+        ):
+            try:
+                __util__.privileged_chmod("/some/path", 0o755)
+                raised = None
+            except OSError as e:
+                raised = e
+        return calls, raised
+
+    @pytest.mark.parametrize(
+        "exc",
+        [
+            FileNotFoundError(errno.ENOENT, "No such file or directory"),
+            NotADirectoryError(errno.ENOTDIR, "Not a directory"),
+            IsADirectoryError(errno.EISDIR, "Is a directory"),
+            OSError(errno.ENOSPC, "No space left on device"),
+            OSError(errno.EROFS, "Read-only file system"),
+        ],
+        ids=["enoent", "enotdir", "eisdir", "enospc", "erofs"],
+    )
+    def test_a_non_permission_failure_never_shells_out_to_sudo(self, exc):
+        calls, raised = self._direct_raises(exc)
+        assert not calls, f"escalated to root for {exc!r}: {calls}"
+        assert raised is not None, "the original error was swallowed"
+        assert raised.errno == exc.errno, "the caller lost the real reason"
+
+    @pytest.mark.parametrize(
+        "exc",
+        [
+            PermissionError(errno.EACCES, "Permission denied"),
+            PermissionError(errno.EPERM, "Operation not permitted"),
+        ],
+        ids=["eacces", "eperm"],
+    )
+    def test_a_permission_failure_still_escalates(self, exc):
+        """The feature itself must keep working."""
+        calls, raised = self._direct_raises(exc)
+        assert calls, "a genuine permission refusal did not try elevation"
+        assert calls[0][:1] == ["sudo"], calls[0]
+        assert raised is None
+
+
+class TestElevationDoesNotFollowASymlink:
+    """Root must not be talked into writing somewhere else.
+
+    The direct route opens with O_NOFOLLOW. The elevation fallback shells out to
+    `sudo tee` and `sudo chmod`, which follow symlinks like any other command, so
+    a link planted where this tool expects to write would be followed AS ROOT --
+    turning a refused user-level write into a root write to a file the attacker
+    chose. Backup destinations are exactly the kind of shared directory where
+    someone else may be able to create a name.
+    """
+
+    def _attempt(self, tmp_path, op):
+        victim = tmp_path / "victim"
+        victim.write_text("original", encoding="utf-8")
+        link = tmp_path / "link"
+        link.symlink_to(victim)
+
+        calls = []
+
+        def fake_run(*args, **kwargs):
+            calls.append(args[0] if args else kwargs.get("args"))
+            return subprocess.CompletedProcess(
+                args=[], returncode=0, stdout=b"", stderr=b""
+            )
+
+        refusal = PermissionError(errno.EACCES, "Permission denied")
+        with (
+            patch.object(__util__.subprocess, "run", side_effect=fake_run),
+            patch.object(__util__.Path, "chmod", side_effect=refusal),
+        ):
+            with pytest.raises(PermissionError) as excinfo:
+                if op == "write":
+                    __util__.privileged_write_bytes(link, b"attacker content")
+                else:
+                    __util__.privileged_chmod(link, 0o777)
+        return calls, str(excinfo.value), victim
+
+    @pytest.mark.parametrize("op", ["write", "chmod"])
+    def test_it_refuses_rather_than_elevating_onto_the_link(self, tmp_path, op):
+        calls, message, victim = self._attempt(tmp_path, op)
+        assert not calls, f"ran a privileged command on a symlink: {calls}"
+        assert "symbolic link" in message, message
+        assert victim.read_text(encoding="utf-8") == "original", (
+            "the linked-to file was modified"
+        )
+
+    def test_the_message_names_where_the_link_pointed(self, tmp_path):
+        _calls, message, victim = self._attempt(tmp_path, "write")
+        assert str(victim) in message

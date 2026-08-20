@@ -5,6 +5,7 @@ Common utility code shared between modules.
 import contextlib
 import functools
 import json
+import errno
 import os
 import subprocess
 import time
@@ -579,6 +580,7 @@ def _privileged_fs(
     path: str | Path,
     stdin_bytes: bytes | None = None,
     allow_prompt: bool = False,
+    refuse_symlink: bool = False,
 ) -> Any:
     """Perform a filesystem operation directly, elevating only if that fails.
 
@@ -605,10 +607,35 @@ def _privileged_fs(
     with full sudo is prompted exactly as they were before rather than being told
     to start over as root.
     """
+    # Checked BEFORE the direct attempt, not only before the fallback: neither
+    # `Path.write_bytes` nor `Path.chmod` uses O_NOFOLLOW, and `sudo tee` and
+    # `sudo chmod` certainly do not, so a link planted where this tool expects
+    # to write gets followed by whichever route runs. Under root -- which is how
+    # backups usually run -- the direct route succeeds and follows it silently.
+    # Anyone able to create a name in a backup directory could otherwise
+    # redirect a write, or a mode change, onto a file they do not own.
+    if refuse_symlink and os.path.islink(path):
+        raise PermissionError(
+            f"Refusing to {action} {path}: it is a symbolic link pointing at "
+            f"{os.path.realpath(path)}, and following it would write somewhere "
+            f"this command was not asked to touch. Remove or replace the link, "
+            f"or point this at a real path."
+        )
+
     try:
         return direct()
-    except (PermissionError, OSError) as direct_error:
+    except OSError as direct_error:
         if os.geteuid() == 0:
+            raise
+        # Escalate only when the direct attempt was refused for PERMISSION
+        # reasons. `except (PermissionError, OSError)` is just `except OSError`,
+        # so every failure retried itself as root: a full filesystem, a
+        # mistyped path, a file where a directory belongs. None of those are
+        # fixed by being root, and retrying them there is how an unrelated
+        # error turns into a root-privileged write -- ENOSPC in particular
+        # would succeed by eating the reserved blocks a normal user is
+        # correctly denied.
+        if direct_error.errno not in (errno.EACCES, errno.EPERM):
             raise
         first_error = direct_error
 
@@ -679,6 +706,7 @@ def privileged_write_bytes(
         path=path,
         stdin_bytes=data,
         allow_prompt=allow_prompt,
+        refuse_symlink=True,
     )
 
 
@@ -693,6 +721,7 @@ def privileged_chmod(
         action="set permissions on",
         path=path,
         allow_prompt=allow_prompt,
+        refuse_symlink=True,
     )
 
 
