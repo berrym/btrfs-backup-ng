@@ -488,7 +488,7 @@ def verify_full(
             return report
 
     # Verify temp dir is on btrfs
-    if not __util__.is_btrfs(temp_path):  # type: ignore[attr-defined]
+    if not __util__.is_btrfs(temp_path):
         report.errors.append(f"Temp directory {temp_path} is not on btrfs filesystem")
         report.completed_at = time.time()
         return report
@@ -566,7 +566,7 @@ def verify_full(
                 if not restored_path.exists():
                     raise VerifyError(f"Restored snapshot not found at {restored_path}")
 
-                if not __util__.is_subvolume(restored_path):  # type: ignore[attr-defined]
+                if not __util__.is_subvolume(restored_path):
                     raise VerifyError(
                         f"Restored path {restored_path} is not a valid subvolume"
                     )
@@ -625,7 +625,7 @@ def verify_full(
             for snap in to_verify:
                 snap_path = temp_path / snap.get_name()
                 try:
-                    if snap_path.exists() and __util__.is_subvolume(snap_path):  # type: ignore[attr-defined]
+                    if snap_path.exists() and __util__.is_subvolume(snap_path):
                         _delete_temp_subvolume(snap_path)
                 except Exception as e:  # noqa: BLE001 - cleanup is best-effort
                     logger.warning(

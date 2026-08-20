@@ -307,7 +307,7 @@ class OperationRecord:
         path.parent.mkdir(parents=True, exist_ok=True)
         payload = json.dumps(self.to_dict(), indent=2)
         try:
-            __util__.atomic_write_bytes(path, payload)  # type: ignore[attr-defined]
+            __util__.atomic_write_bytes(path, payload)
         except OSError as e:
             logger.warning("Failed to persist operation state to %s: %s", path, e)
 

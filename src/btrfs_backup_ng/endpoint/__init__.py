@@ -7,7 +7,7 @@ from ..__logger__ import logger
 from .local import LocalEndpoint
 from .raw import RawEndpoint, SSHRawEndpoint
 from .shell import ShellEndpoint
-from .ssh import SSHEndpoint  # type: ignore[attr-defined]
+from .ssh import SSHEndpoint
 
 
 def assert_encryption_applied(requested_encrypt, endpoint) -> None:

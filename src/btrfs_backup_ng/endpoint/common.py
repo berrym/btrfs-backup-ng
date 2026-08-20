@@ -135,7 +135,7 @@ class Endpoint:
         # Handle string paths
         if isinstance(val, str):
             # Just expanduser for remote paths to avoid resolving them locally
-            if hasattr(self, "_is_remote") and getattr(self, "_is_remote", False):
+            if self._is_remote:
                 expanded = str(Path(val).expanduser())
                 logger.debug("Remote path expanded: %s -> %s", val, expanded)
                 return expanded
@@ -171,7 +171,7 @@ class Endpoint:
         # If it's already a Path object
         if isinstance(val, Path):
             # For remote paths, convert to string to avoid resolution issues
-            if hasattr(self, "_is_remote") and getattr(self, "_is_remote", False):
+            if self._is_remote:
                 return str(val)
 
             # For local paths, handle safely
@@ -601,6 +601,14 @@ class Endpoint:
                 f"Send stream test failed: "
                 f"{result.stderr.decode(errors='replace').strip()}"
             )
+
+    #: Whether this endpoint reaches its destination over the network. Declared
+    #: here so it is part of the endpoint contract rather than an attribute that
+    #: some subclasses happen to set: it was referenced through
+    #: ``hasattr(self, "_is_remote") and getattr(self, "_is_remote", False)`` in
+    #: half a dozen places, which is what an undeclared attribute costs, and a
+    #: type checker could only report it as unknown.
+    _is_remote: bool = False
 
     #: Whether ``set_lock`` writes the lock to durable storage. True here because
     #: the base implementation persists to a lock file at ``config['path']``.
@@ -1032,7 +1040,7 @@ class Endpoint:
 
     def _listdir(self, location: Any) -> List[str]:
         # For remote endpoints, don't try to resolve the path locally
-        if hasattr(self, "_is_remote") and getattr(self, "_is_remote", False):
+        if self._is_remote:
             # Remote endpoints should implement their own _listdir
             logger.debug(
                 "Using default _listdir implementation on remote path: %s", location

@@ -55,7 +55,7 @@ def assert_target_mounted(target_path: str) -> None:
     # Path("raw:///mnt/usb") could never be a mount point, so the check aborted
     # every raw transfer instead of guarding it.
     resolved = Path(scheme.path).resolve()
-    if not __util__.is_mounted(resolved):  # type: ignore[attr-defined]
+    if not __util__.is_mounted(resolved):
         raise __util__.AbortError(
             f"Target {target_path} is not mounted. "
             f"Ensure the drive is connected and mounted, or set require_mount = false."

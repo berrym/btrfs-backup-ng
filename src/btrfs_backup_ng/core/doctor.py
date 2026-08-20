@@ -1215,7 +1215,7 @@ class Doctor:
                     # Atomic replace via the shared primitive (R7): a plain write_text
                     # here could leave a torn lock file on a crash, which read_locks then
                     # misreads as "no locks" -> retention prunes a still-locked snapshot.
-                    __util__.atomic_write_bytes(  # type: ignore[attr-defined]
+                    __util__.atomic_write_bytes(
                         lock_file, __util__.write_locks(locks), mode=0o600
                     )
                     logger.info(

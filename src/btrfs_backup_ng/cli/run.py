@@ -370,7 +370,7 @@ def _backup_volume(
                 ("ssh://", "raw://", "raw+ssh://")
             ):
                 target_path = Path(target.path).resolve()
-                if not __util__.is_mounted(target_path):  # type: ignore[attr-defined]
+                if not __util__.is_mounted(target_path):
                     raise __util__.AbortError(
                         f"Target {target.path} is not mounted. "
                         f"Ensure the drive is connected and mounted, or set require_mount = false."
@@ -608,7 +608,7 @@ def _backup_snapper_volume(
                 ("ssh://", "raw://", "raw+ssh://")
             ):
                 target_path = Path(target.path).resolve()
-                if not __util__.is_mounted(target_path):  # type: ignore[attr-defined]
+                if not __util__.is_mounted(target_path):
                     raise __util__.AbortError(
                         f"Target {target.path} is not mounted. "
                         f"Ensure the drive is connected and mounted."

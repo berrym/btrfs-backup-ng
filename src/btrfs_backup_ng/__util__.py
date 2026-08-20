@@ -9,6 +9,7 @@ import os
 import subprocess
 import time
 from pathlib import Path
+from typing import Any, Callable
 
 from .__logger__ import logger
 
@@ -56,7 +57,7 @@ class InsufficientSpaceError(AbortError):
     """
 
 
-def _endpoint_timestamp_format(endpoint):
+def _endpoint_timestamp_format(endpoint: Any) -> str:
     """Return the timestamp format configured on an endpoint, or the default."""
     config = getattr(endpoint, "config", None)
     if isinstance(config, dict):
@@ -71,7 +72,12 @@ class Snapshot:
     """Represents a snapshot with comparison by prefix and time_obj."""
 
     def __init__(
-        self, location, prefix, endpoint, time_obj=None, time_format=None
+        self,
+        location: str | Path,
+        prefix: str,
+        endpoint: Any,
+        time_obj: time.struct_time | None = None,
+        time_format: str | None = None,
     ) -> None:
         self.location = Path(location)
         self.prefix = prefix
@@ -85,8 +91,8 @@ class Snapshot:
         if time_format is None:
             time_format = _endpoint_timestamp_format(endpoint)
         self.time_format = time_format
-        self.locks = set()
-        self.parent_locks = set()
+        self.locks: set = set()
+        self.parent_locks: set = set()
         # btrfs subvolume identity, populated best-effort at enumeration (Phase 0).
         # ``uuid`` is this snapshot's own UUID; ``received_uuid`` is set on a subvolume
         # produced by ``btrfs receive`` and equals the source subvolume's UUID -- the
@@ -99,7 +105,7 @@ class Snapshot:
     def __eq__(self, other):
         return self.prefix == other.prefix and self.time_obj == other.time_obj
 
-    def __lt__(self, other):
+    def __lt__(self, other: "Snapshot") -> bool:
         if self.prefix != other.prefix:
             msg = f"prefixes don't match: {self.prefix} vs {other.prefix}"
             raise NotImplementedError(
@@ -110,15 +116,15 @@ class Snapshot:
     def __repr__(self) -> str:
         return self.get_name()
 
-    def get_name(self):
+    def get_name(self) -> str:
         """Return a snapshot's name."""
         return self.prefix + date_to_str(self.time_obj, fmt=self.time_format)
 
-    def get_path(self):
+    def get_path(self) -> Path:
         """Return full path to a snapshot."""
         return self.location / self.get_name()
 
-    def find_parent(self, present_snapshots):
+    def find_parent(self, present_snapshots: list["Snapshot"]) -> "Snapshot | None":
         """Returns object from ``present_snapshot`` most suitable for being
         used as a parent for transferring this one or ``None``,
         if none found.
@@ -137,7 +143,7 @@ class Snapshot:
         return None
 
 
-def parse_subvolume_list(output):
+def parse_subvolume_list(output: str) -> list[dict[str, str]]:
     """Parse ``btrfs subvolume list -o -u -R`` output into per-subvolume identity.
 
     Returns a list of dicts ``{'name', 'uuid', 'received_uuid', 'path'}``. Parsed
@@ -183,7 +189,7 @@ def parse_subvolume_list(output):
     return entries
 
 
-def parse_subvolume_show(output):
+def parse_subvolume_show(output: str) -> dict[str, str]:
     """Parse ``btrfs subvolume show <path>`` output for a subvolume's identity.
 
     Returns ``{'uuid': ..., 'received_uuid': ...}`` (empty strings when a field is unset
@@ -203,7 +209,9 @@ def parse_subvolume_show(output):
     return {"uuid": uuid, "received_uuid": received_uuid}
 
 
-def exec_subprocess(command, method="check_output", **kwargs):
+def exec_subprocess(
+    command: list[str], method: str = "check_output", **kwargs: Any
+) -> Any:
     """Executes ``getattr(subprocess, method)(cmd, **kwargs)`` and takes
     care of proper logging and error handling. ``AbortError`` is raised
     in case of a ``subprocess.CalledProcessError``.
@@ -270,12 +278,14 @@ def exec_subprocess(command, method="check_output", **kwargs):
         raise AbortError(f"Error executing {command[0]}: {e}") from e
 
 
-def log_heading(caption) -> str:
+def log_heading(caption: str) -> str:
     """Formatted heading for logging output sections."""
     return f"{f'--[ {caption} ]':-<50}"
 
 
-def date_to_str(timestamp=None, fmt=None):
+def date_to_str(
+    timestamp: time.struct_time | None = None, fmt: str | None = None
+) -> str:
     """Convert date format to string."""
     if timestamp is None:
         timestamp = time.localtime()
@@ -284,7 +294,9 @@ def date_to_str(timestamp=None, fmt=None):
     return time.strftime(fmt, timestamp)
 
 
-def str_to_date(time_string=None, fmt=None):
+def str_to_date(
+    time_string: str | None = None, fmt: str | None = None
+) -> time.struct_time:
     """Convert date string to date object."""
     if time_string is None:
         # we don't simply return time.localtime() because this would have
@@ -295,7 +307,9 @@ def str_to_date(time_string=None, fmt=None):
     return time.strptime(time_string, fmt)
 
 
-def parse_snapshot_time(time_string, preferred_fmt=None):
+def parse_snapshot_time(
+    time_string: str, preferred_fmt: str | None = None
+) -> tuple[time.struct_time, str]:
     """Parse a snapshot timestamp into a ``(time_obj, matched_fmt)`` pair.
 
     ``preferred_fmt`` (a configured ``timestamp_format``) is tried first when
@@ -319,7 +333,7 @@ def parse_snapshot_time(time_string, preferred_fmt=None):
     raise last_error or ValueError(f"unparseable snapshot timestamp: {time_string!r}")
 
 
-def infer_snapshot_prefix(name, preferred_fmt=None):
+def infer_snapshot_prefix(name: str, preferred_fmt: str | None = None) -> str | None:
     """Return the snapshot prefix ``name`` would need to parse, or None.
 
     A snapshot name is ``<prefix><timestamp>``, and every listing filters on the
@@ -342,7 +356,7 @@ def infer_snapshot_prefix(name, preferred_fmt=None):
     return None
 
 
-def is_btrfs(path):
+def is_btrfs(path: str | Path) -> bool:
     """Checks whether path is inside a btrfs file system."""
     path = Path(path).resolve()
     logger.debug("Checking for btrfs filesystem: %s", path)
@@ -375,7 +389,7 @@ def is_btrfs(path):
     return result
 
 
-def is_subvolume(path):
+def is_subvolume(path: str | Path) -> bool:
     """Checks whether the given path is a btrfs subvolume.
 
     Args:
@@ -397,7 +411,7 @@ def is_subvolume(path):
     return result
 
 
-def delete_subvolume(path):
+def delete_subvolume(path: str | Path) -> None:
     """Delete a btrfs subvolume.
 
     Args:
@@ -414,7 +428,7 @@ def delete_subvolume(path):
     logger.debug("  -> Subvolume deleted successfully")
 
 
-def is_mounted(path):
+def is_mounted(path: str | Path) -> bool:
     """Check if path is an active mount point.
 
     This verifies that a filesystem is actually mounted at the given path,
@@ -444,7 +458,7 @@ def is_mounted(path):
     return False
 
 
-def get_mount_info(path):
+def get_mount_info(path: str | Path) -> dict[str, str] | None:
     """Get mount information for the filesystem containing path.
 
     Args:
@@ -485,7 +499,9 @@ def get_mount_info(path):
     return best_match
 
 
-def atomic_write_bytes(path, data, *, mode=0o600, fsync=True):
+def atomic_write_bytes(
+    path: str | Path, data: bytes | str, *, mode: int = 0o600, fsync: bool = True
+) -> None:
     """Crash-atomically replace ``path`` with ``data``.
 
     Writes a sibling temp file (in the SAME directory, so ``os.replace`` is a
@@ -547,7 +563,15 @@ def atomic_write_bytes(path, data, *, mode=0o600, fsync=True):
         raise
 
 
-def _privileged_fs(direct, argv, *, action, path, stdin_bytes=None, allow_prompt=False):
+def _privileged_fs(
+    direct: Callable[[], Any],
+    argv: list[str],
+    *,
+    action: str,
+    path: str | Path,
+    stdin_bytes: bytes | None = None,
+    allow_prompt: bool = False,
+) -> Any:
     """Perform a filesystem operation directly, elevating only if that fails.
 
     Try the plain operation FIRST, whatever our uid. "Not root, therefore must
@@ -601,7 +625,7 @@ def _privileged_fs(direct, argv, *, action, path, stdin_bytes=None, allow_prompt
     )
 
 
-def _current_user():
+def _current_user() -> str:
     """The running user's name, for error messages; the uid if it has no name."""
     try:
         import pwd
@@ -611,7 +635,13 @@ def _current_user():
         return f"uid {os.geteuid()}"
 
 
-def privileged_mkdir(path, *, parents=True, exist_ok=True, allow_prompt=False):
+def privileged_mkdir(
+    path: str | Path,
+    *,
+    parents: bool = True,
+    exist_ok: bool = True,
+    allow_prompt: bool = False,
+) -> None:
     """Create ``path``, elevating only if the direct mkdir is refused."""
     path = Path(path)
     return _privileged_fs(
@@ -623,7 +653,9 @@ def privileged_mkdir(path, *, parents=True, exist_ok=True, allow_prompt=False):
     )
 
 
-def privileged_write_bytes(path, data, *, allow_prompt=False):
+def privileged_write_bytes(
+    path: str | Path, data: bytes | str, *, allow_prompt: bool = False
+) -> None:
     """Write ``data`` to ``path``, elevating only if the direct write is refused."""
     path = Path(path)
     if isinstance(data, str):
@@ -642,7 +674,9 @@ def privileged_write_bytes(path, data, *, allow_prompt=False):
     )
 
 
-def privileged_chmod(path, mode, *, allow_prompt=False):
+def privileged_chmod(
+    path: str | Path, mode: int, *, allow_prompt: bool = False
+) -> None:
     """chmod ``path``, elevating only if the direct chmod is refused."""
     path = Path(path)
     return _privileged_fs(
@@ -654,7 +688,7 @@ def privileged_chmod(path, mode, *, allow_prompt=False):
     )
 
 
-def privileged_rmtree(path, *, allow_prompt=False):
+def privileged_rmtree(path: str | Path, *, allow_prompt: bool = False) -> None:
     """Remove ``path`` recursively, elevating only if the direct remove fails.
 
     Best-effort by nature -- every caller is already cleaning up after a failure
@@ -673,7 +707,7 @@ def privileged_rmtree(path, *, allow_prompt=False):
     )
 
 
-def read_locks(s):
+def read_locks(s: str) -> dict[str, Any]:
     """Reads locks from lock file content given as string.
     Returns ``{'snap_name': {'locks': ['lock', ...], ...}, 'parent_locks': ['lock', ...]}``.
     If format is invalid, ``ValueError`` is raised.
@@ -703,6 +737,6 @@ def read_locks(s):
     return content
 
 
-def write_locks(lock_dict):
+def write_locks(lock_dict: dict[str, Any]) -> str:
     """Converts ``lock_dict`` back to the string readable by ``read_locks``."""
     return json.dumps(lock_dict, indent=4)

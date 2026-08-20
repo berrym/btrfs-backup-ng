@@ -1203,9 +1203,17 @@ def _log_subprocess_error(e, destination_endpoint) -> None:
     if hasattr(e, "stderr") and e.stderr:
         stderr = e.stderr.decode("utf-8", errors="replace")
         logger.error("Process stderr: %s", stderr)
+        # Check the VALUE, not merely that the attribute exists. This read
+        # `hasattr(destination_endpoint, "_is_remote")` and used the attribute's
+        # presence as a stand-in for "this endpoint is remote", which worked only
+        # while the attribute was set exclusively by the ssh endpoints. Now that
+        # Endpoint declares it, hasattr is true for every endpoint, and a LOCAL
+        # backup hitting a permission error would be told to use --ssh-sudo and
+        # edit a remote sudoers file -- advice that cannot help, offered at the
+        # moment someone is already debugging a failure.
         if (
             "permission denied" in stderr.lower() or "sudo" in stderr.lower()
-        ) and hasattr(destination_endpoint, "_is_remote"):
+        ) and getattr(destination_endpoint, "_is_remote", False):
             logger.error("This appears to be a permission issue")
             logger.error("For SSH destinations, use --ssh-sudo")
             logger.error(
@@ -2186,8 +2194,8 @@ def _create_snapper_snapshot_wrapper(snapper_snapshot, destination_endpoint=None
     def get_path_override():
         return getattr(wrapper, "_snapper_path")
 
-    wrapper.get_name = get_name_override  # type: ignore[method-assign]
-    wrapper.get_path = get_path_override  # type: ignore[method-assign]
+    wrapper.get_name = get_name_override
+    wrapper.get_path = get_path_override
 
     # Enrich the wrapper's btrfs uuid / received_uuid (sudo-escalated `subvolume show` via the
     # source endpoint, same as P2 enumeration) so the correspondence-based planner can

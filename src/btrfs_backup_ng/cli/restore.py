@@ -563,7 +563,7 @@ def _prepare_local_endpoint(
     }
 
     local_ep = LocalEndpoint(config=endpoint_kwargs)
-    local_ep.prepare()  # type: ignore[attr-defined]
+    local_ep.prepare()
 
     return local_ep
 
@@ -937,7 +937,7 @@ def _execute_cleanup(args: argparse.Namespace) -> int:
                 continue
 
             # Check if it's a subvolume
-            if not __util__.is_subvolume(item):  # type: ignore[attr-defined]
+            if not __util__.is_subvolume(item):
                 continue
 
             # Check for signs of incomplete restore

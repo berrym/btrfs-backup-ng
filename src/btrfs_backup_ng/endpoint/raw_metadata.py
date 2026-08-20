@@ -349,9 +349,7 @@ class RawSnapshot:
         untrusted directory (``raw backfill-metadata`` over a target with foreign/legacy
         content, typically as root) must not let a pre-planted ``<name>.meta.tmp``
         symlink redirect the write to an arbitrary file."""
-        __util__.atomic_write_bytes(  # type: ignore[attr-defined]
-            self.metadata_path, self.serialize(), mode=0o600
-        )
+        __util__.atomic_write_bytes(self.metadata_path, self.serialize(), mode=0o600)
 
     @classmethod
     def from_dict(cls, data: dict[str, Any], stream_path: Path) -> RawSnapshot:

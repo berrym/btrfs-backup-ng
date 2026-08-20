@@ -176,7 +176,7 @@ def validate_restore_destination(
             raise RestoreError(f"Cannot create destination directory {path}: {e}")
 
     # Must be on btrfs filesystem
-    if not __util__.is_btrfs(path):  # type: ignore[attr-defined]
+    if not __util__.is_btrfs(path):
         raise RestoreError(
             f"Destination {path} is not on a btrfs filesystem. "
             "btrfs receive requires a btrfs filesystem."
@@ -243,7 +243,7 @@ def verify_restored_snapshot(
             )
 
         # Verify it's a valid subvolume
-        if not __util__.is_subvolume(snapshot_path):  # type: ignore[attr-defined]
+        if not __util__.is_subvolume(snapshot_path):
             raise RestoreError(
                 f"{snapshot_path} exists but is not a valid btrfs subvolume. "
                 "The restore may have failed."
@@ -1697,7 +1697,7 @@ def restore_snapper_snapshot(
                         ],
                         capture_output=True,
                     )
-                    __util__.delete_subvolume(dest_snapshot_path)  # type: ignore[attr-defined]
+                    __util__.delete_subvolume(dest_snapshot_path)
             if dest_snapshot_dir.exists():
                 __util__.privileged_rmtree(dest_snapshot_dir, allow_prompt=True)
         except Exception as cleanup_e:

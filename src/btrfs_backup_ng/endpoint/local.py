@@ -113,7 +113,7 @@ class LocalEndpoint(Endpoint):
         fs_checks_mode = self.config["fs_checks"]
 
         if fs_checks_mode != "skip" and self.config["source"] is not None:
-            if not __util__.is_subvolume(self.config["source"]):  # type: ignore[attr-defined]
+            if not __util__.is_subvolume(self.config["source"]):
                 msg = f"{self.config['source']} does not seem to be a btrfs subvolume"
                 if fs_checks_mode == "strict":
                     logger.error(msg)
@@ -125,7 +125,7 @@ class LocalEndpoint(Endpoint):
                     logger.warning("%s - continuing anyway (auto mode)", msg)
 
         if fs_checks_mode != "skip":
-            if not __util__.is_btrfs(self.config["path"]):  # type: ignore[attr-defined]
+            if not __util__.is_btrfs(self.config["path"]):
                 msg = f"{self.config['path']} does not seem to be on a btrfs filesystem"
                 if fs_checks_mode == "strict":
                     logger.error(msg)
