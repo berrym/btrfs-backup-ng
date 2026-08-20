@@ -7,6 +7,123 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.4] - 2026-08-20
+
+The "a check that did not run is not a check that passed" release.
+
+Twenty-one fixes, nearly all of them the same defect wearing different clothes: a
+value read from your config and then quietly dropped, a check that could not run
+reported as though it had passed, a setting recognised and discarded without a
+word. Individually small; together they meant the program could tell you it had
+done something it had not. Several were found by running the real CLI between two
+real machines rather than by reading code, and two of those could restore the
+wrong data while reporting success.
+
+Nothing here changes a config format. Two behaviours change, both listed below.
+
+### Security
+
+- **A root systemd unit could run a binary an ordinary user can replace** — `install`
+  checked the executable's own owner and mode, but replacing a file is `unlink` plus
+  `create`, which is a write to the *directory*. A root-owned binary in a
+  user-writable directory passed the check. Every parent directory is now checked
+  for a non-root owner and for group/other write, with sticky directories exempted.
+  A binary that cannot be examined at all now says the check did **not** run,
+  instead of producing the most reassuring output of any case.
+- **Symlink race when writing as root** — the guard was `islink()` followed by the
+  operation, so a link swapped in between the two won and the write or `chmod`
+  followed it. Both now use `O_NOFOLLOW`, moving the check inside the kernel call.
+
+### Fixed
+
+- **`restore` could restore a different volume than you asked for, and report
+  success** — on `raw+ssh://`, `--prefix` was ignored for every stream that has a
+  `.meta` sidecar, which is all of them. Two volumes sharing one destination
+  returned both sets; `restore --prefix X` restored the other volume too, said
+  "Restored: 2, Failed: 0", exited 0, and used one volume's snapshot as the
+  incremental parent of the other's stream. Found on real hardware between two
+  machines.
+- **An explicit `--prefix` was silently replaced** — prefix inference ran even when
+  you had named the prefix yourself, so a restore asked for one volume listed and
+  restored another, and exited 0. Inference now applies only when no prefix was
+  given; a prefix that matches nothing is a mismatch to report, not a guess to make.
+- **Compression to an ssh:// target delivered zero bytes on Debian, Ubuntu, Alpine
+  and most NAS boxes** — POSIX gives an asynchronous list `/dev/null` for stdin when
+  job control is off; bash exempts a backgrounded pipeline, dash and busybox ash do
+  not, so the remote decompressor lost its input. Measured with `btrfs receive`
+  replaced by a byte counter.
+- **A `raw://` location holding backups reported as empty** — a prefix mismatch
+  produced "no snapshots found" and exit 0, because the prefix diagnostics could not
+  parse raw filenames (`name.btrfs`, plus compression and encryption suffixes). They
+  now report what prefixes are actually present, on local and remote raw alike.
+- **`ssh_port` was ignored on restore** — a non-standard port connected to 22 while
+  logging that the target's `ssh_port` had been applied. The value was read, then
+  dropped by the endpoint's key whitelist because it was threaded under the wrong
+  name.
+- **`ssh_password_auth = false` did nothing on restore** — the option could not be
+  returned under any value it could hold, and the endpoint read the setting from a
+  command-line flag that does not exist. It was honoured for backups and ignored for
+  restores, so a target configured to refuse password authentication refused it when
+  writing and offered it when reading back.
+- **`doctor` reported two things it had not established** — it probed for a command
+  named after the compression *method* rather than its binary, so `lzo` (whose binary
+  is `lzop`) was reported missing though it works; and a remote decompressor check
+  passed on the strength of the local machine. Both now report only what they
+  actually checked.
+- **`estimate` presented a floor as a measurement** — incremental sizes come from
+  `btrfs send --no-data`, a metadata-only stream whose real transfer runs roughly
+  10-100x larger, and it was printed as "Total data to transfer" with no caveat and
+  emitted as a bare number in `--json`. Underestimated totals now print as "AT
+  LEAST" with the reason, affected rows are marked, and `--json` carries
+  `total_transfer_is_lower_bound`. Measured full transfers stay unqualified.
+- **A transfer killed by our own timeout looked like an ssh problem** — both monitors
+  logged "Transfer timed out" and recorded no reason anywhere the run summary or
+  transaction log would find it, so the natural suspect was an ssh idle timeout,
+  which also commonly defaults to an hour. The limit now names itself and its value,
+  and says it is not an ssh idle or keepalive timeout.
+- **Overlapping runs** — a timer firing while the previous transfer was still running
+  started a second run over the same volumes and targets. systemd declines to start
+  a second copy of one unit, so the packaged timer was covered by systemd rather than
+  by us, and a manual run racing a timer run was not covered at all. A run lock keyed
+  on the config file now covers every target type.
+- **The source tarball was missing `examples/`, so building from source failed its
+  own tests** — the manifest named `config.example.toml`, a file that stopped
+  existing when the examples moved into `examples/`, so it shipped nothing. Four
+  tests read those files at collection time and failed from the sdist. This is the
+  same failure that lost `docs/` in 0.9.3, so the check is now on the invariant:
+  any directory the test suite reads must be declared in the manifest.
+- **btrbk migration produced configs that did not match the source** — `no` (btrbk's
+  "off") was carried across as a literal value, producing `ssh://no@host/...` and
+  `ssh_key = "no"`; a `target` declared at global scope was discarded, migrating to
+  volumes with no destination at all; an explicitly declared target type was overruled
+  by an unrelated option, silently changing the backup format; `backend` was ignored,
+  so a config that chose the non-sudo backend migrated to one that elevates; ssh
+  options were emitted on purely local targets; and six recognised options were
+  stored and never read. Each is now carried, or reported as not carried, with the
+  reason.
+
+### Changed
+
+- **A run that cannot start because another is in progress now exits non-zero.** The
+  cause is benign, but no backup was made, and a run that did not happen must not
+  report success. A timer reporting this repeatedly means the schedule fires faster
+  than a run takes.
+- **`compress` on a local btrfs target now warns at config load.** It was accepted and
+  then dropped — correctly, since compressing only to decompress on the same machine
+  buys nothing — but nothing said so, and the config read as though backups were
+  compressed. The backup still runs, uncompressed.
+
+### Documentation
+
+- **`core/progress.py` now states where its bars actually appear** — every `ssh://`
+  btrfs backup takes the direct-pipe path and never reaches that module, and even on
+  the traditional path it needs an interactive terminal, a known size, no compression
+  and no rate limit. The direct pipe cannot use it because those helpers count bytes
+  by pulling them through Python, which is exactly what that path exists to avoid.
+
+Thanks to Michael J Gruber (@mjg) for the transfer-timeout report and the questions
+that led to the timeout, overlapping-run and `estimate` fixes (#93).
+
 ## [0.9.3] - 2026-08-16
 
 ### Fixed
