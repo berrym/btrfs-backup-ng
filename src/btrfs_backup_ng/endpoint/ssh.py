@@ -210,7 +210,7 @@ def _build_receive_command(
             # always honoured use_sudo, and this branch has to agree with it.
             inner = _guarded_pipeline(f"{decompressor} | btrfs receive {quoted_dest}")
             script = f'trap "" PIPE; exec sudo -S sh -c {shlex.quote(inner)}'
-            return f"sh -c {shlex.quote(script)}"
+            return f"exec sh -c {shlex.quote(script)}"
         script = (
             f'trap "" PIPE; {_guarded_pipeline(f"{decompressor} | {base_receive}")}'
         )
@@ -224,7 +224,17 @@ def _build_receive_command(
     # any single-quoted destination inside it: a path with a space would be
     # truncated, an apostrophe would be a remote syntax error, and a `;` would
     # run an injected command whose exit status masks a failing btrfs receive.
-    return f"sh -c {shlex.quote(script)}"
+    #
+    # `exec` so the remote login shell REPLACES itself with the shell holding the
+    # trap, instead of forking and waiting. ssh runs this string through the
+    # login shell, so without exec there are two shells and the trap is in the
+    # inner one: a signal reaches the outer shell, which has no trap, and the
+    # pipeline is orphaned. bash hides this by exec-ing a sole final command on
+    # its own, dash and busybox ash do not -- the same bash-vs-dash split that
+    # cost this feature its stdin, and the same Debian/Ubuntu/Alpine remotes.
+    # Measured in a dash container: orphaned sh, subshell and receive without it,
+    # clean with it; unchanged under bash either way.
+    return f"exec sh -c {shlex.quote(script)}"
 
 
 class SSHEndpoint(Endpoint):

@@ -52,6 +52,13 @@ Nothing here changes a config format. Two behaviours change, both listed below.
   job control is off; bash exempts a backgrounded pipeline, dash and busybox ash do
   not, so the remote decompressor lost its input. Measured with `btrfs receive`
   replaced by a byte counter.
+- **A signal left `btrfs receive` running on Debian-family remotes** — the remote
+  command is a script wrapped in `sh -c`, with the cleanup trap in the inner
+  shell. bash exec-replaces a sole final command, so the signal reached the trap;
+  dash and busybox ash fork and wait, so the signal killed the outer shell and
+  orphaned the decompressor, the receive and the subshell. The wrapper is now
+  `exec`-ed, which behaves identically on both. Reproduced in a dash container --
+  hardware testing runs against a bash host, so it could not have surfaced there.
 - **A `raw://` location holding backups reported as empty** — a prefix mismatch
   produced "no snapshots found" and exit 0, because the prefix diagnostics could not
   parse raw filenames (`name.btrfs`, plus compression and encryption suffixes). They

@@ -168,21 +168,37 @@ class TestTheRemoteCommandDecompresses:
     def test_the_destination_is_still_quoted_exactly_once(self):
         cmd = _build_receive_command("/back ups/it's here", decompress="zstd")
         assert "'/back ups/it'\"'\"'s here'" in cmd or "back ups" in cmd
-        assert cmd.startswith("sh -c ")
+        assert cmd.startswith("exec sh -c ")
 
 
 class TestTheUncompressedCommandIsUnchanged:
-    """Compression is opt-in; the path everyone already uses must not move."""
+    """Compression is opt-in; the path everyone already uses must not move.
+
+    The form gained a leading `exec` after a dash container showed the remote
+    login shell forking instead of replacing itself, which orphaned the receive
+    on every Debian-family remote. The script INSIDE is otherwise untouched,
+    which is what this class exists to hold.
+    """
 
     @pytest.mark.parametrize("decompress", [None, "none"])
     def test_it_matches_the_historical_form(self, decompress):
         arg = None if decompress in (None, "none") else decompress
         cmd = _build_receive_command(DEST, use_sudo=True, decompress=arg)
-        assert cmd == "sh -c 'trap \"\" PIPE; exec sudo -n btrfs receive /backups/home'"
+        assert cmd == (
+            "exec sh -c 'trap \"\" PIPE; exec sudo -n btrfs receive /backups/home'"
+        )
 
     def test_without_sudo_too(self):
         cmd = _build_receive_command(DEST)
-        assert cmd == "sh -c 'trap \"\" PIPE; exec btrfs receive /backups/home'"
+        assert cmd == "exec sh -c 'trap \"\" PIPE; exec btrfs receive /backups/home'"
+
+    def test_the_script_itself_is_untouched(self):
+        """The change is the wrapper, not the script: strip the exec and the
+        historical string is exactly what remains."""
+        cmd = _build_receive_command(DEST, use_sudo=True)
+        assert cmd.removeprefix("exec ") == (
+            "sh -c 'trap \"\" PIPE; exec sudo -n btrfs receive /backups/home'"
+        )
 
 
 class TestTheBufferProgram:
