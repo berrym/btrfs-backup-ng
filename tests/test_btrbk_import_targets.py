@@ -311,3 +311,61 @@ class TestConnectionOptionsSurviveImport:
         target = loaded.volumes[0].targets[0]
         assert target.ssh_key == "/keys/id_ed25519"
         assert target.ssh_port == 2222
+
+
+class TestBtrbkOffValuesAreNotSettings:
+    """btrbk writes `no` to disable an option; it is not a value.
+
+    Taken literally the string is truthy and non-empty, so it flowed straight
+    through: `ssh_user no` produced `ssh://no@host/...` and `ssh_key = "no"` -- a
+    config that logs in as a user called "no" with a key file called "no". Worse,
+    `raw_target_compress no` made `is_raw_target` true, turning every plain
+    send-receive destination into a raw stream-file one: a different backup
+    format entirely, chosen silently.
+    """
+
+    def _toml(self, text):
+        return convert_to_toml(
+            parse_btrbk_config(
+                f"{text}volume /mnt/pool\n  subvolume home\n"
+                f"    target send-receive ssh://nas.local/backup\n"
+            )
+        )[0]
+
+    @pytest.mark.parametrize("off", ["no", "NO", "off", "false", "0"])
+    def test_a_disabled_ssh_user_is_not_a_username(self, off):
+        toml = self._toml(f"ssh_user {off}\n")
+        assert "@nas.local" not in toml, toml
+        assert f"{off}@" not in toml, toml
+
+    @pytest.mark.parametrize("off", ["no", "off", "false"])
+    def test_a_disabled_ssh_identity_is_not_a_key_path(self, off):
+        assert "ssh_key" not in self._toml(f"ssh_identity {off}\n")
+
+    @pytest.mark.parametrize("off", ["no", "off", "false"])
+    def test_a_disabled_raw_option_does_not_make_the_target_raw(self, off):
+        """The destination format must not change because an option was OFF."""
+        toml = self._toml(f"raw_target_compress {off}\n")
+        assert "raw+ssh://" not in toml, toml
+        assert 'path = "ssh://nas.local/backup"' in toml, toml
+
+    def test_a_disabled_raw_encrypt_does_not_make_the_target_raw(self):
+        toml = self._toml("raw_target_encrypt no\n")
+        assert "raw+ssh://" not in toml, toml
+
+    def test_real_values_are_still_carried(self):
+        """The guard must not swallow genuine settings."""
+        toml = self._toml("ssh_user backup\nssh_identity /keys/id\n")
+        assert 'path = "ssh://backup@nas.local/backup"' in toml, toml
+        assert 'ssh_key = "/keys/id"' in toml, toml
+
+    def test_a_genuinely_raw_target_is_still_raw(self):
+        toml = convert_to_toml(
+            parse_btrbk_config(
+                "volume /mnt/pool\n  subvolume home\n"
+                "    target raw ssh://nas.local/backup\n"
+                "      raw_target_compress zstd\n"
+            )
+        )[0]
+        assert "raw+ssh://" in toml, toml
+        assert 'compress = "zstd"' in toml, toml

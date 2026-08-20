@@ -681,6 +681,15 @@ def _retention_block(
     return lines, warnings
 
 
+def _is_disabled(value: object) -> bool:
+    """Is this btrbk value one of its spellings for "off" / "use the default"?
+
+    btrbk writes `no` to disable an option. Treated as a plain string it is
+    truthy and non-empty, so it flowed through as a literal setting.
+    """
+    return str(value).strip().lower() in ("no", "off", "false", "0") if value else False
+
+
 def convert_to_toml(btrbk_config: BtrbkConfig) -> tuple[str, list[str]]:
     """Convert parsed btrbk config to TOML format.
 
@@ -863,12 +872,18 @@ def convert_to_toml(btrbk_config: BtrbkConfig) -> tuple[str, list[str]]:
                 # username had come across, and got authentication failures
                 # against a host btrbk had been backing up to correctly.
                 def inherited(name: str) -> str | None:
-                    return (
+                    value = (
                         target.options.get(name)
                         or subvolume.options.get(name)
                         or volume.options.get(name)
                         or btrbk_config.global_options.get(name)
                     )
+                    # btrbk spells "off" / "use the default" as `no`, so the
+                    # string is a DISABLED setting, not a value. Taken literally
+                    # it produced `ssh://no@host/...` and `ssh_key = "no"` -- a
+                    # config that tries to log in as a user called "no" with a
+                    # key file called "no".
+                    return None if _is_disabled(value) else value
 
                 ssh_identity = inherited("ssh_identity")
                 ssh_user = inherited("ssh_user")
@@ -878,8 +893,14 @@ def convert_to_toml(btrbk_config: BtrbkConfig) -> tuple[str, list[str]]:
                 # Determine if this is a raw target. The declared type counts:
                 # `target raw <url>` is a raw target even when no raw_target_*
                 # option is set anywhere.
+                # `bool("no")` is True, so btrbk's documented OFF value for
+                # raw_target_compress / raw_target_encrypt turned every plain
+                # send-receive destination into a raw stream-file one -- a
+                # completely different backup format, chosen silently.
                 is_raw_target = bool(
-                    raw_compress or raw_encrypt or target.target_type == "raw"
+                    (raw_compress and not _is_disabled(raw_compress))
+                    or (raw_encrypt and not _is_disabled(raw_encrypt))
+                    or target.target_type == "raw"
                 )
 
                 # Convert btrbk target path format
