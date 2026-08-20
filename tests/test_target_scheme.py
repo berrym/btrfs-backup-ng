@@ -33,7 +33,7 @@ FORMS = [
         "backups/home", TargetKind.LOCAL, False, False, True, False, id="local-relative"
     ),
     pytest.param(
-        "ssh://host:/backups", TargetKind.SSH, True, False, False, False, id="ssh-colon"
+        "ssh://host:/backups", TargetKind.SSH, True, False, False, True, id="ssh-colon"
     ),
     pytest.param(
         "ssh://user@host:/backups",
@@ -41,7 +41,7 @@ FORMS = [
         True,
         False,
         False,
-        False,
+        True,
         id="ssh-user",
     ),
     pytest.param(
@@ -50,7 +50,7 @@ FORMS = [
         True,
         False,
         False,
-        False,
+        True,
         id="ssh-no-colon",
     ),
     pytest.param(
@@ -59,7 +59,7 @@ FORMS = [
         True,
         False,
         False,
-        False,
+        True,
         id="ssh-port",
     ),
     pytest.param(
@@ -130,15 +130,19 @@ class TestTheBugThisModuleExistsFor:
         assert parse_target("raw:///mnt/usb/backups").supports_mount_check is True
         assert parse_target("raw+ssh://host/backups").supports_mount_check is False
 
-    def test_only_raw_targets_support_compress(self):
+    def test_compress_is_supported_wherever_an_endpoint_implements_it(self):
         """One documented option, three verified behaviours.
 
-        raw compresses correctly; ssh:// silently discards it; a local btrfs
-        target fails the transfer outright.
+        raw compresses at rest; ssh:// compresses over the wire and decompresses
+        in the remote command; a LOCAL btrfs destination would compress only to
+        decompress on the same machine, so core.operations drops it.
+
+        ssh:// answered False here for as long as nothing decompressed on the
+        remote. It does now, and this is the property that says so.
         """
         assert parse_target("raw:///mnt/x").supports_compress is True
         assert parse_target("raw+ssh://host/x").supports_compress is True
-        assert parse_target("ssh://host:/x").supports_compress is False
+        assert parse_target("ssh://host:/x").supports_compress is True
         assert parse_target("/mnt/x").supports_compress is False
 
 

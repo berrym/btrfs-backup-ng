@@ -183,14 +183,24 @@ class TargetScheme:
     def supports_compress(self) -> bool:
         """Whether ``compress`` does anything.
 
-        Verified behaviour of one documented option, three ways: raw targets
-        compress correctly (the compressor is part of the stream written to the
-        file); ``ssh://`` silently discards the setting; a local btrfs target
-        feeds compressed bytes to ``btrfs receive`` and the transfer fails.
-        Only raw targets support it, so the other two should be rejected at
-        config load rather than surprising someone at 3am.
+        Compression is owned by the ENDPOINT, never by the generic transfer
+        layer, and what each endpoint does with it differs:
+
+        * ``raw://`` / ``raw+ssh://`` compress at rest, recording the method in
+          the .meta sidecar so a restore can reverse it;
+        * ``ssh://`` compresses before the wire and puts the matching
+          decompressor into the remote command, so ``btrfs receive`` is handed a
+          plain stream;
+        * a LOCAL btrfs destination would compress and immediately decompress on
+          the same machine for no saving, so ``core.operations`` drops it with a
+          note rather than burning the CPU.
+
+        This said ``ssh://`` silently discards the setting and recommended
+        rejecting it at config load. That was true before stream compression was
+        wired up over ssh, and acting on it now would reject the case
+        compression exists for -- compressing over the wire is the whole point.
         """
-        return self.is_raw
+        return self.kind in (TargetKind.RAW, TargetKind.RAW_SSH, TargetKind.SSH)
 
 
 def parse_target(uri: str | None) -> TargetScheme:

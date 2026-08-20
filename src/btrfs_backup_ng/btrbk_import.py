@@ -886,12 +886,14 @@ def convert_to_toml(btrbk_config: BtrbkConfig) -> tuple[str, list[str]]:
                 )
 
                 # btrbk resolves an option at the narrowest scope that sets it.
-                # These four were recognised by the parser -- so they never looked
-                # unknown -- stored, and then never read back, which dropped them
-                # silently at EVERY scope. The migration guide promises three of
-                # them by name, so a user read the table, believed their key and
-                # username had come across, and got authentication failures
-                # against a host btrbk had been backing up to correctly.
+                # ssh_identity, ssh_user, ssh_port and rate_limit were recognised
+                # by the parser -- so they never looked unknown -- stored, and
+                # then never read back, which dropped them silently at EVERY
+                # scope. The migration guide promises three of them by name, so a
+                # user read the table, believed their key and username had come
+                # across, and got authentication failures against a host btrbk
+                # had been backing up to correctly. `backend` was added to the
+                # same lookup later, for the same reason.
                 def inherited(name: str) -> str | None:
                     value = (
                         target.options.get(name)
