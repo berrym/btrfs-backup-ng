@@ -1663,12 +1663,19 @@ class TestRestoreSnapshot:
 class TestRestoreSnapshots:
     """Tests for restore_snapshots function."""
 
-    def test_returns_empty_stats_when_no_backups(self):
-        """Test returns empty stats when no backups found."""
+    def test_finding_no_backups_is_a_FAILED_restore(self):
+        """Restoring nothing is a failure, not a quiet success.
+
+        This asserted failed == 0, which the CLI turns into exit status 0 -- so
+        `btrfs-backup-ng restore ... && echo ok` printed ok having recovered
+        nothing. Measured against a real remote, where a prefix mismatch
+        produced exactly this: "Found 0 remote snapshots", then success.
+        """
         from btrfs_backup_ng.core.restore import restore_snapshots
 
         backup_endpoint = MagicMock()
         backup_endpoint.list_snapshots.return_value = []
+        backup_endpoint.describe_empty_listing.return_value = None
 
         local_endpoint = MagicMock()
 
@@ -1676,7 +1683,25 @@ class TestRestoreSnapshots:
 
         assert stats["restored"] == 0
         assert stats["skipped"] == 0
-        assert stats["failed"] == 0
+        assert stats["failed"] == 1, "a restore that restored nothing reported success"
+        assert stats["errors"], "nothing explained why nothing came back"
+
+    def test_the_empty_listing_diagnosis_is_passed_on(self):
+        """The endpoint can often say WHY a location looks empty -- usually a
+        prefix mismatch, with the right prefix named. That belongs in front of
+        the operator, not only in the listing command."""
+        from btrfs_backup_ng.core.restore import restore_snapshots
+
+        backup_endpoint = MagicMock()
+        backup_endpoint.list_snapshots.return_value = []
+        backup_endpoint.describe_empty_listing.return_value = (
+            "This location is NOT empty: prefixes present: 'srv-'"
+        )
+
+        stats = restore_snapshots(backup_endpoint, MagicMock())
+
+        assert stats["failed"] == 1
+        assert any("srv-" in str(e) for e in stats["errors"]), stats["errors"]
 
     def test_restores_latest_by_default(self):
         """Test restores latest snapshot by default."""

@@ -413,7 +413,26 @@ def restore_snapshots(
     backup_snapshots = backup_endpoint.list_snapshots()
 
     if not backup_snapshots:
-        logger.warning("No snapshots found at backup location")
+        # A restore that restored nothing is a FAILED restore. This returned
+        # stats with failed=0, which the CLI turns into exit status 0, so
+        # `btrfs-backup-ng restore ... && echo ok` printed ok having recovered
+        # nothing at all -- measured against a real remote, where a prefix
+        # mismatch produced exactly this. Listing legitimately finding an empty
+        # location is still a failure HERE: the caller asked for data back.
+        detail = ""
+        describe = getattr(backup_endpoint, "describe_empty_listing", None)
+        if callable(describe):
+            try:
+                detail = describe() or ""
+            except Exception:  # noqa: BLE001 - a diagnostic must not mask the error
+                detail = ""
+        message = "No snapshots found at the backup location; nothing was restored"
+        logger.error(message)
+        if detail:
+            for line in str(detail).splitlines():
+                logger.error("%s", line)
+        stats["failed"] = 1
+        stats["errors"].append(message if not detail else f"{message}. {detail}")
         return stats
 
     logger.info("Found %d snapshot(s) at backup location", len(backup_snapshots))
