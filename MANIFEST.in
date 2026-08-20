@@ -15,5 +15,9 @@ include CHANGELOG.md
 include CONTRIBUTING.md
 recursive-include docs *.md
 
-# Include config example
-include config.example.toml
+# Include the example configs. These are not decoration: the test suite reads
+# examples/*.toml at collection time, so an sdist without them fails its own
+# tests -- which is how docs/ went missing in 0.9.3. The path here was
+# config.example.toml, a file that has not existed since the examples moved
+# into examples/, so this shipped nothing at all.
+recursive-include examples *.toml
