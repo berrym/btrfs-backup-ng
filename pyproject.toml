@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=61.0"]
+requires = ["setuptools>=77.0"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
@@ -24,7 +24,8 @@ name = "btrfs-backup-ng"
 version = "0.9.4"
 description = "Complete btrfs backup solution with automated snapshots, incremental transfers, restore functionality, snapper integration, and systemd scheduling"
 authors = [{ name = "Michael Berry", email = "trismegustis@gmail.com" }]
-license = { file = "LICENSE" }
+license = "MIT"
+license-files = ["LICENSE"]
 dependencies = ["filelock", "rich", "paramiko"]
 classifiers = [
     "Programming Language :: Python :: 3",

@@ -91,3 +91,46 @@ def test_the_manifest_names_no_path_that_does_not_exist():
         if len(parts) >= 2 and parts[0] == "include" and not Path(parts[1]).exists():
             missing.append(parts[1])
     assert not missing, f"MANIFEST.in includes paths that do not exist: {missing}"
+
+
+class TestTheLicenseMetadataIsAnIdentifierNotAnEssay:
+    """PyPI showed the whole MIT text where the licence name belongs.
+
+    `license = { file = "LICENSE" }` makes setuptools inline the file's CONTENTS
+    into the metadata's License field, so the 0.9.4 release page rendered
+    "The MIT License (MIT)\\n\\nCopyright..." as its licence. PEP 639 replaced
+    that with an SPDX expression plus a separate license-files entry, which is
+    what produces `License-Expression: MIT` and still ships the file.
+
+    Cosmetic, but the kind of thing that quietly stays wrong for years.
+    """
+
+    def _pyproject(self) -> str:
+        return Path("pyproject.toml").read_text(encoding="utf-8")
+
+    @pytest.mark.skipif(
+        not Path("pyproject.toml").exists(), reason="not a git checkout"
+    )
+    def test_the_license_is_an_spdx_expression(self):
+        assert 'license = "MIT"' in self._pyproject(), (
+            "license must be an SPDX expression; the table form inlines the "
+            "entire licence text into the metadata field"
+        )
+
+    @pytest.mark.skipif(
+        not Path("pyproject.toml").exists(), reason="not a git checkout"
+    )
+    def test_the_license_file_is_still_shipped(self):
+        """SPDX names the licence; the file itself must still reach users."""
+        assert 'license-files = ["LICENSE"]' in self._pyproject()
+        assert Path("LICENSE").exists()
+
+    @pytest.mark.skipif(
+        not Path("pyproject.toml").exists(), reason="not a git checkout"
+    )
+    def test_the_build_backend_is_new_enough_to_understand_it(self):
+        """An SPDX expression under setuptools < 77 is an error, not a no-op."""
+        match = re.search(r"setuptools>=(\d+)", self._pyproject())
+        assert match and int(match.group(1)) >= 77, (
+            "PEP 639 license expressions need setuptools>=77"
+        )
