@@ -102,6 +102,57 @@ def _compression_choices() -> list[str]:
     return ["none", *sorted(set(COMPRESSION_PROGRAMS) | set(COMPRESSION_CONFIG))]
 
 
+def _keep_global_options_across_subcommands(
+    parser: argparse.ArgumentParser,
+) -> None:
+    """Stop a subcommand's own copy of a global option from erasing the global one.
+
+    argparse parses a subcommand into a fresh namespace and then copies every key
+    of it onto the parent namespace, so a subparser that also defines ``--config``
+    writes its own default over the value ``-c`` already supplied ahead of the
+    subcommand: ``btrfs-backup-ng -c FILE restore`` silently loses FILE.
+
+    Suppressing the subparser default leaves the attribute unset when the flag is
+    absent, so the global value survives, while a flag given after the subcommand
+    still takes precedence.
+
+    Only options that mean the same thing are carried over, and sameness is judged
+    by metavar, which is the deliberate signal of what a value is.  Several
+    subcommands reuse the name for something else entirely:
+
+        -c FILE   the configuration file            (global, restore, estimate)
+        -c NAME   a snapper config such as ``root`` (snapper list/status/...)
+
+    Carrying a value across that boundary would hand a file path to code expecting
+    a snapper config name.  Positionals are never touched for the same reason --
+    ``snapper backup`` and ``snapper restore`` take the snapper config name that
+    way.  Help text is deliberately not consulted: rewording it must not change
+    what the command line does.
+    """
+    global_options = {
+        action.dest: action
+        for action in parser._actions
+        if action.option_strings and action.dest not in ("help", argparse.SUPPRESS)
+    }
+
+    def walk(current: argparse.ArgumentParser) -> None:
+        for action in current._actions:
+            if not isinstance(action, argparse._SubParsersAction):
+                continue
+            for subparser in action.choices.values():
+                for sub_action in subparser._actions:
+                    global_action = global_options.get(sub_action.dest)
+                    if (
+                        global_action is not None
+                        and sub_action.option_strings
+                        and sub_action.metavar == global_action.metavar
+                    ):
+                        sub_action.default = argparse.SUPPRESS
+                walk(subparser)
+
+    walk(parser)
+
+
 def create_subcommand_parser() -> argparse.ArgumentParser:
     """Create the main argument parser with subcommands."""
     parser = argparse.ArgumentParser(
@@ -1614,6 +1665,8 @@ Examples:
         action="store_true",
         help="Output in JSON format instead of TOML",
     )
+
+    _keep_global_options_across_subcommands(parser)
 
     return parser
 
