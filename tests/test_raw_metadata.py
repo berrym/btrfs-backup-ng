@@ -336,8 +336,51 @@ class TestCompressionConfig:
 
     def test_all_algorithms_have_config(self):
         """Test that all expected algorithms are configured."""
-        expected = {"gzip", "pigz", "zstd", "lz4", "xz", "lzo", "pbzip2", "bzip2"}
+        expected = {
+            "gzip",
+            "pigz",
+            "zstd",
+            "lz4",
+            "xz",
+            "lzo",
+            # Second spelling of lzo, after the program both entries run. The
+            # transfer path names methods after the binary, this table after the
+            # format; accepting both means `compress` means the same thing
+            # whatever the destination.
+            "lzop",
+            "pbzip2",
+            "bzip2",
+        }
         assert set(COMPRESSION_CONFIG.keys()) == expected
+
+    def test_the_two_transports_accept_the_same_methods(self):
+        """`compress` must not mean different things on different destinations.
+
+        A raw target ran one table and a btrfs target another, so a config could
+        compress with xz at rest but not over the wire, and `--compress lzop`
+        was accepted for one destination and refused by the other. Nothing
+        technical required that: both sides just run `<prog> -c` and
+        `<prog> -dc`.
+        """
+        from btrfs_backup_ng.core.transfer import COMPRESSION_PROGRAMS
+
+        assert set(COMPRESSION_CONFIG) == set(COMPRESSION_PROGRAMS), (
+            "the raw and btrfs transports disagree about which methods exist"
+        )
+
+    def test_both_spellings_of_lzo_run_the_same_program(self):
+        assert (
+            COMPRESSION_CONFIG["lzo"]["compress_cmd"]
+            == COMPRESSION_CONFIG["lzop"]["compress_cmd"]
+        )
+        assert (
+            COMPRESSION_CONFIG["lzo"]["decompress_cmd"]
+            == COMPRESSION_CONFIG["lzop"]["decompress_cmd"]
+        )
+        assert (
+            COMPRESSION_CONFIG["lzo"]["extension"]
+            == COMPRESSION_CONFIG["lzop"]["extension"]
+        ), "a sidecar written under one spelling must be readable under the other"
 
     def test_config_has_required_fields(self):
         """Test that each config has required fields."""

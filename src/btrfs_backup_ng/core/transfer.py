@@ -8,6 +8,8 @@ import shutil
 import subprocess
 from typing import Optional, TypedDict
 
+from .compression import COMPRESSION_METHODS
+
 logger = logging.getLogger(__name__)
 
 
@@ -19,33 +21,19 @@ class CompressionConfig(TypedDict):
     check: str
 
 
-# Available compression programs with their compress/decompress commands
+# Available compression programs, as a view onto the one canonical table.
+# `core.compression` is the definition; this name is kept because it is what the
+# transfer path has always imported, and it exposes exactly the fields that path
+# uses. Deriving it means the ssh:// and raw:// sides can no longer disagree
+# about which methods exist -- they used to, and `compress` meant different
+# things depending on the destination.
 COMPRESSION_PROGRAMS: dict[str, CompressionConfig] = {
-    "gzip": {
-        "compress": ["gzip", "-c"],
-        "decompress": ["gzip", "-dc"],
-        "check": "gzip",
-    },
-    "zstd": {
-        "compress": ["zstd", "-c", "-T0"],  # -T0 uses all CPU cores
-        "decompress": ["zstd", "-dc", "-T0"],
-        "check": "zstd",
-    },
-    "lz4": {
-        "compress": ["lz4", "-c"],
-        "decompress": ["lz4", "-dc"],
-        "check": "lz4",
-    },
-    "pigz": {
-        "compress": ["pigz", "-c"],  # Parallel gzip
-        "decompress": ["pigz", "-dc"],
-        "check": "pigz",
-    },
-    "lzop": {
-        "compress": ["lzop", "-c"],
-        "decompress": ["lzop", "-dc"],
-        "check": "lzop",
-    },
+    name: {
+        "compress": entry["compress"],
+        "decompress": entry["decompress"],
+        "check": entry["program"],
+    }
+    for name, entry in COMPRESSION_METHODS.items()
 }
 
 
@@ -53,7 +41,7 @@ def check_compression_available(method: str) -> bool:
     """Check if a compression method is available on the system.
 
     Args:
-        method: Compression method name (gzip, zstd, lz4, pigz, lzop)
+        method: Compression method name (see COMPRESSION_PROGRAMS)
 
     Returns:
         True if the compression program is available

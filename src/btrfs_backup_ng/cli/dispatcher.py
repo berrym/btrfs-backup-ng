@@ -84,6 +84,24 @@ def is_legacy_mode(argv: list[str]) -> bool:
     return False
 
 
+def _compression_choices() -> list[str]:
+    """Every method some target can actually run, from the authoritative tables.
+
+    The two transports run different programs: a btrfs target (local, ssh://)
+    uses core.transfer.COMPRESSION_PROGRAMS, a raw target uses
+    endpoint.raw_metadata.COMPRESSION_CONFIG, and the sets are not the same --
+    lzop is btrfs-only, xz/lzo/bzip2/pbzip2 are raw-only. Hard-coding one set
+    here made valid configurations unreachable from the command line
+    (`--compress xz` for a raw target) while offering one the raw endpoint
+    rejects. Whether a given method suits the given target is decided by that
+    target, which reports the set it accepts.
+    """
+    from ..core.transfer import COMPRESSION_PROGRAMS
+    from ..endpoint.raw_metadata import COMPRESSION_CONFIG
+
+    return ["none", *sorted(set(COMPRESSION_PROGRAMS) | set(COMPRESSION_CONFIG))]
+
+
 def create_subcommand_parser() -> argparse.ArgumentParser:
     """Create the main argument parser with subcommands."""
     parser = argparse.ArgumentParser(
@@ -140,7 +158,7 @@ def create_subcommand_parser() -> argparse.ArgumentParser:
     run_parser.add_argument(
         "--compress",
         metavar="METHOD",
-        choices=["none", "gzip", "zstd", "lz4", "pigz", "lzop"],
+        choices=_compression_choices(),
         help="Compression method for transfers (overrides config)",
     )
     run_parser.add_argument(
@@ -205,7 +223,7 @@ def create_subcommand_parser() -> argparse.ArgumentParser:
     transfer_parser.add_argument(
         "--compress",
         metavar="METHOD",
-        choices=["none", "gzip", "zstd", "lz4", "pigz", "lzop"],
+        choices=_compression_choices(),
         help="Compression method for transfers (overrides config)",
     )
     transfer_parser.add_argument(
@@ -305,6 +323,18 @@ def create_subcommand_parser() -> argparse.ArgumentParser:
     config_subs.add_parser(
         "validate",
         help="Validate configuration file",
+        description=(
+            "Validate a configuration file and check, locally, whether this "
+            "machine could run it.\n\n"
+            "Exit status:\n"
+            "  0  the file is valid and its volumes are usable here\n"
+            "  1  the file itself is invalid and must be edited\n"
+            "  2  the file is valid, but this machine cannot back up these "
+            "volumes\n     (the normal result when editing another host's "
+            "config, or in CI)\n\n"
+            "Remote targets are not probed; use `doctor` for that."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
 
     init_parser = config_subs.add_parser(
@@ -667,7 +697,7 @@ Config-driven restore:
     restore_parser.add_argument(
         "--compress",
         metavar="METHOD",
-        choices=["none", "gzip", "zstd", "lz4", "pigz", "lzop"],
+        choices=_compression_choices(),
         help="Compression method for transfers",
     )
     restore_parser.add_argument(
@@ -1352,7 +1382,7 @@ Examples:
     snapper_backup.add_argument(
         "--compress",
         metavar="METHOD",
-        choices=["none", "gzip", "zstd", "lz4", "pigz", "lzop"],
+        choices=_compression_choices(),
         help="Compression method for transfers",
     )
     snapper_backup.add_argument(

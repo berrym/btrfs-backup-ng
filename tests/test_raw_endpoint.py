@@ -162,7 +162,7 @@ class TestRawEndpointPipeline:
         pipeline = endpoint._build_receive_pipeline(tmp_path / "test.btrfs.zst")
 
         assert len(pipeline) == 1
-        assert pipeline[0] == ["zstd", "-c"]
+        assert pipeline[0] == COMPRESSION_CONFIG["zstd"]["compress_cmd"]
 
     def test_build_pipeline_encryption_only(self, tmp_path):
         """Test pipeline with encryption only."""
@@ -252,7 +252,9 @@ class TestRawEndpointPipeline:
         pipeline = endpoint._build_receive_pipeline(tmp_path / "test.btrfs.zst.enc")
 
         assert len(pipeline) == 2
-        assert pipeline[0] == ["zstd", "-c"]  # Compression first
+        assert (
+            pipeline[0] == COMPRESSION_CONFIG["zstd"]["compress_cmd"]
+        )  # Compression first
         assert "openssl" in pipeline[1]  # Then encryption
 
 
@@ -284,7 +286,7 @@ class TestRawEndpointRestorePipeline:
         pipeline = endpoint._build_restore_pipeline(snapshot)
 
         assert len(pipeline) == 1
-        assert pipeline[0] == ["zstd", "-d", "-c"]
+        assert pipeline[0] == COMPRESSION_CONFIG["zstd"]["decompress_cmd"]
 
     def test_build_restore_pipeline_encrypted(self, tmp_path):
         """Test restore pipeline for encrypted stream."""
@@ -316,7 +318,7 @@ class TestRawEndpointRestorePipeline:
         # Decrypt first, then decompress (reverse of encrypt then compress)
         assert len(pipeline) == 2
         assert "--decrypt" in pipeline[0]  # GPG decrypt first
-        assert pipeline[1] == ["zstd", "-d", "-c"]  # Then decompress
+        assert pipeline[1] == COMPRESSION_CONFIG["zstd"]["decompress_cmd"]
 
     def test_build_restore_pipeline_openssl_encrypted(self, tmp_path, monkeypatch):
         """Test restore pipeline for OpenSSL encrypted stream."""
@@ -351,7 +353,7 @@ class TestRawEndpointRestorePipeline:
         assert len(pipeline) == 2
         assert "openssl" in pipeline[0]  # OpenSSL decrypt first
         assert "-d" in pipeline[0]
-        assert pipeline[1] == ["zstd", "-d", "-c"]  # Then decompress
+        assert pipeline[1] == COMPRESSION_CONFIG["zstd"]["decompress_cmd"]
 
 
 class TestRawEndpointSnapshotManagement:

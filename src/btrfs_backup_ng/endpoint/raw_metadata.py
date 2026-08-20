@@ -18,48 +18,21 @@ from typing import Any
 from btrfs_backup_ng import __util__, __version__
 from btrfs_backup_ng.__logger__ import logger
 
-# Compression tool configurations
-COMPRESSION_CONFIG: dict[str, dict[str, Any]] = {
-    "gzip": {
-        "extension": ".gz",
-        "compress_cmd": ["gzip", "-c"],
-        "decompress_cmd": ["gzip", "-d", "-c"],
-    },
-    "pigz": {
-        "extension": ".gz",
-        "compress_cmd": ["pigz", "-c"],
-        "decompress_cmd": ["pigz", "-d", "-c"],
-    },
-    "zstd": {
-        "extension": ".zst",
-        "compress_cmd": ["zstd", "-c"],
-        "decompress_cmd": ["zstd", "-d", "-c"],
-    },
-    "lz4": {
-        "extension": ".lz4",
-        "compress_cmd": ["lz4", "-c"],
-        "decompress_cmd": ["lz4", "-d", "-c"],
-    },
-    "xz": {
-        "extension": ".xz",
-        "compress_cmd": ["xz", "-c"],
-        "decompress_cmd": ["xz", "-d", "-c"],
-    },
-    "lzo": {
-        "extension": ".lzo",
-        "compress_cmd": ["lzop", "-c"],
-        "decompress_cmd": ["lzop", "-d", "-c"],
-    },
-    "pbzip2": {
-        "extension": ".bz2",
-        "compress_cmd": ["pbzip2", "-c"],
-        "decompress_cmd": ["pbzip2", "-d", "-c"],
-    },
-    "bzip2": {
-        "extension": ".bz2",
-        "compress_cmd": ["bzip2", "-c"],
-        "decompress_cmd": ["bzip2", "-d", "-c"],
-    },
+from ..core.compression import COMPRESSION_METHODS
+
+# Raw stream compression, as a view onto the one canonical table in
+# core.compression. The extension and the method NAME are both recorded for
+# every raw backup -- the name in the .meta sidecar, the suffix on the stream
+# file -- so neither may drift; deriving them from one definition is what makes
+# that safe. This used to be a second, independently maintained table that
+# disagreed with the transfer path about which methods exist.
+COMPRESSION_CONFIG: dict[str, dict] = {
+    name: {
+        "extension": entry["extension"],
+        "compress_cmd": entry["compress"],
+        "decompress_cmd": entry["decompress"],
+    }
+    for name, entry in COMPRESSION_METHODS.items()
 }
 
 

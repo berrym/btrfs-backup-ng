@@ -12,6 +12,7 @@ import pytest
 
 from btrfs_backup_ng.endpoint.raw import RawEndpoint
 from btrfs_backup_ng.endpoint.raw_metadata import RawSnapshot
+from btrfs_backup_ng.endpoint.raw_metadata import COMPRESSION_CONFIG
 
 
 def tool_available(tool: str) -> bool:
@@ -180,7 +181,7 @@ class TestRealCompressionPipelines:
         # Decompress and verify
         snapshot = RawSnapshot(name="test", stream_path=output_file, compress="gzip")
         restore_pipeline = endpoint._build_restore_pipeline(snapshot)
-        assert restore_pipeline == [["gzip", "-d", "-c"]]
+        assert restore_pipeline == [COMPRESSION_CONFIG["gzip"]["decompress_cmd"]]
 
         # Actually decompress
         result = subprocess.run(
@@ -524,7 +525,7 @@ class TestRestorePipelineExecution:
 
         # Build restore pipeline
         pipeline = endpoint._build_restore_pipeline(snapshot)
-        assert pipeline == [["gzip", "-d", "-c"]]
+        assert pipeline == [COMPRESSION_CONFIG["gzip"]["decompress_cmd"]]
 
         # Execute restore pipeline
         proc = endpoint._execute_restore_pipeline(pipeline, compressed_file)
