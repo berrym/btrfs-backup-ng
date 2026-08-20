@@ -157,7 +157,13 @@ class TestTheRemoteCommandDecompresses:
         which is what the exec was buying on the uncompressed path."""
         cmd = _build_receive_command(DEST, decompress="zstd")
         assert "kill 0" in cmd
-        assert "exec " not in cmd
+        # The PIPELINE is not exec-replaced -- that is what the group kill is for.
+        # `exec 3<&0` is a redirection, not process replacement: it duplicates
+        # stdin so the backgrounded group keeps the stream (dash and busybox give
+        # a backgrounded pipeline /dev/null otherwise).
+        assert "exec zstd" not in cmd, cmd
+        assert "exec btrfs" not in cmd, cmd
+        assert "exec 3<&0" in cmd, cmd
 
     def test_the_destination_is_still_quoted_exactly_once(self):
         cmd = _build_receive_command("/back ups/it's here", decompress="zstd")
@@ -940,3 +946,97 @@ class TestOneMethodSetForEveryDestination:
                     encoding="utf-8",
                 )
                 load_config(path)  # must not raise
+
+
+class TestThePayloadActuallyReachesTheRemote:
+    """Bytes delivered, not just argv and exit codes.
+
+    Every other test here drives the command through `/bin/sh` and asserts on the
+    command string or the exit status. On a host whose /bin/sh is bash they all
+    passed while the compressed command delivered NOTHING on a Debian or busybox
+    remote: backgrounding a pipeline gives it /dev/null on stdin under POSIX when
+    job control is off, and bash exempts pipelines from that rule where dash and
+    busybox ash do not. Measured with `btrfs receive` replaced by a byte counter:
+    0 bytes on dash and busybox, 4096 on bash.
+
+    Asserting on the payload is what makes this class able to fail; asserting on
+    the argv is what let the bug ship.
+    """
+
+    SHELLS = [sh for sh in ("/bin/sh", "/bin/bash", "/bin/dash") if os.path.exists(sh)]
+
+    def _deliver(self, shell, tmp_path, **kwargs):
+        """Run the emitted command and report how many bytes reached btrfs."""
+        (tmp_path / "btrfs").write_text("#!/bin/sh\nwc -c\n")
+        # `read` takes EXACTLY one line, as sudo -S does; `head -n 1` would read a
+        # block and swallow part of the stream.
+        (tmp_path / "sudo").write_text(
+            "#!/bin/sh\n"
+            'if [ "$1" = "-S" ]; then shift; IFS= read -r _pw; fi\n'
+            'while [ "${1#-}" != "$1" ]; do shift; done\n'
+            'exec "$@"\n'
+        )
+        for name in ("btrfs", "sudo"):
+            (tmp_path / name).chmod(0o755)
+
+        payload = b"\0" * 4096
+        blob = subprocess.run(
+            COMPRESSION_PROGRAMS["gzip"]["compress"],
+            input=payload,
+            capture_output=True,
+            check=True,
+        ).stdout
+        if kwargs.get("password_on_stdin"):
+            blob = b"hunter2\n" + blob
+
+        result = subprocess.run(
+            [shell, "-c", _build_receive_command(DEST, **kwargs)],
+            input=blob,
+            capture_output=True,
+            env={**os.environ, "PATH": f"{tmp_path}:{os.environ['PATH']}"},
+        )
+        digits = result.stdout.decode(errors="replace").strip().split()
+        return int(digits[0]) if digits and digits[0].isdigit() else 0
+
+    @pytest.mark.parametrize("shell", SHELLS)
+    def test_a_compressed_stream_arrives_whole(self, shell, tmp_path):
+        delivered = self._deliver(shell, tmp_path, use_sudo=True, decompress="gzip")
+        assert delivered == 4096, (
+            f"{shell} delivered {delivered} of 4096 bytes to btrfs receive; a "
+            f"backgrounded pipeline loses stdin unless it is redirected back"
+        )
+
+    @pytest.mark.parametrize("shell", SHELLS)
+    def test_the_password_form_delivers_too(self, shell, tmp_path):
+        delivered = self._deliver(
+            shell,
+            tmp_path,
+            use_sudo=True,
+            password_on_stdin=True,
+            decompress="gzip",
+        )
+        assert delivered == 4096, f"{shell} delivered {delivered} of 4096 bytes"
+
+    @pytest.mark.parametrize("shell", SHELLS)
+    def test_the_uncompressed_form_is_unaffected(self, shell, tmp_path):
+        (tmp_path / "btrfs").write_text("#!/bin/sh\nwc -c\n")
+        (tmp_path / "sudo").write_text(
+            '#!/bin/sh\nwhile [ "${1#-}" != "$1" ]; do shift; done\nexec "$@"\n'
+        )
+        for name in ("btrfs", "sudo"):
+            (tmp_path / name).chmod(0o755)
+        result = subprocess.run(
+            [shell, "-c", _build_receive_command(DEST, use_sudo=True)],
+            input=b"\0" * 4096,
+            capture_output=True,
+            env={**os.environ, "PATH": f"{tmp_path}:{os.environ['PATH']}"},
+        )
+        digits = result.stdout.decode(errors="replace").strip().split()
+        assert digits and digits[0] == "4096", result.stdout
+
+    def test_stdin_is_duplicated_before_backgrounding(self):
+        """The mechanism, pinned: without this the stream goes to /dev/null on
+        any remote whose /bin/sh is dash or busybox ash."""
+        cmd = _build_receive_command(DEST, use_sudo=True, decompress="gzip")
+        assert "exec 3<&0" in cmd, cmd
+        assert "<&3 &" in cmd, cmd

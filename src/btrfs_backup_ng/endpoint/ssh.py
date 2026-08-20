@@ -104,9 +104,30 @@ def _guarded_pipeline(pipeline: str) -> str:
     signalled this shell has default disposition and simply dies. `wait` then
     yields the pipeline's own exit status, so a failing `btrfs receive` is still
     reported as a failure rather than swallowed.
+
+    Backgrounding costs the pipeline its stdin, which is the ENTIRE POINT of the
+    command: POSIX says an asynchronous list gets /dev/null on stdin when job
+    control is off, which is every non-interactive `sh -c`. bash exempts a
+    backgrounded PIPELINE from that rule; dash and busybox ash do not. So the
+    stream is fed to the decompressor on a bash remote and to /dev/null on a
+    dash or busybox one -- measured, with `btrfs receive` replaced by a byte
+    counter and nothing else changed:
+
+        debian:stable-slim  (/bin/sh -> dash)      0 bytes    "unexpected end of file"
+        alpine:latest       (/bin/sh -> busybox)   0 bytes
+        fedora:latest       (/bin/sh -> bash)      4096 bytes
+
+    Debian, Ubuntu and the busybox-based NAS boxes are exactly the machines
+    people back up to, so compression over ssh:// was inert on most of them
+    while passing every test on a bash host.
+
+    Duplicating stdin onto fd 3 and redirecting the group from it restores the
+    stream: an explicit redirection is applied AFTER the /dev/null default, so
+    it wins. Verified delivering the full payload on all three shells above,
+    with a failing `btrfs receive` still exiting non-zero through the group.
     """
     return (
-        f"{pipeline} & pid=$!; "
+        f"exec 3<&0; {{ {pipeline}; }} <&3 & pid=$!; "
         f'trap "trap - HUP INT TERM; kill 0" HUP INT TERM; '
         f'wait "$pid"'
     )
