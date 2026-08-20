@@ -1,6 +1,45 @@
 """Rich progress bar support for transfers.
 
 Provides pretty progress bars with percentage, speed, and ETA for interactive use.
+
+WHERE THESE BARS ACTUALLY APPEAR
+--------------------------------
+Narrower than the name suggests, and worth knowing before assuming a transfer
+will show one. ``run_transfer_with_progress`` is reached from exactly two
+places: ``core.operations._do_rich_progress_transfer`` and the restore path in
+``core.restore``. Everything else in this module except ``is_interactive`` and
+``estimate_snapshot_size`` is an internal of that one function.
+
+On the backup side four conditions must ALL hold (see
+``_do_rich_progress_transfer``): an interactive terminal, a known transfer size
+(so full transfers only -- an incremental reports None and is usually over in
+under a second), no compression, and no rate limit.
+
+And before any of that, the destination must not be an ssh endpoint at all:
+
+    use_direct_pipe = is_ssh_endpoint and hasattr(destination_endpoint, "send_receive")
+
+``SSHEndpoint`` always has ``send_receive``, so **every ssh:// btrfs backup
+takes the direct-pipe path and never reaches this module.** In practice that
+leaves local destinations and restores.
+
+WHY THE DIRECT PIPE CANNOT SIMPLY USE THIS
+------------------------------------------
+Not an oversight to be tidied up later. ``RichProgressPipe`` and
+``ProgressReader`` count bytes by pulling them THROUGH Python
+(``self.bytes_read += len(data)``). The direct pipe exists precisely so that
+bytes do not pass through Python -- ``btrfs send`` is joined to ``btrfs
+receive`` at the OS level -- so wrapping the stream to draw a bar would undo the
+reason that path exists. Its monitor therefore only polls whether the processes
+are alive and watches a wall clock; it has no idea how many bytes have moved,
+which is also why it cannot tell a slow transfer from a stuck one (#93).
+
+The way to cover it is out-of-band, counting bytes without carrying them: ``pv``
+is already in that pipeline as a smoothing buffer and can report counts, and on
+Linux ``/proc/<pid>/io`` gives them for our own children without depending on pv
+being installed. One such signal would drive both a real progress bar on the ssh
+path and the stall detection the timeout work needs -- which is why the two are
+worth doing together rather than separately.
 """
 
 import logging
