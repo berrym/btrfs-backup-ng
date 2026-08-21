@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`restore --list` finds the prefix a location uses, like `restore` does** — the
+  most ordinary command there is, `restore --list <destination>` with no
+  `--prefix`, answered "No snapshots matched" for a location holding a perfectly
+  good backup, then told the operator to re-run with a prefix it had just worked
+  out for itself. It now lists them, and says which prefix it used. An explicit
+  `--prefix` is still never second-guessed, and a location holding two prefixes is
+  still reported rather than guessed between.
+
 - **Transfers are no longer limited by a wall clock at all, by default** — a
   transfer that is moving data is succeeding, and ending it because a timer expired
   confused operator policy with fault detection. Any fixed value is a guess about

@@ -17,6 +17,7 @@ from ..__logger__ import create_logger
 from ..config import ConfigError, find_config_file, load_config
 from ..core.target import parse_target
 from ..core.restore import (
+    _retry_with_inferred_prefix,
     RestoreError,
     list_remote_snapshots,
     restore_snapshots,
@@ -406,6 +407,29 @@ def _execute_list(args: argparse.Namespace) -> int:
     except Exception as e:
         logger.error("Failed to list snapshots: %s", e)
         return 1
+
+    if not snapshots:
+        # Do for `--list` what `restore` already does: work out the prefix this
+        # location actually uses and show those snapshots, rather than telling
+        # the operator to re-run with an argument we just derived ourselves.
+        #
+        # The most ordinary command there is -- `restore --list <dest>` with no
+        # --prefix -- otherwise answered "No snapshots matched" for a location
+        # holding a perfectly good backup, which reads as data loss.
+        #
+        # Same primitive as the restore path, so the rules cannot diverge: it
+        # infers only when NO prefix was asked for, and refuses to choose when
+        # the location holds more than one (two prefixes usually means two
+        # volumes side by side, and listing the wrong one is worse than asking).
+        inferred = _retry_with_inferred_prefix(backup_endpoint)
+        if inferred:
+            used = backup_endpoint.config.get("snap_prefix", "") or ""
+            print(
+                f"No snapshots use the default prefix here; listing {used!r} "
+                f"instead, which is what this location uses."
+            )
+            print("")
+            snapshots = inferred
 
     if not snapshots:
         # "No snapshots found" is only honest when the location really is empty.
