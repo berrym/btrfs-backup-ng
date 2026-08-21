@@ -3109,12 +3109,18 @@ line rate before any overhead. It now defaults to 24 hours and is configurable:
 
 ```toml
 [global]
-transfer_timeout = 43200   # seconds; default 86400 (24h)
+transfer_timeout = 43200         # seconds; default 86400 (24h)
+transfer_stall_timeout = 900     # seconds with no data before "stuck"; 0 disables
 ```
 
 A generous wall clock is safe because a transfer that stops moving data is caught
 separately, within minutes, by a stall check that watches bytes rather than the
 clock. So a slow transfer runs to completion, and a dead one is not waited out.
+
+The stall check only applies while data should be flowing — once the local send has
+finished and the remote is applying what it already received, no bytes move on this
+side and that is completion, not a stall. Set `transfer_stall_timeout = 0` to turn
+it off entirely.
 
 If a transfer does hit either limit, the error says which, and says explicitly that
 it is btrfs-backup-ng's own limit and not an ssh idle or keepalive timeout — a

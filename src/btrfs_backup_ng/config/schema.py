@@ -287,6 +287,10 @@ class GlobalConfig:
             data is caught in minutes by the stall check regardless of this value.
             The old fixed 3600 killed legitimate first syncs of large subvolumes
             over slow links (#93).
+        transfer_stall_timeout: Seconds a transfer may move NO data before it is
+            treated as stuck (default 900). Judged only while the send is running,
+            so the tail of a transfer -- where the remote is still applying what it
+            already received -- is never mistaken for a stall. Set 0 to disable.
         parallel_volumes: Max concurrent volume backups
         parallel_targets: Max concurrent target transfers per volume
         quiet: Suppress non-essential output
@@ -301,6 +305,7 @@ class GlobalConfig:
     retention: RetentionConfig = field(default_factory=RetentionConfig)
     notifications: NotificationConfig = field(default_factory=NotificationConfig)
     transfer_timeout: int = 86400
+    transfer_stall_timeout: int = 900
     parallel_volumes: int = 2
     parallel_targets: int = 3
     quiet: bool = False

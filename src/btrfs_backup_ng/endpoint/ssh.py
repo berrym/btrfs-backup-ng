@@ -229,6 +229,10 @@ def _build_receive_command(
 
 #: How long a transfer may move NO bytes before it is treated as stuck.
 #:
+#: The default; `transfer_stall_timeout` in [global] overrides it, and 0 disables
+#: the check. An operator who hits a false positive needs a way out that is not
+#: "edit the source" -- the same reason the wall clock became configurable.
+#:
 #: A wall-clock limit cannot tell a slow transfer from a dead one: it kills a
 #: healthy first sync of a large subvolume over a slow link, and waits the full
 #: hour on a pipe that died in the first minute. Reported as #93, where an
@@ -332,6 +336,7 @@ class SSHEndpoint(Endpoint):
             "ssh_auth_sock",
             "ssh_password_fallback",
             "ssh_host_key_policy",
+            "transfer_stall_timeout",
         ):
             if config.get(_ssh_key) is not None:
                 self.config[_ssh_key] = config[_ssh_key]
@@ -4070,9 +4075,12 @@ print(json.dumps(result))
             for proc in (send_process, receive_process, buffer_process)
             if proc is not None
         ]
+        stall_limit = int(
+            self.config.get("transfer_stall_timeout", STALL_TIMEOUT_SECONDS)
+        )
         last_bytes = __util__.any_bytes_moved(stall_pids)
         last_progress_time = start_time
-        stall_detection = last_bytes is not None
+        stall_detection = stall_limit > 0 and last_bytes is not None
         if not stall_detection:
             # Never silently downgrade to "no bytes moved": that would read as a
             # stall and kill a healthy transfer. Say the check is off instead.
@@ -4085,7 +4093,19 @@ print(json.dumps(result))
             current_time = time.time()
             elapsed = current_time - start_time
 
-            if stall_detection:
+            # Check process status
+            send_alive = send_process.poll() is None
+            receive_alive = receive_process.poll() is None
+            buffer_alive = buffer_process.poll() is None if buffer_process else True
+
+            # Only judge a stall while the SEND is still running. Once it has
+            # finished, the remote is applying what it already received and no
+            # bytes move on this side -- which is completion, not a stall, and
+            # killing it there would destroy a transfer that was about to
+            # succeed. A remote wedged MID-receive still blocks the send, so
+            # that case is caught; only the tail is exempt, and the wall clock
+            # covers it.
+            if stall_detection and send_alive:
                 moved = __util__.any_bytes_moved(stall_pids)
                 if moved is None:
                     # Everything we could read has exited; the exit-code checks
@@ -4094,7 +4114,7 @@ print(json.dumps(result))
                 elif moved != last_bytes:
                     last_bytes = moved
                     last_progress_time = current_time
-                elif current_time - last_progress_time >= STALL_TIMEOUT_SECONDS:
+                elif current_time - last_progress_time >= stall_limit:
                     stalled_for = current_time - last_progress_time
                     self._last_transfer_error = (
                         f"the transfer moved no data for {stalled_for:.0f}s and was "
@@ -4112,11 +4132,6 @@ print(json.dumps(result))
                             except Exception:
                                 proc.kill()
                     return False
-
-            # Check process status
-            send_alive = send_process.poll() is None
-            receive_alive = receive_process.poll() is None
-            buffer_alive = buffer_process.poll() is None if buffer_process else True
 
             # Check for critical failures
             if not send_alive and send_process.returncode != 0:
@@ -4315,6 +4330,18 @@ print(json.dumps(result))
 
         logger.debug("STATUS: Waiting for transfer processes to complete...")
 
+        # The same stall check the other monitor runs. Wiring only one of two
+        # monitors is how a guard comes to protect the setup it was developed
+        # against and nothing else -- this file already has a test class named
+        # for that failure.
+        stall_pids = [proc.pid for proc in processes_to_wait]
+        stall_limit = int(
+            self.config.get("transfer_stall_timeout", STALL_TIMEOUT_SECONDS)
+        )
+        last_bytes = __util__.any_bytes_moved(stall_pids)
+        last_progress_time = start_time
+        stall_detection = stall_limit > 0 and last_bytes is not None
+
         # Simple polling loop with timeout
         while time.time() - start_time < max_wait_time:
             all_finished = True
@@ -4326,6 +4353,33 @@ print(json.dumps(result))
 
             if all_finished:
                 break
+
+            # Judged only while the SEND is alive: after it finishes the remote
+            # is applying what it already has, which is completion, not a stall.
+            if stall_detection and send_process.poll() is None:
+                now = time.time()
+                moved = __util__.any_bytes_moved(stall_pids)
+                if moved is None:
+                    stall_detection = False
+                elif moved != last_bytes:
+                    last_bytes = moved
+                    last_progress_time = now
+                elif now - last_progress_time >= stall_limit:
+                    self._last_transfer_error = (
+                        f"the transfer moved no data for {now - last_progress_time:.0f}s "
+                        f"and was terminated as stuck. This is btrfs-backup-ng's stall "
+                        f"limit, NOT an ssh timeout. A slow transfer that is still "
+                        f"moving is never stopped by this."
+                    )
+                    logger.error("FAILED: %s", self._last_transfer_error)
+                    for proc in processes_to_wait:
+                        if proc.poll() is None:
+                            proc.terminate()
+                            try:
+                                proc.wait(timeout=5)
+                            except Exception:
+                                proc.kill()
+                    return False
 
             # Log status every 30 seconds
             elapsed = time.time() - start_time

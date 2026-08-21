@@ -498,6 +498,10 @@ def _backup_volume(
 
             thread_raw_encryption(dest_kwargs, target)
             thread_raw_compression(dest_kwargs, target, compress_override)
+            # Global, so threaded here rather than by the per-target helper.
+            dest_kwargs["transfer_stall_timeout"] = (
+                config.global_config.transfer_stall_timeout
+            )
             dest_endpoint = endpoint.choose_endpoint(
                 target.path,
                 dest_kwargs,
@@ -766,6 +770,12 @@ def _backup_snapper_volume(
                 "snap_prefix": "",
                 "timestamp_format": get_timestamp_format(config),
             }
+            # A global setting, so it is threaded here rather than by the
+            # per-target helper. Without this the key loads, validates and does
+            # nothing -- the shape of defect this project keeps finding.
+            snapper_endpoint_config["transfer_stall_timeout"] = (
+                config.global_config.transfer_stall_timeout
+            )
             thread_ssh_target_config(snapper_endpoint_config, target)
             thread_raw_encryption(snapper_endpoint_config, target)
             thread_raw_compression(snapper_endpoint_config, target, compress_override)

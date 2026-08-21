@@ -135,6 +135,43 @@ class TestTheMonitorActsOnIt:
         assert "moved no data" in endpoint._last_transfer_error
         assert "NOT an ssh timeout" in endpoint._last_transfer_error
 
+    def test_a_finished_send_is_not_a_stall(self, monkeypatch):
+        """The tail of every transfer, and the worst false positive available.
+
+        Once the local send has finished, the remote is still applying what it
+        already received and no bytes move on this side. That is completion, not
+        a stall. Killing it there would destroy a transfer that was about to
+        succeed -- so the check only judges while the send is alive.
+
+        A remote wedged MID-receive still blocks the send, so that case is
+        unaffected; only the tail is exempt, and the wall clock covers it.
+        """
+        import btrfs_backup_ng.endpoint.ssh as ssh_mod
+
+        monkeypatch.setattr(ssh_mod, "STALL_TIMEOUT_SECONDS", 1)
+        endpoint = self._endpoint()
+
+        finished_send = subprocess.Popen(["true"])
+        finished_send.wait()  # send is DONE
+        idle_receive = subprocess.Popen(["sleep", "4"])  # remote still applying
+        try:
+            endpoint._monitor_transfer_progress(
+                {"send": finished_send, "receive": idle_receive},
+                start_time=time.time(),
+                dest_path="/backup",
+                snapshot_name="snap",
+                max_wait_time=3,
+            )
+        finally:
+            if idle_receive.poll() is None:
+                idle_receive.kill()
+            idle_receive.wait()
+
+        reason = endpoint._last_transfer_error or ""
+        assert "moved no data" not in reason, (
+            f"a transfer whose send had finished was called stalled: {reason}"
+        )
+
     def test_a_moving_transfer_is_not_killed(self, monkeypatch):
         """The failure that matters most: never stop a healthy slow transfer.
 
@@ -239,4 +276,171 @@ class TestTheWallClockIsConfigurableAndGenerous:
                     offenders.append(f"{module.__name__}:{line_no}: {stripped}")
         assert not offenders, (
             "a transfer timeout is still hardcoded:\n  " + "\n  ".join(offenders)
+        )
+
+
+class TestBothMonitorsAreCovered:
+    """There are two monitors. A guard in one is a guard for one setup.
+
+    `_do_piped_transfer` reaches `_simple_transfer_monitor`, which had no stall
+    check when the other one gained it. This file's sibling already has a class
+    named TestEveryTransferStrategyIsCovered for exactly this failure.
+    """
+
+    def _endpoint(self):
+        from btrfs_backup_ng.endpoint.ssh import SSHEndpoint
+
+        endpoint = SSHEndpoint(hostname="nas", path="/backup")
+        endpoint._last_transfer_error = None
+        return endpoint
+
+    def test_the_simple_monitor_catches_a_stall(self, monkeypatch):
+        import btrfs_backup_ng.endpoint.ssh as ssh_mod
+
+        monkeypatch.setattr(ssh_mod, "STALL_TIMEOUT_SECONDS", 1)
+        endpoint = self._endpoint()
+        idle = [subprocess.Popen(["sleep", "30"]) for _ in range(2)]
+        try:
+            result = endpoint._simple_transfer_monitor(
+                {"send": idle[0], "receive": idle[1]},
+                start_time=time.time(),
+                dest_path="/backup",
+                snapshot_name="snap",
+                max_wait_time=600,
+            )
+        finally:
+            for proc in idle:
+                if proc.poll() is None:
+                    proc.kill()
+                proc.wait()
+        assert result is False, "the simple monitor let a stalled transfer run"
+        assert "moved no data" in (endpoint._last_transfer_error or "")
+
+    def test_the_simple_monitor_does_not_kill_a_moving_transfer(self, monkeypatch):
+        import btrfs_backup_ng.endpoint.ssh as ssh_mod
+
+        monkeypatch.setattr(ssh_mod, "STALL_TIMEOUT_SECONDS", 1)
+        endpoint = self._endpoint()
+        mover = subprocess.Popen(
+            ["dd", "if=/dev/zero", "of=/dev/null", "bs=64k"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        try:
+            endpoint._simple_transfer_monitor(
+                {"send": mover, "receive": mover},
+                start_time=time.time(),
+                dest_path="/backup",
+                snapshot_name="snap",
+                max_wait_time=3,
+            )
+        finally:
+            if mover.poll() is None:
+                mover.kill()
+            mover.wait()
+        assert "moved no data" not in (endpoint._last_transfer_error or "")
+
+    def test_the_simple_monitor_exempts_a_finished_send(self, monkeypatch):
+        import btrfs_backup_ng.endpoint.ssh as ssh_mod
+
+        monkeypatch.setattr(ssh_mod, "STALL_TIMEOUT_SECONDS", 1)
+        endpoint = self._endpoint()
+        done = subprocess.Popen(["true"])
+        done.wait()
+        idle = subprocess.Popen(["sleep", "4"])
+        try:
+            endpoint._simple_transfer_monitor(
+                {"send": done, "receive": idle},
+                start_time=time.time(),
+                dest_path="/backup",
+                snapshot_name="snap",
+                max_wait_time=3,
+            )
+        finally:
+            if idle.poll() is None:
+                idle.kill()
+            idle.wait()
+        assert "moved no data" not in (endpoint._last_transfer_error or "")
+
+
+class TestTheStallWindowIsReachable:
+    """A config key that loads and then does nothing is this project's signature
+    defect. The stall window nearly shipped as one: it was added to the schema
+    and the loader, and dropped by the endpoint's config whitelist.
+    """
+
+    def test_the_loader_accepts_it(self, tmp_path):
+        from btrfs_backup_ng.config.loader import load_config
+
+        path = tmp_path / "config.toml"
+        path.write_text(
+            "[global]\ntransfer_stall_timeout = 120\n\n"
+            '[[volumes]]\npath = "/home"\n\n'
+            '[[volumes.targets]]\npath = "ssh://nas:/backup"\n'
+        )
+        config, warnings = load_config(path)
+        assert not [w for w in warnings if "Unknown config key" in w]
+        assert config.global_config.transfer_stall_timeout == 120
+
+    def test_it_survives_the_endpoint_config_whitelist(self):
+        """The step that was missing: accepted by the loader, dropped here."""
+        from btrfs_backup_ng.endpoint import choose_endpoint
+
+        endpoint = choose_endpoint(
+            "ssh://u@h/p",
+            {"path": "ssh://u@h/p", "snap_prefix": "", "transfer_stall_timeout": 60},
+        )
+        assert endpoint.config.get("transfer_stall_timeout") == 60, (
+            "the endpoint whitelist dropped the stall window, so configuring it "
+            "would silently do nothing"
+        )
+
+    def test_zero_disables_the_check(self, monkeypatch):
+        """The escape hatch. Someone hitting a false positive must not have to
+        edit the source to get their backup through."""
+        from btrfs_backup_ng.endpoint.ssh import SSHEndpoint
+
+        endpoint = SSHEndpoint(hostname="nas", path="/backup", transfer_stall_timeout=0)
+        endpoint._last_transfer_error = None
+        idle = [subprocess.Popen(["sleep", "3"]) for _ in range(2)]
+        try:
+            endpoint._monitor_transfer_progress(
+                {"send": idle[0], "receive": idle[1]},
+                start_time=time.time(),
+                dest_path="/backup",
+                snapshot_name="snap",
+                max_wait_time=2,
+            )
+        finally:
+            for proc in idle:
+                if proc.poll() is None:
+                    proc.kill()
+                proc.wait()
+        assert "moved no data" not in (endpoint._last_transfer_error or ""), (
+            "the check fired despite being disabled"
+        )
+
+    def test_a_configured_window_is_actually_used(self):
+        """Not just stored: the monitor must read it rather than the default."""
+        from btrfs_backup_ng.endpoint.ssh import SSHEndpoint
+
+        endpoint = SSHEndpoint(hostname="nas", path="/backup", transfer_stall_timeout=1)
+        endpoint._last_transfer_error = None
+        idle = [subprocess.Popen(["sleep", "30"]) for _ in range(2)]
+        try:
+            result = endpoint._monitor_transfer_progress(
+                {"send": idle[0], "receive": idle[1]},
+                start_time=time.time(),
+                dest_path="/backup",
+                snapshot_name="snap",
+                max_wait_time=600,
+            )
+        finally:
+            for proc in idle:
+                if proc.poll() is None:
+                    proc.kill()
+                proc.wait()
+        assert result is False
+        assert "moved no data" in (endpoint._last_transfer_error or ""), (
+            "a 1-second window was configured but the default was used instead"
         )

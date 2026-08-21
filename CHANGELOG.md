@@ -21,7 +21,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `btrfs send` runs under sudo and its counters are unreadable to us; the ssh
   process is ours, and bytes leaving on the socket is the same evidence. Where
   nothing can be read the check disables itself rather than reporting a healthy
-  transfer as stuck.
+  transfer as stuck. It applies only while the send is running, so the tail of a
+  transfer -- where the remote is still applying what it already received -- is
+  never mistaken for a stall. Tunable as `transfer_stall_timeout` in `[global]`;
+  0 disables it.
 
 ### Changed
 
