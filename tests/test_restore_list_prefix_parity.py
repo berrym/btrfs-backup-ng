@@ -83,6 +83,40 @@ class TestListInfersLikeRestoreDoes:
         out = capsys.readouterr().out
         assert "No snapshots use the default prefix here" in out, out
         assert "which is what this location uses" in out, out
+        # And it must name the prefix it actually used. Checking only the
+        # wording lets the message degrade to "listing '' instead", which is
+        # nonsense the operator cannot act on.
+        assert "'myvol-'" in out, out
+
+
+class TestTheContractListDependsOn:
+    """`--list` reports which prefix it used by reading the endpoint config
+    AFTER the inference, which works because `_retry_with_inferred_prefix`
+    deliberately leaves the endpoint configured with the prefix it found -- the
+    restore path needs that too, since it goes on to restore from that endpoint.
+
+    That is a real coupling between two modules, so it is pinned here rather
+    than left as something the next reader has to notice.
+    """
+
+    def test_the_helper_leaves_the_inferred_prefix_set(self):
+        from btrfs_backup_ng.core.restore import _retry_with_inferred_prefix
+
+        endpoint = _Endpoint({"myvol-": 1}, configured="")
+        found = _retry_with_inferred_prefix(endpoint)
+        assert found, "nothing was inferred, so the contract cannot be checked"
+        assert endpoint.config["snap_prefix"] == "myvol-", (
+            "the inferred prefix was not left on the endpoint; --list would "
+            "report the wrong prefix and restore would read the wrong set"
+        )
+
+    def test_it_restores_the_previous_prefix_when_nothing_is_found(self):
+        """Failing to infer must not leave the endpoint reconfigured."""
+        from btrfs_backup_ng.core.restore import _retry_with_inferred_prefix
+
+        endpoint = _Endpoint({}, configured="orig-")
+        assert _retry_with_inferred_prefix(endpoint) == []
+        assert endpoint.config["snap_prefix"] == "orig-"
 
     def test_an_explicit_prefix_is_not_second_guessed(self, capsys):
         """Asked for one set, told about another -- that is the harm the
