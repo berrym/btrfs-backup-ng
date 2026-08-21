@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **`paramiko` is no longer a dependency** — it was a second implementation of one
+  case, a transfer to a remote whose `sudo` requires a password, and every install
+  carried `cryptography`, `pynacl`, `bcrypt` and `cffi` for it: 31 MB and 13
+  packages against 9.2 MB and 6 without. Nothing is lost. The OpenSSH pipeline
+  performs the same transfer, and was measured against a real remote with
+  password-required sudo doing it byte-identically, compressed and uncompressed,
+  in both the backup and restore directions, with a wrong password failing cleanly
+  and writing nothing. Two implementations of one path had already cost a release:
+  the pipeline compressed and paramiko did not, so password-sudo users silently got
+  uncompressed backups. It also opened its own connection, bypassing the OpenSSH
+  ControlMaster the rest of the tool sets up. SSH host-key verification is
+  unchanged.
+
 ## [0.9.4] - 2026-08-20
 
 The "a check that did not run is not a check that passed" release.

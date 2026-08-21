@@ -19,7 +19,6 @@ import os
 import pwd
 import stat
 from pathlib import Path
-from unittest.mock import MagicMock
 
 import pytest
 
@@ -166,61 +165,4 @@ def test_ssh_base_cmd_applies_operator_ssh_opts_first():
 # ------------------------------------ P1: Paramiko loads the operator known_hosts (no fail-open)
 
 
-def test_paramiko_client_loads_operator_known_hosts(monkeypatch):
-    """THE P1 enforcement guard: the verified-client factory loads system + the operator's
-    known_hosts before returning, so paramiko rejects a changed key. Mutation guard: remove
-    the load_host_keys call -> AutoAddPolicy runs on an empty store (fail-open) and this
-    fails."""
-    from btrfs_backup_ng.endpoint import choose_endpoint
-    import btrfs_backup_ng.endpoint.ssh as ssh_mod
-
-    ep = choose_endpoint(
-        "ssh://u@host/p", {"path": "ssh://u@host/p", "snap_prefix": ""}
-    )
-
-    fake_paramiko = MagicMock()
-    fake_client = fake_paramiko.SSHClient.return_value
-    monkeypatch.setattr(ssh_mod, "paramiko", fake_paramiko)
-
-    client = ep._new_verified_paramiko_client()
-
-    assert client is fake_client
-    fake_client.load_system_host_keys.assert_called_once()
-    fake_client.load_host_keys.assert_called_once_with(
-        str(ep.ssh_manager.known_hosts_path)
-    )
-    fake_client.set_missing_host_key_policy.assert_called_once()
-    assert fake_paramiko.AutoAddPolicy.called
-
-
 # ------------------------------------ P1: the BadHostKeyException handler refuses loudly
-
-
-def test_paramiko_transfer_refuses_changed_host_key(monkeypatch):
-    """The BadHostKeyException handler (R12/P1) returns False AND logs a loud MITM message
-    -- the changed-key outcome. Driven through the real method's error path: the client
-    factory raises the exception inside the transfer's try. Mutation guard: move the
-    BadHostKeyException branch below its SSHException superclass -> the MITM message is lost
-    and this fails."""
-    import paramiko
-
-    from btrfs_backup_ng.endpoint import choose_endpoint
-    import btrfs_backup_ng.endpoint.ssh as ssh_mod
-
-    ep = choose_endpoint(
-        "ssh://u@host/p", {"path": "ssh://u@host/p", "snap_prefix": ""}
-    )
-    monkeypatch.setattr(ep, "_estimate_snapshot_size", lambda *a, **k: 0)
-
-    def _raise(*_a, **_k):
-        raise paramiko.BadHostKeyException("host", MagicMock(), MagicMock())
-
-    monkeypatch.setattr(ep, "_new_verified_paramiko_client", _raise)
-
-    errors = []
-    monkeypatch.setattr(ssh_mod.logger, "error", lambda *a, **k: errors.append(a))
-
-    ok = ep._do_paramiko_transfer("/src", "/dst", "snap", None, "sudopw", False)
-
-    assert ok is False
-    assert any("man-in-the-middle" in str(a[0]) for a in errors)

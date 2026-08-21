@@ -221,20 +221,6 @@ class TestCallerContract:
         assert dest == NASTY_DEST
         assert dest != shlex.quote(NASTY_DEST)
 
-    def test_paramiko_transfer_passes_raw_destination(self):
-        ep = self._endpoint()
-        dest = self._capture(
-            lambda: ep._do_paramiko_transfer(
-                source_path="/src/snap",
-                dest_path=NASTY_DEST,
-                snapshot_name="snap",
-                parent_path=None,
-                sudo_password="pw",
-            )
-        )
-        assert dest == NASTY_DEST
-        assert dest != shlex.quote(NASTY_DEST)
-
     def test_shell_pipeline_transfer_passes_raw_destination(self):
         ep = self._endpoint()
         dest = self._capture(

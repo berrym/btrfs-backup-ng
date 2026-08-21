@@ -76,26 +76,6 @@ def _paramiko_policy_used(policy, monkeypatch):
     return fake
 
 
-def test_paramiko_strict_uses_reject_policy(monkeypatch):
-    """strict -> RejectPolicy (unknown host refused). Also guards the ssh.py config
-    whitelist: drop 'ssh_host_key_policy' there and the endpoint never sees strict."""
-    fake = _paramiko_policy_used("strict", monkeypatch)
-    assert fake.RejectPolicy.called
-    assert not fake.AutoAddPolicy.called
-
-
-def test_paramiko_accept_new_uses_autoadd(monkeypatch):
-    fake = _paramiko_policy_used("accept-new", monkeypatch)
-    assert fake.AutoAddPolicy.called
-    assert not fake.RejectPolicy.called
-
-
-def test_paramiko_default_is_accept_new(monkeypatch):
-    fake = _paramiko_policy_used(None, monkeypatch)
-    assert fake.AutoAddPolicy.called
-    assert not fake.RejectPolicy.called
-
-
 # ------------------------------------ raw+ssh transport (raw.py)
 
 
