@@ -20,6 +20,7 @@ import os
 import re
 import shlex
 import shutil
+import socket
 import subprocess
 import time
 from collections.abc import Iterator
@@ -1577,7 +1578,8 @@ class RawEndpoint(Endpoint):
         return list(snapshots)
 
     #: Declared beside the override that makes it true, so the two cannot drift.
-    #: SSHRawEndpoint inherits this, which is correct: it does not persist either.
+    #: Local raw keeps its in-memory lock set; SSHRawEndpoint overrides this to
+    #: True because it now writes a real lock on the remote target.
     persists_locks: bool = False
 
     def set_lock(
@@ -1841,14 +1843,186 @@ class SSHRawEndpoint(RawEndpoint):
         )
         return f"raw+ssh://{user_host}{self.config['path']}"
 
+    #: raw+ssh writes its snapshot locks on the remote target, so they survive
+    #: the process and are visible to any other process or machine touching that
+    #: target. Local raw keeps the in-memory set (see RawEndpoint).
+    persists_locks: bool = True
+
+    def _read_locks(self) -> dict:
+        """The locks recorded ON THIS TARGET, in the lock-file shape.
+
+        ``restore --status`` and ``--unlock`` go through this. Overriding it here
+        is what makes those commands tell the truth about a remote target rather
+        than announcing that it does not persist locks.
+        """
+        from ..sshutil.lock import read_persisted_locks
+
+        if self._lock_target_path() is None:
+            return {}
+        return read_persisted_locks(self._lock_manager())
+
+    def _write_locks(self, lock_dict: dict) -> None:
+        """Reconcile this target's locks to ``lock_dict`` (``restore --unlock``)."""
+        from ..sshutil.lock import write_persisted_locks
+
+        if self._lock_target_path() is None:
+            return
+        write_persisted_locks(self._lock_manager(), lock_dict)
+
+    def set_lock(
+        self,
+        snapshot: Any,
+        lock_id: Any,
+        lock_state: bool,
+        parent: bool = False,
+    ) -> None:
+        """Pin or unpin a snapshot ON THE REMOTE, not just in this process.
+
+        A restore reads a snapshot here while a prune, in another process or on
+        another machine, may be deleting from this same target. An in-memory
+        pin is invisible to that prune, so it was free to delete what was being
+        read. The lock is now a directory on the target itself.
+
+        The in-memory set is still maintained, because the transfer and prune
+        logic within this run reads it directly and a remote round trip per
+        query would be gratuitous.
+        """
+        super().set_lock(snapshot, lock_id, lock_state, parent=parent)
+        from ..sshutil.lock import snapshot_lock_name
+
+        name = f"snap-{snapshot_lock_name(snapshot)}"
+        manager = self._lock_manager()
+        try:
+            # SHARED, not exclusive: the in-memory contract is a SET of lock ids,
+            # so any number of restores and transfers may pin one stream at once
+            # and it stays pinned until the last lets go. Each holder writes and
+            # removes only its own file, which is why releasing here cannot drop
+            # somebody else's pin -- and why a parent pin is keyed apart from a
+            # direct one.
+            holder_id = f"p:{lock_id}" if parent else str(lock_id)
+            if lock_state:
+                if not manager.holds_shared(name, holder_id):
+                    manager.acquire_shared_persistent(name, holder_id, str(lock_id))
+            else:
+                manager.release_shared(name, holder_id)
+        except Exception as exc:  # noqa: BLE001 - see below
+            if lock_state and not self.config.get("skip_remote_lock"):
+                # A lock that could not be written must never read as one that
+                # was. Continuing with a warning leaves the operation running
+                # unprotected while a prune on this target sees nothing holding
+                # the stream and is free to delete it mid-read -- the exact
+                # failure this lock exists to prevent, with a log line in place
+                # of the protection. So it stops, and says what to grant.
+                #
+                # --skip-remote-lock is the operator overriding that, for a
+                # destination they can read but not write. It relaxes only THIS:
+                # the pin is still consulted everywhere it is read, so nothing
+                # starts reporting a target as unlocked without having looked.
+                raise __util__.AbortError(
+                    f"Could not lock {snapshot_lock_name(snapshot)} on this "
+                    f"target: {exc}. Refusing to continue unprotected: another "
+                    f"process pruning this target would not see the stream as in "
+                    f"use and could delete it while it is being read. Make the "
+                    f"target writable by the account running this, allow that "
+                    f"account to elevate for it, or pass --skip-remote-lock to "
+                    f"proceed unprotected on purpose."
+                ) from exc
+            # Either the operator opted out with --skip-remote-lock, or this is
+            # a release. A release failing is not the same risk: the heartbeat
+            # stops, the pin goes stale, and it is swept.
+            if lock_state:
+                logger.warning(
+                    "Could not record the lock for %s on this target (%s), and "
+                    "--skip-remote-lock was given, so this continues WITHOUT "
+                    "protection: a prune elsewhere will not see it as in use.",
+                    snapshot_lock_name(snapshot),
+                    exc,
+                )
+            else:
+                logger.warning(
+                    "Could not clear the lock for %s on this target (%s). It will "
+                    "expire on its own once its heartbeat stops.",
+                    snapshot_lock_name(snapshot),
+                    exc,
+                )
+
+    def _lock_target_path(self) -> str | None:
+        """The remote directory locks live in, or None if this target has none.
+
+        The one resolution shared by the writer (``set_lock``) and the reader
+        (the delete guard). They must agree: if this returns None the writer
+        cannot record a lock, so the reader finding nothing is a proven-empty
+        answer rather than a check that silently did not run.
+        """
+        path = self.config.get("path")
+        if path in (None, ""):
+            return None
+        return str(path)
+
+    def _lock_manager(self) -> Any:
+        """The lock manager for this target, one per resolved path.
+
+        See ``sshutil.lock.cached_manager`` for why it is shared rather than
+        rebuilt per call, and why the cache is keyed by path.
+        """
+        from ..sshutil.lock import cached_manager
+
+        return cached_manager(
+            self, self._lock_target_path() or "", self._build_lock_manager
+        )
+
+    def _build_lock_manager(self) -> Any:
+        """A lock manager bound to this target, elevating as this target does.
+
+        Built per call rather than cached: the endpoint's config (path, sudo)
+        can be rewritten between operations, and a manager holding a stale path
+        would lock somewhere other than where the work is happening.
+        """
+        from ..sshutil.lock import RemoteLockManager
+
+        def run(script: str) -> tuple[int, str, str]:
+            # The endpoint quotes each element and applies its own elevation, so
+            # the script must NOT be pre-elevated here -- doing both wraps it in
+            # sudo twice.
+            result = self._exec_remote_command(["sh", "-c", script], check=False)
+            out, err = result.stdout or b"", result.stderr or b""
+            if isinstance(out, bytes):
+                out = out.decode("utf-8", errors="replace")
+            if isinstance(err, bytes):
+                err = err.decode("utf-8", errors="replace")
+            return result.returncode, out, err
+
+        path = self._lock_target_path()
+        if path is None:
+            raise ValueError("raw+ssh target has no path; cannot lock")
+
+        def run_elevated(script: str) -> tuple[int, str, str]:
+            # Only reached when the unprivileged attempt could not create the
+            # lock directory -- a root-owned destination, the common case.
+            return run(self._elevate(f"sh -c {shlex.quote(script)}"))
+
+        return RemoteLockManager(
+            run,
+            path,
+            hostname=socket.gethostname(),
+            run_elevated=run_elevated,
+        )
+
     @contextlib.contextmanager
     def target_lock(self, *, timeout: float | None = None) -> Iterator[None]:
-        """No-op for raw+ssh. A per-target lock over ssh needs a remote lockfile with
-        stale-detection (there is no persistent connection to hold an flock), which is
-        a separate change; concurrent-operation protection is currently local-only. Run
-        maintenance commands against a raw+ssh target when it is otherwise idle. The
-        raw maintenance CLI warns the operator of this at the point of use."""
-        yield
+        """Hold an exclusive lock on this remote target for a MUTATING operation.
+
+        This used to be a no-op, on the grounds that a per-target lock over ssh
+        needs a remote lockfile with stale detection and there is no persistent
+        connection on which to hold an flock. Both halves were true; the
+        conclusion was not. `sshutil.lock` provides exactly that lockfile, so
+        raw+ssh now gets the same mutual exclusion local raw targets have always
+        had -- across processes AND across machines, which the local flock never
+        offered.
+        """
+        manager = self._lock_manager()
+        with manager.hold("target", "mutating operation"):
+            yield
 
     def _build_ssh_command(self) -> list[str]:
         """Build the base SSH command.
@@ -2697,6 +2871,33 @@ class SSHRawEndpoint(RawEndpoint):
         remote deletion for a raw+ssh target. Inheriting the base ``delete_snapshots``
         keeps the (no-op) lock discipline uniform across local and remote. The same
         chain guard as the local primitive applies (never orphan a child stream)."""
+        # Locks recorded ON THE TARGET, not just this process's in-memory set: a
+        # prune in another process lists the target fresh, so every snapshot it
+        # sees looks unlocked -- including one a restore is reading right now.
+        from ..sshutil.lock import (
+            RemoteLockUnavailable,
+            blocked_by_remote_lock,
+            snapshot_lock_name,
+        )
+
+        remote_locked: set[str] = set()
+        if self._lock_target_path() is not None:
+            try:
+                remote_locked = blocked_by_remote_lock(
+                    self._lock_manager(), list(snapshots)
+                )
+            except RemoteLockUnavailable as exc:
+                # Same contract as a refused delete below: retention did not run,
+                # and it says so rather than finishing "successfully" having
+                # removed nothing while the target quietly fills up.
+                raise __util__.AbortError(f"Retention did NOT run: {exc}.") from exc
+        if remote_locked:
+            logger.info(
+                "Skipping %d stream(s) locked by another process on this target: %s",
+                len(remote_locked),
+                ", ".join(sorted(remote_locked)),
+            )
+
         protected = self._chain_referenced_parents(snapshots, delete_session)
         ssh_cmd = self._build_ssh_command()
 
@@ -2708,6 +2909,8 @@ class SSHRawEndpoint(RawEndpoint):
                     "unrestorable. Skipping.",
                     snapshot.get_name(),
                 )
+                continue
+            if snapshot_lock_name(snapshot) in remote_locked:
                 continue
             try:
                 # Build rm command for stream and metadata

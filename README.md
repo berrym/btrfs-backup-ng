@@ -3189,6 +3189,8 @@ src/btrfs_backup_ng/
 
 - [CLI Reference](docs/CLI-REFERENCE.md) - Complete command and option reference
 - [Migrating from btrbk](docs/MIGRATING-FROM-BTRBK.md) - Guide for btrbk users
+- [Snapper Integration](docs/SNAPPER-INTEGRATION.md) - Backing up and restoring snapper snapshots
+- [Remote Locks](docs/REMOTE-LOCKS.md) - How a restore is protected from a concurrent prune
 - [Changelog](CHANGELOG.md) - Version history and release notes
 
 ### Example Configurations
