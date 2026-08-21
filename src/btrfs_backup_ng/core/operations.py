@@ -16,6 +16,7 @@ from typing import Any, Optional
 
 from .. import __util__
 from ..transaction import log_transaction
+from .transfer import DEFAULT_TRANSFER_TIMEOUT
 from . import progress as progress_utils
 from . import transfer as transfer_utils
 from .chunked_transfer import (
@@ -302,6 +303,9 @@ def send_snapshot(
                 clones,
                 send_process,
                 show_progress=show_progress,
+                transfer_timeout=int(
+                    options.get("transfer_timeout", DEFAULT_TRANSFER_TIMEOUT)
+                ),
             )
         else:
             return_codes = _do_process_transfer(
@@ -663,7 +667,7 @@ def _transfer_chunks_local(
         total_bytes = reader.pipe_to_process(receive_process)
 
         # Wait for receive to complete
-        return_code = receive_process.wait(timeout=3600)
+        return_code = receive_process.wait(timeout=DEFAULT_TRANSFER_TIMEOUT)
 
         if return_code != 0:
             stderr = ""
@@ -777,7 +781,7 @@ def _transfer_chunks_ssh(
                 receive_process.stdin.close()
 
             # Wait for receive to complete
-            return_code = receive_process.wait(timeout=3600)
+            return_code = receive_process.wait(timeout=DEFAULT_TRANSFER_TIMEOUT)
 
             if return_code != 0:
                 stderr = ""
@@ -936,6 +940,7 @@ def _do_direct_pipe_transfer(
     clones,
     send_process,
     show_progress: bool = False,
+    transfer_timeout: int = DEFAULT_TRANSFER_TIMEOUT,
 ) -> list[int]:
     """Perform transfer using SSH direct pipe method."""
     try:
@@ -950,7 +955,7 @@ def _do_direct_pipe_transfer(
             snapshot,
             parent=parent,
             clones=clones,
-            timeout=3600,  # 1 hour timeout
+            timeout=transfer_timeout,
             show_progress=show_progress,
         )
     except Exception as e:
@@ -1073,7 +1078,9 @@ def _do_process_transfer(
         logger.error("Failed to start receive process: %s", e)
         raise __util__.SnapshotTransferError(f"Receive process failed to start: {e}")
 
-    timeout_seconds = 3600  # 1 hour overall bound
+    # Same bound as every other transfer path, from one name. A fixed hour here
+    # ends a legitimate large first sync exactly as it did on the direct pipe.
+    timeout_seconds = DEFAULT_TRANSFER_TIMEOUT
     send_reap_seconds = 30  # grace for the send to finish once the receive is done
 
     # Wait on the RECEIVE (the sink) first, NOT the send. The send is the producer and

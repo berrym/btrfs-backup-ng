@@ -3103,11 +3103,25 @@ apply over `ssh://` (compressed on the wire) and to `raw://` / `raw+ssh://`
 
 **A large first transfer stops after about an hour:**
 
-That is btrfs-backup-ng's own transfer timeout, not an ssh idle or keepalive timeout —
-a distinction worth making before searching `sshd_config`, since ssh commonly defaults
-to an hour as well. Since 0.9.4 the failure says so explicitly and names the limit. A
-full first sync of a large subvolume over a slow link can legitimately exceed it; use
-`estimate` to see what the transfer will actually move.
+Fixed. The limit was a fixed one hour, which a legitimate first sync of a large
+subvolume over a slow link can exceed — 36 GB over 100 Mbit is roughly 50 minutes at
+line rate before any overhead. It now defaults to 24 hours and is configurable:
+
+```toml
+[global]
+transfer_timeout = 43200   # seconds; default 86400 (24h)
+```
+
+A generous wall clock is safe because a transfer that stops moving data is caught
+separately, within minutes, by a stall check that watches bytes rather than the
+clock. So a slow transfer runs to completion, and a dead one is not waited out.
+
+If a transfer does hit either limit, the error says which, and says explicitly that
+it is btrfs-backup-ng's own limit and not an ssh idle or keepalive timeout — a
+distinction worth having before searching `sshd_config`, since ssh commonly defaults
+to an hour as well.
+
+To see what a transfer will actually move before starting it:
 
 ```bash
 btrfs-backup-ng estimate /path/to/snapshots ssh://user@host:/backup

@@ -37,6 +37,20 @@ COMPRESSION_PROGRAMS: dict[str, CompressionConfig] = {
 }
 
 
+#: Seconds a single transfer may run before it is given up on.
+#:
+#: A BACKSTOP for a pathologically slow transfer, not a hang detector: a transfer
+#: that stops moving data is caught in minutes by the endpoint's stall check,
+#: whatever this says. Overridable per install with `transfer_timeout` in
+#: [global].
+#:
+#: It was a fixed 3600 in eight places, which killed legitimate first syncs --
+#: 36 GB over 100 Mbit is about 50 minutes at line rate before any overhead, so
+#: the cap fired on transfers that were working perfectly (#93). One name now,
+#: so raising it cannot miss a site.
+DEFAULT_TRANSFER_TIMEOUT = 86400
+
+
 def check_compression_available(method: str) -> bool:
     """Check if a compression method is available on the system.
 
@@ -381,7 +395,9 @@ def cleanup_pipeline(processes: list) -> None:
                 pass
 
 
-def wait_for_pipeline(processes: list, timeout: int = 3600) -> list[int]:
+def wait_for_pipeline(
+    processes: list, timeout: int = DEFAULT_TRANSFER_TIMEOUT
+) -> list[int]:
     """Wait for all pipeline processes to complete.
 
     Args:

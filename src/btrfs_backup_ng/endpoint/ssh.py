@@ -60,6 +60,7 @@ from btrfs_backup_ng.core.retry import (  # noqa: E402
     RetryPolicy,
 )
 from btrfs_backup_ng.core.space import SpaceInfo  # noqa: E402
+from btrfs_backup_ng.core.transfer import DEFAULT_TRANSFER_TIMEOUT  # noqa: E402
 from btrfs_backup_ng.sshutil.master import SSHMasterManager  # noqa: E402
 
 from .common import Endpoint  # noqa: E402
@@ -224,6 +225,21 @@ def _build_receive_command(
     # Measured in a dash container: orphaned sh, subshell and receive without it,
     # clean with it; unchanged under bash either way.
     return f"exec sh -c {shlex.quote(script)}"
+
+
+#: How long a transfer may move NO bytes before it is treated as stuck.
+#:
+#: A wall-clock limit cannot tell a slow transfer from a dead one: it kills a
+#: healthy first sync of a large subvolume over a slow link, and waits the full
+#: hour on a pipe that died in the first minute. Reported as #93, where an
+#: initial 36 GB transfer over 100 Mbit hit a one-hour cap that had nothing to do
+#: with how the transfer was actually doing.
+#:
+#: Generous on purpose. A transfer legitimately moves nothing while btrfs walks
+#: metadata on a large subvolume, and a congested link can pause for a long time
+#: without being broken. This is the "nothing has happened at all" line, not a
+#: performance target.
+STALL_TIMEOUT_SECONDS = 900
 
 
 class SSHEndpoint(Endpoint):
@@ -3376,7 +3392,7 @@ print(json.dumps(result))
         dest_path: str,
         snapshot_name: str,
         parent_path: Optional[str] = None,
-        max_wait_time: int = 3600,
+        max_wait_time: int = DEFAULT_TRANSFER_TIMEOUT,
         show_progress: bool = False,
         **kwargs: Any,
     ) -> bool:
@@ -3654,7 +3670,7 @@ print(json.dumps(result))
         snapshot: "__util__.Snapshot",
         parent: Optional["__util__.Snapshot"] = None,
         clones: Optional[List["__util__.Snapshot"]] = None,
-        timeout: int = 3600,
+        timeout: int = DEFAULT_TRANSFER_TIMEOUT,
         show_progress: bool = False,
         retry_policy: Optional[RetryPolicy] = None,
     ) -> bool:
@@ -3818,7 +3834,7 @@ print(json.dumps(result))
         chunk_reader: Any,
         manifest: Any,
         show_progress: bool = False,
-        timeout: int = 3600,
+        timeout: int = DEFAULT_TRANSFER_TIMEOUT,
     ) -> bool:
         """Receive a chunked transfer with verification.
 
@@ -4013,7 +4029,7 @@ print(json.dumps(result))
         start_time: float,
         dest_path: str,
         snapshot_name: str,
-        max_wait_time: int = 3600,
+        max_wait_time: int = DEFAULT_TRANSFER_TIMEOUT,
         received_name: Optional[str] = None,
     ) -> bool:
         """Enhanced transfer monitoring with real-time progress feedback.
@@ -4045,9 +4061,57 @@ print(json.dumps(result))
         status_interval = 5  # Status updates every 5 seconds
         verification_interval = 30  # Verify snapshot every 30 seconds
 
+        # Stall detection. The pids we can actually read are the ones running as
+        # us: the ssh process and the buffer. The local `btrfs send` runs under
+        # sudo, so its io file is root-owned and unreadable -- which is fine,
+        # because bytes leaving on the socket is the same evidence.
+        stall_pids = [
+            proc.pid
+            for proc in (send_process, receive_process, buffer_process)
+            if proc is not None
+        ]
+        last_bytes = __util__.any_bytes_moved(stall_pids)
+        last_progress_time = start_time
+        stall_detection = last_bytes is not None
+        if not stall_detection:
+            # Never silently downgrade to "no bytes moved": that would read as a
+            # stall and kill a healthy transfer. Say the check is off instead.
+            logger.debug(
+                "Stall detection unavailable (no readable /proc/<pid>/io for this "
+                "transfer); falling back to the wall-clock limit alone."
+            )
+
         while time.time() - start_time < max_wait_time:
             current_time = time.time()
             elapsed = current_time - start_time
+
+            if stall_detection:
+                moved = __util__.any_bytes_moved(stall_pids)
+                if moved is None:
+                    # Everything we could read has exited; the exit-code checks
+                    # below decide the outcome, so stop asserting anything here.
+                    stall_detection = False
+                elif moved != last_bytes:
+                    last_bytes = moved
+                    last_progress_time = current_time
+                elif current_time - last_progress_time >= STALL_TIMEOUT_SECONDS:
+                    stalled_for = current_time - last_progress_time
+                    self._last_transfer_error = (
+                        f"the transfer moved no data for {stalled_for:.0f}s and was "
+                        f"terminated as stuck. This is btrfs-backup-ng's stall "
+                        f"limit, NOT an ssh timeout: the connection may have died "
+                        f"without closing, or the remote may be wedged. A slow "
+                        f"transfer that is still moving is never stopped by this."
+                    )
+                    logger.error("FAILED: %s", self._last_transfer_error)
+                    for proc in (send_process, receive_process, buffer_process):
+                        if proc is not None and proc.poll() is None:
+                            proc.terminate()
+                            try:
+                                proc.wait(timeout=5)
+                            except Exception:
+                                proc.kill()
+                    return False
 
             # Check process status
             send_alive = send_process.poll() is None
@@ -4215,7 +4279,7 @@ print(json.dumps(result))
         start_time: float,
         dest_path: str,
         snapshot_name: str,
-        max_wait_time: int = 3600,
+        max_wait_time: int = DEFAULT_TRANSFER_TIMEOUT,
         received_name: Optional[str] = None,
     ) -> bool:
         """Simplified transfer monitoring with basic process tracking.

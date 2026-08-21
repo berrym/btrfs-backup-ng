@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`transfer_timeout` in `[global]`** — how long a single transfer may run,
+  defaulting to 24 hours. It was a fixed one hour in nine places, which ended
+  legitimate first syncs of large subvolumes over slow links: 36 GB over 100 Mbit
+  is about 50 minutes at line rate before any overhead. Reported by Michael J
+  Gruber (@mjg) (#93).
+- **Stall detection** — a transfer that stops moving data is now given up on within
+  minutes instead of waiting out the wall clock, and a transfer that is merely slow
+  is never stopped by it. Bytes are counted out-of-band from `/proc/<pid>/io`, so
+  nothing is routed through Python and the direct pipe stays direct. The local
+  `btrfs send` runs under sudo and its counters are unreadable to us; the ssh
+  process is ours, and bytes leaving on the socket is the same evidence. Where
+  nothing can be read the check disables itself rather than reporting a healthy
+  transfer as stuck.
+
 ### Changed
 
 - **`paramiko` is no longer a dependency** — it was a second implementation of one

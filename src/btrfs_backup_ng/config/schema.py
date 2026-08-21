@@ -281,6 +281,12 @@ class GlobalConfig:
         transaction_log: Path to JSON transaction log for auditing
         retention: Default retention policy
         notifications: Notification settings (email, webhook)
+        transfer_timeout: Seconds a single transfer may run before it is given up
+            on (default 86400, one day). This is a backstop for a transfer that is
+            pathologically slow, not a hang detector -- a transfer that stops moving
+            data is caught in minutes by the stall check regardless of this value.
+            The old fixed 3600 killed legitimate first syncs of large subvolumes
+            over slow links (#93).
         parallel_volumes: Max concurrent volume backups
         parallel_targets: Max concurrent target transfers per volume
         quiet: Suppress non-essential output
@@ -294,6 +300,7 @@ class GlobalConfig:
     transaction_log: Optional[str] = None
     retention: RetentionConfig = field(default_factory=RetentionConfig)
     notifications: NotificationConfig = field(default_factory=NotificationConfig)
+    transfer_timeout: int = 86400
     parallel_volumes: int = 2
     parallel_targets: int = 3
     quiet: bool = False
