@@ -357,7 +357,7 @@ def _parse_global(data: dict[str, Any]) -> GlobalConfig:
         transaction_log=data.get("transaction_log"),
         retention=retention,
         notifications=notifications,
-        transfer_timeout=data.get("transfer_timeout", 86400),
+        transfer_timeout=data.get("transfer_timeout", 0),
         transfer_stall_timeout=data.get("transfer_stall_timeout", 900),
         parallel_volumes=data.get("parallel_volumes", 2),
         parallel_targets=data.get("parallel_targets", 3),

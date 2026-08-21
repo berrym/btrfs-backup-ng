@@ -50,7 +50,10 @@ class TestATimeoutSaysWhoseItWas:
             start_time=time.time(),
             dest_path="/backup",
             snapshot_name="snap",
-            max_wait_time=0,  # already past the deadline
+            # A tiny positive limit, not 0: since transfer_timeout became
+            # configurable, 0 means UNLIMITED rather than "already expired",
+            # and passing it here made this test hang instead of run.
+            max_wait_time=1,
         )
         assert result is False
         assert endpoint._last_transfer_error, "the timeout recorded no reason"
@@ -65,7 +68,7 @@ class TestATimeoutSaysWhoseItWas:
             start_time=time.time(),
             dest_path="/backup",
             snapshot_name="snap",
-            max_wait_time=0,
+            max_wait_time=1,
         )
         assert result is False
         assert endpoint._last_transfer_error, "the timeout recorded no reason"

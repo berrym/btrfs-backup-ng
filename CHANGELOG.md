@@ -9,11 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **`transfer_timeout` in `[global]`** — how long a single transfer may run,
-  defaulting to 24 hours. It was a fixed one hour in nine places, which ended
-  legitimate first syncs of large subvolumes over slow links: 36 GB over 100 Mbit
-  is about 50 minutes at line rate before any overhead. Reported by Michael J
-  Gruber (@mjg) (#93).
+- **Transfers are no longer limited by a wall clock at all, by default** — a
+  transfer that is moving data is succeeding, and ending it because a timer expired
+  confused operator policy with fault detection. Any fixed value is a guess about
+  link speed times dataset size; the old fixed one hour, in nine places, ended first
+  syncs that were working perfectly (36 GB over 100 Mbit is about 50 minutes at line
+  rate before overhead). `transfer_timeout` in `[global]` remains for operators who
+  need a real deadline, and defaults to unlimited. Reported by Michael J Gruber
+  (@mjg) (#93).
 - **Stall detection** — a transfer that stops moving data is now given up on within
   minutes instead of waiting out the wall clock, and a transfer that is merely slow
   is never stopped by it. Bytes are counted out-of-band from `/proc/<pid>/io`, so

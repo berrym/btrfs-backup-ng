@@ -16,7 +16,7 @@ from typing import Any, Optional
 
 from .. import __util__
 from ..transaction import log_transaction
-from .transfer import DEFAULT_TRANSFER_TIMEOUT
+from .transfer import DEFAULT_STALL_TIMEOUT, DEFAULT_TRANSFER_TIMEOUT
 from . import progress as progress_utils
 from . import transfer as transfer_utils
 from .chunked_transfer import (
@@ -319,6 +319,12 @@ def send_snapshot(
                 snapshot_name=snapshot_name,
                 estimated_size=estimated_size,
                 parent_name=parent_name,
+                stall_timeout=int(
+                    options.get("transfer_stall_timeout", DEFAULT_STALL_TIMEOUT)
+                ),
+                wall_timeout=int(
+                    options.get("transfer_timeout", DEFAULT_TRANSFER_TIMEOUT)
+                ),
             )
 
         if any(rc != 0 for rc in return_codes):
@@ -631,6 +637,21 @@ def _do_chunked_transfer(
         raise __util__.SnapshotTransferError(f"Chunked transfer failed: {e}") from e
 
 
+def _timeouts_from(options: dict) -> tuple[int, int]:
+    """The stall window and the wall limit for a transfer, from its options.
+
+    Two different jobs, deliberately separate. The stall window detects a FAULT
+    -- the transfer has stopped moving and is not coming back. The wall limit is
+    operator POLICY, unlimited unless someone asks for it, because a transfer
+    that is moving data is succeeding and ending it on a clock would be a guess
+    dressed as a safety check.
+    """
+    return (
+        int(options.get("transfer_stall_timeout", DEFAULT_STALL_TIMEOUT)),
+        int(options.get("transfer_timeout", DEFAULT_TRANSFER_TIMEOUT)),
+    )
+
+
 def _transfer_chunks_local(
     manifest: TransferManifest,
     destination_endpoint,
@@ -649,6 +670,7 @@ def _transfer_chunks_local(
         options: Transfer options
         show_progress: Whether to show progress
     """
+    stall_timeout, wall_timeout = _timeouts_from(options)
     logger.info("Reassembling %d chunks for local btrfs receive", manifest.chunk_count)
 
     # Create a reader to reassemble chunks
@@ -666,8 +688,15 @@ def _transfer_chunks_local(
         # Pipe chunks to receive
         total_bytes = reader.pipe_to_process(receive_process)
 
-        # Wait for receive to complete
-        return_code = receive_process.wait(timeout=DEFAULT_TRANSFER_TIMEOUT)
+        # Poll rather than block: a blocking wait can only count seconds, so it
+        # cannot tell a working transfer from a dead one.
+        return_code = transfer_utils.wait_with_progress(
+            receive_process,
+            stall_pids=[receive_process.pid],
+            stall_timeout=stall_timeout,
+            wall_timeout=wall_timeout,
+            description="chunked receive",
+        )
 
         if return_code != 0:
             stderr = ""
@@ -724,6 +753,7 @@ def _transfer_chunks_ssh(
         options: Transfer options
         show_progress: Whether to show progress
     """
+    stall_timeout, wall_timeout = _timeouts_from(options)
     # Get pending chunks (for resume support)
     pending_chunks = manifest.pending_chunks
 
@@ -781,7 +811,13 @@ def _transfer_chunks_ssh(
                 receive_process.stdin.close()
 
             # Wait for receive to complete
-            return_code = receive_process.wait(timeout=DEFAULT_TRANSFER_TIMEOUT)
+            return_code = transfer_utils.wait_with_progress(
+                receive_process,
+                stall_pids=[receive_process.pid],
+                stall_timeout=stall_timeout,
+                wall_timeout=wall_timeout,
+                description="chunked receive",
+            )
 
             if return_code != 0:
                 stderr = ""
@@ -988,6 +1024,8 @@ def _do_process_transfer(
     show_progress: bool = False,
     snapshot_name: str = "",
     estimated_size: int | None = None,
+    stall_timeout: int = DEFAULT_STALL_TIMEOUT,
+    wall_timeout: int = DEFAULT_TRANSFER_TIMEOUT,
     parent_name: str | None = None,
 ) -> list[int]:
     """Perform transfer using traditional process piping.
@@ -1080,7 +1118,7 @@ def _do_process_transfer(
 
     # Same bound as every other transfer path, from one name. A fixed hour here
     # ends a legitimate large first sync exactly as it did on the direct pipe.
-    timeout_seconds = DEFAULT_TRANSFER_TIMEOUT
+    timeout_seconds = wall_timeout
     send_reap_seconds = 30  # grace for the send to finish once the receive is done
 
     # Wait on the RECEIVE (the sink) first, NOT the send. The send is the producer and
@@ -1090,7 +1128,15 @@ def _do_process_transfer(
     # that was the hang on remote restores. A finished receive implies the send has (or
     # is about to) finish too, so this ordering is correct for the normal case as well.
     try:
-        return_code_receive = receive_process.wait(timeout=timeout_seconds)
+        return_code_receive = transfer_utils.wait_with_progress(
+            receive_process,
+            stall_pids=[
+                proc.pid for proc in (receive_process, send_process) if proc is not None
+            ],
+            stall_timeout=stall_timeout,
+            wall_timeout=timeout_seconds,
+            description="receive",
+        )
         logger.debug(
             "Receive process completed with return code: %s", return_code_receive
         )

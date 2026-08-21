@@ -3103,24 +3103,36 @@ apply over `ssh://` (compressed on the wire) and to `raw://` / `raw+ssh://`
 
 **A large first transfer stops after about an hour:**
 
-Fixed. The limit was a fixed one hour, which a legitimate first sync of a large
-subvolume over a slow link can exceed — 36 GB over 100 Mbit is roughly 50 minutes at
-line rate before any overhead. It now defaults to 24 hours and is configurable:
+Fixed, and the design changed rather than the number. **There is no wall-clock
+limit by default.**
+
+A transfer that is moving data is succeeding, slowly. Ending it because a clock
+expired confuses operator policy with fault detection, and any fixed value is a
+guess about link speed times dataset size — 36 GB over 100 Mbit is roughly 50
+minutes at line rate before any overhead, which is why the old fixed hour ended
+transfers that were working perfectly.
+
+Faults are detected by measuring instead: if a transfer moves **no data** for
+`transfer_stall_timeout` (default 15 minutes) it is stuck and is stopped. Time
+elapsed is not consulted, so a slow transfer runs to completion.
 
 ```toml
 [global]
-transfer_timeout = 43200         # seconds; default 86400 (24h)
-transfer_stall_timeout = 900     # seconds with no data before "stuck"; 0 disables
+transfer_stall_timeout = 900   # seconds with no data before "stuck"; 0 disables
+transfer_timeout = 0           # wall clock; 0 = unlimited (default)
 ```
 
-A generous wall clock is safe because a transfer that stops moving data is caught
-separately, within minutes, by a stall check that watches bytes rather than the
-clock. So a slow transfer runs to completion, and a dead one is not waited out.
+Set `transfer_timeout` only as an operational constraint — "this must finish before
+the working day" — not as a health check.
 
-The stall check only applies while data should be flowing — once the local send has
-finished and the remote is applying what it already received, no bytes move on this
-side and that is completion, not a stall. Set `transfer_stall_timeout = 0` to turn
-it off entirely.
+Two details worth knowing:
+
+- The stall check applies only while data should be flowing. Once the local send has
+  finished and the remote is applying what it already received, no bytes move on this
+  side; that is completion, not a stall.
+- If byte progress cannot be measured at all (unreadable `/proc/<pid>/io`, or the
+  check disabled) a generous fallback limit applies instead, and says so in the log —
+  guard by measurement where possible, by clock where not.
 
 If a transfer does hit either limit, the error says which, and says explicitly that
 it is btrfs-backup-ng's own limit and not an ssh idle or keepalive timeout — a

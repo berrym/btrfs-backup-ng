@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+import threading
 import time
 
 from btrfs_backup_ng import __util__
@@ -224,13 +225,20 @@ class TestTheWallClockIsConfigurableAndGenerous:
         path.write_text(body)
         return load_config(path)
 
-    def test_the_default_is_generous_enough_for_a_large_first_sync(self):
+    def test_the_default_imposes_no_wall_clock_at_all(self):
+        """A transfer that is moving data is succeeding, slowly.
+
+        Any fixed default is a guess about link speed times dataset size, and
+        every guess ends someone's working transfer. Faults are detected by
+        measuring bytes instead, so the clock has no safety job left and
+        defaults to off. Setting it is then an operator's deadline, not a
+        health check.
+        """
         from btrfs_backup_ng.core.transfer import DEFAULT_TRANSFER_TIMEOUT
 
-        # 36 GB over 100 Mbit ~ 50 min at line rate; a 500 GB first sync ~ 11 h.
-        assert DEFAULT_TRANSFER_TIMEOUT >= 12 * 3600, (
-            "the default cannot accommodate a large first sync over a slow link, "
-            "which is the failure reported in #93"
+        assert DEFAULT_TRANSFER_TIMEOUT == 0, (
+            "a default wall clock is back; it will end transfers that are "
+            "working, which is the failure reported in #93"
         )
 
     def test_it_can_be_set_in_the_config(self, tmp_path):
@@ -243,7 +251,12 @@ class TestTheWallClockIsConfigurableAndGenerous:
         assert not [w for w in warnings if "Unknown config key" in w]
         assert config.global_config.transfer_timeout == 43200
 
-    def test_it_defaults_when_absent(self, tmp_path):
+    def test_the_loader_default_matches_the_code_default(self, tmp_path):
+        """Two defaults that disagree is a bug waiting to be blamed on the user.
+
+        The loader briefly said 86400 while the constant said 0, so a run with
+        no config and a run with an empty [global] behaved differently.
+        """
         from btrfs_backup_ng.core.transfer import DEFAULT_TRANSFER_TIMEOUT
 
         config, _ = self._config(
@@ -251,7 +264,7 @@ class TestTheWallClockIsConfigurableAndGenerous:
             '[[volumes]]\npath = "/home"\n\n'
             '[[volumes.targets]]\npath = "ssh://nas:/backup"\n',
         )
-        assert config.global_config.transfer_timeout == DEFAULT_TRANSFER_TIMEOUT
+        assert config.global_config.transfer_timeout == DEFAULT_TRANSFER_TIMEOUT == 0
 
     def test_no_transfer_path_still_hardcodes_an_hour(self):
         """It was eight places, and mjg's patch could only reach one of them.
@@ -444,3 +457,181 @@ class TestTheStallWindowIsReachable:
         assert "moved no data" in (endpoint._last_transfer_error or ""), (
             "a 1-second window was configured but the default was used instead"
         )
+
+
+class TestAnUnmeasurableTransferStillHasAGuard:
+    """Guard by measurement where we can, by clock where we cannot.
+
+    With the wall clock unlimited by default, the stall check is the only thing
+    standing between a wedged transfer and forever. But the stall check can be
+    unavailable -- no readable /proc/<pid>/io for anything in the pipeline, or
+    an operator who set the window to 0. In that state there would be no guard
+    at all, and a scheduled backup would wedge silently.
+
+    So the fallback is not decoration: it is the whole reason `transfer_timeout`
+    can safely default to unlimited.
+    """
+
+    def _unmeasurable_process(self):
+        """A live process whose io counters we cannot read.
+
+        PID 1 is root's, so `process_io_bytes` returns None for it while the
+        process is unmistakably alive -- the real shape of the problem, not a
+        stub of it.
+        """
+
+        class _Proc:
+            pid = 1  # root-owned: unreadable io, definitely alive
+
+            def wait(self, timeout=None):
+                raise subprocess.TimeoutExpired(cmd="unmeasurable", timeout=timeout)
+
+        return _Proc()
+
+    def test_it_is_bounded_rather_than_hanging_forever(self, monkeypatch):
+        import btrfs_backup_ng.core.transfer as transfer_mod
+
+        if os.geteuid() == 0:
+            return  # as root, PID 1 is readable and the premise does not hold
+
+        monkeypatch.setattr(transfer_mod, "UNMEASURABLE_FALLBACK_TIMEOUT", 2)
+
+        # Run it on a thread and JOIN with a deadline. Without the fallback the
+        # call never returns, and a test that hangs is barely a test -- CI would
+        # time out with no explanation instead of naming the missing guard.
+        outcome: dict = {}
+
+        def _run():
+            try:
+                transfer_mod.wait_with_progress(
+                    self._unmeasurable_process(),
+                    stall_pids=[1],
+                    stall_timeout=900,
+                    wall_timeout=0,  # unlimited: the fallback is the only guard
+                    poll_interval=0.2,
+                    description="unmeasurable",
+                )
+                outcome["result"] = "returned"
+            except subprocess.TimeoutExpired:
+                outcome["result"] = "bounded"
+            except Exception as exc:  # noqa: BLE001 - reported below
+                outcome["result"] = f"error: {exc!r}"
+
+        thread = threading.Thread(target=_run, daemon=True)
+        thread.start()
+        thread.join(timeout=20)
+
+        assert not thread.is_alive(), (
+            "an unmeasurable transfer with no wall clock was never bounded; it "
+            "would hang until something else killed it"
+        )
+        assert outcome.get("result") == "bounded", outcome
+
+    def test_an_explicit_wall_clock_still_wins(self, monkeypatch):
+        """If the operator set a deadline, that is the bound -- not the fallback."""
+        import btrfs_backup_ng.core.transfer as transfer_mod
+
+        if os.geteuid() == 0:
+            return
+
+        monkeypatch.setattr(transfer_mod, "UNMEASURABLE_FALLBACK_TIMEOUT", 3600)
+        outcome: dict = {}
+
+        def _run():
+            try:
+                transfer_mod.wait_with_progress(
+                    self._unmeasurable_process(),
+                    stall_pids=[1],
+                    stall_timeout=900,
+                    wall_timeout=2,
+                    poll_interval=0.2,
+                    description="unmeasurable",
+                )
+                outcome["result"] = "returned"
+            except subprocess.TimeoutExpired:
+                outcome["result"] = "bounded"
+
+        thread = threading.Thread(target=_run, daemon=True)
+        thread.start()
+        thread.join(timeout=20)
+        assert not thread.is_alive(), "the configured wall clock was not enforced"
+        assert outcome.get("result") == "bounded", outcome
+
+
+class TestZeroMeansUnlimitedNotExpired:
+    """`0` is the value that says "no wall clock". Read as a duration it says
+    "zero seconds allowed", and every transfer fails the instant it starts.
+
+    That is precisely what happened: the default became unlimited, both monitor
+    loops were `while elapsed < max_wait_time`, and a real transfer to a real
+    machine died immediately with "transfer timeout of 0s elapsed". The unit
+    tests all passed explicit non-zero values, so only hardware caught it.
+    """
+
+    def _endpoint(self):
+        from btrfs_backup_ng.endpoint.ssh import SSHEndpoint
+
+        endpoint = SSHEndpoint(hostname="nas", path="/backup")
+        endpoint._last_transfer_error = None
+        return endpoint
+
+    def test_zero_does_not_instantly_fail_the_monitor(self):
+        endpoint = self._endpoint()
+        proc = subprocess.Popen(["sleep", "0.6"])
+        try:
+            endpoint._monitor_transfer_progress(
+                {"send": proc, "receive": proc},
+                start_time=time.time(),
+                dest_path="/backup",
+                snapshot_name="snap",
+                max_wait_time=0,  # unlimited
+            )
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+            proc.wait()
+        reason = endpoint._last_transfer_error or ""
+        assert "0s" not in reason, (
+            f"an unlimited wall clock was read as zero seconds: {reason}"
+        )
+
+    def test_zero_does_not_instantly_fail_the_simple_monitor(self):
+        endpoint = self._endpoint()
+        proc = subprocess.Popen(["sleep", "0.6"])
+        try:
+            endpoint._simple_transfer_monitor(
+                {"send": proc, "receive": proc},
+                start_time=time.time(),
+                dest_path="/backup",
+                snapshot_name="snap",
+                max_wait_time=0,
+            )
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+            proc.wait()
+        reason = endpoint._last_transfer_error or ""
+        assert "0s" not in reason, (
+            f"an unlimited wall clock was read as zero seconds: {reason}"
+        )
+
+    def test_the_default_reaches_the_monitor_as_unlimited(self):
+        """End to end on the value that actually ships: no config, no clock."""
+        from btrfs_backup_ng.core.transfer import DEFAULT_TRANSFER_TIMEOUT
+
+        assert DEFAULT_TRANSFER_TIMEOUT == 0
+        endpoint = self._endpoint()
+        proc = subprocess.Popen(["sleep", "0.6"])
+        try:
+            endpoint._monitor_transfer_progress(
+                {"send": proc, "receive": proc},
+                start_time=time.time(),
+                dest_path="/backup",
+                snapshot_name="snap",
+                max_wait_time=DEFAULT_TRANSFER_TIMEOUT,
+            )
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+            proc.wait()
+        assert "0s" not in (endpoint._last_transfer_error or "")

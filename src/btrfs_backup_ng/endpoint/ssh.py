@@ -3972,7 +3972,19 @@ print(json.dumps(result))
 
             # Wait for receive to complete
             try:
-                return_code = receive_process.wait(timeout=timeout)
+                # Poll rather than block, so the wait can also measure whether
+                # the transfer is actually moving.
+                from ..core.transfer import wait_with_progress
+
+                return_code = wait_with_progress(
+                    receive_process,
+                    stall_pids=[receive_process.pid],
+                    stall_timeout=int(
+                        self.config.get("transfer_stall_timeout", STALL_TIMEOUT_SECONDS)
+                    ),
+                    wall_timeout=timeout,
+                    description="ssh receive",
+                )
             except subprocess.TimeoutExpired:
                 logger.error("Timeout waiting for SSH receive to complete")
                 receive_process.kill()
@@ -4089,7 +4101,10 @@ print(json.dumps(result))
                 "transfer); falling back to the wall-clock limit alone."
             )
 
-        while time.time() - start_time < max_wait_time:
+        # `max_wait_time <= 0` means NO wall clock, not "zero seconds allowed".
+        # Read the other way it makes every transfer fail instantly, which is
+        # exactly what happened the first time the default became unlimited.
+        while max_wait_time <= 0 or time.time() - start_time < max_wait_time:
             current_time = time.time()
             elapsed = current_time - start_time
 
@@ -4343,7 +4358,10 @@ print(json.dumps(result))
         stall_detection = stall_limit > 0 and last_bytes is not None
 
         # Simple polling loop with timeout
-        while time.time() - start_time < max_wait_time:
+        # `max_wait_time <= 0` means NO wall clock, not "zero seconds allowed".
+        # Read the other way it makes every transfer fail instantly, which is
+        # exactly what happened the first time the default became unlimited.
+        while max_wait_time <= 0 or time.time() - start_time < max_wait_time:
             all_finished = True
 
             for proc in processes_to_wait:
