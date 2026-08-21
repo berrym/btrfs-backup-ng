@@ -123,7 +123,7 @@ def _run_lock(config_path: Path | str) -> Any:
         )
         yield
         return
-    with __util__.exclusive_lock(  # type: ignore[attr-defined]
+    with __util__.exclusive_lock(
         lock_file,
         timeout=RUN_LOCK_WAIT_SECONDS,
         subject=f"a run for {config_path}",

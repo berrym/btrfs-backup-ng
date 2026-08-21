@@ -108,6 +108,11 @@ fail_under = 55
 [tool.mypy]
 python_version = "3.11"
 warn_unused_configs = true
+# A `type: ignore` that no longer silences anything is worse than none: it reads
+# as "there is a typing problem here" when there is not, and it will swallow a
+# REAL error appearing on that line later. 42 of the 46 in the tree were dead
+# when this was turned on, most outliving the .pyi stubs that caused them.
+warn_unused_ignores = true
 ignore_missing_imports = true
 exclude = [
     "tests/",

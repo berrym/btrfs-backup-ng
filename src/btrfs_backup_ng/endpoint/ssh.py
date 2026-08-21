@@ -718,22 +718,22 @@ class SSHEndpoint(Endpoint):
         LEGACY count-based path (see ``Endpoint.delete_old_snapshots``); the modern retention
         engine is time-based ``retention.apply_retention`` via ``prune``.
         """
-        snapshots = self.list_snapshots()  # type: ignore
-        unlocked = [  # type: ignore
-            s  # type: ignore
-            for s in snapshots  # type: ignore
-            if not getattr(s, "locks", False) and not getattr(s, "parent_locks", False)  # type: ignore
+        snapshots = self.list_snapshots()
+        unlocked = [
+            s
+            for s in snapshots
+            if not getattr(s, "locks", False) and not getattr(s, "parent_locks", False)
         ]
-        if keep <= 0 or len(unlocked) <= keep:  # type: ignore
+        if keep <= 0 or len(unlocked) <= keep:
             logger.debug(
                 "No unlocked snapshots to delete (keep=%d, unlocked=%d)",
                 keep,
-                len(unlocked),  # type: ignore
+                len(unlocked),
             )
             return
-        to_delete = unlocked[:-keep]  # type: ignore
-        for snap in to_delete:  # type: ignore
-            logger.info("Deleting old remote snapshot: %s", str(snap))  # type: ignore
+        to_delete = unlocked[:-keep]
+        for snap in to_delete:
+            logger.info("Deleting old remote snapshot: %s", str(snap))
             self.delete_snapshots([snap])
 
     #: Declared beside the override that makes it true, so the two cannot drift.
@@ -1690,11 +1690,10 @@ print(json.dumps(result))
         )
 
         # Check if command is using the tuple format (arg, is_path)
-        if command and isinstance(command[0], tuple) and len(command[0]) == 2:  # type: ignore
-            # type: ignore
+        if command and isinstance(command[0], tuple) and len(command[0]) == 2:
             # New format with (arg, is_path) tuples
             logger.debug("Detected tuple format command (arg, is_path)")
-            for i, (arg, is_path) in enumerate(command):  # type: ignore
+            for i, (arg, is_path) in enumerate(command):
                 logger.debug(
                     "Processing arg %d: '%s' (is_path=%s, type=%s)",
                     i,
@@ -1705,32 +1704,32 @@ print(json.dumps(result))
                 if is_path and isinstance(arg, (str, Path)):
                     normalized = self._normalize_path(arg)
                     logger.debug("Normalized path arg %d: %s -> %s", i, arg, normalized)
-                    string_command.append(normalized)  # type: ignore
+                    string_command.append(normalized)
                 else:
                     # Not a path, just append as-is
                     logger.debug("Using non-path arg %d as-is: %s", i, arg)
-                    string_command.append(arg)  # type: ignore
+                    string_command.append(arg)
             logger.debug(
                 "Processed marked command arguments for remote execution: %s",
-                string_command,  # type: ignore
+                string_command,
             )
         else:
             # Legacy format - convert any Path objects in the command to strings
             logger.debug("Using legacy command format")
-            for i, arg in enumerate(command):  # type: ignore
+            for i, arg in enumerate(command):
                 if isinstance(arg, (str, Path)):
                     normalized = self._normalize_path(arg)
                     logger.debug("Normalized arg %d: %s -> %s", i, arg, normalized)
-                    string_command.append(normalized)  # type: ignore
+                    string_command.append(normalized)
                 else:
                     logger.debug("Using non-string arg %d as-is: %s", i, arg)
-                    string_command.append(arg)  # type: ignore
+                    string_command.append(arg)
             logger.debug(
                 "Processed legacy command format for remote execution: %s",
-                string_command,  # type: ignore
+                string_command,
             )
 
-        remote_cmd = self._build_remote_command(string_command)  # type: ignore
+        remote_cmd = self._build_remote_command(string_command)
         logger.debug("Final remote command after build: %s", remote_cmd)
 
         # Detect if sudo -S is in the command (needs password on stdin)
@@ -1766,7 +1765,7 @@ print(json.dumps(result))
             if "sudo" in cmd_str and "-n" not in cmd_str and not using_sudo_with_stdin:
                 needs_tty = True
 
-        ssh_base_cmd = self.ssh_manager.get_ssh_base_cmd(force_tty=needs_tty)  # type: ignore
+        ssh_base_cmd = self.ssh_manager.get_ssh_base_cmd(force_tty=needs_tty)
         logger.debug("SSH base command: %s", ssh_base_cmd)
 
         # shlex.quote each element: ssh space-joins the command args and the REMOTE
@@ -1804,13 +1803,13 @@ print(json.dumps(result))
             if "input" in kwargs:
                 logger.debug("subprocess.run has input data (password)")
 
-            result = subprocess.run(ssh_cmd, **kwargs)  # type: ignore[misc]
-            exit_code = result.returncode  # type: ignore[attr-defined]
+            result = subprocess.run(ssh_cmd, **kwargs)
+            exit_code = result.returncode
 
             if exit_code != 0 and kwargs.get("check", False) is False:
                 stderr = (
-                    str(result.stderr.decode("utf-8", errors="replace"))  # type: ignore
-                    if hasattr(result, "stderr") and result.stderr  # type: ignore
+                    str(result.stderr.decode("utf-8", errors="replace"))
+                    if hasattr(result, "stderr") and result.stderr
                     else ""
                 )
 
@@ -1819,31 +1818,31 @@ print(json.dumps(result))
 
                 logger.debug(
                     "Command exited with non-zero code %d: %s\nError: %s",
-                    exit_code,  # type: ignore
-                    ssh_cmd_str,  # type: ignore
-                    stderr,  # type: ignore
+                    exit_code,
+                    ssh_cmd_str,
+                    stderr,
                 )
                 details: Dict[str, Any] = {
                     "command": ssh_cmd_str,
                     "exit_code": exit_code,
                     "stderr_length": len(stderr) if stderr else 0,
-                    "has_stdout": result.stdout is not None,  # type: ignore[attr-defined]
+                    "has_stdout": result.stdout is not None,
                 }
                 logger.debug("Non-zero exit command details: %s", details)
             elif exit_code == 0:
-                logger.debug("Command executed successfully: %s", ssh_cmd_str)  # type: ignore
-                if result.stdout:  # type: ignore[attr-defined]
-                    stdout_data = result.stdout  # type: ignore[attr-defined]
+                logger.debug("Command executed successfully: %s", ssh_cmd_str)
+                if result.stdout:
+                    stdout_data = result.stdout
                     if stdout_data:
                         stdout_len = (
                             len(stdout_data)
                             if isinstance(stdout_data, bytes)
-                            else len(str(stdout_data))  # type: ignore[arg-type]
+                            else len(str(stdout_data))
                         )
                         logger.debug("Command stdout length: %d bytes", stdout_len)
 
-            logger.debug("Command execution result: exit_code=%d", result.returncode)  # type: ignore[attr-defined]
-            return result  # type: ignore[return-value]
+            logger.debug("Command execution result: exit_code=%d", result.returncode)
+            return result
 
         except subprocess.TimeoutExpired as e:
             logger.error(
@@ -1889,14 +1888,14 @@ print(json.dumps(result))
         if val is None:
             return ""
         path = val
-        if isinstance(val, tuple) and len(val) == 2:  # type: ignore
+        if isinstance(val, tuple) and len(val) == 2:
             path, is_path = cast(Tuple[Any, Any], val)
             logger.debug(
                 f"Tuple format detected in _normalize_path: {str(path)} (is_path={str(is_path)})"
             )
             if not is_path:
                 logger.debug(f"Not a path, returning as-is: {str(path)}")
-                return str(path)  # type: ignore
+                return str(path)
         if isinstance(path, Path):
             logger.debug("Converting Path object to string: %s", path)
             return str(path)
@@ -1952,7 +1951,7 @@ print(json.dumps(result))
                 original_path = path
                 path = os.path.expanduser(path)
                 logger.debug("Expanded user path: %s -> %s", original_path, path)
-        return str(path) if path is not None else ""  # type: ignore
+        return str(path) if path is not None else ""
 
     def _verify_btrfs_availability(self, use_sudo: bool = False) -> bool:
         try:
