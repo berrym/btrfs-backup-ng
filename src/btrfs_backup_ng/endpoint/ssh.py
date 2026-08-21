@@ -32,17 +32,6 @@ from subprocess import CompletedProcess
 from threading import Lock
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, TypeVar, cast
 
-# Handle paramiko import with proper typing
-paramiko: Optional[types.ModuleType]
-try:
-    import paramiko as _paramiko
-
-    paramiko = _paramiko
-    PARAMIKO_AVAILABLE = True
-except ImportError:
-    paramiko = None
-    PARAMIKO_AVAILABLE = False
-
 if TYPE_CHECKING:
     pass
 
@@ -2669,7 +2658,7 @@ print(json.dumps(result))
         """The compression method for this transfer, or None.
 
         Every transfer strategy has to ask the same question, and there are
-        several: the direct pipe, the password-sudo path via paramiko, and the
+        several: the direct pipe, the password-sudo path, and the
         shell pipeline. Wiring only one of them is how `compress` came to work
         on some setups and silently do nothing on others.
         """
@@ -3046,24 +3035,12 @@ print(json.dumps(result))
                 logger.error("Password-based sudo required but no password provided")
                 return False
 
-        # Use Paramiko for password-based sudo (cleaner stdin handling)
-        if (
-            use_sudo
-            and not passwordless_available
-            and sudo_password
-            and PARAMIKO_AVAILABLE
-        ):
-            return self._do_paramiko_transfer(
-                source_path=source_path,
-                dest_path=dest_path,
-                snapshot_name=snapshot_name,
-                parent_path=parent_path,
-                sudo_password=sudo_password,
-                show_progress=show_progress,
-            )
-
-        # Fall back to the shell pipeline: passwordless sudo, no sudo at all, or
-        # password sudo on a host without paramiko. Only this caller knows which.
+        # One route for every case: passwordless sudo, no sudo at all, and
+        # password sudo, which used to have a second implementation on top of
+        # paramiko. Measured .203 -> .70 against a password-required sudo with
+        # key-based login: transfer, compressed transfer and restore all
+        # byte-identical, a wrong password failing non-zero with nothing written,
+        # and the two implementations agreeing exactly. So the second one went.
         return self._do_shell_pipeline_transfer(
             source_path=source_path,
             dest_path=dest_path,
@@ -3072,384 +3049,6 @@ print(json.dumps(result))
             password_sudo=bool(use_sudo) and not passwordless_available,
             show_progress=show_progress,
         )
-
-    def _new_verified_paramiko_client(self) -> Any:
-        """Create a Paramiko SSHClient that verifies the host key against the operator's
-        known_hosts (R12/P1).
-
-        Loading the store is what closes the fail-open: with it, a CHANGED key raises
-        ``BadHostKeyException`` on connect (the MITM signal), while a genuinely new host is
-        trusted AND persisted -- accept-new parity with the subprocess transport. The old
-        code loaded NOTHING, so every key looked "missing" and ``AutoAddPolicy`` blindly
-        accepted any key, including a changed one, on the path that carries the SSH and
-        sudo passwords."""
-        assert paramiko is not None
-        client = paramiko.SSHClient()
-        try:
-            client.load_system_host_keys()
-        except OSError:
-            pass  # a missing/unreadable system known_hosts must not block the transfer
-        known_hosts = str(self.ssh_manager.known_hosts_path)
-        try:
-            # load_host_keys also sets the write-back file, so AutoAddPolicy persists a
-            # newly accepted host to the operator's known_hosts (accept-new pinning).
-            client.load_host_keys(known_hosts)
-        except OSError as e:
-            logger.warning("Could not load known_hosts %s: %s", known_hosts, e)
-        # strict => an UNKNOWN host is refused (RejectPolicy); accept-new => trust+pin a new
-        # host (AutoAddPolicy). A CHANGED key is rejected under BOTH (the loaded store raises
-        # BadHostKeyException before the missing-key policy is consulted). R12b.
-        if self.config.get("ssh_host_key_policy", "accept-new") == "strict":
-            client.set_missing_host_key_policy(paramiko.RejectPolicy())
-        else:
-            client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        return client
-
-    def _do_paramiko_transfer(
-        self,
-        source_path: str,
-        dest_path: str,
-        snapshot_name: str,
-        parent_path: Optional[str],
-        sudo_password: str,
-        show_progress: bool = False,
-    ) -> bool:
-        """Execute transfer using Paramiko for clean password handling.
-
-        Paramiko gives us direct control over stdin, allowing us to:
-        1. Connect with SSH password auth (collected via getpass)
-        2. Send sudo password + newline to sudo -S
-        3. Then stream btrfs data
-        Without any shell escaping issues.
-
-        Args:
-            source_path: Path to the source snapshot
-            dest_path: Destination path on remote
-            snapshot_name: Name of the snapshot being transferred
-            parent_path: Optional parent snapshot for incremental transfer
-            sudo_password: The sudo password to use
-            show_progress: Whether to show progress bars during transfer
-
-        Returns:
-            True if transfer succeeded, False otherwise
-        """
-
-        # Get username from config (from CLI --ssh-username or ssh://user@host URL)
-        ssh_user = self.config.get("username", "root")
-        ssh_port = self.config.get("port", 22) or 22
-
-        # Get SSH password - use cached password first, only prompt if not available
-        ssh_password_fallback = self.config.get("ssh_password_fallback", False)
-        ssh_password: Optional[str] = None
-        if ssh_password_fallback:
-            # First check if we already have the password cached (from _prepare or earlier)
-            ssh_password = self._get_ssh_password(prompt=False)
-            if not ssh_password:
-                # Also check if sudo_password is available (often same as SSH password)
-                ssh_password = self._cached_sudo_password or sudo_password
-            if not ssh_password:
-                # Last resort: prompt user
-                ssh_password = self._get_ssh_password(prompt=True)
-            if not ssh_password:
-                logger.error("SSH password required but not provided")
-                return False
-            # Cache it for future use
-            if hasattr(self, "ssh_manager"):
-                self.ssh_manager._cached_ssh_password = ssh_password
-
-        # Estimate snapshot size for progress display (None for incremental)
-        estimated_size = self._estimate_snapshot_size(source_path, parent_path)
-        is_incremental = parent_path and os.path.exists(parent_path)
-
-        # Auto-enable progress for full transfers (they can take a long time)
-        if not is_incremental and not show_progress:
-            show_progress = True
-            logger.debug("Auto-enabling progress for full transfer")
-
-        if estimated_size:
-            size_mb = estimated_size / (1024 * 1024)
-            logger.info(f"Estimated snapshot size: {size_mb:.1f} MiB")
-        elif is_incremental:
-            logger.info(
-                "Incremental transfer - size will be determined during transfer"
-            )
-
-        logger.info(f"Transferring {snapshot_name} to {self.hostname}:{dest_path}")
-        logger.info("Using Paramiko for secure password-based transfer")
-
-        # Build local btrfs send command. When compressing, the stream is piped
-        # through the compressor before it reaches the channel; the remote
-        # command above carries the matching decompressor.
-        send_cmd = ["sudo", "btrfs", "send"]
-        if is_incremental and parent_path is not None:
-            send_cmd.extend(["-p", parent_path])
-            logger.info(f"Using parent: {os.path.basename(parent_path)}")
-        send_cmd.append(source_path)
-
-        # Remote command with orphan protection
-        # sudo -S reads password from stdin, then receives btrfs stream.
-        # _build_receive_command escapes the destination itself; do not pre-quote.
-        compress_method = self._stream_compress_method()
-        remote_cmd = _build_receive_command(
-            dest_path,
-            use_sudo=True,
-            password_on_stdin=True,
-            decompress=compress_method,
-        )
-
-        # Ensure paramiko is available
-        if paramiko is None:
-            logger.error("Paramiko is not available for SSH transfer")
-            return False
-
-        # After the None check, paramiko is guaranteed to be available
-        assert paramiko is not None  # For type checker - we checked above
-        _paramiko = paramiko  # Local reference
-
-        client: Optional[Any] = None
-        send_proc: Optional[subprocess.Popen[bytes]] = None
-        compress_proc: Optional[subprocess.Popen[bytes]] = None
-
-        try:
-            # Connect via Paramiko using the pattern:
-            # 1. Get username (from CLI/URL - already in ssh_user)
-            # 2. Get password (via getpass - in ssh_password)
-            # 3. Connect with those credentials
-            # Host-key-verified client (loads the operator's known_hosts -> accept-new
-            # parity: a changed key is refused, a new host is trusted+pinned). R12/P1.
-            client = self._new_verified_paramiko_client()
-
-            connect_kwargs: Dict[str, Any] = {
-                "hostname": self.hostname,
-                "port": ssh_port,
-                "username": ssh_user,
-                "timeout": 30,
-            }
-
-            # Use password auth if we have an SSH password
-            if ssh_password:
-                connect_kwargs["password"] = ssh_password
-                connect_kwargs["allow_agent"] = False
-                connect_kwargs["look_for_keys"] = False
-                logger.debug(
-                    f"Connecting to {ssh_user}@{self.hostname}:{ssh_port} with password auth"
-                )
-            else:
-                # Fall back to key-based auth
-                ssh_identity_file = self.config.get("ssh_identity_file")
-                if ssh_identity_file and os.path.exists(ssh_identity_file):
-                    connect_kwargs["key_filename"] = ssh_identity_file
-                else:
-                    connect_kwargs["allow_agent"] = True
-                    connect_kwargs["look_for_keys"] = True
-                logger.debug(
-                    f"Connecting to {ssh_user}@{self.hostname}:{ssh_port} with key auth"
-                )
-
-            client.connect(**connect_kwargs)  # type: ignore[union-attr]
-            logger.debug("Paramiko SSH connection established")
-
-            # Open channel and execute remote command
-            transport = client.get_transport()  # type: ignore[union-attr]
-            if not transport:
-                logger.error("Failed to get SSH transport")
-                return False
-
-            channel = transport.open_session()
-            channel.exec_command(remote_cmd)
-
-            # Start local btrfs send process
-            send_proc = subprocess.Popen(
-                send_cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-            )
-
-            # Compress before the bytes reach the channel. The remote command
-            # built above already carries the matching decompressor, and this
-            # half was missing: the remote ran `zstd -dc` over a plain `btrfs
-            # send` stream, which fails with "unsupported format" and delivers
-            # nothing to `btrfs receive`. Every other strategy compresses; this
-            # one only claimed to in a comment.
-            stream = send_proc.stdout
-            if compress_method:
-                from ..core.transfer import COMPRESSION_PROGRAMS
-
-                logger.info(
-                    "Compressing the transfer with %s (decompressed on the "
-                    "remote before btrfs receive)",
-                    compress_method,
-                )
-                compress_proc = subprocess.Popen(
-                    COMPRESSION_PROGRAMS[compress_method]["compress"],
-                    stdin=send_proc.stdout,
-                    stdout=subprocess.PIPE,
-                    bufsize=0,
-                )
-                if send_proc.stdout:
-                    # Let btrfs send see SIGPIPE if the compressor dies.
-                    send_proc.stdout.close()
-                stream = compress_proc.stdout
-
-            # Send password first (sudo -S reads from stdin)
-            channel.sendall((sudo_password + "\n").encode())
-            logger.debug("Sent sudo password to remote")
-
-            # Give sudo a moment to process password
-            time.sleep(0.1)
-
-            bytes_sent = 0
-            start_time = time.time()
-            chunk_size = 65536
-
-            # Stream btrfs send output to remote, with optional progress bar
-            if show_progress:
-                from rich.progress import (
-                    BarColumn,
-                    DownloadColumn,
-                    Progress,
-                    TextColumn,
-                    TimeRemainingColumn,
-                    TransferSpeedColumn,
-                )
-
-                with Progress(
-                    TextColumn("[bold blue]{task.description}"),
-                    BarColumn(bar_width=40),
-                    "[progress.percentage]{task.percentage:>3.1f}%",
-                    DownloadColumn(),
-                    TransferSpeedColumn(),
-                    TimeRemainingColumn(),
-                    transient=False,
-                ) as progress:
-                    task = progress.add_task(
-                        f"Sending {snapshot_name}",
-                        total=estimated_size if estimated_size else None,
-                    )
-
-                    while True:
-                        if stream is None:
-                            break
-                        chunk = stream.read(chunk_size)
-                        if not chunk:
-                            break
-                        channel.sendall(chunk)
-                        bytes_sent += len(chunk)
-                        progress.update(task, advance=len(chunk))
-            else:
-                # No progress bar - just stream the data
-                while True:
-                    if stream is None:
-                        break
-                    chunk = stream.read(chunk_size)
-                    if not chunk:
-                        break
-                    channel.sendall(chunk)
-                    bytes_sent += len(chunk)
-
-            # Signal end of data
-            channel.shutdown_write()
-
-            # Wait for send process
-            send_proc.wait()
-            send_stderr = (
-                send_proc.stderr.read().decode(errors="replace")
-                if send_proc.stderr
-                else ""
-            )
-
-            if send_proc.returncode != 0:
-                logger.error(
-                    f"btrfs send failed (exit {send_proc.returncode}): {send_stderr}"
-                )
-                return False
-
-            # A compressor that died mid-stream truncates the backup, and the
-            # remote may still exit 0 on the prefix it managed to receive. Check
-            # it, or a partial snapshot passes for a complete one.
-            if compress_proc is not None:
-                compress_proc.wait()
-                if compress_proc.returncode != 0:
-                    logger.error(
-                        "Compressor %s failed (exit %s); the transfer is incomplete",
-                        compress_method,
-                        compress_proc.returncode,
-                    )
-                    return False
-
-            # Wait for remote command to complete
-            exit_status = channel.recv_exit_status()
-
-            # Get any remote output
-            remote_stdout = b""
-            remote_stderr = b""
-            while channel.recv_ready():
-                remote_stdout += channel.recv(4096)
-            while channel.recv_stderr_ready():
-                remote_stderr += channel.recv_stderr(4096)
-
-            # btrfs receive names the received subvolume after the source basename
-            # (== snapshot_name for native backups, "snapshot" for snapper).
-            received_name = Path(source_path).name
-
-            if exit_status != 0:
-                stderr_text = remote_stderr.decode(errors="replace")
-                logger.error(
-                    f"btrfs receive failed (exit {exit_status}): {stderr_text}"
-                )
-                self._cleanup_partial_subvolume(dest_path, received_name)
-                return False
-
-            elapsed = time.time() - start_time
-            rate = bytes_sent / elapsed if elapsed > 0 else 0
-            logger.info(
-                f"Transfer completed: {bytes_sent / (1024 * 1024):.1f} MiB in {elapsed:.1f}s "
-                f"({rate / (1024 * 1024):.1f} MiB/s)"
-            )
-
-            # Secondary confirmation only after send+receive both exited 0. Because
-            # receive succeeded here, a failed verification is treated as
-            # inconclusive: report failure but do NOT delete the received
-            # subvolume (it may be a good backup and only the verify step failed).
-            if self._verify_snapshot_exists(dest_path, received_name):
-                logger.info(f"Snapshot {received_name} verified on remote")
-                return True
-            else:
-                logger.error(
-                    "Transfer verification inconclusive - leaving received "
-                    "subvolume in place at %s for reconciliation",
-                    dest_path,
-                )
-                return False
-
-        except Exception as e:
-            # Handle paramiko-specific exceptions
-            if paramiko is not None:
-                # A changed host key -> refuse LOUDLY (this is the MITM signal the R12/P1
-                # fix exists to raise). Must precede the SSHException check (subclass).
-                if isinstance(e, paramiko.BadHostKeyException):
-                    logger.error(
-                        "SSH host key for %s does NOT match the pinned key in %s -- "
-                        "refusing to transfer (possible man-in-the-middle). If the host was "
-                        "legitimately rekeyed, remove its stale entry from that known_hosts "
-                        "file and retry.",
-                        self.hostname,
-                        self.ssh_manager.known_hosts_path,
-                    )
-                    return False
-                if isinstance(e, paramiko.AuthenticationException):
-                    logger.error(f"SSH authentication failed: {e}")
-                    return False
-                if isinstance(e, paramiko.SSHException):
-                    logger.error(f"SSH error: {e}")
-                    return False
-            logger.error(f"Transfer failed: {e}")
-            return False
-        finally:
-            if send_proc and send_proc.poll() is None:
-                send_proc.terminate()
-            if client:
-                client.close()
 
     def _do_shell_pipeline_transfer(
         self,
@@ -3537,8 +3136,8 @@ print(json.dumps(result))
         # _build_receive_command escapes the destination itself; do not pre-quote.
         # The extra shlex.quote below is for the LOCAL bash pipeline, not the remote.
         #
-        # This path is reached for password-based sudo too, whenever paramiko is
-        # not installed -- `_do_piped_transfer` sends it here as its fallback.
+        # This path is reached for password-based sudo too -- it is now the only
+        # implementation of it, the paramiko one having been removed.
         # It used to hardcode password_on_stdin=False, emitting `sudo -n` at a
         # remote that wants a password: sudo refused, the receive died, and the
         # operator saw `zstd: Broken pipe` from the local end of the pipeline
@@ -3553,8 +3152,7 @@ print(json.dumps(result))
         if needs_password and not sudo_password:
             logger.error(
                 "This remote's sudo requires a password and none is available. "
-                "Set BTRFS_BACKUP_SUDO_PASSWORD, install paramiko (which handles "
-                "the password prompt directly), or grant the remote user "
+                "Set BTRFS_BACKUP_SUDO_PASSWORD, or grant the remote user "
                 "passwordless sudo for /usr/bin/btrfs."
             )
             return False

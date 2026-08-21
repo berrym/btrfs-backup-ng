@@ -1348,7 +1348,7 @@ you can, and see the sudoers guidance below.
 
 Both halves are exercised on real hardware: a remote whose sudo genuinely
 demands a password backs up AND restores, over ssh:// with and without stream
-compression, through both the paramiko and shell-pipeline transfer strategies.
+compression, through the shell-pipeline transfer strategy.
 Restore in particular used to fail there -- the remote `btrfs send` was asked for
 a password that nothing supplied -- so a destination could be written to and
 never read back.

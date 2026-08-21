@@ -396,15 +396,16 @@ class TestEveryTransferStrategyIsCovered:
 
     `_try_direct_transfer` is taken only when sudo is passwordless (or absent).
     With ssh_sudo set and a password-based remote, the transfer diverts to
-    _try_sudo_cached_transfer -> _do_piped_transfer -> paramiko or shell
-    pipeline. Wiring only the first path is how an option comes to work on the
-    developer's machine and silently do nothing on a user's.
+    _try_sudo_cached_transfer -> _do_piped_transfer -> shell pipeline. Wiring
+    only the first path is how an option comes to work on the developer's
+    machine and silently do nothing on a user's.
     """
 
     def test_the_direct_strategy_really_launches_a_compressor(self):
         """Counting `decompress=` in the module source proved nothing: it stayed
-        green while the paramiko strategy sent plaintext to a decompressing
-        remote. Run the strategy and look at the processes it starts."""
+        green while a second strategy, since removed, sent plaintext to a
+        decompressing remote. Run the strategy and look at the processes it
+        starts."""
         captured = _captured_argv(euid=1000, compress="zstd")
         assert captured["compress"] is not None, (
             "the direct strategy told the remote to decompress but started no "
