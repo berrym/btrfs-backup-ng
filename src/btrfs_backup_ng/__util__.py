@@ -914,3 +914,56 @@ def exclusive_lock(lockfile: Path, *, timeout: float, subject: str) -> Any:
         yield
     finally:
         os.close(fd)  # releases the flock
+
+
+def process_io_bytes(pid: int) -> int | None:
+    """Bytes this process has read plus written, from ``/proc/<pid>/io``.
+
+    Used to tell a SLOW transfer from a STUCK one. A wall-clock limit cannot:
+    it fires on a healthy first sync of a large subvolume over a slow link, and
+    waits the full hour on a pipe that died in the first minute.
+
+    Returns None when the number cannot be had, which is not an error and must
+    not be treated as "no bytes moved":
+
+    * not Linux, or no procfs;
+    * the process has already exited;
+    * **the process belongs to another user.** The local ``btrfs send`` runs
+      under sudo, so its io file is root-owned and unreadable to us. The ssh
+      process is ours and readable, which is enough -- bytes leaving on the
+      socket is the same evidence.
+
+    Counting rchar+wchar rather than read_bytes/write_bytes deliberately: the
+    latter count actual block-device traffic, so a transfer served entirely from
+    page cache would look stalled while moving at full speed.
+    """
+    try:
+        with open(f"/proc/{pid}/io", encoding="ascii") as handle:
+            total = 0
+            found = False
+            for line in handle:
+                key, _, value = line.partition(":")
+                if key in ("rchar", "wchar"):
+                    total += int(value.strip())
+                    found = True
+            return total if found else None
+    except (OSError, ValueError):
+        return None
+
+
+def any_bytes_moved(pids: list[int]) -> int | None:
+    """Total io across ``pids``, ignoring the ones that cannot be read.
+
+    None means NOTHING in the set could be measured -- the caller must then
+    disable stall detection rather than conclude the transfer is stuck, and say
+    so, because silently degrading a safety check to a false positive would kill
+    healthy transfers.
+    """
+    total = 0
+    measured = False
+    for pid in pids:
+        value = process_io_bytes(pid)
+        if value is not None:
+            total += value
+            measured = True
+    return total if measured else None

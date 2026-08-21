@@ -60,6 +60,7 @@ from btrfs_backup_ng.core.retry import (  # noqa: E402
     RetryPolicy,
 )
 from btrfs_backup_ng.core.space import SpaceInfo  # noqa: E402
+from btrfs_backup_ng.core.transfer import DEFAULT_TRANSFER_TIMEOUT  # noqa: E402
 from btrfs_backup_ng.sshutil.master import SSHMasterManager  # noqa: E402
 
 from .common import Endpoint  # noqa: E402
@@ -226,6 +227,25 @@ def _build_receive_command(
     return f"exec sh -c {shlex.quote(script)}"
 
 
+#: How long a transfer may move NO bytes before it is treated as stuck.
+#:
+#: The default; `transfer_stall_timeout` in [global] overrides it, and 0 disables
+#: the check. An operator who hits a false positive needs a way out that is not
+#: "edit the source" -- the same reason the wall clock became configurable.
+#:
+#: A wall-clock limit cannot tell a slow transfer from a dead one: it kills a
+#: healthy first sync of a large subvolume over a slow link, and waits the full
+#: hour on a pipe that died in the first minute. Reported as #93, where an
+#: initial 36 GB transfer over 100 Mbit hit a one-hour cap that had nothing to do
+#: with how the transfer was actually doing.
+#:
+#: Generous on purpose. A transfer legitimately moves nothing while btrfs walks
+#: metadata on a large subvolume, and a congested link can pause for a long time
+#: without being broken. This is the "nothing has happened at all" line, not a
+#: performance target.
+STALL_TIMEOUT_SECONDS = 900
+
+
 class SSHEndpoint(Endpoint):
     """SSH-based endpoint for remote operations.
 
@@ -316,6 +336,7 @@ class SSHEndpoint(Endpoint):
             "ssh_auth_sock",
             "ssh_password_fallback",
             "ssh_host_key_policy",
+            "transfer_stall_timeout",
         ):
             if config.get(_ssh_key) is not None:
                 self.config[_ssh_key] = config[_ssh_key]
@@ -3376,7 +3397,7 @@ print(json.dumps(result))
         dest_path: str,
         snapshot_name: str,
         parent_path: Optional[str] = None,
-        max_wait_time: int = 3600,
+        max_wait_time: int = DEFAULT_TRANSFER_TIMEOUT,
         show_progress: bool = False,
         **kwargs: Any,
     ) -> bool:
@@ -3654,7 +3675,7 @@ print(json.dumps(result))
         snapshot: "__util__.Snapshot",
         parent: Optional["__util__.Snapshot"] = None,
         clones: Optional[List["__util__.Snapshot"]] = None,
-        timeout: int = 3600,
+        timeout: int = DEFAULT_TRANSFER_TIMEOUT,
         show_progress: bool = False,
         retry_policy: Optional[RetryPolicy] = None,
     ) -> bool:
@@ -3818,7 +3839,7 @@ print(json.dumps(result))
         chunk_reader: Any,
         manifest: Any,
         show_progress: bool = False,
-        timeout: int = 3600,
+        timeout: int = DEFAULT_TRANSFER_TIMEOUT,
     ) -> bool:
         """Receive a chunked transfer with verification.
 
@@ -3951,7 +3972,19 @@ print(json.dumps(result))
 
             # Wait for receive to complete
             try:
-                return_code = receive_process.wait(timeout=timeout)
+                # Poll rather than block, so the wait can also measure whether
+                # the transfer is actually moving.
+                from ..core.transfer import wait_with_progress
+
+                return_code = wait_with_progress(
+                    receive_process,
+                    stall_pids=[receive_process.pid],
+                    stall_timeout=int(
+                        self.config.get("transfer_stall_timeout", STALL_TIMEOUT_SECONDS)
+                    ),
+                    wall_timeout=timeout,
+                    description="ssh receive",
+                )
             except subprocess.TimeoutExpired:
                 logger.error("Timeout waiting for SSH receive to complete")
                 receive_process.kill()
@@ -4013,7 +4046,7 @@ print(json.dumps(result))
         start_time: float,
         dest_path: str,
         snapshot_name: str,
-        max_wait_time: int = 3600,
+        max_wait_time: int = DEFAULT_TRANSFER_TIMEOUT,
         received_name: Optional[str] = None,
     ) -> bool:
         """Enhanced transfer monitoring with real-time progress feedback.
@@ -4045,7 +4078,33 @@ print(json.dumps(result))
         status_interval = 5  # Status updates every 5 seconds
         verification_interval = 30  # Verify snapshot every 30 seconds
 
-        while time.time() - start_time < max_wait_time:
+        # Stall detection. The pids we can actually read are the ones running as
+        # us: the ssh process and the buffer. The local `btrfs send` runs under
+        # sudo, so its io file is root-owned and unreadable -- which is fine,
+        # because bytes leaving on the socket is the same evidence.
+        stall_pids = [
+            proc.pid
+            for proc in (send_process, receive_process, buffer_process)
+            if proc is not None
+        ]
+        stall_limit = int(
+            self.config.get("transfer_stall_timeout", STALL_TIMEOUT_SECONDS)
+        )
+        last_bytes = __util__.any_bytes_moved(stall_pids)
+        last_progress_time = start_time
+        stall_detection = stall_limit > 0 and last_bytes is not None
+        if not stall_detection:
+            # Never silently downgrade to "no bytes moved": that would read as a
+            # stall and kill a healthy transfer. Say the check is off instead.
+            logger.debug(
+                "Stall detection unavailable (no readable /proc/<pid>/io for this "
+                "transfer); falling back to the wall-clock limit alone."
+            )
+
+        # `max_wait_time <= 0` means NO wall clock, not "zero seconds allowed".
+        # Read the other way it makes every transfer fail instantly, which is
+        # exactly what happened the first time the default became unlimited.
+        while max_wait_time <= 0 or time.time() - start_time < max_wait_time:
             current_time = time.time()
             elapsed = current_time - start_time
 
@@ -4053,6 +4112,41 @@ print(json.dumps(result))
             send_alive = send_process.poll() is None
             receive_alive = receive_process.poll() is None
             buffer_alive = buffer_process.poll() is None if buffer_process else True
+
+            # Only judge a stall while the SEND is still running. Once it has
+            # finished, the remote is applying what it already received and no
+            # bytes move on this side -- which is completion, not a stall, and
+            # killing it there would destroy a transfer that was about to
+            # succeed. A remote wedged MID-receive still blocks the send, so
+            # that case is caught; only the tail is exempt, and the wall clock
+            # covers it.
+            if stall_detection and send_alive:
+                moved = __util__.any_bytes_moved(stall_pids)
+                if moved is None:
+                    # Everything we could read has exited; the exit-code checks
+                    # below decide the outcome, so stop asserting anything here.
+                    stall_detection = False
+                elif moved != last_bytes:
+                    last_bytes = moved
+                    last_progress_time = current_time
+                elif current_time - last_progress_time >= stall_limit:
+                    stalled_for = current_time - last_progress_time
+                    self._last_transfer_error = (
+                        f"the transfer moved no data for {stalled_for:.0f}s and was "
+                        f"terminated as stuck. This is btrfs-backup-ng's stall "
+                        f"limit, NOT an ssh timeout: the connection may have died "
+                        f"without closing, or the remote may be wedged. A slow "
+                        f"transfer that is still moving is never stopped by this."
+                    )
+                    logger.error("FAILED: %s", self._last_transfer_error)
+                    for proc in (send_process, receive_process, buffer_process):
+                        if proc is not None and proc.poll() is None:
+                            proc.terminate()
+                            try:
+                                proc.wait(timeout=5)
+                            except Exception:
+                                proc.kill()
+                    return False
 
             # Check for critical failures
             if not send_alive and send_process.returncode != 0:
@@ -4215,7 +4309,7 @@ print(json.dumps(result))
         start_time: float,
         dest_path: str,
         snapshot_name: str,
-        max_wait_time: int = 3600,
+        max_wait_time: int = DEFAULT_TRANSFER_TIMEOUT,
         received_name: Optional[str] = None,
     ) -> bool:
         """Simplified transfer monitoring with basic process tracking.
@@ -4251,8 +4345,23 @@ print(json.dumps(result))
 
         logger.debug("STATUS: Waiting for transfer processes to complete...")
 
+        # The same stall check the other monitor runs. Wiring only one of two
+        # monitors is how a guard comes to protect the setup it was developed
+        # against and nothing else -- this file already has a test class named
+        # for that failure.
+        stall_pids = [proc.pid for proc in processes_to_wait]
+        stall_limit = int(
+            self.config.get("transfer_stall_timeout", STALL_TIMEOUT_SECONDS)
+        )
+        last_bytes = __util__.any_bytes_moved(stall_pids)
+        last_progress_time = start_time
+        stall_detection = stall_limit > 0 and last_bytes is not None
+
         # Simple polling loop with timeout
-        while time.time() - start_time < max_wait_time:
+        # `max_wait_time <= 0` means NO wall clock, not "zero seconds allowed".
+        # Read the other way it makes every transfer fail instantly, which is
+        # exactly what happened the first time the default became unlimited.
+        while max_wait_time <= 0 or time.time() - start_time < max_wait_time:
             all_finished = True
 
             for proc in processes_to_wait:
@@ -4262,6 +4371,33 @@ print(json.dumps(result))
 
             if all_finished:
                 break
+
+            # Judged only while the SEND is alive: after it finishes the remote
+            # is applying what it already has, which is completion, not a stall.
+            if stall_detection and send_process.poll() is None:
+                now = time.time()
+                moved = __util__.any_bytes_moved(stall_pids)
+                if moved is None:
+                    stall_detection = False
+                elif moved != last_bytes:
+                    last_bytes = moved
+                    last_progress_time = now
+                elif now - last_progress_time >= stall_limit:
+                    self._last_transfer_error = (
+                        f"the transfer moved no data for {now - last_progress_time:.0f}s "
+                        f"and was terminated as stuck. This is btrfs-backup-ng's stall "
+                        f"limit, NOT an ssh timeout. A slow transfer that is still "
+                        f"moving is never stopped by this."
+                    )
+                    logger.error("FAILED: %s", self._last_transfer_error)
+                    for proc in processes_to_wait:
+                        if proc.poll() is None:
+                            proc.terminate()
+                            try:
+                                proc.wait(timeout=5)
+                            except Exception:
+                                proc.kill()
+                    return False
 
             # Log status every 30 seconds
             elapsed = time.time() - start_time

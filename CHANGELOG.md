@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Transfers are no longer limited by a wall clock at all, by default** — a
+  transfer that is moving data is succeeding, and ending it because a timer expired
+  confused operator policy with fault detection. Any fixed value is a guess about
+  link speed times dataset size; the old fixed one hour, in nine places, ended first
+  syncs that were working perfectly (36 GB over 100 Mbit is about 50 minutes at line
+  rate before overhead). `transfer_timeout` in `[global]` remains for operators who
+  need a real deadline, and defaults to unlimited. Reported by Michael J Gruber
+  (@mjg) (#93).
+- **Stall detection** — a transfer that stops moving data is now given up on within
+  minutes instead of waiting out the wall clock, and a transfer that is merely slow
+  is never stopped by it. Bytes are counted out-of-band from `/proc/<pid>/io`, so
+  nothing is routed through Python and the direct pipe stays direct. The local
+  `btrfs send` runs under sudo and its counters are unreadable to us; the ssh
+  process is ours, and bytes leaving on the socket is the same evidence. Where
+  nothing can be read the check disables itself rather than reporting a healthy
+  transfer as stuck. It applies only while the send is running, so the tail of a
+  transfer -- where the remote is still applying what it already received -- is
+  never mistaken for a stall. Tunable as `transfer_stall_timeout` in `[global]`;
+  0 disables it.
+
 ### Changed
 
 - **`paramiko` is no longer a dependency** — it was a second implementation of one

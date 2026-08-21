@@ -281,6 +281,17 @@ class GlobalConfig:
         transaction_log: Path to JSON transaction log for auditing
         retention: Default retention policy
         notifications: Notification settings (email, webhook)
+        transfer_timeout: Wall-clock limit on a single transfer, in seconds.
+            UNLIMITED by default, because a transfer that is moving data is
+            succeeding and ending it on a clock confuses operator policy with
+            fault detection. Faults are caught by transfer_stall_timeout, which
+            measures bytes. Set this only as an operational constraint -- "must
+            finish before the working day". The old fixed 3600 ended first syncs
+            that were working perfectly (#93).
+        transfer_stall_timeout: Seconds a transfer may move NO data before it is
+            treated as stuck (default 900). Judged only while the send is running,
+            so the tail of a transfer -- where the remote is still applying what it
+            already received -- is never mistaken for a stall. Set 0 to disable.
         parallel_volumes: Max concurrent volume backups
         parallel_targets: Max concurrent target transfers per volume
         quiet: Suppress non-essential output
@@ -294,6 +305,8 @@ class GlobalConfig:
     transaction_log: Optional[str] = None
     retention: RetentionConfig = field(default_factory=RetentionConfig)
     notifications: NotificationConfig = field(default_factory=NotificationConfig)
+    transfer_timeout: int = 0
+    transfer_stall_timeout: int = 900
     parallel_volumes: int = 2
     parallel_targets: int = 3
     quiet: bool = False

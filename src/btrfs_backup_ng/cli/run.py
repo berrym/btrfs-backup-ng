@@ -20,7 +20,7 @@ from ..config import (
     find_config_file,
     load_config,
 )
-from ..core.operations import sync_snapshots
+from ..core.operations import DEFAULT_TRANSFER_TIMEOUT, sync_snapshots
 from ..notifications import (
     EmailConfig,
     WebhookConfig,
@@ -498,6 +498,10 @@ def _backup_volume(
 
             thread_raw_encryption(dest_kwargs, target)
             thread_raw_compression(dest_kwargs, target, compress_override)
+            # Global, so threaded here rather than by the per-target helper.
+            dest_kwargs["transfer_stall_timeout"] = (
+                config.global_config.transfer_stall_timeout
+            )
             dest_endpoint = endpoint.choose_endpoint(
                 target.path,
                 dest_kwargs,
@@ -539,6 +543,7 @@ def _backup_volume(
                     rate_limit_override,
                     show_progress,
                     space_options,
+                    config.global_config.transfer_timeout,
                 ): (dest_endpoint, target_config)
                 for dest_endpoint, target_config in destination_endpoints
             }
@@ -571,6 +576,7 @@ def _backup_volume(
                     rate_limit_override,
                     show_progress,
                     space_options,
+                    config.global_config.transfer_timeout,
                 )
                 if success:
                     stats["completed"] += 1
@@ -750,6 +756,9 @@ def _backup_snapper_volume(
                 "compress": compress_override or target.compress or default_compress,
                 "rate_limit": rate_limit_override or target.rate_limit,
                 "show_progress": show_progress,
+                # Threaded rather than left to the default: the point of making it
+                # configurable is that an install with a slow link can raise it.
+                "transfer_timeout": config.global_config.transfer_timeout,
                 # Space-check flags so --no-check-space/--force actually apply.
                 **(space_options or {}),
             }
@@ -761,6 +770,12 @@ def _backup_snapper_volume(
                 "snap_prefix": "",
                 "timestamp_format": get_timestamp_format(config),
             }
+            # A global setting, so it is threaded here rather than by the
+            # per-target helper. Without this the key loads, validates and does
+            # nothing -- the shape of defect this project keeps finding.
+            snapper_endpoint_config["transfer_stall_timeout"] = (
+                config.global_config.transfer_stall_timeout
+            )
             thread_ssh_target_config(snapper_endpoint_config, target)
             thread_raw_encryption(snapper_endpoint_config, target)
             thread_raw_compression(snapper_endpoint_config, target, compress_override)
@@ -895,6 +910,7 @@ def _transfer_to_target(
     rate_limit_override: str | None = None,
     show_progress: bool = False,
     space_options: dict[str, Any] | None = None,
+    transfer_timeout: int = DEFAULT_TRANSFER_TIMEOUT,
 ) -> bool:
     """Transfer snapshot to a single target.
 
@@ -920,6 +936,7 @@ def _transfer_to_target(
             "rate_limit": rate_limit_override or target_config.rate_limit,
             "ssh_sudo": target_config.ssh_sudo,
             "show_progress": show_progress,
+            "transfer_timeout": transfer_timeout,
             # Space-check flags (--no-check-space/--force/--safety-margin) so the
             # destination space preflight can actually be bypassed when requested.
             **(space_options or {}),

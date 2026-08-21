@@ -6,8 +6,10 @@ Provides stream processing for btrfs send/receive pipelines.
 import logging
 import shutil
 import subprocess
-from typing import Optional, TypedDict
+import time
+from typing import Any, Optional, TypedDict
 
+from .. import __util__
 from .compression import COMPRESSION_METHODS
 
 logger = logging.getLogger(__name__)
@@ -35,6 +37,34 @@ COMPRESSION_PROGRAMS: dict[str, CompressionConfig] = {
     }
     for name, entry in COMPRESSION_METHODS.items()
 }
+
+
+#: Wall-clock limit on a transfer. UNLIMITED by default.
+#:
+#: A transfer that is moving data is succeeding, slowly; ending it because a
+#: clock expired confuses operator policy with fault detection. Faults are
+#: detected by measuring bytes (see ``wait_with_progress``), which is the real
+#: signal, so the clock is not needed to keep a broken transfer from hanging.
+#:
+#: Setting `transfer_timeout` in [global] is therefore an operational constraint
+#: -- "this must finish before the working day" -- and not a health check. It was
+#: a fixed 3600 in nine places, which ended first syncs that were working
+#: perfectly: 36 GB over 100 Mbit is about 50 minutes at line rate before any
+#: overhead (#93).
+DEFAULT_TRANSFER_TIMEOUT = 0
+
+#: Seconds a transfer may move NO data before it is treated as stuck. This is the
+#: fault detector -- the thing the wall clock used to stand in for badly.
+DEFAULT_STALL_TIMEOUT = 900
+
+#: Applied ONLY when byte progress cannot be sampled at all -- no readable
+#: /proc/<pid>/io for anything in the pipeline, or the stall check switched off.
+#:
+#: Guard by measurement where we can, by clock where we cannot. Without this an
+#: unmeasurable transfer would have no guard whatsoever, which is worse than an
+#: arbitrary one. It is deliberately generous, and its use is logged so the
+#: operator knows which regime is in force.
+UNMEASURABLE_FALLBACK_TIMEOUT = 86400
 
 
 def check_compression_available(method: str) -> bool:
@@ -381,7 +411,9 @@ def cleanup_pipeline(processes: list) -> None:
                 pass
 
 
-def wait_for_pipeline(processes: list, timeout: int = 3600) -> list[int]:
+def wait_for_pipeline(
+    processes: list, timeout: int = DEFAULT_TRANSFER_TIMEOUT
+) -> list[int]:
     """Wait for all pipeline processes to complete.
 
     Args:
@@ -420,3 +452,81 @@ def get_available_compression_methods() -> list[str]:
         if check_compression_available(method):
             available.append(method)
     return available
+
+
+def wait_with_progress(
+    process: Any,
+    *,
+    stall_pids: list[int],
+    stall_timeout: int,
+    wall_timeout: int = DEFAULT_TRANSFER_TIMEOUT,
+    poll_interval: float = 0.5,
+    description: str = "transfer",
+) -> int:
+    """Wait for ``process``, giving up only when it stops making progress.
+
+    Replaces ``process.wait(timeout=N)``, which blocks in the kernel and so
+    cannot tell a working transfer from a dead one -- it can only count seconds.
+    This polls, so the same loop that waits can also measure, and raises
+    ``subprocess.TimeoutExpired`` exactly as ``wait`` would, leaving every
+    caller's error handling unchanged.
+
+    Three regimes, in order of preference:
+
+    1. **Bytes are readable.** The transfer is given up on when nothing has moved
+       for ``stall_timeout``. Elapsed time is not consulted; a slow transfer runs
+       to completion.
+    2. **A wall limit was configured.** Enforced as well, because an operator who
+       asks for a deadline is expressing policy, not a health check.
+    3. **Nothing is measurable** -- no readable /proc/<pid>/io and no configured
+       limit. A generous fallback applies so an unmonitorable process cannot hang
+       forever, and it is logged, because degrading silently to "no guard" is how
+       a backup wedges a scheduler at 3am.
+    """
+    start = time.monotonic()
+    last_bytes = __util__.any_bytes_moved(stall_pids)
+    measurable = stall_timeout > 0 and last_bytes is not None
+    last_progress = start
+
+    effective_wall = wall_timeout
+    if not measurable and wall_timeout <= 0:
+        effective_wall = UNMEASURABLE_FALLBACK_TIMEOUT
+        logger.warning(
+            "Cannot measure byte progress for this %s, so it is guarded by a "
+            "%ds limit instead of by whether it is actually moving. A slow "
+            "transfer may be ended by it.",
+            description,
+            effective_wall,
+        )
+
+    while True:
+        # `wait`, not `poll`, so the return value and its semantics are exactly
+        # what a plain process.wait(timeout=N) would have produced -- this is a
+        # drop-in for the blocking call it replaces, and callers (and their
+        # test doubles) see no difference. The short timeout is what turns the
+        # blocking wait into a loop that can also measure.
+        try:
+            return process.wait(timeout=poll_interval)
+        except subprocess.TimeoutExpired:
+            pass
+
+        now = time.monotonic()
+
+        if measurable:
+            moved = __util__.any_bytes_moved(stall_pids)
+            if moved is None:
+                measurable = False
+                if wall_timeout <= 0:
+                    effective_wall = UNMEASURABLE_FALLBACK_TIMEOUT
+            elif moved != last_bytes:
+                last_bytes = moved
+                last_progress = now
+            elif now - last_progress >= stall_timeout:
+                raise subprocess.TimeoutExpired(
+                    cmd=description, timeout=float(stall_timeout)
+                )
+
+        if effective_wall > 0 and now - start >= effective_wall:
+            raise subprocess.TimeoutExpired(
+                cmd=description, timeout=float(effective_wall)
+            )
