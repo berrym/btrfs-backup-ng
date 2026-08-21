@@ -199,7 +199,7 @@ LOCK_FILENAME = ".btrfs-backup-ng.lock"
 def _open_failure_reason(e: OSError) -> str:
     """See ``__util__.open_failure_reason`` -- kept as a local name for the
     call sites here (the checksum open as well as the lock open)."""
-    return __util__.open_failure_reason(e)  # type: ignore[attr-defined]
+    return __util__.open_failure_reason(e)
 
 
 _ELEVATION_SENTINEL = "__BBNG_ELEVATED__"
@@ -675,7 +675,7 @@ class RawEndpoint(Endpoint):
             timeout = float(self.config.get("lock_timeout", 30.0))
         path = Path(self.config["path"])
         path.mkdir(parents=True, exist_ok=True, mode=0o700)
-        with __util__.exclusive_lock(  # type: ignore[attr-defined]
+        with __util__.exclusive_lock(
             path / LOCK_FILENAME,
             timeout=timeout,
             subject=f"raw target {path}",
