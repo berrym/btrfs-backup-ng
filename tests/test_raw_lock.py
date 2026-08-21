@@ -183,12 +183,33 @@ def test_lock_file_is_not_a_snapshot(tmp_path):
     assert ep.streams_without_sidecar() == []
 
 
-def test_ssh_target_lock_is_noop(tmp_path):
-    """raw+ssh locking is deferred: target_lock is a no-op that never blocks."""
+def test_ssh_target_lock_actually_excludes(tmp_path, monkeypatch):
+    """raw+ssh target_lock is a real lock on the target, not a no-op.
+
+    It used to be a no-op -- two concurrent prunes of the same remote target
+    could interleave, and a prune could delete what a restore was reading. The
+    lock now lives on the target itself, so a second holder is refused.
+
+    This drives the real POSIX protocol (mkdir/stat/mv) against a sandbox rather
+    than mocking its replies, so it fails if the protocol stops excluding.
+    """
+    from .lockshell import lock_aware
+
+    def unexpected(cmd, *a, **k):
+        raise AssertionError(f"unexpected remote command: {cmd}")
+
     ep = SSHRawEndpoint(config={"path": "/backup", "hostname": "nas"})
+    monkeypatch.setattr(raw_mod.subprocess, "run", lock_aware(unexpected, tmp_path))
+
+    other = SSHRawEndpoint(config={"path": "/backup", "hostname": "nas"})
     with ep.target_lock():
-        with ep.target_lock(timeout=0.1):  # no conflict, no RuntimeError
-            pass
+        with pytest.raises(RuntimeError, match="busy"):
+            with other.target_lock(timeout=0.1):
+                pass
+
+    # Released cleanly, so the next contender gets it.
+    with other.target_lock(timeout=0.1):
+        pass
 
 
 def _busy_lock(self, **kw):
@@ -283,7 +304,7 @@ def test_prune_takes_lock_once_for_whole_pass(tmp_path, monkeypatch):
     assert len(ep.list_snapshots(flush_cache=True)) == 1
 
 
-def test_ssh_prune_issues_remote_rm(monkeypatch):
+def test_ssh_prune_issues_remote_rm(monkeypatch, tmp_path):
     """delete_old_snapshots must prune a raw+ssh target via a remote rm. The atomic-
     prune refactor routes deletion through _delete_snapshots_locked, so SSHRawEndpoint
     overrides THAT (not delete_snapshots); otherwise remote retention silently deletes
@@ -312,7 +333,9 @@ def test_ssh_prune_issues_remote_rm(monkeypatch):
 
         return _R()
 
-    monkeypatch.setattr(raw_mod.subprocess, "run", fake_run)
+    from .lockshell import lock_aware
+
+    monkeypatch.setattr(raw_mod.subprocess, "run", lock_aware(fake_run, tmp_path))
     ep.delete_old_snapshots(keep=1)  # prune the 2 oldest remotely
     assert len(rm_targets) == 2
     assert all("root.20240103" not in t for t in rm_targets)  # newest kept

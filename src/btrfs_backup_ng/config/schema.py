@@ -132,6 +132,12 @@ class TargetConfig:
         ssh_auth_sock: Explicit ssh-agent socket path (overrides auto-discovery; useful
             under sudo where SSH_AUTH_SOCK is stripped and the key is passphrase-protected)
         ssh_password_auth: Allow password authentication fallback
+        skip_remote_lock: Proceed even when a lock cannot be recorded on this
+            target. For a destination that can be read but not written, where no
+            lock can be taken and none is needed because nothing running as this
+            account will delete from it either. It relaxes only that failure --
+            locks are still READ, so nothing reports the target as unlocked
+            without having looked.
         compress: Compression algorithm for transfers (none, gzip, zstd, lz4)
         rate_limit: Bandwidth limit for transfers (e.g., "10M", "1G", "500K")
         require_mount: Require path to be an active mount point (safety check for external drives)
@@ -147,6 +153,7 @@ class TargetConfig:
     ssh_key: Optional[str] = None
     ssh_auth_sock: Optional[str] = None
     ssh_password_auth: bool = True
+    skip_remote_lock: bool = False
     # Host-key verification policy: "accept-new" (default; trust-on-first-use, reject a
     # changed key) or "strict" (known_hosts-only, reject an unknown host). R12b.
     ssh_host_key_policy: str = "accept-new"

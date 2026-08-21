@@ -170,6 +170,31 @@ def add_ssh_hostkey_arg(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def add_remote_lock_arg(parser: argparse.ArgumentParser) -> None:
+    """Add ``--skip-remote-lock`` to a parser that touches a remote target.
+
+    Locking is the default and a target that cannot record a lock stops the
+    operation, because continuing would run it unprotected while a prune
+    elsewhere is free to delete what is being read.
+
+    That default is wrong for one real setup: a destination the operator can
+    read but not write, where no lock can be recorded and none is needed
+    because nothing here will be deleting either. This flag is how that
+    operator says so explicitly. It is deliberately not a config-file default
+    for a whole site -- the risk is per-run and should be visible in the
+    command that takes it.
+
+    ``default=None`` so an unset flag never overrides a target's own setting.
+    """
+    parser.add_argument(
+        "--skip-remote-lock",
+        action="store_true",
+        default=None,
+        help="Proceed even if a lock cannot be recorded on the remote target. "
+        "Only safe when nothing else can prune this target during the run.",
+    )
+
+
 def get_fs_checks_mode(args: argparse.Namespace) -> str:
     """Get the filesystem checks mode from parsed arguments.
 
@@ -268,6 +293,7 @@ def thread_ssh_target_config(kwargs: dict, target) -> None:
     """
     kwargs["port"] = getattr(target, "ssh_port", 22)
     kwargs["ssh_sudo"] = getattr(target, "ssh_sudo", False)
+    kwargs["skip_remote_lock"] = getattr(target, "skip_remote_lock", False)
     kwargs["ssh_host_key_policy"] = getattr(target, "ssh_host_key_policy", "accept-new")
     kwargs["ssh_password_fallback"] = getattr(target, "ssh_password_auth", True)
     ssh_key = getattr(target, "ssh_key", None)

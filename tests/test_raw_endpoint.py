@@ -1085,8 +1085,12 @@ class TestSSHRawEndpointMethods:
         call_args = mock_run.call_args[0][0]
         assert "rm -f" in call_args[-1]
 
-    def test_delete_snapshots_failure(self):
+    def test_delete_snapshots_failure(self, tmp_path):
         """Test handling delete failure on remote."""
+        import subprocess
+
+        from .lockshell import lock_aware
+
         endpoint = SSHRawEndpoint(
             config={
                 "path": "/backup",
@@ -1098,17 +1102,17 @@ class TestSSHRawEndpointMethods:
             stream_path=Path("/backup/test.btrfs"),
         )
 
-        with patch("subprocess.run") as mock_run:
-            import subprocess
+        def refuse(cmd, *a, **k):
+            raise subprocess.CalledProcessError(1, "ssh", stderr=b"Permission denied")
 
-            mock_run.side_effect = subprocess.CalledProcessError(
-                1, "ssh", stderr=b"Permission denied"
-            )
+        with patch("subprocess.run", lock_aware(refuse, tmp_path)):
             # Should not raise, just log error
             endpoint.delete_snapshots([snapshot])
 
-    def test_delete_updates_cache(self):
+    def test_delete_updates_cache(self, tmp_path):
         """Test that remote delete updates cache."""
+        from .lockshell import lock_aware
+
         endpoint = SSHRawEndpoint(
             config={
                 "path": "/backup",
@@ -1121,8 +1125,10 @@ class TestSSHRawEndpointMethods:
         )
         endpoint._cached_snapshots = [snapshot]
 
-        with patch("subprocess.run") as mock_run:
-            mock_run.return_value = MagicMock(returncode=0)
+        def ok(cmd, *a, **k):
+            return MagicMock(returncode=0, stdout=b"", stderr=b"")
+
+        with patch("subprocess.run", lock_aware(ok, tmp_path)):
             endpoint.delete_snapshots([snapshot])
 
         assert len(endpoint._cached_snapshots) == 0

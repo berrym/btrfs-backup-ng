@@ -513,6 +513,7 @@ def _configured_target_options(args: argparse.Namespace, source: str) -> dict:
                 "ssh_auth_sock",
                 "ssh_host_key_policy",
                 "ssh_password_auth",
+                "skip_remote_lock",
                 "gpg_keyring",
                 "openssl_cipher",
             ):
@@ -592,6 +593,12 @@ def _prepare_backup_endpoint(args: argparse.Namespace, source: str):
         )
         if _hkp:
             endpoint_kwargs["ssh_host_key_policy"] = _hkp
+        # --skip-remote-lock is per-run and the flag wins; a target may also
+        # carry it for a destination that can never be written.
+        if getattr(args, "skip_remote_lock", None) or configured.get(
+            "skip_remote_lock"
+        ):
+            endpoint_kwargs["skip_remote_lock"] = True
         # There is no --ssh-password-auth flag, so the args lookup is a constant
         # True unless a caller sets the attribute directly; reading only it meant
         # a configured `ssh_password_auth = false` had no effect on a restore at
@@ -824,16 +831,21 @@ def _execute_status(args: argparse.Namespace) -> int:
     print("=" * 60)
     print()
 
-    # Endpoints whose set_lock is in-memory only never write a lock file, so
-    # there is nothing here to inspect. Reporting "no active locks" would be
-    # technically true and actively misleading: it reads as "we looked, and the
-    # target is clean" when nothing was ever recorded to look at.
+    # Endpoints whose set_lock is in-memory only never record a lock, so there is
+    # nothing here to inspect. Reporting "no active locks" would be technically
+    # true and actively misleading: it reads as "we looked, and the target is
+    # clean" when nothing was ever recorded to look at. Remote endpoints do
+    # record locks now and implement _read_locks against them, so they take the
+    # ordinary path below rather than this one.
     if not backup_endpoint.persists_locks:
         print("This target does not persist locks.")
         print()
-        print("Locks on ssh://, raw:// and raw+ssh:// targets are held in memory for")
-        print("the duration of a single run, so no lock file is written. An")
-        print("interrupted run leaves nothing behind here to inspect or unlock.")
+        print("Locks on a local raw:// target are held in memory for the duration of")
+        print("a single run, so nothing is written here. An interrupted run leaves")
+        print("nothing behind to inspect or unlock.")
+        print()
+        print("ssh:// and raw+ssh:// targets DO persist locks, on the target itself,")
+        print("and report them here.")
         return 0
 
     # Read through the endpoint rather than rebuilding the path here. The
@@ -939,9 +951,8 @@ def _execute_unlock(args: argparse.Namespace, lock_id: str) -> int:
     if not backup_endpoint.persists_locks:
         print("This target does not persist locks, so there is nothing to unlock.")
         print()
-        print("Locks on ssh://, raw:// and raw+ssh:// targets are held in memory for")
-        print("the duration of a single run, so no lock file is written. An")
-        print("interrupted run leaves nothing behind here to inspect or unlock.")
+        print("Locks on a local raw:// target are held in memory for the duration of")
+        print("a single run, so an interrupted run leaves nothing behind to clear.")
         return 0
 
     # Same endpoint API as --status, for the same reason.

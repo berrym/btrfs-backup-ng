@@ -17,7 +17,10 @@ from __future__ import annotations
 import subprocess
 from unittest.mock import MagicMock
 
+import pytest
+
 import btrfs_backup_ng.endpoint.ssh as ssh_mod
+from btrfs_backup_ng import __util__
 from btrfs_backup_ng.endpoint.ssh import SSHEndpoint
 
 
@@ -95,19 +98,45 @@ def test_send_quotes_remote_path(monkeypatch):
     assert "'/backup/weird name;rm -rf'" in remote
 
 
-def test_set_lock_is_in_memory_only_and_never_writes(tmp_path):
-    """SSHEndpoint.set_lock must only mutate the in-memory lock set -- no local lock file
-    (its path is on the remote). Mutation guard: falling back to the base set_lock would
-    try to write a lock file and (for a remote path) raise."""
+def test_set_lock_writes_no_local_lock_file(tmp_path):
+    """SSHEndpoint.set_lock must never write a LOCAL lock file: its path is on the
+    remote. Falling back to the base set_lock would try to write one and (for a
+    remote path) raise, which aborted a restore FROM an ssh:// source.
+
+    The lock is recorded on the remote target instead -- driven here through a
+    manager whose shell runs on this machine, since there is no remote host in a
+    unit test. tests/test_remote_locks.py covers the protocol itself.
+    """
+    from tests.test_remote_locks import _manager
+
     ep = SSHEndpoint(hostname="backup-host", config={"path": str(tmp_path)})
+    ep._build_lock_manager = lambda: _manager(tmp_path)
     snap = MagicMock()
     snap.locks = set()
     snap.parent_locks = set()
+    snap.get_name.return_value = "root.20240115T120000"
+
     ep.set_lock(snap, "restore:abc", True)
     assert snap.locks == {"restore:abc"}
     ep.set_lock(snap, "xfer:1", True, parent=True)
     assert snap.parent_locks == {"xfer:1"}
     ep.set_lock(snap, "restore:abc", False)
     assert snap.locks == set()
-    # No lock file was written next to the (here local-stand-in) path.
-    assert not (tmp_path / ".btrfs-backup-ng.locks").exists()
+
+    # Recorded on the target, never as a local lock FILE at the endpoint path.
+    assert not (tmp_path / ".btrfs-backup-ng.locks").is_file()
+
+
+def test_set_lock_refuses_to_continue_when_it_cannot_record(tmp_path):
+    """Mutation guard for the whole point of the change.
+
+    If set_lock goes back to mutating memory and warning, this passes silently
+    and a prune elsewhere is free to delete the snapshot being restored.
+    """
+    ep = SSHEndpoint(hostname="nas.invalid", config={"path": "/backup"})
+    snap = MagicMock()
+    snap.locks = set()
+    snap.parent_locks = set()
+    snap.get_name.return_value = "root.20240115T120000"
+    with pytest.raises(__util__.AbortError, match="Refusing to continue unprotected"):
+        ep.set_lock(snap, "restore:abc", True)

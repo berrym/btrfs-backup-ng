@@ -13,6 +13,7 @@ from ..__logger__ import logger
 from .common import (
     add_fs_checks_args,
     add_progress_args,
+    add_remote_lock_arg,
     add_ssh_hostkey_arg,
     add_verbosity_args,
 )
@@ -770,6 +771,7 @@ Config-driven restore:
     )
     add_fs_checks_args(restore_parser)
     add_ssh_hostkey_arg(restore_parser)
+    add_remote_lock_arg(restore_parser)
 
     # Config-driven restore options
     config_group = restore_parser.add_argument_group(
@@ -932,6 +934,7 @@ Examples:
     )
     add_fs_checks_args(verify_parser)
     add_ssh_hostkey_arg(verify_parser)
+    add_remote_lock_arg(verify_parser)
     verify_parser.add_argument(
         "--json",
         action="store_true",
@@ -1085,6 +1088,7 @@ Examples:
     )
     add_fs_checks_args(estimate_parser)
     add_ssh_hostkey_arg(estimate_parser)
+    add_remote_lock_arg(estimate_parser)
     estimate_parser.add_argument(
         "--json",
         action="store_true",
@@ -1430,6 +1434,7 @@ Examples:
         help="Explicit ssh-agent socket (overrides auto-discovery; useful under sudo)",
     )
     add_ssh_hostkey_arg(snapper_backup)
+    add_remote_lock_arg(snapper_backup)
     snapper_backup.add_argument(
         "--compress",
         metavar="METHOD",
@@ -1582,6 +1587,7 @@ Examples:
         "does not record one (modern sidecars are authoritative)",
     )
     add_ssh_hostkey_arg(snapper_restore)
+    add_remote_lock_arg(snapper_restore)
     snapper_restore.add_argument(
         "-l",
         "--list",

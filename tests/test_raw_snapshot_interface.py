@@ -104,24 +104,37 @@ def test_find_parent_picks_most_recent_older():
     assert c.find_parent([]) is None
 
 
-def test_set_lock_is_in_memory_only_and_never_raises(tmp_path):
+def test_set_lock_on_a_local_raw_target_stays_in_memory(tmp_path):
     """Restore locks/unlocks the backup snapshot. The raw override must mutate
     only the in-memory lock set -- no `source` requirement, no local lock-file
     write (which would fail for a remote raw+ssh target and abort the restore).
-    Persisting locks across runs is deferred (R3)."""
-    for ep in (
-        RawEndpoint(config={"path": str(tmp_path)}),
-        SSHRawEndpoint(config={"path": "/remote/backup", "hostname": "nas"}),
-    ):
-        snap = _raw("root.20240115", 15)
+
+    A LOCAL raw target still keeps its locks in memory for the run. raw+ssh no
+    longer does; see tests/test_remote_locks.py."""
+    ep = RawEndpoint(config={"path": str(tmp_path)})
+    snap = _raw("root.20240115", 15)
+    ep.set_lock(snap, "restore:abc", True)
+    assert snap.locks == {"restore:abc"}
+    ep.set_lock(snap, "restore:abc", False)
+    assert snap.locks == set()
+    ep.set_lock(snap, "xfer:1", True, parent=True)
+    assert snap.parent_locks == {"xfer:1"}
+    # No lock file was written next to a local raw target.
+    assert not (tmp_path / ".btrfs-backup-ng.locks").exists()
+
+
+def test_set_lock_on_a_raw_ssh_target_refuses_to_pretend(tmp_path):
+    """A raw+ssh lock that cannot be recorded must stop, not warn.
+
+    It used to mutate the in-memory set and continue. The restore then ran with
+    no protection at all while a prune on that target saw nothing holding the
+    stream -- which is what made a pruned-mid-restore possible in the first
+    place. An unreachable host is the easiest way to reach that state.
+    """
+    ep = SSHRawEndpoint(config={"path": "/remote/backup", "hostname": "nas.invalid"})
+    snap = _raw("root.20240115", 15)
+    with pytest.raises(__util__.AbortError, match="Refusing to continue unprotected"):
         ep.set_lock(snap, "restore:abc", True)
-        assert snap.locks == {"restore:abc"}
-        ep.set_lock(snap, "restore:abc", False)
-        assert snap.locks == set()
-        ep.set_lock(snap, "xfer:1", True, parent=True)
-        assert snap.parent_locks == {"xfer:1"}
-        # No lock file was written next to a local raw target.
-        assert not (tmp_path / ".btrfs-backup-ng.locks").exists()
 
 
 def test_list_snapshots_threads_endpoint_locally(tmp_path):
