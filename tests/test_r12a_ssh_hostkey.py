@@ -10,7 +10,7 @@
 - P4: UserKnownHostsFile points at the OPERATOR's known_hosts (even under sudo), so accept-new
   verifies/pins against the operator's curated trust, not root's empty store.
 
-The changed-key -> refused behaviour itself is paramiko's guarantee once the store is loaded,
+The changed-key -> refused behaviour itself is OpenSSH's guarantee once the store is loaded,
 and is validated end-to-end on real hardware; here the enforcement guard is that the store IS
 loaded (revert the load -> fail-open returns -> the wiring test fails).
 """

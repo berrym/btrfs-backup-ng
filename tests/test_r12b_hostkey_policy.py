@@ -1,12 +1,10 @@
 """R12b -- configurable ssh_host_key_policy (accept-new | strict) across all transports.
 
 Covers: config validation (fail-closed on invalid), and that each of the three transports
-(subprocess master, paramiko, raw+ssh) emits the correct policy for each setting. The
-paramiko test also guards the endpoint config-restore whitelist (drop the key there ->
+(subprocess master, ssh:// endpoint, raw+ssh) emits the correct policy for each
+setting. The endpoint test also guards the config whitelist (drop the key there ->
 strict silently degrades -> the test fails).
 """
-
-from unittest.mock import MagicMock
 
 import pytest
 
@@ -59,21 +57,49 @@ def test_master_accept_new_emits_accept_new():
     assert "StrictHostKeyChecking=yes" not in cmd
 
 
-# ------------------------------------ paramiko transport (ssh.py) + config whitelist
+# ------------------------------------ ssh:// endpoint + config whitelist
 
 
-def _paramiko_policy_used(policy, monkeypatch):
+def _endpoint_policy_cmd(policy):
+    """Build a real ssh:// endpoint through choose_endpoint and return the ssh
+    options its master manager would use.
+
+    This goes through the endpoint's config whitelist, which the tests above do
+    not: they construct SSHMasterManager directly. Dropping ssh_host_key_policy
+    from that whitelist makes `strict` degrade to accept-new in silence -- a
+    weakened MITM mitigation with nothing to announce it. The paramiko test used
+    to be what caught that; it went with the transport, so the guard is restored
+    here against the path that remains.
+    """
     from btrfs_backup_ng.endpoint import choose_endpoint
-    import btrfs_backup_ng.endpoint.ssh as ssh_mod
 
     cfg = {"path": "ssh://u@h/p", "snap_prefix": ""}
     if policy is not None:
         cfg["ssh_host_key_policy"] = policy
-    ep = choose_endpoint("ssh://u@h/p", cfg)
-    fake = MagicMock()
-    monkeypatch.setattr(ssh_mod, "paramiko", fake)
-    ep._new_verified_paramiko_client()
-    return fake
+    endpoint = choose_endpoint("ssh://u@h/p", cfg)
+    return endpoint.ssh_manager._ssh_base_cmd()
+
+
+def test_endpoint_strict_survives_the_config_whitelist():
+    cmd = _endpoint_policy_cmd("strict")
+    assert "StrictHostKeyChecking=yes" in cmd, (
+        "strict did not reach the ssh command; the endpoint config whitelist "
+        "may have dropped ssh_host_key_policy"
+    )
+    assert "StrictHostKeyChecking=accept-new" not in cmd
+
+
+def test_endpoint_accept_new_survives_the_config_whitelist():
+    cmd = _endpoint_policy_cmd("accept-new")
+    assert "StrictHostKeyChecking=accept-new" in cmd
+    assert "StrictHostKeyChecking=yes" not in cmd
+
+
+def test_endpoint_defaults_to_accept_new():
+    """Fail-safe, not fail-open: no policy configured must not mean no checking."""
+    cmd = _endpoint_policy_cmd(None)
+    assert "StrictHostKeyChecking=accept-new" in cmd
+    assert "StrictHostKeyChecking=no" not in cmd
 
 
 # ------------------------------------ raw+ssh transport (raw.py)
