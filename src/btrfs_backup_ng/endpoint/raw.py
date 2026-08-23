@@ -1954,7 +1954,12 @@ class SSHRawEndpoint(RawEndpoint):
         cannot record a lock, so the reader finding nothing is a proven-empty
         answer rather than a check that silently did not run.
         """
-        path = self.config.get("path")
+        # ``lock_root`` wins where it is set, because ``path`` is not always the
+        # target. The snapper flow points the endpoint at
+        # ``.snapshots/<n>.incoming`` for the duration of a receive, and a lock
+        # root that followed it would write the lock INSIDE the slot being
+        # published -- then get renamed into place along with it.
+        path = self.config.get("lock_root") or self.config.get("path")
         if path in (None, ""):
             return None
         return str(path)

@@ -79,6 +79,12 @@ LOCK_DIR_NAME = ".btrfs-backup-ng.locks"
 #: key off this one constant so they cannot drift apart.
 SNAPSHOT_LOCK_PREFIX = "snap-"
 
+#: Prefix marking a lock as the right to CREATE one destination subvolume.
+#: Scoped per destination rather than per target: two receives into one
+#: directory under different names are safe and common, and serialising them
+#: would cost throughput to prevent a clash that cannot happen.
+RECEIVING_LOCK_PREFIX = "receiving-"
+
 #: Holder files for a SHARED lock live here, one per holder.
 HOLDERS_DIR_NAME = "holders"
 
