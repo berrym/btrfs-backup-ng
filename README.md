@@ -24,7 +24,9 @@ verification / MITM mitigation) in 0.9.1 (tracked in
 restoration polish, and 0.9.4 was a correctness release: it fixed two ways a restore could
 return the wrong volume while reporting success, and a class of bugs that only appear when
 the remote's `/bin/sh` is `dash` or `busybox ash` — which is most Debian, Ubuntu, Alpine and
-NAS targets. As with any backup tool, test your restores.
+NAS targets. 0.9.5 makes concurrency safe: locks on a remote target are now recorded on the
+target itself, so a prune running in another process — or on another machine — can no longer
+delete the snapshot a restore is reading. As with any backup tool, test your restores.
 
 ## Heritage
 
@@ -44,7 +46,12 @@ See the [LICENSE](LICENSE) file for full copyright attribution.
 - **Disaster Recovery**: Restore backups back to btrfs from local, remote SSH, and raw
   targets — full or incremental chains, verified byte-identical against real hardware
 - **Reliable Transfers**: A failed or partial transfer is never reported as success, and
-  an interrupted stream terminates cleanly instead of hanging (local, SSH, and raw alike)
+  an interrupted stream terminates cleanly instead of hanging (local, SSH, and raw alike).
+  There is no wall-clock limit by default — a stuck transfer is found by measuring bytes, so
+  a merely slow one is never cut off
+- **Safe Concurrency**: Locks on a remote target are recorded on the target, so a prune in
+  another process or on another machine cannot delete a snapshot a restore is reading, and
+  two transfers cannot create the same subvolume
 - **Backup Verification**: Raw backups carry a sealed checksum and can be re-verified
   against it (`raw verify`); btrfs backup verification (metadata / stream / full restore
   test) is being deepened as part of the reliability roadmap ([#20](https://github.com/berrym/btrfs-backup-ng/issues/20))
@@ -316,6 +323,12 @@ parallel_volumes = 2                   # Concurrent volume backups
 parallel_targets = 3                   # Concurrent target transfers
 quiet = false                          # Suppress non-essential output
 verbose = false                        # Enable verbose output
+transfer_timeout = 0                   # Wall-clock limit per transfer, in seconds.
+                                       # 0 = unlimited (the default): a transfer that is
+                                       # moving data is succeeding, and any fixed value is
+                                       # a guess about link speed times dataset size
+transfer_stall_timeout = 900           # Give up on a transfer that has stopped moving
+                                       # data for this many seconds. 0 disables it
 ```
 
 ### Logging
@@ -614,6 +627,12 @@ compress = "zstd"                      # Stream compression. On ssh:// the strea
                                        # destination.
 rate_limit = "10M"                     # Bandwidth limit (K|M|G suffix)
 require_mount = false                  # Require path to be a mount point (safety check)
+skip_remote_lock = false               # Proceed even when a lock cannot be RECORDED on this
+                                       # target. Default false: an operation stops rather
+                                       # than run unprotected, because a prune elsewhere
+                                       # would not see the snapshot as in use. Set true only
+                                       # for a destination you can read but not write.
+                                       # Locks are still READ either way
 ```
 
 ### Raw Target Configuration
@@ -985,7 +1004,7 @@ snapshot_dir = ".snapshots"       # Same as btrbk default
 | Timestamp formats | short/long/long-iso | strftime patterns |
 | Language | Perl | Python |
 | CLI output | Plain text | Rich formatting |
-| SSH handling | External ssh | Native Paramiko option |
+| SSH handling | External ssh | External OpenSSH, with ControlMaster multiplexing and host-key verification |
 | Systemd integration | Manual setup | Built-in install/migrate |
 
 For detailed migration information, see [docs/MIGRATING-FROM-BTRBK.md](docs/MIGRATING-FROM-BTRBK.md).
@@ -1593,8 +1612,9 @@ The restore command:
 | `--no-fs-checks` | Skip btrfs subvolume verification (needed for backup directories) |
 | `--progress` | Show progress bars (default in terminal) |
 | `--no-progress` | Disable progress bars |
-| `--status` | Show locks and incomplete restores at backup location |
+| `--status` | Show locks and incomplete restores at backup location. On `ssh://` and `raw+ssh://` this reads locks recorded on the target, so it sees other processes and other machines |
 | `--unlock [ID]` | Unlock stuck restore sessions ('all' or specific session ID) |
+| `--skip-remote-lock` | Proceed even if a lock cannot be recorded on the remote target. Only safe when nothing else can prune this target during the run |
 | `--cleanup` | Clean up partial/incomplete restores at destination |
 
 **Config-driven restore options:**
@@ -1923,7 +1943,14 @@ btrfs-backup-ng restore --unlock all ssh://backup@server:/backups/home \
     --no-fs-checks --ssh-sudo
 ```
 
-**Note:** `--unlock` only removes restore locks. Backup and transfer locks are preserved to prevent accidental data loss.
+**Note:** `--unlock` only removes restore locks (snapshot pins). Whole-target locks — held
+by an operation running right now — are deliberately left alone: the command clears
+leftovers, it does not interrupt work in progress.
+
+On `ssh://` and `raw+ssh://` targets these locks live **on the target**, so `--status`
+reports what other processes and other machines are holding, and a lock left by an
+interrupted run is visible from anywhere that can reach the target. See
+[Remote Locks](docs/REMOTE-LOCKS.md) for how they work and when they expire.
 
 #### Clean Up Partial Restores
 

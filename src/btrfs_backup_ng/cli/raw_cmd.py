@@ -91,20 +91,6 @@ def _open_target(args: argparse.Namespace):
     return ep, spec
 
 
-def _warn_remote_no_lock(ep) -> None:
-    """Warn (on stderr, so ``--json`` stays clean) that a raw+ssh target is not
-    lock-protected. The per-target mutual-exclusion lock is local-only (a remote
-    lock needs a persistent connection to hold an flock, which is deferred), so a
-    remote maintenance write can still race a concurrent backup/prune -- run it
-    while the target is idle."""
-    if getattr(ep, "_is_remote", False):
-        print(
-            "warning: raw+ssh targets are not lock-protected; run maintenance while "
-            "the target is idle (no concurrent backup or prune to this target).",
-            file=sys.stderr,
-        )
-
-
 def _raw_list(args: argparse.Namespace) -> int:
     """List the backups a raw target holds (via their ``.meta`` sidecars)."""
     try:
@@ -228,10 +214,14 @@ def _raw_backfill(args: argparse.Namespace) -> int:
         return 2
 
     dry = getattr(args, "dry_run", False)
-    if not dry:
-        _warn_remote_no_lock(ep)
     # Hold the per-target lock across scan + write so a concurrent backup/prune
     # cannot interleave (a dry-run is read-only, so it needs no lock).
+    #
+    # This used to print "raw+ssh targets are not lock-protected; run maintenance
+    # while the target is idle" immediately before taking the lock. That was true
+    # when SSHRawEndpoint.target_lock was a no-op. It is not true now -- the lock
+    # is recorded on the remote target -- so the warning told the operator to
+    # work around a hazard that no longer exists.
     lock_ctx = contextlib.nullcontext() if dry else ep.target_lock()
     results = []
     try:

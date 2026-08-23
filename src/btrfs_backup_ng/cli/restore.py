@@ -17,8 +17,8 @@ from ..__logger__ import create_logger
 from ..config import ConfigError, find_config_file, load_config
 from ..core.target import parse_target
 from ..core.restore import (
-    _retry_with_inferred_prefix,
     RestoreError,
+    _retry_with_inferred_prefix,
     list_remote_snapshots,
     restore_snapshots,
     validate_restore_destination,
@@ -402,34 +402,31 @@ def _execute_list(args: argparse.Namespace) -> int:
         logger.error("Failed to prepare backup endpoint: %s", e)
         return 1
 
+    # Do for `--list` what `restore` already does: work out the prefix this
+    # location actually uses and show those snapshots, rather than telling the
+    # operator to re-run with an argument we just derived ourselves.
+    #
+    # The most ordinary command there is -- `restore --list <dest>` with no
+    # --prefix -- otherwise answered "No snapshots matched" for a location
+    # holding a perfectly good backup, which reads as data loss.
+    #
+    # Shared with --interactive, --status and the restore path, so the rules
+    # cannot diverge: it infers only when NO prefix was asked for, and refuses
+    # to choose when the location holds more than one (two prefixes usually
+    # means two volumes side by side, and showing the wrong one is worse than
+    # asking).
     try:
-        snapshots = list_remote_snapshots(backup_endpoint)
+        snapshots, inferred_prefix = _list_for_display(backup_endpoint)
     except Exception as e:
         logger.error("Failed to list snapshots: %s", e)
         return 1
 
-    if not snapshots:
-        # Do for `--list` what `restore` already does: work out the prefix this
-        # location actually uses and show those snapshots, rather than telling
-        # the operator to re-run with an argument we just derived ourselves.
-        #
-        # The most ordinary command there is -- `restore --list <dest>` with no
-        # --prefix -- otherwise answered "No snapshots matched" for a location
-        # holding a perfectly good backup, which reads as data loss.
-        #
-        # Same primitive as the restore path, so the rules cannot diverge: it
-        # infers only when NO prefix was asked for, and refuses to choose when
-        # the location holds more than one (two prefixes usually means two
-        # volumes side by side, and listing the wrong one is worse than asking).
-        inferred = _retry_with_inferred_prefix(backup_endpoint)
-        if inferred:
-            used = backup_endpoint.config.get("snap_prefix", "") or ""
-            print(
-                f"No snapshots use the default prefix here; listing {used!r} "
-                f"instead, which is what this location uses."
-            )
-            print("")
-            snapshots = inferred
+    if inferred_prefix:
+        print(
+            f"No snapshots use the default prefix here; listing "
+            f"{inferred_prefix!r} instead, which is what this location uses."
+        )
+        print("")
 
     if not snapshots:
         # "No snapshots found" is only honest when the location really is empty.
@@ -741,6 +738,37 @@ def _parse_datetime(dt_str: str) -> time.struct_time:
     )
 
 
+def _list_for_display(backup_endpoint: Any) -> tuple[list[Any], str]:
+    """Snapshots at this location, under the prefix it actually uses.
+
+    Returns ``(snapshots, inferred_prefix)``; ``inferred_prefix`` is empty when
+    nothing had to be inferred.
+
+    Every read-only view of a location goes through here, so none of them can
+    drift from the others. ``--list`` grew the inference and its siblings did
+    not, which left three commands answering for the same directory three
+    different ways:
+
+    * ``--interactive`` printed "No snapshots available", and the restore then
+      returned 0 -- a restore that restored nothing, reporting success -- for a
+      location the same command without ``-i`` restores fine;
+    * ``--status`` reported "Available snapshots: 0" for a location ``--list``
+      shows as full;
+    * ``--list`` was right.
+
+    The inference rules are the transfer path's own primitive, not a copy of it:
+    it applies only when no prefix was asked for, and refuses to choose when a
+    location holds more than one.
+    """
+    snapshots = list_remote_snapshots(backup_endpoint)
+    if snapshots:
+        return snapshots, ""
+    inferred = _retry_with_inferred_prefix(backup_endpoint)
+    if not inferred:
+        return [], ""
+    return inferred, str(backup_endpoint.config.get("snap_prefix", "") or "")
+
+
 def _interactive_select(backup_endpoint) -> str | None:
     """Interactively select a snapshot to restore.
 
@@ -751,7 +779,7 @@ def _interactive_select(backup_endpoint) -> str | None:
         Selected snapshot name, or None if cancelled
     """
     try:
-        snapshots = list_remote_snapshots(backup_endpoint)
+        snapshots, inferred = _list_for_display(backup_endpoint)
     except Exception as e:
         logger.error("Failed to list snapshots: %s", e)
         return None
@@ -759,6 +787,12 @@ def _interactive_select(backup_endpoint) -> str | None:
     if not snapshots:
         print("No snapshots available")
         return None
+
+    if inferred:
+        print(
+            f"No snapshots use the default prefix here; showing {inferred!r} "
+            f"instead, which is what this location uses."
+        )
 
     print("")
     print("Available snapshots:")
@@ -912,10 +946,14 @@ def _execute_status(args: argparse.Namespace) -> int:
         print("No active locks found.")
         print()
 
-    # List snapshots for reference
+    # List snapshots for reference, under the prefix this location actually
+    # uses -- reporting 0 for a location holding backups reads as data loss.
     try:
-        snapshots = list_remote_snapshots(backup_endpoint)
-        print(f"\nAvailable snapshots: {len(snapshots)}")
+        snapshots, inferred = _list_for_display(backup_endpoint)
+        if inferred:
+            print(f"\nAvailable snapshots: {len(snapshots)} (prefix {inferred!r})")
+        else:
+            print(f"\nAvailable snapshots: {len(snapshots)}")
     except Exception as e:
         logger.warning("Could not list snapshots: %s", e)
 

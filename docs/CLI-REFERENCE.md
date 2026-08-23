@@ -1043,7 +1043,12 @@ Inspect and maintain [raw-target](#raw-targets) backups directly. Raw targets ho
 btrfs-backup-ng raw SUBCOMMAND [OPTIONS]
 ```
 
-Mutating operations on a local `raw://` target (a backup's commit, prune, `backfill-metadata`, and `encrypt`) hold an exclusive per-target lock so they cannot race each other; concurrent operations serialize rather than corrupt one another. The lock is an empty `.btrfs-backup-ng.lock` file kept in the target directory — it is created `0600`, is safe to leave in place, and is never listed as a backup. Because the lock lives inside the target directory, that directory must not be writable by untrusted users. The lock is currently local-only: `raw+ssh://` maintenance is not serialized, so run it while the target is otherwise idle.
+Mutating operations on a local `raw://` target (a backup's commit, prune, `backfill-metadata`, and `encrypt`) hold an exclusive per-target lock so they cannot race each other; concurrent operations serialize rather than corrupt one another. The lock is an empty `.btrfs-backup-ng.lock` file kept in the target directory — it is created `0600`, is safe to leave in place, and is never listed as a backup. Because the lock lives inside the target directory, that directory must not be writable by untrusted users. `raw+ssh://` targets are serialized too. The lock is a directory under
+`<target>/.btrfs-backup-ng.locks/`, created with `mkdir` — atomic, so exactly one of
+any number of racing creators wins — and kept alive by a heartbeat, so a holder that
+dies is broken by the next contender rather than blocking the target until someone
+cleans up by hand. It holds across processes and across machines. See
+[Remote Locks](REMOTE-LOCKS.md).
 
 #### raw list
 
@@ -1132,7 +1137,9 @@ btrfs-backup-ng raw backfill-metadata TARGET [OPTIONS]
 
 Each backfilled sidecar records the pipeline inferred from the filename (compression/encryption) and a sha256 of the stream as it exists now, and is stamped `provenance_origin=backfill` with `stream_completeness=unknown`. A legacy stream's completeness cannot be proven (it might have been truncated), so a backfilled sidecar is marked as a **reconstructed, non-authoritative** record — the checksum lets `raw verify` detect later corruption, but does not confirm the original backup was complete. Exit status is `1` if any sidecar write failed, else `0`.
 
-On a local `raw://` target, `backfill-metadata` holds the per-target lock while it works, so a concurrent backup or prune serializes against it; it also re-checks for a sidecar immediately before writing, so a concurrently-committed backup is never overwritten. On a `raw+ssh://` target the lock is a no-op (remote locking is not yet implemented) and the command warns you — run remote maintenance while the target is idle.
+On a local `raw://` target, `backfill-metadata` holds the per-target lock while it works, so a concurrent backup or prune serializes against it; it also re-checks for a sidecar immediately before writing, so a concurrently-committed backup is never overwritten. A `raw+ssh://` target takes the same lock, recorded on the remote target itself, so a
+concurrent backup or prune — from another process, or another machine — serializes
+against it rather than racing it.
 
 **Example Output:**
 ```

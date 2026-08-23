@@ -29,6 +29,13 @@ parallel_targets = 3    # Max concurrent target transfers per volume
 quiet = false           # Suppress non-essential output
 verbose = false         # Enable verbose output
 
+# Transfer limits. A transfer that is moving data is succeeding, so there is NO
+# wall-clock limit by default; faults are caught by measuring bytes instead. A
+# fixed deadline is a guess about link speed times dataset size, and the old
+# fixed hour ended first syncs that were working perfectly.
+transfer_timeout = 0            # Seconds per transfer; 0 = unlimited (default)
+transfer_stall_timeout = 900    # Give up when no data has moved for this long; 0 disables
+
 # -----------------------------------------------------------------------------
 # Default Retention Policy
 # -----------------------------------------------------------------------------
@@ -150,6 +157,13 @@ require_mount = true    # Fail if drive is not mounted (safety check)
 # ssh_key = "~/.ssh/id_rsa"         # Path to SSH private key
 # ssh_auth_sock = "/path/to/agent.sock"  # Explicit ssh-agent socket (see note below)
 # ssh_password_auth = true           # Allow password authentication fallback
+# ssh_host_key_policy = "accept-new" # accept-new (trust first contact, reject a changed
+#                                    # key) | strict (known_hosts only)
+# skip_remote_lock = false           # Proceed even when a lock cannot be RECORDED on this
+#                                    # target. Default false: an operation stops rather than
+#                                    # run unprotected, because a prune elsewhere would not
+#                                    # see the snapshot as in use. Set true only for a
+#                                    # destination you can read but not write
 # compress = "none"                  # Compression: none|gzip|pigz|zstd|lz4|
 #                                    # xz|lzo|bzip2|pbzip2 -- the same set on
 #                                    # every kind of target

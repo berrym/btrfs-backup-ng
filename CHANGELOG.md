@@ -5,9 +5,96 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.9.5] - 2026-08-23
+
+The "a lock only one process can see is not a lock" release.
+
+Two processes could not see each other's work on a remote target. A restore
+pinned the snapshot it was reading and a prune skipped what was pinned, but the
+pin lived in the restoring process's memory, so a prune running anywhere else --
+a cron job, a second terminal, another machine -- was free to delete the
+snapshot mid-restore. Locks are now recorded on the target itself, where anything
+that can reach it can see them.
+
+This release also drops the paramiko dependency, removes the wall-clock limit on
+transfers in favour of detecting an actually-stuck one, and fixes a set of
+commands that described the same backup location three different ways.
+
+### Known issue
+
+Re-running an interrupted restore **without** `--prefix`, against a location
+whose prefix has to be inferred, fails on the first snapshot it should have
+skipped ("creating subvolume ... failed: File exists") instead of skipping it.
+The restore reports the failure rather than claiming success. Passing an
+explicit `--prefix` avoids it entirely. This predates the release; the fix is
+tracked for 0.9.6.
+
 
 ### Added
+
+- **A prune in one process can no longer delete the snapshot a restore is
+  reading in another** — a restore pins the snapshot it reads and a prune skips
+  what is pinned; both halves worked, on different data. The pin lived in the
+  restoring process's memory, and a prune is normally a different process: a
+  cron job, a second terminal, a scheduler on another machine. It lists the
+  destination fresh, so every snapshot it sees carries an empty lock set —
+  including the one being read at that moment. The delete went through and the
+  restore failed partway with a stream whose parent had gone. Locks are now
+  recorded on the destination itself, beside the data they protect, so any
+  process that can reach it can see them. `ssh://` and `raw+ssh://` targets
+  persist locks; a local `raw://` target still keeps them in memory for the run
+  and still says so.
+
+  A snapshot pin is shared: any number of restores and transfers may hold the
+  same snapshot at once, and it stays pinned until the last of them lets go —
+  which is what the in-memory contract already meant. Whole-target locks, held
+  by mutating operations, remain exclusive. `raw+ssh://` gains the per-target
+  mutual exclusion local `raw://` always had, and across machines, which the
+  local flock never provided.
+
+  Mutual exclusion is built from operations that are already atomic on the
+  remote filesystem — `mkdir`, which exactly one of any number of racing
+  creators wins, and `mv`, which is what makes breaking an abandoned lock safe.
+  Staleness is computed entirely from the destination's own clock, never by
+  comparing a local one: the two machines this was developed against disagree by
+  four seconds, and client-side arithmetic would let the fast one break locks
+  that are alive. A lock whose heartbeat stops is broken by the next contender,
+  so a crashed restore costs one staleness window rather than needing manual
+  cleanup, and an interrupted run releases immediately on Ctrl-C rather than
+  waiting that window out.
+
+- **`restore --status` and `--unlock` tell the truth about a remote target** —
+  they used to answer "This target does not persist locks", which was accurate
+  and useless: a backup tool that reports it cannot protect a restore is not
+  protecting the restore. They now report what actually holds a remote
+  destination, every holder of a snapshot rather than just the first, and a
+  holder whose record cannot be read as `unknown` rather than omitting it —
+  because "something holds this and we cannot say what" must never be rounded
+  down to "nothing holds this". `--unlock` clears leftover pins without
+  disturbing a lock a running operation is holding.
+
+- **`--skip-remote-lock`, and a matching `skip_remote_lock` target option** — a
+  destination that cannot record a lock now stops the operation rather than
+  continuing unprotected, because continuing leaves the restore exposed while a
+  prune elsewhere sees nothing holding the snapshot. That default is wrong for
+  one real setup: a destination you can read but not write, where no lock can be
+  taken and none is needed. This is how you say so. It relaxes only that
+  failure — locks are still read, so nothing begins reporting a target as
+  unlocked without having looked.
+
+- **Two transfers can no longer create the same subvolume on one destination** —
+  nothing serialised two machines writing to one `ssh://` target. What btrfs
+  actually does was measured before this was designed, because the answer
+  changes the fix: two `btrfs receive` runs into one directory under different
+  names both succeed, while two under the same name leave one failing with
+  "creating subvolume ... failed: File exists" — after it has transferred the
+  entire snapshot. So the lock is scoped to the destination subvolume rather
+  than the whole target, and backups of `/`, `/home` and `/var` to one
+  destination still run in parallel. What it adds is timing and attribution: the
+  clash is refused before the stream starts, by a message naming the host and
+  process holding the path, across machines. For snapper it spans both halves of
+  the transaction — the receive into `.snapshots/<n>.incoming` and the rename
+  that publishes it — so a second writer cannot publish between them.
 
 - **`restore --list` finds the prefix a location uses, like `restore` does** — the
   most ordinary command there is, `restore --list <destination>` with no
@@ -36,6 +123,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   transfer -- where the remote is still applying what it already received -- is
   never mistaken for a stall. Tunable as `transfer_stall_timeout` in `[global]`;
   0 disables it.
+
+### Fixed
+
+- **`raw backfill-metadata` warned that a `raw+ssh://` target was not
+  lock-protected, three lines before locking it** — the warning was true when
+  `SSHRawEndpoint.target_lock` was a no-op. It is not true now, so the command
+  was telling operators to work around a hazard that no longer exists. Removed.
+
+- **`restore --interactive` and `restore --status` disagreed with `restore
+  --list` about the same location** — `--list` learned to work out the prefix a
+  location actually uses; its siblings did not. `--interactive` answered "No
+  snapshots available" and the restore then exited 0, having restored nothing,
+  for a location the same command without `-i` restores fine; `--status`
+  reported "Available snapshots: 0" for a location `--list` shows as full. All
+  three now go through one lister, so a fourth view cannot drift from them, and
+  each says which prefix it used rather than substituting one silently.
 
 ### Changed
 
