@@ -17,6 +17,7 @@ Environment variables that affect behavior:
   would be required.
 """
 
+import contextlib
 import copy
 import getpass
 import os
@@ -30,7 +31,17 @@ import uuid
 from pathlib import Path
 from subprocess import CompletedProcess
 from threading import Lock
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, TypeVar, cast
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Dict,
+    Iterator,
+    List,
+    Optional,
+    Tuple,
+    TypeVar,
+    cast,
+)
 
 if TYPE_CHECKING:
     pass
@@ -337,6 +348,7 @@ class SSHEndpoint(Endpoint):
             "ssh_password_fallback",
             "ssh_host_key_policy",
             "skip_remote_lock",
+            "lock_root",
             "transfer_stall_timeout",
         ):
             if config.get(_ssh_key) is not None:
@@ -810,7 +822,12 @@ class SSHEndpoint(Endpoint):
         cannot record a lock, so the reader finding nothing is a proven-empty
         answer rather than a check that silently did not run.
         """
-        path = self.config.get("path")
+        # ``lock_root`` wins where it is set, because ``path`` is not always the
+        # destination. The snapper flow points the endpoint at
+        # ``.snapshots/<n>.incoming`` for the duration of a receive, and a lock
+        # root that followed it would write the lock INSIDE the slot being
+        # published -- then get renamed into place along with it.
+        path = self.config.get("lock_root") or self.config.get("path")
         if path in (None, ""):
             return None
         return str(path)
@@ -874,6 +891,91 @@ class SSHEndpoint(Endpoint):
             hostname=_socket.gethostname(),
             run_elevated=run_elevated,
         )
+
+    @contextlib.contextmanager
+    def receiving_lock(
+        self, destination: str, *, timeout: float | None = None
+    ) -> Iterator[None]:
+        """Hold the right to create ``destination`` on this target.
+
+        Scoped to ONE destination subvolume rather than to the whole target,
+        because that is the only thing that actually collides. Measured against a
+        real remote: two ``btrfs receive`` runs into the same directory under
+        DIFFERENT names both succeed, while two under the SAME name leave one
+        failing with "creating subvolume ... failed: File exists". A whole-target
+        lock would therefore serialise backups of /, /home and /var to a single
+        destination -- transfers btrfs runs happily in parallel -- to prevent a
+        clash that can only occur between transfers sharing a destination.
+
+        What this adds over btrfs's own behaviour is timing and attribution: the
+        clash is refused BEFORE the stream starts rather than after pushing the
+        whole snapshot across the wire, and the refusal names the host and
+        process holding it. It also spans machines, which nothing here did.
+
+        Re-entrant within a process, because the snapper flow holds this across
+        both the receive and the publish that renames ``<n>.incoming`` into
+        ``<n>`` -- two halves of one transaction on the same slot -- and the
+        transfer beneath must not contend with its own caller.
+        """
+        from ..sshutil.lock import (
+            RECEIVING_LOCK_PREFIX,
+            RemoteLockBusy,
+            RemoteLockUnavailable,
+        )
+
+        if self._lock_target_path() is None:
+            yield
+            return
+
+        name = f"{RECEIVING_LOCK_PREFIX}{destination}"
+        manager = self._lock_manager()
+        if manager.holds(name):
+            yield  # already held further up this call stack
+            return
+
+        try:
+            manager.acquire_once(name, f"receive:{destination}")
+        except RemoteLockBusy as exc:
+            # Built from the holder's details rather than by interpolating the
+            # exception, whose text repeats the destination and the lock name.
+            # An operator reading a wrapped three-line sentence to find a
+            # hostname is being made to work for it.
+            info = exc.info or {}
+            holder = "another process"
+            if info:
+                holder = (
+                    f"{info.get('hostname', 'an unknown host')} "
+                    f"(pid {info.get('pid', '?')})"
+                )
+            raise __util__.AbortError(
+                f"Already being received by {holder}: {destination}\n"
+                f"Refusing to start a second transfer to the same path -- both "
+                f"would create the same subvolume, and the loser only finds out "
+                f"after transferring everything."
+            ) from exc
+        except RemoteLockUnavailable as exc:
+            if self.config.get("skip_remote_lock"):
+                logger.warning(
+                    "Could not lock %s before receiving (%s), and "
+                    "--skip-remote-lock was given, so this continues WITHOUT "
+                    "protection against a concurrent transfer to the same path.",
+                    destination,
+                    exc,
+                )
+                yield
+                return
+            raise __util__.AbortError(
+                f"Could not lock {destination!r} before receiving: {exc}. "
+                f"Refusing to continue unprotected: a second transfer to the "
+                f"same path would collide. Pass --skip-remote-lock to proceed "
+                f"anyway."
+            ) from exc
+
+        manager._start_heartbeat(name)
+        try:
+            yield
+        finally:
+            manager.release(name)
 
     def _read_locks(self) -> dict:
         """The locks recorded ON THIS TARGET, in the lock-file shape.
@@ -3872,6 +3974,18 @@ print(json.dumps(result))
             logger.error(f"Error during transfer: {e}")
             logger.debug(f"Full error details: {e}", exc_info=True)
             return False
+
+    def _receive_destination(self, source_path: Any) -> str:
+        """The subvolume path a receive of ``source_path`` will create here.
+
+        ``btrfs receive`` names the received subvolume after the SOURCE
+        basename, not after the snapshot name -- for snapper that is always
+        "snapshot", under ``.snapshots/<n>/``. This mirrors the same derivation
+        the transfer and verification paths already use, so the lock names the
+        thing that actually collides.
+        """
+        dest = str(self._normalize_path(self.config["path"])).rstrip("/")
+        return f"{dest}/{Path(str(source_path)).name}"
 
     def send_receive(
         self,

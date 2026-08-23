@@ -64,6 +64,9 @@ winner in each case.
 
 ```
 <target>/.btrfs-backup-ng.locks/
+    receiving-<dest>.lock/        EXCLUSIVE: the right to create one subvolume
+        info.json
+        heartbeat
     target.lock/                  EXCLUSIVE: a whole-target lock
         info.json                 holder: operation, hostname, pid, token
         heartbeat                 mtime refreshed while the holder lives
@@ -170,6 +173,46 @@ exit and on SIGINT/SIGTERM, so Ctrl-C on a restore frees the snapshot at once.
 The signal handlers chain to whatever was installed before them rather than
 replacing it. The stale window remains the backstop for what no handler can
 catch: SIGKILL, a power cut, a severed network.
+
+### Receiving
+
+A transfer holds the right to create one destination subvolume, named
+`receiving-<path>`. Scoped per destination, not per target, and the reason is
+measured rather than assumed:
+
+| Two `btrfs receive` runs into one directory | Result on a real remote |
+|---|---|
+| different snapshot names | both succeed |
+| the same snapshot name | one fails `creating subvolume ... failed: File exists` |
+
+btrfs already handles the first case, so a whole-target lock would serialise
+backups of `/`, `/home` and `/var` to a single destination for no safety gain.
+What the lock adds is timing and attribution for the second case: the clash is
+refused before the stream starts rather than after transferring the whole
+snapshot, by a message naming the host and pid holding it, and it spans
+machines.
+
+```
+Already being received by nas.example (pid 3412): /backups/home.20240115T120000
+Refusing to start a second transfer to the same path -- both would create the
+same subvolume, and the loser only finds out after transferring everything.
+```
+
+The lock is taken where the transaction is, in `core/operations.py`, not inside
+the endpoint's transfer methods — those are the quoting and stream-contract
+surface, exercised by unit tests that have no remote to talk to.
+
+For snapper the same lock spans **both** halves of the transaction: the receive
+into `.snapshots/<n>.incoming` and the rename that publishes it as
+`.snapshots/<n>`. A second writer aiming at the same slot must be kept out for
+both, or it can publish in between. It is re-entrant so the transfer beneath
+finds it already held.
+
+The snapper flow also repoints the endpoint at the `.incoming` directory while
+receiving. `lock_root` pins where locks are written for that window, so the lock
+is not created inside the slot about to be published and renamed into place
+along with it — and it is restored afterwards, so an endpoint reused for another
+target does not keep writing locks to the old one.
 
 ## What each side does
 

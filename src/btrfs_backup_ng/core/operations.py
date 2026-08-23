@@ -775,11 +775,15 @@ def _transfer_chunks_ssh(
     # Use the endpoint's send_receive if available for direct pipe
     if hasattr(destination_endpoint, "receive_chunked"):
         # Future: dedicated chunked receive method
-        success = destination_endpoint.receive_chunked(
-            reader,
-            manifest,
-            show_progress=show_progress,
-        )
+        with _receiving_lock(
+            destination_endpoint,
+            _destination_subvolume(destination_endpoint, manifest.snapshot_path),
+        ):
+            success = destination_endpoint.receive_chunked(
+                reader,
+                manifest,
+                show_progress=show_progress,
+            )
         if not success:
             raise __util__.SnapshotTransferError("SSH chunked receive failed")
     else:
@@ -987,13 +991,17 @@ def _do_direct_pipe_transfer(
             send_process.terminate()
             send_process.wait()
 
-        success = destination_endpoint.send_receive(
-            snapshot,
-            parent=parent,
-            clones=clones,
-            timeout=transfer_timeout,
-            show_progress=show_progress,
-        )
+        with _receiving_lock(
+            destination_endpoint,
+            _destination_subvolume(destination_endpoint, snapshot.get_path()),
+        ):
+            success = destination_endpoint.send_receive(
+                snapshot,
+                parent=parent,
+                clones=clones,
+                timeout=transfer_timeout,
+                show_progress=show_progress,
+            )
     except Exception as e:
         logger.error("Error during SSH direct pipe transfer: %s", e)
         raise __util__.SnapshotTransferError(f"SSH direct pipe transfer failed: {e}")
@@ -1897,6 +1905,74 @@ def _enumerate_snapper_btrfs_backups(destination_endpoint) -> list:
     return backups
 
 
+def _receiving_lock(destination_endpoint, destination: str, lock_root: str = ""):
+    """The destination lock for ``destination``, or a no-op for a local target.
+
+    Taken HERE rather than inside the endpoint's transfer methods. Those methods
+    are the quoting and stream-contract surface, exercised by unit tests that
+    have no remote to talk to; making each of them open a network lock would
+    have meant every such test acquiring one. The lock belongs with the
+    transaction, and the transaction is here.
+
+    Only remote endpoints record locks; a local one has no cross-machine
+    contention to guard against and no ``receiving_lock`` to call.
+
+    ``lock_root``, when given, pins where the lock is written. The snapper flow
+    needs it: it repoints the endpoint at ``.snapshots/<n>.incoming`` for the
+    duration of a receive, and a lock that followed would be written inside the
+    slot being published and renamed into place along with it.
+    """
+    import contextlib
+
+    hold = getattr(destination_endpoint, "receiving_lock", None)
+    if hold is None:
+        return contextlib.nullcontext()
+    if not lock_root:
+        return hold(destination)
+
+    @contextlib.contextmanager
+    def _pinned():
+        # Restored afterwards rather than left set. An endpoint that outlives
+        # this call and is later pointed at a different target would otherwise
+        # keep writing its locks to the old one -- a lock recorded where no
+        # guard will look for it, which is the failure this whole mechanism
+        # exists to remove.
+        config = destination_endpoint.config
+        had = "lock_root" in config
+        previous = config.get("lock_root")
+        config["lock_root"] = lock_root
+        try:
+            with hold(destination):
+                yield
+        finally:
+            if had:
+                config["lock_root"] = previous
+            else:
+                config.pop("lock_root", None)
+
+    return _pinned()
+
+
+def _destination_subvolume(destination_endpoint, source_path) -> str:
+    """The subvolume path a receive of ``source_path`` will create.
+
+    ``btrfs receive`` names the received subvolume after the SOURCE basename,
+    not after the snapshot name -- for snapper that is always "snapshot", under
+    ``.snapshots/<n>/``. Mirrors the derivation the transfer and verification
+    paths already use, so the lock names the thing that actually collides.
+    """
+    from pathlib import Path as _Path
+
+    # The endpoint's own derivation wins where it has one: it applies the same
+    # path normalisation the transfer and verification use, and a second copy
+    # here would be free to drift from it.
+    own = getattr(destination_endpoint, "_receive_destination", None)
+    if callable(own):
+        return str(own(source_path))
+    dest = str(destination_endpoint.config.get("path", "")).rstrip("/")
+    return f"{dest}/{_Path(str(source_path)).name}"
+
+
 def _snapper_publish_slot(destination_endpoint, snapshot_num) -> None:
     """Publish ``.snapshots/{num}.incoming`` as ``.snapshots/{num}``, replacing an occupied slot
     (a recycled snapper number) WITHOUT a data-loss window.
@@ -2149,21 +2225,34 @@ def send_snapper_snapshot(
             snap_root = f"{base_path.rstrip('/')}/.snapshots"
             incoming = f"{snap_root}/{snapshot_num}.incoming"
             final_dir = f"{snap_root}/{snapshot_num}"
-            # Clear any leftover temp from a prior crashed run before receiving.
-            _cleanup_snapper_backup(destination_endpoint, snapshot_num, is_raw)
-            saved_path = destination_endpoint.config["path"]
-            destination_endpoint.config["path"] = incoming
-            try:
-                send_snapshot(
-                    source_wrapper,
-                    destination_endpoint,
-                    parent=parent_wrapper,
-                    options=options,
-                )
-            finally:
-                destination_endpoint.config["path"] = saved_path
-            # Receive succeeded -> atomically publish into the numbered slot.
-            _snapper_publish_slot(destination_endpoint, snapshot_num)
+            # The receive and the publish are two halves of ONE transaction on
+            # slot {num}: the stream lands in {num}.incoming and is then renamed
+            # into {num}. A second writer aiming at the same slot -- another
+            # machine backing up a snapper config whose numbers overlap -- must
+            # be kept out for BOTH halves, not just the transfer, or it can
+            # publish between this receive and this rename.
+            #
+            # The lock is named for exactly what the transfer beneath will lock,
+            # so that call finds it already held rather than taking a second one.
+            slot_lock = _receiving_lock(
+                destination_endpoint, f"{incoming}/snapshot", base_path
+            )
+            with slot_lock:
+                # Clear any leftover temp from a prior crashed run before receiving.
+                _cleanup_snapper_backup(destination_endpoint, snapshot_num, is_raw)
+                saved_path = destination_endpoint.config["path"]
+                destination_endpoint.config["path"] = incoming
+                try:
+                    send_snapshot(
+                        source_wrapper,
+                        destination_endpoint,
+                        parent=parent_wrapper,
+                        options=options,
+                    )
+                finally:
+                    destination_endpoint.config["path"] = saved_path
+                # Receive succeeded -> atomically publish into the numbered slot.
+                _snapper_publish_slot(destination_endpoint, snapshot_num)
             # Place info.xml beside the published snapshot.
             saved_path = destination_endpoint.config["path"]
             destination_endpoint.config["path"] = final_dir
