@@ -724,9 +724,12 @@ class TestRestoreSnapshotsExecution:
             dry_run=False,
         )
 
-        # Should restore snap-2 (snap-1 is used as parent in chain)
-        # The chain logic finds that snap-1 exists so chain is just [snap-2]
-        assert stats["restored"] == 1
+        # skip_existing=False is what --overwrite sets, and it now means what it
+        # says: snap-1 is present at the destination and is REPLACED rather than
+        # used as a parent and left alone. This assertion used to read == 1 with
+        # the comment "the chain logic finds that snap-1 exists so chain is just
+        # [snap-2]" -- an accurate description of why --overwrite did nothing.
+        assert stats["restored"] == 2
         assert stats["skipped"] == 0
 
     @patch("btrfs_backup_ng.core.restore.restore_snapshot")
@@ -750,8 +753,8 @@ class TestRestoreSnapshotsExecution:
         local_endpoint = MagicMock()
         local_endpoint.list_snapshots.return_value = [snapshots[0], snapshots[1]]
 
-        # With skip_existing=False, all should be attempted
-        # But chain logic will use existing as parent, so only snap-3 in chain
+        # With skip_existing=False every snapshot in the chain is restored,
+        # including the ones already present -- that is what replacing means.
         stats = restore_snapshots(
             backup_endpoint,
             local_endpoint,
@@ -760,9 +763,12 @@ class TestRestoreSnapshotsExecution:
             dry_run=False,
         )
 
-        # snap-3 should be restored (chain stops at snap-2 which exists)
-        assert stats["restored"] == 1
-        assert stats["skipped"] == 0  # skip_existing=False means no skipping
+        # The whole chain, not just snap-3. This previously asserted == 1 with
+        # the comment "chain stops at snap-2 which exists", alongside
+        # "skip_existing=False means no skipping" -- the two together describe a
+        # flag that skipped nothing because nothing reached the filter.
+        assert stats["restored"] == 3
+        assert stats["skipped"] == 0
 
     @patch("btrfs_backup_ng.core.restore.restore_snapshot")
     def test_restore_with_options(self, mock_restore):

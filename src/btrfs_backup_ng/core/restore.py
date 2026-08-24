@@ -17,6 +17,7 @@ from ..__util__ import Snapshot
 from ..transaction import log_transaction
 from . import progress as progress_utils
 from .operations import _list_snapper_backups_at_destination, send_snapshot
+from .space import check_space_availability, format_space_check
 from .target import TargetKind, parse_target
 
 logger = logging.getLogger(__name__)
@@ -32,6 +33,7 @@ def get_restore_chain(
     target_snapshot: Snapshot,
     all_backup_snapshots: list[Snapshot],
     existing_local: list[Snapshot],
+    overwrite: bool = False,
 ) -> list[Snapshot]:
     """Determine which snapshots need to be restored to get target_snapshot.
 
@@ -57,8 +59,13 @@ def get_restore_chain(
         current_name = current.get_name()
 
         # If this snapshot already exists locally, we can stop
-        # It can serve as the incremental base
-        if current_name in existing_names:
+        # It can serve as the incremental base.
+        #
+        # Unless the caller means to replace it. --overwrite sets skip_existing
+        # False, but that filter runs LATER, and this truncation ran first --
+        # which is why --overwrite did nothing at all: the snapshot it was meant
+        # to replace never reached the filter that would have kept it.
+        if current_name in existing_names and not overwrite:
             logger.debug(
                 "Found existing local snapshot %s - can use as incremental base",
                 current_name,
@@ -266,6 +273,64 @@ def verify_restored_snapshot(
         raise RestoreError(f"Verification failed: {e}")
 
 
+def _replace_at_destination(local_endpoint, snapshot_name: str, estimated_bytes: int):
+    """Remove ``snapshot_name`` from the destination so it can be received again.
+
+    There is no atomic swap available here. A received subvolume is read-only
+    and cannot be renamed OR moved -- verified against real btrfs, where even a
+    move to a different parent under the same name fails with EROFS. The snapper
+    path works around this by renaming the *containing directory*, which only
+    works because its layout puts each snapshot in its own directory; a restore
+    destination holds the subvolume directly, so there is nothing to rename
+    around it.
+
+    So the old copy is removed and the new one received in its place, which
+    leaves a window where neither exists. That window costs a retry rather than
+    data: a restore reads the backup and never writes to it, so the authoritative
+    copy is untouched and re-running finishes the job. It would be a different
+    proposition during a backup, where the destination may be the only other copy.
+
+    Space is checked BEFORE anything is deleted, so a destination that cannot
+    hold the replacement is left exactly as it was.
+    """
+    if estimated_bytes > 0:
+        try:
+            space_info = local_endpoint.get_space_info()
+            check = check_space_availability(space_info, estimated_bytes)
+        except Exception as e:  # noqa: BLE001 - see below
+            # Not knowing is not the same as knowing there is room, but refusing
+            # to replace because the free space could not be read would make
+            # --overwrite unusable wherever the check is unavailable. It says so
+            # and continues; the receive still fails safely if space runs out.
+            logger.warning(
+                "Could not check free space before replacing %s (%s). Continuing; "
+                "the receive will fail if the destination fills up.",
+                snapshot_name,
+                e,
+            )
+        else:
+            if not check.sufficient:
+                raise RestoreError(
+                    f"Not enough room to replace {snapshot_name}: "
+                    f"{format_space_check(check)}. Nothing has been deleted."
+                )
+
+    logger.info("Removing the existing %s to replace it", snapshot_name)
+    try:
+        existing = [
+            s
+            for s in local_endpoint.list_snapshots(flush_cache=True)
+            if s.get_name() == snapshot_name
+        ]
+        if existing:
+            local_endpoint.delete_snapshots(existing)
+    except Exception as e:
+        raise RestoreError(
+            f"Could not remove the existing {snapshot_name} at the destination "
+            f"({e}). It has been left in place."
+        ) from e
+
+
 def restore_snapshot(
     backup_endpoint,
     local_endpoint,
@@ -273,6 +338,8 @@ def restore_snapshot(
     parent=None,
     options: dict | None = None,
     session_id: str | None = None,
+    overwrite: bool = False,
+    estimated_bytes: int = 0,
 ) -> None:
     """Restore a single snapshot from backup to local.
 
@@ -304,11 +371,23 @@ def restore_snapshot(
     # known issue surfaced. If the destination cannot be read at all, that is
     # raised rather than treated as "nothing is there".
     if check_snapshot_collision(snapshot_name, local_endpoint):
-        raise RestoreError(
-            f"{snapshot_name} is already at the destination. Receiving onto a "
-            f"name that exists fails after transferring everything, so this "
-            f"stops now. Remove it first, or restore to a different path."
-        )
+        if not overwrite:
+            raise RestoreError(
+                f"{snapshot_name} is already at the destination. Receiving onto "
+                f"a name that exists fails after transferring everything, so "
+                f"this stops now. Remove it first, restore to a different path, "
+                f"or pass --overwrite to replace it."
+            )
+        # Decided here, DONE later. Everything between this point and the
+        # transfer can fail -- most notably set_lock, which reaches across the
+        # network and, since locks became persistent, aborts when it cannot
+        # record one. Deleting here would mean an operator loses their copy to a
+        # failure that never moved a byte. The removal is deferred to the last
+        # moment before the stream, so the window is the transfer and nothing
+        # else.
+        replace_first = True
+    else:
+        replace_first = False
 
     logger.info("Restoring %s ...", snapshot_name)
     if parent:
@@ -321,6 +400,15 @@ def restore_snapshot(
     backup_endpoint.set_lock(snapshot, lock_id, True)
     if parent:
         backup_endpoint.set_lock(parent, lock_id, True, parent=True)
+
+    # Everything that can fail without moving data has now happened: the lock is
+    # held, the parent is chosen, the endpoints are ready. This is the last point
+    # before the stream, and therefore the narrowest the window can be made --
+    # a received subvolume cannot be renamed or moved (EROFS on real btrfs, and
+    # btrfs refuses to clear the read-only flag while received_uuid is set), so
+    # replacing means removing first and no staging is available.
+    if replace_first:
+        _replace_at_destination(local_endpoint, snapshot_name, estimated_bytes)
 
     restore_start = time.monotonic()
 
@@ -648,7 +736,9 @@ def restore_snapshots(
     # Build restore chain(s) for all targets
     all_to_restore = []
     for target in targets:
-        chain = get_restore_chain(target, backup_snapshots, local_snapshots)
+        chain = get_restore_chain(
+            target, backup_snapshots, local_snapshots, overwrite=not skip_existing
+        )
         for snap in chain:
             if snap not in all_to_restore:
                 all_to_restore.append(snap)
@@ -772,12 +862,26 @@ def restore_snapshots(
                 parent=parent,
                 options=options,
                 session_id=session_id,
+                overwrite=not skip_existing,
+                estimated_bytes=getattr(snap, "size_bytes", 0) or 0,
             )
             stats["restored"] += 1
             restored_snapshots.append(snap)
 
         except (RestoreError, __util__.AbortError) as e:
             logger.error("Failed to restore %s: %s", snap_name, e)
+            if not skip_existing:
+                # --overwrite removes the old copy before receiving, so a failure
+                # here can leave neither. Say what state the destination is in
+                # and that the backup is untouched, rather than leaving an
+                # operator to work out whether they have lost anything.
+                logger.error(
+                    "  --overwrite removed the previous %s before this transfer, "
+                    "so the destination may now hold neither copy. The backup was "
+                    "only read from and is unchanged -- run the same command "
+                    "again to finish restoring it.",
+                    snap_name,
+                )
             stats["failed"] += 1
             stats["errors"].append(f"{snap_name}: {e}")
 

@@ -336,7 +336,23 @@ def _execute_main_restore(args: argparse.Namespace) -> int:
     dry_run = getattr(args, "dry_run", False)
     snapshot_name = getattr(args, "snapshot", None)
     restore_all = getattr(args, "all", False)
-    skip_existing = not getattr(args, "overwrite", False)
+    overwrite = getattr(args, "overwrite", False)
+    if overwrite and not force:
+        # --overwrite deletes the existing subvolume before receiving its
+        # replacement, and there is no atomic swap available: a received
+        # subvolume is read-only and cannot even be moved. So the destination
+        # briefly holds neither copy. That costs a retry rather than data --
+        # a restore only reads the backup -- but it destroys something the
+        # operator has, so it is gated the same way --in-place is.
+        logger.error(
+            "--overwrite deletes the existing snapshot at the destination before "
+            "receiving its replacement, and the destination holds neither copy "
+            "while the transfer runs. The backup itself is only read from and is "
+            "never modified, so re-running finishes the job if a transfer is "
+            "interrupted. Add --yes-i-know-what-i-am-doing to proceed."
+        )
+        return 1
+    skip_existing = not overwrite
     no_incremental = getattr(args, "no_incremental", False)
     interactive = getattr(args, "interactive", False)
 
