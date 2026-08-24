@@ -433,6 +433,48 @@ def _retry_with_inferred_prefix(backup_endpoint: Any) -> list[Any]:
     return found or []
 
 
+def _choose_parent(backup_snapshots, present, snap, backup_endpoint):
+    """The incremental parent for ``snap``, or None for a full send.
+
+    ONE chooser, used by both the dry-run preview and the real execution. They
+    each had their own copy, which is how a preview comes to describe a transfer
+    the run will not perform -- the same divergence that let --list, --status and
+    --interactive disagree about one location.
+
+    ``present`` differs legitimately between the two callers: the preview passes
+    what WILL be there, the execution passes what IS. The selection rules must
+    not differ, and now cannot.
+    """
+    parent, _local_match = find_parent_by_correspondence(
+        backup_snapshots, present, snap, backup_endpoint
+    )
+    if parent:
+        logger.debug("Found corresponding parent: %s", parent.get_name())
+    else:
+        # Degrade to time-based parent finding when no correspondent exists
+        parent = snap.find_parent(present)
+        if parent:
+            logger.debug("Found time-based parent: %s", parent.get_name())
+
+    # A parent that is not OLDER than this snapshot means sending it backwards.
+    # Both selectors can produce one: find_parent deliberately falls back to the
+    # oldest present (__util__.Snapshot.find_parent, an optimisation for the
+    # BACKUP direction) and correspondence matches on identity without consulting
+    # time. Neither was reachable here while the destination always listed empty,
+    # so reading it under the right prefix makes both reachable at once. A full
+    # send is what this path has always produced in that situation, and fixing
+    # the listing must not silently change what gets sent.
+    if parent is not None and not (parent < snap):
+        logger.debug(
+            "Not using %s as a parent for %s: it is not older. Restore has never "
+            "sent a reverse incremental; sending in full.",
+            parent.get_name(),
+            snap.get_name(),
+        )
+        parent = None
+    return parent
+
+
 def restore_snapshots(
     backup_endpoint,
     local_endpoint,
@@ -515,8 +557,38 @@ def restore_snapshots(
 
     logger.info("Found %d snapshot(s) at backup location", len(backup_snapshots))
 
-    # List existing local snapshots
-    local_snapshots = local_endpoint.list_snapshots()
+    # Read the destination under the SAME prefix the source ended up being read
+    # under. _prepare_local_endpoint's docstring already required this -- "the
+    # local endpoint must parse already-restored subvolumes under the SAME
+    # prefix, or it fails to recognize them and the restore chain re-restores an
+    # existing parent" -- and it held while the prefix came from --prefix. It
+    # stopped holding once the prefix could be INFERRED: inference updates the
+    # source endpoint, the destination was built earlier from an empty --prefix,
+    # and nothing carried the answer across. The destination then listed as
+    # empty, so a snapshot sitting right there was invisible and got re-sent
+    # onto its own name: "creating subvolume ... failed: File exists".
+    #
+    # Copied UNCONDITIONALLY rather than inside the inference branch above.
+    # `restore --interactive` lists (and therefore infers) before it ever calls
+    # this function, so by the time we get here the source listing succeeds on
+    # the first attempt and that branch never runs -- while the prefix it left
+    # behind is exactly the one the destination needs. Keying off "did we infer
+    # just now" would fix the plain path and quietly leave -i broken.
+    #
+    # Only a real string is copied. Callers in tests hand in doubles whose
+    # config.get returns a mock, and a mock reaching str.startswith raises
+    # inside the listing rather than here, where the cause would be obvious.
+    _source_prefix = backup_endpoint.config.get("snap_prefix", "")
+    if isinstance(_source_prefix, str):
+        logger.debug(
+            "Reading the destination under the source's prefix %r", _source_prefix
+        )
+        local_endpoint.config["snap_prefix"] = _source_prefix
+
+    # List existing local snapshots. flush_cache because the prefix may have just
+    # changed: a listing memoised under the old one would return the stale empty
+    # set, which is the very failure being fixed and produces no error of its own.
+    local_snapshots = local_endpoint.list_snapshots(flush_cache=True)
     local_names = {s.get_name() for s in local_snapshots}
     logger.debug("Found %d existing local snapshot(s)", len(local_snapshots))
 
@@ -589,15 +661,15 @@ def restore_snapshots(
     if dry_run:
         logger.info("Dry run - no changes made")
         for i, snap in enumerate(to_restore, 1):
-            # Correspondence-based parent (received_uuid for btrfs, name for raw)
-            parent, _local_match = find_parent_by_correspondence(
-                backup_snapshots, local_snapshots, snap, backup_endpoint
+            # The same chooser the real run uses, so the preview cannot promise a
+            # transfer that will not happen. `present` is what WILL be at the
+            # destination by the time this snapshot is reached.
+            parent = _choose_parent(
+                backup_snapshots,
+                [s for s in to_restore if s != snap] + local_snapshots,
+                snap,
+                backup_endpoint,
             )
-            if not parent:
-                # Degrade to time-based parent finding when no correspondent exists
-                parent = snap.find_parent(
-                    [s for s in to_restore if s != snap] + local_snapshots
-                )
             mode = "incremental" if parent else "full"
             parent_info = f" from {parent.get_name()}" if parent else ""
             logger.info(
@@ -624,17 +696,9 @@ def restore_snapshots(
         # Then fall back to name/time-based matching
         parent = None
         if not no_incremental:
-            # Correspondence-based parent (received_uuid for btrfs, name for raw)
-            parent, _local_match = find_parent_by_correspondence(
+            parent = _choose_parent(
                 backup_snapshots, restored_snapshots, snap, backup_endpoint
             )
-            if parent:
-                logger.debug("Found corresponding parent: %s", parent.get_name())
-            else:
-                # Degrade to time-based parent finding when no correspondent exists
-                parent = snap.find_parent(restored_snapshots)
-                if parent:
-                    logger.debug("Found time-based parent: %s", parent.get_name())
 
             # The ``btrfs send -p <parent>`` diff is computed ON THE BACKUP SIDE (the
             # REMOTE host for an ssh:// source, the local backup dir otherwise). A parent
