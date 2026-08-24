@@ -358,13 +358,29 @@ class TestCheckSnapshotCollision:
         result = check_snapshot_collision("snap-nonexistent", mock_endpoint)
         assert result is False
 
-    def test_handles_error(self):
-        """Test graceful handling of errors."""
+    def test_an_unreadable_destination_raises_instead_of_answering(self):
+        """A check that could not run is not a check that found nothing.
+
+        This used to return False -- "no collision" -- so a caller acting on it
+        would receive onto a name that may already exist, which is the failure
+        the function exists to prevent. Not knowing and knowing-there-is-nothing
+        are different answers and must not share a return value.
+        """
         mock_endpoint = MagicMock()
         mock_endpoint.list_snapshots.side_effect = Exception("Network error")
 
-        result = check_snapshot_collision("snap-1", mock_endpoint)
-        assert result is False  # Default to no collision on error
+        with pytest.raises(RestoreError, match="Refusing to assume"):
+            check_snapshot_collision("snap-1", mock_endpoint)
+
+    def test_the_error_names_the_snapshot_and_the_cause(self):
+        mock_endpoint = MagicMock()
+        mock_endpoint.list_snapshots.side_effect = Exception("Network error")
+
+        with pytest.raises(RestoreError) as caught:
+            check_snapshot_collision("snap-1", mock_endpoint)
+        message = str(caught.value)
+        assert "snap-1" in message
+        assert "Network error" in message
 
 
 class TestListRemoteSnapshots:

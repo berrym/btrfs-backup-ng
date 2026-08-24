@@ -201,17 +201,25 @@ def check_snapshot_collision(
         destination_endpoint: Destination endpoint
 
     Returns:
-        True if collision exists, False otherwise
+        True if a snapshot of that name is already at the destination.
+
+    Raises:
+        RestoreError: if the destination could not be read at all.
+
+    A check that could not run used to return False -- "no collision" -- and a
+    caller acting on that would receive onto a name that already exists, which
+    is the failure this function is meant to prevent. Not knowing is not the
+    same as knowing there is nothing there, so it now says which one it is and
+    lets the caller decide.
     """
     try:
         existing = destination_endpoint.list_snapshots(flush_cache=True)
-        for snap in existing:
-            if snap.get_name() == snapshot_name:
-                return True
-        return False
     except Exception as e:
-        logger.warning("Could not check for collision: %s", e)
-        return False
+        raise RestoreError(
+            f"Could not read the destination to check whether {snapshot_name!r} "
+            f"is already there ({e}). Refusing to assume it is not."
+        ) from e
+    return any(snap.get_name() == snapshot_name for snap in existing)
 
 
 def verify_restored_snapshot(
@@ -287,6 +295,20 @@ def restore_snapshot(
 
     snapshot_name = snapshot.get_name()
     parent_name = parent.get_name() if parent else None
+
+    # Refuse before streaming rather than after. `btrfs receive` names the
+    # subvolume it creates after the source, so receiving onto a name that is
+    # already there fails with "creating subvolume ... failed: File exists" --
+    # having transferred the whole snapshot first. The callers filter by name
+    # already; this catches what reaches here anyway, which is how the 0.9.5
+    # known issue surfaced. If the destination cannot be read at all, that is
+    # raised rather than treated as "nothing is there".
+    if check_snapshot_collision(snapshot_name, local_endpoint):
+        raise RestoreError(
+            f"{snapshot_name} is already at the destination. Receiving onto a "
+            f"name that exists fails after transferring everything, so this "
+            f"stops now. Remove it first, or restore to a different path."
+        )
 
     logger.info("Restoring %s ...", snapshot_name)
     if parent:
@@ -647,7 +669,22 @@ def restore_snapshots(
         to_restore = all_to_restore
 
     if not to_restore:
-        logger.info("No snapshots need to be restored")
+        # Say WHY there is nothing to do. "No snapshots need to be restored" is
+        # true for several different situations and distinguishes none of them,
+        # so an operator who named a snapshot and got it back could not tell
+        # whether it was already present, filtered out, or never found. The
+        # answer is not a failure -- asking for a snapshot that is already at
+        # the destination is a satisfied request, and a restore script that
+        # re-runs after success must keep succeeding -- but it has to be said.
+        already_present = [t.get_name() for t in targets if t.get_name() in local_names]
+        if already_present:
+            stats["skipped"] += len(already_present)
+            logger.info(
+                "Already at the destination, so nothing to do: %s",
+                ", ".join(already_present),
+            )
+        else:
+            logger.info("No snapshots need to be restored")
         return stats
 
     # Show restore plan
