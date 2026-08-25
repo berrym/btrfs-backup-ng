@@ -61,10 +61,11 @@ btrfs-backup-ng = "btrfs_backup_ng.__main__:main"
 testpaths = ["tests"]
 python_files = ["test_*.py"]
 python_functions = ["test_*"]
-addopts = "-v --tb=short -m 'not tier2'"
+addopts = "-v --tb=short -m 'not tier2 and not tier3'"
 asyncio_mode = "auto"
 markers = [
     "tier2: Tier 2 integration tests requiring real btrfs and root privileges",
+    "tier3: Tier 3 acceptance matrix -- drives the real CLI against real btrfs and a real remote host",
 ]
 
 [tool.coverage.run]
