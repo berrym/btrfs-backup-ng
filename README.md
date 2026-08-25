@@ -1601,7 +1601,7 @@ The restore command:
 | `-i, --interactive` | Interactive snapshot selection |
 | `--dry-run` | Show what would be restored without making changes |
 | `--no-incremental` | Force full transfers (skip incremental) |
-| `--overwrite` | Overwrite existing snapshots instead of skipping |
+| `--overwrite` | **Not supported.** Reports that existing snapshots were left in place and continues; nothing at the destination is deleted. Remove a snapshot yourself to replace it |
 | `--in-place` | Restore to original location (DANGEROUS, requires confirmation) |
 | `--yes-i-know-what-i-am-doing` | Confirm dangerous operations like in-place restore |
 | `--prefix PREFIX` | Snapshot prefix filter (include trailing hyphen, e.g., `home-`) |
@@ -1903,8 +1903,10 @@ By default, snapshots that already exist locally are skipped:
 # Skip existing (default)
 btrfs-backup-ng restore ssh://...:/backups/home /mnt/restore
 
-# Overwrite existing snapshots
-btrfs-backup-ng restore ssh://...:/backups/home /mnt/restore --overwrite
+# --overwrite is NOT supported: it reports and leaves existing snapshots alone.
+# To replace one, remove it and restore again.
+sudo btrfs subvolume delete /mnt/restore/home-20240101-120000
+btrfs-backup-ng restore ssh://...:/backups/home /mnt/restore
 ```
 
 ### Recovery from Failed Restores
@@ -2041,9 +2043,14 @@ sudo btrfs-backup-ng restore /mnt/backup /mnt/restore --no-fs-checks
 
 **"btrfs send/receive failed" when snapshot already exists:**
 ```bash
-# By default, existing snapshots are skipped but may show errors
-# Use --overwrite to replace existing snapshots
-btrfs-backup-ng restore /mnt/backup /mnt/restore --overwrite --no-fs-checks
+# `btrfs receive` names the subvolume after the source, so receiving onto a name
+# that already exists fails. Remove the existing snapshot, then restore again:
+sudo btrfs subvolume delete /mnt/restore/<snapshot-name>
+btrfs-backup-ng restore /mnt/backup /mnt/restore --no-fs-checks
+
+# --overwrite does NOT do this for you. Replacing a snapshot means deleting it
+# before its replacement arrives, and that window could not be made safe: see
+# docs/RESTORE-OVERWRITE.md. Doing it by hand keeps the decision yours.
 
 # Or restore to a clean directory
 mkdir /mnt/restore-new
@@ -3218,6 +3225,7 @@ src/btrfs_backup_ng/
 - [Migrating from btrbk](docs/MIGRATING-FROM-BTRBK.md) - Guide for btrbk users
 - [Snapper Integration](docs/SNAPPER-INTEGRATION.md) - Backing up and restoring snapper snapshots
 - [Remote Locks](docs/REMOTE-LOCKS.md) - How a restore is protected from a concurrent prune
+- [Replacing a restore destination](docs/RESTORE-OVERWRITE.md) - Why `--overwrite` does not replace, and what a future design must satisfy
 - [Changelog](CHANGELOG.md) - Version history and release notes
 
 ### Example Configurations

@@ -5,6 +5,73 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **Re-running an interrupted restore no longer fails on the snapshot it should
+  have skipped** — the known issue shipped in 0.9.5. Restore works out the prefix
+  a location uses when you did not pass `--prefix`, but only the source learned
+  it; the destination was still read under the empty prefix it was built with, so
+  a snapshot sitting right there was invisible and got re-sent onto its own name
+  (`creating subvolume ... failed: File exists`). Both sides are now read under
+  the same prefix.
+
+- **Incremental restore from a `raw://` or `raw+ssh://` backup silently became a
+  full transfer** — raw snapshots do not record a prefix, so a comparison that
+  demanded an exact match discarded every one of them and no incremental parent
+  was ever found. Restores still succeeded, just by sending everything. Where
+  neither side declares a prefix, the names are asked instead, using the same
+  split every listing already uses.
+
+- **`restore --interactive` and `restore --status` disagreed with `restore
+  --list` about the same location** — `--interactive` answered "No snapshots
+  available" and the restore then exited 0 having restored nothing, for a
+  location the same command without `-i` restores fine; `--status` reported
+  "Available snapshots: 0" for a location `--list` shows as full. All three now
+  go through one lister and each says which prefix it used.
+
+- **Asking for a snapshot that is already at the destination said nothing
+  useful** — it reported "No snapshots need to be restored", the same sentence
+  used when nothing matched and when the location was empty. It now names what it
+  found and counts it as skipped. The exit status stays 0: a request that is
+  already satisfied is not a failed restore, and a restore script that re-runs
+  after success must keep working.
+
+- **A collision check that could not run reported "no collision"** — so a caller
+  acting on it would receive onto a name that may already exist, which is what
+  the check exists to prevent. It now raises, naming the snapshot and the cause.
+
+- **A restore could abort entirely on a destination holding an unrelated
+  snapshot** — ordering two snapshots with different prefixes raises, and the
+  parent search compared as it walked. An unorderable pair now falls back to a
+  full send, which always works.
+
+- **An undeliverable backup is found before the transfer starts** — a corrupt
+  stream, a missing decompressor or an unsupported cipher were all detected
+  inside the send, so the failure arrived mid-transfer. They are checked first.
+
+### Changed
+
+- **`--overwrite` does not replace snapshots and says so** — it reports that
+  existing snapshots were left in place and the restore continues, bringing back
+  whatever is missing. Nothing at the destination is deleted.
+
+  Replacement was implemented, put through four adversarial reviews, and
+  withdrawn. `btrfs receive` names the subvolume after its source, so replacing
+  means deleting the existing copy first, and there is no way to stage the
+  replacement instead: a received subvolume cannot be renamed or moved, and btrfs
+  refuses to clear its read-only flag while the `received_uuid` incremental send
+  depends on is set. The destination therefore holds neither copy while the
+  transfer runs, and each review found another way for that window to end in
+  permanent loss — most conclusively a corrupt backup, where every check of
+  whether the replacement could be delivered ran after the deletion, so the last
+  good copy was destroyed to make room for something that could not arrive.
+
+  To replace a snapshot, remove it and restore again. See
+  [docs/RESTORE-OVERWRITE.md](docs/RESTORE-OVERWRITE.md) for the full reasoning
+  and the constraint a future design has to satisfy.
+
 ## [0.9.5] - 2026-08-23
 
 The "a lock only one process can see is not a lock" release.
