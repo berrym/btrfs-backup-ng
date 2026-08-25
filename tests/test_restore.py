@@ -763,11 +763,15 @@ class TestRestoreSnapshotsExecution:
             dry_run=False,
         )
 
-        # The whole chain, not just snap-3. This previously asserted == 1 with
-        # the comment "chain stops at snap-2 which exists", alongside
-        # "skip_existing=False means no skipping" -- the two together describe a
-        # flag that skipped nothing because nothing reached the filter.
-        assert stats["restored"] == 3
+        # Only snap-3, the snapshot actually asked for. snap-2 is present at the
+        # destination and is an ANCESTOR, not the target -- it stays put and
+        # serves as the incremental base, which is what it is for.
+        #
+        # This briefly asserted == 3 on the way to fixing --overwrite, which was
+        # wrong: suppressing the truncation for every ancestor made
+        # `--overwrite --snapshot snap-3` delete snap-1 and snap-2 as well,
+        # neither of which the operator named.
+        assert stats["restored"] == 1
         assert stats["skipped"] == 0
 
     @patch("btrfs_backup_ng.core.restore.restore_snapshot")

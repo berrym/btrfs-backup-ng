@@ -337,7 +337,9 @@ def _execute_main_restore(args: argparse.Namespace) -> int:
     snapshot_name = getattr(args, "snapshot", None)
     restore_all = getattr(args, "all", False)
     overwrite = getattr(args, "overwrite", False)
-    if overwrite and not force:
+    # A dry run deletes nothing, so gating it refuses the one command an operator
+    # would use to SEE what --overwrite is about to do before consenting to it.
+    if overwrite and not force and not getattr(args, "dry_run", False):
         # --overwrite deletes the existing subvolume before receiving its
         # replacement, and there is no atomic swap available: a received
         # subvolume is read-only and cannot even be moved. So the destination
