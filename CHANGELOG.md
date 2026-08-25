@@ -47,6 +47,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   parent search compared as it walked. An unorderable pair now falls back to a
   full send, which always works.
 
+- **A restore that failed to lock its parent left the snapshot locked forever**
+  — the two locks were taken one after the other, but only the block that
+  releases them covered the second, so a failure in between left the first in
+  place. Since 0.9.5 a lock on a remote target persists rather than dying with
+  the process, so the leaked one blocked every later prune of that snapshot
+  until it aged out as stale. Both are now released, and only the ones actually
+  taken.
+
+- **`--dry-run` could describe a restore different from the one performed** — it
+  ignored `--no-incremental` and previewed incrementals that the run would send
+  in full, offered snapshots as parents that would not be at the destination
+  yet, and named parents that are not on the backup side (where `btrfs send -p`
+  computes the delta). The preview and the run now make the same choice from the
+  same inputs, which is what sizing a restore over a slow link depends on.
+
 - **An undeliverable backup is found before the transfer starts** — a corrupt
   stream, a missing decompressor or an unsupported cipher were all detected
   inside the send, so the failure arrived mid-transfer. They are checked first.

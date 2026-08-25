@@ -316,11 +316,16 @@ def restore_snapshot(
     else:
         logger.info("  No parent available (full restore)")
 
-    # Set lock on backup to prevent deletion during restore
+    # Set lock on backup to prevent deletion during restore.
+    #
+    # Both pins are taken INSIDE the try, and the finally releases exactly what
+    # was acquired. Taking the parent pin outside it leaked the snapshot pin
+    # whenever the parent pin failed -- the finally had not been entered yet, so
+    # nothing released the first one. Since 0.9.5 those pins PERSIST on a remote
+    # target, so a leaked one no longer dies with the process: it blocks every
+    # later prune of that snapshot indefinitely.
     lock_id = f"restore:{session_id}"
-    backup_endpoint.set_lock(snapshot, lock_id, True)
-    if parent:
-        backup_endpoint.set_lock(parent, lock_id, True, parent=True)
+    acquired: list[tuple[Any, bool]] = []
 
     restore_start = time.monotonic()
 
@@ -338,6 +343,12 @@ def restore_snapshot(
     )
 
     try:
+        backup_endpoint.set_lock(snapshot, lock_id, True)
+        acquired.append((snapshot, False))
+        if parent:
+            backup_endpoint.set_lock(parent, lock_id, True, parent=True)
+            acquired.append((parent, True))
+
         # Prove the backup can be delivered before streaming it. Every read-side
         # check -- a corrupt stream, a missing decompressor, an unsupported
         # cipher -- otherwise lives inside send_snapshot, so a failure is found
@@ -390,10 +401,18 @@ def restore_snapshot(
         raise RestoreError(f"Restore failed for {snapshot_name}: {e}")
 
     finally:
-        # Release locks
-        backup_endpoint.set_lock(snapshot, lock_id, False)
-        if parent:
-            backup_endpoint.set_lock(parent, lock_id, False, parent=True)
+        # Release locks -- only the ones actually taken, and never let a failed
+        # release mask the error that is already propagating.
+        for locked, is_parent in reversed(acquired):
+            try:
+                backup_endpoint.set_lock(locked, lock_id, False, parent=is_parent)
+            except Exception as release_error:  # noqa: BLE001
+                logger.warning(
+                    "Could not release the restore lock on %s: %s. It will be "
+                    "swept once it goes stale.",
+                    locked.get_name(),
+                    release_error,
+                )
 
 
 def _retry_with_inferred_prefix(backup_endpoint: Any) -> list[Any]:
@@ -476,14 +495,6 @@ def _choose_parent(backup_snapshots, present, snap, backup_endpoint):
     what WILL be there, the execution passes what IS. The selection rules must
     not differ, and now cannot.
     """
-    # Only snapshots from the SAME volume can be parents. A different prefix is
-    # a different volume: no shared history, so no delta for `btrfs send -p` to
-    # compute. Filtered BEFORE selection rather than after, because
-    # Snapshot.__lt__ raises NotImplementedError("prefixes don't match") and
-    # find_parent compares as it walks -- so a single foreign snapshot at the
-    # destination aborted the whole restore before any guard downstream could
-    # refuse it. That is reachable for raw sources, whose snapshots carry no
-    # prefix at all.
     # Only snapshots from the SAME volume can be parents: a different prefix is
     # a different volume, so there is no shared history for `btrfs send -p` to
     # compute a delta against. Filtered BEFORE selection because
@@ -532,9 +543,14 @@ def _choose_parent(backup_snapshots, present, snap, backup_endpoint):
             theirs = __util__.infer_snapshot_prefix(str(candidate.get_name()))
         except Exception:  # noqa: BLE001 - an unnameable candidate is unusable
             return False
-        if mine is None or theirs is None:
+        if mine is None and theirs is None:
+            # Neither name parses as <prefix><timestamp>, so there is genuinely
+            # nothing to distinguish them by and refusing would make every such
+            # restore a full transfer.
             return True
-        return mine == theirs
+        # One name yields a volume and the other does not: they are not
+        # demonstrably the same, and a wrong parent is worse than a full send.
+        return mine is not None and mine == theirs
 
     present = [p for p in present if _same_volume(p)]
 
@@ -784,7 +800,11 @@ def restore_snapshots(
                 ", ".join(already_present),
             )
         else:
-            logger.info("Already at the destination, so nothing to do: everything")
+            # Nothing was already present, so the emptiness has another cause:
+            # nothing matched, or everything was filtered. This branch briefly
+            # announced "Already at the destination ... everything", which states
+            # the opposite of the condition that reaches it.
+            logger.info("No snapshots need to be restored")
         return stats
 
     # Show restore plan
@@ -798,15 +818,36 @@ def restore_snapshots(
     if dry_run:
         logger.info("Dry run - no changes made")
         for i, snap in enumerate(to_restore, 1):
-            # The same chooser the real run uses, so the preview cannot promise a
-            # transfer that will not happen. `present` is what WILL be at the
-            # destination by the time this snapshot is reached.
-            parent = _choose_parent(
-                backup_snapshots,
-                [s for s in to_restore if s != snap] + local_snapshots,
-                snap,
-                backup_endpoint,
-            )
+            # The same chooser the real run uses, under the same condition, over
+            # the same set -- otherwise the preview describes a transfer the run
+            # will not perform, which is exactly what an operator sizing a restore
+            # over a slow link relies on it not to do.
+            #
+            # `present` is what will be at the destination when this snapshot is
+            # reached: the ones EARLIER in the chain, plus whatever was already
+            # there. Passing the whole chain named parents that do not exist yet.
+            if no_incremental:
+                parent = None
+            else:
+                parent = _choose_parent(
+                    backup_snapshots,
+                    local_snapshots + to_restore[: i - 1],
+                    snap,
+                    backup_endpoint,
+                )
+                # The run remaps the chosen parent to the BACKUP-side snapshot
+                # of the same name and drops to a full send when it is not
+                # there. Without the same step the preview promises an
+                # incremental the run will not perform.
+                if parent is not None:
+                    parent = next(
+                        (
+                            b
+                            for b in backup_snapshots
+                            if b.get_name() == parent.get_name()
+                        ),
+                        None,
+                    )
             mode = "incremental" if parent else "full"
             parent_info = f" from {parent.get_name()}" if parent else ""
             logger.info(

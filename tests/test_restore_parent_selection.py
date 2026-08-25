@@ -12,7 +12,9 @@ falls back to what the NAMES imply, via the same split every listing uses.
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
+
+import pytest
 
 from btrfs_backup_ng.core import restore as core_restore
 
@@ -333,3 +335,204 @@ class TestTheBackupIsProvenBeforeStreaming:
                 ):
                     core_restore.restore_snapshot(backup, destination, self._snapshot())
         assert sent == [1]
+
+
+class TestThePreviewMatchesTheRun:
+    """A dry run is what an operator uses to size a restore before starting it.
+
+    `_choose_parent` exists so the preview cannot describe a transfer the run
+    will not perform. Two things still let them diverge: the preview did not
+    honour `--no-incremental`, and it offered every snapshot in the chain as a
+    candidate parent rather than only the ones that will already be at the
+    destination when a given snapshot is reached.
+    """
+
+    def _endpoint(self, names):
+        import sys
+
+        sys.path.insert(0, "tests")
+        from test_restore_destination_prefix_parity import _Endpoint
+
+        return _Endpoint(names)
+
+    def test_no_incremental_previews_full_sends(self, caplog):
+        backup = self._endpoint(["home-20240101T120000", "home-20240102T120000"])
+        with caplog.at_level("INFO"):
+            core_restore.restore_snapshots(
+                backup,
+                self._endpoint([]),
+                restore_all=True,
+                dry_run=True,
+                no_incremental=True,
+            )
+        assert "incremental" not in caplog.text, (
+            "the preview promised an incremental that --no-incremental forbids"
+        )
+
+    def test_the_first_snapshot_has_no_parent_to_offer(self, caplog):
+        """Nothing precedes it, so it must preview as a full send. Passing the
+        whole chain let it name a LATER snapshot as its parent."""
+        backup = self._endpoint(["home-20240101T120000", "home-20240102T120000"])
+        with caplog.at_level("INFO"):
+            core_restore.restore_snapshots(
+                backup, self._endpoint([]), restore_all=True, dry_run=True
+            )
+        first = [
+            line
+            for line in caplog.text.splitlines()
+            if "home-20240101T120000" in line and "Would restore" in line
+        ]
+        assert first, "the first snapshot was never previewed"
+        assert "(full)" in first[0], (
+            f"the first snapshot was previewed against a parent that will not be "
+            f"at the destination yet: {first[0]}"
+        )
+
+
+class TestSameVolumeMatchesItsOwnComment:
+    """ "Cannot-tell on BOTH names is the only case that accepts" -- the code
+    accepted when EITHER was unknown, which is not the same rule."""
+
+    def test_one_sided_uncertainty_refuses(self):
+        from datetime import datetime, timezone
+        from pathlib import Path
+
+        from btrfs_backup_ng.endpoint.raw_metadata import RawSnapshot
+
+        def raw(name, stamp):
+            return RawSnapshot(
+                name=name,
+                stream_path=Path(f"/backup/{name}.btrfs"),
+                created=datetime.strptime(stamp, "%Y%m%d-%H%M%S").replace(
+                    tzinfo=timezone.utc
+                ),
+            )
+
+        target = raw("home-20240102-120000", "20240102-120000")
+        unparseable = raw("not-a-snapshot-name", "20240101-120000")
+
+        backup = MagicMock()
+        backup.correspondent_of.return_value = None
+        assert (
+            core_restore._choose_parent([target], [unparseable], target, backup) is None
+        ), "a candidate whose volume cannot be determined was used as a parent"
+
+
+class TestThePreviewAndTheRunAgree:
+    """Drive both paths over the same inputs and compare, rather than asserting
+    on either one alone.
+
+    A preview that disagrees with the run is worse than no preview: it is what
+    an operator sizes a restore by before committing to it over a slow link.
+    Two divergences survived the first parity fix -- the preview ordered
+    `present` differently from the run, and it skipped the run's remap of the
+    chosen parent onto the backup side (which drops to a full send when the
+    parent is not there).
+    """
+
+    def _endpoints(self, backup_names, local_names):
+        import sys
+
+        sys.path.insert(0, "tests")
+        from test_restore_destination_prefix_parity import _Endpoint
+
+        return _Endpoint(backup_names), _Endpoint(local_names)
+
+    def _plan(self, caplog, marker):
+        """(name, mode, parent) for each line the given path announced."""
+        out = []
+        for line in caplog.text.splitlines():
+            if marker not in line:
+                continue
+            body = line.split(marker, 1)[1].strip()
+            name = body.split(" ", 1)[0]
+            detail = body[body.find("(") + 1 : body.rfind(")")]
+            if detail.startswith("incremental from "):
+                out.append((name, "incremental", detail.split("from ", 1)[1]))
+            else:
+                out.append((name, "full", None))
+        return out
+
+    @pytest.mark.parametrize(
+        ("backup_names", "local_names", "no_incremental"),
+        [
+            (["home-20240101T120000", "home-20240102T120000"], [], False),
+            (["home-20240101T120000", "home-20240102T120000"], [], True),
+            (
+                [
+                    "home-20240101T120000",
+                    "home-20240102T120000",
+                    "home-20240103T120000",
+                ],
+                ["home-20240101T120000"],
+                False,
+            ),
+        ],
+    )
+    def test_the_preview_describes_what_the_run_does(
+        self, caplog, backup_names, local_names, no_incremental
+    ):
+        backup, local = self._endpoints(backup_names, local_names)
+        with caplog.at_level("INFO"):
+            core_restore.restore_snapshots(
+                backup,
+                local,
+                restore_all=True,
+                dry_run=True,
+                no_incremental=no_incremental,
+            )
+        previewed = self._plan(caplog, "Would restore:")
+
+        caplog.clear()
+        backup, local = self._endpoints(backup_names, local_names)
+        with (
+            patch.object(core_restore, "restore_snapshot"),
+            caplog.at_level("INFO"),
+        ):
+            core_restore.restore_snapshots(
+                backup,
+                local,
+                restore_all=True,
+                no_incremental=no_incremental,
+            )
+        # "] Restoring", not "Restoring": the latter also matches the summary
+        # line "Restoring all N snapshots", which is not a per-snapshot plan.
+        performed = self._plan(caplog, "] Restoring")
+
+        assert previewed, "the preview announced nothing"
+        assert previewed == performed, (
+            f"the dry run described a different restore from the one performed.\n"
+            f"  preview: {previewed}\n"
+            f"  run:     {performed}"
+        )
+
+    def test_a_parent_absent_from_the_backup_previews_as_full(self, caplog):
+        """The run remaps the chosen parent onto the backup side and drops to a
+        full send when it is not there -- `btrfs send -p` computes the delta on
+        the BACKUP side, so a parent that exists only at the destination has no
+        usable path there.
+
+        Pinned directly because the end-to-end parity fixtures cannot reach it:
+        in those, every parent the chooser returns already IS a backup snapshot,
+        so the remap is a no-op and deleting it changes nothing.
+        """
+        backup, local = self._endpoints(
+            ["home-20240101T120000", "home-20240102T120000"], []
+        )
+        only_at_the_destination = MagicMock()
+        only_at_the_destination.get_name.return_value = "home-19990101T120000"
+
+        with (
+            patch.object(
+                core_restore, "_choose_parent", return_value=only_at_the_destination
+            ),
+            caplog.at_level("INFO"),
+        ):
+            core_restore.restore_snapshots(
+                backup, local, restore_all=True, dry_run=True
+            )
+
+        assert "home-19990101T120000" not in caplog.text, (
+            "the preview promised an incremental against a parent that is not "
+            "on the backup side, which the run would send in full instead"
+        )

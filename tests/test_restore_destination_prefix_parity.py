@@ -16,7 +16,6 @@ Shipped as a known issue in 0.9.5 with `--prefix` as the workaround.
 from __future__ import annotations
 
 import re
-from unittest.mock import patch
 
 import pytest
 
@@ -243,12 +242,60 @@ class TestTheFixIsANoOpWhereItShouldBe:
         )
         assert destination.listed_under[-1] == ""
 
-    def test_a_failed_inference_does_not_corrupt_the_destination_prefix(self):
-        """Inference that finds nothing must not set a garbage prefix."""
+    def test_a_failed_inference_does_not_corrupt_the_prefix(self):
+        """Inference that finds nothing must put the prefix back.
+
+        The previous version of this test patched out
+        `_retry_with_inferred_prefix` and then asserted on the DESTINATION's
+        prefix -- which that function never touches. It exercised nothing and
+        passed even with both restore paths deleted.
+        """
         backup = _Endpoint([], prefix="")
-        destination = _Endpoint(["home-20240101T120000"], prefix="")
-        with patch.object(core_restore, "_retry_with_inferred_prefix", lambda ep: []):
-            core_restore.restore_snapshots(
-                backup, destination, restore_all=True, dry_run=True
-            )
-        assert destination.config["snap_prefix"] == ""
+        backup.prefixes_present = lambda: {"garbage-": 1}
+        assert core_restore._retry_with_inferred_prefix(backup) == []
+        assert backup.config["snap_prefix"] == "", (
+            "a prefix that yielded nothing was left on the endpoint, so every "
+            "later listing filters on it"
+        )
+
+    def test_a_listing_that_raises_also_puts_the_prefix_back(self):
+        """The failure path restores it too, or the exception leaks a bad prefix."""
+
+        class _Raises(_Endpoint):
+            def list_snapshots(self, flush_cache=False):
+                if self.config.get("snap_prefix"):
+                    raise OSError("backup location went away")
+                return []
+
+        backup = _Raises([], prefix="")
+        backup.prefixes_present = lambda: {"home-": 1}
+        assert core_restore._retry_with_inferred_prefix(backup) == []
+        assert backup.config["snap_prefix"] == "", (
+            "a listing that raised left the inferred prefix on the endpoint"
+        )
+
+    def test_the_retry_is_not_served_from_the_stale_cache(self):
+        """The real endpoint memoises its listing.
+
+        The caller has already listed once under the old prefix, so a retry that
+        does not flush gets that cached empty result back and the whole
+        inference is silently a no-op -- which is what the code comment says.
+        """
+
+        class _Caching(_Endpoint):
+            """Memoises like the base endpoint: only flush_cache re-reads."""
+
+            _cache = None
+
+            def list_snapshots(self, flush_cache=False):
+                if self._cache is None or flush_cache:
+                    self._cache = super().list_snapshots()
+                return self._cache
+
+        backup = _Caching(["home-20240101T120000"], prefix="")
+        assert backup.list_snapshots() == []  # the caller's first listing
+        found = core_restore._retry_with_inferred_prefix(backup)
+        assert [s.get_name() for s in found] == ["home-20240101T120000"], (
+            "the retry was served the stale empty listing, so inference found "
+            "nothing that was plainly there"
+        )

@@ -547,6 +547,20 @@ class TestFindSnapshotBeforeTimeEdgeCases:
         assert result.get_name() == "snap-2"
 
 
+def _released(endpoint, snapshot):
+    """Whether `endpoint` was asked to drop its pin on `snapshot`.
+
+    Matches on the snapshot and the lock state only. The release now names
+    `parent=` explicitly -- releasing exactly what was acquired -- so an
+    exact-call assertion pins the argument spelling rather than the behaviour.
+    """
+    return any(
+        call.args[0] is snapshot and call.args[2] is False
+        for call in endpoint.set_lock.call_args_list
+        if len(call.args) >= 3
+    )
+
+
 class TestRestoreSnapshotsExecution:
     """Tests for actual execution paths in restore_snapshots."""
 
@@ -1587,8 +1601,11 @@ class TestRestoreSnapshot:
         # Verify send_snapshot was called
         mock_send.assert_called_once()
 
-        # Verify lock was released
-        backup_endpoint.set_lock.assert_any_call(snapshot, ANY, False)
+        # Verify lock was released. Asserted by SNAPSHOT and STATE rather than
+        # by exact call shape: the release passes `parent=` explicitly so that
+        # only what was actually pinned is unpinned, and `parent=False` is the
+        # same call this always made.
+        assert _released(backup_endpoint, snapshot), "the snapshot was never unpinned"
 
     @patch("btrfs_backup_ng.core.restore.verify_restored_snapshot")
     @patch("btrfs_backup_ng.core.restore.send_snapshot")
@@ -1684,7 +1701,12 @@ class TestRestoreSnapshot:
             restore_snapshot(backup_endpoint, local_endpoint, snapshot, parent=parent)
 
         # Verify locks were released
-        backup_endpoint.set_lock.assert_any_call(snapshot, ANY, False)
+        assert _released(backup_endpoint, snapshot), (
+            "the snapshot stayed pinned after a failed restore"
+        )
+        assert _released(backup_endpoint, parent), (
+            "the parent stayed pinned after a failed restore"
+        )
         backup_endpoint.set_lock.assert_any_call(parent, ANY, False, parent=True)
 
 
