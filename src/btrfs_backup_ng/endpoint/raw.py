@@ -1320,6 +1320,22 @@ class RawEndpoint(Endpoint):
         Returns:
             Popen object with stdout containing the decompressed/decrypted stream
         """
+        self.preflight_send(snapshot)
+        pipeline = self._build_restore_pipeline(snapshot)
+        return self._execute_restore_pipeline(pipeline, snapshot.stream_path)
+
+    def preflight_send(self, snapshot: Any) -> None:
+        """Every read-side check ``send`` makes, without starting the transfer.
+
+        Split out of ``send`` so a caller about to delete the copy it is
+        replacing can find out FIRST whether this stream can be delivered. These
+        checks all used to run inside ``send``, i.e. after `--overwrite` had
+        already removed the operator's copy: a corrupt stream then cost them the
+        last good copy, and the failure advice ("run the same command again")
+        failed identically every time.
+
+        Raises exactly what ``send`` raises, so nothing is weakened by moving it.
+        """
         if not isinstance(snapshot, RawSnapshot):
             raise TypeError(f"Expected RawSnapshot, got {type(snapshot)}")
         if not snapshot.stream_path.exists():
@@ -1328,7 +1344,6 @@ class RawEndpoint(Endpoint):
         pipeline = self._build_restore_pipeline(snapshot)
         self._preflight_restore_tools(pipeline, snapshot)
         self._verify_stream_integrity(snapshot)
-        return self._execute_restore_pipeline(pipeline, snapshot.stream_path)
 
     def _verify_stream_integrity(self, snapshot: RawSnapshot) -> None:
         """Refuse to restore a stored stream that no longer matches the sha256 sealed

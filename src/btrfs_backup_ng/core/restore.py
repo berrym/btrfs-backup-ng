@@ -16,12 +16,7 @@ from .. import __util__
 from ..__util__ import Snapshot
 from ..transaction import log_transaction
 from . import progress as progress_utils
-from .operations import (
-    _list_snapper_backups_at_destination,
-    _verify_destination_space,
-    send_snapshot,
-)
-from .space import check_space_availability, format_space_check
+from .operations import _list_snapper_backups_at_destination, send_snapshot
 from .target import TargetKind, parse_target
 
 logger = logging.getLogger(__name__)
@@ -37,7 +32,6 @@ def get_restore_chain(
     target_snapshot: Snapshot,
     all_backup_snapshots: list[Snapshot],
     existing_local: list[Snapshot],
-    overwrite: bool = False,
 ) -> list[Snapshot]:
     """Determine which snapshots need to be restored to get target_snapshot.
 
@@ -64,19 +58,7 @@ def get_restore_chain(
 
         # If this snapshot already exists locally, we can stop.
         # It can serve as the incremental base.
-        #
-        # Unless it IS the snapshot the caller asked to replace. --overwrite sets
-        # skip_existing False, but that filter runs LATER and this truncation ran
-        # first, which is why --overwrite did nothing at all.
-        #
-        # Exempting only the TARGET, not every ancestor. Suppressing the
-        # truncation wholesale meant `--overwrite --snapshot snap-3` returned the
-        # entire history -- snap-0, snap-1, snap-2, snap-3 -- and deleted three
-        # subvolumes the operator never named, while the consent they gave spoke
-        # of one. An ancestor that is already present is exactly what an
-        # incremental base is; replacing it is neither asked for nor useful.
-        replaceable = overwrite and current_name == target_snapshot.get_name()
-        if current_name in existing_names and not replaceable:
+        if current_name in existing_names:
             logger.debug(
                 "Found existing local snapshot %s - can use as incremental base",
                 current_name,
@@ -284,166 +266,6 @@ def verify_restored_snapshot(
         raise RestoreError(f"Verification failed: {e}")
 
 
-class _ReplaceFailed(RestoreError):
-    """A failed replacement, carrying whether the old copy was already removed.
-
-    The advisory tells an operator their copy is gone. That must be true when it
-    is said, AND said when it is true -- someone not told goes looking for a copy
-    that no longer exists.
-    """
-
-    def __init__(self, message: str, removed: bool):
-        super().__init__(message)
-        self.removed = removed
-
-
-def _replacement_size(snapshot) -> int:
-    """Bytes the destination must hold for ``snapshot``, or 0 for unknown.
-
-    ``RawSnapshot.size`` is the size of the STREAM FILE -- compressed and
-    possibly encrypted -- not of the subvolume the destination will hold. Using
-    it directly turned a check that never ran into a check that runs against a
-    number which is systematically too small, so it reports enough room, the
-    existing copy is deleted, and the transfer then runs out of space. That is
-    worse than not checking: the old behaviour at least did not claim anything.
-
-    A compressed stream has no reliable expansion factor, so no factor is
-    invented here. Where the recorded size cannot be trusted to represent the
-    destination footprint, this returns 0 -- "unknown" -- and the caller says
-    the check was skipped instead of acting on a wrong number.
-    """
-    size = int(getattr(snapshot, "size", 0) or 0)
-    if size <= 0:
-        return 0
-    compress = getattr(snapshot, "compress", None)
-    if compress and str(compress).lower() not in ("none", "no", ""):
-        logger.debug(
-            "%s is stored compressed (%s), so its %d-byte stream does not give "
-            "the space the destination needs; treating the size as unknown.",
-            snapshot.get_name(),
-            compress,
-            size,
-        )
-        return 0
-    if getattr(snapshot, "encrypt", None):
-        return 0
-    return size
-
-
-def _replace_at_destination(local_endpoint, snapshot_name: str, estimated_bytes: int):
-    """Remove ``snapshot_name`` from the destination so it can be received again.
-
-    There is no atomic swap available here. A received subvolume is read-only
-    and cannot be renamed OR moved -- verified against real btrfs, where even a
-    move to a different parent under the same name fails with EROFS. The snapper
-    path works around this by renaming the *containing directory*, which only
-    works because its layout puts each snapshot in its own directory; a restore
-    destination holds the subvolume directly, so there is nothing to rename
-    around it.
-
-    So the old copy is removed and the new one received in its place, which
-    leaves a window where neither exists. That window costs a retry rather than
-    data: a restore reads the backup and never writes to it, so the authoritative
-    copy is untouched and re-running finishes the job. It would be a different
-    proposition during a backup, where the destination may be the only other copy.
-
-    Where the size of the replacement is known, free space is checked BEFORE
-    anything is deleted, so a destination that cannot hold it is left exactly as
-    it was. ``RawSnapshot`` records a stream size; a btrfs ``Snapshot`` carries
-    none, and obtaining one costs a full ``btrfs send`` pass -- so for btrfs the
-    check is skipped and SAID to be skipped. Claiming a check that did not run
-    is worse than not running it.
-
-    Deleting first also frees the old copy's space, so a like-for-like
-    replacement needs little or none: the check matters when the replacement is
-    substantially larger than what it replaces.
-    """
-    if estimated_bytes <= 0:
-        logger.info(
-            "No size is known for %s, so free space was NOT checked before "
-            "replacing it. The receive will fail if the destination fills up.",
-            snapshot_name,
-        )
-    if estimated_bytes > 0:
-        try:
-            space_info = local_endpoint.get_space_info()
-            check = check_space_availability(space_info, estimated_bytes)
-        except Exception as e:  # noqa: BLE001 - see below
-            # Not knowing is not the same as knowing there is room, but refusing
-            # to replace because the free space could not be read would make
-            # --overwrite unusable wherever the check is unavailable. It says so
-            # and continues; the receive still fails safely if space runs out.
-            logger.warning(
-                "Could not check free space before replacing %s (%s). Continuing; "
-                "the receive will fail if the destination fills up.",
-                snapshot_name,
-                e,
-            )
-        else:
-            if not check.sufficient:
-                raise RestoreError(
-                    f"Not enough room to replace {snapshot_name}: "
-                    f"{format_space_check(check)}. Nothing has been deleted."
-                )
-
-    logger.info("Removing the existing %s to replace it", snapshot_name)
-    removed = False
-    try:
-        existing = [
-            s
-            for s in local_endpoint.list_snapshots(flush_cache=True)
-            if s.get_name() == snapshot_name
-        ]
-        if existing:
-            local_endpoint.delete_snapshots(existing)
-            # Recorded BEFORE the confirmation below. Once the delete is issued
-            # the copy may be gone whatever happens next, and if the confirming
-            # listing itself fails the caller still has to be able to say so.
-            removed = True
-    except Exception as e:
-        raise _ReplaceFailed(
-            f"Could not remove the existing {snapshot_name} at the destination "
-            f"({e}). It has been left in place.",
-            removed=removed,
-        ) from e
-
-    # delete_snapshots does NOT raise when it declines: it logs and moves on for
-    # a locked snapshot, a refused sudo, an incremental parent it will not orphan.
-    # Trusting its return would let the whole snapshot stream out and fail at the
-    # very end with "creating subvolume ... failed: File exists" -- the exact
-    # outcome this function exists to prevent. So the destination is asked again.
-    #
-    # flush_cache because Endpoint.delete_snapshots drops the entry from its own
-    # memo even when the delete FAILED (endpoint/common.py). A cached read would
-    # therefore report the snapshot gone after a failure -- a false clean, and
-    # precisely the answer this confirmation exists to catch.
-    try:
-        still_there = [
-            s
-            for s in local_endpoint.list_snapshots(flush_cache=True)
-            if s.get_name() == snapshot_name
-        ]
-    except Exception as e:
-        # The confirmation could not run, but the delete was already issued, so
-        # the copy may be gone. Say so, rather than leaving the operator to infer
-        # their destination's state from a listing error.
-        raise _ReplaceFailed(
-            f"Could not confirm whether {snapshot_name} was removed ({e}). The "
-            f"removal was already issued, so the copy may be gone. The backup is "
-            f"unchanged; re-running will restore it.",
-            removed=removed,
-        ) from e
-    if still_there:
-        raise RestoreError(
-            f"{snapshot_name} is still at the destination after trying to remove "
-            f"it, so it cannot be replaced. It is most likely locked by another "
-            f"operation, held as the incremental parent of a snapshot that is "
-            f"staying, or the removal was refused for lack of privilege. Nothing "
-            f"has been transferred and the destination is unchanged."
-        )
-    return removed
-
-
 def restore_snapshot(
     backup_endpoint,
     local_endpoint,
@@ -451,9 +273,6 @@ def restore_snapshot(
     parent=None,
     options: dict | None = None,
     session_id: str | None = None,
-    overwrite: bool = False,
-    estimated_bytes: int = 0,
-    on_replaced: Callable[[str], None] | None = None,
 ) -> None:
     """Restore a single snapshot from backup to local.
 
@@ -485,23 +304,11 @@ def restore_snapshot(
     # known issue surfaced. If the destination cannot be read at all, that is
     # raised rather than treated as "nothing is there".
     if check_snapshot_collision(snapshot_name, local_endpoint):
-        if not overwrite:
-            raise RestoreError(
-                f"{snapshot_name} is already at the destination. Receiving onto "
-                f"a name that exists fails after transferring everything, so "
-                f"this stops now. Remove it first, restore to a different path, "
-                f"or pass --overwrite to replace it."
-            )
-        # Decided here, DONE later. Everything between this point and the
-        # transfer can fail -- most notably set_lock, which reaches across the
-        # network and, since locks became persistent, aborts when it cannot
-        # record one. Deleting here would mean an operator loses their copy to a
-        # failure that never moved a byte. The removal is deferred to the last
-        # moment before the stream, so the window is the transfer and nothing
-        # else.
-        replace_first = True
-    else:
-        replace_first = False
+        raise RestoreError(
+            f"{snapshot_name} is already at the destination. Receiving onto a "
+            f"name that exists fails after transferring everything, so this "
+            f"stops now. Remove it first, or restore to a different path."
+        )
 
     logger.info("Restoring %s ...", snapshot_name)
     if parent:
@@ -531,36 +338,14 @@ def restore_snapshot(
     )
 
     try:
-        # Everything that can fail without moving data has now happened: the lock
-        # is held, the parent is chosen, the endpoints are ready. This is the last
-        # point before the stream, and therefore the narrowest the window can be
-        # made -- a received subvolume cannot be renamed or moved (EROFS on real
-        # btrfs, and btrfs refuses to clear the read-only flag while received_uuid
-        # is set), so replacing means removing first and no staging is available.
-        #
-        # INSIDE the try: locks are already held by this point, and a failure here
-        # must still reach the finally that releases them. Outside it, a refused
-        # delete left a persistent restore lock on the backup snapshot, which now
-        # blocks retention from ever pruning it.
-
-        if replace_first:
-            # The transfer layer's OWN space check runs first. send_snapshot
-            # calls _verify_destination_space and raises InsufficientSpaceError
-            # -- but AFTER this deletion, so the operator's copy was destroyed
-            # for a shortage the tool already had the means to detect. The
-            # estimate can be slow on a large subvolume; that is the right
-            # trade against deleting somebody's data.
-            if options.get("check_space", True) and not options.get("force", False):
-                _verify_destination_space(snapshot, local_endpoint, parent, options)
-            really_removed = _replace_at_destination(
-                local_endpoint, snapshot_name, estimated_bytes
-            )
-            if on_replaced is not None and really_removed:
-                # The caller tracks what is present at the destination and
-                # picks incremental parents from it. That list was taken
-                # before this deletion; leaving the removed name in it lets a
-                # later snapshot be sent against a parent that is gone.
-                on_replaced(snapshot_name)
+        # Prove the backup can be delivered before streaming it. Every read-side
+        # check -- a corrupt stream, a missing decompressor, an unsupported
+        # cipher -- otherwise lives inside send_snapshot, so a failure is found
+        # only after the transfer has started. Asking first turns a late failure
+        # into an early, clearer one and costs nothing when the backup is fine.
+        preflight = getattr(backup_endpoint, "preflight_send", None)
+        if callable(preflight):
+            preflight(snapshot)
 
         # Use send_snapshot with swapped endpoints
         # backup_endpoint is the source (has send method)
@@ -602,11 +387,6 @@ def restore_snapshot(
             error=str(e),
         )
         logger.error("Failed to restore %s: %s", snapshot_name, e)
-        if isinstance(e, _ReplaceFailed):
-            # Re-wrapping loses the flag that says whether the destination copy
-            # was already removed, and the caller needs it to decide whether to
-            # tell the operator their copy is gone. Raise the original.
-            raise
         raise RestoreError(f"Restore failed for {snapshot_name}: {e}")
 
     finally:
@@ -968,9 +748,7 @@ def restore_snapshots(
     # Build restore chain(s) for all targets
     all_to_restore = []
     for target in targets:
-        chain = get_restore_chain(
-            target, backup_snapshots, local_snapshots, overwrite=not skip_existing
-        )
+        chain = get_restore_chain(target, backup_snapshots, local_snapshots)
         for snap in chain:
             if snap not in all_to_restore:
                 all_to_restore.append(snap)
@@ -1029,13 +807,6 @@ def restore_snapshots(
                 snap,
                 backup_endpoint,
             )
-            if not skip_existing and snap.get_name() in local_names:
-                logger.info(
-                    "  [%d/%d] Would DELETE and replace: %s",
-                    i,
-                    len(to_restore),
-                    snap.get_name(),
-                )
             mode = "incremental" if parent else "full"
             parent_info = f" from {parent.get_name()}" if parent else ""
             logger.info(
@@ -1050,21 +821,6 @@ def restore_snapshots(
 
     # Execute restores
     restored_snapshots = list(local_snapshots)  # Track what we've restored
-    replaced_names: set[str] = set()
-
-    def _forget_replaced(name: str) -> None:
-        """Record a replacement, and drop it from the present-set.
-
-        Two things depend on knowing this actually happened. Parents are chosen
-        from ``restored_snapshots``, which was taken before any replacement, so
-        leaving a removed name in it lets a later snapshot be sent against a
-        parent that is no longer at the destination. And the failure advisory
-        tells the operator their copy was deleted -- which must be true when it
-        is said.
-        """
-        replaced_names.add(name)
-        restored_snapshots[:] = [s for s in restored_snapshots if s.get_name() != name]
-
     for i, snap in enumerate(to_restore, 1):
         snap_name = snap.get_name()
 
@@ -1115,34 +871,12 @@ def restore_snapshots(
                 parent=parent,
                 options=options,
                 session_id=session_id,
-                overwrite=not skip_existing,
-                estimated_bytes=_replacement_size(snap),
-                on_replaced=_forget_replaced,
             )
             stats["restored"] += 1
             restored_snapshots.append(snap)
 
         except (RestoreError, __util__.AbortError) as e:
-            # A replacement that failed AFTER removing the old copy must still be
-            # recorded, or the operator is not told their copy is gone -- the
-            # same defect as claiming one that is not.
-            if isinstance(e, _ReplaceFailed) and e.removed:
-                replaced_names.add(snap_name)
             logger.error("Failed to restore %s: %s", snap_name, e)
-            if snap_name in replaced_names:
-                # Only when the old copy was ACTUALLY removed. Printing this for
-                # every --overwrite failure told operators their copy was gone
-                # after failures that never touched it -- including the case
-                # where the message just above says it was left in place.
-                # Reporting a destruction that did not happen is the same defect
-                # as hiding one that did.
-                logger.error(
-                    "  --overwrite removed the previous %s before this transfer, "
-                    "so the destination now holds neither copy. The backup was "
-                    "only read from and is unchanged -- run the same command "
-                    "again to finish restoring it.",
-                    snap_name,
-                )
             stats["failed"] += 1
             stats["errors"].append(f"{snap_name}: {e}")
 

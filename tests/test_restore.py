@@ -724,12 +724,14 @@ class TestRestoreSnapshotsExecution:
             dry_run=False,
         )
 
-        # skip_existing=False is what --overwrite sets, and it now means what it
-        # says: snap-1 is present at the destination and is REPLACED rather than
-        # used as a parent and left alone. This assertion used to read == 1 with
-        # the comment "the chain logic finds that snap-1 exists so chain is just
-        # [snap-2]" -- an accurate description of why --overwrite did nothing.
-        assert stats["restored"] == 2
+        # snap-1 is present at the destination, so the chain stops there and uses
+        # it as the incremental base: only snap-2 is restored.
+        #
+        # skip_existing=False was briefly wired to --overwrite, which made this 2.
+        # --overwrite is not in this release (replacing a snapshot means deleting
+        # it first, and that could not be made safe), so an existing snapshot is
+        # a parent again rather than something to replace.
+        assert stats["restored"] == 1
         assert stats["skipped"] == 0
 
     @patch("btrfs_backup_ng.core.restore.restore_snapshot")
