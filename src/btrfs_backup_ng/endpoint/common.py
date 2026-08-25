@@ -250,6 +250,24 @@ class Endpoint:
                 self.add_snapshot(snapshot)
         return snapshot
 
+    def preflight_send(self, snapshot: Any) -> None:
+        """Confirm this endpoint could actually send ``snapshot``, without sending.
+
+        Exists so a caller that is about to DESTROY something can find out first
+        whether the replacement can be delivered. `restore --overwrite` removes
+        the copy at the destination before receiving, and its safety argument is
+        that a restore only ever reads the backup, so an interruption costs a
+        retry rather than data. That argument holds only while the backup is
+        deliverable. When it is not -- a corrupted stream, a missing decompressor
+        -- the copy being removed was the last good one, and every check that
+        would have said so lived inside ``send``, downstream of the deletion.
+
+        The base implementation makes no claim: an endpoint that cannot check
+        cheaply must not pretend it did. Overrides should raise the same error
+        ``send`` would.
+        """
+        return None
+
     def send(
         self, snapshot: Any, parent: Any = None, clones: Optional[List[Any]] = None
     ) -> Any:

@@ -358,13 +358,29 @@ class TestCheckSnapshotCollision:
         result = check_snapshot_collision("snap-nonexistent", mock_endpoint)
         assert result is False
 
-    def test_handles_error(self):
-        """Test graceful handling of errors."""
+    def test_an_unreadable_destination_raises_instead_of_answering(self):
+        """A check that could not run is not a check that found nothing.
+
+        This used to return False -- "no collision" -- so a caller acting on it
+        would receive onto a name that may already exist, which is the failure
+        the function exists to prevent. Not knowing and knowing-there-is-nothing
+        are different answers and must not share a return value.
+        """
         mock_endpoint = MagicMock()
         mock_endpoint.list_snapshots.side_effect = Exception("Network error")
 
-        result = check_snapshot_collision("snap-1", mock_endpoint)
-        assert result is False  # Default to no collision on error
+        with pytest.raises(RestoreError, match="Refusing to assume"):
+            check_snapshot_collision("snap-1", mock_endpoint)
+
+    def test_the_error_names_the_snapshot_and_the_cause(self):
+        mock_endpoint = MagicMock()
+        mock_endpoint.list_snapshots.side_effect = Exception("Network error")
+
+        with pytest.raises(RestoreError) as caught:
+            check_snapshot_collision("snap-1", mock_endpoint)
+        message = str(caught.value)
+        assert "snap-1" in message
+        assert "Network error" in message
 
 
 class TestListRemoteSnapshots:
@@ -529,6 +545,20 @@ class TestFindSnapshotBeforeTimeEdgeCases:
         result = find_snapshot_before_time(target_time, snapshots)
 
         assert result.get_name() == "snap-2"
+
+
+def _released(endpoint, snapshot):
+    """Whether `endpoint` was asked to drop its pin on `snapshot`.
+
+    Matches on the snapshot and the lock state only. The release now names
+    `parent=` explicitly -- releasing exactly what was acquired -- so an
+    exact-call assertion pins the argument spelling rather than the behaviour.
+    """
+    return any(
+        call.args[0] is snapshot and call.args[2] is False
+        for call in endpoint.set_lock.call_args_list
+        if len(call.args) >= 3
+    )
 
 
 class TestRestoreSnapshotsExecution:
@@ -708,8 +738,13 @@ class TestRestoreSnapshotsExecution:
             dry_run=False,
         )
 
-        # Should restore snap-2 (snap-1 is used as parent in chain)
-        # The chain logic finds that snap-1 exists so chain is just [snap-2]
+        # snap-1 is present at the destination, so the chain stops there and uses
+        # it as the incremental base: only snap-2 is restored.
+        #
+        # skip_existing=False was briefly wired to --overwrite, which made this 2.
+        # --overwrite is not in this release (replacing a snapshot means deleting
+        # it first, and that could not be made safe), so an existing snapshot is
+        # a parent again rather than something to replace.
         assert stats["restored"] == 1
         assert stats["skipped"] == 0
 
@@ -734,8 +769,8 @@ class TestRestoreSnapshotsExecution:
         local_endpoint = MagicMock()
         local_endpoint.list_snapshots.return_value = [snapshots[0], snapshots[1]]
 
-        # With skip_existing=False, all should be attempted
-        # But chain logic will use existing as parent, so only snap-3 in chain
+        # With skip_existing=False every snapshot in the chain is restored,
+        # including the ones already present -- that is what replacing means.
         stats = restore_snapshots(
             backup_endpoint,
             local_endpoint,
@@ -744,9 +779,16 @@ class TestRestoreSnapshotsExecution:
             dry_run=False,
         )
 
-        # snap-3 should be restored (chain stops at snap-2 which exists)
+        # Only snap-3, the snapshot actually asked for. snap-2 is present at the
+        # destination and is an ANCESTOR, not the target -- it stays put and
+        # serves as the incremental base, which is what it is for.
+        #
+        # This briefly asserted == 3 on the way to fixing --overwrite, which was
+        # wrong: suppressing the truncation for every ancestor made
+        # `--overwrite --snapshot snap-3` delete snap-1 and snap-2 as well,
+        # neither of which the operator named.
         assert stats["restored"] == 1
-        assert stats["skipped"] == 0  # skip_existing=False means no skipping
+        assert stats["skipped"] == 0
 
     @patch("btrfs_backup_ng.core.restore.restore_snapshot")
     def test_restore_with_options(self, mock_restore):
@@ -1559,8 +1601,11 @@ class TestRestoreSnapshot:
         # Verify send_snapshot was called
         mock_send.assert_called_once()
 
-        # Verify lock was released
-        backup_endpoint.set_lock.assert_any_call(snapshot, ANY, False)
+        # Verify lock was released. Asserted by SNAPSHOT and STATE rather than
+        # by exact call shape: the release passes `parent=` explicitly so that
+        # only what was actually pinned is unpinned, and `parent=False` is the
+        # same call this always made.
+        assert _released(backup_endpoint, snapshot), "the snapshot was never unpinned"
 
     @patch("btrfs_backup_ng.core.restore.verify_restored_snapshot")
     @patch("btrfs_backup_ng.core.restore.send_snapshot")
@@ -1656,7 +1701,12 @@ class TestRestoreSnapshot:
             restore_snapshot(backup_endpoint, local_endpoint, snapshot, parent=parent)
 
         # Verify locks were released
-        backup_endpoint.set_lock.assert_any_call(snapshot, ANY, False)
+        assert _released(backup_endpoint, snapshot), (
+            "the snapshot stayed pinned after a failed restore"
+        )
+        assert _released(backup_endpoint, parent), (
+            "the parent stayed pinned after a failed restore"
+        )
         backup_endpoint.set_lock.assert_any_call(parent, ANY, False, parent=True)
 
 

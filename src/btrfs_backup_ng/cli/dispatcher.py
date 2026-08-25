@@ -708,7 +708,8 @@ Config-driven restore:
     restore_parser.add_argument(
         "--overwrite",
         action="store_true",
-        help="Overwrite existing snapshots instead of skipping",
+        help="Not supported in this release: existing snapshots are left in place "
+        "and a warning is printed. Remove a snapshot yourself to replace it",
     )
     restore_parser.add_argument(
         "--in-place",
