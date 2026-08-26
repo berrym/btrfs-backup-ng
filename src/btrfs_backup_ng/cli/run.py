@@ -33,6 +33,7 @@ from ..notifications import (
 from ..retention import RetentionError
 from ..transaction import set_transaction_log
 from .common import (
+    assert_target_mounted,
     get_log_level,
     get_timestamp_format,
     should_show_progress,
@@ -481,17 +482,13 @@ def _backup_volume(
     destination_endpoints = []
     for target in volume.targets:
         try:
-            # Check mount requirement for local targets
-            if target.require_mount and not target.path.startswith(
-                ("ssh://", "raw://", "raw+ssh://")
-            ):
-                target_path = Path(target.path).resolve()
-                if not __util__.is_mounted(target_path):
-                    raise __util__.AbortError(
-                        f"Target {target.path} is not mounted. "
-                        f"Ensure the drive is connected and mounted, or set require_mount = false."
-                    )
-                logger.debug("Mount check passed for %s", target.path)
+            # One mount check, shared with `transfer`. The inline copy this
+            # replaces tested the scheme with path.startswith(...) and listed
+            # raw:// as exempt, so `run` skipped the check for a raw target
+            # entirely -- an unmounted USB raw target with require_mount = true
+            # was written to the root filesystem and reported as a success.
+            if target.require_mount:
+                assert_target_mounted(target.path)
 
             dest_kwargs = dict(endpoint_kwargs)
             thread_ssh_target_config(dest_kwargs, target)
@@ -725,16 +722,10 @@ def _backup_snapper_volume(
     succeeded_targets: list[tuple[Any, dict[str, Any]]] = []
     for target in volume.targets:
         try:
-            # Check mount requirement for local targets
-            if target.require_mount and not target.path.startswith(
-                ("ssh://", "raw://", "raw+ssh://")
-            ):
-                target_path = Path(target.path).resolve()
-                if not __util__.is_mounted(target_path):
-                    raise __util__.AbortError(
-                        f"Target {target.path} is not mounted. "
-                        f"Ensure the drive is connected and mounted."
-                    )
+            # Same shared check as above. This copy also carried a shorter
+            # message that omitted how to turn the check off.
+            if target.require_mount:
+                assert_target_mounted(target.path)
 
             # Build transfer options.
             #

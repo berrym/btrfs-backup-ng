@@ -222,6 +222,66 @@ class TestRequireMountGate:
         with pytest.raises(__util__.AbortError, match="cannot be determined"):
             self._run(uri, mounted=False)
 
+    @pytest.mark.parametrize("func", ["_backup_volume", "_backup_snapper_volume"])
+    def test_run_calls_the_gate_too(self, func):
+        """`run` is the PRIMARY command and it did not use this gate.
+
+        It carried two inline copies of its own that tested the scheme with
+        path.startswith(("ssh://", "raw://", "raw+ssh://")) -- putting raw:// on
+        the exempt list. So `require_mount = true` on an unmounted USB raw target
+        was silently skipped during `run` while `transfer` refused it, and the
+        backup went to the root filesystem and was reported as a success.
+
+        Only `transfer` was pinned here, which is why the gap survived.
+        """
+        import inspect
+
+        from btrfs_backup_ng.cli import run as run_cli
+
+        source = inspect.getsource(getattr(run_cli, func))
+        assert "assert_target_mounted(target.path)" in source, (
+            f"{func} does not use the shared mount gate"
+        )
+        assert "target.require_mount" in source
+
+    @pytest.mark.parametrize("func", ["_backup_volume", "_backup_snapper_volume"])
+    def test_run_does_not_gate_the_check_on_a_scheme_string(self, func):
+        """The exact shape of the bug: `require_mount and not path.startswith(...)`.
+
+        Asserted on that construct rather than on "raw://" appearing anywhere --
+        the first version of this test matched the COMMENT explaining the fix and
+        failed on prose, which would have made it useless the moment someone
+        reworded a comment.
+        """
+        import inspect
+
+        from btrfs_backup_ng.cli import run as run_cli
+
+        source = inspect.getsource(getattr(run_cli, func))
+        compact = " ".join(source.split())
+        assert "require_mount and not" not in compact, (
+            f"{func} gates the mount check on a scheme string again; that is how "
+            f"raw:// ended up exempt from require_mount"
+        )
+        assert "startswith" not in compact.split("require_mount")[-1][:200], (
+            f"{func} appears to test the scheme by string near the mount check"
+        )
+
+    def test_there_is_exactly_one_mount_gate(self):
+        """Three copies disagreed. Keep it one."""
+        import inspect
+
+        from btrfs_backup_ng.cli import common as common_cli
+        from btrfs_backup_ng.cli import run as run_cli
+
+        for module in (run_cli, transfer):
+            source = inspect.getsource(module)
+            assert "is_mounted(" not in source, (
+                f"{module.__name__} calls is_mounted directly instead of going "
+                f"through assert_target_mounted"
+            )
+        assert "is_mounted(" in inspect.getsource(common_cli.assert_target_mounted)
+
     def test_execute_transfer_still_calls_the_gate(self):
         """The gate is only worth testing if the command still invokes it.
 

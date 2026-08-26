@@ -1,10 +1,64 @@
 """Shared CLI utilities and argument parsers."""
 
 import argparse
+import logging
 import sys
+from pathlib import Path
 from typing import Any
 
 from .. import __util__
+from ..core.target import parse_target
+
+logger = logging.getLogger(__name__)
+
+
+def assert_target_mounted(target_path: str) -> None:
+    """Enforce ``require_mount`` for a target. Raises AbortError if unsatisfied.
+
+    THE single mount-check path. It lived in ``cli/transfer.py`` while ``cli/run.py``
+    carried two inline copies of its own, and the copies disagreed with it: they
+    tested the scheme with ``path.startswith(("ssh://", "raw://", "raw+ssh://"))``,
+    which put ``raw://`` on the exempt list. So ``run`` -- the primary command --
+    silently skipped the check for a raw target, and a user who set
+    ``require_mount = true`` on an unmounted USB raw target got no protection at
+    all while being given no indication of it.
+
+    Separate from any command so it can be exercised directly: the inline version
+    sat behind a real btrfs source with real snapshots, so nothing tested it and it
+    was wrong in both directions.
+
+    Remote targets are exempt -- the README scopes require_mount to local ones, and
+    a local mount table says nothing about a remote filesystem.
+    """
+    scheme = parse_target(target_path)
+    if scheme.is_remote:
+        return
+
+    # Fail CLOSED. Gating on supports_mount_check alone let an unclassifiable
+    # target skip the guard entirely -- `raw://mnt/usb/backups` is UNSUPPORTED,
+    # yet choose_endpoint happily builds an endpoint writing to /usb/backups. The
+    # old code refused it (for the wrong reason); skipping the check would write
+    # the backup to the root filesystem and then prune the source as though it
+    # had succeeded, which is the exact accident require_mount exists to prevent.
+    # supports_mount_check is true only for LOCAL and RAW, and neither can carry
+    # an empty path, so this covers the Path("") -> Path(".") hazard as well.
+    if not scheme.supports_mount_check:
+        raise __util__.AbortError(
+            f"Target {target_path} requires a mount check but its path cannot "
+            f"be determined" + (f": {scheme.reason}" if scheme.reason else ".")
+        )
+
+    # The filesystem path, not the URI. This branch also covers raw:// now: an
+    # unmounted USB raw target is exactly the case require_mount exists for, and
+    # Path("raw:///mnt/usb") could never be a mount point, so the check aborted
+    # every raw transfer instead of guarding it.
+    resolved = Path(scheme.path).resolve()
+    if not __util__.is_mounted(resolved):
+        raise __util__.AbortError(
+            f"Target {target_path} is not mounted. "
+            f"Ensure the drive is connected and mounted, or set require_mount = false."
+        )
+    logger.debug("Mount check passed for %s", target_path)
 
 
 def space_options_from_args(args: argparse.Namespace) -> dict[str, Any]:

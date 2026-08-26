@@ -5,6 +5,24 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **`require_mount` was silently ignored for `raw://` targets during `run`** —
+  the check that exists to stop a backup landing on the root filesystem when an
+  external drive is not mounted. `run` carried two inline copies of the mount
+  check that decided whether a target was local by testing the path with
+  `startswith(("ssh://", "raw://", "raw+ssh://"))`, which put `raw://` on the
+  exempt list. So `require_mount = true` on an unmounted `raw:///mnt/usb/...`
+  target was skipped entirely, the backup was written to the root filesystem,
+  and the run reported success — while `transfer`, which used a different
+  implementation, refused the same target correctly.
+
+  All three call sites now share one scheme-aware check. Behaviour for local
+  and remote targets is unchanged; `raw://` targets are now checked, which is
+  what `require_mount` was always documented to do.
+
 ## [0.9.6] - 2026-08-25
 
 ### Fixed
