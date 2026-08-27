@@ -142,7 +142,10 @@ snapshot_prefix = "home-"
 
 [[volumes.targets]]
 path = "/mnt/usb-backup/home"
-require_mount = true    # Fail if drive is not mounted (safety check)
+# The target is a SUBDIRECTORY of the mount point, so name the mount point.
+# require_mount = true would require /mnt/usb-backup/home itself to be a mount
+# point, and would abort even with the drive connected.
+require_mount = "/mnt/usb-backup"    # Fail if the drive is not mounted
 
 
 # =============================================================================
@@ -168,7 +171,7 @@ require_mount = true    # Fail if drive is not mounted (safety check)
 #                                    # xz|lzo|bzip2|pbzip2 -- the same set on
 #                                    # every kind of target
 # rate_limit = "10M"                 # Bandwidth limit: number with K|M|G suffix
-# require_mount = false              # Require path to be a mount point (local only)
+# require_mount = false              # true, or "/mnt/point" the target lives under (local only)
 #
 # SSH agent under sudo:
 # Backups run as root (btrfs send/receive need it), and sudo strips SSH_AUTH_SOCK.

@@ -241,11 +241,60 @@ def _parse_target(data: dict[str, Any]) -> TargetConfig:
         ssh_host_key_policy=ssh_host_key_policy,
         compress=compress,
         rate_limit=data.get("rate_limit"),
-        require_mount=data.get("require_mount", False),
+        require_mount=_parse_require_mount(data.get("require_mount", False)),
         encrypt=encrypt,
         gpg_recipient=gpg_recipient,
         gpg_keyring=data.get("gpg_keyring"),
         openssl_cipher=data.get("openssl_cipher"),
+    )
+
+
+def _parse_require_mount(value: Any) -> bool | str:
+    """Validate ``require_mount`` at the config boundary.
+
+    Accepts a bool, or a mount point the target must live under. Anything else
+    fails LOUD here rather than at backup time: this is the guard that stops a
+    backup landing on the root filesystem when an external drive is absent, so a
+    value that cannot be honoured must not be discovered halfway through a run.
+
+    An empty string is rejected rather than treated as false. It reads as a
+    mistake -- a variable that expanded to nothing, most likely -- and silently
+    disabling the safety check on that basis is exactly the failure this option
+    exists to prevent.
+    """
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        candidate = value.strip()
+        if not candidate:
+            raise ConfigError(
+                "require_mount is an empty string. Use true/false, or the mount "
+                "point the target lives under (for example "
+                'require_mount = "/mnt/backup"). An empty value would turn the '
+                "check off silently."
+            )
+        if Path(candidate).resolve() == Path("/"):
+            # "/" is always mounted and every path is under it, so this passes
+            # unconditionally: a check that protects nothing while looking like
+            # protection. The same failure the containment test refuses from the
+            # other direction.
+            raise ConfigError(
+                f"require_mount = {value!r} resolves to / , which would always "
+                f"pass -- the root filesystem is always mounted and every target "
+                f"is under it, so the check would protect nothing. Name the mount "
+                f"point the target actually lives under (for example "
+                f'"/mnt/backup"), or use true/false.'
+            )
+        if not candidate.startswith("/"):
+            raise ConfigError(
+                f"require_mount = {value!r} is not an absolute path. It names the "
+                f"mount point the target must live under, so it has to be absolute "
+                f'(for example "/mnt/backup").'
+            )
+        return candidate
+    raise ConfigError(
+        f"require_mount must be true, false, or a mount point path; got "
+        f"{type(value).__name__} ({value!r})."
     )
 
 
@@ -703,7 +752,11 @@ path = "/mnt/backup/home"
 # Example external drive target with mount verification
 # [[volumes.targets]]
 # path = "/mnt/usb-backup/home"
-# require_mount = true          # Fail if drive is not mounted (safety check)
+# require_mount = "/mnt/usb-backup"   # Fail if the drive is not mounted.
+#                                     # The target is a SUBDIRECTORY of the mount
+#                                     # point, so the mount point is named here.
+#                                     # `true` would require the target itself to
+#                                     # be a mount point and would always abort.
 
 # Example SSH target
 # [[volumes.targets]]

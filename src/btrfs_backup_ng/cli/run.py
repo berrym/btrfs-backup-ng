@@ -487,8 +487,7 @@ def _backup_volume(
             # raw:// as exempt, so `run` skipped the check for a raw target
             # entirely -- an unmounted USB raw target with require_mount = true
             # was written to the root filesystem and reported as a success.
-            if target.require_mount:
-                assert_target_mounted(target.path)
+            assert_target_mounted(target.path, target.require_mount)
 
             dest_kwargs = dict(endpoint_kwargs)
             thread_ssh_target_config(dest_kwargs, target)
@@ -724,8 +723,7 @@ def _backup_snapper_volume(
         try:
             # Same shared check as above. This copy also carried a shorter
             # message that omitted how to turn the check off.
-            if target.require_mount:
-                assert_target_mounted(target.path)
+            assert_target_mounted(target.path, target.require_mount)
 
             # Build transfer options.
             #

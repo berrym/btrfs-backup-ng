@@ -2186,7 +2186,14 @@ class TestDetectionWizard:
         assert exit_code == 0
         captured = capsys.readouterr()
         assert "/mnt/usb-drive/backup" in captured.out
-        assert "require_mount = true" in captured.out
+        # The target is a SUBDIRECTORY, so `true` -- which requires the target
+        # itself to be a mount point -- produces a config that aborts even with
+        # the drive correctly connected. This previously asserted exactly that.
+        assert "require_mount = true" not in captured.out, (
+            "the wizard emitted require_mount = true for a subdirectory target; "
+            "that config can never pass"
+        )
+        assert 'require_mount = "/mnt/usb-drive"' in captured.out
 
     @patch("btrfs_backup_ng.snapper.SnapperScanner")
     @patch("btrfs_backup_ng.cli.config_cmd.find_config_file")

@@ -140,7 +140,9 @@ class TargetConfig:
             without having looked.
         compress: Compression algorithm for transfers (none, gzip, zstd, lz4)
         rate_limit: Bandwidth limit for transfers (e.g., "10M", "1G", "500K")
-        require_mount: Require path to be an active mount point (safety check for external drives)
+        require_mount: Require a mount before writing (safety check for external
+            drives). True means the target itself must be a mount point; a path
+            means that path must be mounted and the target must live under it
         encrypt: Encryption method for raw targets only (none, gpg, openssl_enc)
         gpg_recipient: GPG key recipient (required when encrypt=gpg)
         gpg_keyring: Optional path to a GPG keyring file
@@ -159,7 +161,10 @@ class TargetConfig:
     ssh_host_key_policy: str = "accept-new"
     compress: str = "none"
     rate_limit: Optional[str] = None
-    require_mount: bool = False
+    # bool | str: True requires the target itself to be a mount point; a path
+    # requires THAT path to be mounted with the target at or under it, which is
+    # the many-boxes-into-one-drive case (issue #100).
+    require_mount: bool | str = False
     # Encryption applies only to raw (raw:// / raw+ssh://) targets. The loader
     # rejects these on non-raw targets so a misplaced setting fails loudly rather
     # than being silently ignored (which would write plaintext).

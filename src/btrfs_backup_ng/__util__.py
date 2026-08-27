@@ -8,6 +8,7 @@ import functools
 import json
 import errno
 import os
+from collections.abc import Iterator
 import stat as stat_module
 import subprocess
 import time
@@ -367,6 +368,57 @@ def infer_snapshot_prefix(name: str, preferred_fmt: str | None = None) -> str | 
     return None
 
 
+def unescape_mount_field(field: str) -> str:
+    """Decode the octal escapes the kernel writes into ``/proc/mounts``.
+
+    Every path field there is escaped: space becomes ``\\040``, tab ``\\011``,
+    newline ``\\012`` and backslash ``\\134``. Comparing an undecoded field
+    against a real path therefore fails for any mount point containing one of
+    them -- and on a systemd desktop that is the norm rather than an edge case.
+    udisks2 mounts removable drives at ``/run/media/<user>/<Volume Label>``, and
+    volume labels routinely contain spaces, so the single most common external
+    drive layout could not be matched at all.
+
+    Only well-formed three-digit octal escapes are decoded; anything else is left
+    alone, so a literal backslash in a name survives unharmed.
+    """
+    if "\\" not in field:
+        return field
+    out: list[str] = []
+    i = 0
+    while i < len(field):
+        if field[i] == "\\" and len(field) - i >= 4:
+            digits = field[i + 1 : i + 4]
+            if len(digits) == 3 and all(c in "01234567" for c in digits):
+                out.append(chr(int(digits, 8)))
+                i += 4
+                continue
+        out.append(field[i])
+        i += 1
+    return "".join(out)
+
+
+def iter_mounts(mounts_file: str | None = None) -> Iterator[tuple[str, str, str]]:
+    """Yield ``(device, mount_point, fs_type)`` for each mount, paths DECODED.
+
+    THE single reader of the mount table. Four separate parsers used to split the
+    line by hand and compare the raw field, so every one of them was blind to a
+    mount point containing a space -- including ``is_btrfs``, which would report
+    a btrfs drive as not-btrfs purely because of its volume label.
+    """
+    path = mounts_file or MOUNTS_FILE
+    with open(path, encoding="utf-8") as handle:
+        for line in handle:
+            parts = line.split(" ")
+            if len(parts) < 3:
+                continue
+            yield (
+                unescape_mount_field(parts[0]),
+                unescape_mount_field(parts[1]),
+                parts[2],
+            )
+
+
 def is_btrfs(path: str | Path) -> bool:
     """Checks whether path is inside a btrfs file system."""
     path = Path(path).resolve()
@@ -374,29 +426,24 @@ def is_btrfs(path: str | Path) -> bool:
     best_match = ""
     best_match_fs_type = ""
     logger.debug("  Reading mounts file: %s", MOUNTS_FILE)
-    with open(MOUNTS_FILE, encoding="utf-8") as f:
-        for line in f:
-            try:
-                mount_point, fs_type = line.split(" ")[1:3]
-            except ValueError as e:
-                logger.debug("  Couldn't split line, skipping: %s\nCaught: %s", line, e)
-                continue
-            mount_point_prefix = Path(mount_point)
-            if path == mount_point_prefix or path.is_relative_to(mount_point_prefix):
-                if len(str(mount_point)) > len(best_match):
-                    best_match = mount_point
-                    best_match_fs_type = fs_type
-                    logger.debug(
-                        "  New best_match with filesystem type %s: %s",
-                        best_match_fs_type,
-                        best_match,
-                    )
-        result = best_match_fs_type == "btrfs"
-        logger.debug(
-            "  -> best_match_fs_type is %s, result is %r",
-            best_match_fs_type,
-            result,
-        )
+    for _device, mount_point, fs_type in iter_mounts():
+        mount_point_prefix = Path(mount_point)
+        if path == mount_point_prefix or path.is_relative_to(mount_point_prefix):
+            if len(str(mount_point)) > len(best_match):
+                best_match = mount_point
+                best_match_fs_type = fs_type
+                logger.debug(
+                    "  New best_match with filesystem type %s: %s",
+                    best_match_fs_type,
+                    best_match,
+                )
+
+    result = best_match_fs_type == "btrfs"
+    logger.debug(
+        "  -> best_match_fs_type is %s, result is %r",
+        best_match_fs_type,
+        result,
+    )
     return result
 
 
@@ -455,15 +502,10 @@ def is_mounted(path: str | Path) -> bool:
     path = Path(path).resolve()
     logger.debug("Checking if path is a mount point: %s", path)
 
-    with open(MOUNTS_FILE, encoding="utf-8") as f:
-        for line in f:
-            try:
-                mount_point = line.split(" ")[1]
-            except (ValueError, IndexError):
-                continue
-            if Path(mount_point).resolve() == path:
-                logger.debug("  -> Path is an active mount point")
-                return True
+    for _device, mount_point, _fs_type in iter_mounts():
+        if Path(mount_point).resolve() == path:
+            logger.debug("  -> Path is an active mount point")
+            return True
 
     logger.debug("  -> Path is NOT a mount point")
     return False
@@ -483,25 +525,16 @@ def get_mount_info(path: str | Path) -> dict[str, str] | None:
     best_match = None
     best_match_len = 0
 
-    with open(MOUNTS_FILE, encoding="utf-8") as f:
-        for line in f:
-            try:
-                parts = line.split(" ")
-                device = parts[0]
-                mount_point = parts[1]
-                fs_type = parts[2]
-            except (ValueError, IndexError):
-                continue
-
-            mount_path = Path(mount_point)
-            if path == mount_path or path.is_relative_to(mount_path):
-                if len(str(mount_point)) > best_match_len:
-                    best_match_len = len(str(mount_point))
-                    best_match = {
-                        "mount_point": mount_point,
-                        "fs_type": fs_type,
-                        "device": device,
-                    }
+    for device, mount_point, fs_type in iter_mounts():
+        mount_path = Path(mount_point)
+        if path == mount_path or path.is_relative_to(mount_path):
+            if len(str(mount_point)) > best_match_len:
+                best_match_len = len(str(mount_point))
+                best_match = {
+                    "mount_point": mount_point,
+                    "fs_type": fs_type,
+                    "device": device,
+                }
 
     if best_match:
         logger.debug("  -> Mount info: %s", best_match)

@@ -7,7 +7,61 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`require_mount` accepts the mount point the target lives under** — reported
+  in [#100](https://github.com/berrym/btrfs-backup-ng/issues/100). Backing up
+  several machines or volumes into one drive means targets like
+  `/mnt/backup/box1` while the drive is mounted at `/mnt/backup`. The check
+  compared the target against each mount point for equality, so only the mount
+  point itself ever passed and a subdirectory never could — leaving no way to
+  protect exactly the setup that needs it most.
+
+  ```toml
+  [[volumes.targets]]
+  path = "/mnt/backup/box1"
+  require_mount = "/mnt/backup"
+  ```
+
+  `require_mount = true` is unchanged and still requires the target itself to be
+  a mount point. The named path must be mounted **and** the target must live
+  under it: naming a drive the target is not written to would confirm a mounted
+  filesystem while the backup went elsewhere, so that combination is refused
+  rather than passed. Invalid values (empty string, relative path, wrong type)
+  fail when the config is loaded rather than part-way through a backup.
+
+  The `config init` template, both shipped example configs, and the interactive
+  wizard all produced `require_mount = true` for subdirectory targets — configs
+  that abort even with the drive correctly connected. The wizard now names the
+  mount point instead, and the examples and template were corrected.
+
+### Changed
+
+- **`require_mount` values that are neither a boolean nor an absolute path are
+  now rejected when the config loads.** Previously `require_mount` was passed
+  through unvalidated, so `1`, `0`, `"true"` and `""` all loaded — `1` and
+  `"true"` enabling the check, `0` and `""` silently disabling it. They now
+  raise a configuration error, which stops the whole file loading rather than
+  applying a setting nobody can predict. If you wrote the value quoted or as a
+  number, change it to a bare `true`/`false` or to the mount point path.
+
 ### Fixed
+
+- **Mount points containing spaces were invisible, breaking the common desktop
+  layout** — the kernel escapes space, tab, newline and backslash in every path
+  field of `/proc/mounts` (`\040`, `\011`, `\012`, `\134`), and four separate
+  parsers compared the raw field against a real path. udisks2 mounts removable
+  drives at `/run/media/<user>/<volume label>`, and labels routinely contain
+  spaces, so on a systemd desktop the single most common external-drive layout
+  could not be matched at all: `require_mount` could never be satisfied, and
+  `is_btrfs` reported a btrfs drive as not-btrfs purely because of its label.
+  One decoder now serves every reader of the mount table.
+
+- **`require_mount` pointed at a memory-backed filesystem is refused** — `/run`
+  is `tmpfs` and always mounted, and udisks2 mounts drives beneath it, so
+  `require_mount = "/run"` confirmed a filesystem that is present exactly when
+  the drive is absent, and the backup was written into RAM. The containment
+  check cannot catch this, because the target genuinely is under `/run`.
 
 - **`require_mount` was silently ignored for `raw://` targets during `run`** —
   the check that exists to stop a backup landing on the root filesystem when an

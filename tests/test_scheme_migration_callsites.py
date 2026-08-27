@@ -239,10 +239,11 @@ class TestRequireMountGate:
         from btrfs_backup_ng.cli import run as run_cli
 
         source = inspect.getsource(getattr(run_cli, func))
-        assert "assert_target_mounted(target.path)" in source, (
-            f"{func} does not use the shared mount gate"
+        assert "assert_target_mounted(target.path, target.require_mount)" in source, (
+            f"{func} does not hand the configured require_mount value to the "
+            f"shared gate. The gate decides bool vs mount-point, so dropping the "
+            f"value there silently reverts to the boolean-only behaviour."
         )
-        assert "target.require_mount" in source
 
     @pytest.mark.parametrize("func", ["_backup_volume", "_backup_snapper_volume"])
     def test_run_does_not_gate_the_check_on_a_scheme_string(self, func):
@@ -292,5 +293,4 @@ class TestRequireMountGate:
         import inspect
 
         source = inspect.getsource(transfer.execute_transfer)
-        assert "assert_target_mounted(target.path)" in source
-        assert "target.require_mount" in source
+        assert "assert_target_mounted(target.path, target.require_mount)" in source

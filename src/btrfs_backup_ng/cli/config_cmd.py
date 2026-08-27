@@ -9,6 +9,7 @@ from typing import Any
 
 from ..__logger__ import create_logger
 from ..config import ConfigError, find_config_file, load_config
+from .. import __util__
 from ..config.loader import generate_example_config, get_default_config_path
 from .common import get_log_level
 from .wizard_utils import (
@@ -199,6 +200,46 @@ def _prompt_target_encryption(target_path: str) -> dict[str, Any]:
     return result
 
 
+def _derive_require_mount(target_path: str) -> bool | str:
+    """Turn "yes, check the mount" into a value that can actually pass.
+
+    The wizard offers this check for /mnt/... paths, which are overwhelmingly
+    SUBDIRECTORIES of a mount point -- several machines or volumes backing up
+    into one drive. `require_mount = true` requires the target ITSELF to be a
+    mount point, so for those it produces a config that aborts even with the
+    drive correctly connected. The wizard emitted exactly that, and the shipped
+    examples taught it.
+
+    So: if the target is itself a mount point, `true` is right and is kept.
+    Otherwise name the mount point the target lives under -- taken from the
+    mount table when the drive is connected (the usual case while configuring),
+    falling back to the parent directory, which is the intended answer for the
+    ``/mnt/<drive>/<host>`` layout this prompt exists for.
+    """
+    path = Path(target_path)
+    if not path.is_absolute():
+        return True
+
+    def _mounted(candidate: Path) -> bool:
+        # The wizard did not read the mount table before this; an unreadable
+        # /proc/mounts must not take the whole config wizard down with it. The
+        # parent-directory fallback below is a good answer without it.
+        try:
+            return __util__.is_mounted(candidate)
+        except OSError:
+            return False
+
+    if _mounted(path):
+        return True
+    for parent in path.parents:
+        if parent == Path("/"):
+            break
+        if _mounted(parent):
+            return str(parent)
+    parent = path.parent
+    return True if parent == Path("/") else str(parent)
+
+
 def _generate_config_from_wizard(config_data: dict[str, Any]) -> str:
     """Generate TOML config content from wizard data.
 
@@ -334,7 +375,14 @@ def _generate_config_from_wizard(config_data: dict[str, Any]) -> str:
             )
             if target.get("ssh_sudo"):
                 lines.append("ssh_sudo = true")
-            if target.get("require_mount"):
+            # require_mount is bool OR a mount point path. Emitting `true` for
+            # any truthy value silently rewrote a configured mount point as a
+            # boolean on every round-trip through this writer, turning the
+            # many-boxes-into-one-drive setup back into a check that cannot pass.
+            require_mount = target.get("require_mount")
+            if isinstance(require_mount, str):
+                lines.append(f"require_mount = {_toml_str(require_mount)}")
+            elif require_mount:
                 lines.append("require_mount = true")
             # Raw-target encryption. Enforce the raw-only invariant at emit time
             # (matching the loader and _prompt_target_encryption) so the serializer
@@ -498,9 +546,8 @@ def _run_interactive_wizard() -> str:
             if target_path.startswith("ssh://"):
                 target["ssh_sudo"] = prompt_bool("  Use sudo on remote host?", False)
             elif target_path.startswith("/mnt/") or "usb" in target_path.lower():
-                target["require_mount"] = prompt_bool(
-                    "  Require mount check (for external drives)?", True
-                )
+                if prompt_bool("  Require mount check (for external drives)?", True):
+                    target["require_mount"] = _derive_require_mount(target_path)
 
             # Encryption is offered only for raw:// / raw+ssh:// targets.
             target.update(_prompt_target_encryption(target_path))
@@ -1480,9 +1527,8 @@ def _run_detection_wizard(result) -> int:
             if target_path.startswith("ssh://"):
                 target["ssh_sudo"] = prompt_bool("  Use sudo on remote host?", False)
             elif target_path.startswith("/mnt/") or "usb" in target_path.lower():
-                target["require_mount"] = prompt_bool(
-                    "  Require mount check (for external drives)?", True
-                )
+                if prompt_bool("  Require mount check (for external drives)?", True):
+                    target["require_mount"] = _derive_require_mount(target_path)
 
             # Encryption is offered only for raw:// / raw+ssh:// targets.
             target.update(_prompt_target_encryption(target_path))

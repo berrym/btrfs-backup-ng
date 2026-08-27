@@ -626,7 +626,7 @@ compress = "zstd"                      # Stream compression. On ssh:// the strea
                                        # The same set applies to every kind of
                                        # destination.
 rate_limit = "10M"                     # Bandwidth limit (K|M|G suffix)
-require_mount = false                  # Require path to be a mount point (safety check)
+require_mount = false                  # true, or "/mnt/point" the target lives under (safety check)
 skip_remote_lock = false               # Proceed even when a lock cannot be RECORDED on this
                                        # target. Default false: an operation stops rather
                                        # than run unprotected, because a prune elsewhere
@@ -693,13 +693,41 @@ Each stream file has a companion `.meta` file with JSON metadata for incremental
 
 When backing up to external drives or removable media, there's a common pitfall: if the drive isn't mounted, backups will silently write to the mount point directory on your root filesystem, consuming disk space and not actually backing up your data.
 
-The `require_mount` option prevents this by verifying that the target path is an active mount point before starting any transfers.
+The `require_mount` option prevents this by verifying that a filesystem is actually mounted before starting any transfers. It takes either `true` or the mount point the target lives under.
 
 ```toml
-# External USB drive backup with mount verification
+# The target IS the mount point
 [[volumes.targets]]
 path = "/mnt/usb-backup"
-require_mount = true    # Fail if /mnt/usb-backup is not a mount point
+require_mount = true          # Fail if /mnt/usb-backup is not a mount point
+
+# The target is a SUBDIRECTORY of the mount point -- several machines or
+# volumes backing up into one drive
+[[volumes.targets]]
+path = "/mnt/usb-backup/box1"
+require_mount = "/mnt/usb-backup"   # Fail if THAT is not mounted
+```
+
+`require_mount = true` requires the target itself to be a mount point, so it cannot be used when the target is a subdirectory: `/mnt/usb-backup/box1` is not a mount point even when the drive is connected. Name the mount point instead.
+
+On a desktop that auto-mounts removable drives (udisks2, as on Fedora), the mount point is `/run/media/<user>/<volume label>` and the label often contains spaces:
+
+```toml
+[[volumes.targets]]
+path = "/run/media/mberry/My Backup/box1"
+require_mount = "/run/media/mberry/My Backup"
+```
+
+Do not name `/run` itself. It is a `tmpfs` held in memory and is always mounted — including when the drive is absent — so the check would always pass and the backup would be written into RAM. `require_mount` refuses memory-backed filesystems for that reason.
+
+The named path must be mounted **and** the target must live under it. Naming a drive the target is not written to would confirm a mounted filesystem while the backup went elsewhere, so that is refused:
+
+```
+Target /var/backups is not inside /mnt/usb-backup, which require_mount says must be
+mounted. As written the check would confirm a drive that this target is not written
+to, so it would report success while protecting nothing. Point require_mount at the
+mount the target lives under, or set it to true to require the target itself to be a
+mount point.
 ```
 
 **When to use `require_mount = true`:**
@@ -722,7 +750,7 @@ snapshot_prefix = "home"
 
 [[volumes.targets]]
 path = "/mnt/external-backup/home"
-require_mount = true    # Safety check - fail if drive not mounted
+require_mount = "/mnt/external-backup"    # Fail if the drive is not mounted
 
 # Also backup to remote server (no mount check needed for SSH)
 [[volumes.targets]]
@@ -730,7 +758,7 @@ path = "ssh://backup@server:/backups/home"
 ssh_sudo = true
 ```
 
-**Note:** `require_mount` only applies to local targets. It has no effect on SSH targets.
+**Note:** `require_mount` applies to local targets, including `raw://` ones. It has no effect on `ssh://` or `raw+ssh://` targets -- a local mount table cannot answer for a remote filesystem.
 
 ## Configuration File Locations
 

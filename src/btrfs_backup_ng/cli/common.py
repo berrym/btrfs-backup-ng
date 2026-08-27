@@ -12,7 +12,15 @@ from ..core.target import parse_target
 logger = logging.getLogger(__name__)
 
 
-def assert_target_mounted(target_path: str) -> None:
+# Filesystems that live in RAM. Naming one in require_mount is always a mistake:
+# they are mounted whether or not any drive is attached, so the check can never
+# fail, and a backup written to one disappears at reboot after consuming memory.
+_MEMORY_BACKED_FILESYSTEMS = frozenset(
+    {"tmpfs", "ramfs", "devtmpfs", "proc", "sysfs", "devpts", "cgroup", "cgroup2"}
+)
+
+
+def assert_target_mounted(target_path: str, require_mount: bool | str = True) -> None:
     """Enforce ``require_mount`` for a target. Raises AbortError if unsatisfied.
 
     THE single mount-check path. It lived in ``cli/transfer.py`` while ``cli/run.py``
@@ -29,7 +37,27 @@ def assert_target_mounted(target_path: str) -> None:
 
     Remote targets are exempt -- the README scopes require_mount to local ones, and
     a local mount table says nothing about a remote filesystem.
+
+    ``require_mount`` may be a bool or a mount point:
+
+    ``True``
+        the target itself must be a mount point. Unchanged, and unusable when
+        several machines back up into subdirectories of one drive -- with the
+        drive at /mnt/backup, a target of /mnt/backup/box1 can never satisfy it,
+        because is_mounted compares for equality.
+
+    a path
+        THAT path must be a mount point, and the target must live at or under it.
+
+    Both halves of the string form are required. Asserting only that
+    /mnt/backup is mounted, while writing to /somewhere/else, would pass a check
+    that protects nothing -- the point is to prevent a write landing on the root
+    filesystem when a specific drive is absent, so the drive being checked has to
+    be the drive being written to.
     """
+    if not require_mount:
+        return
+
     scheme = parse_target(target_path)
     if scheme.is_remote:
         return
@@ -53,6 +81,68 @@ def assert_target_mounted(target_path: str) -> None:
     # Path("raw:///mnt/usb") could never be a mount point, so the check aborted
     # every raw transfer instead of guarding it.
     resolved = Path(scheme.path).resolve()
+
+    if isinstance(require_mount, str):
+        expected = Path(require_mount).resolve()
+
+        # Vacuity is decided HERE, after resolve(), because that is where the
+        # value acquires its meaning. The loader also refuses this, but only the
+        # gate sees the resolved path: "/.", "/..", "/mnt/.." and any number of
+        # other spellings all resolve to "/", and a lexical check on the raw
+        # string lets every one of them through. Root is always mounted and every
+        # path is under it, so such a value passes unconditionally -- a check that
+        # reports success while protecting nothing, which is the same failure the
+        # containment test below refuses from the other direction.
+        #
+        # Checking here also covers a TargetConfig built in code, which never
+        # passes through the loader at all.
+        if expected == Path("/"):
+            raise __util__.AbortError(
+                f"require_mount = {require_mount!r} resolves to / , which would "
+                f"always pass: the root filesystem is always mounted and every "
+                f"target is under it, so the check would protect nothing. Name "
+                f"the mount point the target actually lives under, or use true to "
+                f"require the target itself to be a mount point."
+            )
+
+        if not resolved.is_relative_to(expected):
+            raise __util__.AbortError(
+                f"Target {target_path} is not inside {require_mount}, which "
+                f"require_mount says must be mounted. As written the check would "
+                f"confirm a drive that this target is not written to, so it would "
+                f"report success while protecting nothing. Point require_mount at "
+                f"the mount the target lives under, or set it to true to require "
+                f"the target itself to be a mount point."
+            )
+        if not __util__.is_mounted(expected):
+            raise __util__.AbortError(
+                f"{require_mount} is not mounted, so {target_path} cannot be "
+                f"written to the drive it names. Ensure the drive is connected "
+                f"and mounted, or set require_mount = false."
+            )
+
+        # A memory-backed filesystem is never the drive an operator means, and
+        # naming one produces a check that always passes. This is not academic:
+        # /run is tmpfs and always mounted, and udisks2 mounts removable drives
+        # under /run/media/<user>/<label> -- so require_mount = "/run" confirms a
+        # filesystem that is present precisely when the drive is ABSENT, and the
+        # backup is written into RAM. The containment test cannot catch it,
+        # because the target genuinely is under /run.
+        info = __util__.get_mount_info(expected)
+        fs_type = (info or {}).get("fs_type", "")
+        if fs_type in _MEMORY_BACKED_FILESYSTEMS:
+            raise __util__.AbortError(
+                f"require_mount names {require_mount}, which is a {fs_type} "
+                f"filesystem held in memory, not the drive you mean. It is always "
+                f"mounted, so the check would always pass -- and with the drive "
+                f"absent the backup would be written into RAM. Name the mount "
+                f"point of the drive itself, such as "
+                f"/run/media/<user>/<volume-label>."
+            )
+
+        logger.debug("Mount check passed for %s (under %s)", target_path, expected)
+        return
+
     if not __util__.is_mounted(resolved):
         raise __util__.AbortError(
             f"Target {target_path} is not mounted. "

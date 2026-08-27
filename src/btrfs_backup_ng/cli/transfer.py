@@ -150,8 +150,7 @@ def execute_transfer(args: argparse.Namespace) -> int:
             for target in volume.targets:
                 try:
                     # Check mount requirement for local targets
-                    if target.require_mount:
-                        assert_target_mounted(target.path)
+                    assert_target_mounted(target.path, target.require_mount)
 
                     dest_kwargs = dict(endpoint_kwargs)
                     thread_ssh_target_config(dest_kwargs, target)
