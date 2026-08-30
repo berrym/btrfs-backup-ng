@@ -82,12 +82,8 @@ class LocalEndpoint(Endpoint):
 
         for d in dirs:
             if not d.is_dir():
-                logger.info("Creating directory: %s", d)
-                try:
-                    d.mkdir(parents=True, exist_ok=True)
-                except OSError as e:
-                    logger.error("Error creating new location %s: %s", d, e)
-                    raise __util__.AbortError(f"Failed to create directory {d}: {e}")
+                logger.error("Error resolving path: %s", d)
+                raise __util__.AbortError(f"Failed to resolve path: {d}")
 
         # Create snapshot directory if it exists in config
         if self.config.get("snapshot_dir") and isinstance(
