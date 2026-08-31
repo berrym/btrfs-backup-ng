@@ -47,6 +47,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A target that failed to prepare was not counted, so the run could report
+  success** — `_backup_volume` prepared each destination in a loop, and a failure
+  there was logged and recorded in the error list, but the success verdict was
+  computed from a variable declared below that loop and never saw it, and the
+  failure counter was untouched. A volume with more than one target, where one
+  failed and another transferred, therefore exited 0 and sent a "success"
+  notification, with the failure visible only as a log line. Single-target
+  volumes were unaffected, which is why this went unnoticed.
+
+  This covers every reason a destination can fail to prepare, including
+  `require_mount`: the mount check could correctly detect that an external drive
+  was absent, refuse the target, and the run would still report that the backup
+  had worked. The snapper path already accounted for this correctly; only the
+  native path did not.
+
 - **Mount points containing spaces were invisible, breaking the common desktop
   layout** — the kernel escapes space, tab, newline and backslash in every path
   field of `/proc/mounts` (`\040`, `\011`, `\012`, `\134`), and four separate

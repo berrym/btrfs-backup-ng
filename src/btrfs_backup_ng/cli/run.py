@@ -480,6 +480,7 @@ def _backup_volume(
         return True, stats, errors
 
     destination_endpoints = []
+    prepare_failures = 0
     for target in volume.targets:
         try:
             # One mount check, shared with `transfer`. The inline copy this
@@ -513,13 +514,30 @@ def _backup_volume(
         except Exception as e:
             logger.error("Failed to prepare destination %s: %s", target.path, e)
             errors.append(f"Destination endpoint {target.path}: {e}")
+            # Count it. This block used to log, record the error, and stop --
+            # `all_success` was declared BELOW the loop and never saw it, and
+            # `stats["failed"]` was untouched. So a volume with more than one
+            # target whose preparation failed here reported success: exit 0, a
+            # "success" notification, and the failure visible only as a log line.
+            #
+            # That covers every reason preparation can fail, and require_mount is
+            # among them: the mount check could correctly detect that an external
+            # drive was absent, refuse the target, and the run would still say the
+            # backup worked. A safety check whose verdict is discarded is not a
+            # safety check.
+            #
+            # Single-target volumes were saved only by the `not
+            # destination_endpoints` guard below, which is why this survived.
+            prepare_failures += 1
+            stats["failed"] += 1
 
     if not destination_endpoints:
         logger.error("No destination endpoints could be prepared")
         return False, stats, errors
 
-    # Transfer to destinations
-    all_success = True
+    # Transfer to destinations. A target that never got as far as a transfer has
+    # already failed, so the verdict starts from that rather than from True.
+    all_success = prepare_failures == 0
     # Targets whose transfer SUCCEEDED -- only these are pruned afterwards (fate-sharing: never
     # prune on a broken backup).
     succeeded_targets: list = []
