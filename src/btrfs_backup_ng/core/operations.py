@@ -2045,6 +2045,12 @@ class _SnapperBtrfsDestView:
         # Bind the real primitive to this instance (avoids a module-level Endpoint import /
         # circular dependency).
         self.correspondent_of = Endpoint.correspondent_of.__get__(self)
+        # The batch form, bound for the same reason and from the same source.
+        # The planner asks for all correspondents in ONE listing now (issue
+        # #106); binding only the singular form left this view without the
+        # method the planner calls, which is an AttributeError on every
+        # snapper-to-btrfs backup rather than a slow one.
+        self.correspondents_of = Endpoint.correspondents_of.__get__(self)
 
     def list_snapshots(self, flush_cache: bool = False) -> list:
         return list(self._snaps)

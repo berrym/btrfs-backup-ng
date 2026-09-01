@@ -644,6 +644,33 @@ class RawEndpoint(Endpoint):
             logger.debug("correspondent_of: could not resolve correspondent (%s)", e)
         return None
 
+    def correspondents_of(self, snapshots: list[Any]) -> dict[str, Any]:
+        """Raw override of :meth:`Endpoint.correspondents_of` -- NAME semantics.
+
+        Same rule as the singular raw form (a raw backup has no ``received_uuid``
+        to match, so correspondence is by name), over a listing taken once rather
+        than once per snapshot. Never raises.
+        """
+        try:
+            candidates = self.list_snapshots()
+        except Exception as e:  # noqa: BLE001 - contract: never raise; empty is safe
+            logger.debug("correspondents_of: could not list snapshots (%s)", e)
+            return {}
+
+        by_name: dict[str, Any] = {}
+        for candidate in candidates:
+            by_name.setdefault(candidate.get_name(), candidate)
+
+        found: dict[str, Any] = {}
+        for snapshot in snapshots:
+            get_name = getattr(snapshot, "get_name", None)
+            if not callable(get_name):
+                continue
+            match = by_name.get(get_name())
+            if match is not None:
+                found[get_name()] = match
+        return found
+
     @contextlib.contextmanager
     def target_lock(self, *, timeout: float | None = None) -> Iterator[None]:
         """Hold an exclusive lock on the target directory for a MUTATING operation.

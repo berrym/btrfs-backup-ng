@@ -47,6 +47,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Planning a transfer re-listed the destination once per snapshot**
+  ([#106](https://github.com/berrym/btrfs-backup-ng/issues/106)) — deciding which
+  snapshots were already at the destination asked the endpoint about each one
+  individually, and each question triggered a fresh listing. On an `ssh://`
+  destination that is a remote `btrfs subvolume list` per source snapshot, so a
+  44-snapshot source spent over two minutes deciding what to send before sending
+  anything, logging "Found 44 remote snapshots" once per snapshot. The listing is
+  now taken once. Local and `raw://` destinations were unaffected in practice
+  because their listings are cached; `SSHEndpoint` is the only endpoint that does
+  not cache.
+
+
 - **A target that failed to prepare was not counted, so the run could report
   success** — `_backup_volume` prepared each destination in a loop, and a failure
   there was logged and recorded in the error list, but the success verdict was

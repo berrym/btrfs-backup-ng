@@ -76,6 +76,15 @@ def _endpoints(source_snaps, dest_snaps=()):
     # Presence via the correspondence primitive: present iff a same-named dest snap exists.
     _dest_by_name = {s.get_name(): s for s in dest_snaps}
     dst.correspondent_of.side_effect = lambda s: _dest_by_name.get(s.get_name())
+    # The batch form must agree with the singular one, or this double is not a
+    # faithful stand-in. A bare MagicMock auto-creates correspondents_of and
+    # returns a Mock, which reads as "nothing is present" -- so leaving it
+    # unconfigured makes the double silently disagree with itself.
+    dst.correspondents_of.side_effect = lambda snaps: {
+        s.get_name(): _dest_by_name[s.get_name()]
+        for s in snaps
+        if s.get_name() in _dest_by_name
+    }
     return src, dst
 
 
@@ -91,6 +100,11 @@ class _FakeDest:
     """
 
     correspondent_of = Endpoint.correspondent_of  # the real uuid-correspondence logic
+    # The batch form, bound verbatim for the same reason: presence detection now
+    # asks for all correspondents in ONE listing (issue #106), and a double that
+    # supplied only the singular form would exercise a path production no longer
+    # takes.
+    correspondents_of = Endpoint.correspondents_of
 
     def __init__(self, dest_snaps=(), ep_id="fake-dest"):
         self._snaps = list(dest_snaps)

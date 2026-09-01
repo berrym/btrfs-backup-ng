@@ -547,6 +547,48 @@ class Endpoint:
                 return candidate
         return None
 
+    def correspondents_of(self, snapshots: List[Any]) -> Dict[str, Any]:
+        """``{source_name: correspondent}`` for every snapshot, from ONE listing.
+
+        The batch form of :meth:`correspondent_of`, with identical semantics --
+        it is the same ``received_uuid == uuid`` rule, applied to a listing taken
+        once instead of once per snapshot.
+
+        This exists because the per-snapshot API forced the caller into O(n)
+        listings. The transfer planner asks "is this already on the destination?"
+        for every source snapshot, and on an ssh:// destination each of those was
+        a separate remote ``btrfs subvolume list`` -- roughly three seconds each,
+        so a 44-snapshot source spent over two minutes deciding what to send
+        before sending anything (issue #106). The listing is the expensive part
+        and it does not change while it is being consulted, so it is taken once.
+
+        Never raises, exactly like the singular form: a listing failure yields an
+        empty mapping, which reads as "nothing corresponds" and degrades to full
+        transfers rather than to an unapplyable ``send -p``.
+        """
+        try:
+            candidates = self.list_snapshots()
+        except Exception as e:  # noqa: BLE001 - contract: never raise; empty is safe
+            logger.debug("correspondents_of: could not list snapshots (%s)", e)
+            return {}
+
+        by_received: Dict[str, Any] = {}
+        for candidate in candidates:
+            received = getattr(candidate, "received_uuid", "")
+            if received:
+                # First wins, matching the singular form's first-match scan.
+                by_received.setdefault(received, candidate)
+
+        found: Dict[str, Any] = {}
+        for snapshot in snapshots:
+            src_uuid = getattr(snapshot, "uuid", "")
+            if not src_uuid:
+                continue
+            match = by_received.get(src_uuid)
+            if match is not None:
+                found[snapshot.get_name()] = match
+        return found
+
     def verify_structure(self, snapshot: Any) -> StructureVerdict:
         """Confirm ``snapshot`` is a real, valid backup ARTIFACT (not just a name-shaped
         directory entry) -- the polymorphic structural check behind the ``verify`` metadata

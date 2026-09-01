@@ -25,11 +25,18 @@ def snapshots_present_on(source_snapshots, destination_endpoint):
     transfer planner and the R3 lock reconcile, so the two can never disagree. A re-created
     snapshot (same name, new uuid) is correctly absent, never a name coincidence.
     """
-    return {
-        s.get_name()
-        for s in source_snapshots
-        if destination_endpoint.correspondent_of(s) is not None
-    }
+    # ONE listing for all of them. Asking per snapshot meant a remote
+    # `btrfs subvolume list` per source snapshot on an ssh:// destination --
+    # about three seconds each, so a 44-snapshot source spent over two minutes
+    # here before transferring anything (issue #106). Semantics are unchanged:
+    # correspondents_of applies the same per-endpoint rule (received_uuid for
+    # btrfs, name for raw) and never raises.
+    # Called directly rather than probed for. Every endpoint inherits
+    # correspondents_of from Endpoint (raw overrides it with name semantics), so
+    # a getattr/callable probe would only ever be accommodating a test double --
+    # and it silently mis-fires on one: a bare MagicMock auto-creates the
+    # attribute, so the probe took the batch path and called a Mock.
+    return set(destination_endpoint.correspondents_of(list(source_snapshots)))
 
 
 def plan_transfer_sequence(

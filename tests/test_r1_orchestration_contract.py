@@ -51,6 +51,14 @@ def _endpoints(source_snaps, dest_snaps=()):
     # Presence via the correspondence primitive: present iff a same-named dest snap exists.
     _dest_by_name = {s.get_name(): s for s in dest_snaps}
     dst.correspondent_of.side_effect = lambda s: _dest_by_name.get(s.get_name())
+    # The batch form must agree with the singular one. A bare MagicMock
+    # auto-creates it and returns a Mock, which reads as "nothing is present" --
+    # so leaving it unconfigured makes the double disagree with itself.
+    dst.correspondents_of.side_effect = lambda snaps: {
+        s.get_name(): _dest_by_name[s.get_name()]
+        for s in snaps
+        if s.get_name() in _dest_by_name
+    }
     return src, dst
 
 
