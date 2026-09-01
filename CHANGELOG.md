@@ -47,6 +47,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`log_file` recorded only a fraction of the run while looking complete** —
+  the shared logger is a standalone `logging.Logger("btrfs-backup-ng")` named
+  with hyphens, while 36 modules across `cli/` and `core/` log through
+  `logging.getLogger(__name__)` under `btrfs_backup_ng` with underscores. Those
+  are unrelated logger trees, so a file handler attached only to the former never
+  saw a single line from `run`, `transfer`, `restore`, `operations` or any other
+  module that logs that way. An operator reading the log after a failure was
+  missing most of what happened. Config warnings were missing for a second
+  reason: they were emitted before the handler from that same config was
+  installed. Both are fixed, and enabling file logging no longer changes console
+  verbosity for the rest of the process.
+
+
 - **Planning a transfer re-listed the destination once per snapshot**
   ([#106](https://github.com/berrym/btrfs-backup-ng/issues/106)) — deciding which
   snapshots were already at the destination asked the endpoint about each one

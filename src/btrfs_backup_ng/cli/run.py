@@ -158,9 +158,6 @@ def execute_run(args: argparse.Namespace) -> int:
         logger.info("Loading configuration from: %s", config_path)
         config, warnings = load_config(config_path)
 
-        for warning in warnings:
-            logger.warning("Config: %s", warning)
-
     except ConfigError as e:
         logger.error("Configuration error: %s", e)
         return 1
@@ -169,6 +166,13 @@ def execute_run(args: argparse.Namespace) -> int:
     if config.global_config.log_file:
         add_file_handler(config.global_config.log_file)
         logger.info("File logging enabled: %s", config.global_config.log_file)
+
+        # Emitted AFTER the file handler is installed. Logged before it, these
+        # went to the console only -- an operator running from cron or systemd
+        # with log_file set had a log that silently omitted every config
+        # warning, which is the one place they would look afterwards.
+    for warning in warnings:
+        logger.warning("Config: %s", warning)
 
     # Enable transaction logging if configured
     if config.global_config.transaction_log:
