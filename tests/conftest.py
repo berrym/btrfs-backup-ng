@@ -1,8 +1,59 @@
 """Pytest configuration and shared fixtures."""
 
+import functools
 import logging
+import subprocess
 
 import pytest
+
+
+@functools.cache
+def ssh_localhost_works() -> bool:
+    """Whether passwordless ssh to localhost is usable, decided ONCE.
+
+    THE shared probe. Two copies of this existed: one with a subprocess timeout
+    and one without, inline in a `skipif` expression. The one without could hang
+    for minutes -- `ConnectTimeout` only bounds the TCP connect, so an ssh that
+    connects and then stalls is unbounded -- and because a boolean `skipif`
+    condition is evaluated when the module is IMPORTED, every pytest run paid it
+    whether or not those tests were selected. Measured on a machine where
+    localhost ssh stalls: 230 seconds of a 400-second suite, to decide to skip.
+
+    Cached so a run pays it at most once, and only when something actually asks.
+    """
+    try:
+        result = subprocess.run(
+            [
+                "ssh",
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                "ConnectTimeout=3",
+                "localhost",
+                "true",
+            ],
+            capture_output=True,
+            timeout=8,
+        )
+        return result.returncode == 0
+    except Exception:
+        # Missing ssh, a stall that hit the timeout, anything else -- none of it
+        # is the test's problem, and all of it means "cannot use localhost ssh".
+        return False
+
+
+@pytest.fixture
+def requires_ssh_localhost():
+    """Skip unless passwordless ssh to localhost works.
+
+    A fixture rather than a `skipif` marker on purpose. A boolean skipif
+    condition is evaluated when the module is IMPORTED, so the probe runs on
+    every pytest invocation -- including ones that deselect the test entirely --
+    and an ssh that connects and then stalls made that unbounded. A fixture runs
+    at test SETUP, so a run that never reaches these tests never pays for them.
+    """
+    if not ssh_localhost_works():
+        pytest.skip("passwordless ssh to localhost not available")
 
 
 @pytest.fixture(autouse=True)

@@ -396,31 +396,13 @@ class TestSSHRawEndpointEncryption:
         assert not [s for s in pipeline if s and s[0] in ("gpg", "openssl")]
 
 
-def _ssh_localhost_works() -> bool:
-    import subprocess
-
-    try:
-        r = subprocess.run(
-            [
-                "ssh",
-                "-o",
-                "BatchMode=yes",
-                "-o",
-                "ConnectTimeout=3",
-                "localhost",
-                "true",
-            ],
-            capture_output=True,
-            timeout=8,
-        )
-        return r.returncode == 0
-    except Exception:
-        return False
+# The localhost ssh probe lives in tests/conftest.py now -- it was duplicated
+# here and, in test_raw_endpoint_integration.py, without a timeout.
 
 
 @pytest.mark.skipif(
-    __import__("shutil").which("gpg") is None or not _ssh_localhost_works(),
-    reason="gpg + working passwordless ssh to localhost required",
+    __import__("shutil").which("gpg") is None,
+    reason="gpg required",
 )
 class TestSSHRawRealRoundTrip:
     """Definitive: a real raw+ssh://localhost backup with encrypt=gpg produces a

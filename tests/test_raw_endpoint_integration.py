@@ -965,24 +965,7 @@ class TestSSHRawEndpointIntegration:
         assert "compress=gzip" in repr_str
         assert "encrypt=gpg" in repr_str
 
-    @pytest.mark.skipif(
-        not tool_available("ssh")
-        or subprocess.run(
-            [
-                "ssh",
-                "-o",
-                "BatchMode=yes",
-                "-o",
-                "ConnectTimeout=1",
-                "localhost",
-                "true",
-            ],
-            capture_output=True,
-        ).returncode
-        != 0,
-        reason="SSH to localhost not available or not passwordless",
-    )
-    def test_ssh_localhost_prepare(self, tmp_path):
+    def test_ssh_localhost_prepare(self, tmp_path, requires_ssh_localhost):
         """Test SSH endpoint prepare with localhost."""
         from btrfs_backup_ng.endpoint.raw import SSHRawEndpoint
 
@@ -1002,25 +985,8 @@ class TestSSHRawEndpointIntegration:
         assert remote_path.exists()
         assert remote_path.is_dir()
 
-    @pytest.mark.skipif(
-        not tool_available("ssh")
-        or subprocess.run(
-            [
-                "ssh",
-                "-o",
-                "BatchMode=yes",
-                "-o",
-                "ConnectTimeout=1",
-                "localhost",
-                "true",
-            ],
-            capture_output=True,
-        ).returncode
-        != 0,
-        reason="SSH to localhost not available or not passwordless",
-    )
     @pytest.mark.skipif(not tool_available("zstd"), reason="zstd not available")
-    def test_ssh_localhost_pipeline(self, tmp_path):
+    def test_ssh_localhost_pipeline(self, tmp_path, requires_ssh_localhost):
         """Test SSH pipeline execution to localhost."""
         from btrfs_backup_ng.endpoint.raw import SSHRawEndpoint
 
