@@ -25,15 +25,32 @@ def ssh_localhost_works() -> bool:
         result = subprocess.run(
             [
                 "ssh",
+                "-n",
                 "-o",
                 "BatchMode=yes",
                 "-o",
                 "ConnectTimeout=3",
+                # A shared connection makes this probe measure the wrong thing: it
+                # either reuses a master whose state says nothing about a fresh
+                # connection, or spawns one that outlives the probe.
+                "-o",
+                "ControlMaster=no",
+                "-o",
+                "ControlPath=none",
                 "localhost",
                 "true",
             ],
             capture_output=True,
-            timeout=8,
+            # stdin is NOT covered by capture_output, so it stays connected to
+            # whatever pytest was given. ssh then reads from it and never sees
+            # EOF, and the probe times out on a machine where localhost ssh works
+            # perfectly -- silently skipping every test that asks for it. `-n`
+            # covers the same ground; both are set because either alone is a
+            # single point of failure for a check whose failure mode is silence.
+            stdin=subprocess.DEVNULL,
+            # A full handshake with no connection sharing measured ~5s here, so 8
+            # left almost no headroom.
+            timeout=20,
         )
         return result.returncode == 0
     except Exception:
