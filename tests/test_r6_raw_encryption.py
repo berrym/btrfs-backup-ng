@@ -408,7 +408,9 @@ class TestSSHRawRealRoundTrip:
     """Definitive: a real raw+ssh://localhost backup with encrypt=gpg produces a
     file on the (local)host that is genuine ciphertext and decrypts back."""
 
-    def test_raw_ssh_localhost_gpg_roundtrip(self, tmp_path, isolated_gpg):
+    def test_raw_ssh_localhost_gpg_roundtrip(
+        self, tmp_path, isolated_gpg, requires_ssh_localhost
+    ):
         import subprocess
 
         recipient = isolated_gpg
