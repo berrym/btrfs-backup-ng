@@ -185,6 +185,8 @@ def _parse_target(data: dict[str, Any]) -> TargetConfig:
     path = str(data["path"]).strip() if isinstance(data["path"], str) else data["path"]
     is_raw = str(path).startswith(("raw://", "raw+ssh://"))
 
+    require_mount = _parse_require_mount(data.get("require_mount", False))
+
     # Validate compression against what the target's transport ACTUALLY supports.
     # Raw endpoints and the btrfs/ssh transfer pipeline support different sets
     # (raw adds xz/lzo/bzip2/pbzip2; the transfer path uses lzop). Source the sets
@@ -241,7 +243,7 @@ def _parse_target(data: dict[str, Any]) -> TargetConfig:
         ssh_host_key_policy=ssh_host_key_policy,
         compress=compress,
         rate_limit=data.get("rate_limit"),
-        require_mount=_parse_require_mount(data.get("require_mount", False)),
+        require_mount=require_mount,
         encrypt=encrypt,
         gpg_recipient=gpg_recipient,
         gpg_keyring=data.get("gpg_keyring"),
@@ -249,49 +251,57 @@ def _parse_target(data: dict[str, Any]) -> TargetConfig:
     )
 
 
+_TRUTHY_SPELLINGS = {"true", "yes", "on", "1"}
+_FALSY_SPELLINGS = {"false", "no", "off", "0"}
+
+
 def _parse_require_mount(value: Any) -> bool | str:
-    """Validate ``require_mount`` at the config boundary.
+    """Normalise ``require_mount`` to a bool or a mount point.
 
-    Accepts a bool, or a mount point the target must live under. Anything else
-    fails LOUD here rather than at backup time: this is the guard that stops a
-    backup landing on the root filesystem when an external drive is absent, so a
-    value that cannot be honoured must not be discovered halfway through a run.
+    Most malformed values are COERCED here and warned about separately (see
+    ``_collect_require_mount_warnings``), rather than rejected. The reason is
+    blast radius: a ConfigError aborts the whole file -- every volume, every
+    target, and `list`, `status` and `doctor` along with `run` -- while the mount
+    gate already refuses an unusable value per target, fail-closed, with a
+    message naming it. Erroring here adds no safety for those values and takes
+    down configs that worked on 0.9.6.
 
-    An empty string is rejected rather than treated as false. It reads as a
-    mistake -- a variable that expanded to nothing, most likely -- and silently
-    disabling the safety check on that basis is exactly the failure this option
-    exists to prevent.
+    Two classes still raise, because coercing them would be a guess with a
+    dangerous wrong answer:
+
+    - An EMPTY or whitespace-only string. Both 0.9.6 and the gate read it as
+      falsy, so it silently turns the check OFF -- exactly the failure
+      require_mount exists to prevent -- and it almost always means a variable
+      that expanded to nothing rather than a deliberate "no".
+    - A type that carries no interpretation at all (list, table). No plausible
+      working config contains one.
     """
     if isinstance(value, bool):
         return value
+
+    if isinstance(value, (int, float)):
+        # 1/0 and 1.0/0.0 were truthiness on 0.9.6 and mean exactly that here.
+        return bool(value)
+
     if isinstance(value, str):
         candidate = value.strip()
         if not candidate:
             raise ConfigError(
-                "require_mount is an empty string. Use true/false, or the mount "
-                "point the target lives under (for example "
-                'require_mount = "/mnt/backup"). An empty value would turn the '
-                "check off silently."
+                "require_mount is an empty string, which would turn the mount "
+                "check OFF without saying so -- and that is the accident the "
+                "option exists to prevent. Use true/false, or the mount point "
+                'the target lives under (for example "/mnt/backup"). If a '
+                "variable was meant to expand here, it did not."
             )
-        if Path(candidate).resolve() == Path("/"):
-            # "/" is always mounted and every path is under it, so this passes
-            # unconditionally: a check that protects nothing while looking like
-            # protection. The same failure the containment test refuses from the
-            # other direction.
-            raise ConfigError(
-                f"require_mount = {value!r} resolves to / , which would always "
-                f"pass -- the root filesystem is always mounted and every target "
-                f"is under it, so the check would protect nothing. Name the mount "
-                f"point the target actually lives under (for example "
-                f'"/mnt/backup"), or use true/false.'
-            )
-        if not candidate.startswith("/"):
-            raise ConfigError(
-                f"require_mount = {value!r} is not an absolute path. It names the "
-                f"mount point the target must live under, so it has to be absolute "
-                f'(for example "/mnt/backup").'
-            )
+        lowered = candidate.lower()
+        if lowered in _TRUTHY_SPELLINGS:
+            return True
+        if lowered in _FALSY_SPELLINGS:
+            return False
+        # Anything else is treated as a mount point. A relative or vacuous one
+        # is refused by the gate, per target, with the value quoted.
         return candidate
+
     raise ConfigError(
         f"require_mount must be true, false, or a mount point path; got "
         f"{type(value).__name__} ({value!r})."
@@ -560,6 +570,128 @@ def _collect_unknown_key_warnings(data: dict[str, Any]) -> list[str]:
     return warnings
 
 
+def _collect_require_mount_warnings(data: dict[str, Any]) -> list[str]:
+    """Report every ``require_mount`` value that was not written as intended.
+
+    Walks the RAW dict, like ``_collect_unknown_key_warnings``, because by the
+    time the config is built the value has been coerced and the original
+    spelling -- the thing the operator needs to see -- is gone.
+
+    These are warnings rather than errors deliberately. The mount gate refuses an
+    unusable value per target, fail-closed, quoting it; a ConfigError here would
+    add no safety and would stop the whole file loading, taking `list`, `status`
+    and `doctor` down with `run`. But a coercion nobody is told about is the
+    "recognised and silently ignored" shape this project keeps removing, so each
+    one is named, with what it was read as.
+    """
+    warnings: list[str] = []
+    if not isinstance(data, dict):
+        return warnings
+
+    for v_index, volume in enumerate(data.get("volumes", []) or []):
+        if not isinstance(volume, dict):
+            continue
+        for t_index, target in enumerate(volume.get("targets", []) or []):
+            if not isinstance(target, dict) or "require_mount" not in target:
+                continue
+            where = f"volumes[{v_index}].targets[{t_index}]"
+            raw = target["require_mount"]
+            if isinstance(raw, bool):
+                continue
+
+            if isinstance(raw, (int, float)):
+                warnings.append(
+                    f"require_mount = {raw!r} in [{where}] is not true/false. "
+                    f"Read as {bool(raw)}"
+                    + ("" if raw else " -- the mount check is OFF for this target")
+                    + ". Write true or false, or the mount point the target "
+                    "lives under."
+                )
+                continue
+
+            if isinstance(raw, str):
+                lowered = raw.strip().lower()
+                if lowered in _TRUTHY_SPELLINGS:
+                    warnings.append(
+                        f"require_mount = {raw!r} in [{where}] is quoted. Read as "
+                        f"true. Write it unquoted."
+                    )
+                elif lowered in _FALSY_SPELLINGS:
+                    warnings.append(
+                        f"require_mount = {raw!r} in [{where}] is quoted. Read as "
+                        f"false, so the mount check is OFF for this target. Write "
+                        f"it unquoted."
+                    )
+                elif not raw.strip().startswith("/"):
+                    warnings.append(
+                        f"require_mount = {raw!r} in [{where}] is not an absolute "
+                        f"path, so it cannot name a mount point. This target will "
+                        f"refuse to run until it is fixed."
+                    )
+                elif _target_is_remote(target.get("path")):
+                    # A mount point is checked against THIS machine's mount
+                    # table, which says nothing about a remote filesystem, so
+                    # the gate exempts remote targets and the value does
+                    # nothing. Warned rather than refused: README documents
+                    # require_mount as having no effect on ssh:// targets, and
+                    # the sibling precedent in this file (compress not applied
+                    # to a same-machine target) warns for the same shape.
+                    warnings.append(
+                        f"require_mount = {raw!r} in [{where}] names a mount "
+                        f"point, which is checked on THIS machine. The target is "
+                        f"remote, so it has no effect there and nothing is being "
+                        f"guarded."
+                    )
+                elif Path(raw.strip()).resolve() == Path("/"):
+                    warnings.append(
+                        f"require_mount = {raw!r} in [{where}] resolves to / , "
+                        f"which is always mounted, so the check would pass "
+                        f"unconditionally. This target will refuse to run until "
+                        f"it names the mount the target actually lives under."
+                    )
+                else:
+                    # Containment is decidable here with no I/O, and getting it
+                    # wrong means this target aborts on every run. Reported at
+                    # load so `config validate` says so, rather than only at
+                    # backup time -- but as a warning, because the gate already
+                    # refuses the target fail-closed and an error would stop the
+                    # whole file loading.
+                    warnings += _containment_warning(target.get("path"), raw, where)
+    return warnings
+
+
+def _target_is_remote(path: Any) -> bool:
+    """Whether a target path is a remote scheme, per the one scheme authority."""
+    from ..core.target import parse_target
+
+    try:
+        return bool(parse_target(str(path)).is_remote)
+    except Exception:  # noqa: BLE001 - an unclassifiable path is not remote here
+        return False
+
+
+def _containment_warning(path: Any, require_mount: str, where: str) -> list[str]:
+    """Warn when the target does not live under the mount point it names."""
+    from ..core.target import parse_target
+
+    try:
+        scheme = parse_target(str(path))
+        if not scheme.supports_mount_check or not scheme.path:
+            return []
+        target_dir = Path(scheme.path).resolve()
+        expected = Path(require_mount.strip()).resolve()
+    except Exception:  # noqa: BLE001 - undeterminable is the gate's problem
+        return []
+
+    if target_dir.is_relative_to(expected):
+        return []
+    return [
+        f"require_mount = {require_mount!r} in [{where}] names a mount the "
+        f"target is not inside, so it would confirm a drive this target is not "
+        f"written to. This target will refuse to run until one of them changes."
+    ]
+
+
 def _validate_config(config: Config) -> list[str]:
     """Validate configuration and return list of warnings."""
     # Imported here rather than at module scope: core/__init__ pulls in
@@ -688,7 +820,11 @@ def load_config(path: Path | str) -> tuple[Config, list[str]]:
     # Validate and collect warnings. Unknown-key warnings first: a typo'd or
     # misplaced key is a structural mistake worth seeing before the semantic
     # checks, and it explains why an expected setting appears not to take effect.
-    warnings = _collect_unknown_key_warnings(data) + _validate_config(config)
+    warnings = (
+        _collect_unknown_key_warnings(data)
+        + _collect_require_mount_warnings(data)
+        + _validate_config(config)
+    )
 
     return config, warnings
 

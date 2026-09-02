@@ -118,3 +118,51 @@ class TestAMemoryBackedMountIsRefused:
 
         _table(monkeypatch, tmp_path, ["/dev/sdb1 /mnt/backup btrfs rw 0 0\n"])
         assert_target_mounted("/mnt/backup/box1", "/mnt/backup")
+
+
+class TestTheUpgradeErrorDiagnosesItself:
+    """`require_mount = true` requires the TARGET to be a mount point, so a
+    subdirectory of a correctly-connected drive fails it. The generic message
+    then told the operator to connect a drive that is already connected, or to
+    turn the safety check off -- and that is the most likely thing to be read
+    after upgrading, because raw:// targets were exempt from this check before
+    and are not now.
+    """
+
+    def test_it_names_the_mounted_drive_and_the_line_to_write(
+        self, monkeypatch, tmp_path
+    ):
+        from btrfs_backup_ng.cli.common import assert_target_mounted
+
+        _table(monkeypatch, tmp_path, ["/dev/sdb1 /mnt/usb-backup btrfs rw 0 0\n"])
+        with pytest.raises(__util__.AbortError) as caught:
+            assert_target_mounted("/mnt/usb-backup/home", True)
+        message = str(caught.value)
+        assert 'require_mount = "/mnt/usb-backup"' in message, (
+            f"the error does not tell the operator what to change: {message}"
+        )
+        assert "is not itself a mount point" in message
+        assert "set require_mount = false" not in message, (
+            "the error advises disabling the safety check when the fix is to "
+            "name the mount point"
+        )
+
+    def test_a_genuinely_absent_drive_keeps_the_original_message(
+        self, monkeypatch, tmp_path
+    ):
+        """No ancestor is mounted, so there is nothing to suggest."""
+        from btrfs_backup_ng.cli.common import assert_target_mounted
+
+        _table(monkeypatch, tmp_path, ["/dev/sda1 / ext4 rw 0 0\n"])
+        with pytest.raises(__util__.AbortError, match="Ensure the drive is connected"):
+            assert_target_mounted("/mnt/usb-backup/home", True)
+
+    def test_root_is_never_suggested(self, monkeypatch, tmp_path):
+        """/ is always mounted; suggesting it would hand the operator a config
+        that always passes and protects nothing."""
+        from btrfs_backup_ng.cli.common import assert_target_mounted
+
+        _table(monkeypatch, tmp_path, ["/dev/sda1 / ext4 rw 0 0\n"])
+        with pytest.raises(__util__.AbortError) as caught:
+            assert_target_mounted("/srv/backups", True)
+        assert 'require_mount = "/"' not in str(caught.value)

@@ -2177,9 +2177,21 @@ class TestDetectionWizard:
             "print",  # print config
         ]
 
-        with patch(
-            "btrfs_backup_ng.cli.config_cmd.prompt_snapshot_prefix",
-            side_effect=["home"],  # prefix
+        # The drive is CONNECTED while the wizard runs -- the normal case, and
+        # the only one in which the mount table can tell the wizard anything.
+        with (
+            patch(
+                "btrfs_backup_ng.cli.config_cmd.prompt_snapshot_prefix",
+                side_effect=["home"],  # prefix
+            ),
+            patch(
+                "btrfs_backup_ng.__util__.is_mounted",
+                lambda p: str(p) == "/mnt/usb-drive",
+            ),
+            patch(
+                "btrfs_backup_ng.__util__.get_mount_info",
+                lambda p: {"fs_type": "btrfs"},
+            ),
         ):
             exit_code = _run_detection_wizard(result)
 
@@ -2190,8 +2202,8 @@ class TestDetectionWizard:
         # itself to be a mount point -- produces a config that aborts even with
         # the drive correctly connected. This previously asserted exactly that.
         assert "require_mount = true" not in captured.out, (
-            "the wizard emitted require_mount = true for a subdirectory target; "
-            "that config can never pass"
+            "the wizard emitted require_mount = true for a subdirectory target "
+            "while the drive was mounted; that config can never pass"
         )
         assert 'require_mount = "/mnt/usb-drive"' in captured.out
 

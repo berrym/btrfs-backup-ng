@@ -85,9 +85,16 @@ class TestTheBooleanFormIsUnchanged:
         _gate("/mnt/backup", True, mounted=["/mnt/backup"])
 
     def test_true_still_refuses_a_subdirectory(self):
-        """Unchanged, deliberately -- existing configs must behave as before."""
-        with pytest.raises(__util__.AbortError, match="is not mounted"):
+        """Unchanged, deliberately -- existing configs must behave as before.
+
+        The refusal is the behaviour under test. The MESSAGE now diagnoses the
+        case rather than saying "is not mounted", because with the drive
+        connected that reads as advice to fix something that is not broken; see
+        TestTheUpgradeErrorDiagnosesItself.
+        """
+        with pytest.raises(__util__.AbortError) as caught:
             _gate("/mnt/backup/box1", True, mounted=["/mnt/backup"])
+        assert 'require_mount = "/mnt/backup"' in str(caught.value)
 
     def test_false_checks_nothing(self):
         _gate("/anywhere/at/all", False, mounted=[])
@@ -99,9 +106,16 @@ class TestTheBooleanFormIsUnchanged:
         _gate(uri, "/mnt/backup", mounted=[])
 
 
-class TestBadValuesFailAtConfigLoad:
-    """Not at backup time. This guard stops a backup landing on the root
-    filesystem, so a value that cannot be honoured must fail before the run."""
+class TestBadValuesAreCoercedAndNamed:
+    """Most malformed values are coerced and warned about, not rejected.
+
+    The mount gate already refuses an unusable value per target, fail-closed,
+    quoting it -- so a ConfigError at load adds no safety and takes the WHOLE
+    file down, stopping `list`, `status` and `doctor` as well as `run`, for
+    configs that worked on 0.9.6. But a coercion nobody is told about is the
+    "recognised and silently ignored" shape this project keeps removing, so each
+    one is named with what it was read as.
+    """
 
     def test_a_path_is_accepted(self):
         assert _parse_require_mount("/mnt/backup") == "/mnt/backup"
@@ -110,20 +124,68 @@ class TestBadValuesFailAtConfigLoad:
     def test_booleans_are_accepted(self, value):
         assert _parse_require_mount(value) is value
 
-    def test_an_empty_string_is_rejected(self):
-        """Reads as an expansion that produced nothing. Treating it as false
-        would disable the safety check silently."""
-        with pytest.raises(ConfigError, match="empty string"):
-            _parse_require_mount("")
+    @pytest.mark.parametrize(
+        ("value", "expected"),
+        [(1, True), (0, False), (1.5, True), (0.0, False)],
+    )
+    def test_numbers_are_coerced_by_truthiness(self, value, expected):
+        """Exactly what 0.9.6 did with them, and the only reading they have."""
+        assert _parse_require_mount(value) is expected
 
-    def test_a_relative_path_is_rejected(self):
-        with pytest.raises(ConfigError, match="absolute"):
-            _parse_require_mount("mnt/backup")
+    @pytest.mark.parametrize(
+        ("value", "expected"),
+        [
+            ("true", True),
+            ("True", True),
+            ("yes", True),
+            ("on", True),
+            ("1", True),
+            ("false", False),
+            ("FALSE", False),
+            ("no", False),
+            ("off", False),
+            ("0", False),
+        ],
+    )
+    def test_quoted_booleans_are_coerced(self, value, expected):
+        assert _parse_require_mount(value) is expected
 
-    @pytest.mark.parametrize("value", [123, 1.5, ["/mnt/backup"], {"a": 1}])
-    def test_other_types_are_rejected(self, value):
+    def test_a_relative_path_is_kept_for_the_gate_to_refuse(self):
+        """Not an error: the gate refuses this target with the value quoted."""
+        assert _parse_require_mount("mnt/backup") == "mnt/backup"
+        with pytest.raises(__util__.AbortError):
+            _gate("/mnt/backup/box1", "mnt/backup", mounted=["/mnt/backup"])
+
+
+class TestTheTwoValuesThatStillFailLoudly:
+    """Coercing these would be a guess whose wrong answer is dangerous."""
+
+    @pytest.mark.parametrize("value", ["", "   ", "\t"])
+    def test_an_empty_string_is_rejected(self, value):
+        """Both 0.9.6 and the gate read it as falsy, so it turns the check OFF
+        silently -- the accident require_mount exists to prevent. It nearly
+        always means a variable that expanded to nothing."""
+        with pytest.raises(ConfigError, match="turn the mount check OFF"):
+            _parse_require_mount(value)
+
+    @pytest.mark.parametrize("value", [["/mnt/backup"], {"a": 1}, None])
+    def test_uninterpretable_types_are_rejected(self, value):
         with pytest.raises(ConfigError, match="must be true, false, or a mount"):
             _parse_require_mount(value)
+
+
+class TestAVacuousMountLoadsButCannotRun:
+    """`require_mount = "/"` would pass unconditionally. It is warned about at
+    load and refused by the gate, rather than stopping the file loading."""
+
+    @pytest.mark.parametrize("value", ["/", "//", "/.", "/mnt/.."])
+    def test_it_loads(self, value):
+        assert _parse_require_mount(value) == value
+
+    @pytest.mark.parametrize("value", ["/", "/.", "/mnt/.."])
+    def test_the_gate_refuses_it(self, value):
+        with pytest.raises(__util__.AbortError, match="protect nothing|always pass"):
+            _gate("/mnt/backup/box1", value, mounted=["/"])
 
 
 class TestTheConfigWriterPreservesIt:
@@ -178,17 +240,3 @@ class TestTheConfigWriterPreservesIt:
 
     def test_false_emits_nothing(self):
         assert self._emit(False) == []
-
-
-class TestAVacuousMountIsRefused:
-    """`require_mount = "/"` would pass unconditionally: root is always mounted
-    and every path is under it. That is the containment footgun from the other
-    direction -- a check that looks like protection and provides none."""
-
-    @pytest.mark.parametrize("value", ["/", "//", "///"])
-    def test_root_is_refused_at_config_load(self, value):
-        with pytest.raises(ConfigError, match="would always pass"):
-            _parse_require_mount(value)
-
-    def test_a_real_mount_point_is_still_accepted(self):
-        assert _parse_require_mount("/mnt") == "/mnt"

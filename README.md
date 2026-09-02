@@ -718,6 +718,8 @@ path = "/run/media/mberry/My Backup/box1"
 require_mount = "/run/media/mberry/My Backup"
 ```
 
+A value that cannot work is reported when the config is read — by `config validate`, `doctor`, `list` and `run`, and in `log_file` — rather than only when a backup runs. A quoted `"true"`, a number, or a path the target does not live under still loads, with a warning naming it and what it was read as; the target itself is refused at backup time. Only two values stop the file loading: an empty string, which would turn the check off silently, and a type that has no interpretation at all.
+
 Do not name `/run` itself. It is a `tmpfs` held in memory and is always mounted — including when the drive is absent — so the check would always pass and the backup would be written into RAM. `require_mount` refuses memory-backed filesystems for that reason.
 
 The named path must be mounted **and** the target must live under it. Naming a drive the target is not written to would confirm a mounted filesystem while the backup went elsewhere, so that is refused:

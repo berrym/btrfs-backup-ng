@@ -144,6 +144,28 @@ def assert_target_mounted(target_path: str, require_mount: bool | str = True) ->
         return
 
     if not __util__.is_mounted(resolved):
+        # Say which case this is. `require_mount = true` requires the TARGET to be
+        # a mount point, so a subdirectory of a correctly-connected drive fails
+        # here -- and the generic message then tells the operator to connect a
+        # drive that is already connected, or to switch the safety check off.
+        # That is the most likely thing to be read after an upgrade, because
+        # raw:// targets were exempt from this check before and are not now.
+        mounted_ancestor = next(
+            (
+                str(parent)
+                for parent in resolved.parents
+                if parent != Path("/") and __util__.is_mounted(parent)
+            ),
+            None,
+        )
+        if mounted_ancestor:
+            raise __util__.AbortError(
+                f"Target {target_path} is not itself a mount point, which is what "
+                f"require_mount = true asks for. {mounted_ancestor} IS mounted, "
+                f"and the target is inside it -- if that is the drive you mean, "
+                f'use require_mount = "{mounted_ancestor}" instead, which checks '
+                f"that drive and allows the target to be a subdirectory of it."
+            )
         raise __util__.AbortError(
             f"Target {target_path} is not mounted. "
             f"Ensure the drive is connected and mounted, or set require_mount = false."

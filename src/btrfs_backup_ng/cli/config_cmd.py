@@ -11,7 +11,7 @@ from ..__logger__ import create_logger
 from ..config import ConfigError, find_config_file, load_config
 from .. import __util__
 from ..config.loader import generate_example_config, get_default_config_path
-from .common import get_log_level
+from .common import _MEMORY_BACKED_FILESYSTEMS, get_log_level
 from .wizard_utils import (
     console,
     display_btrbk_detected,
@@ -204,26 +204,39 @@ def _derive_require_mount(target_path: str) -> bool | str:
     """Turn "yes, check the mount" into a value that can actually pass.
 
     The wizard offers this check for /mnt/... paths, which are overwhelmingly
-    SUBDIRECTORIES of a mount point -- several machines or volumes backing up
-    into one drive. `require_mount = true` requires the target ITSELF to be a
-    mount point, so for those it produces a config that aborts even with the
-    drive correctly connected. The wizard emitted exactly that, and the shipped
-    examples taught it.
+    SUBDIRECTORIES of a mount point. `require_mount = true` requires the target
+    ITSELF to be a mount point, so for those it produced a config that aborts
+    even with the drive correctly connected.
 
-    So: if the target is itself a mount point, `true` is right and is kept.
-    Otherwise name the mount point the target lives under -- taken from the
-    mount table when the drive is connected (the usual case while configuring),
-    falling back to the parent directory, which is the intended answer for the
-    ``/mnt/<drive>/<host>`` layout this prompt exists for.
+    Only the mount table is consulted, and only when it can actually answer. An
+    earlier version fell back to the target's PARENT when nothing was mounted,
+    which fabricated mount points that can never exist -- a target of
+    /mnt/backup yielded "/mnt", and /run/media/<user>/<drive> yielded
+    "/run/media/<user>" -- so the wizard emitted configs that abort forever, with
+    the drive connected, for a reason the operator never chose. Guessing is worse
+    than declining to guess: `true` is the documented default, and when it is
+    wrong the runtime error now names the mounted drive and the exact line to
+    write instead.
+
+    The scheme comes from `parse_target`, not from `Path.is_absolute()`. A
+    raw:// URI is not an absolute path, so the earlier check bailed to `true`
+    for precisely the scheme whose targets are usually subdirectories.
     """
-    path = Path(target_path)
+    from ..core.target import parse_target
+
+    scheme = parse_target(target_path)
+    if scheme.is_remote or not scheme.supports_mount_check:
+        # Nothing local to check, or the path cannot be determined; `true` is the
+        # documented default and the gate handles both cases on its own.
+        return True
+
+    path = Path(scheme.path)
     if not path.is_absolute():
         return True
 
     def _mounted(candidate: Path) -> bool:
         # The wizard did not read the mount table before this; an unreadable
-        # /proc/mounts must not take the whole config wizard down with it. The
-        # parent-directory fallback below is a good answer without it.
+        # /proc/mounts must not take the whole config wizard down with it.
         try:
             return __util__.is_mounted(candidate)
         except OSError:
@@ -231,13 +244,25 @@ def _derive_require_mount(target_path: str) -> bool | str:
 
     if _mounted(path):
         return True
+
     for parent in path.parents:
         if parent == Path("/"):
             break
-        if _mounted(parent):
-            return str(parent)
-    parent = path.parent
-    return True if parent == Path("/") else str(parent)
+        if not _mounted(parent):
+            continue
+        # Never name a filesystem held in memory: /run is tmpfs and always
+        # mounted, so it would produce a check that always passes -- the very
+        # thing assert_target_mounted refuses.
+        info = None
+        try:
+            info = __util__.get_mount_info(parent)
+        except OSError:
+            pass
+        if (info or {}).get("fs_type") in _MEMORY_BACKED_FILESYSTEMS:
+            break
+        return str(parent)
+
+    return True
 
 
 def _generate_config_from_wizard(config_data: dict[str, Any]) -> str:

@@ -12,6 +12,7 @@ import subprocess
 from pathlib import Path
 
 from .models import BtrfsMountInfo, DetectedSubvolume, DetectionResult
+from .. import __util__
 
 logger = logging.getLogger(__name__)
 
@@ -87,6 +88,16 @@ def parse_proc_mounts(
             continue
 
         device, mount_point, fs_type, options_str = parts[:4]
+
+        # Decode the kernel's octal escapes, the same way every other reader of
+        # this file does. Without it a btrfs filesystem mounted at a path
+        # containing a space is reported with a literal "\040" in its path, so
+        # detection disagrees with is_mounted/is_btrfs about the same mount and
+        # anything built from the detected path points somewhere that does not
+        # exist. Muted for removable media, which is excluded by default -- but
+        # a system mount like "/srv/my data" is exactly this case.
+        device = __util__.unescape_mount_field(device)
+        mount_point = __util__.unescape_mount_field(mount_point)
 
         if fs_type != "btrfs":
             continue

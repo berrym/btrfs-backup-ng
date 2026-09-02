@@ -37,13 +37,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- **`require_mount` values that are neither a boolean nor an absolute path are
-  now rejected when the config loads.** Previously `require_mount` was passed
-  through unvalidated, so `1`, `0`, `"true"` and `""` all loaded — `1` and
-  `"true"` enabling the check, `0` and `""` silently disabling it. They now
-  raise a configuration error, which stops the whole file loading rather than
-  applying a setting nobody can predict. If you wrote the value quoted or as a
-  number, change it to a bare `true`/`false` or to the mount point path.
+- **`require_mount` values that are not quite right now warn instead of stopping
+  the whole config from loading** — a quoted `"true"`, a number, a relative path,
+  or a mount point the target does not live under all load, with a warning naming
+  the value and what it was read as. The mount check itself still refuses an
+  unusable value, per target, when a backup runs; a configuration error would
+  have stopped `list`, `status` and `doctor` as well as `run`, for values that
+  worked on 0.9.6 and were never unsafe.
+
+  Two values still fail loudly, because coercing them would be a guess with a
+  dangerous wrong answer: an empty string, which reads as false and so turns the
+  check off without saying so — usually a variable that expanded to nothing — and
+  a type with no interpretation, such as a list.
+
+  A configuration that can never run is now named when the config is read rather
+  than only at backup time: a target that is not inside the mount point it names,
+  or a mount point that resolves to `/`, is reported by `config validate`.
 
 ### Fixed
 

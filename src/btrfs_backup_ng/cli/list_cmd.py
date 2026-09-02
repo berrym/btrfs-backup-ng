@@ -37,6 +37,9 @@ def execute_list(args: argparse.Namespace) -> int:
             return 1
 
         config, warnings = load_config(config_path)
+        # Bound and never used, which reads as though they were surfaced.
+        for warning in warnings:
+            logger.warning("Config: %s", warning)
 
     except ConfigError as e:
         logger.error("Configuration error: %s", e)

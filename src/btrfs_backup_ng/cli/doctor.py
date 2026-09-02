@@ -45,7 +45,12 @@ def execute_doctor(args: argparse.Namespace) -> int:
     config = None
     if config_path:
         try:
-            config, _warnings = load_config(config_path)
+            config, config_warnings = load_config(config_path)
+            # Discarded until now, so `doctor` -- the command an operator runs
+            # precisely when something looks wrong -- reported "Configuration is
+            # valid" for a config the loader had complained about.
+            for warning in config_warnings:
+                logger.warning("Config: %s", warning)
         except ConfigError:
             pass  # Doctor will report this
 
