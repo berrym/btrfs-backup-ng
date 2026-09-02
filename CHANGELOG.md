@@ -9,6 +9,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Retention can differ between the source and each target, and can be a count**
+  ([#103](https://github.com/berrym/btrfs-backup-ng/issues/103)) — there was one
+  policy per volume, applied identically to the source and every target, so
+  "keep many recent snapshots on the machine but the long tail on the backup
+  drive" could not be expressed, and two targets could not differ from each
+  other.
+
+  ```toml
+  [volumes.source_retention]     # this volume's source snapshots only
+  min = "6h"
+  hourly = 48
+
+  [[volumes.targets]]
+  path = "/mnt/archive"
+
+  [volumes.targets.retention]    # this one target only
+  keep = 30                      # at least the 30 most recent
+  ```
+
+  A target uses its own policy, else the volume's, else the global one; the
+  source uses `source_retention`, else the volume's, else global. A config that
+  sets none of the new keys resolves to the same policy everywhere, exactly as
+  before.
+
+  `keep = N` is count-based retention, and it replaces the time buckets
+  (`hourly` through `yearly`) for that scope rather than combining with them — a
+  count is neither obviously a floor nor a ceiling, and guessing wrong either
+  wastes space or deletes history. Setting both is reported as a warning naming
+  which keys are ignored. `min` is not a bucket and still applies: it is a floor,
+  floors compose, and ignoring it would let a documented safety setting sit in
+  the config doing nothing. So `keep = N` means "at least N"; use `min = "0s"`
+  for the count alone. This is
+  not a new idea: the original btrfs-backup had `--num-snapshots` and
+  `--num-backups`, separately for source and destination, and the subcommand CLI
+  dropped them without replacement. Those flags still work in legacy mode.
+
+  Snapshots whose timestamp cannot be read are kept regardless of policy, as
+  before, and locked snapshots are never deleted — so a `keep = 30` scope can
+  legitimately hold more than 30 while transfers are pending.
+
 - **`require_mount` accepts the mount point the target lives under** — reported
   in [#100](https://github.com/berrym/btrfs-backup-ng/issues/100). Backing up
   several machines or volumes into one drive means targets like

@@ -89,6 +89,12 @@ class RetentionConfig:
         weekly: Number of weekly snapshots to keep
         monthly: Number of monthly snapshots to keep
         yearly: Number of yearly snapshots to keep
+        keep: Count-based retention -- keep exactly the N most recent snapshots.
+            When set (> 0) it REPLACES the time buckets for that scope rather than
+            combining with them. The original btrfs-backup had this as
+            --num-snapshots/--num-backups and the subcommand CLI dropped it; a
+            drive that is only connected occasionally prunes strangely by time,
+            and "keep the last N" is what people mean there.
     """
 
     min: str = "1d"
@@ -97,6 +103,9 @@ class RetentionConfig:
     weekly: int = 4
     monthly: int = 12
     yearly: int = 0
+    # 0 = unset: use the time buckets above. > 0 = keep exactly that many, newest
+    # first, and ignore the buckets.
+    keep: int = 0
 
 
 @dataclass
@@ -165,6 +174,10 @@ class TargetConfig:
     # requires THAT path to be mounted with the target at or under it, which is
     # the many-boxes-into-one-drive case (issue #100).
     require_mount: bool | str = False
+    # This target's own retention, overriding the volume's and the global one.
+    # A rarely-connected archive and an always-on space-limited disk want
+    # different policies; before this they were forced to share one.
+    retention: Optional["RetentionConfig"] = None
     # Encryption applies only to raw (raw:// / raw+ssh://) targets. The loader
     # rejects these on non-raw targets so a misplaced setting fails loudly rather
     # than being silently ignored (which would write plaintext).
@@ -263,6 +276,12 @@ class VolumeConfig:
     snapshot_dir: str = ".snapshots"
     targets: list[TargetConfig] = field(default_factory=list)
     retention: Optional[RetentionConfig] = None
+    # Retention for this volume's SOURCE snapshots only, overriding `retention`.
+    # Keeping many recent snapshots on the box while the targets hold the long
+    # tail is the common shape, and one policy for both cannot express it.
+    # Named source_retention rather than nested under [volumes.source] because
+    # `source` is already a scalar on a volume ("native" / "snapper").
+    source_retention: Optional[RetentionConfig] = None
     enabled: bool = True
     source: str = "native"
     snapper: Optional[SnapperSourceConfig] = None
@@ -343,6 +362,25 @@ class Config:
         Volume-specific retention overrides global retention.
         """
         return volume.retention or self.global_config.retention
+
+    def get_source_retention(self, volume: VolumeConfig) -> RetentionConfig:
+        """Retention for a volume's SOURCE snapshots.
+
+        source_retention, else the volume's policy, else global -- so a config
+        that sets neither behaves exactly as it did before these keys existed.
+        """
+        return (
+            volume.source_retention or volume.retention or self.global_config.retention
+        )
+
+    def get_target_retention(
+        self, volume: VolumeConfig, target: TargetConfig
+    ) -> RetentionConfig:
+        """Retention for one target of a volume.
+
+        The target's own policy, else the volume's, else global.
+        """
+        return target.retention or volume.retention or self.global_config.retention
 
     def get_enabled_volumes(self) -> list[VolumeConfig]:
         """Get list of enabled volumes."""

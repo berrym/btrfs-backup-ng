@@ -638,25 +638,44 @@ def _prune_after_transfer(
     so ``run`` exits non-zero rather than silently skipping retention. ``run`` never forces a
     degenerate prune: an intentional keep-only-latest prune is the explicit ``prune --force``.
     """
-    retention = config.get_effective_retention(volume)
-    if is_degenerate_policy(retention):
-        logger.error(
-            "Refusing to prune %s: retention keeps ONLY the latest snapshot (all buckets 0, "
-            "min=%s). Fix the policy, or run `prune --force` to prune it deliberately.",
-            volume.path,
-            retention.min,
-        )
-        errors.append(f"Degenerate retention policy: {volume.path}")
-        return False
+    # Degeneracy is judged PER ENDPOINT below, not once for the volume: with
+    # per-scope policies a volume default can be degenerate while every endpoint
+    # that actually runs has a good policy of its own, and refusing the whole
+    # volume for that would block a valid configuration.
 
     prefix = volume.snapshot_prefix
     ts_format = get_timestamp_format(config)
     ok = True
-    endpoints = [(source_endpoint, f"source {volume.path}")]
-    endpoints += [(ep, f"target {tc.path}") for ep, tc in succeeded_targets]
-    for ep, label in endpoints:
+    # Each endpoint gets its OWN policy. The source and a target want different
+    # answers -- keep many recent snapshots on the box while the targets hold the
+    # long tail -- and two targets can differ from each other, since a rarely
+    # connected archive and an always-on space-limited disk are not the same
+    # problem. Before this they all shared one policy, so neither could be
+    # expressed. A config that sets no per-scope keys resolves to the same value
+    # for every endpoint, exactly as before.
+    endpoints = [
+        (source_endpoint, f"source {volume.path}", config.get_source_retention(volume))
+    ]
+    endpoints += [
+        (ep, f"target {tc.path}", config.get_target_retention(volume, tc))
+        for ep, tc in succeeded_targets
+    ]
+    for ep, label, endpoint_retention in endpoints:
+        if is_degenerate_policy(endpoint_retention):
+            logger.error(
+                "Refusing to prune %s: retention keeps ONLY the latest snapshot "
+                "(all buckets 0, no keep count, min=%s). Fix the policy, or run "
+                "`prune --force` to prune it deliberately.",
+                label,
+                endpoint_retention.min,
+            )
+            errors.append(f"Degenerate retention policy: {label}")
+            ok = False
+            continue
         try:
-            _keep, to_delete = plan_endpoint_retention(ep, retention, prefix, ts_format)
+            _keep, to_delete = plan_endpoint_retention(
+                ep, endpoint_retention, prefix, ts_format
+            )
             deleted, del_errs = execute_retention_deletes(ep, to_delete)
             if deleted:
                 logger.info("Pruned %d old snapshot(s) (%s)", deleted, label)

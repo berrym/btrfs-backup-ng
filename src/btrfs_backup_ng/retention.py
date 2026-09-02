@@ -367,6 +367,45 @@ def apply_retention(
         valid_infos[0].keep = True
         valid_infos[0].keep_reason = "latest"
 
+    # Count-based retention REPLACES the buckets for this scope.
+    #
+    # Combining the two raises a question with no good answer -- is a count a
+    # floor or a ceiling? -- and getting it backwards either wastes space or
+    # deletes history. One rule at a time is easier to predict, and it is what
+    # the original --num-snapshots/--num-backups did.
+    #
+    # `min` still applies. It is documented as "keep ALL snapshots for at least
+    # this long" -- a floor -- and a floor composes with a count without
+    # ambiguity: both can only ever keep MORE, never fewer. Ignoring it would
+    # make a safety setting sitting in the config do nothing, which is the exact
+    # defect this project keeps removing; measured, `keep = 1` with `min = "1d"`
+    # deleted five snapshots from the last hour.
+    #
+    # So `keep = N` means "at least the newest N". That is already true for other
+    # reasons -- quarantined snapshots and snapshots locked for a pending
+    # transfer are kept regardless of any policy -- so this is the meaning the
+    # option already had.
+    if getattr(config, "keep", 0) > 0:
+        for position, info in enumerate(valid_infos):
+            if position < config.keep:
+                info.keep = True
+                if not info.keep_reason:
+                    info.keep_reason = f"newest {config.keep}"
+            elif info.timestamp >= min_cutoff:
+                info.keep = True
+                if not info.keep_reason:
+                    info.keep_reason = f"within min ({config.min})"
+        to_keep = [info.snapshot for info in valid_infos if info.keep]
+        to_keep += [info.snapshot for info in quarantined_infos]
+        to_delete = [info.snapshot for info in valid_infos if not info.keep]
+        logger.debug(
+            "Retention (count): keeping %d of %d, deleting %d",
+            len(to_keep),
+            len(valid_infos) + len(quarantined_infos),
+            len(to_delete),
+        )
+        return to_keep, to_delete
+
     # Rule 2: Keep everything within min retention period
     for info in valid_infos:
         if not info.keep and info.timestamp >= min_cutoff:

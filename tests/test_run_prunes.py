@@ -53,6 +53,12 @@ def _volume():
 def _config(retention):
     c = MagicMock()
     c.get_effective_retention.return_value = retention
+    # Retention is resolved PER ENDPOINT now -- source and each target can carry
+    # their own policy. A bare MagicMock would return a Mock from these, and the
+    # degeneracy check compares against an int, so an unconfigured double no
+    # longer stands in faithfully for a Config.
+    c.get_source_retention.return_value = retention
+    c.get_target_retention.return_value = retention
     return c
 
 

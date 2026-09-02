@@ -147,6 +147,14 @@ def _parse_retention(data: dict[str, Any]) -> RetentionConfig:
         raise ConfigError(
             f"Invalid retention 'min' duration: {min_value!r} ({e})"
         ) from e
+    keep = data.get("keep", 0)
+    if not isinstance(keep, int) or isinstance(keep, bool) or keep < 0:
+        raise ConfigError(
+            f"Invalid retention 'keep': {keep!r}. It is the NUMBER of most-recent "
+            f"snapshots to keep, so it must be a non-negative whole number "
+            f"(0 means use the time buckets instead)."
+        )
+
     return RetentionConfig(
         min=min_value,
         hourly=data.get("hourly", 24),
@@ -154,6 +162,7 @@ def _parse_retention(data: dict[str, Any]) -> RetentionConfig:
         weekly=data.get("weekly", 4),
         monthly=data.get("monthly", 12),
         yearly=data.get("yearly", 0),
+        keep=keep,
     )
 
 
@@ -244,6 +253,9 @@ def _parse_target(data: dict[str, Any]) -> TargetConfig:
         compress=compress,
         rate_limit=data.get("rate_limit"),
         require_mount=require_mount,
+        retention=(
+            _parse_retention(data["retention"]) if "retention" in data else None
+        ),
         encrypt=encrypt,
         gpg_recipient=gpg_recipient,
         gpg_keyring=data.get("gpg_keyring"),
@@ -329,6 +341,10 @@ def _parse_volume(data: dict[str, Any], global_config: GlobalConfig) -> VolumeCo
     if "retention" in data:
         retention = _parse_retention(data["retention"])
 
+    source_retention = None
+    if "source_retention" in data:
+        source_retention = _parse_retention(data["source_retention"])
+
     # Parse source type and snapper config
     source = data.get("source", "native")
     if source not in ("native", "snapper"):
@@ -350,6 +366,7 @@ def _parse_volume(data: dict[str, Any], global_config: GlobalConfig) -> VolumeCo
         snapshot_dir=data.get("snapshot_dir", global_config.snapshot_dir),
         targets=targets,
         retention=retention,
+        source_retention=source_retention,
         enabled=data.get("enabled", True),
         source=source,
         snapper=snapper,
@@ -447,7 +464,15 @@ _KNOWN_GLOBAL_KEYS = {
     "quiet",
     "verbose",
 }
-_KNOWN_RETENTION_KEYS = {"min", "hourly", "daily", "weekly", "monthly", "yearly"}
+_KNOWN_RETENTION_KEYS = {
+    "min",
+    "hourly",
+    "daily",
+    "weekly",
+    "monthly",
+    "yearly",
+    "keep",
+}
 _KNOWN_NOTIFICATIONS_KEYS = {"email", "webhook"}
 _KNOWN_EMAIL_KEYS = {
     "enabled",
@@ -474,6 +499,7 @@ _KNOWN_VOLUME_KEYS = {
     "path",
     "targets",
     "retention",
+    "source_retention",
     "source",
     "snapper",
     "snapshot_prefix",
@@ -482,6 +508,7 @@ _KNOWN_VOLUME_KEYS = {
 }
 _KNOWN_TARGET_KEYS = {
     "path",
+    "retention",
     "ssh_sudo",
     "ssh_port",
     "ssh_key",
@@ -567,6 +594,55 @@ def _collect_unknown_key_warnings(data: dict[str, Any]) -> list[str]:
                         f"{label}.targets[{j}]", tgt, _KNOWN_TARGET_KEYS
                     )
 
+    return warnings
+
+
+_BUCKET_KEYS = ("hourly", "daily", "weekly", "monthly", "yearly")
+
+
+def _collect_retention_warnings(data: dict[str, Any]) -> list[str]:
+    """Warn when a retention table sets BOTH a keep count and time buckets.
+
+    Walks the RAW dict because the parser fills bucket defaults, so after parsing
+    every policy looks as though daily/weekly/monthly were set. Only the raw
+    table shows what the operator actually wrote.
+
+    `keep` replaces the buckets rather than combining with them -- a count is
+    neither obviously a floor nor obviously a ceiling, and guessing wrong either
+    wastes space or deletes history -- so writing both is a contradiction worth
+    naming rather than silently resolving.
+    """
+    warnings: list[str] = []
+    if not isinstance(data, dict):
+        return warnings
+
+    def check(table: Any, where: str) -> None:
+        if not isinstance(table, dict) or not table.get("keep"):
+            return
+        also = [k for k in _BUCKET_KEYS if k in table]
+        if also:
+            warnings.append(
+                f"retention in [{where}] sets keep = {table['keep']!r} and also "
+                f"{', '.join(also)}. keep replaces the time buckets, so "
+                f"{', '.join(also)} {'is' if len(also) == 1 else 'are'} ignored "
+                f"here. Remove one or the other to say which you meant."
+            )
+
+    global_data = data.get("global", {})
+    if isinstance(global_data, dict):
+        check(global_data.get("retention"), "global.retention")
+
+    for v_index, volume in enumerate(data.get("volumes", []) or []):
+        if not isinstance(volume, dict):
+            continue
+        check(volume.get("retention"), f"volumes[{v_index}].retention")
+        check(volume.get("source_retention"), f"volumes[{v_index}].source_retention")
+        for t_index, target in enumerate(volume.get("targets", []) or []):
+            if isinstance(target, dict):
+                check(
+                    target.get("retention"),
+                    f"volumes[{v_index}].targets[{t_index}].retention",
+                )
     return warnings
 
 
@@ -823,6 +899,7 @@ def load_config(path: Path | str) -> tuple[Config, list[str]]:
     warnings = (
         _collect_unknown_key_warnings(data)
         + _collect_require_mount_warnings(data)
+        + _collect_retention_warnings(data)
         + _validate_config(config)
     )
 

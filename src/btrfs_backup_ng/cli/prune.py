@@ -35,6 +35,11 @@ def is_degenerate_policy(retention: Any) -> bool:
     and the ``run`` pipeline refuse it (``prune`` unless ``--force``; ``run`` always, since an
     intentional degenerate prune is an explicit ``prune --force``). A legitimate short-window
     policy (e.g. ``min="30d"`` with zeroed buckets) is NOT degenerate -- it keeps a time window."""
+    # A count policy keeps a definite number of snapshots, so it is a real policy
+    # even with every bucket at zero -- refusing it would block exactly the
+    # configuration the count form exists for.
+    if getattr(retention, "keep", 0) > 0:
+        return False
     if any(
         c > 0
         for c in (
