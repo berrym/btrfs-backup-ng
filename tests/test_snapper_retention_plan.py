@@ -200,7 +200,10 @@ class TestTheRunPhaseContract:
 
         volume = SimpleNamespace(path="/home", targets=[])
         config = SimpleNamespace(
-            get_effective_retention=lambda v: retention or _retention()
+            get_effective_retention=lambda v: retention or _retention(),
+            get_target_retention=lambda v, t: (
+                getattr(t, "retention", None) or retention or _retention()
+            ),
         )
         if targets is None:
             targets = [(SimpleNamespace(path="/backups"), {})]
@@ -265,7 +268,10 @@ class TestTheRunPhaseContract:
         from btrfs_backup_ng.cli import run as run_cli
 
         volume = SimpleNamespace(path="/home", targets=[])
-        config = SimpleNamespace(get_effective_retention=lambda v: _retention())
+        config = SimpleNamespace(
+            get_effective_retention=lambda v: _retention(),
+            get_target_retention=lambda v, t: _retention(),
+        )
         errors: list = []
         backups = [_backup(n, days_ago=n * 20) for n in range(1, 13)]
         with patch(
@@ -287,7 +293,10 @@ class TestTheRunPhaseContract:
 
         seen = []
         volume = SimpleNamespace(path="/home", targets=[])
-        config = SimpleNamespace(get_effective_retention=lambda v: _retention())
+        config = SimpleNamespace(
+            get_effective_retention=lambda v: _retention(),
+            get_target_retention=lambda v, t: _retention(),
+        )
 
         def record(path, options):
             seen.append(path)

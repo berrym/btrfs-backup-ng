@@ -23,7 +23,12 @@ from ..notifications import (
     NotificationConfig as NotifConfig,
 )
 from ..retention import RetentionError, apply_retention, parse_duration
-from .common import get_log_level, get_timestamp_format, thread_ssh_target_config
+from .common import (
+    assert_target_mounted,
+    get_log_level,
+    get_timestamp_format,
+    thread_ssh_target_config,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -323,6 +328,51 @@ def execute_retention_deletes(
     return deleted, errors
 
 
+def _log_retention(label: str, retention: Any) -> None:
+    """Log one endpoint's resolved policy.
+
+    A count-based policy has no meaningful bucket values, so printing the buckets
+    for one reports a policy the endpoint is not being pruned under.
+    """
+    if getattr(retention, "keep", 0) > 0:
+        logger.info(
+            "%s: keep=%d (at least), min=%s", label, retention.keep, retention.min
+        )
+    else:
+        logger.info(
+            "%s: min=%s, hourly=%d, daily=%d, weekly=%d, monthly=%d, yearly=%d",
+            label,
+            retention.min,
+            retention.hourly,
+            retention.daily,
+            retention.weekly,
+            retention.monthly,
+            retention.yearly,
+        )
+
+
+def _refuse_degenerate(
+    label: str, retention: Any, force: bool, error_messages: list[str]
+) -> bool:
+    """Return True if this endpoint must not be pruned under ``retention``.
+
+    The guardrail is per endpoint rather than per volume: the policies now differ
+    between the source and each target, so a degenerate one must stop that
+    endpoint alone instead of cancelling the whole volume.
+    """
+    if not is_degenerate_policy(retention) or force:
+        return False
+    logger.error(
+        "  Refusing to prune %s: retention keeps ONLY the latest snapshot "
+        "(all buckets 0, no keep count, min=%s). Re-run with --force if this is "
+        "intended.",
+        label,
+        retention.min,
+    )
+    error_messages.append(f"Refused (degenerate policy, no --force): {label}")
+    return True
+
+
 def execute_prune(args: argparse.Namespace) -> int:
     """Execute the prune command.
 
@@ -387,32 +437,21 @@ def execute_prune(args: argparse.Namespace) -> int:
         volume_had_errors = False
         volumes_processed += 1
 
-        retention = config.get_effective_retention(volume)
-        logger.info(
-            "  Retention: min=%s, hourly=%d, daily=%d, weekly=%d, monthly=%d, yearly=%d",
-            retention.min,
-            retention.hourly,
-            retention.daily,
-            retention.weekly,
-            retention.monthly,
-            retention.yearly,
-        )
+        # Retention is resolved per endpoint, the same way the run pipeline
+        # resolves it: source_retention for the source, each target's own policy
+        # for that target. Resolving a single policy per volume here made `prune`
+        # delete snapshots that `run` keeps, from the same config and with no
+        # warning -- the two commands share plan_endpoint_retention precisely so
+        # they cannot disagree about what a policy means.
+        source_retention = config.get_source_retention(volume)
+        _log_retention("  Retention (source)", source_retention)
 
-        # Degenerate-policy guardrail: refuse to prune a volume whose policy keeps only the
+        # Degenerate-policy guardrail: refuse to prune an endpoint whose policy keeps only the
         # latest snapshot, unless --force -- enforced even non-interactively (the fat-fingered-
         # config-nukes-all-history backstop). Does not change pruning semantics, only gates them.
-        if is_degenerate_policy(retention) and not force:
-            logger.error(
-                "  Refusing to prune %s: retention keeps ONLY the latest snapshot "
-                "(all buckets 0, min=%s). Re-run with --force if this is intended.",
-                volume.path,
-                retention.min,
-            )
-            error_messages.append(
-                f"Refused (degenerate policy, no --force): {volume.path}"
-            )
-            volumes_failed += 1
-            continue
+        source_refused = _refuse_degenerate(
+            f"source {volume.path}", source_retention, force, error_messages
+        )
 
         # Build endpoint kwargs
         endpoint_kwargs = {
@@ -426,49 +465,80 @@ def execute_prune(args: argparse.Namespace) -> int:
 
         prefix = volume.snapshot_prefix
 
-        # Prune source snapshots
-        try:
-            source_path = Path(volume.path).resolve()
-
-            snapshot_dir = Path(volume.snapshot_dir)
-            if not snapshot_dir.is_absolute():
-                # Relative snapshot_dir: relative to source volume
-                full_snapshot_dir = (source_path / snapshot_dir).resolve()
-            else:
-                # Absolute snapshot_dir: add source name as subdirectory
-                full_snapshot_dir = (snapshot_dir / source_path.name).resolve()
-
-            if not full_snapshot_dir.exists():
-                logger.info("  No snapshot directory found")
-                continue
-
-            source_kwargs = dict(endpoint_kwargs)
-            source_kwargs["path"] = full_snapshot_dir
-            source_kwargs["snapshot_folder"] = str(full_snapshot_dir)
-
-            source_endpoint = endpoint.choose_endpoint(
-                str(source_path),
-                source_kwargs,
-                source=True,
-            )
-            source_endpoint.prepare()
-
-            to_keep, to_delete = plan_endpoint_retention(
-                source_endpoint, retention, prefix, get_timestamp_format(config)
-            )
-            logger.info("  Keeping %d, deleting %d", len(to_keep), len(to_delete))
-            total_kept += len(to_keep)
-            if to_delete:
-                plan.append((source_endpoint, to_delete, f"source {volume.path}"))
-
-        except Exception as e:
-            logger.error("  Error pruning source: %s", e)
-            error_messages.append(f"Source {volume.path}: {e}")
+        # A refused source policy stops the source only. The targets below have
+        # their own policies and are still pruned under them.
+        if source_refused:
             volume_had_errors = True
+        else:
+            # Prune source snapshots
+            try:
+                source_path = Path(volume.path).resolve()
+
+                snapshot_dir = Path(volume.snapshot_dir)
+                if not snapshot_dir.is_absolute():
+                    # Relative snapshot_dir: relative to source volume
+                    full_snapshot_dir = (source_path / snapshot_dir).resolve()
+                else:
+                    # Absolute snapshot_dir: add source name as subdirectory
+                    full_snapshot_dir = (snapshot_dir / source_path.name).resolve()
+
+                if not full_snapshot_dir.exists():
+                    # Skip the SOURCE only. `continue` here skipped this
+                    # volume's TARGETS as well, so a volume whose snapshot
+                    # directory had been removed left its backups unpruned
+                    # forever while `prune` still reported success.
+                    logger.info("  No snapshot directory found; skipping source")
+                else:
+                    source_kwargs = dict(endpoint_kwargs)
+                    source_kwargs["path"] = full_snapshot_dir
+                    source_kwargs["snapshot_folder"] = str(full_snapshot_dir)
+
+                    source_endpoint = endpoint.choose_endpoint(
+                        str(source_path),
+                        source_kwargs,
+                        source=True,
+                    )
+                    source_endpoint.prepare()
+
+                    to_keep, to_delete = plan_endpoint_retention(
+                        source_endpoint,
+                        source_retention,
+                        prefix,
+                        get_timestamp_format(config),
+                    )
+                    logger.info(
+                        "  Keeping %d, deleting %d", len(to_keep), len(to_delete)
+                    )
+                    total_kept += len(to_keep)
+                    if to_delete:
+                        plan.append(
+                            (source_endpoint, to_delete, f"source {volume.path}")
+                        )
+
+            except Exception as e:
+                logger.error("  Error pruning source: %s", e)
+                error_messages.append(f"Source {volume.path}: {e}")
+                volume_had_errors = True
 
         # Prune target backups
         for target in volume.targets:
+            target_retention = config.get_target_retention(volume, target)
+            _log_retention(f"    Retention (target {target.path})", target_retention)
+            if _refuse_degenerate(
+                f"target {target.path}", target_retention, force, error_messages
+            ):
+                volume_had_errors = True
+                continue
             try:
+                # The same mount gate the other commands use. Without it `prune`
+                # was the one command that would happily operate on the empty
+                # mount-point directory of an absent drive -- listing the real
+                # backups as gone and, on a target whose policy is count-based,
+                # deleting whatever a previous unguarded run had written to the
+                # root filesystem there. A refused target is skipped, not fatal:
+                # the other targets and the source still prune.
+                assert_target_mounted(target.path, target.require_mount)
+
                 dest_kwargs = dict(endpoint_kwargs)
                 thread_ssh_target_config(dest_kwargs, target)
 
@@ -480,7 +550,10 @@ def execute_prune(args: argparse.Namespace) -> int:
                 dest_endpoint.prepare()
 
                 to_keep, to_delete = plan_endpoint_retention(
-                    dest_endpoint, retention, prefix, get_timestamp_format(config)
+                    dest_endpoint,
+                    target_retention,
+                    prefix,
+                    get_timestamp_format(config),
                 )
                 logger.info("    Keeping %d, deleting %d", len(to_keep), len(to_delete))
                 total_kept += len(to_keep)

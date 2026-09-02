@@ -339,6 +339,17 @@ def _run_configured_backups(args: argparse.Namespace, config: Config) -> int:
     return exit_code
 
 
+def _format_retention(retention: Any) -> str:
+    """One endpoint's policy as a line. A count policy has no bucket values."""
+    if getattr(retention, "keep", 0) > 0:
+        return f"keep={retention.keep} (at least), min={retention.min}"
+    return (
+        f"min={retention.min}, hourly={retention.hourly}, "
+        f"daily={retention.daily}, weekly={retention.weekly}, "
+        f"monthly={retention.monthly}, yearly={retention.yearly}"
+    )
+
+
 def _dry_run(config: Config) -> int:
     """Show what would be done without making changes."""
     print("Dry run mode - showing what would be done:")
@@ -358,14 +369,15 @@ def _dry_run(config: Config) -> int:
             print(f"  Snapshot prefix: {volume.snapshot_prefix}")
             print(f"  Snapshot dir: {volume.snapshot_dir}")
 
-            retention = config.get_effective_retention(volume)
-            print(
-                f"  Retention: min={retention.min}, hourly={retention.hourly}, daily={retention.daily}"
-            )
-            if is_degenerate_policy(retention):
+            # The source policy, not the volume's: reporting the volume policy
+            # described an endpoint that is not pruned under it, and called a
+            # healthy per-scope config degenerate.
+            source_retention = config.get_source_retention(volume)
+            print(f"  Retention (source): {_format_retention(source_retention)}")
+            if is_degenerate_policy(source_retention):
                 print(
-                    "  Retention: WOULD FAIL -- policy keeps only the latest snapshot "
-                    "(run `prune --force` to prune it deliberately)"
+                    "  Retention (source): WOULD FAIL -- policy keeps only the latest "
+                    "snapshot (run `prune --force` to prune it deliberately)"
                 )
             else:
                 print(
@@ -378,6 +390,13 @@ def _dry_run(config: Config) -> int:
             for target in volume.targets:
                 sudo_note = " (sudo)" if target.ssh_sudo else ""
                 print(f"    -> {target.path}{sudo_note}")
+                target_retention = config.get_target_retention(volume, target)
+                print(f"       Retention: {_format_retention(target_retention)}")
+                if is_degenerate_policy(target_retention):
+                    print(
+                        "       Retention: WOULD FAIL -- policy keeps only the latest "
+                        "backup (run `prune --force` to prune it deliberately)"
+                    )
         else:
             print("  Targets: (none)")
         print("")
@@ -879,20 +898,23 @@ def _prune_snapper_after_transfer(
         plan_snapper_retention,
     )
 
-    retention = config.get_effective_retention(volume)
-    if is_degenerate_policy(retention):
-        logger.error(
-            "Refusing to prune snapper backups for %s: retention keeps ONLY the "
-            "latest backup (all buckets 0, min=%s). Fix the policy, or prune it "
-            "deliberately.",
-            volume.path,
-            retention.min,
-        )
-        errors.append(f"Degenerate retention policy: {volume.path}")
-        return False
-
     ok = True
     for target, endpoint_config in succeeded_targets:
+        # Per-target retention, as on the native path. A snapper destination is
+        # frequently the only copy of a backup, so resolving one policy for every
+        # target here would delete under a policy the target does not have.
+        retention = config.get_target_retention(volume, target)
+        if is_degenerate_policy(retention):
+            logger.error(
+                "Refusing to prune snapper backups for %s: retention keeps ONLY "
+                "the latest backup (all buckets 0, no keep count, min=%s). Fix "
+                "the policy, or prune it deliberately.",
+                target.path,
+                retention.min,
+            )
+            errors.append(f"Degenerate retention policy: target {target.path}")
+            ok = False
+            continue
         try:
             to_keep, to_delete = plan_snapper_retention(
                 target.path, retention, endpoint_config
