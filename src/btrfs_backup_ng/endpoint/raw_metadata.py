@@ -436,6 +436,7 @@ def parse_stream_filename(filename: str) -> dict[str, Any]:
         "name": "",
         "compress": None,
         "encrypt": None,
+        "is_stream": False,
     }
 
     # Check for encryption suffix
@@ -454,9 +455,16 @@ def parse_stream_filename(filename: str) -> dict[str, Any]:
             filename = filename[: -len(ext)]
             break
 
-    # Remove .btrfs suffix
+    # Remove .btrfs suffix. Whether it was actually there is the only reliable
+    # signal that this file is one of ours: everything after `.btrfs` must be a
+    # suffix we write. A blacklist of endings (.part/.tmp/.lock) cannot decide
+    # this -- a btrbk sidecar named `home.20260110T120000.btrfs.gz.info` contains
+    # ".btrfs", is on no blacklist, and was listed as a second backup.
     if filename.endswith(".btrfs"):
         filename = filename[:-6]
+        result["is_stream"] = True
+    else:
+        result["is_stream"] = False
 
     result["name"] = filename
     return result
@@ -573,6 +581,16 @@ def discover_raw_snapshots(
             continue
 
         parsed = parse_stream_filename(item.name)
+        if not parsed.get("is_stream"):
+            # Contains ".btrfs" but does not end in a suffix we produce -- a
+            # foreign sidecar (btrbk writes `.info`), an editor backup, a partial
+            # download. Listing it invents a backup that does not exist.
+            logger.debug(
+                "Ignoring %s in %s: not a raw stream this tool wrote",
+                item.name,
+                directory,
+            )
+            continue
         name = parsed["name"]
 
         # Skip if already loaded from metadata (by name)

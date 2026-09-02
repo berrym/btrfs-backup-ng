@@ -659,16 +659,29 @@ class RawEndpoint(Endpoint):
 
         by_name: dict[str, Any] = {}
         for candidate in candidates:
-            by_name.setdefault(candidate.get_name(), candidate)
+            # A listing entry without a name is skipped, not fatal: this method
+            # promises never to raise, and three callers rely on that.
+            candidate_name = getattr(candidate, "get_name", None)
+            if not callable(candidate_name):
+                continue
+            try:
+                by_name.setdefault(candidate_name(), candidate)
+            except Exception as exc:  # noqa: BLE001 - contract: never raise
+                logger.debug("correspondents_of: unusable listing entry (%s)", exc)
 
         found: dict[str, Any] = {}
         for snapshot in snapshots:
             get_name = getattr(snapshot, "get_name", None)
             if not callable(get_name):
                 continue
-            match = by_name.get(get_name())
+            try:
+                name = get_name()
+            except Exception as exc:  # noqa: BLE001 - contract: never raise
+                logger.debug("correspondents_of: unusable source entry (%s)", exc)
+                continue
+            match = by_name.get(name)
             if match is not None:
-                found[get_name()] = match
+                found[name] = match
         return found
 
     @contextlib.contextmanager
@@ -1289,6 +1302,11 @@ class RawEndpoint(Endpoint):
             if item.with_name(item.name + ".meta").exists():
                 continue  # already has an authoritative sidecar
             parsed = parse_stream_filename(item.name)
+            # A file that is not one of our streams must never receive a sidecar:
+            # backfilling one would make a phantom backup authoritative and
+            # permanent, which is worse than listing it.
+            if not parsed.get("is_stream"):
+                continue
             try:
                 stat = item.stat()
             except OSError:
@@ -1592,7 +1610,12 @@ class RawEndpoint(Endpoint):
         """
         if entry.endswith(".meta"):
             return None
-        return parse_stream_filename(entry).get("name") or None
+        parsed = parse_stream_filename(entry)
+        if not parsed.get("is_stream"):
+            # A foreign file would otherwise contribute its whole filename as a
+            # candidate "name", skewing the prefix this diagnostic infers.
+            return None
+        return parsed.get("name") or None
 
     def list_snapshots(self, flush_cache: bool = False) -> list[RawSnapshot]:
         """List all raw snapshots in the target directory.
@@ -1861,6 +1884,13 @@ class SSHRawEndpoint(RawEndpoint):
         # An explicit ssh-agent socket (e.g. `--ssh-auth-sock`), useful under sudo where
         # SSH_AUTH_SOCK is not inherited. None -> rely on ssh's own agent discovery.
         self.ssh_auth_sock = config.get("ssh_auth_sock")
+
+        # set_lock consults self.config for this, but only SSHEndpoint whitelisted
+        # it, so a raw+ssh target could never relax the lock abort -- the abort's
+        # own message says "pass --skip-remote-lock to proceed unprotected on
+        # purpose", advice that did nothing on this transport.
+        if config.get("skip_remote_lock") is not None:
+            self.config["skip_remote_lock"] = config["skip_remote_lock"]
 
         self._is_remote = True
 
@@ -2555,6 +2585,8 @@ class SSHRawEndpoint(RawEndpoint):
             if created is None:
                 continue
             parsed = parse_stream_filename(Path(sp).name)
+            if not parsed.get("is_stream"):
+                continue
             out.append(
                 RawSnapshot(
                     name=parsed["name"],
@@ -2836,6 +2868,8 @@ class SSHRawEndpoint(RawEndpoint):
             if str(stream_path) in loaded_paths:
                 continue
             parsed = parse_stream_filename(stream_path.name)
+            if not parsed.get("is_stream"):
+                continue
             name = parsed["name"]
             if name in loaded_names:
                 continue
