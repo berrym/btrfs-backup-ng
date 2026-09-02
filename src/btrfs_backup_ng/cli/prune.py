@@ -561,6 +561,12 @@ def execute_prune(args: argparse.Namespace) -> int:
                     plan.append((dest_endpoint, to_delete, f"target {target.path}"))
 
             except Exception as e:
+                if getattr(target, "optional", False):
+                    # Declared as allowed to be absent; an unreachable optional
+                    # target is not a prune failure. Its backups are simply not
+                    # pruned this time, which is the safe direction.
+                    logger.warning("  Skipping optional target %s: %s", target.path, e)
+                    continue
                 logger.error("  Error pruning target %s: %s", target.path, e)
                 error_messages.append(f"Target {target.path}: {e}")
                 volume_had_errors = True

@@ -199,6 +199,13 @@ def execute_transfer(args: argparse.Namespace) -> int:
                     success_count += 1
 
                 except Exception as e:
+                    if getattr(target, "optional", False):
+                        # Declared as allowed to be absent, so its unavailability
+                        # is not a transfer failure. Reported either way.
+                        logger.warning(
+                            "  Skipping optional target %s: %s", target.path, e
+                        )
+                        continue
                     logger.error("  Transfer to %s failed: %s", target.path, e)
                     fail_count += 1
 

@@ -546,6 +546,13 @@ def _backup_volume(
             logger.debug("Destination endpoint ready: %s", dest_endpoint)
 
         except Exception as e:
+            if getattr(target, "optional", False):
+                # Declared as allowed to be absent. Reported, not counted: it does
+                # not fail the run and does not hold back source retention, which
+                # is the whole point of marking a monthly drive optional rather
+                # than choosing between a permanently red run and an unguarded one.
+                logger.warning("Skipping optional target %s: %s", target.path, e)
+                continue
             logger.error("Failed to prepare destination %s: %s", target.path, e)
             errors.append(f"Destination endpoint {target.path}: {e}")
             # Count it. This block used to log, record the error, and stop --

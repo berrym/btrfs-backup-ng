@@ -106,6 +106,40 @@ class RetentionConfig:
     # 0 = unset: use the time buckets above. > 0 = keep exactly that many, newest
     # first, and ignore the buckets.
     keep: int = 0
+    # The keys this scope's config block actually wrote. A narrower scope inherits
+    # every key it did NOT write from the scope above it; without this record a
+    # block naming one key silently reset the rest to the defaults below, so
+    # `[volumes.retention] daily = 7` discarded a global `min = "2d"` and replaced
+    # it with `1d`.
+    #
+    # None means "not recorded" and every key counts as written -- the whole-object
+    # replacement this had before. That is the right answer for a RetentionConfig
+    # built in code, which states a complete policy on purpose; only the loader
+    # knows which keys a FILE actually named.
+    explicit: frozenset[str] | None = None
+
+    RETENTION_KEYS = ("min", "hourly", "daily", "weekly", "monthly", "yearly", "keep")
+
+    def inherited_from(self, parent: "RetentionConfig") -> "RetentionConfig":
+        """This scope resolved against ``parent``: parent's values, ours on top.
+
+        Only the keys this block actually wrote override the parent. Resolution
+        chains global -> volume -> (source_retention | target retention), so a
+        narrow scope can adjust one key without restating the policy.
+        """
+        written = (
+            set(self.RETENTION_KEYS) if self.explicit is None else set(self.explicit)
+        )
+        merged = {
+            key: getattr(self if key in written else parent, key)
+            for key in self.RETENTION_KEYS
+        }
+        inherited = written | (
+            set(parent.RETENTION_KEYS)
+            if parent.explicit is None
+            else set(parent.explicit)
+        )
+        return RetentionConfig(**merged, explicit=frozenset(inherited))
 
 
 @dataclass
@@ -152,6 +186,10 @@ class TargetConfig:
         require_mount: Require a mount before writing (safety check for external
             drives). True means the target itself must be a mount point; a path
             means that path must be mounted and the target must live under it
+        optional: This target is allowed to be unavailable. A target that cannot
+            be prepared -- an external drive that is not connected, a host that is
+            down -- is reported and skipped instead of failing the run, and does
+            not hold back source retention
         encrypt: Encryption method for raw targets only (none, gpg, openssl_enc)
         gpg_recipient: GPG key recipient (required when encrypt=gpg)
         gpg_keyring: Optional path to a GPG keyring file
@@ -174,6 +212,15 @@ class TargetConfig:
     # requires THAT path to be mounted with the target at or under it, which is
     # the many-boxes-into-one-drive case (issue #100).
     require_mount: bool | str = False
+    # A target that is EXPECTED to be absent sometimes: a drive connected once a
+    # month, a laptop that is not always up. Without this, the only honest choices
+    # were to fail every run the drive is away, or to let a genuinely broken target
+    # pass unnoticed. It also releases source retention: the source stops pruning
+    # while a REQUIRED target is missing, because that target is still owed those
+    # snapshots, and an optional target is by definition not something the run
+    # waits for. Applies to preparing the target, not to a transfer that started
+    # and then failed -- that is a real error either way.
+    optional: bool = False
     # This target's own retention, overriding the volume's and the global one.
     # A rarely-connected archive and an always-on space-limited disk want
     # different policies; before this they were forced to share one.
@@ -357,30 +404,31 @@ class Config:
     volumes: list[VolumeConfig] = field(default_factory=list)
 
     def get_effective_retention(self, volume: VolumeConfig) -> RetentionConfig:
-        """Get the effective retention policy for a volume.
-
-        Volume-specific retention overrides global retention.
-        """
-        return volume.retention or self.global_config.retention
+        """The volume-wide policy: global, with the volume's own keys on top."""
+        if volume.retention is None:
+            return self.global_config.retention
+        return volume.retention.inherited_from(self.global_config.retention)
 
     def get_source_retention(self, volume: VolumeConfig) -> RetentionConfig:
         """Retention for a volume's SOURCE snapshots.
 
-        source_retention, else the volume's policy, else global -- so a config
-        that sets neither behaves exactly as it did before these keys existed.
+        Resolved global -> volume -> source_retention, each layer overriding only
+        the keys it wrote. A config that sets none of the newer keys resolves to
+        exactly what it did before they existed.
         """
-        return (
-            volume.source_retention or volume.retention or self.global_config.retention
-        )
+        base = self.get_effective_retention(volume)
+        if volume.source_retention is None:
+            return base
+        return volume.source_retention.inherited_from(base)
 
     def get_target_retention(
         self, volume: VolumeConfig, target: TargetConfig
     ) -> RetentionConfig:
-        """Retention for one target of a volume.
-
-        The target's own policy, else the volume's, else global.
-        """
-        return target.retention or volume.retention or self.global_config.retention
+        """Retention for one target: global -> volume -> this target's own keys."""
+        base = self.get_effective_retention(volume)
+        if target.retention is None:
+            return base
+        return target.retention.inherited_from(base)
 
     def get_enabled_volumes(self) -> list[VolumeConfig]:
         """Get list of enabled volumes."""

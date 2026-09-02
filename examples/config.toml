@@ -146,6 +146,8 @@ path = "/mnt/usb-backup/home"
 # require_mount = true would require /mnt/usb-backup/home itself to be a mount
 # point, and would abort even with the drive connected.
 require_mount = "/mnt/usb-backup"    # Fail if the drive is not mounted
+# optional = true                    # Allowed to be absent: skip it instead of
+                                     # failing the run, and let the source prune
 
 
 # =============================================================================

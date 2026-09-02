@@ -696,7 +696,7 @@ When backing up to external drives or removable media, there's a common pitfall:
 <!-- retention-scopes -->
 ### Retention per source and per target
 
-Retention is resolved separately for the source and for each target. A target uses its own policy if it has one, otherwise the volume's, otherwise the global one; the source uses `source_retention` if present, otherwise the same fallback. A config that sets none of these keys behaves exactly as it always did — one policy everywhere.
+Retention is resolved separately for the source and for each target, and each scope inherits key by key from the one above it: global, then the volume, then `source_retention` or a target's own `retention`. A scope overrides only the keys it actually writes and keeps the rest, so a volume that sets `daily` does not discard the global `min`. A config that sets none of these keys behaves exactly as it always did — one policy everywhere.
 
 ```toml
 [global.retention]
@@ -722,6 +722,17 @@ keep = 30
 `min` is not a bucket and still applies — it is a floor ("keep everything for at least this long"), and a floor composes with a count without ambiguity, since both can only ever keep more. So `keep = 5` with `min = "1d"` keeps five snapshots *and* everything from the last day. Write `min = "0s"` if you want the count alone.
 
 Two things hold regardless of policy: a snapshot whose timestamp cannot be parsed is never deleted, and a snapshot still locked for a pending transfer is never deleted. Together with `min`, that is why `keep = N` means "at least N" rather than "exactly N".
+
+A target that is expected to be away sometimes — a drive connected once a month, a host that is not always on — can say so with `optional = true`. A target that cannot be prepared is then reported and skipped instead of failing the run, in `run`, `transfer` and `prune` alike.
+
+```toml
+[[volumes.targets]]
+path = "/mnt/monthly-archive"
+require_mount = "/mnt/monthly-archive"
+optional = true
+```
+
+This matters for retention as well as for exit codes. While a *required* target is missing, the source is not pruned: that target is still owed those snapshots, and nothing else is holding them. Marking a target optional says the run does not wait for it, so source retention proceeds normally. Targets are required unless they say otherwise.
 
 The `require_mount` option prevents this by verifying that a filesystem is actually mounted before starting any transfers. It takes either `true` or the mount point the target lives under.
 

@@ -163,6 +163,11 @@ def _parse_retention(data: dict[str, Any]) -> RetentionConfig:
         monthly=data.get("monthly", 12),
         yearly=data.get("yearly", 0),
         keep=keep,
+        # Which keys this block actually wrote, so a narrower scope inherits the
+        # rest from the scope above instead of resetting them to the defaults
+        # above. The defaults still stand for the GLOBAL scope, which has nothing
+        # to inherit from.
+        explicit=frozenset(k for k in RetentionConfig.RETENTION_KEYS if k in data),
     )
 
 
@@ -253,6 +258,7 @@ def _parse_target(data: dict[str, Any]) -> TargetConfig:
         compress=compress,
         rate_limit=data.get("rate_limit"),
         require_mount=require_mount,
+        optional=_parse_bool_option(data.get("optional", False), "optional"),
         retention=(
             _parse_retention(data["retention"]) if "retention" in data else None
         ),
@@ -265,6 +271,25 @@ def _parse_target(data: dict[str, Any]) -> TargetConfig:
 
 _TRUTHY_SPELLINGS = {"true", "yes", "on", "1"}
 _FALSY_SPELLINGS = {"false", "no", "off", "0"}
+
+
+def _parse_bool_option(value: Any, name: str) -> bool:
+    """A strict boolean for a per-target switch.
+
+    Quoted spellings are accepted with the value named back, because a quoted
+    "false" reads as true to plain truthiness -- the mistake that made
+    `require_mount = "false"` silently ENABLE the check. Anything with no sensible
+    reading is refused rather than guessed at.
+    """
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in _TRUTHY_SPELLINGS:
+            return True
+        if lowered in _FALSY_SPELLINGS:
+            return False
+    raise ConfigError(f"Invalid {name}: {value!r}. Write true or false, unquoted.")
 
 
 def _parse_require_mount(value: Any) -> bool | str:
@@ -518,6 +543,7 @@ _KNOWN_TARGET_KEYS = {
     "compress",
     "rate_limit",
     "require_mount",
+    "optional",
     "encrypt",
     "gpg_recipient",
     "gpg_keyring",
@@ -966,6 +992,8 @@ path = "/mnt/backup/home"
 # [[volumes.targets]]
 # path = "/mnt/usb-backup/home"
 # require_mount = "/mnt/usb-backup"   # Fail if the drive is not mounted.
+# optional = true                     # Allowed to be absent: skip instead of
+#                                     # failing, and let the source still prune.
 #                                     # The target is a SUBDIRECTORY of the mount
 #                                     # point, so the mount point is named here.
 #                                     # `true` would require the target itself to
