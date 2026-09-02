@@ -30,27 +30,28 @@ def ssh_localhost_works() -> bool:
                 "BatchMode=yes",
                 "-o",
                 "ConnectTimeout=3",
-                # A shared connection makes this probe measure the wrong thing: it
-                # either reuses a master whose state says nothing about a fresh
-                # connection, or spawns one that outlives the probe.
+                # The probe spent 3.1 of its ~4 seconds on a gssapi-with-mic
+                # attempt that always fails here, and that attempt is the part
+                # whose duration varies -- it can block far longer than the rest
+                # of the handshake. Skipping it takes the probe from ~4s to ~0.2s,
+                # which is what makes the timeout below a wide margin rather than
+                # a coin toss under load. Nothing this probe answers depends on
+                # gssapi: the tests authenticate by key.
                 "-o",
-                "ControlMaster=no",
-                "-o",
-                "ControlPath=none",
+                "GSSAPIAuthentication=no",
                 "localhost",
                 "true",
             ],
             capture_output=True,
-            # stdin is NOT covered by capture_output, so it stays connected to
-            # whatever pytest was given. ssh then reads from it and never sees
-            # EOF, and the probe times out on a machine where localhost ssh works
-            # perfectly -- silently skipping every test that asks for it. `-n`
-            # covers the same ground; both are set because either alone is a
-            # single point of failure for a check whose failure mode is silence.
+            # stdin is NOT covered by capture_output, so it stays attached to
+            # whatever pytest was given. ssh reads from it, never sees EOF, and
+            # the probe times out on a host where localhost ssh works -- silently
+            # skipping every test that asks for it. `-n` covers the same ground;
+            # both are set because the failure mode of this check is silence.
             stdin=subprocess.DEVNULL,
-            # A full handshake with no connection sharing measured ~5s here, so 8
-            # left almost no headroom.
-            timeout=20,
+            # Measured: ~0.2s warm or cold with gssapi skipped, ~4s with it. This
+            # is paid at most once per run, and only if a test actually asks.
+            timeout=30,
         )
         return result.returncode == 0
     except Exception:
