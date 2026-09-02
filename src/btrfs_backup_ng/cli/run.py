@@ -254,7 +254,7 @@ def _run_configured_backups(args: argparse.Namespace, config: Config) -> int:
     logger.info("Processing %d volume(s)", len(enabled_volumes))
 
     results = []
-    transfer_stats = {"completed": 0, "failed": 0}
+    transfer_stats = {"completed": 0, "failed": 0, "snapshots_created": 0}
     error_messages = []
 
     if parallel_volumes > 1 and len(enabled_volumes) > 1:
@@ -280,6 +280,9 @@ def _run_configured_backups(args: argparse.Namespace, config: Config) -> int:
                     results.append((volume.path, success))
                     transfer_stats["completed"] += vol_stats.get("completed", 0)
                     transfer_stats["failed"] += vol_stats.get("failed", 0)
+                    transfer_stats["snapshots_created"] += vol_stats.get(
+                        "snapshots_created", 0
+                    )
                     error_messages.extend(vol_errors)
                 except Exception as e:
                     logger.error("Volume %s failed: %s", volume.path, e)
@@ -301,6 +304,9 @@ def _run_configured_backups(args: argparse.Namespace, config: Config) -> int:
                 results.append((volume.path, success))
                 transfer_stats["completed"] += vol_stats.get("completed", 0)
                 transfer_stats["failed"] += vol_stats.get("failed", 0)
+                transfer_stats["snapshots_created"] += vol_stats.get(
+                    "snapshots_created", 0
+                )
                 error_messages.extend(vol_errors)
             except Exception as e:
                 logger.error("Volume %s failed: %s", volume.path, e)
@@ -329,7 +335,7 @@ def _run_configured_backups(args: argparse.Namespace, config: Config) -> int:
         config,
         volumes_processed=len(results),
         volumes_failed=fail_count,
-        snapshots_created=success_count,  # One snapshot per successful volume
+        snapshots_created=transfer_stats.get("snapshots_created", 0),
         transfers_completed=transfer_stats.get("completed", 0),
         transfers_failed=transfer_stats.get("failed", 0),
         duration_seconds=duration,
@@ -427,7 +433,7 @@ def _backup_volume(
     Returns:
         Tuple of (success, transfer_stats, error_messages)
     """
-    stats = {"completed": 0, "failed": 0}
+    stats = {"completed": 0, "failed": 0, "snapshots_created": 0}
     errors = []
     logger.info(__util__.log_heading(f"Volume: {volume.path}"))
 
@@ -491,6 +497,11 @@ def _backup_volume(
     try:
         logger.info("Creating snapshot...")
         snapshot = source_endpoint.snapshot()
+        # Counted here, where it happened. The notification derived this from the
+        # number of fully-successful VOLUMES, so a volume that created a snapshot
+        # and transferred it to one target while another target failed reported
+        # "0 snapshots created" -- a snapshot that exists on disk, denied.
+        stats["snapshots_created"] += 1
         logger.info("Created snapshot: %s", snapshot)
     except Exception as e:
         logger.error("Failed to create snapshot: %s", e)
@@ -632,11 +643,22 @@ def _backup_volume(
     # retention engine as the `prune` command (non-interactively), so `run` leaves the source and
     # its successfully-transferred targets in a policy-compliant state instead of accumulating
     # snapshots forever. Strict contract: a degenerate policy or an invalid `min` fails loudly
-    # (non-zero exit) rather than being silently skipped. Fate-sharing: the source is pruned (R3
-    # lock reconcile keeps a snapshot a failed transfer still needs), and only targets whose
-    # transfer SUCCEEDED are pruned.
+    # (non-zero exit) rather than being silently skipped.
+    #
+    # Fate-sharing, both ways: only targets whose transfer SUCCEEDED are pruned,
+    # and the source is pruned only if EVERY target succeeded. R3 lock reconcile
+    # protects a snapshot whose transfer failed part-way, but a target that never
+    # got as far as a transfer -- refused by require_mount, or failing to prepare
+    # for any other reason -- takes no lock at all, so the snapshots it still owes
+    # had nothing holding them. Deleting history that a target is waiting for, to
+    # satisfy a policy, is not a trade this tool gets to make silently.
     prune_ok = _prune_after_transfer(
-        volume, config, source_endpoint, succeeded_targets, errors
+        volume,
+        config,
+        source_endpoint,
+        succeeded_targets,
+        errors,
+        prune_source=all_success,
     )
     return (all_success and prune_ok), stats, errors
 
@@ -647,6 +669,7 @@ def _prune_after_transfer(
     source_endpoint: Any,
     succeeded_targets: list,
     errors: list[str],
+    prune_source: bool = True,
 ) -> bool:
     """The ``run`` pipeline's post-transfer retention phase (regular volumes).
 
@@ -672,9 +695,24 @@ def _prune_after_transfer(
     # problem. Before this they all shared one policy, so neither could be
     # expressed. A config that sets no per-scope keys resolves to the same value
     # for every endpoint, exactly as before.
-    endpoints = [
-        (source_endpoint, f"source {volume.path}", config.get_source_retention(volume))
-    ]
+    endpoints = []
+    if prune_source:
+        endpoints.append(
+            (
+                source_endpoint,
+                f"source {volume.path}",
+                config.get_source_retention(volume),
+            )
+        )
+    else:
+        # Said plainly: a source that stops pruning will grow, and an operator who
+        # is not told why will find a full disk instead of a reason.
+        logger.warning(
+            "Not pruning source %s: a target did not complete, and the snapshots "
+            "it still needs are not held by any lock. Source retention resumes "
+            "once every target succeeds.",
+            volume.path,
+        )
     endpoints += [
         (ep, f"target {tc.path}", config.get_target_retention(volume, tc))
         for ep, tc in succeeded_targets
@@ -741,7 +779,11 @@ def _backup_snapper_volume(
     from ..snapper import SnapperScanner
     from ..snapper.scanner import SnapperNotFoundError
 
-    stats = {"completed": 0, "failed": 0}
+    stats = {"completed": 0, "failed": 0, "snapshots_created": 0}
+    # snapshots_created stays 0 on this path deliberately: snapper creates the
+    # snapshots, this pipeline only transfers them. Previously the notification
+    # derived the count from successful VOLUMES, so a snapper volume reported a
+    # snapshot this tool had not taken.
     errors = []
 
     logger.info("Snapper-sourced volume: %s", volume.path)
@@ -1041,7 +1083,11 @@ def _send_backup_notifications(
     status: Literal["success", "failure", "partial"]
     if volumes_failed == 0 and transfers_failed == 0:
         status = "success"
-    elif volumes_failed == volumes_processed:
+    elif volumes_failed == volumes_processed and transfers_completed == 0:
+        # Total failure means nothing got through. A single-volume run with one
+        # good target and one refused target marks the volume failed, which made
+        # every such run report "failure" while a backup had in fact been
+        # delivered -- the operator cannot tell that from a run that did nothing.
         status = "failure"
     else:
         status = "partial"
