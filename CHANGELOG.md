@@ -5,9 +5,29 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.9.7] - 2026-09-04
 
 ### Added
+
+- **A target can be declared `optional`** — a drive connected once a month, or a
+  host that is not always up, is expected to be absent. Without a way to say so
+  the only choices were a run that reports failure most of the time, or no mount
+  check at all.
+
+  ```toml
+  [[volumes.targets]]
+  path = "/mnt/monthly-archive"
+  require_mount = "/mnt/monthly-archive"
+  optional = true
+  ```
+
+  A target that cannot be prepared is reported and skipped rather than failing
+  the run, in `run`, `transfer` and `prune` alike. It also releases source
+  retention: the source stops pruning while a *required* target is missing,
+  because that target is still owed those snapshots, and an optional target is by
+  definition not one the run waits for. This applies to preparing a target, not
+  to a transfer that started and then failed. Targets are required unless they
+  say otherwise.
 
 - **Retention can differ between the source and each target, and can be a count**
   ([#103](https://github.com/berrym/btrfs-backup-ng/issues/103)) — there was one
@@ -77,6 +97,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Retention scopes inherit key by key instead of replacing the whole policy** —
+  a narrower scope now overrides only the keys it actually writes and inherits
+  the rest, resolving global to volume to source or target.
+
+  ```toml
+  [global.retention]
+  min = "2d"
+  daily = 14
+  monthly = 6
+
+  [volumes.retention]
+  daily = 7        # min = "2d" and monthly = 6 still apply
+  ```
+
+  Previously a scope replaced its parent outright, and any key it did not name
+  fell back to the built-in defaults rather than to the parent's value, so the
+  block above silently became `min = "1d"` with `monthly = 12`. A
+  `RetentionConfig` built in code still replaces wholesale: it states a complete
+  policy deliberately, and only the loader knows which keys a file named. A
+  config that sets no scoped keys resolves exactly as before.
+
+- **A degenerate retention policy now fails the endpoint it applies to, not the
+  whole volume** — a consequence of resolving retention per scope. A config whose
+  volume policy is degenerate but whose `source_retention` and per-target
+  policies are healthy used to fail wholesale and now prunes normally; a config
+  whose volume policy is healthy but which sets a degenerate policy on one target
+  used to exit 0 and now exits 1 for that target. Both verdicts are more
+  accurate, but a scheduled `prune` that was green can start reporting a failure.
+
 - **`require_mount` values that are not quite right now warn instead of stopping
   the whole config from loading** — a quoted `"true"`, a number, a relative path,
   or a mount point the target does not live under all load, with a warning naming
@@ -95,6 +144,59 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   or a mount point that resolves to `/`, is reported by `config validate`.
 
 ### Fixed
+
+- **`prune` ignored the per-scope retention keys and deleted what `run` keeps** —
+  the resolution added for `source_retention` and per-target `retention` landed
+  on the run pipeline only. The standalone `prune` command, the snapper prune
+  phase and `run --dry-run` each still resolved one policy per volume and applied
+  it to the source and to every target. On a config with
+  `[volumes.source_retention] keep = 8` and a target `keep = 2`, `run` kept 8 and
+  2 while `prune` fell back to the global policy and deleted from both, silently,
+  exiting 0 and logging a policy line that never mentioned the count.
+
+- **`prune` performed no `require_mount` check** — the only command without one,
+  so it would operate inside the empty mount-point directory of a drive that is
+  not connected: reporting the real backups as gone and, under a count-based
+  policy, deleting whatever an earlier unguarded run had written to the root
+  filesystem there.
+
+- **A missing snapshot directory made `prune` skip that volume's targets** — the
+  source was skipped with a `continue` that left the loop, so a volume whose
+  snapshot directory had been removed never had its backups pruned again, while
+  `prune` reported success.
+
+- **The source was pruned even when a target never received its snapshots** —
+  `run` prunes the source after transferring, on the grounds that lock reconcile
+  holds any snapshot a failed transfer still needs. A target refused before
+  transfer, by `require_mount` or any other failure to prepare, never reaches the
+  code that takes those locks, so the snapshots it was owed were held by nothing
+  and were deleted to satisfy retention. If *every* target was refused the run
+  returned before pruning, so a partial failure pruned where a total failure did
+  not. The source is now pruned only when every target succeeded.
+
+- **The completion notification miscounted what happened** — `snapshots_created`
+  was the number of fully-successful volumes, so a volume that created a snapshot
+  and delivered it to one target while another failed reported zero snapshots
+  created. And a single-volume run reported `failure` rather than `partial`
+  whenever anything failed, even with a backup successfully delivered, which
+  reads identically to a run that achieved nothing.
+
+- **`raw list` reported backups that do not exist** — any filename containing
+  `.btrfs` was inferred as a stream, so a foreign sidecar such as btrbk's
+  `<stream>.info` was listed as a second snapshot, offered for restore and
+  counted by retention. A file is now recognised only when everything after
+  `.btrfs` is a suffix this tool writes, and that rule is applied at all four
+  sites that enumerate streams. The sidecar backfill scan mattered most: it would
+  have written a `.meta` for the foreign file, making the phantom authoritative.
+
+- **`--skip-remote-lock` did nothing on a `raw+ssh://` target** —
+  `RawEndpoint.set_lock` reads the value, but only `SSHEndpoint` ever stored it,
+  so the abort whose own message recommends the flag could not be relaxed on that
+  transport.
+
+- **`RawEndpoint.correspondents_of` could raise despite documenting that it never
+  does** — a listing entry without a usable name reached an unguarded
+  `get_name()`, in a method three call sites rely on.
 
 - **`log_file` recorded only a fraction of the run while looking complete** —
   the shared logger is a standalone `logging.Logger("btrfs-backup-ng")` named
