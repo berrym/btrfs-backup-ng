@@ -1799,6 +1799,15 @@ class RawEndpoint(Endpoint):
         result = DeletionResult()
         protected = self._chain_referenced_parents(snapshots, delete_session)
         for snapshot in snapshots:
+            # A retention lock is what a restore holds while it reads a stream.
+            # The base Endpoint.delete_snapshots checks it; this override
+            # replaces that method wholesale and never did, so `set_lock` on a
+            # raw target pinned nothing: a prune deleted the stream a restore was
+            # reading, in the same process, with the lock set. Measured.
+            if snapshot.locks or snapshot.parent_locks:
+                logger.info("Skipping locked raw stream: %s", snapshot.get_name())
+                result.skip(snapshot, "held by a retention lock")
+                continue
             if snapshot.get_name() in protected:
                 logger.error(
                     "Refusing to delete raw stream %r: it is the incremental parent of a stream "
@@ -3196,6 +3205,15 @@ class SSHRawEndpoint(RawEndpoint):
         ssh_cmd = self._build_ssh_command()
 
         for snapshot in snapshots:
+            # The remote lock below is the cross-process guard and covers the
+            # ordinary case. This is the in-process one, and it is what still
+            # holds when --skip-remote-lock was passed: the operator accepted
+            # running without protection from OTHER machines, not without
+            # protection from the restore running in this one.
+            if snapshot.locks or snapshot.parent_locks:
+                logger.info("Skipping locked raw+ssh stream: %s", snapshot.get_name())
+                result.skip(snapshot, "held by a retention lock")
+                continue
             if snapshot.get_name() in protected:
                 logger.error(
                     "Refusing to delete raw+ssh stream %r: it is the incremental parent of a "
