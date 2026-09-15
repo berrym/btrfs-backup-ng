@@ -35,6 +35,13 @@ from pathlib import Path
 import pytest
 
 REMOTE_SPEC = os.environ.get("BBNG_TEST_SSH_HOST", "")
+#: A second remote axis for raw+ssh, which stores PLAIN FILES and so needs
+#: neither btrfs nor sudo on the far end. It cannot reuse BBNG_TEST_SSH_HOST's
+#: gate, which requires NOPASSWD btrfs -- and the interesting host to point it at
+#: is one that could never satisfy that gate: a NAS, or the macOS/APFS box the
+#: matrix below uses, where `stat -c` does not exist, /bin/sh is not GNU, and
+#: every local-filesystem assumption in the raw+ssh path fails loudly.
+RAW_REMOTE_SPEC = os.environ.get("BBNG_TEST_RAW_SSH_HOST", "")
 RIG_ROOT = Path(os.environ.get("BBNG_TEST_RIG", "/tmp/bbng-tier3"))
 PAYLOAD_BYTES = 2 * 1024 * 1024
 
@@ -60,6 +67,27 @@ def _have_remote() -> bool:
             "ConnectTimeout=8",
             REMOTE_SPEC,
             "sudo -n btrfs --version",
+        ],
+        capture_output=True,
+        timeout=30,
+    )
+    return r.returncode == 0
+
+
+@functools.cache
+def _have_raw_remote() -> bool:
+    """Reachable, and able to hold files. Deliberately NOT a btrfs or sudo probe."""
+    if not RAW_REMOTE_SPEC:
+        return False
+    r = subprocess.run(
+        [
+            "ssh",
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "ConnectTimeout=8",
+            RAW_REMOTE_SPEC,
+            "mkdir -p ~/.bbng-probe && rmdir ~/.bbng-probe",
         ],
         capture_output=True,
         timeout=30,
@@ -98,6 +126,10 @@ requires_remote = pytest.mark.skipif(
     _Deferred(lambda: not _have_remote()),
     reason="Tier 3 remote cells need BBNG_TEST_SSH_HOST with NOPASSWD btrfs",
 )
+requires_raw_remote = pytest.mark.skipif(
+    _Deferred(lambda: not _have_raw_remote()),
+    reason="Tier 3 foreign-target cells need BBNG_TEST_RAW_SSH_HOST (no btrfs, no sudo)",
+)
 
 
 def sh(cmd, timeout=900, check=False):
@@ -113,6 +145,10 @@ def remote_sh(script, timeout=300):
     return sh(["ssh", "-o", "BatchMode=yes", REMOTE_SPEC, script], timeout)
 
 
+def raw_remote_sh(script, timeout=300):
+    return sh(["ssh", "-o", "BatchMode=yes", RAW_REMOTE_SPEC, script], timeout)
+
+
 @dataclass
 class Rig:
     """A real btrfs source and destination, plus remote scratch."""
@@ -122,6 +158,7 @@ class Rig:
     dst: Path
     raw: Path
     remote_base: str
+    raw_remote_base: str
     payload: bytes
 
     @property
@@ -216,9 +253,44 @@ class Rig:
         r = remote_sh(f"ls -1 '{dest}' 2>/dev/null")
         return sorted(x for x in r.stdout.split() if x.endswith(".btrfs"))
 
+    def foreign_raw_streams(self, dest: str) -> list[str]:
+        r = raw_remote_sh(f"ls -1 '{dest}' 2>/dev/null")
+        return sorted(x for x in r.stdout.split() if x.endswith(".btrfs"))
 
-def _rig_up(remote_base: str) -> Rig:
-    _rig_down(remote_base)
+    def foreign_mode(self, path: str) -> str:
+        """Permission bits of a file on the foreign target, portably.
+
+        GNU `stat -c %a` first, then BSD/macOS `stat -f %Lp` -- the same order the
+        product uses, and for the same reason: the hosts worth pointing this axis
+        at are the ones without GNU coreutils.
+        """
+        r = raw_remote_sh(
+            f"stat -c %a '{path}' 2>/dev/null || stat -f %Lp '{path}' 2>/dev/null"
+        )
+        return r.stdout.strip()
+
+
+@functools.cache
+def _foreign_home_base() -> str:
+    """An ABSOLUTE rig path on the foreign target, resolved by its own shell.
+
+    Not "/home/<user>": this axis exists to be pointed at hosts that are not
+    Linux, and on macOS home is /Users/<user>. Not "$HOME/..." either -- the path
+    is interpolated into single-quoted shell words and into a raw+ssh:// URL,
+    neither of which expands it, so an unexpanded $HOME would have the teardown
+    remove a directory literally named $HOME in the login directory.
+    """
+    home = raw_remote_sh('printf %s "$HOME"').stdout.strip()
+    if not home.startswith("/"):
+        raise RuntimeError(
+            f"could not resolve the home directory on {RAW_REMOTE_SPEC!r} "
+            f"(got {home!r}); refusing to guess a path a teardown will delete"
+        )
+    return f"{home}/bbng-tier3-raw"
+
+
+def _rig_up(remote_base: str, raw_remote_base: str) -> Rig:
+    _rig_down(remote_base, raw_remote_base)
     RIG_ROOT.mkdir(parents=True, exist_ok=True)
     payload = os.urandom(PAYLOAD_BYTES)
 
@@ -243,6 +315,8 @@ def _rig_up(remote_base: str) -> Rig:
         remote_sh(
             f"rm -rf '{remote_base}'; mkdir -p '{remote_base}/btrfs' '{remote_base}/raw'"
         )
+    if RAW_REMOTE_SPEC:
+        raw_remote_sh(f"rm -rf '{raw_remote_base}'; mkdir -p '{raw_remote_base}/raw'")
 
     return Rig(
         root=RIG_ROOT,
@@ -250,11 +324,17 @@ def _rig_up(remote_base: str) -> Rig:
         dst=dst,
         raw=raw,
         remote_base=remote_base,
+        raw_remote_base=raw_remote_base,
         payload=payload,
     )
 
 
-def _rig_down(remote_base: str) -> None:
+def _rig_down(remote_base: str, raw_remote_base: str) -> None:
+    if RAW_REMOTE_SPEC:
+        # Only the path this rig recorded at creation, removed by name. No
+        # enumeration anywhere near a delete: deciding what to remove by listing
+        # what is there is how a teardown reaches beyond its own rig.
+        raw_remote_sh(f"rm -rf '{raw_remote_base}'")
     if REMOTE_SPEC:
         remote_sh(
             f"for d in $(find '{remote_base}' -maxdepth 4 -type d 2>/dev/null | tac); do "
@@ -264,6 +344,18 @@ def _rig_down(remote_base: str) -> None:
     for name in ("dst", "src"):
         mnt = RIG_ROOT / name
         if not mnt.is_dir():
+            continue
+        # `btrfs subvolume list -o` is FILESYSTEM-wide, not path-scoped -- the trap
+        # endpoint/ssh.py documents, and the one that cost this project a user's
+        # ~/.ssh, ~/.gnupg and /home/.snapshots when an agent ran it against a rig
+        # path. It is safe below ONLY because each rig is its own loopback
+        # filesystem, so filesystem-wide and rig-wide are the same set. Confirm
+        # that before believing it: if the mount is not up (mkfs failed, an
+        # earlier run left the directory behind, BBNG_TEST_RIG points somewhere
+        # unexpected) then this directory belongs to the HOST filesystem and the
+        # listing would enumerate the host's subvolumes instead.
+        if not os.path.ismount(mnt):
+            shutil.rmtree(mnt, ignore_errors=True)
             continue
         r = sh(["btrfs", "subvolume", "list", "-o", str(mnt)])
         for line in reversed(r.stdout.splitlines()):
@@ -284,11 +376,12 @@ def rig():
         if "@" in REMOTE_SPEC
         else "/tmp/bbng-tier3-remote"
     )
-    r = _rig_up(base)
+    raw_base = _foreign_home_base() if RAW_REMOTE_SPEC else ""
+    r = _rig_up(base, raw_base)
     try:
         yield r
     finally:
-        _rig_down(base)
+        _rig_down(base, raw_base)
 
 
 def assert_payload_restored(dest: Path, expected: bytes) -> None:

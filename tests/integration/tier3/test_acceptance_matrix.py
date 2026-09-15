@@ -35,7 +35,12 @@ from __future__ import annotations
 
 import pytest
 
-from .conftest import assert_payload_restored, requires_local, requires_remote
+from .conftest import (
+    assert_payload_restored,
+    requires_local,
+    requires_raw_remote,
+    requires_remote,
+)
 
 pytestmark = [pytest.mark.tier3, requires_local]
 
@@ -177,14 +182,97 @@ class TestNativeSource:
 
 
 # --------------------------------------------------------------------------- #
+# a target that is not Linux and not btrfs
+# --------------------------------------------------------------------------- #
+class TestForeignRawTarget:
+    """raw+ssh against a host that shares none of this one's assumptions.
+
+    A raw target stores plain files, so it need not be btrfs, need not grant
+    sudo, and need not be Linux. That is exactly what makes it the cell worth
+    having: on a macOS/APFS box `stat -c` does not exist, /bin/sh is not GNU,
+    df's columns sit in different places, and any code that asked the LOCAL
+    filesystem about the target fails visibly instead of quietly answering about
+    the wrong machine.
+
+    Measured before the fix on this axis: get_space_info returned this host's
+    free space rather than the target's, and restore could not find a stream
+    that was plainly there.
+    """
+
+    @requires_raw_remote
+    def test_backup_and_restore_against_a_foreign_host(self, rig):
+        from .conftest import RAW_REMOTE_SPEC
+
+        dest = f"{rig.raw_remote_base}/raw"
+        loc = f"raw+ssh://{RAW_REMOTE_SPEC}:{dest}"
+        cfg = rig.write_config(
+            rig.root / "cfg-foreign-raw.toml", f'path = "{loc}"', prefix="t3frn-"
+        )
+        res = _lifecycle(rig, cfg, location=loc, prefix="t3frn-")
+
+        assert res["backup_rc"] == 0, res["backup_out"]
+        streams = rig.foreign_raw_streams(dest)
+        assert streams, "nothing landed on the foreign target"
+
+        # The restore is the assertion that matters: it reads the stream back
+        # ACROSS the link and decodes it here. Checking the exit code would have
+        # passed while the destination held only a bookkeeping directory.
+        assert_payload_restored(res["restore_dest"], rig.payload)
+
+    @requires_raw_remote
+    def test_the_published_stream_is_not_world_readable(self, rig):
+        """The stream is the most sensitive file this tool writes. A remote
+        `cat >` left it at the target's umask, typically 0644, while the .meta
+        sidecar beside it was chmod'd 600."""
+        from .conftest import RAW_REMOTE_SPEC
+
+        dest = f"{rig.raw_remote_base}/raw"
+        loc = f"raw+ssh://{RAW_REMOTE_SPEC}:{dest}"
+        cfg = rig.write_config(
+            rig.root / "cfg-foreign-mode.toml", f'path = "{loc}"', prefix="t3mode-"
+        )
+        assert rig.cli("run", config=cfg).returncode == 0
+
+        streams = rig.foreign_raw_streams(dest)
+        assert streams, "nothing landed on the foreign target"
+        for name in streams:
+            assert rig.foreign_mode(f"{dest}/{name}") == "600", (
+                f"{name} is readable by other users on the target"
+            )
+
+    @requires_raw_remote
+    def test_the_space_check_measures_the_target_not_this_host(self, rig):
+        """The pre-transfer space check and `estimate` both read this figure.
+        Taken from os.statvfs here, it described the machine being backed UP, so
+        a full target passed the check and the transfer ran until it ran out."""
+        import os as _os
+
+        from btrfs_backup_ng.endpoint.raw import SSHRawEndpoint
+
+        from .conftest import RAW_REMOTE_SPEC, raw_remote_sh
+
+        dest = f"{rig.raw_remote_base}/raw"
+        host = RAW_REMOTE_SPEC.split("@")[-1]
+        user = RAW_REMOTE_SPEC.split("@")[0] if "@" in RAW_REMOTE_SPEC else None
+        endpoint = SSHRawEndpoint(
+            config={"path": dest, "hostname": host, "username": user}
+        )
+        info = endpoint.get_space_info()
+
+        truth = raw_remote_sh(f"df -Pk '{dest}' | tail -1").stdout.split()
+        assert info.total_bytes // 1024 == int(truth[1])
+        assert info.available_bytes // 1024 == int(truth[3])
+
+        here = _os.statvfs("/")
+        assert info.total_bytes != here.f_blocks * here.f_frsize, (
+            "the reported size equals this host's root filesystem"
+        )
+
+
+# --------------------------------------------------------------------------- #
 # restore honesty -- independent of any one target
 # --------------------------------------------------------------------------- #
 class TestRestoreReportsHonestly:
-    @pytest.mark.xfail(
-        reason="restore exits 0 when it restored nothing; observed on master with "
-        "only a .btrfs-backup-ng bookkeeping directory created",
-        strict=True,
-    )
     def test_restoring_from_an_empty_location_is_not_success(self, rig, tmp_path):
         """An empty backup location must not produce a successful restore.
 
