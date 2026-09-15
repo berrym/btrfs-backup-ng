@@ -1123,6 +1123,7 @@ def _send_backup_notifications(
         to_addrs=notif_config.email.to_addrs,
         on_success=notif_config.email.on_success,
         on_failure=notif_config.email.on_failure,
+        timeout=notif_config.email.timeout,
     )
 
     webhook_config = WebhookConfig(

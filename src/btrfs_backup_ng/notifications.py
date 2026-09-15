@@ -13,7 +13,7 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
-from typing import Literal, Optional
+from typing import Any, Literal, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -181,6 +181,7 @@ class EmailConfig:
         to_addrs: List of recipient email addresses
         on_success: Send notification on successful backup
         on_failure: Send notification on failed backup
+        timeout: SMTP connection and socket timeout in seconds
     """
 
     enabled: bool = False
@@ -193,6 +194,10 @@ class EmailConfig:
     to_addrs: list[str] = field(default_factory=list)
     on_success: bool = False
     on_failure: bool = True
+    #: Matches WebhookConfig.timeout, which has always had one. smtplib defaults
+    #: to socket._GLOBAL_DEFAULT_TIMEOUT -- the process-wide default, which is
+    #: None, i.e. block forever.
+    timeout: int = 30
 
 
 @dataclass
@@ -235,6 +240,18 @@ class NotificationConfig:
         return self.email.enabled or self.webhook.enabled
 
 
+def _tighten(server: Any, timeout: int) -> None:
+    """Apply ``timeout`` to an SMTP server's live socket, if it has one.
+
+    smtplib's own timeout covers the connect and each exchange it performs, but
+    the socket is replaced by starttls and is Optional until connected, so the
+    value is re-applied rather than assumed to have carried over.
+    """
+    sock = getattr(server, "sock", None)
+    if sock is not None:
+        sock.settimeout(timeout)
+
+
 def send_email(config: EmailConfig, event: NotificationEvent) -> bool:
     """Send email notification.
 
@@ -272,19 +289,33 @@ def send_email(config: EmailConfig, event: NotificationEvent) -> bool:
         # Connect and send
         context = ssl.create_default_context()
 
+        # An explicit timeout on both constructors and on the socket afterwards.
+        # smtplib applies its timeout to the CONNECT and to each subsequent
+        # exchange, but a server that accepts the connection and then stops
+        # responding mid-dialogue is exactly the case worth bounding, so the
+        # value is set on both.
         if config.smtp_tls == "ssl":
             # Implicit TLS (port 465)
             with smtplib.SMTP_SSL(
-                config.smtp_host, config.smtp_port, context=context
+                config.smtp_host,
+                config.smtp_port,
+                context=context,
+                timeout=config.timeout,
             ) as server:
+                _tighten(server, config.timeout)
                 if config.smtp_user and config.smtp_password:
                     server.login(config.smtp_user, config.smtp_password)
                 server.sendmail(config.from_addr, config.to_addrs, msg.as_string())
         else:
             # Plain or STARTTLS
-            with smtplib.SMTP(config.smtp_host, config.smtp_port) as server:
+            with smtplib.SMTP(
+                config.smtp_host, config.smtp_port, timeout=config.timeout
+            ) as server:
+                _tighten(server, config.timeout)
                 if config.smtp_tls == "starttls":
                     server.starttls(context=context)
+                    # starttls replaces the socket with an SSL-wrapped one.
+                    _tighten(server, config.timeout)
                 if config.smtp_user and config.smtp_password:
                     server.login(config.smtp_user, config.smtp_password)
                 server.sendmail(config.from_addr, config.to_addrs, msg.as_string())

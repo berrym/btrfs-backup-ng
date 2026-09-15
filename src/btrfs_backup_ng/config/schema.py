@@ -22,6 +22,7 @@ class EmailNotificationConfig:
         to_addrs: List of recipient email addresses
         on_success: Send notification on successful backup
         on_failure: Send notification on failed backup
+        timeout: SMTP connection and socket timeout in seconds
     """
 
     enabled: bool = False
@@ -34,6 +35,14 @@ class EmailNotificationConfig:
     to_addrs: list[str] = field(default_factory=list)
     on_success: bool = False
     on_failure: bool = True
+    #: Matches WebhookNotificationConfig.timeout. smtplib defaults to
+    #: socket._GLOBAL_DEFAULT_TIMEOUT, i.e. the process-wide default, which is
+    #: None -- block forever. Notifications are sent AFTER the backup finishes,
+    #: from inside `run`, so one unreachable or silently-dropping SMTP host left
+    #: that process blocked indefinitely; under a systemd Type=oneshot unit there
+    #: is no start timeout, so the unit stayed in `activating` and every later
+    #: timer fire was skipped. A successful backup, then silence.
+    timeout: int = 30
 
 
 @dataclass
