@@ -534,6 +534,13 @@ class RawEndpoint(Endpoint):
             self.encrypt = None
         self.gpg_recipient = config.get("gpg_recipient")
         self.gpg_keyring = config.get("gpg_keyring")
+
+        # Streams whose sealed sha256 has already been confirmed by this endpoint.
+        # A restore verifies via preflight_send and then calls send(), which
+        # preflights again -- without this the whole stream is hashed TWICE per
+        # restore (twice ACROSS THE NETWORK for raw+ssh). Per instance, so it lasts
+        # a run and no longer.
+        self._integrity_verified: set[str] = set()
         # Validated at construction so a bad cipher fails fast rather than
         # surfacing as a cryptic openssl error mid-transfer. An explicit None or
         # "" (the CLI threads openssl_cipher=None for gpg/plaintext targets) means
@@ -1415,7 +1422,12 @@ class RawEndpoint(Endpoint):
                 snapshot.name,
             )
             return
+        key = str(snapshot.stream_path)
+        if key in self._integrity_verified:
+            return
         verdict = self.verify_stream_checksum(snapshot)
+        if verdict.status == "ok":
+            self._integrity_verified.add(key)
         if verdict.status == "unverifiable":
             # Nothing to compare against (legacy backup, or a non-sha256 algorithm) --
             # the restore's own decode step still surfaces a genuinely unreadable stream.
@@ -1859,6 +1871,14 @@ class SSHRawEndpoint(RawEndpoint):
     Writes raw btrfs send streams to a remote host via SSH,
     with optional local compression/encryption before transfer.
     """
+
+    #: Declared on the CLASS, as SSHEndpoint does. It used to be assigned in
+    #: __init__ AFTER super().__init__(), so the base initialiser still saw the
+    #: default and `_normalize_path` took its local branch: `config["path"]`
+    #: became a pathlib.Path, `~` expanded against the LOCAL user, and a relative
+    #: path resolved against the LOCAL working directory -- all for a location on
+    #: another machine.
+    _is_remote = True
 
     def __init__(self, config: dict[str, Any] | None = None, **kwargs: Any) -> None:
         """Initialize the SSH Raw Endpoint.
@@ -2682,19 +2702,86 @@ class SSHRawEndpoint(RawEndpoint):
                 f"Failed to write remote sidecar {meta}: {(stderr or '').strip()}"
             )
 
-    def send(
-        self,
-        snapshot: Any,
-        parent: Any | None = None,
-        clones: list[Any] | None = None,
-    ) -> subprocess.Popen[bytes]:
-        """Read a raw stream back from the REMOTE host for restore.
+    def get_space_info(self, path: str | None = None) -> Any:
+        """Free/used space of the REMOTE filesystem holding the raw target.
 
-        The base RawEndpoint.send() opens a local file; for raw+ssh the stream
-        lives on the remote, so we stream it down over ssh and decrypt/decompress
-        it LOCALLY -- ``ssh host 'cat <remote>' | <decrypt> | <decompress>``. The
-        gpg key / openssl passphrase stay on the restore host; secrets are never
-        sent to the (untrusted) remote.
+        The base implementation runs ``os.statvfs`` on this host. For a raw+ssh
+        target that measured the wrong machine entirely: the pre-transfer check
+        (``core/operations.py``) and ``estimate`` both reported the BACKING-UP
+        host's free space, so a full remote target passed the check and the
+        transfer ran until the remote ran out mid-stream.
+
+        ``df -Pk`` rather than the ``python3``/``statvfs`` probe
+        ``core.space.get_space_info``'s ``exec_func`` hook would run: a raw target
+        is a plain file store, often a NAS or a macOS box with no python3 on
+        PATH. ``-P`` is the POSIX single-line format and ``-k`` fixes the unit at
+        1 KiB, so GNU, BSD/macOS and BusyBox all answer the same way.
+
+        No qgroup query: a raw target holds files and need not be btrfs at all
+        (the .25 macOS/APFS cell in the acceptance matrix is exactly this), so
+        there is no quota to read.
+        """
+        from btrfs_backup_ng.core.space import SpaceInfo
+
+        if path is None:
+            path = str(self.config["path"])
+        else:
+            path = str(path)
+
+        res = self._exec_remote_command(
+            ["sh", "-c", f"df -Pk {shlex.quote(path)}"], check=False
+        )
+        out = res.stdout
+        if isinstance(out, (bytes, bytearray)):
+            out = out.decode(errors="replace")
+        err = res.stderr
+        if isinstance(err, (bytes, bytearray)):
+            err = err.decode(errors="replace")
+
+        # Fields are located by SHAPE, not by position: `df -P` puts the device
+        # first and the mount point last, and either may contain spaces
+        # (/Volumes/Backup Drive on the macOS cell), which splits the row into a
+        # column count that varies by host. The 1k-blocks/used/available/capacity%
+        # run is unambiguous wherever it sits.
+        match = None
+        for line in (out or "").splitlines():
+            match = re.search(r"(\d+)\s+(\d+)\s+(\d+)\s+(\d+)%", line) or match
+        if res.returncode != 0 or match is None:
+            # Report nothing rather than a figure measured on the wrong host or
+            # parsed out of an unrecognised table. The caller treats the raised
+            # error as "space unverified" and proceeds with a warning, which is
+            # the honest outcome; a fabricated 0 would abort a sound transfer and
+            # a fabricated total would green-light a doomed one.
+            detail = (err or out or "").strip().splitlines()
+            raise OSError(
+                f"Cannot read remote free space for {self.hostname}:{path}"
+                + (f": {detail[-1]}" if detail else " (df returned no usable row)")
+            )
+
+        blocks, used, available = (int(match.group(i)) * 1024 for i in (1, 2, 3))
+        return SpaceInfo(
+            path=path,
+            total_bytes=blocks,
+            used_bytes=used,
+            available_bytes=available,
+            quota_enabled=False,
+            source="remote df",
+        )
+
+    def preflight_send(self, snapshot: Any) -> None:
+        """Every read-side check ``send`` makes, performed on the REMOTE host.
+
+        The base implementation asks the LOCAL filesystem whether the stream
+        exists (``snapshot.stream_path.exists()``), which for a raw+ssh backup is
+        a path on the other machine. ``core/restore.py`` calls this before
+        ``send``, so restoring from a raw+ssh target failed every time with
+        "Stream file not found" while ``send`` -- which has always checked the
+        remote -- would have delivered the stream. Where both hosts happen to use
+        the same directory it was worse than a failure: the check passed against
+        an unrelated local file of the same name.
+
+        These are the checks ``send`` used to perform inline; ``send`` now calls
+        this, so there is one implementation rather than two that can drift.
         """
         if not isinstance(snapshot, RawSnapshot):
             raise TypeError(f"Expected RawSnapshot, got {type(snapshot)}")
@@ -2716,6 +2803,24 @@ class SSHRawEndpoint(RawEndpoint):
         # no re-download) before streaming it down, so a corrupted remote backup is
         # refused up front rather than decoded into a corrupt subvolume.
         self._verify_stream_integrity(snapshot)
+
+    def send(
+        self,
+        snapshot: Any,
+        parent: Any | None = None,
+        clones: list[Any] | None = None,
+    ) -> subprocess.Popen[bytes]:
+        """Read a raw stream back from the REMOTE host for restore.
+
+        The base RawEndpoint.send() opens a local file; for raw+ssh the stream
+        lives on the remote, so we stream it down over ssh and decrypt/decompress
+        it LOCALLY -- ``ssh host 'cat <remote>' | <decrypt> | <decompress>``. The
+        gpg key / openssl passphrase stay on the restore host; secrets are never
+        sent to the (untrusted) remote.
+        """
+        self.preflight_send(snapshot)
+        remote = str(snapshot.stream_path)
+        pipeline = self._build_restore_pipeline(snapshot)
 
         ssh_cmd = self._build_ssh_command()
         remote_cat = f"cat {shlex.quote(remote)}"
