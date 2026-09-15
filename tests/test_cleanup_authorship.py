@@ -401,3 +401,93 @@ class TestSnapperRestoreDeletesOnlyWhatItCreated:
         # before the receive would refuse to remove the directory it made.
         assert "slot_preexisted = dest_snapshot_dir.exists()" in source
         assert "snapshot_preexisted = dest_snapshot_path.exists()" in source
+
+
+class TestNoCleanupCanBeReachedWithoutDecidingAuthorship:
+    """The lesson from the first attempt at this fix.
+
+    created_by_this_run was given a default of True "to preserve the behaviour of
+    any caller that has not been taught to record it". There were six such
+    callers, all inside endpoint/ssh.py, on every ssh:// transfer route -- so the
+    guard read as applied while every remote path went straight past it. A
+    parameter that can be omitted on the path it protects is not a guard.
+    """
+
+    CLEANUPS = [
+        ("btrfs_backup_ng.core.operations", "_cleanup_partial_local_subvolume"),
+        ("btrfs_backup_ng.core.operations", "_cleanup_partial_remote_subvolume"),
+        ("btrfs_backup_ng.endpoint.ssh", "SSHEndpoint._cleanup_partial_subvolume"),
+    ]
+
+    @pytest.mark.parametrize(
+        ("module", "qualname"), CLEANUPS, ids=[q for _m, q in CLEANUPS]
+    )
+    def test_the_parameter_has_no_default(self, module, qualname):
+        import importlib
+        import inspect
+
+        obj = importlib.import_module(module)
+        for part in qualname.split("."):
+            obj = getattr(obj, part)
+        param = inspect.signature(obj).parameters["created_by_this_run"]
+        assert param.default is inspect.Parameter.empty, (
+            f"{qualname} defaults created_by_this_run to {param.default!r}; a "
+            "caller can then reach the delete without deciding"
+        )
+
+    def test_every_ssh_call_site_passes_it(self):
+        """All six live inside the module that defines the method, which is how
+        they were missed: threading the flag from core/operations.py looked like
+        the whole job."""
+        import ast
+        import inspect
+
+        from btrfs_backup_ng.endpoint import ssh as ssh_mod
+
+        tree = ast.parse(inspect.getsource(ssh_mod))
+        sites, bad = 0, []
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            if not (
+                isinstance(func, ast.Attribute)
+                and func.attr == "_cleanup_partial_subvolume"
+            ):
+                continue
+            sites += 1
+            kw = next(
+                (k for k in node.keywords if k.arg == "created_by_this_run"), None
+            )
+            if kw is None:
+                bad.append((node.lineno, "absent"))
+            elif isinstance(kw.value, ast.Constant):
+                bad.append((node.lineno, f"hardcoded {kw.value.value!r}"))
+        assert sites >= 6, f"expected at least 6 call sites, found {sites}"
+        assert not bad, f"call sites not deciding authorship: {bad}"
+
+    def test_the_remote_probe_answers_the_remote(self):
+        from btrfs_backup_ng.endpoint.ssh import SSHEndpoint
+
+        ep = SSHEndpoint.__new__(SSHEndpoint)
+        ep.config = {"ssh_sudo": False}
+        ep.hostname = "host"
+        ep._exec_remote_command = MagicMock(return_value=SimpleNamespace(returncode=0))
+
+        assert ep.artifact_exists("/dest", "snap-1") is True
+        assert ep._exec_remote_command.call_args[0][0] == [
+            "test",
+            "-e",
+            "/dest/snap-1",
+        ]
+
+    def test_an_unreachable_probe_assumes_pre_existing(self):
+        """Uncertainty must resolve to leaving the artifact alone."""
+        from btrfs_backup_ng.endpoint.ssh import SSHEndpoint
+
+        ep = SSHEndpoint.__new__(SSHEndpoint)
+        ep.config = {"ssh_sudo": False}
+        ep.hostname = "host"
+        ep._exec_remote_command = MagicMock(side_effect=OSError("connection closed"))
+
+        assert ep.artifact_exists("/dest", "snap-1") is True

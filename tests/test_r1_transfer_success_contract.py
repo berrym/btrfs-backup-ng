@@ -308,7 +308,7 @@ class TestCleanupPartialSubvolume:
 
     def test_deletes_exact_path_when_present(self):
         ep, calls = self._endpoint()
-        ep._cleanup_partial_subvolume("/d/5", "snapshot")
+        ep._cleanup_partial_subvolume("/d/5", "snapshot", created_by_this_run=True)
         delete_cmds = [c for c in calls if c[:3] == ["btrfs", "subvolume", "delete"]]
         assert delete_cmds, "expected a subvolume delete of the partial"
         assert delete_cmds[0][-1] == "/d/5/snapshot"
@@ -324,7 +324,7 @@ class TestCleanupPartialSubvolume:
 
         ep._exec_remote_command = MagicMock(side_effect=fake_exec)  # type: ignore[method-assign]
         ep._exec_remote_command_with_retry = MagicMock(side_effect=fake_exec)  # type: ignore[method-assign]
-        ep._cleanup_partial_subvolume("/d/5", "snapshot")
+        ep._cleanup_partial_subvolume("/d/5", "snapshot", created_by_this_run=True)
         assert not [c for c in calls if c[:3] == ["btrfs", "subvolume", "delete"]]
 
 

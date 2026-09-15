@@ -2931,12 +2931,33 @@ print(json.dumps(result))
             logger.debug(f"Verification exception details: {e}", exc_info=True)
             return False
 
+    def artifact_exists(self, dest_path: str, received_name: str) -> bool:
+        """Whether ``{dest_path}/{received_name}`` is already on the REMOTE.
+
+        Asked before a transfer begins, to establish whether the partial cleanup
+        on the failure path would be deleting its own work or somebody else's.
+        Answers True when it cannot tell: the failure being guarded against is
+        removing a backup that was not ours, so uncertainty resolves to leaving
+        it alone.
+        """
+        expected = f"{dest_path.rstrip('/')}/{received_name}"
+        try:
+            return (
+                self._exec_remote_command(
+                    ["test", "-e", expected], check=False
+                ).returncode
+                == 0
+            )
+        except Exception as e:  # noqa: BLE001 - see docstring
+            logger.debug("Could not determine whether %s pre-existed: %s", expected, e)
+            return True
+
     def _cleanup_partial_subvolume(
         self,
         dest_path: str,
         received_name: str,
         *,
-        created_by_this_run: bool = True,
+        created_by_this_run: bool,
     ) -> None:
         """Remove a partial/failed received subvolume at its exact destination path.
 
@@ -2950,11 +2971,14 @@ print(json.dumps(result))
         caller's to establish: being at the path proves only that something is
         there, not that this transfer put it there. Skip-detection works by UUID
         correspondence rather than by name, so a destination subvolume that merely
-        shares a name -- one another tool wrote, or a restored copy -- is planned
-        for transfer and would be deleted here when that transfer failed. Defaults
-        True to preserve the behaviour of any caller that has not been taught to
-        record it, which is a weaker guarantee than the flag being required; the
-        transfer path passes it explicitly.
+        shares a name -- one another tool wrote, a second source machine using the
+        same snap_prefix, a restored copy -- is planned for transfer and would be
+        deleted here when that transfer failed.
+
+        REQUIRED, with no default. It briefly had one, which silently exempted
+        every caller inside this module -- six of them, on every ssh:// transfer
+        route -- while the guard read as applied. A parameter that can be omitted
+        on the path it protects is not a guard.
 
         Best-effort: failures are logged and swallowed (the caller has already
         decided the transfer failed).
@@ -3445,6 +3469,12 @@ print(json.dumps(result))
         Returns:
             True if transfer succeeded, False otherwise
         """
+        # Recorded BEFORE the transfer: once bytes have been written, a partial
+        # this run left and a backup that was already at that path are the same
+        # observation, and the failure path below deletes by path.
+        received_name = Path(source_path).name
+        artifact_preexisted = self.artifact_exists(dest_path, received_name)
+
         import sys
 
         control_path = str(self.ssh_manager.control_path)
@@ -3635,16 +3665,19 @@ print(json.dumps(result))
             proc.wait()
             stderr_thread.join(timeout=5)
 
-            # The received subvolume is named after the source basename
-            # (== snapshot_name for native, "snapshot" for snapper).
-            received_name = Path(source_path).name
-
+            # received_name (the source basename: == snapshot_name for native,
+            # "snapshot" for snapper) was resolved before the transfer, together
+            # with whether anything already occupied that destination path.
             if proc.returncode != 0:
                 stderr_output = "".join(stderr_lines)
                 logger.error(f"Transfer failed (exit {proc.returncode})")
                 if stderr_output:
                     logger.error(f"Error output: {stderr_output}")
-                self._cleanup_partial_subvolume(dest_path, received_name)
+                self._cleanup_partial_subvolume(
+                    dest_path,
+                    received_name,
+                    created_by_this_run=not artifact_preexisted,
+                )
                 return False
 
             logger.info("Transfer completed successfully")
@@ -3772,6 +3805,8 @@ print(json.dumps(result))
         # report failure and delete a backup that transferred correctly.
         received_name = Path(source_path).name
         logger.debug(f"Received subvolume name (for verification): {received_name}")
+        # Recorded BEFORE the transfer, for the reason above.
+        artifact_preexisted = self.artifact_exists(dest_path, received_name)
 
         # Check if source path exists
         if not os.path.exists(source_path):
@@ -4010,7 +4045,11 @@ print(json.dumps(result))
             receive_failed = recv_rc is not None and recv_rc != 0
             send_failed = send_rc is not None and send_rc != 0
             if receive_failed or send_failed:
-                self._cleanup_partial_subvolume(dest_path, received_name)
+                self._cleanup_partial_subvolume(
+                    dest_path,
+                    received_name,
+                    created_by_this_run=not artifact_preexisted,
+                )
             else:
                 logger.warning(
                     "Receive completed but verification was inconclusive; leaving "
@@ -4248,6 +4287,8 @@ print(json.dumps(result))
         # (== snapshot_name for native, "snapshot" for snapper). Compute it up front
         # so partial-cleanup on the failure paths can target the exact path.
         received_name = Path(manifest.snapshot_path).name
+        # Recorded BEFORE the receive, for the reason above.
+        artifact_preexisted = self.artifact_exists(dest_path, received_name)
         use_sudo = self.config.get("ssh_sudo", False)
         passwordless = self.config.get("passwordless", False) or self.config.get(
             "passwordless_sudo_available", False
@@ -4309,7 +4350,11 @@ print(json.dumps(result))
                         chunks_sent,
                         stderr,
                     )
-                    self._cleanup_partial_subvolume(dest_path, received_name)
+                    self._cleanup_partial_subvolume(
+                        dest_path,
+                        received_name,
+                        created_by_this_run=not artifact_preexisted,
+                    )
                     return False
 
                 # Write chunk data
@@ -4354,7 +4399,11 @@ print(json.dumps(result))
             except subprocess.TimeoutExpired:
                 logger.error("Timeout waiting for SSH receive to complete")
                 receive_process.kill()
-                self._cleanup_partial_subvolume(dest_path, received_name)
+                self._cleanup_partial_subvolume(
+                    dest_path,
+                    received_name,
+                    created_by_this_run=not artifact_preexisted,
+                )
                 return False
 
             if return_code != 0:
@@ -4368,7 +4417,11 @@ print(json.dumps(result))
                     return_code,
                     stderr,
                 )
-                self._cleanup_partial_subvolume(dest_path, received_name)
+                self._cleanup_partial_subvolume(
+                    dest_path,
+                    received_name,
+                    created_by_this_run=not artifact_preexisted,
+                )
                 return False
 
             elapsed = time.time() - start_time
@@ -4403,7 +4456,11 @@ print(json.dumps(result))
             except Exception:
                 pass
             # The stream did not complete normally: remove any partial subvolume.
-            self._cleanup_partial_subvolume(dest_path, received_name)
+            self._cleanup_partial_subvolume(
+                dest_path,
+                received_name,
+                created_by_this_run=not artifact_preexisted,
+            )
             return False
 
     def _monitor_transfer_progress(

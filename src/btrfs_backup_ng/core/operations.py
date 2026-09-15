@@ -1554,7 +1554,7 @@ def _cleanup_partial_local_subvolume(
 
 
 def _cleanup_partial_remote_subvolume(
-    destination_endpoint, manifest, *, created_by_this_run: bool = True
+    destination_endpoint, manifest, *, created_by_this_run: bool
 ) -> None:
     """Best-effort removal of a partial REMOTE subvolume after a failed chunked
     SSH transfer, using the endpoint's own exact-path cleaner when present.
@@ -1563,7 +1563,9 @@ def _cleanup_partial_remote_subvolume(
     underlying ``_cleanup_partial_subvolume``, which never searches by name -- so a
     sibling is never deleted. ``created_by_this_run`` is what stops the EXACT path
     being deleted when the thing at it predates the transfer; being there is not
-    evidence this run wrote it. A no-op for endpoints without the cleaner.
+    evidence this run wrote it. Required, with no default: a default silently
+    exempted six callers inside endpoint/ssh.py while the guard read as applied.
+    A no-op for endpoints without the cleaner.
     """
     cleaner = getattr(destination_endpoint, "_cleanup_partial_subvolume", None)
     if cleaner is None:

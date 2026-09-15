@@ -172,7 +172,7 @@ class TestChunkedPartialCleanup:
         ep = MagicMock(spec=["config"])  # no _cleanup_partial_subvolume
         ep.config = {"path": "/remote/dest"}
         # must not raise
-        ops._cleanup_partial_remote_subvolume(ep, manifest)
+        ops._cleanup_partial_remote_subvolume(ep, manifest, created_by_this_run=True)
 
 
 class TestRawPartialCleanup:

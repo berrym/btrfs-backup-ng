@@ -67,6 +67,11 @@ def _captured_argv(*, euid, compress):
     endpoint.ssh_manager = MagicMock()
     endpoint.ssh_manager.control_path = "/run/cm.sock"
     endpoint._check_command_exists = lambda c: False  # no pv/mbuffer
+    # The pre-transfer "does anything already occupy the destination path" probe
+    # is a remote round trip this helper's fake Popen cannot serve, and it is not
+    # what these tests are about; it has its own coverage. False = the path is
+    # free, i.e. the ordinary case.
+    endpoint.artifact_exists = lambda *a, **k: False
     endpoint._estimate_snapshot_size = lambda *a, **k: None
     endpoint._diagnostics_cache = {}
     # Every probe passes, and passwordless sudo in particular: that is what
