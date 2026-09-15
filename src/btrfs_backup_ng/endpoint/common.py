@@ -838,35 +838,58 @@ class Endpoint:
                 logger.info("Skipping locked snapshot: %s", snapshot)
                 result.skip(snapshot, "held by a retention lock")
                 continue
-            cmd = [
-                ("btrfs", False),
-                ("subvolume", False),
-                ("delete", False),
-                (str(snapshot.get_path()), True),
-            ]
-            logger.debug(
-                "Executing deletion command: %s",
-                [(arg, is_path) for arg, is_path in cmd],
-            )
-            try:
-                logger.debug("Deleting snapshot with path: %s", snapshot.get_path())
-                self._exec_command({"command": cmd})
+            # Built by _build_deletion_commands rather than hand-rolled here, so
+            # `convert_rw` gets its `btrfs property set -ts ... ro false` ahead of
+            # the delete. Both are legacy CLI flags -- `-w/--convert-rw` and
+            # `-s/--sync` -- that reach this endpoint's config and were then
+            # dropped, because this method assembled its own single command and
+            # consulted neither. Their help text promised behaviour that never
+            # happened. `subvolume_sync` is deliberately excluded per snapshot:
+            # it is one trailing command for the whole batch, issued below.
+            commands = self._build_deletion_commands([snapshot], subvolume_sync=False)
+            logger.debug("Executing deletion command(s): %s", commands)
+            for cmd in commands:
+                try:
+                    logger.debug("Deleting snapshot with path: %s", snapshot.get_path())
+                    self._exec_command({"command": cmd})
+                except Exception as e:
+                    logger.error(
+                        "Failed to delete snapshot %s: %s", snapshot.get_path(), e
+                    )
+                    logger.error("Deletion command was: %s", cmd)
+                    result.fail(snapshot, e)
+                    break
+            else:
                 logger.info("Deleted snapshot subvolume: %s", snapshot.get_path())
-            except Exception as e:
-                logger.error("Failed to delete snapshot %s: %s", snapshot.get_path(), e)
-                logger.error(
-                    "Deletion command was: %s", [(arg, is_path) for arg, is_path in cmd]
-                )
-                result.fail(snapshot, e)
-                continue
-            result.deleted.append(snapshot)
-            # Evicted only on success. This sat outside the try, so a snapshot
-            # whose deletion FAILED was dropped from the cache anyway and every
-            # later list_snapshots() in the process reported it gone -- the
-            # listing agreeing with a deletion that did not happen.
-            if self.__cached_snapshots is not None:
-                with contextlib.suppress(ValueError):
-                    self.__cached_snapshots.remove(snapshot)
+                result.deleted.append(snapshot)
+                # Evicted only on success, inside this branch. It used to sit at
+                # the loop's own indent, so a snapshot whose deletion FAILED was
+                # dropped from the cache anyway and every later list_snapshots()
+                # in the process reported it gone -- the listing agreeing with a
+                # deletion that did not happen.
+                if self.__cached_snapshots is not None:
+                    with contextlib.suppress(ValueError):
+                        self.__cached_snapshots.remove(snapshot)
+        # `btrfs subvolume sync` waits for the deletions to finish being cleaned
+        # up, so it belongs after the batch and only if the batch deleted
+        # something. It is not a per-snapshot verdict: the subvolumes are already
+        # gone from the tree, and failing the deletions over a failed wait would
+        # report a loss that did not happen.
+        if result.deleted and self.config.get("subvolume_sync", False):
+            for cmd in self._build_deletion_commands(
+                [], convert_rw=False, subvolume_sync=True
+            ):
+                try:
+                    self._exec_command({"command": cmd})
+                except Exception as e:
+                    logger.error(
+                        "Deleted %d snapshot(s), but 'btrfs subvolume sync' on %s "
+                        "failed: %s. The deletions stand; the filesystem may still "
+                        "be reclaiming their space.",
+                        result.deleted_count,
+                        self.config["path"],
+                        e,
+                    )
         return result
 
     def delete_snapshot(self, snapshot: Any, **kwargs: Any) -> DeletionResult:
