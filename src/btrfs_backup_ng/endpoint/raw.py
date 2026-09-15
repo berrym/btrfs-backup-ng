@@ -809,8 +809,16 @@ class RawEndpoint(Endpoint):
         # sha256 was then sealed over the corruption, so both processes exited 0,
         # the engine's return-code gate passed, `raw verify` reported ok, and the
         # damage surfaced only at restore.
+        #
+        # Neither component distinguishes MACHINES, though, and a raw+ssh target is
+        # routinely shared by several: pids collide across hosts by nature, and
+        # monotonic_ns is uptime on Linux, so two boxes that boot together and run
+        # the same timer are not an exotic case. The random token closes that, and
+        # is random rather than a hostname because it has to be a filename on an
+        # unknown remote filesystem without needing to be sanitised into one.
         part_path = Path(
-            f"{output_path}.{os.getpid()}.{time.monotonic_ns():x}{PARTIAL_SUFFIX}"
+            f"{output_path}.{os.getpid()}.{time.monotonic_ns():x}"
+            f".{os.urandom(4).hex()}{PARTIAL_SUFFIX}"
         )
 
         logger.info("Writing raw stream to: %s", part_path)
@@ -2379,7 +2387,25 @@ class SSHRawEndpoint(RawEndpoint):
         # with spaces/metacharacters writes to the intended file, and so the
         # receive-write and commit_receive halves quote identically (they must
         # agree on the target or a valid config could fail at commit).
-        remote_cmd = f"cat > {shlex.quote(str(output_path))}"
+        #
+        # `set -C` is the remote counterpart of the O_EXCL|O_NOFOLLOW the local
+        # path opens its .part with (_open_part_file), and it was missing: a plain
+        # `cat >` truncates whatever is at the path and follows a symlink to write
+        # through it. So two hosts that did land on the same .part name interleaved
+        # into one stream -- the corruption the name's pid/monotonic components
+        # exist to prevent, but with nothing to catch it if they collided anyway --
+        # and a symlink planted in a target directory that untrusted users can
+        # write redirected a root-run backup onto whatever it pointed at. Under
+        # `set -C` the redirect fails outright (measured on dash, bash and POSIX
+        # sh; each refuses an existing file, a symlink, and a DANGLING symlink,
+        # and each exits non-zero so the transfer is reported failed).
+        #
+        # `umask 077` gives the stream the same 0600 the local path opens it with
+        # and the same mode the .meta sidecar beside it is already chmod'd to; a
+        # remote `cat >` otherwise left the most sensitive file at the remote's
+        # umask, typically 0644. `mv` preserves the mode, so this is the mode the
+        # published backup keeps.
+        remote_cmd = f"umask 077; set -C; cat > {shlex.quote(str(output_path))}"
         remote_cmd = self._elevate(f"sh -c {shlex.quote(remote_cmd)}")
 
         if not pipeline or pipeline == [["cat"]]:
@@ -2428,6 +2454,14 @@ class SSHRawEndpoint(RawEndpoint):
             return
         part_path = pending["part_path"]
         final_path = pending["stream_path"]
+        # Size and digest are read from the ``.part`` file, BEFORE the lock. `mv`
+        # is a pure rename, so both describe the committed stream exactly -- and
+        # hashing a multi-GB stream, even on the remote's own kernel, can take
+        # minutes. Holding the target lock across it would make a legitimately
+        # parallel commit exceed its wait and FAIL instead of serialize, which is
+        # why the local path hashes its ``.part`` outside the lock too. The
+        # ``.part`` name is this transfer's alone, so no peer can touch it.
+        size, checksum = self._remote_size_and_digest(Path(str(part_path)))
         # The leading sync flushes the just-written bytes BEFORE the rename (so
         # the final name can never refer to unflushed data); the trailing sync
         # makes the rename itself durable, matching the local path's post-rename
@@ -2437,29 +2471,43 @@ class SSHRawEndpoint(RawEndpoint):
             f"sync && mv -f {shlex.quote(str(part_path))} "
             f"{shlex.quote(str(final_path))} && sync"
         )
-        result = self._exec_remote_command(["sh", "-c", mv_script], check=False)
-        if result.returncode != 0:
-            stderr = result.stderr
-            if isinstance(stderr, (bytes, bytearray)):
-                stderr = stderr.decode(errors="replace")
-            raise RuntimeError(
-                f"Failed to publish remote raw stream {final_path}: "
-                f"{(stderr or '').strip()}"
-            )
-        # Write the authoritative sidecar remotely (best-effort: the stream is
-        # already durable, so a sidecar error must not fail the backup).
-        self._write_remote_sidecar(Path(str(final_path)))
+        # The rename makes the stream visible under its shared final name, so from
+        # here to the sidecar write must be mutually exclusive: a concurrent prune
+        # or backfill that looks in between sees a stream with no sidecar and
+        # mislabels it (backfill stamps it `unknown`/inferred, overwriting the
+        # authoritative record this commit is about to write). The local path has
+        # taken the lock over exactly this window since R7; the remote path never
+        # did, though its window is WIDER -- a network round trip, not a rename --
+        # and its peers can be on other machines, where a flock would not have
+        # helped anyway. This section is now metadata-only and sub-second.
+        with self.target_lock():
+            result = self._exec_remote_command(["sh", "-c", mv_script], check=False)
+            if result.returncode != 0:
+                stderr = result.stderr
+                if isinstance(stderr, (bytes, bytearray)):
+                    stderr = stderr.decode(errors="replace")
+                raise RuntimeError(
+                    f"Failed to publish remote raw stream {final_path}: "
+                    f"{(stderr or '').strip()}"
+                )
+            # Write the authoritative sidecar remotely (best-effort: the stream is
+            # already durable, so a sidecar error must not fail the backup).
+            self._write_remote_sidecar(Path(str(final_path)), (size, checksum))
         self._cached_snapshots = None
         logger.debug("Committed remote raw stream + sidecar: %s", final_path)
 
-    def _write_remote_sidecar(self, final_path: Path) -> None:
-        """Stat the committed remote stream for its size, then write its .meta
-        sidecar remotely and atomically (temp -> sync -> mv -> chmod 600)."""
+    def _remote_size_and_digest(self, path: Path) -> tuple[int, str | None]:
+        """Portable remote byte count + sha256 of ``path``, best-effort.
+
+        Split out of ``_write_remote_sidecar`` so a commit can measure the
+        ``.part`` file before taking the target lock and hand the results in,
+        rather than paying a full remote hash with the lock held.
+        """
         size = 0
         # Portable remote size: GNU `stat -c %s`, else BSD/macOS `stat -f %z`,
         # else POSIX `wc -c`. A raw target is often a non-Linux box (NAS, macOS),
         # so GNU-only stat would record a bogus size on those.
-        q = shlex.quote(str(final_path))
+        q = shlex.quote(str(path))
         size_cmd = (
             f"stat -c %s {q} 2>/dev/null || stat -f %z {q} 2>/dev/null || wc -c < {q}"
         )
@@ -2475,21 +2523,52 @@ class SSHRawEndpoint(RawEndpoint):
                 # the failure observable (size stays 0, best-effort).
                 logger.warning(
                     "Remote size of %s failed (rc=%s); recording sidecar size=0",
-                    final_path,
+                    path,
                     stat_res.returncode,
                 )
         except (ValueError, TypeError, OSError) as e:
             logger.warning(
                 "Could not size remote stream %s: %s; recording sidecar size=0",
-                final_path,
+                path,
                 e,
             )
-        # Best-effort: the stream is already durable, so a checksum or sidecar error
-        # must not fail the backup (mirrors the local commit path). Both the remote
-        # hash and write_sidecar are inside the try so neither can flip an
-        # already-successful transfer into a reported failure (the PR1/R1 contract).
         try:
-            checksum = self._remote_sha256(final_path)
+            checksum = self._remote_sha256(path)
+        except Exception as e:
+            # Best-effort, as at every other seal site: the backup data itself has
+            # already succeeded, so a failed digest must not fail the transfer.
+            logger.warning("Could not hash remote stream %s: %s", path, e)
+            checksum = None
+        return size, checksum
+
+    def _write_remote_sidecar(
+        self,
+        final_path: Path,
+        measured: tuple[int, str | None] | None = None,
+    ) -> None:
+        """Write ``final_path``'s .meta sidecar remotely and atomically
+        (temp -> sync -> mv -> chmod 600).
+
+        ``measured`` is a ``(size, checksum)`` pair from a caller that already
+        measured the stream under its ``.part`` name -- ``mv`` is a pure rename,
+        so those figures describe this file. Omitted, the file is measured here,
+        which is what the backfill path needs (it has no ``.part`` to measure).
+
+        One optional PAIR rather than two optional values, because a failed remote
+        hash legitimately yields ``None``: keyed on the checksum alone, exactly the
+        streams whose digest could not be taken would be hashed a second time, at
+        full cost, to fail again.
+        """
+        size, checksum = (
+            measured
+            if measured is not None
+            else self._remote_size_and_digest(final_path)
+        )
+        # Best-effort: the stream is already durable, so a sidecar error must not
+        # fail the backup (mirrors the local commit path) -- write_sidecar is
+        # inside the try so it cannot flip an already-successful transfer into a
+        # reported failure (the PR1/R1 contract).
+        try:
             self.write_sidecar(self._sidecar_snapshot(final_path, size, checksum))
         except Exception as e:
             logger.warning("Failed to write remote sidecar for %s: %s", final_path, e)
