@@ -418,15 +418,27 @@ def wait_for_pipeline(
 
     Args:
         processes: List of (name, Popen) tuples
-        timeout: Timeout in seconds
+        timeout: Wall limit in seconds. ``0`` (the shipped default, see
+            DEFAULT_TRANSFER_TIMEOUT) means NO limit.
 
     Returns:
         List of return codes
     """
+    # Zero is this project's "no limit" sentinel everywhere else -- wait_with_progress
+    # spells it `wall_timeout <= 0` and substitutes a fallback. Passed straight to
+    # Popen.wait it is a literal zero, i.e. a non-blocking poll that raises
+    # TimeoutExpired immediately (measured: 0.000s). The handler below then SIGKILLs
+    # the process and records -1, and operations.py scores any non-zero return code
+    # as a failed transfer. So on the DEFAULT configuration every compress/throttle/
+    # progress stage not already reaped when the send finished was killed with no
+    # grace and a transfer whose data had been fully received was reported failed.
+    # It survived because the compressor has usually drained by then, which is
+    # exactly why it would never show up in a passing test.
+    wait_timeout = timeout if timeout and timeout > 0 else None
     return_codes = []
     for name, proc in processes:
         try:
-            rc = proc.wait(timeout=timeout)
+            rc = proc.wait(timeout=wait_timeout)
             return_codes.append(rc)
             if rc != 0:
                 stderr = ""
