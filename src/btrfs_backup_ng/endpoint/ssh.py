@@ -2931,7 +2931,13 @@ print(json.dumps(result))
             logger.debug(f"Verification exception details: {e}", exc_info=True)
             return False
 
-    def _cleanup_partial_subvolume(self, dest_path: str, received_name: str) -> None:
+    def _cleanup_partial_subvolume(
+        self,
+        dest_path: str,
+        received_name: str,
+        *,
+        created_by_this_run: bool = True,
+    ) -> None:
         """Remove a partial/failed received subvolume at its exact destination path.
 
         Called after a transfer is judged failed so that a leftover partial cannot
@@ -2940,9 +2946,27 @@ print(json.dumps(result))
         ``{dest_path}/{received_name}`` — never a filesystem-wide search — for the
         same reason exact-path verification is: sibling snapshots must not be touched.
 
+        ``created_by_this_run`` is what makes the removal safe, and it is the
+        caller's to establish: being at the path proves only that something is
+        there, not that this transfer put it there. Skip-detection works by UUID
+        correspondence rather than by name, so a destination subvolume that merely
+        shares a name -- one another tool wrote, or a restored copy -- is planned
+        for transfer and would be deleted here when that transfer failed. Defaults
+        True to preserve the behaviour of any caller that has not been taught to
+        record it, which is a weaker guarantee than the flag being required; the
+        transfer path passes it explicitly.
+
         Best-effort: failures are logged and swallowed (the caller has already
         decided the transfer failed).
         """
+        if not created_by_this_run:
+            logger.warning(
+                "Not cleaning up %s on %s: it was already at that path before this "
+                "transfer started, so it is not this run's partial.",
+                received_name,
+                self.hostname,
+            )
+            return
         expected_path = f"{dest_path.rstrip('/')}/{received_name}"
         use_sudo = self.config.get("ssh_sudo", False)
 

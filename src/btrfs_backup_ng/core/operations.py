@@ -673,6 +673,11 @@ def _transfer_chunks_local(
     stall_timeout, wall_timeout = _timeouts_from(options)
     logger.info("Reassembling %d chunks for local btrfs receive", manifest.chunk_count)
 
+    # Recorded before the receive starts: afterwards a partial this run wrote is
+    # indistinguishable from a backup that was already at that path.
+    received_name = Path(manifest.snapshot_path).name
+    preexisting = destination_artifact_exists(destination_endpoint, received_name)
+
     # Create a reader to reassemble chunks
     reader = chunked_manager.create_reassembly_reader(manifest)
 
@@ -715,7 +720,7 @@ def _transfer_chunks_local(
     except subprocess.TimeoutExpired:
         receive_process.kill()
         _cleanup_partial_local_subvolume(
-            destination_endpoint, Path(manifest.snapshot_path).name
+            destination_endpoint, received_name, created_by_this_run=not preexisting
         )
         raise __util__.SnapshotTransferError("Timeout waiting for btrfs receive")
 
@@ -725,7 +730,7 @@ def _transfer_chunks_local(
         except Exception:
             pass
         _cleanup_partial_local_subvolume(
-            destination_endpoint, Path(manifest.snapshot_path).name
+            destination_endpoint, received_name, created_by_this_run=not preexisting
         )
         raise
 
@@ -766,6 +771,13 @@ def _transfer_chunks_ssh(
         len(pending_chunks),
         manifest.completed_chunks,
         manifest.chunk_count,
+    )
+
+    # Recorded before the receive starts, for the same reason as the local path:
+    # once bytes have been written, a partial and a pre-existing backup at the
+    # destination path are the same observation.
+    preexisting = destination_artifact_exists(
+        destination_endpoint, Path(manifest.snapshot_path).name
     )
 
     # For SSH, we stream the reassembled chunks through the SSH pipe
@@ -847,7 +859,9 @@ def _transfer_chunks_ssh(
 
         except subprocess.TimeoutExpired:
             receive_process.kill()
-            _cleanup_partial_remote_subvolume(destination_endpoint, manifest)
+            _cleanup_partial_remote_subvolume(
+                destination_endpoint, manifest, created_by_this_run=not preexisting
+            )
             raise __util__.SnapshotTransferError(
                 "Timeout waiting for SSH btrfs receive"
             )
@@ -857,7 +871,9 @@ def _transfer_chunks_ssh(
                 receive_process.kill()
             except Exception:
                 pass
-            _cleanup_partial_remote_subvolume(destination_endpoint, manifest)
+            _cleanup_partial_remote_subvolume(
+                destination_endpoint, manifest, created_by_this_run=not preexisting
+            )
             # Re-raise with context about which chunk failed
             if chunks_sent < len(manifest.chunks):
                 chunk = manifest.chunks[chunks_sent]
@@ -1439,7 +1455,37 @@ def sync_snapshots(
     return result
 
 
-def _cleanup_partial_local_subvolume(destination_endpoint, name: str) -> None:
+def destination_artifact_exists(destination_endpoint, name: str) -> bool:
+    """Whether ``{dest}/{name}`` is already there, asked BEFORE a transfer runs.
+
+    This is the authorship record the partial-transfer cleanups needed. A cleanup
+    that deletes whatever is at the path can only be safe if something establishes
+    that this run put it there, and nothing did -- see
+    ``_cleanup_partial_local_subvolume`` for what that cost.
+
+    Local destinations are stat'd directly; remote ones are asked over their own
+    transport. Anything that cannot be determined returns True, i.e. "assume it
+    was already there", because the failure this guards against is deleting a
+    backup that was not ours and the safe answer under uncertainty is to leave it
+    alone.
+    """
+    try:
+        base = str(destination_endpoint.config["path"]).rstrip("/")
+        expected = f"{base}/{name}"
+        if not getattr(destination_endpoint, "_is_remote", False):
+            return Path(expected).exists()
+        exec_remote = getattr(destination_endpoint, "_exec_remote_command", None)
+        if exec_remote is None:
+            return True
+        return exec_remote(["test", "-e", expected], check=False).returncode == 0
+    except Exception as e:
+        logger.debug("Could not determine whether %s pre-existed: %s", name, e)
+        return True
+
+
+def _cleanup_partial_local_subvolume(
+    destination_endpoint, name: str, *, created_by_this_run: bool
+) -> None:
     """Best-effort removal of a partial received subvolume after a failed transfer.
 
     A killed or failed local ``btrfs receive`` leaves an incomplete subvolume at
@@ -1448,13 +1494,24 @@ def _cleanup_partial_local_subvolume(destination_endpoint, name: str) -> None:
     mistake for a completed backup -- silently skipping the real transfer. Remove
     it so a re-run starts clean.
 
-    Safety (the received subvolume is never a good backup here):
-      * only called on the failure path, so a successful transfer never triggers it;
-      * skip-detection already excluded any snapshot whose name is present at the
-        destination BEFORE the transfer was attempted, so anything now at the exact
-        path is this failed run's partial, not a prior good backup;
-      * scoped to the EXACT single path via ``Path.exists()`` -- never a
-        filesystem-wide name search -- so siblings are untouched.
+    ``created_by_this_run`` is the whole safety argument, and it used to be an
+    assumption stated in this docstring rather than a fact anyone had checked.
+    The claim was that "skip-detection already excluded any snapshot whose name is
+    present at the destination BEFORE the transfer was attempted, so anything now
+    at the exact path is this failed run's partial". Skip-detection is by UUID
+    CORRESPONDENCE, not by name (``planning.plan_transfer_sequence`` via
+    ``Endpoint.correspondents_of``), so a destination subvolume that merely shares
+    a name and has no matching ``received_uuid`` -- a backup taken by another
+    tool, a manual ``btrfs receive``, a restored copy -- was planned for transfer
+    and then deleted by this function when that transfer failed. With an
+    ``rm -rf`` fallback behind it.
+
+    The caller now records existence before the attempt and passes the answer in;
+    ``_cleanup_partial_raw_stream`` has recorded authorship the same way all
+    along, by deleting only the ``.part`` name this run generated.
+
+    Still scoped to the EXACT single path -- never a filesystem-wide name search --
+    so siblings are untouched either way.
 
     Only handles LOCAL btrfs destinations: SSH endpoints clean their own partials
     during the transfer, and raw destinations are handled by the raw cleanup path.
@@ -1466,6 +1523,15 @@ def _cleanup_partial_local_subvolume(destination_endpoint, name: str) -> None:
     if getattr(destination_endpoint, "_is_remote", False):
         return
     if isinstance(destination_endpoint, RawEndpoint):
+        return
+    if not created_by_this_run:
+        logger.warning(
+            "Not cleaning up %s at the destination: it was already there before "
+            "this transfer started, so it is not this run's partial. The failed "
+            "transfer left nothing to remove, or left it inside something that "
+            "predates this run; inspect it before deleting anything.",
+            name,
+        )
         return
 
     try:
@@ -1487,14 +1553,17 @@ def _cleanup_partial_local_subvolume(destination_endpoint, name: str) -> None:
         logger.debug("Partial local-subvolume cleanup failed: %s", cleanup_e)
 
 
-def _cleanup_partial_remote_subvolume(destination_endpoint, manifest) -> None:
+def _cleanup_partial_remote_subvolume(
+    destination_endpoint, manifest, *, created_by_this_run: bool = True
+) -> None:
     """Best-effort removal of a partial REMOTE subvolume after a failed chunked
     SSH transfer, using the endpoint's own exact-path cleaner when present.
 
     Scoped to the exact received path (``{dest}/{source_basename}``) by the
-    underlying ``_cleanup_partial_subvolume``, which guards on existence and never
-    searches by name -- so a good backup is never deleted. A no-op for endpoints
-    that do not expose the cleaner.
+    underlying ``_cleanup_partial_subvolume``, which never searches by name -- so a
+    sibling is never deleted. ``created_by_this_run`` is what stops the EXACT path
+    being deleted when the thing at it predates the transfer; being there is not
+    evidence this run wrote it. A no-op for endpoints without the cleaner.
     """
     cleaner = getattr(destination_endpoint, "_cleanup_partial_subvolume", None)
     if cleaner is None:
@@ -1502,7 +1571,7 @@ def _cleanup_partial_remote_subvolume(destination_endpoint, manifest) -> None:
     try:
         dest_path = str(destination_endpoint.config["path"])
         received_name = Path(manifest.snapshot_path).name
-        cleaner(dest_path, received_name)
+        cleaner(dest_path, received_name, created_by_this_run=created_by_this_run)
     except Exception as e:
         logger.debug("Partial remote-subvolume cleanup failed: %s", e)
 
@@ -1589,6 +1658,12 @@ def _execute_transfers(
                 result.failed.append((best_snapshot, err))
                 continue
 
+        # Asked BEFORE the transfer, because afterwards there is no way to tell a
+        # partial this run wrote from a backup that was already sitting there.
+        preexisting = destination_artifact_exists(
+            destination_endpoint, best_snapshot.get_name()
+        )
+
         # Set locks
         source_endpoint.set_lock(best_snapshot, destination_id, True)
         if parent:
@@ -1629,7 +1704,9 @@ def _execute_transfers(
             # file would otherwise be re-listed as a phantom backup) are cleaned
             # here; SSH btrfs endpoints clean their own partials during transfer.
             _cleanup_partial_local_subvolume(
-                destination_endpoint, best_snapshot.get_name()
+                destination_endpoint,
+                best_snapshot.get_name(),
+                created_by_this_run=not preexisting,
             )
             _cleanup_partial_raw_stream(destination_endpoint)
 
