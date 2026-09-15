@@ -33,6 +33,7 @@ from btrfs_backup_ng.config.schema import (
     TargetConfig,
     VolumeConfig,
 )
+from btrfs_backup_ng.core.operations import TransferResult
 
 
 @pytest.fixture
@@ -46,7 +47,11 @@ def rig(tmp_path, monkeypatch):
         return m
 
     monkeypatch.setattr(run_mod.endpoint, "choose_endpoint", _endpoint)
-    monkeypatch.setattr(run_mod, "_transfer_to_target", lambda *a, **k: True)
+    monkeypatch.setattr(
+        run_mod,
+        "_transfer_to_target",
+        lambda *a, **k: TransferResult(transferred=[object()]),
+    )
     monkeypatch.setattr(run_mod, "_prune_after_transfer", lambda *a, **k: True)
     return tmp_path, monkeypatch
 
@@ -197,11 +202,11 @@ class TestTheFixDoesNotSabotageWorkingTargets:
         transferred: list = []
 
         def _spy(*a, **k):
-            # MUST return True. `list.append` returns None, and a falsy return
-            # here is read as a failed transfer -- which made this test report
-            # the code broken when only the spy was.
+            # MUST return a TransferResult. None is how the real function reports
+            # a failed transfer, and `list.append` returns None -- which made this
+            # test report the code broken when only the spy was.
             transferred.append(True)
-            return True
+            return TransferResult(transferred=[object()])
 
         monkeypatch.setattr(run_mod, "_transfer_to_target", _spy)
         good = tmp_path / "good"
@@ -246,11 +251,11 @@ class TestTheFixDoesNotSabotageWorkingTargets:
         transferred: list = []
 
         def _spy(*a, **k):
-            # MUST return True. `list.append` returns None, and a falsy return
-            # here is read as a failed transfer -- which made this test report
-            # the code broken when only the spy was.
+            # MUST return a TransferResult. None is how the real function reports
+            # a failed transfer, and `list.append` returns None -- which made this
+            # test report the code broken when only the spy was.
             transferred.append(True)
-            return True
+            return TransferResult(transferred=[object()])
 
         monkeypatch.setattr(run_mod, "_transfer_to_target", _spy)
         usb = tmp_path / "usb"

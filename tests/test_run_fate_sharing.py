@@ -15,6 +15,7 @@ from types import SimpleNamespace
 
 from btrfs_backup_ng.cli import run as run_cli
 from btrfs_backup_ng.config.schema import RetentionConfig
+from btrfs_backup_ng.core.operations import TransferResult
 
 # Every bucket is written out. Unset keys are filled from hard-coded defaults
 # (hourly=24, weekly=4, monthly=12), not from what the file says, so a policy
@@ -120,8 +121,14 @@ class TestTheWiringItselfIsCorrect:
             "_prune_after_transfer",
             lambda *a, **kw: pruned.append(kw.get("prune_source")) or True,
         )
+        # None is how a failed transfer is reported; a success carries its
+        # outcome, which is what the caller now counts snapshots from.
         monkeypatch.setattr(
-            run_cli, "_transfer_to_target", lambda *a, **kw: target_succeeds
+            run_cli,
+            "_transfer_to_target",
+            lambda *a, **kw: (
+                TransferResult(transferred=[object()]) if target_succeeds else None
+            ),
         )
 
         class _Src:

@@ -95,6 +95,14 @@ def execute_transfer(args: argparse.Namespace) -> int:
 
     success_count = 0
     fail_count = 0
+    #: Snapshots actually delivered, as opposed to targets that finished without
+    #: raising. A target whose plan was empty because it is already up to date
+    #: increments success_count and moves nothing.
+    moved_count = 0
+    #: Optional targets that were unavailable. Their `continue` bypasses both
+    #: counters, so without this a run where every target was skipped reported
+    #: complete success.
+    skipped_count = 0
 
     for volume in volumes:
         logger.info("Volume: %s", volume.path)
@@ -188,7 +196,7 @@ def execute_transfer(args: argparse.Namespace) -> int:
                         **space_options_from_args(args),
                     }
 
-                    sync_snapshots(
+                    result = sync_snapshots(
                         source_endpoint,
                         dest_endpoint,
                         keep_num_backups=0,
@@ -197,6 +205,9 @@ def execute_transfer(args: argparse.Namespace) -> int:
                         options=transfer_options,
                     )
                     success_count += 1
+                    moved_count += result.transferred_count
+                    if result.transferred_count == 0:
+                        logger.info("  %s is already up to date", target.path)
 
                 except Exception as e:
                     if getattr(target, "optional", False):
@@ -205,6 +216,7 @@ def execute_transfer(args: argparse.Namespace) -> int:
                         logger.warning(
                             "  Skipping optional target %s: %s", target.path, e
                         )
+                        skipped_count += 1
                         continue
                     logger.error("  Transfer to %s failed: %s", target.path, e)
                     fail_count += 1
@@ -220,6 +232,22 @@ def execute_transfer(args: argparse.Namespace) -> int:
             "Completed with errors: %d succeeded, %d failed", success_count, fail_count
         )
         return 1
-    else:
-        logger.info("All transfers completed successfully")
+    if skipped_count and success_count == 0:
+        # Every target was declared optional and every one was unavailable. The
+        # `continue` for an optional target bypasses both counters, so this used
+        # to print "All transfers completed successfully" and exit 0 for a run
+        # that reached nothing at all.
+        logger.warning(
+            "No transfers ran: all %d target(s) were skipped as optional",
+            skipped_count,
+        )
         return 0
+    # The snapshot count, not the target count. "All transfers completed
+    # successfully" was printed for a run that moved nothing, because the
+    # verdict came from fail_count alone and fail_count only ever rises in an
+    # except handler.
+    logger.info(
+        "All transfers completed successfully; %d snapshot(s) transferred",
+        moved_count,
+    )
+    return 0

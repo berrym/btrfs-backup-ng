@@ -32,6 +32,7 @@ from btrfs_backup_ng.config.schema import (
     TargetConfig,
     VolumeConfig,
 )
+from btrfs_backup_ng.core.operations import TransferResult
 
 
 def _mounted(*paths):
@@ -70,9 +71,11 @@ def rig(tmp_path, monkeypatch):
 
     def _fake_transfer(*a, **k):
         # Records that a transfer was REACHED. If the mount check works, an
-        # unmounted target never gets here.
+        # unmounted target never gets here. Returns the outcome type the real
+        # function returns -- None means the transfer failed, so a bool here
+        # would make a reached target look like a failed one.
         state["transferred"].append(True)
-        return True
+        return TransferResult(transferred=[object()])
 
     monkeypatch.setattr(run_mod.endpoint, "choose_endpoint", _fake_endpoint)
     monkeypatch.setattr(run_mod, "_transfer_to_target", _fake_transfer)
@@ -191,7 +194,9 @@ class TestTheTransferCommandEnforcesItToo:
 
         synced: list = []
         monkeypatch.setattr(
-            transfer_mod, "sync_snapshots", lambda *a, **k: synced.append(True)
+            transfer_mod,
+            "sync_snapshots",
+            lambda *a, **k: (synced.append(True), TransferResult())[1],
         )
         monkeypatch.setattr(
             transfer_mod, "find_config_file", lambda *a, **k: str(tmp_path / "c.toml")

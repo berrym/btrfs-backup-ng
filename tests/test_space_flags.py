@@ -27,6 +27,7 @@ from btrfs_backup_ng.config.schema import (
     TargetConfig,
     VolumeConfig,
 )
+from btrfs_backup_ng.core.operations import TransferResult
 
 
 # --- the flags -> options mapping --------------------------------------------
@@ -67,6 +68,7 @@ def test_transfer_to_target_merges_space_options(monkeypatch):
 
     def fake_sync(*a, **k):
         captured.update(k.get("options", {}))
+        return TransferResult()
 
     monkeypatch.setattr(run_mod, "sync_snapshots", fake_sync)
 
@@ -84,7 +86,9 @@ def test_transfer_to_target_merges_space_options(monkeypatch):
         True,
         space_options={"check_space": False, "force": True},
     )
-    assert ok is True
+    # A TransferResult, not a bool: a successful transfer now reports what it
+    # delivered so the caller can count snapshots rather than targets.
+    assert ok is not None
     assert captured["check_space"] is False
     assert captured["force"] is True
 
@@ -147,7 +151,7 @@ def test_execute_transfer_merges_space_options(monkeypatch, tmp_path):
     monkeypatch.setattr(
         transfer_mod,
         "sync_snapshots",
-        lambda *a, **k: captured.update(k.get("options", {})),
+        lambda *a, **k: (captured.update(k.get("options", {})), TransferResult())[1],
     )
     monkeypatch.setattr(
         transfer_mod, "find_config_file", lambda *a, **k: str(tmp_path / "c.toml")
@@ -176,7 +180,9 @@ def test_transfer_to_target_without_space_options_is_safe(monkeypatch):
     send-side defaults apply)."""
     captured = {}
     monkeypatch.setattr(
-        run_mod, "sync_snapshots", lambda *a, **k: captured.update(k.get("options", {}))
+        run_mod,
+        "sync_snapshots",
+        lambda *a, **k: (captured.update(k.get("options", {})), TransferResult())[1],
     )
     tc = MagicMock()
     tc.compress = "none"
