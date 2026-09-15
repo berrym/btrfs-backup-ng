@@ -230,8 +230,25 @@ class RawSnapshot:
         is a struct_time (``restore --before``); returning the same type as a
         btrfs Snapshot makes those paths work uniformly across snapshot types
         (and makes cross-type ordering well-defined) instead of raising TypeError.
+
+        LOCAL fields, because that is what the type means to every consumer.
+        ``__util__.Snapshot.time_obj`` comes from parsing the snapshot's NAME,
+        which this project writes in local time, and ``restore --before`` builds
+        its target from a local-time string the operator typed. ``created`` is
+        UTC-aware at every site that sets it, and ``.timetuple()`` on an aware
+        datetime yields ITS OWN fields with the offset discarded -- so returning
+        it directly handed UTC fields to code that reads them as local.
+
+        On a non-UTC host that made ``restore --before`` select the wrong backup
+        for every raw target, and made ``restore --list`` print a timestamp
+        disagreeing with the snapshot's own name on the same row, by the host's
+        UTC offset. A naive ``created`` is treated as UTC, which is what it has
+        always meant here.
         """
-        return self.created.timetuple()
+        created = self.created
+        if created.tzinfo is None:
+            created = created.replace(tzinfo=timezone.utc)
+        return created.astimezone().timetuple()
 
     def __repr__(self) -> str:
         return self.name
