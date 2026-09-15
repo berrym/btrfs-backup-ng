@@ -258,3 +258,146 @@ def test_the_raw_cleanup_remains_the_reference_pattern():
     assert 'pending["stream_path"]' not in source, (
         "the raw cleanup now deletes the published stream, not just its .part"
     )
+
+
+class TestVerifyDeletesOnlyWhatItRestored:
+    """``verify --level full`` test-restores each backup into a temp directory and
+    removes them afterwards. The removal loop iterated ``to_verify`` and deleted
+    ``temp_path / snap.get_name()`` for every entry, on existence alone.
+
+    Two ways that reaches beyond the run: ``--temp-dir`` may be a directory the
+    operator already uses, where a subvolume sharing a backup's name is theirs;
+    and a snapshot whose restore never ran -- a space shortfall skips it before
+    the restore -- still had its path deleted.
+    """
+
+    def test_a_subvolume_already_in_a_user_temp_dir_is_not_deleted(
+        self, monkeypatch, tmp_path
+    ):
+        """Drives the real verify_full: only _test_restore and the privilege
+        preflight are stubbed, so the cleanup loop under test is the shipped one."""
+        from btrfs_backup_ng.core import verify as vf
+
+        theirs = tmp_path / "home.20240101-120000"
+        theirs.mkdir()
+        (theirs / "their-data.bin").write_bytes(b"not ours to delete")
+
+        snap = MagicMock()
+        snap.get_name.return_value = "home.20240101-120000"
+        backup_endpoint = MagicMock()
+        backup_endpoint.config = {"path": "/backups"}
+        backup_endpoint.list_snapshots.return_value = [snap]
+
+        deleted: list = []
+        monkeypatch.setattr(vf, "_can_run_btrfs_privileged", lambda: True)
+        monkeypatch.setattr(vf.__util__, "is_btrfs", lambda p: True)
+        monkeypatch.setattr(vf, "_delete_temp_subvolume", deleted.append)
+        monkeypatch.setattr(vf.__util__, "is_subvolume", lambda p: True)
+        monkeypatch.setattr(vf, "_estimate_temp_shortfall", lambda *a, **k: None)
+        # The restore is a no-op: the subvolume at that path is the operator's,
+        # and the point is that the cleanup must not touch it regardless.
+        monkeypatch.setattr(vf, "_test_restore", lambda *a, **k: None)
+
+        report = vf.verify_full(backup_endpoint, temp_dir=tmp_path, cleanup=True)
+
+        assert report.results, f"verify never reached a snapshot: {report.errors}"
+        assert deleted == [], (
+            f"verify deleted {deleted} from a temp dir it did not restore into"
+        )
+        assert (theirs / "their-data.bin").read_bytes() == b"not ours to delete"
+
+    def test_a_subvolume_this_run_restored_is_still_deleted(
+        self, monkeypatch, tmp_path
+    ):
+        """The guard must not turn the cleanup off: a received subvolume left in a
+        user-supplied temp dir carries a received_uuid and could later be mistaken
+        for a real backup."""
+        from btrfs_backup_ng.core import verify as vf
+
+        snap = MagicMock()
+        snap.get_name.return_value = "home.20240102-120000"
+        backup_endpoint = MagicMock()
+        backup_endpoint.config = {"path": "/backups"}
+        backup_endpoint.list_snapshots.return_value = [snap]
+
+        target = tmp_path / "home.20240102-120000"
+        deleted: list = []
+        monkeypatch.setattr(vf, "_can_run_btrfs_privileged", lambda: True)
+        monkeypatch.setattr(vf.__util__, "is_btrfs", lambda p: True)
+        monkeypatch.setattr(vf, "_delete_temp_subvolume", deleted.append)
+        monkeypatch.setattr(vf.__util__, "is_subvolume", lambda p: True)
+        monkeypatch.setattr(vf, "_estimate_temp_shortfall", lambda *a, **k: None)
+        monkeypatch.setattr(vf, "_test_restore", lambda *a, **k: target.mkdir())
+
+        report = vf.verify_full(backup_endpoint, temp_dir=tmp_path, cleanup=True)
+
+        assert report.results, f"verify never reached a snapshot: {report.errors}"
+        assert deleted == [target], f"the restored subvolume was left behind: {deleted}"
+
+    def test_the_cleanup_loop_iterates_what_was_restored_not_what_was_planned(self):
+        """Pins the fix at the source, since the loop is inside a long function
+        that a unit test cannot easily drive end to end."""
+        import inspect
+
+        source = inspect.getsource(
+            __import__(
+                "btrfs_backup_ng.core.verify", fromlist=["verify_full"]
+            ).verify_full
+        )
+        cleanup = source.split("finally:")[-1]
+        assert "for snap_path in restored_here:" in cleanup, (
+            "the verify cleanup no longer iterates the paths it restored"
+        )
+        assert "for snap in to_verify:" not in cleanup, (
+            "the verify cleanup deletes by plan again, not by what it restored"
+        )
+
+
+class TestSnapperRestoreDeletesOnlyWhatItCreated:
+    """``restore_snapper_snapshot`` removes the destination subvolume and the whole
+    numbered slot directory on ANY exception, on existence alone. The slot comes
+    from ``get_next_snapshot_number`` and is supposed to be free -- but a stale
+    scan, a concurrent snapper, or a slot made by hand is enough to make it not,
+    and a failure before anything was written then deletes a snapshot that was
+    already there.
+    """
+
+    @staticmethod
+    def _source():
+        import inspect
+
+        from btrfs_backup_ng.core import restore as rs
+
+        return inspect.getsource(rs.restore_snapper_snapshot)
+
+    def test_existence_is_recorded_before_the_slot_is_created(self):
+        source = self._source()
+        record = source.index("slot_preexisted = dest_snapshot_dir.exists()")
+        mkdir = source.index("privileged_mkdir(dest_snapshot_dir")
+        assert record < mkdir, (
+            "the slot's prior existence is recorded after it is created, which "
+            "always answers 'it was already there'"
+        )
+
+    def test_the_subvolume_deletion_is_gated_on_the_record(self):
+        assert (
+            "if dest_snapshot_path.exists() and not snapshot_preexisted:"
+            in self._source()
+        )
+
+    def test_the_slot_removal_is_gated_on_the_record(self):
+        assert (
+            "if dest_snapshot_dir.exists() and not slot_preexisted:" in self._source()
+        )
+
+    def test_the_two_are_judged_separately(self):
+        """A restore can fail after creating the directory but before receiving
+        into it, and can also fail into a slot that already held a snapshot. One
+        flag for both would either leak the directory or delete the snapshot."""
+        source = self._source()
+        # Each must be derived from its OWN path. Counting the assignments is not
+        # enough: `snapshot_preexisted = slot_preexisted` assigns exactly once and
+        # collapses the two, so a failure after the directory was created but
+        # before the receive would refuse to remove the directory it made.
+        assert "slot_preexisted = dest_snapshot_dir.exists()" in source
+        assert "snapshot_preexisted = dest_snapshot_path.exists()" in source

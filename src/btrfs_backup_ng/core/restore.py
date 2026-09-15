@@ -1717,6 +1717,14 @@ def restore_snapper_snapshot(
         logger.info("Dry run - would restore as snapshot %d", next_num)
         return next_num, Path("/dev/null")
 
+    # Recorded BEFORE anything is created. get_next_snapshot_number is supposed to
+    # hand back a free slot, but the failure path below removes the whole numbered
+    # directory, and "supposed to be free" is the kind of unchecked premise that
+    # turns a failed restore into the loss of a snapshot that was already there --
+    # a stale scan, a concurrent snapper, or a slot made by hand is enough.
+    slot_preexisted = dest_snapshot_dir.exists()
+    snapshot_preexisted = dest_snapshot_path.exists()
+
     transfer_start = time.monotonic()
 
     log_transaction(
@@ -1995,9 +2003,19 @@ def restore_snapper_snapshot(
             error=str(e),
         )
 
-        # Clean up partial restore
+        # Clean up partial restore -- only what this run put there. The subvolume
+        # and the numbered directory are judged separately: a restore can fail
+        # after creating the directory but before receiving into it, and it can
+        # also fail into a slot that already held one.
+        if snapshot_preexisted or slot_preexisted:
+            logger.warning(
+                "Not removing %s after the failed restore: it was already present "
+                "before this restore started, so it is not this run's partial. "
+                "Inspect it before deleting anything.",
+                dest_snapshot_path if snapshot_preexisted else dest_snapshot_dir,
+            )
         try:
-            if dest_snapshot_path.exists():
+            if dest_snapshot_path.exists() and not snapshot_preexisted:
                 if os.geteuid() != 0:
                     subprocess.run(
                         [
@@ -2036,7 +2054,7 @@ def restore_snapper_snapshot(
                         capture_output=True,
                     )
                     __util__.delete_subvolume(dest_snapshot_path)
-            if dest_snapshot_dir.exists():
+            if dest_snapshot_dir.exists() and not slot_preexisted:
                 __util__.privileged_rmtree(dest_snapshot_dir, allow_prompt=True)
         except Exception as cleanup_e:
             logger.warning("Cleanup failed: %s", cleanup_e)
