@@ -16,6 +16,7 @@ from datetime import datetime, timedelta
 from btrfs_backup_ng.cli.prune import execute_prune
 from btrfs_backup_ng.config.schema import RetentionConfig
 from btrfs_backup_ng.endpoint.local import LocalEndpoint
+from btrfs_backup_ng.endpoint.common import DeletionResult
 
 # Every bucket is written out. Unset keys are filled from hard-coded defaults
 # (hourly=24, weekly=4, monthly=12), not from what the file says, so a policy
@@ -76,6 +77,7 @@ class TestPruneHonoursRequireMount:
         def record(self, snaps, **_k):
             key = str(self.config.get("path", "?"))
             deleted.setdefault(key, []).extend(s.get_name() for s in snaps)
+            return DeletionResult(deleted=list(snaps))
 
         monkeypatch.setattr(LocalEndpoint, "delete_snapshots", record)
         monkeypatch.setattr("sys.stdin.isatty", lambda: False)
@@ -143,6 +145,7 @@ class TestAMissingSnapshotDirDoesNotSkipTheTargets:
             deleted.setdefault(str(self.config.get("path", "?")), []).extend(
                 s.get_name() for s in snaps
             )
+            return DeletionResult(deleted=list(snaps))
 
         monkeypatch.setattr(LocalEndpoint, "delete_snapshots", record)
         monkeypatch.setattr("sys.stdin.isatty", lambda: False)

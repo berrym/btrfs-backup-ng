@@ -31,6 +31,7 @@ from btrfs_backup_ng.cli.prune import (
 )
 from btrfs_backup_ng.config.schema import RetentionConfig
 from btrfs_backup_ng.retention import apply_retention
+from btrfs_backup_ng.endpoint.common import DeletionResult
 
 NOW = datetime(2026, 8, 18, 12, 0, 0)
 
@@ -385,7 +386,11 @@ class TestTheDeletePrimitive:
         endpoint = SimpleNamespace(
             config={"path": "raw:///backups"},
             list_snapshots=lambda: [snap],
-            delete_snapshots=MagicMock(),
+            # Returns the endpoint's real verdict type: the count now comes from
+            # what was deleted, not from the call having returned.
+            delete_snapshots=MagicMock(
+                return_value=DeletionResult(deleted=[snap]),
+            ),
         )
         with patch("btrfs_backup_ng.endpoint.choose_endpoint", return_value=endpoint):
             deleted, errors = prune.delete_snapper_backups(

@@ -13,6 +13,7 @@ from datetime import datetime, timedelta
 from btrfs_backup_ng.cli.prune import is_degenerate_policy, execute_prune
 from btrfs_backup_ng.config.schema import RetentionConfig
 from btrfs_backup_ng.endpoint.local import LocalEndpoint
+from btrfs_backup_ng.endpoint.common import DeletionResult
 
 
 # --------------------------------------------------------------------------- #
@@ -89,7 +90,10 @@ def _drive(
     monkeypatch.setattr(
         LocalEndpoint,
         "delete_snapshots",
-        lambda self, snaps, **k: deletes.append(list(snaps)),
+        lambda self, snaps, **k: (
+            deletes.append(list(snaps)),
+            DeletionResult(deleted=list(snaps)),
+        )[1],
     )
     monkeypatch.setattr("sys.stdin.isatty", lambda: isatty)
     monkeypatch.setattr(

@@ -74,7 +74,7 @@ from btrfs_backup_ng.core.space import SpaceInfo  # noqa: E402
 from btrfs_backup_ng.core.transfer import DEFAULT_TRANSFER_TIMEOUT  # noqa: E402
 from btrfs_backup_ng.sshutil.master import SSHMasterManager  # noqa: E402
 
-from .common import Endpoint  # noqa: E402
+from .common import DeletionResult, Endpoint  # noqa: E402
 
 __all__ = ["SSHEndpoint"]
 
@@ -651,7 +651,7 @@ class SSHEndpoint(Endpoint):
         username: str = self.config.get("username", "")
         return f"(SSH) {username}@{self.hostname}:{self.config['path']}"
 
-    def delete_snapshots(self, snapshots: List[Any], **kwargs: Any) -> None:
+    def delete_snapshots(self, snapshots: List[Any], **kwargs: Any) -> DeletionResult:
         """Delete the given snapshots (subvolumes) on the remote host via SSH.
 
         Consults the locks recorded ON THE TARGET as well as the in-memory ones.
@@ -659,6 +659,11 @@ class SSHEndpoint(Endpoint):
         destination fresh, so every snapshot it sees has an empty in-memory lock
         set -- including one a restore is reading at that moment. The guard
         existed; it simply could not see the other process.
+
+        Returns a :class:`DeletionResult`. This method has six distinct outcomes
+        -- refused for an unusable remote lock, skipped for a local or a remote
+        lock, skipped because the path is not a subvolume, failed at the delete,
+        failed with an exception, deleted -- and reported all six as None.
         """
         from ..sshutil.lock import (
             RemoteLockUnavailable,
@@ -666,6 +671,7 @@ class SSHEndpoint(Endpoint):
             snapshot_lock_name,
         )
 
+        result = DeletionResult()
         remote_locked: set[str] = set()
         if self._lock_target_path() is not None:
             try:
@@ -676,12 +682,15 @@ class SSHEndpoint(Endpoint):
                 # Deleting without knowing risks removing what a restore is
                 # reading, so nothing is deleted -- said plainly, because a
                 # deletion pass that quietly removes nothing reads as success.
+                # It said so in the log and returned None anyway, which is how
+                # the caller went on to report the batch as deleted.
                 logger.error(
                     "Not deleting anything on this destination: %s. Nothing was "
                     "removed; resolve the error above and run this again.",
                     exc,
                 )
-                return
+                result.fail_all(snapshots, f"the remote lock is unusable: {exc}")
+                return result
         if remote_locked:
             logger.info(
                 "Skipping %d snapshot(s) locked by another process on this "
@@ -695,8 +704,10 @@ class SSHEndpoint(Endpoint):
                 snapshot.locks or getattr(snapshot, "parent_locks", False)
             ):
                 logger.info("Skipping locked snapshot: %s", snapshot)
+                result.skip(snapshot, "held by a retention lock")
                 continue
             if snapshot_lock_name(snapshot) in remote_locked:
+                result.skip(snapshot, "locked by another process on this destination")
                 continue
 
             # Handle remote path normalization properly
@@ -727,9 +738,15 @@ class SSHEndpoint(Endpoint):
                     logger.warning(
                         f"Not an existing btrfs subvolume, skipping deletion: {remote_path}"
                     )
+                    result.skip(snapshot, "not an existing btrfs subvolume")
                     continue
             except Exception as e:
                 logger.warning(f"Could not verify snapshot path {remote_path}: {e}")
+                # Could not even establish whether there is anything to delete.
+                # Not a skip: the deletion was asked for and did not happen, and
+                # the cause (a dead connection, an unmounted remote filesystem)
+                # applies to every snapshot in the batch.
+                result.fail(snapshot, f"could not verify the path: {e}")
                 continue
 
             # Build deletion command with proper sudo handling
@@ -740,7 +757,7 @@ class SSHEndpoint(Endpoint):
                 # Use retry mechanism for commands that may require authentication
                 use_sudo = self.config.get("ssh_sudo", False)
                 if use_sudo:
-                    result = self._exec_remote_command_with_retry(
+                    proc = self._exec_remote_command_with_retry(
                         cmd,
                         max_retries=2,
                         check=False,
@@ -748,18 +765,19 @@ class SSHEndpoint(Endpoint):
                         stderr=subprocess.PIPE,
                     )
                 else:
-                    result = self._exec_remote_command(
+                    proc = self._exec_remote_command(
                         cmd,
                         check=False,
                         stdout=subprocess.PIPE,
                         stderr=subprocess.PIPE,
                     )
-                if result.returncode == 0:
+                if proc.returncode == 0:
                     logger.info("Deleted remote snapshot subvolume: %s", remote_path)
+                    result.deleted.append(snapshot)
                 else:
                     stderr = (
-                        result.stderr.decode(errors="replace").strip()
-                        if hasattr(result, "stderr") and result.stderr
+                        proc.stderr.decode(errors="replace").strip()
+                        if hasattr(proc, "stderr") and proc.stderr
                         else "Unknown error"
                     )
                     # Check for common btrfs deletion errors
@@ -767,6 +785,7 @@ class SSHEndpoint(Endpoint):
                         logger.warning(
                             f"Snapshot already deleted or path not found: {remote_path}"
                         )
+                        result.skip(snapshot, "already absent on the destination")
                     elif "statfs" in stderr.lower():
                         logger.error(
                             f"Filesystem access error when deleting {remote_path}: {stderr}"
@@ -774,18 +793,22 @@ class SSHEndpoint(Endpoint):
                         logger.error(
                             "This may indicate the remote path is not accessible or the filesystem is unmounted"
                         )
+                        result.fail(snapshot, f"filesystem access error: {stderr}")
                     else:
                         logger.error(
                             f"Failed to delete remote snapshot {remote_path}: {stderr}"
                         )
+                        result.fail(snapshot, stderr)
             except Exception as e:
                 logger.error(
                     f"Exception while deleting remote snapshot {remote_path}: {e}"
                 )
                 # Log additional diagnostic information
                 logger.debug(f"Deletion exception details: {e}", exc_info=True)
+                result.fail(snapshot, e)
+        return result
 
-    def delete_old_snapshots(self, keep: int) -> None:
+    def delete_old_snapshots(self, keep: int) -> DeletionResult:
         """Delete old snapshots on the remote host, keeping the most recent ``keep`` unlocked.
 
         LEGACY count-based path (see ``Endpoint.delete_old_snapshots``); the modern retention
@@ -803,11 +826,13 @@ class SSHEndpoint(Endpoint):
                 keep,
                 len(unlocked),
             )
-            return
+            return DeletionResult()
         to_delete = unlocked[:-keep]
+        result = DeletionResult()
         for snap in to_delete:
             logger.info("Deleting old remote snapshot: %s", str(snap))
-            self.delete_snapshots([snap])
+            result.extend(self.delete_snapshots([snap]))
+        return result
 
     #: ssh:// writes its snapshot locks on the remote destination, so they
     #: survive the process and are visible to any other process or machine

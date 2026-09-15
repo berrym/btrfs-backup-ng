@@ -30,7 +30,7 @@ from typing import Any, Optional, TypedDict
 
 from btrfs_backup_ng import __util__
 from btrfs_backup_ng.__logger__ import logger
-from btrfs_backup_ng.endpoint.common import Endpoint
+from btrfs_backup_ng.endpoint.common import DeletionResult, Endpoint
 from btrfs_backup_ng.endpoint.raw_metadata import (
     COMPRESSION_CONFIG,
     ChecksumVerdict,
@@ -1766,13 +1766,19 @@ class RawEndpoint(Endpoint):
         }
         return {n for n in batch_names if n in referenced_by_survivors}
 
-    def delete_snapshots(self, snapshots: list[RawSnapshot], **kwargs: Any) -> None:
+    def delete_snapshots(
+        self, snapshots: list[RawSnapshot], **kwargs: Any
+    ) -> DeletionResult:
         """Delete raw snapshot files and their metadata.
 
         Args:
             snapshots: List of snapshots to delete
             **kwargs: ``delete_session`` (set[str]) -- the full set of names being deleted this
                 pass, so the chain guard does not mistake a whole-chain delete for orphaning.
+
+        Returns a :class:`DeletionResult`. A busy target means the whole batch was
+        refused, which used to be a warning and a None indistinguishable from a
+        completed prune.
         """
         delete_session = kwargs.get("delete_session")
         # Prune under the per-target lock so it cannot race a concurrent backup
@@ -1780,13 +1786,17 @@ class RawEndpoint(Endpoint):
         # during contention); retention retries on the next run.
         try:
             with self.target_lock():
-                self._delete_snapshots_locked(snapshots, delete_session)
+                return self._delete_snapshots_locked(snapshots, delete_session)
         except RuntimeError as e:
             logger.warning("Skipping raw delete (target busy): %s", e)
+            result = DeletionResult()
+            result.fail_all(snapshots, f"the target is busy: {e}")
+            return result
 
     def _delete_snapshots_locked(
         self, snapshots: list[RawSnapshot], delete_session: set[str] | None = None
-    ) -> None:
+    ) -> DeletionResult:
+        result = DeletionResult()
         protected = self._chain_referenced_parents(snapshots, delete_session)
         for snapshot in snapshots:
             if snapshot.get_name() in protected:
@@ -1796,12 +1806,25 @@ class RawEndpoint(Endpoint):
                     "Skipping.",
                     snapshot.get_name(),
                 )
+                result.skip(
+                    snapshot, "needed as the incremental parent of a kept stream"
+                )
                 continue
             try:
                 # Delete stream file
                 if snapshot.stream_path.exists():
                     snapshot.stream_path.unlink()
                     logger.info("Deleted stream file: %s", snapshot.stream_path)
+                    result.deleted.append(snapshot)
+                else:
+                    # Previously silent: a batch whose every stream was already
+                    # gone produced no log line at all and was reported as a
+                    # completed prune of that many snapshots.
+                    logger.warning(
+                        "Stream file already absent, nothing to delete: %s",
+                        snapshot.stream_path,
+                    )
+                    result.skip(snapshot, "stream file already absent")
 
                 # Delete metadata file
                 if snapshot.metadata_path.exists():
@@ -1816,17 +1839,19 @@ class RawEndpoint(Endpoint):
 
             except OSError as e:
                 logger.error("Failed to delete snapshot %s: %s", snapshot.name, e)
+                result.fail(snapshot, e)
+        return result
 
-    def delete_snapshot(self, snapshot: RawSnapshot, **kwargs: Any) -> None:
+    def delete_snapshot(self, snapshot: RawSnapshot, **kwargs: Any) -> DeletionResult:
         """Delete a single raw snapshot.
 
         Args:
             snapshot: Snapshot to delete
             **kwargs: Additional arguments
         """
-        self.delete_snapshots([snapshot], **kwargs)
+        return self.delete_snapshots([snapshot], **kwargs)
 
-    def delete_old_snapshots(self, keep: int) -> None:
+    def delete_old_snapshots(self, keep: int) -> DeletionResult:
         """Delete old snapshots, keeping only the most recent.
 
         LEGACY count-based path (see ``Endpoint.delete_old_snapshots``); the modern retention
@@ -1836,11 +1861,11 @@ class RawEndpoint(Endpoint):
             keep: Number of snapshots to keep
         """
         if keep <= 0:
-            return
+            return DeletionResult()
 
         snapshots = self.list_snapshots()
         if len(snapshots) <= keep:
-            return
+            return DeletionResult()
 
         to_delete = snapshots[:-keep]
         for snapshot in to_delete:
@@ -1851,9 +1876,12 @@ class RawEndpoint(Endpoint):
         # delete_snapshot would re-take the lock per snapshot and self-deadlock.
         try:
             with self.target_lock():
-                self._delete_snapshots_locked(to_delete)
+                return self._delete_snapshots_locked(to_delete)
         except RuntimeError as e:
             logger.warning("Skipping raw prune (target busy): %s", e)
+            result = DeletionResult()
+            result.fail_all(to_delete, f"the target is busy: {e}")
+            return result
 
     def get_space_info(self, path: str | None = None) -> Any:
         """Get space information for the raw target directory.
@@ -3127,7 +3155,7 @@ class SSHRawEndpoint(RawEndpoint):
 
     def _delete_snapshots_locked(
         self, snapshots: list[RawSnapshot], delete_session: set[str] | None = None
-    ) -> None:
+    ) -> DeletionResult:
         """Delete snapshots on the remote host (issuing a remote ``rm``).
 
         This overrides the LOCAL delete primitive rather than ``delete_snapshots``,
@@ -3163,6 +3191,7 @@ class SSHRawEndpoint(RawEndpoint):
                 ", ".join(sorted(remote_locked)),
             )
 
+        result = DeletionResult()
         protected = self._chain_referenced_parents(snapshots, delete_session)
         ssh_cmd = self._build_ssh_command()
 
@@ -3174,8 +3203,12 @@ class SSHRawEndpoint(RawEndpoint):
                     "unrestorable. Skipping.",
                     snapshot.get_name(),
                 )
+                result.skip(
+                    snapshot, "needed as the incremental parent of a kept stream"
+                )
                 continue
             if snapshot_lock_name(snapshot) in remote_locked:
+                result.skip(snapshot, "locked by another process on this target")
                 continue
             try:
                 # Build rm command for stream and metadata
@@ -3188,6 +3221,7 @@ class SSHRawEndpoint(RawEndpoint):
                 full_cmd = ssh_cmd + [rm_cmd]
                 subprocess.run(full_cmd, check=True, capture_output=True)
                 logger.info("Deleted remote snapshot: %s", snapshot.name)
+                result.deleted.append(snapshot)
 
                 # Update cache
                 if self._cached_snapshots is not None:
@@ -3214,3 +3248,7 @@ class SSHRawEndpoint(RawEndpoint):
                         "btrfs; alternatively give the user ownership of the "
                         "backup directory and turn ssh_sudo off."
                     ) from e
+                # Not a denial, so the rest of the batch may still succeed --
+                # but this one did not, and the caller has to be told which.
+                result.fail(snapshot, stderr or e)
+        return result

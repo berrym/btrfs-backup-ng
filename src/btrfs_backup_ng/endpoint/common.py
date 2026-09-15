@@ -8,6 +8,7 @@ import os
 import stat
 import subprocess
 import tempfile
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -65,6 +66,77 @@ def _command_lock_path() -> Path:
             f"dir -- remove it)"
         )
     return d / "command.lock"
+
+
+@dataclass
+class DeletionResult:
+    """What a deletion batch actually did, per snapshot.
+
+    ``deleted`` holds the snapshots removed from the target. ``skipped`` holds
+    ``(snapshot, reason)`` for those deliberately left alone -- a retention lock
+    held here or by another process, a chain guard refusing to orphan a child,
+    a stream that was already gone. ``failed`` holds ``(snapshot, error)`` for
+    those the target was asked to remove and did not.
+
+    Every deletion path used to return None, and none of them raise: locked
+    snapshots were skipped, unreadable lock files refused the whole batch,
+    btrfs failures were logged, and the caller saw the same None for all of it.
+    ``prune`` therefore counted each call that did not throw, so a pass that
+    removed NOTHING reported "Deleted N snapshot(s)", exited 0 and sent a
+    success notification -- while the target filled up. This is the verdict that
+    was missing, in the shape of ``TransferResult`` (core/operations.py), which
+    exists for the same reason on the transfer side.
+
+    A skip is not a failure: refusing to delete a locked snapshot is the guard
+    working. Only ``failed`` makes ``ok`` False.
+    """
+
+    deleted: List[Any] = field(default_factory=list)
+    skipped: List[Any] = field(default_factory=list)
+    failed: List[Any] = field(default_factory=list)
+
+    @property
+    def ok(self) -> bool:
+        return not self.failed
+
+    @property
+    def deleted_count(self) -> int:
+        return len(self.deleted)
+
+    @property
+    def skipped_count(self) -> int:
+        return len(self.skipped)
+
+    @property
+    def failed_count(self) -> int:
+        return len(self.failed)
+
+    @property
+    def attempted(self) -> int:
+        return len(self.deleted) + len(self.skipped) + len(self.failed)
+
+    def skip(self, snapshot: Any, reason: str) -> None:
+        self.skipped.append((snapshot, reason))
+
+    def fail(self, snapshot: Any, error: Any) -> None:
+        self.failed.append((snapshot, error))
+
+    def fail_all(self, snapshots: List[Any], error: Any) -> None:
+        """Record a whole-batch refusal: nothing was even attempted.
+
+        These are failures rather than skips because the operator asked for the
+        deletion and it did not happen. The distinction matters at exactly one
+        place -- prune's exit code -- and that is the place it was wrong.
+        """
+        for snapshot in snapshots:
+            self.failed.append((snapshot, error))
+
+    def extend(self, other: "DeletionResult") -> "DeletionResult":
+        """Accumulate another batch's outcome into this one."""
+        self.deleted.extend(other.deleted)
+        self.skipped.extend(other.skipped)
+        self.failed.extend(other.failed)
+        return self
 
 
 def require_source(method):
@@ -742,19 +814,29 @@ class Endpoint:
         self.__cached_snapshots.append(snapshot)
         self.__cached_snapshots.sort()
 
-    def delete_snapshots(self, snapshots: List[Any], **kwargs: Any) -> None:
-        """Delete the given snapshots (subvolumes)."""
+    def delete_snapshots(self, snapshots: List[Any], **kwargs: Any) -> DeletionResult:
+        """Delete the given snapshots (subvolumes), reporting what happened to each.
+
+        Returns a :class:`DeletionResult` rather than None. Nothing here raises --
+        a corrupt lock file refuses the batch, a locked snapshot is skipped, a
+        failed ``btrfs subvolume delete`` is logged -- so a caller that inferred
+        success from the absence of an exception was counting every one of those
+        as a deletion.
+        """
+        result = DeletionResult()
         if getattr(self, "_locks_read_failed", False):
-            logger.error(
-                "Refusing to delete snapshots: the lock file is unreadable/corrupt, so "
-                "locked (still-needed) snapshots cannot be identified. Repair or remove "
-                "%s and retry.",
-                self._get_lock_file_path(),
+            reason = (
+                "the lock file is unreadable/corrupt, so locked (still-needed) "
+                f"snapshots cannot be identified; repair or remove "
+                f"{self._get_lock_file_path()} and retry"
             )
-            return
+            logger.error("Refusing to delete snapshots: %s.", reason)
+            result.fail_all(snapshots, reason)
+            return result
         for snapshot in snapshots:
             if snapshot.locks or snapshot.parent_locks:
                 logger.info("Skipping locked snapshot: %s", snapshot)
+                result.skip(snapshot, "held by a retention lock")
                 continue
             cmd = [
                 ("btrfs", False),
@@ -775,15 +857,23 @@ class Endpoint:
                 logger.error(
                     "Deletion command was: %s", [(arg, is_path) for arg, is_path in cmd]
                 )
+                result.fail(snapshot, e)
+                continue
+            result.deleted.append(snapshot)
+            # Evicted only on success. This sat outside the try, so a snapshot
+            # whose deletion FAILED was dropped from the cache anyway and every
+            # later list_snapshots() in the process reported it gone -- the
+            # listing agreeing with a deletion that did not happen.
             if self.__cached_snapshots is not None:
                 with contextlib.suppress(ValueError):
                     self.__cached_snapshots.remove(snapshot)
+        return result
 
-    def delete_snapshot(self, snapshot: Any, **kwargs: Any) -> None:
+    def delete_snapshot(self, snapshot: Any, **kwargs: Any) -> DeletionResult:
         """Delete a snapshot."""
-        self.delete_snapshots([snapshot], **kwargs)
+        return self.delete_snapshots([snapshot], **kwargs)
 
-    def delete_old_snapshots(self, keep: int) -> None:
+    def delete_old_snapshots(self, keep: int) -> DeletionResult:
         """Delete old snapshots, keeping only the most recent ``keep`` unlocked snapshots.
 
         LEGACY COUNT-based retention: keeps a fixed NUMBER of snapshots, ignoring age/time
@@ -802,7 +892,13 @@ class Endpoint:
                 "remove %s and retry.",
                 self._get_lock_file_path(),
             )
-            return
+            result = DeletionResult()
+            result.fail_all(
+                snapshots,
+                "the lock file is unreadable/corrupt, so locked (still-needed) "
+                "snapshots cannot be identified",
+            )
+            return result
         unlocked = [s for s in snapshots if not s.locks and not s.parent_locks]
         if keep <= 0 or len(unlocked) <= keep:
             logger.debug(
@@ -810,11 +906,13 @@ class Endpoint:
                 keep,
                 len(unlocked),
             )
-            return
+            return DeletionResult()
         to_delete = unlocked[:-keep]
+        result = DeletionResult()
         for snap in to_delete:
             logger.info("Deleting old snapshot: %s", snap)
-            self.delete_snapshots([snap])
+            result.extend(self.delete_snapshots([snap]))
+        return result
 
     def protect_incremental_parents(
         self, to_keep: List[Any], to_delete: List[Any]

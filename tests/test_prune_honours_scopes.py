@@ -20,6 +20,7 @@ from datetime import datetime, timedelta
 from btrfs_backup_ng.cli.prune import execute_prune
 from btrfs_backup_ng.config.loader import load_config
 from btrfs_backup_ng.endpoint.local import LocalEndpoint
+from btrfs_backup_ng.endpoint.common import DeletionResult
 
 SNAPSHOT_COUNT = 10
 
@@ -48,6 +49,7 @@ def _drive(cfg, monkeypatch, **argkw):
     def record(self, snaps, **_k):
         key = str(self.config.get("path", "?"))
         deleted.setdefault(key, []).extend(s.get_name() for s in snaps)
+        return DeletionResult(deleted=list(snaps))
 
     monkeypatch.setattr(LocalEndpoint, "delete_snapshots", record)
     monkeypatch.setattr("sys.stdin.isatty", lambda: False)
