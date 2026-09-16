@@ -193,7 +193,20 @@ def _raw_verify(args: argparse.Namespace) -> int:
 
     # Fail if any backup is corrupt or its stream could not be read.
     bad = any(r["status"] in ("corrupt", "error") for r in results)
-    return 1 if bad else 0
+    if bad:
+        return 1
+    if not results:
+        # `any([])` is False, so a target that enumerated to NOTHING reported a
+        # clean pass and exit 0 -- "everything I checked was fine" where the
+        # number checked was zero. The general `verify` command already reports
+        # this state; the raw one silently agreed that an empty target is a
+        # healthy one.
+        print(
+            "No backups were verified: this location holds no readable raw "
+            "streams. That is not a clean result -- check the path and prefix."
+        )
+        return 2
+    return 0
 
 
 def _raw_backfill(args: argparse.Namespace) -> int:

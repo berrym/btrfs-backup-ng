@@ -114,7 +114,15 @@ def execute_list(args: argparse.Namespace) -> int:
                     )
 
         except Exception as e:
+            # Recorded, exactly as the TARGET branch below already does. Left at
+            # debug with nothing on the record, a source that could not be
+            # prepared or enumerated -- permission denied, not a btrfs
+            # filesystem, a broken snapshot_dir -- printed "Source snapshots:
+            # (none)", byte-identical to a volume that genuinely has none. That
+            # is the same sentence during restore triage as "your snapshots are
+            # gone", and `list` exited 0 either way.
             logger.debug("Error listing source snapshots for %s: %s", volume.path, e)
+            volume_data["error"] = str(e)
 
         # Get target snapshots
         for target in volume.targets:
@@ -158,6 +166,19 @@ def execute_list(args: argparse.Namespace) -> int:
     else:
         _print_text_output(all_data)
 
+    # A listing that could not read something is not a successful listing. The
+    # exit code was an unconditional 0, so a script that checks it could not tell
+    # a complete answer from a partial one -- and the partial one, during restore
+    # triage, reads as "the backups are gone".
+    unreadable = [v for v in all_data if v.get("error")] + [
+        t for v in all_data for t in v.get("targets", []) if t.get("error")
+    ]
+    if unreadable:
+        logger.warning(
+            "%d location(s) could not be listed; this listing is INCOMPLETE",
+            len(unreadable),
+        )
+        return 1
     return 0
 
 
@@ -175,6 +196,9 @@ def _print_text_output(data: list) -> None:
                 print(f"    {snap['name']}")
             if len(snapshots) > 10:
                 print(f"    ... and {len(snapshots) - 10} more")
+        elif volume.get("error"):
+            # "(none)" is only honest when the listing succeeded and found none.
+            print(f"  Source snapshots: (could not be listed: {volume['error']})")
         else:
             print("  Source snapshots: (none)")
         print("")

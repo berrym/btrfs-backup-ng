@@ -682,8 +682,28 @@ def _validate_config(args: argparse.Namespace) -> int:
         # printed for one whose every path was fictional -- measured. The word
         # "valid" is what an operator checks before trusting this tool, so it now
         # covers whether the sources could actually be read.
+        enabled = config.get_enabled_volumes()
+        if not enabled:
+            # A config that backs nothing up is not a usable config, and the
+            # readiness loop below cannot say so: it iterates the enabled
+            # volumes, so zero of them means zero problems found and the
+            # all-clear printed. Reached by an ordinary typo -- `[[volume]]` for
+            # `[[volumes]]` parses as an unknown top-level key, the loader warns
+            # "No volumes configured", and `validate` answered "All enabled
+            # volumes look usable from this machine." and exited 0.
+            print("")
+            print("This configuration backs nothing up: it has no enabled volumes.")
+            if warnings:
+                print("The warnings above are the likely reason.")
+            print(
+                "Check the section names -- a volume is [[volumes]] and a target "
+                "is [[volumes.targets]]; a misspelled section parses as an "
+                "unknown key and is ignored."
+            )
+            return 1
+
         readiness: list[tuple[str, list[str]]] = []
-        for volume in config.get_enabled_volumes():
+        for volume in enabled:
             problems = _volume_readiness_problems(volume)
             if problems:
                 readiness.append((str(volume.path), problems))
@@ -691,7 +711,7 @@ def _validate_config(args: argparse.Namespace) -> int:
         print("")
         print("Configuration syntax and structure: valid.")
         print(f"  Volumes: {len(config.volumes)}")
-        print(f"  Enabled: {len(config.get_enabled_volumes())}")
+        print(f"  Enabled: {len(enabled)}")
 
         total_targets = sum(len(v.targets) for v in config.volumes)
         print(f"  Targets: {total_targets}")

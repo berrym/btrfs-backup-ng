@@ -182,9 +182,20 @@ def _verify_target(target):
 
 
 def test_verify_empty_target(tmp_path, capsys):
+    """A target holding nothing is not a clean verification.
+
+    `any([])` is False, so an empty target took the same "nothing was corrupt"
+    branch as a target whose every backup checked out, and exited 0. "Everything
+    I checked was fine" is not a pass when the number checked was zero.
+
+    Exit 2, matching the general `verify` command, which puts "No snapshots found
+    at backup location" into report.errors and exits 2 for the same state. The
+    two disagreeing about whether an empty location is healthy is what let this
+    sit.
+    """
     rc = _verify(tmp_path)
     out = capsys.readouterr().out
-    assert rc == 0
+    assert rc == 2
     assert "verifying 0 snapshot" in out
 
 

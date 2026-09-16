@@ -128,9 +128,19 @@ def execute_status(args: argparse.Namespace) -> int:
                     last_snapshot = snapshots[-1]
                     source_status = "ok"
                 else:
+                    # A volume with nothing to back up is not a healthy volume.
+                    # all_healthy was only ever falsified inside except handlers,
+                    # so every non-exceptional bad state -- this one, a missing
+                    # snapshot dir, a target holding no backups -- left the
+                    # verdict green, and `status` printed "All systems
+                    # operational" and exited 0 for a system that has never
+                    # backed up or whose destination drive was wiped. This is
+                    # the command a monitoring wrapper checks.
                     source_status = "no snapshots"
+                    all_healthy = False
             else:
                 source_status = "no snapshot dir"
+                all_healthy = False
 
         except Exception as e:
             source_status = f"error: {e}"
@@ -162,7 +172,10 @@ def execute_status(args: argparse.Namespace) -> int:
                 if dest_snapshots:
                     target_status = "ok"
                 else:
+                    # A target holding nothing is the state an operator most
+                    # needs told about, and it reported as operational.
                     target_status = "no backups"
+                    all_healthy = False
 
                 # Check sync status
                 if source_count > 0 and target_count > 0:
