@@ -1873,10 +1873,18 @@ class RawEndpoint(Endpoint):
             return DeletionResult()
 
         snapshots = self.list_snapshots()
-        if len(snapshots) <= keep:
+        # Locked streams are excluded BEFORE the slice, as Endpoint.delete_old_
+        # snapshots does. Slicing the full list instead made `keep` count total
+        # streams rather than usable ones, so a lock inside the keep window cost
+        # a real backup: measured with 5 streams under -N 2 and the newest one
+        # locked by a restore, the operator was left with ONE usable backup
+        # instead of two. A retention lock is supposed to protect a stream, not
+        # to spend one of the slots the operator asked to keep.
+        unlocked = [s for s in snapshots if not s.locks and not s.parent_locks]
+        if len(unlocked) <= keep:
             return DeletionResult()
 
-        to_delete = snapshots[:-keep]
+        to_delete = unlocked[:-keep]
         for snapshot in to_delete:
             logger.info("Deleting old raw snapshot: %s", snapshot.name)
         # One lock for the whole prune pass so it is atomic as a unit (a concurrent
