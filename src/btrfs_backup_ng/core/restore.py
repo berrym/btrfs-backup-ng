@@ -436,6 +436,18 @@ def _retry_with_inferred_prefix(backup_endpoint: Any) -> list[Any]:
     if configured:
         logger.debug("Not inferring a prefix: %r was asked for explicitly", configured)
         return []
+    if (config or {}).get("snap_prefix_explicit"):
+        # An EXPLICIT empty prefix -- `--prefix ""`, or snapshot_prefix = "" on
+        # the volume -- means bare-timestamp names, and is exactly as much of a
+        # choice as any other prefix. Truthiness cannot tell it from "nobody
+        # said", so this ran and replaced it: measured, a location holding
+        # another source's `home.` snapshots had the operator's explicit "no
+        # prefix" silently rewritten to `home.` and those snapshots listed for
+        # restore. That is the harm this function's own docstring describes --
+        # "a prefix that was given and matches nothing is a mismatch to report,
+        # not a guess to make" -- reached through the one value that is falsy.
+        logger.debug("Not inferring a prefix: an empty prefix was asked for")
+        return []
 
     discover = getattr(backup_endpoint, "prefixes_present", None)
     if not callable(discover):

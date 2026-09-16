@@ -226,8 +226,11 @@ def _execute_config_restore(args: argparse.Namespace, volume_path: str) -> int:
             args.ssh_key = target.ssh_key
         if not getattr(args, "ssh_host_key_policy", None):
             args.ssh_host_key_policy = target.ssh_host_key_policy
-        # Use volume's snapshot prefix
-        if volume.snapshot_prefix and not getattr(args, "prefix", None):
+        # Use volume's snapshot prefix. `is None`, not truthiness: a volume's
+        # prefix is "" only when the operator wrote snapshot_prefix = "" (an
+        # unset one is auto-derived and non-empty), so a falsy test dropped
+        # exactly the deliberate choice issue #6 exists to honour.
+        if getattr(args, "prefix", None) is None:
             args.prefix = volume.snapshot_prefix
         return _execute_list(args)
 
@@ -262,8 +265,9 @@ def _execute_config_restore(args: argparse.Namespace, volume_path: str) -> int:
     if target.rate_limit and not getattr(args, "rate_limit", None):
         args.rate_limit = target.rate_limit
 
-    # Use volume's snapshot prefix if not overridden
-    if volume.snapshot_prefix and not getattr(args, "prefix", None):
+    # Use volume's snapshot prefix if not overridden. `is None` for the same
+    # reason as the listing path above: an explicit empty prefix is a choice.
+    if getattr(args, "prefix", None) is None:
         args.prefix = volume.snapshot_prefix
 
     # Now call the main restore logic (fall through to execute_restore's main path)
@@ -575,6 +579,10 @@ def _prepare_backup_endpoint(args: argparse.Namespace, source: str):
     # are parsed rather than silently skipped when listing/matching backups.
     endpoint_kwargs = {
         "snap_prefix": getattr(args, "prefix", "") or "",
+        # Whether a prefix was CHOSEN, which the value alone cannot express: ""
+        # is both "the operator asked for no prefix" and "nobody said". Prefix
+        # inference must override the second and never the first.
+        "snap_prefix_explicit": getattr(args, "prefix", None) is not None,
         "convert_rw": False,
         "subvolume_sync": False,
         "btrfs_debug": False,

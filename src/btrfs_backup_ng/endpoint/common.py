@@ -168,6 +168,13 @@ class Endpoint:
         self.config["source"] = self._normalize_path(config.get("source"))
         self.config["path"] = self._normalize_path(config.get("path"))
         self.config["snap_prefix"] = config.get("snap_prefix", "")
+        # Whether that prefix was CHOSEN, which the value alone cannot express:
+        # "" is both "the operator asked for no prefix" (issue #6 -- bare
+        # timestamp names) and "nobody said". Only the second may be overridden
+        # by prefix inference, and truthiness cannot tell them apart.
+        self.config["snap_prefix_explicit"] = bool(
+            config.get("snap_prefix_explicit", False)
+        )
         self.config["convert_rw"] = config.get("convert_rw", False)
         self.config["subvolume_sync"] = config.get("subvolume_sync", False)
         self.config["btrfs_debug"] = config.get("btrfs_debug", False)
