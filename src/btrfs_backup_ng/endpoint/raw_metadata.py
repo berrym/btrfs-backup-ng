@@ -561,6 +561,26 @@ def discover_raw_snapshots(
                 snapshot.name,
                 filename_name,
             )
+        # A sidecar describes a stream; it is not itself the backup. Nothing here
+        # checked that the stream still exists, so a .meta whose stream had been
+        # deleted was reported as a present backup carrying its RECORDED size --
+        # measured, a 999999-byte backup listed from a directory holding only the
+        # sidecar. `raw list` showed it, restore would fail on it, and retention
+        # counted it against the keep budget, so a real backup was pruned in its
+        # place to make room for one that does not exist.
+        #
+        # WARNING, not silence: a sidecar without its stream means a backup is
+        # gone, which is exactly what an operator needs told. The second pass
+        # cannot list it either -- there is no file for it to find.
+        if not snapshot.stream_path.exists():
+            logger.warning(
+                "Raw sidecar %s describes a backup whose stream file %s is "
+                "missing; NOT listing it as a backup. The stream was deleted or "
+                "moved without its sidecar -- that backup is gone.",
+                meta_path,
+                snapshot.stream_path,
+            )
+            continue
         if not prefix or snapshot.name.startswith(prefix):
             snapshots.append(snapshot)
 
