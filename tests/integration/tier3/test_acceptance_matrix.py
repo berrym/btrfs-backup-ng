@@ -182,6 +182,82 @@ class TestNativeSource:
 
 
 # --------------------------------------------------------------------------- #
+# an explicit empty snapshot prefix
+# --------------------------------------------------------------------------- #
+class TestAnExplicitEmptyPrefix:
+    """snapshot_prefix = "" is a supported choice: bare-timestamp names.
+
+    Issue #6. The config layer honours it and the reporter was told so, but
+    restore's prefix inference treated "" as "nobody said" -- the only falsy
+    prefix -- and silently replaced it. Pinned here on real hardware because it
+    is the whole lifecycle that has to work under it, not just the parser: the
+    snapshot has to be CREATED with a bare name, transferred, found again at the
+    destination, and restored.
+    """
+
+    def test_the_whole_cycle_under_a_bare_timestamp_name(self, rig):
+        cfg = rig.write_config(
+            rig.root / "cfg-empty-prefix.toml",
+            f'path = "{rig.dst}"',
+            prefix="",
+            snapshot_dir="snapshots-bare-local",
+        )
+        res = _lifecycle(rig, cfg, location=str(rig.dst), prefix="")
+
+        assert res["backup_rc"] == 0, res["backup_out"]
+
+        # At least one BARE-timestamp name landed. Not "every name here is
+        # bare": the rig is shared, so other cells' prefixed snapshots sit at
+        # this same destination, and with an empty prefix there is no prefix to
+        # filter them out by -- which is the point of the configuration.
+        #
+        # Basenames: both subvol helpers return the `path` field of
+        # `btrfs subvolume list`, which is a path relative to the filesystem
+        # root ("@home/mberry/.../t3ssh-...") rather than a bare name.
+        landed = [n.rsplit("/", 1)[-1] for n in rig.local_btrfs_subvols(rig.dst)]
+        assert landed, "nothing landed at the destination"
+        bare = [n for n in landed if n[:1].isdigit()]
+        assert bare, (
+            f"no bare-timestamp name at the destination, only {landed} -- an "
+            "empty prefix was replaced by a derived one"
+        )
+
+        assert_payload_restored(res["restore_dest"], rig.payload)
+
+    @requires_remote
+    def test_the_same_over_ssh(self, rig):
+        from .conftest import REMOTE_SPEC
+
+        loc = f"ssh://{REMOTE_SPEC}:{rig.remote_base}/btrfs"
+        cfg = rig.write_config(
+            rig.root / "cfg-empty-prefix-ssh.toml",
+            # ssh_sudo, as every other ssh:// cell does: btrfs on the remote
+            # needs root for both `subvolume list` and `receive`, which is what
+            # the README's NOPASSWD sudoers entry is for. Without it this cell
+            # was exercising an unsupported configuration and failing on that
+            # rather than on the prefix.
+            f'path = "{loc}"\nssh_sudo = true',
+            prefix="",
+            snapshot_dir="snapshots-bare-ssh",
+        )
+        res = _lifecycle(rig, cfg, location=loc, prefix="")
+
+        assert res["backup_rc"] == 0, res["backup_out"]
+        landed = [
+            n.rsplit("/", 1)[-1]
+            for n in rig.remote_btrfs_subvols(f"{rig.remote_base}/btrfs")
+        ]
+        assert landed, "nothing landed on the remote"
+        bare = [n for n in landed if n[:1].isdigit()]
+        assert bare, (
+            f"no bare-timestamp name on the remote, only {landed} -- an empty "
+            "prefix was replaced by a derived one"
+        )
+
+        assert_payload_restored(res["restore_dest"], rig.payload)
+
+
+# --------------------------------------------------------------------------- #
 # a target that is not Linux and not btrfs
 # --------------------------------------------------------------------------- #
 class TestForeignRawTarget:
@@ -260,8 +336,17 @@ class TestForeignRawTarget:
         info = endpoint.get_space_info()
 
         truth = raw_remote_sh(f"df -Pk '{dest}' | tail -1").stdout.split()
+        # Total is stable and compared exactly. AVAILABLE is not: it is a live
+        # figure on a machine doing other things, and the two df calls are
+        # seconds apart -- an exact match failed on a 680 KiB drift. The point of
+        # this cell is which HOST answered, so the tolerance is generous and the
+        # assertion below is the one that carries the meaning.
         assert info.total_bytes // 1024 == int(truth[1])
-        assert info.available_bytes // 1024 == int(truth[3])
+        drift = abs(info.available_bytes // 1024 - int(truth[3]))
+        assert drift < 1024 * 1024, (
+            f"available space differs from the target's own df by {drift} KiB, "
+            "which is more than ordinary drift"
+        )
 
         here = _os.statvfs("/")
         assert info.total_bytes != here.f_blocks * here.f_frsize, (

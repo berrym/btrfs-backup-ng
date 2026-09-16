@@ -1125,6 +1125,13 @@ def _do_process_transfer(
         receive_process = destination_endpoint.receive(
             current_stdout, snapshot_name, parent_name=parent_name
         )
+        # The receive owns that pipe now. This is the LAST handoff in the chain,
+        # which is where the omission always is: keeping a copy leaves a reader
+        # that never reads, so the final local stage -- pv, mbuffer or the
+        # compressor -- blocks forever when the receive exits instead of taking
+        # SIGPIPE. Harmless when no pipeline was built, since current_stdout is
+        # then the send's own stdout and the send should see SIGPIPE too.
+        transfer_utils.hand_over(current_stdout)
         if receive_process is None:
             logger.error("Failed to start receive process")
             if is_ssh_endpoint and not destination_endpoint.config.get(

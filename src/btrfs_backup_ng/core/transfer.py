@@ -307,6 +307,33 @@ def create_throttle_process(
     )
 
 
+def hand_over(pipe: Any) -> None:
+    """Release this process's copy of a pipe a child has just inherited.
+
+    After ``Popen(stdin=previous.stdout)`` the pipe has two readers: the new
+    child, and this process. Only the child will ever read it, but the kernel
+    keeps the pipe alive while ANY reader holds it -- so when the child dies,
+    the stage writing into it blocks forever instead of taking SIGPIPE and
+    ending.
+
+    Observed on a real transfer: `btrfs-backup-ng run` asleep in a poll loop
+    with one child, `pv -q -B 32M`, parked in poll_schedule_timeout on a pipe
+    whose read end this process still held after the consumer had gone. The run
+    never terminated, and it held its configuration's run lock the whole time,
+    so the next run refused to start.
+
+    endpoint/ssh.py does this by hand at each handoff and explains it at one of
+    them. Shared here because the miss is always at the LAST handoff in a chain,
+    where it is easiest to forget that the pipe was passed on rather than kept.
+    """
+    if pipe is None or not hasattr(pipe, "close"):
+        return
+    try:
+        pipe.close()
+    except Exception as e:  # noqa: BLE001 - a started pipeline must not fail on this
+        logger.debug("Could not release a handed-over pipe: %s", e)
+
+
 def build_transfer_pipeline(
     send_stdout,
     compress: str = "none",
@@ -337,6 +364,7 @@ def build_transfer_pipeline(
         compress_proc = create_compress_process(compress, stdin=current_stdout)
         if compress_proc:
             processes.append(("compress", compress_proc))
+            hand_over(current_stdout)
             current_stdout = compress_proc.stdout
             logger.info("Transfer compression enabled: %s", compress)
 
@@ -349,6 +377,7 @@ def build_transfer_pipeline(
         )
         if throttle_proc:
             processes.append(("throttle", throttle_proc))
+            hand_over(current_stdout)
             current_stdout = throttle_proc.stdout
             logger.info("Transfer rate limited to: %s", rate_limit)
     elif show_progress:
@@ -356,6 +385,7 @@ def build_transfer_pipeline(
         progress_proc = create_progress_process(stdin=current_stdout)
         if progress_proc:
             processes.append(("progress", progress_proc))
+            hand_over(current_stdout)
             current_stdout = progress_proc.stdout
             logger.debug("Transfer progress display enabled")
 
@@ -386,6 +416,7 @@ def build_receive_pipeline(
         decompress_proc = create_decompress_process(compress, stdin=current_stdout)
         if decompress_proc:
             processes.append(("decompress", decompress_proc))
+            hand_over(current_stdout)
             current_stdout = decompress_proc.stdout
             logger.debug("Transfer decompression enabled: %s", compress)
 

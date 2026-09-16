@@ -2409,6 +2409,26 @@ print(json.dumps(result))
                 bufsize=0,
             )
 
+            # The receive owns that pipe now, so this process must let go of its
+            # copy -- the same reason the two stages upstream do it, one of which
+            # says so in as many words ("Allow send_process to receive SIGPIPE").
+            # This was the third and last handoff in the chain and the only one
+            # that did not.
+            #
+            # Keeping it open leaves a reader alive that never reads, so the
+            # LAST local stage -- pv, mbuffer, or the compressor -- blocks
+            # forever writing into it when the receive exits, instead of taking
+            # SIGPIPE and ending. Observed on a real transfer: `btrfs-backup-ng
+            # run` sleeping in a poll loop with one child, `pv -q -B 32M`, parked
+            # in poll_schedule_timeout on a pipe whose read end this process
+            # still held. The run never terminated, and it held the per-config
+            # run lock while it sat there, so the next run refused to start.
+            if stdin_pipe is not None and hasattr(stdin_pipe, "close"):
+                try:
+                    stdin_pipe.close()
+                except Exception as e:  # noqa: BLE001 - never fail a started transfer
+                    logger.debug("Could not close the handed-over pipe: %s", e)
+
             logger.debug(
                 "btrfs receive process started with PID: %d", receive_process.pid
             )

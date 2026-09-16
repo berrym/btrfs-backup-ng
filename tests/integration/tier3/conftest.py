@@ -182,10 +182,17 @@ class Rig:
         prefix="t3-",
         retention="daily = 5",
         snapper_config="",
+        snapshot_dir="snapshots",
     ) -> Path:
         # snapshot_dir MUST be on the same btrfs as the source: a btrfs snapshot
         # cannot cross filesystems, and putting it on tmpfs fails at creation.
-        snap_dir = self.src / "snapshots"
+        #
+        # Overridable because a snapshot name is <prefix><timestamp>: cells that
+        # share this rig normally differ by prefix, so their names cannot clash.
+        # Two cells using an EMPTY prefix produce byte-identical names and collide
+        # on the second -- which is a true property of that configuration, not a
+        # defect, and the reason those cells take their own directory.
+        snap_dir = self.src / snapshot_dir
         snap_dir.mkdir(parents=True, exist_ok=True)
         volume = str(self.source_volume) if source == "native" else str(self.src)
         lines = [
