@@ -3813,7 +3813,10 @@ print(json.dumps(result))
             logger.error(f"Source path does not exist: {source_path}")
             return False
 
-        # Run pre-transfer diagnostics
+        # Run pre-transfer diagnostics. NOT force_refresh: send_receive has just
+        # refreshed this exact cache key on the way in, so this reads a verdict
+        # seconds old. Refreshing again would pay for all eight probes twice per
+        # snapshot to answer the same question.
         logger.info("Verifying SSH connectivity and filesystem readiness...")
         diagnostics = self._run_diagnostics(dest_path)
         if not all(
@@ -4155,9 +4158,26 @@ print(json.dumps(result))
             logger.error("Error verifying/creating destination: %s", e)
             return False
 
-        # Run diagnostics to ensure everything is ready
+        # Run diagnostics to ensure everything is ready.
+        #
+        # force_refresh, because this is the gate that decides whether to start
+        # moving data. The cache holds a verdict for 300s, and force_refresh
+        # existed with no caller anywhere -- so "verifying SSH connectivity and
+        # filesystem readiness" passed for five minutes after the host went away,
+        # the destination was unmounted, or the remote filesystem went read-only.
+        #
+        # It is worse than a stale pass: the cached value is also written back to
+        # config["passwordless_sudo_available"], which _build_remote_command reads
+        # for EVERY remote command, and the sudo branch below is chosen by the
+        # same stale boolean -- a stale True keeps the run on the direct path and
+        # skips _try_sudo_cached_transfer, the one route that checks the transport
+        # is still alive.
+        #
+        # The cost is eight probes once per snapshot over an already-multiplexed
+        # connection, and _try_direct_transfer's own call below then reads what
+        # this just wrote.
         logger.debug("Verifying pre-transfer readiness")
-        diagnostics = self._run_diagnostics(dest_path)
+        diagnostics = self._run_diagnostics(dest_path, force_refresh=True)
         if not all(
             [
                 diagnostics["ssh_connection"],
