@@ -1853,8 +1853,13 @@ def restore_snapper_snapshot(
                 stderr=subprocess.PIPE,
             )
 
-            if send_process.stdout:
-                send_process.stdout.close()
+            # One idiom for releasing a handed-over pipe, everywhere. There are
+            # no intermediate stages here, so there is nothing for chain_stages
+            # to chain -- but the handoff itself is the same one, and the same
+            # omission elsewhere left a stage blocked forever.
+            from . import transfer as transfer_utils
+
+            transfer_utils.hand_over(send_process.stdout)
 
             receive_stdout, receive_stderr = receive_process.communicate()
             send_process.wait()

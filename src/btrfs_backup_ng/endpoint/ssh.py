@@ -3914,31 +3914,31 @@ print(json.dumps(result))
                 send_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0
             )
 
-            # Set up buffering if available
-            if buffer_cmd:
+            # Stages, in THIS path's order: buffer first, then compress. Built by
+            # the shared chainer rather than by hand -- three hand-written copies
+            # of this construction is how the same descriptor leak came to exist
+            # in all three, and chain_stages releases each pipe as it hands it on.
+            def _buffer(stdin):
+                if not buffer_cmd:
+                    return None
                 logger.debug(f"Using {buffer_name} to improve transfer reliability")
-                buffer_args = buffer_cmd.split()
-                buffer_process = subprocess.Popen(
-                    buffer_args,
-                    stdin=send_process.stdout,
+                return subprocess.Popen(
+                    buffer_cmd.split(),
+                    stdin=stdin,
                     stdout=subprocess.PIPE,
                     bufsize=0,
                 )
-                if send_process.stdout:  # Only close if stdout exists
-                    send_process.stdout.close()  # Allow send_process to receive SIGPIPE
-                pipe_output = buffer_process.stdout
-            else:
-                pipe_output = send_process.stdout
-                buffer_process = None
 
             # Stream compression: compress BEFORE the wire, decompress after it.
             # The decompressor is added to the remote command by _btrfs_receive,
             # so the two halves are always configured from the same value -- the
             # missing half is what made this option a no-op for ssh:// targets.
             # Nothing changes when compression is off.
-            compress_process = None
             compress_method = self._stream_compress_method()
-            if compress_method:
+
+            def _compress(stdin):
+                if not compress_method:
+                    return None
                 from ..core.transfer import COMPRESSION_PROGRAMS
 
                 logger.info(
@@ -3946,16 +3946,22 @@ print(json.dumps(result))
                     "remote before btrfs receive)",
                     compress_method,
                 )
-                compress_process = subprocess.Popen(
+                return subprocess.Popen(
                     COMPRESSION_PROGRAMS[compress_method]["compress"],
-                    stdin=pipe_output,
+                    stdin=stdin,
                     stdout=subprocess.PIPE,
                     bufsize=0,
                 )
-                if pipe_output:
-                    # Let the upstream process see SIGPIPE if the compressor dies.
-                    pipe_output.close()
-                pipe_output = compress_process.stdout
+
+            from ..core.transfer import chain_stages
+
+            pipe_output, stage_list = chain_stages(
+                send_process.stdout,
+                [("buffer", _buffer), ("compress", _compress)],
+            )
+            staged = dict(stage_list)
+            buffer_process = staged.get("buffer")
+            compress_process = staged.get("compress")
 
             # Start the remote receive process
             logger.debug("Starting remote btrfs receive process")

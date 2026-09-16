@@ -334,6 +334,37 @@ def hand_over(pipe: Any) -> None:
         logger.debug("Could not release a handed-over pipe: %s", e)
 
 
+def chain_stages(source_stdout: Any, stages: list) -> tuple:
+    """Chain ``stages`` onto ``source_stdout``, releasing each pipe as it goes.
+
+    ``stages`` is an ORDERED list of ``(name, factory)``, where ``factory(stdin)``
+    returns a Popen or None to skip that stage. The order is the caller's, because
+    the paths genuinely differ -- a local transfer compresses and then throttles,
+    while an ssh transfer buffers and then compresses, and the buffer size was
+    chosen by measurement. What they should NOT differ in is the construction.
+
+    This exists because that construction was written out three times and the
+    same defect appeared in all three: the pipe handed to a child was never
+    released by this process, so a dying consumer left the stage upstream of it
+    blocked forever rather than taking SIGPIPE. Two of the three even had the
+    idiom at their earlier handoffs and missed it at the last one. One chainer
+    means hand_over() happens once, where it cannot be forgotten.
+
+    Returns ``(final_stdout, [(name, proc), ...])``. The caller still owns the
+    final stdout and must hand it over to whatever consumes it.
+    """
+    processes: list = []
+    current = source_stdout
+    for name, factory in stages:
+        proc = factory(current)
+        if proc is None:
+            continue
+        processes.append((name, proc))
+        hand_over(current)
+        current = proc.stdout
+    return current, processes
+
+
 def build_transfer_pipeline(
     send_stdout,
     compress: str = "none",
@@ -356,40 +387,46 @@ def build_transfer_pipeline(
         - final_stdout is the pipe to feed to btrfs receive
         - process_list is list of intermediate processes to monitor/cleanup
     """
-    processes = []
-    current_stdout = send_stdout
 
-    # Add compression if requested
-    if compress and compress != "none":
-        compress_proc = create_compress_process(compress, stdin=current_stdout)
-        if compress_proc:
-            processes.append(("compress", compress_proc))
-            hand_over(current_stdout)
-            current_stdout = compress_proc.stdout
+    def _compress(stdin):
+        if not compress or compress == "none":
+            return None
+        proc = create_compress_process(compress, stdin=stdin)
+        if proc:
             logger.info("Transfer compression enabled: %s", compress)
+        return proc
 
-    # Add throttling if requested (includes progress display)
-    if rate_limit:
-        throttle_proc = create_throttle_process(
-            rate_limit,
-            stdin=current_stdout,
-            show_progress=show_progress,
+    def _throttle(stdin):
+        if not rate_limit:
+            return None
+        proc = create_throttle_process(
+            rate_limit, stdin=stdin, show_progress=show_progress
         )
-        if throttle_proc:
-            processes.append(("throttle", throttle_proc))
-            hand_over(current_stdout)
-            current_stdout = throttle_proc.stdout
+        if proc:
             logger.info("Transfer rate limited to: %s", rate_limit)
-    elif show_progress:
-        # Add progress display without rate limiting
-        progress_proc = create_progress_process(stdin=current_stdout)
-        if progress_proc:
-            processes.append(("progress", progress_proc))
-            hand_over(current_stdout)
-            current_stdout = progress_proc.stdout
-            logger.debug("Transfer progress display enabled")
+        return proc
 
-    return current_stdout, processes
+    def _progress(stdin):
+        # Only when NOT throttling: create_throttle_process already displays
+        # progress, so both would put two meters on one stream.
+        if rate_limit or not show_progress:
+            return None
+        proc = create_progress_process(stdin=stdin)
+        if proc:
+            logger.debug("Transfer progress display enabled")
+        return proc
+
+    # Compression first, then throttling: the rate limit is meant to bound what
+    # goes on the wire, which is the compressed stream. The stage NAMES are the
+    # ones the monitors and cleanup already use.
+    return chain_stages(
+        send_stdout,
+        [
+            ("compress", _compress),
+            ("throttle", _throttle),
+            ("progress", _progress),
+        ],
+    )
 
 
 def build_receive_pipeline(

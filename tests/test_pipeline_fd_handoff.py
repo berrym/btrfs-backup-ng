@@ -193,3 +193,97 @@ def test_a_full_three_stage_chain_unwinds_when_the_consumer_dies():
                 p.kill()
                 p.wait()
             pytest.fail("a stage in the chain did not unwind after the consumer died")
+
+
+class TestNoHandoffCanBeWrittenWithoutReleasingThePipe:
+    """The structural guard, which is the only version of this that survives.
+
+    "Remember to close the pipe" is an instruction; three separate places were
+    told it and two of them forgot at the last handoff. This makes the suite fail
+    instead.
+
+    Every ``Popen(stdin=<something>.stdout)`` in the tree must be accompanied by
+    a release of that same pipe in the same function -- either hand_over(), or
+    chain_stages() doing it on the caller's behalf.
+    """
+
+    @staticmethod
+    def _source_files():
+        import pathlib
+
+        root = pathlib.Path(__file__).resolve().parent.parent / "src"
+        return sorted(root.rglob("*.py"))
+
+    def test_every_popen_handoff_is_released(self):
+        import ast
+
+        offenders = []
+        for path in self._source_files():
+            tree = ast.parse(path.read_text())
+            for fn in ast.walk(tree):
+                if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    continue
+                handoffs = [
+                    node.lineno
+                    for node in ast.walk(fn)
+                    if isinstance(node, ast.Call)
+                    and any(
+                        kw.arg == "stdin"
+                        and isinstance(kw.value, ast.Attribute)
+                        and kw.value.attr == "stdout"
+                        for kw in node.keywords
+                    )
+                ]
+                if not handoffs:
+                    continue
+                releases = [
+                    node
+                    for node in ast.walk(fn)
+                    if isinstance(node, ast.Call)
+                    and (
+                        (
+                            isinstance(node.func, ast.Name)
+                            and node.func.id in ("hand_over", "chain_stages")
+                        )
+                        or (
+                            isinstance(node.func, ast.Attribute)
+                            and node.func.attr in ("hand_over", "chain_stages", "close")
+                        )
+                    )
+                ]
+                if not releases:
+                    offenders.append(f"{path.name}::{fn.name} at line(s) {handoffs}")
+
+        assert not offenders, (
+            "a pipe is handed to a child and never released, so the stage "
+            "upstream of it will block forever when that child dies: "
+            + "; ".join(offenders)
+        )
+
+    def test_the_chainer_releases_each_pipe_as_it_hands_it_on(self):
+        """Two loops building pipelines is how the constructions drifted. There
+        is one, and this is the line that makes it safe."""
+        import inspect
+
+        from btrfs_backup_ng.core import transfer as t
+
+        source = inspect.getsource(t.chain_stages)
+        assert "hand_over(current)" in source, (
+            "the chainer no longer releases each pipe as it hands it on"
+        )
+
+    def test_both_pipelines_declare_their_own_stage_order(self):
+        """They genuinely differ -- local compresses then throttles, ssh buffers
+        then compresses, and the buffer size was chosen by measurement. Sharing
+        the CONSTRUCTION must not have flattened them into one order."""
+        import inspect
+
+        from btrfs_backup_ng.core import transfer as t
+        from btrfs_backup_ng.endpoint.ssh import SSHEndpoint
+
+        local = inspect.getsource(t.build_transfer_pipeline)
+        assert local.index('("compress"') < local.index('("throttle"')
+
+        ssh_src = inspect.getsource(SSHEndpoint._try_direct_transfer)
+        assert '("buffer", _buffer)' in ssh_src
+        assert ssh_src.index('("buffer"') < ssh_src.index('("compress"')
