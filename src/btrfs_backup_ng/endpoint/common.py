@@ -326,7 +326,23 @@ class Endpoint:
                 logger.debug("Executing snapshot command: %s", cmd)
                 self._exec_command({"command": cmd})
                 logger.debug("Snapshot command executed successfully: %s", cmd)
-                self.add_snapshot(snapshot)
+            # ONE registration for one snapshot. This sat inside the loop above,
+            # and `sync` defaults to True, so there are normally two commands --
+            # the create and the `btrfs subvolume sync` -- and the snapshot was
+            # registered twice.
+            #
+            # Count-based retention then budgeted for a snapshot that does not
+            # exist. Measured with the cache populated: 4 existing + 1 new under
+            # `-N 2` left ONE, and `-N 1` left NONE at all -- the duplicate of the
+            # newest pushes the real newest into `unlocked[:-keep]`, so the
+            # snapshot just taken is destroyed along with every other one.
+            #
+            # Unreachable from any shipped flow today, because add_snapshot
+            # returns early while the cache is None and nothing lists the source
+            # before snapshotting it. That is a coincidence of call order, not a
+            # property anyone maintains: one pre-flight listing added to `run`
+            # for an unrelated reason turns `-N 1` into total loss.
+            self.add_snapshot(snapshot)
         return snapshot
 
     def preflight_send(self, snapshot: Any) -> None:
@@ -807,7 +823,16 @@ class Endpoint:
         )
 
     def add_snapshot(self, snapshot: Any, rewrite: bool = True) -> None:
-        """Add a snapshot to the cache."""
+        """Add a snapshot to the cache, once.
+
+        Idempotent by PATH. The caller above registers exactly one snapshot per
+        create, but a cache that can hold the same snapshot twice is a retention
+        budget that can be wrong by that many -- and the damage is not
+        proportional: a single duplicate of the newest entry makes `-N 1` delete
+        everything, including the snapshot just taken. Belt as well as braces,
+        because the cost of the guard is one comparison and the cost of it being
+        absent was measured at total loss.
+        """
         if self.__cached_snapshots is None:
             return
         if rewrite:
@@ -818,6 +843,10 @@ class Endpoint:
                 time_obj=snapshot.time_obj,
                 time_format=snapshot.time_format,
             )
+        path = str(snapshot.get_path())
+        if any(str(s.get_path()) == path for s in self.__cached_snapshots):
+            logger.debug("Snapshot already in the cache, not adding again: %s", path)
+            return
         self.__cached_snapshots.append(snapshot)
         self.__cached_snapshots.sort()
 
