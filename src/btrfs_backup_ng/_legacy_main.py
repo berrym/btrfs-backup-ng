@@ -328,6 +328,9 @@ def run_task(options):
     source_endpoint = prepare_source_endpoint(options)
     destination_endpoints = prepare_destination_endpoints(options, source_endpoint)
 
+    if options.get("remove_locks"):
+        return remove_locks(source_endpoint, destination_endpoints)
+
     if not options["no_snapshot"]:
         snapshot = take_snapshot(source_endpoint, options)
     else:
@@ -355,6 +358,36 @@ def run_task(options):
     time.sleep(1)
     cleanup_snapshots(source_endpoint, destination_endpoints, options)
     return not any_failed
+
+
+def remove_locks(source_endpoint, destination_endpoints):
+    """Drop every lock the given destinations hold on the source's snapshots.
+
+    This is what ``--remove-locks`` promises. The flag had been accepted and
+    parsed since the option was introduced but was never read by anything, so
+    the command exited 0 having done nothing at all.
+
+    Locks are keyed by destination id (``set_lock`` in ``core.operations``), so
+    only the destinations named on this command line are cleared -- a lock held
+    for some other destination is left alone rather than being swept up.
+    """
+    destination_ids = [endpoint.get_id() for endpoint in destination_endpoints]
+    removed = 0
+    for snapshot in source_endpoint.list_snapshots():
+        for destination_id in destination_ids:
+            if destination_id in snapshot.locks:
+                source_endpoint.set_lock(snapshot, destination_id, False)
+                removed += 1
+            if destination_id in snapshot.parent_locks:
+                source_endpoint.set_lock(snapshot, destination_id, False, parent=True)
+                removed += 1
+    logger.info(
+        "Removed %d lock(s) for %d destination(s) from %s",
+        removed,
+        len(destination_ids),
+        source_endpoint,
+    )
+    return True
 
 
 def log_initial_settings(options):
