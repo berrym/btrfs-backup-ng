@@ -254,6 +254,9 @@ def _parse_target(data: dict[str, Any]) -> TargetConfig:
         ssh_key=data.get("ssh_key"),
         ssh_auth_sock=data.get("ssh_auth_sock"),
         ssh_password_auth=data.get("ssh_password_auth", True),
+        skip_remote_lock=_parse_bool_option(
+            data.get("skip_remote_lock", False), "skip_remote_lock"
+        ),
         ssh_host_key_policy=ssh_host_key_policy,
         compress=compress,
         rate_limit=data.get("rate_limit"),
