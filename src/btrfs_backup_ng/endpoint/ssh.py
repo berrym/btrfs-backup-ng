@@ -203,17 +203,72 @@ def _build_receive_command(
             # `sudo -S` reads the password from ITS stdin. Putting the
             # decompressor in front of sudo would feed the password line into the
             # decompressor instead, so sudo would never receive it and the
-            # decompressor would choke on plaintext. Nesting the pipeline INSIDE
-            # sudo keeps the ordering the caller relies on: sudo consumes the
-            # password line, then the remaining stdin -- the compressed stream --
-            # reaches the decompressor.
+            # decompressor would choke on plaintext ("not in gzip format",
+            # measured). Ordering is therefore not free to change.
+            #
+            # But elevating a SHELL -- `sudo -S sh -c '<decompress> | btrfs
+            # receive'` -- asks sudoers for permission to run sh, and the sudoers
+            # recipe this project's own README gives grants only /usr/bin/btrfs.
+            # Measured against a host configured exactly that way: "Sorry, user
+            # is not allowed to execute '/usr/sbin/sh -c ...'", and the backup
+            # never ran. So the shell form is what breaks a restricted host, and
+            # the ordering is what breaks every host -- neither one alone can be
+            # fixed by rewriting the other.
+            #
+            # Both are satisfied by spending the password on `sudo -v` first,
+            # which primes sudo's credential cache, and then running the pipeline
+            # with `sudo -n` scoped to btrfs alone. Where that cache is refused
+            # (timestamp_timeout=0) the command falls back to the shell form,
+            # reconstructing sudo's stdin so the password is delivered exactly as
+            # before. Measured across five sudoers policies:
+            #
+            #   full sudo, caching               scoped    works
+            #   btrfs-only, caching              scoped    works  (was BROKEN)
+            #   full sudo, timestamp_timeout=0   fallback  works  (unchanged)
+            #   btrfs-only, timestamp_timeout=0  fallback  fails  (also fails now)
+            #   btrfs-only NOPASSWD              scoped    works
+            #
+            # The remote decides for itself. sudo deliberately gives the same
+            # answer ("a password is required") whether a command is forbidden or
+            # merely needs authenticating, so NO non-interactive probe from this
+            # side can tell those apart -- the choice cannot be made here.
+            #
+            # `printf` is a shell builtin in dash, bash and busybox ash (checked
+            # in all three), so the password never reaches a process argument
+            # list; and `printf %s` preserves backslashes, which dash's `echo`
+            # would eat.
             #
             # Gated on use_sudo, not on password_on_stdin alone: a caller that
             # asked for no elevation must not be handed a `sudo -S` command
             # merely because it offered a password. The uncompressed branch has
             # always honoured use_sudo, and this branch has to agree with it.
-            inner = _guarded_pipeline(f"{decompressor} | btrfs receive {quoted_dest}")
-            script = f'trap "" PIPE; exec sudo -S sh -c {shlex.quote(inner)}'
+            plain = f"{decompressor} | btrfs receive {quoted_dest}"
+            # Priming, the decision and the transfer all live INSIDE the guarded
+            # group, and that placement is load-bearing. With no tty -- which is
+            # every ssh command -- sudo keys its credential ticket on the PARENT
+            # PID. _guarded_pipeline runs the transfer in a BACKGROUNDED subshell,
+            # so priming outside it records a ticket against this shell that the
+            # subshell's `sudo -n` cannot see: measured as "a password is
+            # required" on bash and dash alike, with the payload never delivered,
+            # while the identical commands unbackgrounded succeeded.
+            group = (
+                'printf "%s\\n" "$__bbng_pw" | sudo -S -v 2>/dev/null; '
+                # </dev/null so the capability probe cannot consume a single byte of
+                # the stream: its stdin is fd 3, the transfer itself. `btrfs
+                # --version` does not read stdin, but a probe sharing the
+                # payload's file description should not depend on that.
+                "if sudo -n btrfs --version </dev/null >/dev/null 2>&1; then "
+                f"{decompressor} | sudo -n btrfs receive {quoted_dest}; "
+                "else "
+                # No cached credential, so spend the password directly -- the
+                # pre-existing form. sudo's stdin is rebuilt as the password line
+                # followed by the rest of the stream, which is byte for byte what
+                # it received before this branch existed.
+                '{ printf "%s\\n" "$__bbng_pw"; cat; } | '
+                f"sudo -S sh -c {shlex.quote(plain)}; "
+                "fi"
+            )
+            script = 'trap "" PIPE; IFS= read -r __bbng_pw; ' + _guarded_pipeline(group)
             return f"exec sh -c {shlex.quote(script)}"
         script = (
             f'trap "" PIPE; {_guarded_pipeline(f"{decompressor} | {base_receive}")}'

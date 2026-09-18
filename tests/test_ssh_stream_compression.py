@@ -989,7 +989,12 @@ class TestThePayloadActuallyReachesTheRemote:
 
     def _deliver(self, shell, tmp_path, **kwargs):
         """Run the emitted command and report how many bytes reached btrfs."""
-        (tmp_path / "btrfs").write_text("#!/bin/sh\nwc -c\n")
+        # The real btrfs answers --version without reading stdin; a stub that
+        # counts bytes regardless would swallow the payload when the command
+        # probes for sudo capability, and report the product as broken.
+        (tmp_path / "btrfs").write_text(
+            '#!/bin/sh\ncase "${1:-}" in --version) echo v6.17; exit 0;; esac\nwc -c\n'
+        )
         # `read` takes EXACTLY one line, as sudo -S does; `head -n 1` would read a
         # block and swallow part of the stream.
         (tmp_path / "sudo").write_text(
