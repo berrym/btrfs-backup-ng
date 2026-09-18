@@ -71,7 +71,10 @@ from btrfs_backup_ng.core.retry import (  # noqa: E402
     RetryPolicy,
 )
 from btrfs_backup_ng.core.space import SpaceInfo  # noqa: E402
-from btrfs_backup_ng.core.transfer import DEFAULT_TRANSFER_TIMEOUT  # noqa: E402
+from btrfs_backup_ng.core.transfer import (  # noqa: E402
+    DEFAULT_TRANSFER_TIMEOUT,
+    UNMEASURABLE_FALLBACK_TIMEOUT,
+)
 from btrfs_backup_ng.sshutil.master import SSHMasterManager  # noqa: E402
 
 from .common import DeletionResult, Endpoint  # noqa: E402
@@ -4534,6 +4537,38 @@ print(json.dumps(result))
             )
             return False
 
+    def _unbounded_tail_expired(
+        self, send_exit_time: Optional[float], max_wait_time: int, now: float
+    ) -> bool:
+        """Whether an unbounded post-send tail has outlived its fallback limit.
+
+        Once the local send exits, no bytes move on this side, so the stall check
+        is deliberately disarmed -- the remote is applying what it already
+        received, and killing it there would destroy a transfer about to succeed.
+        Both monitor loops described that tail as covered by the wall clock, but
+        `transfer_timeout` defaults to 0, which means NO wall clock. On a default
+        configuration nothing bounded the tail at all, so a remote wedged
+        mid-apply hung the run forever (issue #107).
+
+        The fallback is the same generous limit an unmeasurable transfer gets,
+        for the same reason: guard by measurement where possible, by clock where
+        not. An operator wanting a tighter deadline sets `transfer_timeout`.
+        """
+        return (
+            send_exit_time is not None
+            and max_wait_time <= 0
+            and now - send_exit_time >= UNMEASURABLE_FALLBACK_TIMEOUT
+        )
+
+    def _tail_timeout_error(self, waited: float) -> str:
+        return (
+            f"the local send finished but the remote never completed applying "
+            f"the stream after {waited:.0f}s, so the transfer was terminated. "
+            f"This is btrfs-backup-ng's fallback limit for an unbounded tail, "
+            f"NOT an ssh timeout. Set transfer_timeout to impose your own "
+            f"deadline."
+        )
+
     def _monitor_transfer_progress(
         self,
         processes: Dict[str, Any],
@@ -4586,6 +4621,8 @@ print(json.dumps(result))
         )
         last_bytes = __util__.any_bytes_moved(stall_pids)
         last_progress_time = start_time
+        #: When the local send exited, if it has; see _unbounded_tail_expired.
+        send_exit_time: Optional[float] = None
         stall_detection = stall_limit > 0 and last_bytes is not None
         if not stall_detection:
             # Never silently downgrade to "no bytes moved": that would read as a
@@ -4612,8 +4649,34 @@ print(json.dumps(result))
             # bytes move on this side -- which is completion, not a stall, and
             # killing it there would destroy a transfer that was about to
             # succeed. A remote wedged MID-receive still blocks the send, so
-            # that case is caught; only the tail is exempt, and the wall clock
-            # covers it.
+            # that case is caught; only the tail is exempt, and it is bounded by
+            # _unbounded_tail_expired rather than left to run forever.
+            if not send_alive and send_exit_time is None:
+                send_exit_time = current_time
+                if max_wait_time <= 0:
+                    logger.info(
+                        "Send finished; the remote is applying what it received. "
+                        "No wall-clock limit is configured, so this tail is "
+                        "guarded by a %ds fallback.",
+                        UNMEASURABLE_FALLBACK_TIMEOUT,
+                    )
+            if self._unbounded_tail_expired(
+                send_exit_time, max_wait_time, current_time
+            ):
+                assert send_exit_time is not None
+                self._last_transfer_error = self._tail_timeout_error(
+                    current_time - send_exit_time
+                )
+                logger.error("FAILED: %s", self._last_transfer_error)
+                for proc in (send_process, receive_process, buffer_process):
+                    if proc is not None and proc.poll() is None:
+                        proc.terminate()
+                        try:
+                            proc.wait(timeout=5)
+                        except Exception:
+                            proc.kill()
+                return False
+
             if stall_detection and send_alive:
                 moved = __util__.any_bytes_moved(stall_pids)
                 if moved is None:
@@ -4849,6 +4912,8 @@ print(json.dumps(result))
         )
         last_bytes = __util__.any_bytes_moved(stall_pids)
         last_progress_time = start_time
+        #: When the local send exited, if it has; see _unbounded_tail_expired.
+        send_exit_time: Optional[float] = None
         stall_detection = stall_limit > 0 and last_bytes is not None
 
         # Simple polling loop with timeout
@@ -4868,6 +4933,32 @@ print(json.dumps(result))
 
             # Judged only while the SEND is alive: after it finishes the remote
             # is applying what it already has, which is completion, not a stall.
+            # The tail that follows is bounded by _unbounded_tail_expired.
+            tail_now = time.time()
+            if send_process.poll() is not None and send_exit_time is None:
+                send_exit_time = tail_now
+                if max_wait_time <= 0:
+                    logger.info(
+                        "Send finished; the remote is applying what it received. "
+                        "No wall-clock limit is configured, so this tail is "
+                        "guarded by a %ds fallback.",
+                        UNMEASURABLE_FALLBACK_TIMEOUT,
+                    )
+            if self._unbounded_tail_expired(send_exit_time, max_wait_time, tail_now):
+                assert send_exit_time is not None
+                self._last_transfer_error = self._tail_timeout_error(
+                    tail_now - send_exit_time
+                )
+                logger.error("FAILED: %s", self._last_transfer_error)
+                for proc in processes_to_wait:
+                    if proc.poll() is None:
+                        proc.terminate()
+                        try:
+                            proc.wait(timeout=5)
+                        except Exception:
+                            proc.kill()
+                return False
+
             if stall_detection and send_process.poll() is None:
                 now = time.time()
                 moved = __util__.any_bytes_moved(stall_pids)
