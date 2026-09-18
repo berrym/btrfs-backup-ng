@@ -397,15 +397,18 @@ class TestSudoersPolicies:
             "bbng ALL=(ALL) ALL\nDefaults:bbng timestamp_timeout=0",
             True,
         ),
-        # Not a gap this release can close: sudo wants the password for every
-        # invocation, and stdin is carrying the stream. It fails identically
-        # before this fix, so it is pinned as known-unreachable rather than
-        # quietly omitted.
+        # Was the one policy nothing could serve: sudo wants the password for
+        # every invocation while stdin carries the stream. Fixed by decompressing
+        # unelevated and prefixing that output with the password line.
         (
             "btrfs-only-no-caching",
             "bbng ALL=(ALL) /usr/bin/btrfs\nDefaults:bbng timestamp_timeout=0",
-            False,
+            True,
         ),
+        # A host that grants nothing useful must FAIL, and fail loudly. Without
+        # this the table could be satisfied by a command that elevated
+        # everything, which is the defect these cells exist to prevent.
+        ("no-sudo-rights", "bbng ALL=(ALL) /bin/false", False),
     ]
 
     #: /bin/sh differs across these three, and this project has shipped two bugs

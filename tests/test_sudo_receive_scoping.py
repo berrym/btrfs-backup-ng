@@ -65,15 +65,25 @@ def test_the_capability_probe_cannot_consume_the_stream():
     assert "btrfs --version </dev/null" in command
 
 
-def test_the_fallback_still_spends_the_password_directly():
-    """Where the credential cache is refused (timestamp_timeout=0) the older
-    form must remain available, or a working configuration regresses."""
+def test_the_fallback_prefixes_the_decompressed_stream():
+    """Where the credential cache is refused (timestamp_timeout=0) the
+    decompressor runs unelevated and its OUTPUT carries the password line, so
+    `sudo -S` eats that line and btrfs receive gets the decompressed stream."""
     command = _cmd(use_sudo=True, password_on_stdin=True, decompress="gzip")
 
-    assert "sudo -S sh -c" in command
-    assert '{ printf "%s\\n" "$__bbng_pw"; cat; }' in command, (
-        "the fallback does not rebuild sudo's stdin, so the password is lost"
-    )
+    assert '{ printf "%s\\n" "$__bbng_pw"; gzip -dc; } | sudo -S btrfs receive' in (
+        command
+    ), "the fallback does not prefix the decompressed stream with the password"
+
+
+def test_no_path_ever_elevates_a_shell():
+    """The whole defect was asking sudoers for permission to run `sh`. Neither
+    branch may do it: root runs exactly one known binary, btrfs."""
+    command = _cmd(use_sudo=True, password_on_stdin=True, decompress="gzip")
+
+    assert "sudo -S sh" not in command
+    assert "sudo -n sh" not in command
+    assert "sudo sh" not in command
 
 
 def test_the_password_never_reaches_a_process_argument_list():

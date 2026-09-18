@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import contextlib
 import os
+import re
 import shlex
 import signal
 import subprocess
@@ -428,16 +429,26 @@ class TestEveryTransferStrategyIsCovered:
         remote = " ".join(captured["remote"] or [])
         assert "zstd -dc" in remote, remote
 
-    def test_the_password_sudo_path_nests_the_pipeline_inside_sudo(self):
-        """`sudo -S` reads the password from its own stdin. A decompressor in
-        FRONT of sudo eats the password line, so sudo never authenticates and
-        the decompressor chokes on plaintext."""
+    def test_the_password_reaches_sudo_and_not_the_decompressor(self):
+        """`sudo -S` reads the password from its own stdin, so a decompressor
+        that sees the password line first eats it: sudo never authenticates and
+        the decompressor chokes on plaintext.
+
+        The command no longer nests the pipeline inside `sudo sh -c` to arrange
+        that -- asking sudoers for permission to run a shell is what broke a
+        btrfs-only policy. The password is taken off stdin by `read` before any
+        decompressor starts, and where it must still be spent it is prefixed to
+        the decompressor's OUTPUT, which is sudo's stdin.
+        """
         cmd = _build_receive_command(
             DEST, use_sudo=True, password_on_stdin=True, decompress="zstd"
         )
-        assert "sudo -S sh -c" in cmd, cmd
-        # the decompressor must be INSIDE the sudo invocation, not before it
-        assert cmd.index("sudo -S") < cmd.index("zstd -dc"), cmd
+        assert cmd.index("read -r __bbng_pw") < cmd.index("zstd -dc"), cmd
+        fallback = re.search(r"\{ printf[^|]*\| sudo -S btrfs receive", cmd)
+        assert fallback, cmd
+        assert "zstd -dc" in fallback.group(0), (
+            f"the decompressor is not inside the prefixed group: {fallback.group(0)}"
+        )
 
     def test_the_passwordless_path_keeps_the_decompressor_in_front(self):
         cmd = _build_receive_command(DEST, use_sudo=True, decompress="zstd")
@@ -774,7 +785,7 @@ class TestElevationIsOnlyWhatWasAskedFor:
         cmd = _build_receive_command(
             DEST, use_sudo=True, password_on_stdin=True, decompress="zstd"
         )
-        assert "sudo -S sh -c" in cmd, cmd
+        assert "sudo -S btrfs receive" in cmd, cmd
 
 
 class TestAFailedCompressorFailsTheTransfer:

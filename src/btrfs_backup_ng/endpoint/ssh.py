@@ -215,18 +215,22 @@ def _build_receive_command(
             # the ordering is what breaks every host -- neither one alone can be
             # fixed by rewriting the other.
             #
-            # Both are satisfied by spending the password on `sudo -v` first,
-            # which primes sudo's credential cache, and then running the pipeline
-            # with `sudo -n` scoped to btrfs alone. Where that cache is refused
-            # (timestamp_timeout=0) the command falls back to the shell form,
-            # reconstructing sudo's stdin so the password is delivered exactly as
-            # before. Measured across five sudoers policies:
+            # Both are satisfied without ever elevating a shell. The password
+            # primes sudo's credential cache, after which the pipeline runs with
+            # `sudo -n` scoped to btrfs alone. Where that cache is refused
+            # (timestamp_timeout=0) the decompressor runs UNELEVATED and its
+            # output is prefixed with the password line, so `sudo -S` consumes
+            # that line and btrfs receive gets the decompressed stream -- scoped
+            # to btrfs again. Root therefore runs exactly one known binary on
+            # every path. Measured across six sudoers policies, on remotes whose
+            # /bin/sh is bash, dash and busybox ash:
             #
             #   full sudo, caching               scoped    works
             #   btrfs-only, caching              scoped    works  (was BROKEN)
-            #   full sudo, timestamp_timeout=0   fallback  works  (unchanged)
-            #   btrfs-only, timestamp_timeout=0  fallback  fails  (also fails now)
+            #   full sudo, timestamp_timeout=0   prefixed  works
+            #   btrfs-only, timestamp_timeout=0  prefixed  works  (was BROKEN)
             #   btrfs-only NOPASSWD              scoped    works
+            #   no sudo rights at all            --        fails loudly
             #
             # The remote decides for itself. sudo deliberately gives the same
             # answer ("a password is required") whether a command is forbidden or
@@ -242,7 +246,6 @@ def _build_receive_command(
             # asked for no elevation must not be handed a `sudo -S` command
             # merely because it offered a password. The uncompressed branch has
             # always honoured use_sudo, and this branch has to agree with it.
-            plain = f"{decompressor} | btrfs receive {quoted_dest}"
             # Priming, the decision and the transfer all live INSIDE the guarded
             # group, and that placement is load-bearing. With no tty -- which is
             # every ssh command -- sudo keys its credential ticket on the PARENT
@@ -260,12 +263,16 @@ def _build_receive_command(
                 "if sudo -n btrfs --version </dev/null >/dev/null 2>&1; then "
                 f"{decompressor} | sudo -n btrfs receive {quoted_dest}; "
                 "else "
-                # No cached credential, so spend the password directly -- the
-                # pre-existing form. sudo's stdin is rebuilt as the password line
-                # followed by the rest of the stream, which is byte for byte what
-                # it received before this branch existed.
-                '{ printf "%s\\n" "$__bbng_pw"; cat; } | '
-                f"sudo -S sh -c {shlex.quote(plain)}; "
+                # No usable credential cache (timestamp_timeout=0). Decompress
+                # UNELEVATED and prefix the decompressed stream with the password
+                # line, so `sudo -S` eats that line and hands the rest to btrfs
+                # receive. sudo stays scoped to btrfs here too, so this path needs
+                # no permission to run a shell as root either -- and a host that
+                # does not actually want a password is caught by the branch above,
+                # whose `sudo -n` probe succeeds there, so the password line can
+                # never reach btrfs as stream data.
+                f'{{ printf "%s\\n" "$__bbng_pw"; {decompressor}; }} | '
+                f"sudo -S btrfs receive {quoted_dest}; "
                 "fi"
             )
             script = 'trap "" PIPE; IFS= read -r __bbng_pw; ' + _guarded_pipeline(group)
