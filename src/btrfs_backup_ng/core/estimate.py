@@ -87,6 +87,26 @@ class TransferEstimate:
             self.total_incremental_size += estimate.full_size
 
     @property
+    def unmeasured_count(self) -> int:
+        """Snapshots whose transfer size could not be determined at all.
+
+        Such a snapshot contributes nothing to ``total_incremental_size``, so a
+        total of zero means either "nothing to transfer" or "nothing could be
+        measured" -- opposite facts about whether it is safe to proceed. The
+        space check used to read a zero total as the former in both cases and
+        announce "No data to transfer", skipping the check precisely when the
+        numbers backing it were missing.
+        """
+        unmeasured = 0
+        for estimate in self.snapshots:
+            if estimate.is_incremental and estimate.incremental_size is not None:
+                continue
+            if estimate.full_size is not None:
+                continue
+            unmeasured += 1
+        return unmeasured
+
+    @property
     def total_is_lower_bound(self) -> bool:
         """Whether the transfer total is a floor rather than an estimate.
 

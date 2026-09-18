@@ -283,6 +283,18 @@ def _print_space_check(
         return
 
     if estimate.total_incremental_size == 0:
+        # A zero total is not self-explanatory: a snapshot whose size could not
+        # be determined contributes nothing, so "nothing to transfer" and
+        # "nothing could be measured" reach this line identically. Saying the
+        # former when it is the latter skips the check exactly when the numbers
+        # behind it are missing.
+        if estimate.unmeasured_count:
+            print(
+                f"\nCannot check space: the size of {estimate.unmeasured_count} "
+                f"snapshot(s) could not be determined, so the total is not a "
+                f"measurement of what would transfer. Space was NOT verified."
+            )
+            return
         print("\nNo data to transfer - skipping space check.")
         return
 
