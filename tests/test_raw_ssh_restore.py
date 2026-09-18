@@ -132,6 +132,9 @@ def test_list_second_pass_stat_is_portable_and_sudo_scoped():
     """The sidecar-less list stat tries GNU then BSD, and under ssh_sudo the WHOLE
     fallback runs inside one `sudo sh -c` (not just the first stat)."""
     ep = SSHRawEndpoint(config={"path": "/backup", "hostname": "nas", "ssh_sudo": True})
+    # This test is about what the ELEVATED command looks like, so pin that
+    # regime: ssh_sudo alone no longer implies it.
+    ep._file_ops_direct = False
     with patch("subprocess.run") as mrun:
         from btrfs_backup_ng.endpoint.raw import _ELEVATION_SENTINEL
 

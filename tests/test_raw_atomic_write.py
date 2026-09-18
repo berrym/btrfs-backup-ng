@@ -246,6 +246,10 @@ def test_ssh_commit_wraps_in_sudo_when_configured(tmp_path):
     from .lockshell import lock_aware
 
     ep = _ssh_commit_endpoint(ssh_sudo=True)
+    # ssh_sudo elevates only where elevation is needed; this test is about what
+    # the elevated commit looks like, so pin that regime rather than leave it to
+    # a probe the lock-aware mock would answer by accident.
+    ep._file_ops_direct = False
     with patch("btrfs_backup_ng.endpoint.raw.subprocess.run") as mrun:
         mrun.side_effect = lock_aware(
             lambda cmd, **kw: MagicMock(returncode=0, stderr=b"", stdout=b"1"), tmp_path

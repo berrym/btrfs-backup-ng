@@ -1950,6 +1950,13 @@ class SSHRawEndpoint(RawEndpoint):
         self.ssh_key = config.get("ssh_key")
         self.ssh_opts = config.get("ssh_opts", [])
         self.ssh_sudo = config.get("ssh_sudo", False)
+        #: Whether the login user can work in the target directory unaided.
+        #: None until probed. A raw+ssh target is a FILE store -- no btrfs
+        #: command ever runs on the remote -- so when the destination is already
+        #: the user's, every file operation should run as that user even with
+        #: ssh_sudo set. Elevating regardless is what made a valid config fail
+        #: against the btrfs-only sudoers policy the README documents.
+        self._file_ops_direct: bool | None = None
         # Host-key policy: "accept-new" (default; unifies raw+ssh with the btrfs transport --
         # previously it set no StrictHostKeyChecking and inherited the ambient ssh default)
         # or "strict" (refuse an unknown host). R12b.
@@ -2222,8 +2229,64 @@ class SSHRawEndpoint(RawEndpoint):
 
         return cmd
 
+    @property
+    def _should_elevate(self) -> bool:
+        """Whether remote file operations need sudo for this session.
+
+        ``ssh_sudo`` alone is not the answer: it says the operator is willing to
+        elevate, not that elevation is required. _prepare probes whether the
+        login user can create and write the destination, and when it can there
+        is nothing here to elevate for -- a raw target runs no btrfs command.
+
+        Deciding ONCE, rather than per command, is deliberate. ``cat >``, ``mv``
+        and ``rm`` are not idempotent, so a per-command "try direct, else sudo"
+        retry can apply an operation twice; and a session that created the
+        directory directly but wrote files as root would leave behind files the
+        login user cannot read back -- which is how a refused sudo once listed
+        as an empty target.
+        """
+        if not self.ssh_sudo:
+            return False
+        if self._file_ops_direct is None:
+            # list/verify construct an endpoint and read from it WITHOUT calling
+            # _prepare, so the decision cannot live only there: those commands
+            # would elevate against a directory they can read perfectly well.
+            self._file_ops_direct = self._probe_direct_access()
+        return not self._file_ops_direct
+
+    def _probe_direct_access(self) -> bool:
+        """Whether the target is usable as the login user, without side effects.
+
+        Deliberately does NOT create anything: this runs on read-only commands
+        too, and `raw verify` against a mistyped path must not answer the
+        question by bringing the directory into existence. _prepare, which has
+        to create the directory anyway, probes by doing so and records the
+        answer here before this is ever consulted.
+        """
+        quoted = shlex.quote(str(self.config["path"]))
+        probe = f"[ -d {quoted} ] && [ -r {quoted} ] && [ -w {quoted} ]"
+        try:
+            result = subprocess.run(
+                self._build_ssh_command() + [probe], check=False, capture_output=True
+            )
+            direct = result.returncode == 0
+        except Exception as e:  # noqa: BLE001 - the probe must never be the failure
+            # The probe answers "is elevation unnecessary". If it cannot run at
+            # all, that question is unanswered, and the safe answer is the
+            # behaviour that existed before it did: elevate. Raising here would
+            # make a diagnostic step the thing that breaks the operation.
+            logger.debug("raw+ssh: direct-access probe could not run (%s)", e)
+            direct = False
+        logger.debug(
+            "raw+ssh: %s is %s as the login user; ssh_sudo will %s file operations.",
+            self.config["path"],
+            "usable" if direct else "NOT usable",
+            "not elevate" if direct else "elevate",
+        )
+        return direct
+
     def _elevate(self, remote_command: str) -> str:
-        """Wrap a remote command in sudo when ``ssh_sudo`` is set.
+        """Wrap a remote command in sudo when elevation is needed.
 
         ``-n`` (non-interactive) because the ssh connection carries no tty: sudo
         would otherwise try to prompt and report "a terminal is required to read
@@ -2247,7 +2310,7 @@ class SSHRawEndpoint(RawEndpoint):
         # this code parses (stat's mtime/size) then carries no locale formatting.
         # Correctness does not rest on any of this: _is_sudo_denial keys on the
         # untranslated "sudo:" prefix, not on the wording.
-        if not self.ssh_sudo:
+        if not self._should_elevate:
             return remote_command
         return f"LC_ALL=C sudo -n {remote_command}"
 
@@ -2264,7 +2327,7 @@ class SSHRawEndpoint(RawEndpoint):
         stderr to protect, and rewriting the wire format for no reason would be a
         gratuitous behaviour change on the path that already works.
         """
-        if not self.ssh_sudo:
+        if not self._should_elevate:
             return inner
         # The sentinel runs only if sudo actually handed the shell over, and is
         # emitted regardless of the inner command's exit status (find exits 1/2
@@ -2355,7 +2418,32 @@ class SSHRawEndpoint(RawEndpoint):
         path = self.config["path"]
         ssh_cmd = self._build_ssh_command()
 
-        mkdir_cmd = self._elevate(f"mkdir -p {shlex.quote(str(path))}")
+        quoted = shlex.quote(str(path))
+        # Try as the login user FIRST, even when ssh_sudo is set. A raw+ssh
+        # target stores plain files and runs no btrfs command, so when the
+        # destination is already the user's there is nothing to elevate for --
+        # and elevating regardless made a valid config fail against the
+        # btrfs-only sudoers policy the README documents for ssh://.
+        #
+        # The probe must test WRITABILITY, not just mkdir: `mkdir -p` succeeds
+        # on an existing root-owned directory (exist_ok), and the writes would
+        # then be the thing that failed, much later and less legibly.
+        if self.ssh_sudo and self._file_ops_direct is not False:
+            probe = (
+                f"mkdir -p {quoted} && t=$(mktemp {quoted}/.bbng-probe.XXXXXX) "
+                f'&& rm -f "$t"'
+            )
+            direct = subprocess.run(ssh_cmd + [probe], check=False, capture_output=True)
+            if direct.returncode == 0:
+                self._file_ops_direct = True
+                logger.debug(
+                    "raw+ssh: %s is writable as the login user, so ssh_sudo "
+                    "will not elevate file operations for this target.",
+                    path,
+                )
+                return self._preflight_remote_tools()
+
+        mkdir_cmd = self._elevate(f"mkdir -p {quoted}")
 
         full_cmd = ssh_cmd + [mkdir_cmd]
         logger.debug("Creating remote directory: %s", full_cmd)
@@ -2381,6 +2469,19 @@ class SSHRawEndpoint(RawEndpoint):
             logger.error("Failed to create remote directory: %s", stderr)
             raise
 
+        # Reached only when the direct attempt above was refused, so elevation
+        # is genuinely required; record it rather than leaving it to be probed
+        # again by the first file operation.
+        self._file_ops_direct = False
+        self._preflight_remote_tools()
+
+    def _preflight_remote_tools(self) -> None:
+        """Confirm the remote can host raw+ssh, and this host can feed it.
+
+        Shared by both _prepare paths -- the direct one and the elevated
+        one -- so the checks cannot drift apart depending on whether the
+        destination happened to need sudo.
+        """
         # Preflight: raw+ssh runs POSIX shell commands on the remote (cat/mv/chmod
         # + a size tool). The mkdir above already proved connectivity + a POSIX-ish
         # shell, so a missing tool here means the remote can't host raw+ssh (e.g. a
@@ -2682,7 +2783,7 @@ class SSHRawEndpoint(RawEndpoint):
             text=True,
         )
         # Never let an unreachable host look like an empty target (false all-clear).
-        _check_remote_listing(res, self.hostname, base, elevated=self.ssh_sudo)
+        _check_remote_listing(res, self.hostname, base, elevated=self._should_elevate)
         out: list[str] = []
         for p in res.stdout.split("\x00"):
             if not p or "\n" in p:
@@ -2999,7 +3100,9 @@ class SSHRawEndpoint(RawEndpoint):
 
         result = subprocess.run(full_cmd, check=False, capture_output=True, text=True)
         # Never let an unreachable host look like an empty target (false all-clear).
-        _check_remote_listing(result, self.hostname, path, elevated=self.ssh_sudo)
+        _check_remote_listing(
+            result, self.hostname, path, elevated=self._should_elevate
+        )
         meta_files = result.stdout.strip().split("\n") if result.stdout.strip() else []
 
         # For each metadata file, fetch and parse
@@ -3074,7 +3177,9 @@ class SSHRawEndpoint(RawEndpoint):
         # but DROPS before/at this second pass (e.g. a ServerAlive keepalive timeout
         # mid-listing) must still fail loudly rather than truncate the legacy-stream
         # pass to [] and under-report the target's backups.
-        _check_remote_listing(result, self.hostname, path, elevated=self.ssh_sudo)
+        _check_remote_listing(
+            result, self.hostname, path, elevated=self._should_elevate
+        )
         stream_files = (
             result.stdout.strip().split("\n") if result.stdout.strip() else []
         )

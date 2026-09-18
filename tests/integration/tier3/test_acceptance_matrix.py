@@ -155,17 +155,19 @@ class TestNativeSource:
         assert_payload_restored(res["restore_dest"], rig.payload)
 
     @requires_remote
-    @pytest.mark.xfail(reason=BROKEN_SUDO_MKDIR, strict=True)
     def test_raw_over_ssh_with_ssh_sudo(self, rig):
         """Setting ssh_sudo on a raw target must not break it.
 
         A raw target needs no privilege, but ssh_sudo is a documented target
-        option and an operator may reasonably set it. When they do, _prepare
-        runs `sudo mkdir -p` (endpoint/raw.py), which the documented btrfs-only
-        sudoers policy refuses, and the backup fails with "sudo: a password is
-        required" -- an error that says nothing about the actual cause. Either
-        the raw path should not elevate mkdir, or the option should be rejected
-        for raw targets with an explanation.
+        option and an operator may reasonably set it. _prepare used to run every
+        remote command under sudo, starting with `mkdir -p`, which the btrfs-only
+        sudoers policy the README documents refuses -- so a valid config failed
+        against the very policy the project tells people to install.
+
+        ssh_sudo now means "elevate if elevation is needed": the destination is
+        probed as the login user first, and when it is writable no file
+        operation elevates. This ran as an xfail against a btrfs-only sudoers
+        policy until that landed.
         """
         from .conftest import REMOTE_SPEC
 

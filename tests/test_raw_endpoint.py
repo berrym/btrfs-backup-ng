@@ -819,6 +819,11 @@ class TestSSHRawEndpointMethods:
                 "ssh_sudo": True,
             }
         )
+        # ssh_sudo elevates only where elevation is needed, so the regime is
+        # pinned rather than left to a probe the mock would answer by accident.
+        # False = the login user cannot use this destination, which is the case
+        # the option exists for.
+        endpoint._file_ops_direct = False
 
         with patch("subprocess.run") as mock_run:
             mock_run.return_value = MagicMock(returncode=0, stdout=b"RAWSSHOK\n")
