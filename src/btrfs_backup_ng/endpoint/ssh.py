@@ -3682,7 +3682,32 @@ print(json.dumps(result))
             stderr_thread = threading.Thread(target=stream_stderr, daemon=True)
             stderr_thread.start()
 
-            proc.wait()
+            # This path runs whenever ssh_sudo is set without passwordless sudo.
+            # It used to be a bare proc.wait(): no stall check, no wall clock, no
+            # bound of any kind, so a remote that wedged mid-apply hung the client
+            # forever -- while the README promised a fallback limit would apply.
+            # wait_with_progress is the same primitive the other receive paths
+            # use and is a drop-in for the blocking call: it gives up when bytes
+            # stop moving, and falls back to a wall limit when progress cannot be
+            # measured at all.
+            from ..core.transfer import wait_with_progress
+
+            try:
+                wait_with_progress(
+                    proc,
+                    stall_pids=[proc.pid],
+                    stall_timeout=int(
+                        self.config.get("transfer_stall_timeout", STALL_TIMEOUT_SECONDS)
+                    ),
+                    description="ssh sudo pipeline transfer",
+                )
+            except subprocess.TimeoutExpired:
+                logger.error(
+                    "Transfer stopped making progress and was ended; the remote "
+                    "receive may have wedged mid-apply."
+                )
+                proc.kill()
+                proc.wait()
             stderr_thread.join(timeout=5)
 
             # received_name (the source basename: == snapshot_name for native,
