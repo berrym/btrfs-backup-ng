@@ -35,9 +35,12 @@ exists to prevent. There are currently no such cells.
 
 from __future__ import annotations
 
+import shlex
+
 import pytest
 
 from .conftest import (
+    requires_container,
     assert_payload_restored,
     requires_local,
     requires_raw_remote,
@@ -364,6 +367,113 @@ class TestForeignRawTarget:
         assert info.total_bytes != here.f_blocks * here.f_frsize, (
             "the reported size equals this host's root filesystem"
         )
+
+
+# --------------------------------------------------------------------------- #
+# sudoers policy -- the axis no physical host in this suite can represent
+# --------------------------------------------------------------------------- #
+class TestSudoersPolicies:
+    """`ssh_sudo` without passwordless sudo, against real sudoers policies.
+
+    .70 has NOPASSWD for btrfs, so it can never reach the password-sudo branch,
+    and giving it a password-only policy would mean editing /etc/sudoers on a
+    machine someone else relies on. A throwaway container is the only honest way
+    to cover these, and it is where the defect was found: the compressed receive
+    elevated a SHELL (`sudo -S sh -c '<decompress> | btrfs receive'`), which the
+    btrfs-only sudoers recipe in this project's own README refuses.
+
+    The command under test is the one the code actually emits, not a
+    reconstruction -- a hand-written approximation passed while the real string
+    failed, because it lacked the backgrounding that moves sudo's credential
+    ticket to a different parent pid.
+    """
+
+    #: (label, sudoers body, must the payload arrive?)
+    POLICIES = [
+        ("full-sudo-caching", "bbng ALL=(ALL) ALL", True),
+        ("btrfs-only-caching", "bbng ALL=(ALL) /usr/bin/btrfs", True),
+        (
+            "full-sudo-no-caching",
+            "bbng ALL=(ALL) ALL\nDefaults:bbng timestamp_timeout=0",
+            True,
+        ),
+        # Not a gap this release can close: sudo wants the password for every
+        # invocation, and stdin is carrying the stream. It fails identically
+        # before this fix, so it is pinned as known-unreachable rather than
+        # quietly omitted.
+        (
+            "btrfs-only-no-caching",
+            "bbng ALL=(ALL) /usr/bin/btrfs\nDefaults:bbng timestamp_timeout=0",
+            False,
+        ),
+    ]
+
+    #: /bin/sh differs across these three, and this project has shipped two bugs
+    #: from exactly that difference.
+    IMAGES = ["fedora:latest", "debian:stable-slim", "alpine:latest"]
+
+    @requires_container
+    @pytest.mark.parametrize("image", IMAGES)
+    @pytest.mark.parametrize("label,sudoers,must_arrive", POLICIES)
+    def test_the_emitted_receive_command_under_a_sudoers_policy(
+        self, tmp_path, image, label, sudoers, must_arrive
+    ):
+        from btrfs_backup_ng.endpoint.ssh import _build_receive_command
+
+        from .conftest import run_in_container
+
+        emitted = _build_receive_command(
+            "/backup/dest", use_sudo=True, password_on_stdin=True, decompress="gzip"
+        )
+        command_file = tmp_path / "emitted.txt"
+        command_file.write_text(emitted)
+
+        script = r"""
+set -e
+if command -v dnf >/dev/null 2>&1; then
+    dnf -q -y install sudo shadow-utils util-linux gzip >/dev/null 2>&1
+elif command -v apk >/dev/null 2>&1; then
+    apk add --quiet sudo shadow util-linux gzip >/dev/null 2>&1
+else
+    apt-get -qq update >/dev/null 2>&1
+    apt-get -qq install -y sudo gzip >/dev/null 2>&1
+fi
+useradd -m bbng 2>/dev/null || adduser -D bbng 2>/dev/null
+echo 'bbng:hunter2' | chpasswd
+mkdir -p /backup
+cat > /usr/bin/btrfs <<'STUB'
+#!/bin/sh
+case "${1:-}" in --version) echo "btrfs-progs v6.17"; exit 0;; esac
+cat > /tmp/received.bin
+STUB
+chmod 755 /usr/bin/btrfs
+printf 'PAYLOAD-BYTES-THAT-MUST-SURVIVE
+' | gzip > /tmp/data.gz
+printf '%b
+' "$SUDOERS" > /etc/sudoers.d/bbng
+chmod 440 /etc/sudoers.d/bbng
+CMD=$(cat /emitted.txt)
+{ printf 'hunter2
+'; cat /tmp/data.gz; } | runuser -u bbng -- sh -c "$CMD" >/dev/null 2>&1 || true
+echo "DELIVERED:$(cat /tmp/received.bin 2>/dev/null || echo NOTHING)"
+"""
+        result = run_in_container(
+            image,
+            f"SUDOERS={shlex.quote(sudoers)}; {script}",
+            mounts={str(command_file): "/emitted.txt"},
+        )
+        arrived = "DELIVERED:PAYLOAD-BYTES-THAT-MUST-SURVIVE" in result.stdout
+
+        if must_arrive:
+            assert arrived, (
+                f"{image} / {label}: the backup did not arrive.\n"
+                f"stdout: {result.stdout[-1500:]}\nstderr: {result.stderr[-1500:]}"
+            )
+        else:
+            assert not arrived, (
+                f"{image} / {label} now works. That is good news, but this cell "
+                "pins it as unreachable -- confirm why and update the policy table."
+            )
 
 
 # --------------------------------------------------------------------------- #

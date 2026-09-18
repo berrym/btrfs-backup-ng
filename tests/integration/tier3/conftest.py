@@ -132,6 +132,45 @@ requires_raw_remote = pytest.mark.skipif(
 )
 
 
+#: The container runtime used by the sudoers axis below. Podman is preferred
+#: because it needs no daemon and runs rootless.
+CONTAINER_CMD = os.environ.get("BBNG_TEST_CONTAINER") or (
+    shutil.which("podman") or shutil.which("docker") or ""
+)
+
+
+@functools.cache
+def _have_container() -> bool:
+    if not CONTAINER_CMD:
+        return False
+    r = subprocess.run(
+        [CONTAINER_CMD, "info"], capture_output=True, timeout=120, check=False
+    )
+    return r.returncode == 0
+
+
+requires_container = pytest.mark.skipif(
+    _Deferred(lambda: not _have_container()),
+    reason="Tier 3 sudoers cells need podman or docker",
+)
+
+
+def run_in_container(image: str, script: str, mounts: dict[str, str] | None = None):
+    """Run ``script`` as root in a throwaway container.
+
+    A real remote answers "is this permitted" from its sudoers policy, and the
+    hosts this suite targets cannot represent the interesting policies without
+    editing their /etc/sudoers -- a persistent change to a machine someone else
+    relies on, which the teardown rule exists to prevent. A container is the
+    only honest way to cover them, and `--rm` means it leaves nothing behind.
+    """
+    argv = [CONTAINER_CMD, "run", "--rm"]
+    for host_path, container_path in (mounts or {}).items():
+        argv += ["-v", f"{host_path}:{container_path}:ro,Z"]
+    argv += [image, "sh", "-c", script]
+    return subprocess.run(argv, capture_output=True, text=True, timeout=900)
+
+
 def sh(cmd, timeout=900, check=False):
     r = subprocess.run(
         cmd, shell=isinstance(cmd, str), capture_output=True, text=True, timeout=timeout
