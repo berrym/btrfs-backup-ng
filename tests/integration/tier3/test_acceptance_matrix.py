@@ -21,14 +21,16 @@ and nothing else, so `sudo mkdir` and `sudo sh` are refused.
 
 Note on ssh_sudo: it is required for ssh:// (btrfs receive needs root) and
 unnecessary for raw:// and raw+ssh:// (writing a stream file does not). Setting
-it on a raw target is what breaks that target -- which is a defect in how the
-option is handled, not a broken transport. An earlier draft of this file marked
-plain raw+ssh as broken; that was a harness error, not a product one.
+it on a raw target used to break that target; it now elevates only where
+elevation is actually needed, so the option is safe to set anywhere. An earlier
+draft of this file marked plain raw+ssh as broken; that was a harness error,
+not a product one.
 
-They are marked xfail(strict=True) rather than left failing, so this file stays
-green while remaining an accurate inventory: the moment a fix makes one pass,
-XPASS fails the run and the marker must be removed. Do not relax a marker to
-make a run green -- that is the failure mode this suite exists to prevent.
+Known-broken cells are marked xfail(strict=True) rather than left failing, so
+this file stays green while remaining an accurate inventory: the moment a fix
+makes one pass, XPASS fails the run and the marker must be removed. Do not
+relax a marker to make a run green -- that is the failure mode this suite
+exists to prevent. There are currently no such cells.
 """
 
 from __future__ import annotations
@@ -44,10 +46,18 @@ from .conftest import (
 
 pytestmark = [pytest.mark.tier3, requires_local]
 
-BROKEN_SUDO_MKDIR = (
-    "raw+ssh: remote mkdir runs under sudo, which a btrfs-only sudoers policy refuses"
+#: NOT a marker on any cell -- an untested hypothesis, recorded so it is not
+#: mistaken for covered ground. The nearest real code is ssh.py's compressed
+#: receive, which under ssh_sudo WITHOUT passwordless sudo elevates a shell
+#: (`sudo -S sh -c "<decompressor> | btrfs receive"`) rather than the btrfs
+#: binary, and a strictly btrfs-only sudoers policy would refuse that. The
+#: matrix cannot reach it: the branch is taken only when `sudo -n btrfs` fails
+#: on the remote, and the host this suite runs against has passwordless sudo
+#: for btrfs. Proving or disproving it needs a password-sudo host.
+UNTESTED_SUDO_SH = (
+    "ssh:// with compression and ssh_sudo but no passwordless sudo elevates "
+    "`sh`, not `btrfs`; unverified against a btrfs-only sudoers policy"
 )
-BROKEN_SUDO_SH = "snapper over ssh: the slot script runs under `sudo sh`, which a btrfs-only sudoers policy refuses"
 
 
 def _lifecycle(rig, config, *, location, prefix, extra_args=(), snapper=False):
