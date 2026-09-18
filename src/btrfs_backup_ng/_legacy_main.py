@@ -356,7 +356,11 @@ def run_task(options):
             any_failed = True
 
     time.sleep(1)
-    cleanup_snapshots(source_endpoint, destination_endpoints, options)
+    # A retention failure is a failure of the run: the backup may be safe but
+    # the target is not being kept within its policy, and reporting success
+    # hides that until the disk fills.
+    if not cleanup_snapshots(source_endpoint, destination_endpoints, options):
+        any_failed = True
     return not any_failed
 
 
@@ -411,22 +415,59 @@ def log_initial_settings(options):
     logger.debug("Use sudo at SSH remote host: %r", options["ssh_sudo"])
 
 
+def _report_deletion(result, what) -> bool:
+    """Report one deletion batch and say whether it succeeded.
+
+    ``delete_old_snapshots`` returns a DeletionResult saying what it actually
+    did. Both call sites here discarded it, so a batch that deleted nothing --
+    because a lock file was unreadable, a target was busy, or every btrfs delete
+    failed -- was indistinguishable from a clean prune. A skip is not a failure:
+    refusing to delete a locked snapshot is the guard working.
+    """
+    if result is None:  # pragma: no cover - endpoints all return a result now
+        return True
+    if result.deleted_count:
+        logger.info("Deleted %d old %s", result.deleted_count, what)
+    for snapshot, reason in result.skipped:
+        logger.info("Kept %s: %s", snapshot, reason)
+    for snapshot, error in result.failed:
+        logger.error("FAILED to delete %s: %s", snapshot, error)
+    return result.ok
+
+
 def cleanup_snapshots(source_endpoint, destination_endpoints, options):
-    """Clean up old snapshots."""
+    """Clean up old snapshots.
+
+    Returns True when every deletion the retention policy asked for either
+    happened or was deliberately skipped. A failure used to be logged at DEBUG
+    and dropped, so a run whose retention failed outright still reported
+    success -- while the target filled up. The modern `run` path already exits
+    non-zero rather than silently skipping retention; this matches it.
+    """
     logger.info(__util__.log_heading("Cleaning up..."))
+    clean = True
     if options.get("num_snapshots", 0) > 0:
         try:
-            source_endpoint.delete_old_snapshots(options["num_snapshots"])
+            clean &= _report_deletion(
+                source_endpoint.delete_old_snapshots(options["num_snapshots"]),
+                "source snapshot(s)",
+            )
         except __util__.AbortError as e:
-            logger.debug("Error while deleting source snapshots: %s", e)
+            logger.error("Error while deleting source snapshots: %s", e)
+            clean = False
 
     if options.get("num_backups", 0) > 0:
         for destination_endpoint in destination_endpoints:
             try:
-                destination_endpoint.delete_old_snapshots(options["num_backups"])
+                clean &= _report_deletion(
+                    destination_endpoint.delete_old_snapshots(options["num_backups"]),
+                    f"backup(s) on {destination_endpoint}",
+                )
             except __util__.AbortError as e:
-                logger.debug("Error while deleting backups: %s", e)
+                logger.error("Error while deleting backups: %s", e)
+                clean = False
     logger.info(__util__.log_heading(f"Finished at {time.ctime()}"))
+    return clean
 
 
 def prepare_source_endpoint(options):
