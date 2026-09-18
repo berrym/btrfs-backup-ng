@@ -675,11 +675,18 @@ def _send_prune_notifications(
     if not notif_config.is_enabled():
         return
 
-    # Determine overall status
+    # Determine overall status.
+    #
+    # `volumes_failed` counts only volumes that failed while being PLANNED. A
+    # deletion that fails during execution is recorded in `errors` and makes the
+    # command exit 1, but it never touches that counter -- so a prune in which
+    # every deletion failed used to notify "success" while exiting non-zero. The
+    # notification is what an unattended operator actually sees, so it must not
+    # be the more optimistic of the two.
     status: Literal["success", "failure", "partial"]
-    if volumes_failed == 0:
+    if volumes_failed == 0 and not errors:
         status = "success"
-    elif volumes_failed == volumes_processed:
+    elif volumes_processed > 0 and volumes_failed == volumes_processed:
         status = "failure"
     else:
         status = "partial"
