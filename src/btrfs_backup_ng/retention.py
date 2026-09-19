@@ -96,22 +96,34 @@ def parse_duration(duration_str: str) -> timedelta:
     value = int(match.group("value"))
     unit = match.group("unit")
 
-    if unit == "s":
-        return timedelta(seconds=value)
-    elif unit == "m":
-        return timedelta(minutes=value)
-    elif unit == "h":
-        return timedelta(hours=value)
-    elif unit == "d":
-        return timedelta(days=value)
-    elif unit == "w":
-        return timedelta(weeks=value)
-    elif unit == "M":
-        return timedelta(days=value * 30)  # Approximate
-    elif unit == "y":
-        return timedelta(days=value * 365)  # Approximate
-    else:
-        raise ValueError(f"Unknown duration unit: {unit}")
+    # timedelta raises OverflowError, not ValueError, once the value exceeds its
+    # range -- and OverflowError is an ArithmeticError, so none of the three
+    # `except ValueError` guards that wrap this function catch it. It escaped
+    # the loader's boundary check and surfaced inside the destructive prune
+    # path. Out-of-range is a bad duration like any other, so it is reported as
+    # one here, at the producer, and every existing guard works unchanged.
+    try:
+        if unit == "s":
+            return timedelta(seconds=value)
+        elif unit == "m":
+            return timedelta(minutes=value)
+        elif unit == "h":
+            return timedelta(hours=value)
+        elif unit == "d":
+            return timedelta(days=value)
+        elif unit == "w":
+            return timedelta(weeks=value)
+        elif unit == "M":
+            return timedelta(days=value * 30)  # Approximate
+        elif unit == "y":
+            return timedelta(days=value * 365)  # Approximate
+        else:
+            raise ValueError(f"Unknown duration unit: {unit}")
+    except OverflowError as e:
+        raise ValueError(
+            f"Duration out of range: {duration_str!r}. The longest duration this "
+            f"tool can represent is about 999999999 days (roughly 2.7 million years)."
+        ) from e
 
 
 def _subtract_months(dt: datetime, months: int) -> datetime:
@@ -140,11 +152,24 @@ def subtract_duration(now: datetime, duration_str: str) -> datetime:
         raise ValueError(f"Invalid duration format: {duration_str}")
     value = int(match.group("value"))
     unit = match.group("unit")
-    if unit == "M":
-        return _subtract_months(now, value)
-    if unit == "y":
-        return _subtract_months(now, value * 12)
-    return now - parse_duration(s)
+    # Two ways the arithmetic goes out of range, neither of them a ValueError as
+    # written: `now - timedelta` raises OverflowError for a duration parse_duration
+    # itself accepted (999999999d parses, then overflows the subtraction), and the
+    # calendar arm raises ValueError naming a negative year, which tells the
+    # operator nothing about the value they typed. Both become one plain report
+    # against the duration string.
+    try:
+        if unit == "M":
+            return _subtract_months(now, value)
+        if unit == "y":
+            return _subtract_months(now, value * 12)
+        return now - parse_duration(s)
+    except (OverflowError, ValueError) as e:
+        raise ValueError(
+            f"Duration out of range: {duration_str!r}. Subtracting it from the "
+            f"current time lands outside the dates this tool can represent "
+            f"(years 1 through 9999)."
+        ) from e
 
 
 @dataclass
