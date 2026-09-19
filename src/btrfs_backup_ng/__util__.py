@@ -12,6 +12,7 @@ from collections.abc import Iterator
 import stat as stat_module
 import subprocess
 import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
 
@@ -87,7 +88,13 @@ class Snapshot:
         self.prefix = prefix
         self.endpoint = endpoint
         if time_obj is None:
-            time_obj = str_to_date()
+            # localtime() directly, NOT str_to_date(): that round-trips through
+            # DATE_FORMAT, and strptime returns tm_gmtoff=None / tm_isdst=-1, so
+            # a snapshot created under a timestamp_format containing %z was
+            # named without its offset and the tool could then not resolve its
+            # own path. The round trip's stated purpose was to drop sub-second
+            # precision, which struct_time cannot hold in the first place.
+            time_obj = time.localtime()
         self.time_obj = time_obj
         # The format used to render/parse this snapshot's timestamp. Stored per
         # instance so a snapshot parsed under a legacy format regenerates the
@@ -298,11 +305,40 @@ def log_heading(caption: str) -> str:
 def date_to_str(
     timestamp: time.struct_time | None = None, fmt: str | None = None
 ) -> str:
-    """Convert date format to string."""
+    """Convert date format to string.
+
+    ``%z`` is rendered here rather than by ``time.strftime``, which takes the
+    offset from ``tm_zone`` -- a field ``time.strptime`` leaves as None. So a
+    name that CARRIED an offset lost it on re-render: parsing
+    ``20260919T011855-0400`` gives ``tm_gmtoff=-14400`` but ``tm_zone=None``,
+    and strftime returned ``20260919T011855``. Since ``Snapshot.get_name()``
+    regenerates the on-disk name through here and ``get_path()`` builds a path
+    from it, every caller that resolves a path from a Snapshot -- delete, lock,
+    send, verify -- was pointed at a name that does not exist. Reachable from a
+    shipped feature: ``config import`` emits ``%Y%m%dT%H%M%S%z`` for btrbk's
+    ``long-iso``.
+
+    ``%Z`` (the zone NAME) is deliberately left to strftime: it has no
+    equivalent in ``tm_gmtoff`` and inventing one would be worse than omitting
+    it.
+    """
     if timestamp is None:
         timestamp = time.localtime()
     if fmt is None:
         fmt = DATE_FORMAT
+    offset = getattr(timestamp, "tm_gmtoff", None)
+    if "%z" in fmt and offset is not None:
+        try:
+            aware = datetime(*timestamp[:6], tzinfo=timezone(timedelta(seconds=offset)))
+        except (ValueError, TypeError, OverflowError):
+            # datetime rejects a leap second (tm_sec == 60) where strftime
+            # accepts it. Naming a snapshot is too central to fail over
+            # rendering an offset, so fall back rather than refuse to name it.
+            # A struct_time malformed beyond that is NOT rescued here -- the
+            # fallback rejects it too (measured) -- but the stdlib does not
+            # produce one.
+            return time.strftime(fmt, timestamp)
+        return aware.strftime(fmt)
     return time.strftime(fmt, timestamp)
 
 
