@@ -22,6 +22,7 @@ import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from .__util__ import toml_str
 from .core.transfer import COMPRESSION_PROGRAMS
 from .endpoint.raw_metadata import COMPRESSION_CONFIG
 
@@ -652,7 +653,7 @@ def _retention_block(
         warnings += w
     else:
         min_str = "1d"
-    lines.append(f'min = "{min_str}"')
+    lines.append("min = " + toml_str(min_str))
 
     if preserve is not None:
         counts, w = _parse_preserve_counts(preserve)
@@ -726,7 +727,9 @@ def convert_to_toml(btrbk_config: BtrbkConfig) -> tuple[str, list[str]]:
 
     # Map btrbk options to btrfs-backup-ng
     if "snapshot_dir" in btrbk_config.global_options:
-        lines.append(f'snapshot_dir = "{btrbk_config.global_options["snapshot_dir"]}"')
+        lines.append(
+            "snapshot_dir = " + toml_str(btrbk_config.global_options["snapshot_dir"])
+        )
     else:
         lines.append('snapshot_dir = ".snapshots"')
 
@@ -736,14 +739,14 @@ def convert_to_toml(btrbk_config: BtrbkConfig) -> tuple[str, list[str]]:
     )
     if btrbk_ts_format in BTRBK_TIMESTAMP_FORMATS:
         strftime_format = BTRBK_TIMESTAMP_FORMATS[btrbk_ts_format]
-        lines.append(f'timestamp_format = "{strftime_format}"')
+        lines.append("timestamp_format = " + toml_str(strftime_format))
     else:
         # Unknown format, use btrbk's default (long)
         warnings.append(
             f"Unknown btrbk timestamp_format '{btrbk_ts_format}', "
             f"using 'long' format for compatibility"
         )
-        lines.append(f'timestamp_format = "{BTRBK_TIMESTAMP_FORMATS["long"]}"')
+        lines.append("timestamp_format = " + toml_str(BTRBK_TIMESTAMP_FORMATS["long"]))
 
     incremental = btrbk_config.global_options.get("incremental", "yes")
     lines.append(f"incremental = {str(incremental != 'no').lower()}")
@@ -792,7 +795,7 @@ def convert_to_toml(btrbk_config: BtrbkConfig) -> tuple[str, list[str]]:
                 full_path = volume.path
 
             lines.append("[[volumes]]")
-            lines.append(f'path = "{full_path}"')
+            lines.append("path = " + toml_str(full_path))
 
             # Snapshot prefix from options or generate from path
             prefix = subvolume.options.get(
@@ -800,7 +803,7 @@ def convert_to_toml(btrbk_config: BtrbkConfig) -> tuple[str, list[str]]:
             )
             if not prefix:
                 prefix = full_path.strip("/").replace("/", "-") or "root"
-            lines.append(f'snapshot_prefix = "{prefix}"')
+            lines.append("snapshot_prefix = " + toml_str(prefix))
 
             # Snapshot directory
             snap_dir = subvolume.options.get(
@@ -810,7 +813,7 @@ def convert_to_toml(btrbk_config: BtrbkConfig) -> tuple[str, list[str]]:
                     btrbk_config.global_options.get("snapshot_dir", ".snapshots"),
                 ),
             )
-            lines.append(f'snapshot_dir = "{snap_dir}"')
+            lines.append("snapshot_dir = " + toml_str(snap_dir))
 
             # Per-volume retention override. Emit a [volumes.retention] block only
             # when the subvolume or its parent volume explicitly set a preserve
@@ -1003,7 +1006,7 @@ def convert_to_toml(btrbk_config: BtrbkConfig) -> tuple[str, list[str]]:
                             target_path = f"{scheme}{ssh_user}@{rest}"
                             break
 
-                lines.append(f'path = "{target_path}"')
+                lines.append("path = " + toml_str(target_path))
 
                 # A local target has no ssh connection to configure. Emitting
                 # these put irrelevant credentials in the block and made the
@@ -1013,7 +1016,7 @@ def convert_to_toml(btrbk_config: BtrbkConfig) -> tuple[str, list[str]]:
                 # layout (/mnt/backup/@snapshots), which is not a remote target.
                 is_remote_target = bool(_REMOTE_TARGET_RE.match(target_path))
                 if ssh_identity and is_remote_target:
-                    lines.append(f'ssh_key = "{ssh_identity}"')
+                    lines.append("ssh_key = " + toml_str(ssh_identity))
                 if ssh_port and is_remote_target:
                     port = str(ssh_port).strip()
                     if port.isdigit():
@@ -1024,7 +1027,7 @@ def convert_to_toml(btrbk_config: BtrbkConfig) -> tuple[str, list[str]]:
                             f"number and was not carried over"
                         )
                 if target_rate_limit and str(target_rate_limit) not in ("no", "0"):
-                    lines.append(f'rate_limit = "{target_rate_limit}"')
+                    lines.append("rate_limit = " + toml_str(target_rate_limit))
 
                 # stream_compress -> compress, for targets that are not raw. A raw
                 # target takes its method from raw_target_compress below, and setting
@@ -1050,7 +1053,7 @@ def convert_to_toml(btrbk_config: BtrbkConfig) -> tuple[str, list[str]]:
                     method = str(stream_compress)
                     method = _BTRBK_METHOD_ALIASES.get(method, method)
                     if method in _STREAM_COMPRESS_SUPPORTED:
-                        lines.append(f'compress = "{method}"')
+                        lines.append("compress = " + toml_str(method))
                     else:
                         warnings.append(
                             f"Line {target.line}: stream_compress '{method}' is not "
@@ -1107,7 +1110,7 @@ def convert_to_toml(btrbk_config: BtrbkConfig) -> tuple[str, list[str]]:
                         # appeared to succeed and the first run died on its own
                         # output. Say so here, and leave the setting out.
                         if compress in _RAW_COMPRESS_SUPPORTED:
-                            lines.append(f'compress = "{compress}"')
+                            lines.append("compress = " + toml_str(compress))
                         else:
                             warnings.append(
                                 f"Line {target.line}: raw_target_compress "
@@ -1129,7 +1132,9 @@ def convert_to_toml(btrbk_config: BtrbkConfig) -> tuple[str, list[str]]:
                             )
                             if gpg_recipient:
                                 lines.append('encrypt = "gpg"')
-                                lines.append(f'gpg_recipient = "{gpg_recipient}"')
+                                lines.append(
+                                    "gpg_recipient = " + toml_str(gpg_recipient)
+                                )
                             else:
                                 # The loader REFUSES encrypt=gpg without a
                                 # recipient, so emitting it produced a file that
@@ -1154,7 +1159,7 @@ def convert_to_toml(btrbk_config: BtrbkConfig) -> tuple[str, list[str]]:
                                 or btrbk_config.global_options.get("gpg_keyring")
                             )
                             if gpg_keyring:
-                                lines.append(f'gpg_keyring = "{gpg_keyring}"')
+                                lines.append("gpg_keyring = " + toml_str(gpg_keyring))
                         elif raw_encrypt == "openssl_enc":
                             lines.append('encrypt = "openssl_enc"')
                             warnings.append(

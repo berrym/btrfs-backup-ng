@@ -4,12 +4,14 @@ import argparse
 import logging
 import os
 import sys
+import tempfile
 from pathlib import Path
 from typing import Any
 
 from ..__logger__ import create_logger
 from ..config import ConfigError, find_config_file, load_config
 from .. import __util__
+from ..__util__ import toml_str
 from ..config.loader import generate_example_config, get_default_config_path
 from .common import _MEMORY_BACKED_FILESYSTEMS, get_log_level
 from .wizard_utils import (
@@ -129,29 +131,43 @@ def _prompt_int(
             print("  Please enter a valid number.")
 
 
-def _toml_str(value: str) -> str:
-    """Return ``value`` as a quoted, escaped TOML basic string.
+# One canonical implementation, in __util__, shared with the btrbk importer --
+# which emitted its own unescaped f-strings and silently corrupted any path
+# containing a backslash. Kept under the original private name so this module's
+# call sites are unchanged.
+_toml_str = toml_str
 
-    Free-text wizard inputs (a gpg keyring PATH, an openssl cipher, a gpg
-    recipient) can contain a backslash or double-quote. Interpolated raw into a
-    TOML basic string those either make the config unparseable OR -- worse --
-    silently corrupt it (``\\t`` in a path becomes a literal tab, a valid TOML
-    escape, so it loads with the WRONG value). Escaping backslash/quote/control
-    characters makes serialization lossless.
 
-    ``_generate_config_from_wizard`` routes EVERY string value through this helper
-    (paths, log files, notification fields, snapper config name, prefixes, ...).
-    Numeric and boolean fields are emitted unquoted and do not use it.
+def _unloadable_reason(content: str) -> str | None:
+    """Return why ``content`` is not a configuration this tool can load back.
+
+    Returns None when it loads. Validated through ``load_config`` itself rather
+    than a ``tomllib.loads`` stand-in, so the check answers the only question
+    that matters -- will the file we are about to write work -- instead of a
+    narrower one that happens to be easier to ask.
+
+    The importer used to emit a conversion, print "Configuration written to:"
+    and exit 0 for content the very next ``config validate`` rejected. The
+    wizard was worse: its parse attempt sat inside ``except Exception: pass``
+    and only gated a summary table, so an unparseable conversion was written
+    over the operator's real configuration and the wizard still returned 0.
     """
-    escaped = (
-        str(value)
-        .replace("\\", "\\\\")
-        .replace('"', '\\"')
-        .replace("\n", "\\n")
-        .replace("\r", "\\r")
-        .replace("\t", "\\t")
+    handle = tempfile.NamedTemporaryFile(
+        "w", suffix=".toml", prefix="bbng-verify-", delete=False, encoding="utf-8"
     )
-    return f'"{escaped}"'
+    probe = Path(handle.name)
+    try:
+        handle.write(content)
+        handle.close()
+        load_config(probe)
+    except ConfigError as e:
+        return str(e)
+    except OSError as e:
+        return f"could not verify the generated configuration: {e}"
+    finally:
+        handle.close()
+        probe.unlink(missing_ok=True)
+    return None
 
 
 def _prompt_target_encryption(target_path: str) -> dict[str, Any]:
@@ -872,6 +888,21 @@ def _import_config(args: argparse.Namespace) -> int:
             print(f"#   {warning}", file=sys.stderr)
         print("", file=sys.stderr)
 
+    reason = _unloadable_reason(toml_content)
+    if reason is not None:
+        print(
+            "# Refusing to write: the converted configuration cannot be loaded back",
+            file=sys.stderr,
+        )
+        print(f"#   {reason}", file=sys.stderr)
+        print(
+            "# The conversion is printed below so nothing is lost. Please report "
+            "this with the btrbk config it came from.",
+            file=sys.stderr,
+        )
+        print(toml_content)
+        return 1
+
     # Output TOML
     output = getattr(args, "output", None)
     if output:
@@ -1188,6 +1219,16 @@ def _save_wizard_config(content: str) -> int:
         console.print()
         console.print(content)
         return 0
+
+    reason = _unloadable_reason(content)
+    if reason is not None:
+        console.print()
+        console.print(
+            "[red]Refusing to save:[/red] the generated configuration cannot be "
+            f"loaded back ({reason})"
+        )
+        console.print("[yellow]Nothing was written.[/yellow]")
+        return 1
 
     # Save to file
     save_path = prompt("Save configuration to", default_path)

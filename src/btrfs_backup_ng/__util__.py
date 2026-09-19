@@ -313,6 +313,46 @@ _SSH_HOST_RE = re.compile(
 )
 
 
+# TOML basic strings must escape the backslash, the double quote, and every C0
+# control character plus DEL (TOML 1.0, "Basic strings"). Tab is legal raw but is
+# escaped here too, so the output is readable.
+_TOML_SIMPLE_ESCAPES = {
+    "\\": "\\\\",
+    '"': '\\"',
+    "\b": "\\b",
+    "\t": "\\t",
+    "\n": "\\n",
+    "\f": "\\f",
+    "\r": "\\r",
+}
+
+
+def toml_str(value: str) -> str:
+    """Return ``value`` as a quoted, escaped TOML basic string.
+
+    THE canonical way this project turns a Python string into TOML. Config
+    generators interpolated values straight into ``f'key = "{value}"'``, which
+    fails two ways on a path a user can legitimately have. A double quote ends
+    the string early and the file will not parse -- loud, at least. A backslash
+    is worse: ``/mnt/a\\backup`` emits ``"/mnt/a\\backup"``, TOML reads ``\\b`` as
+    a backspace, and the config loads CLEANLY pointing at ``/mnt/a\\x08ackup``.
+    A backup tool then snapshots and prunes a directory the operator never named.
+
+    Escaping every character TOML requires makes the round trip lossless, so a
+    generated config means what the source it was converted from meant.
+    """
+    out: list[str] = []
+    for char in str(value):
+        escape = _TOML_SIMPLE_ESCAPES.get(char)
+        if escape is not None:
+            out.append(escape)
+        elif char < " " or char == "\x7f":
+            out.append(f"\\u{ord(char):04X}")
+        else:
+            out.append(char)
+    return '"' + "".join(out) + '"'
+
+
 def validated_ssh_host(host: str, *, username: str | None = None) -> str:
     """Return ``host`` (or ``user@host``) after checking ssh can be given it.
 
