@@ -68,6 +68,12 @@ class Token:
     value: str
     line: int
     column: int
+    # Absolute offsets into the source. btrbk's grammar is line-oriented -- a
+    # directive is a keyword and then the REST OF THE LINE, verbatim -- so a
+    # value cannot be rebuilt by rejoining tokens without inventing whitespace
+    # that was not there. The parser slices the original text instead.
+    start: int = 0
+    end: int = 0
 
 
 @dataclass
@@ -201,6 +207,7 @@ class BtrbkLexer:
     def _read_keyword_or_value(self) -> None:
         """Read a keyword or unquoted value."""
         start_col = self.column
+        start_pos = self.pos
         word = ""
 
         # First, read the initial word part
@@ -256,7 +263,11 @@ class BtrbkLexer:
         }
 
         if word in keywords:
-            self.tokens.append(Token(TokenType.KEYWORD, word, self.line, start_col))
+            self.tokens.append(
+                Token(
+                    TokenType.KEYWORD, word, self.line, start_col, start_pos, self.pos
+                )
+            )
         else:
             # If followed by path characters, continue reading as a value
             # This handles cases like "ssh://..." or "user@host:..."
@@ -265,11 +276,14 @@ class BtrbkLexer:
                 if char in " \t\n#":
                     break
                 word += self._advance()
-            self.tokens.append(Token(TokenType.VALUE, word, self.line, start_col))
+            self.tokens.append(
+                Token(TokenType.VALUE, word, self.line, start_col, start_pos, self.pos)
+            )
 
     def _read_quoted_string(self) -> None:
         """Read a quoted string value."""
         start_col = self.column
+        start_pos = self.pos
         quote = self._advance()
         value = ""
         while self.pos < len(self.content) and self.content[self.pos] != quote:
@@ -281,25 +295,31 @@ class BtrbkLexer:
                 value += self._advance()
         if self.pos < len(self.content):
             self._advance()  # closing quote
-        self.tokens.append(Token(TokenType.VALUE, value, self.line, start_col))
+        self.tokens.append(
+            Token(TokenType.VALUE, value, self.line, start_col, start_pos, self.pos)
+        )
 
     def _read_value(self) -> None:
         """Read an unquoted value (path, URL, etc)."""
         start_col = self.column
+        start_pos = self.pos
         value = ""
         while self.pos < len(self.content):
             char = self.content[self.pos]
             if char in " \t\n#":
                 break
             value += self._advance()
-        self.tokens.append(Token(TokenType.VALUE, value, self.line, start_col))
+        self.tokens.append(
+            Token(TokenType.VALUE, value, self.line, start_col, start_pos, self.pos)
+        )
 
 
 class BtrbkParser:
     """Parser for btrbk configuration files."""
 
-    def __init__(self, tokens: list[Token]):
+    def __init__(self, tokens: list[Token], content: str = ""):
         self.tokens = tokens
+        self.content = content
         self.pos = 0
         self.config = BtrbkConfig()
         self.current_volume: BtrbkVolume | None = None
@@ -372,6 +392,69 @@ class BtrbkParser:
         else:
             self._advance()
 
+    @staticmethod
+    def _strip_comment(text: str) -> str:
+        """Drop an unquoted ``#`` and everything after it, as btrbk does.
+
+        btrbk removes comments with a quote-aware substitution before it splits
+        the line, and a ``#`` needs no preceding space: ``volume /mnt/a#b`` is
+        the path ``/mnt/a`` (measured).
+        """
+        quote = ""
+        for index, char in enumerate(text):
+            if quote:
+                if char == quote:
+                    quote = ""
+            elif char in "\"'":
+                quote = char
+            elif char == "#":
+                return text[:index]
+        return text
+
+    @staticmethod
+    def _unquote(text: str) -> str:
+        """Strip one layer of matching surrounding quotes, as btrbk does."""
+        if len(text) >= 2 and text[0] == text[-1] and text[0] in "\"'":
+            return text[1:-1]
+        return text
+
+    def _consume_rest_of_line(self, first: Token) -> str:
+        """Return the value the way btrbk reads it: the whole rest of the line.
+
+        btrbk matches ``^([a-zA-Z_]+)(?:\\s+(.*))?$`` against the comment-stripped,
+        whitespace-trimmed line, so a directive's value runs to end of line and
+        keeps its internal spacing exactly as written. Measured against btrbk
+        0.32.7:
+
+            volume /mnt/sp ace          ->  /mnt/sp ace
+            volume /mnt/two  spaces     ->  /mnt/two  spaces   (both spaces kept)
+            volume "/mnt/quoted path"   ->  /mnt/quoted path   (quotes stripped)
+            volume /mnt/a#b             ->  /mnt/a
+
+        This parser is token-based, and the section directives took only the
+        FIRST token, so every path was truncated at its first space and a
+        converted config silently named a different directory. Rejoining the
+        tokens would not be correct either -- it invents single spaces where the
+        source had a tab or several. The original text is sliced instead.
+        """
+        if not self.content:
+            self._advance()
+            return first.value
+
+        newline = self.content.find("\n", first.start)
+        line_end = len(self.content) if newline == -1 else newline
+        raw = self._strip_comment(self.content[first.start : line_end]).rstrip()
+
+        while not self._is_at_end():
+            token = self._current()
+            if token.type not in (TokenType.VALUE, TokenType.KEYWORD):
+                break
+            if token.line != first.line:
+                break
+            self._advance()
+
+        return self._unquote(raw)
+
     def _parse_volume(self) -> None:
         """Parse a volume section."""
         path_token = self._current()
@@ -381,8 +464,8 @@ class BtrbkParser:
             )
             return
 
-        self._advance()
-        self.current_volume = BtrbkVolume(path=path_token.value, line=path_token.line)
+        path = self._consume_rest_of_line(path_token)
+        self.current_volume = BtrbkVolume(path=path, line=path_token.line)
         self.current_subvolume = None
         self.current_target = None
         self.config.volumes.append(self.current_volume)
@@ -396,7 +479,7 @@ class BtrbkParser:
             )
             return
 
-        self._advance()
+        path = self._consume_rest_of_line(path_token)
 
         if self.current_volume is None:
             self.config.warnings.append(
@@ -405,9 +488,7 @@ class BtrbkParser:
             return
 
         self.current_target = None
-        self.current_subvolume = BtrbkSubvolume(
-            path=path_token.value, line=path_token.line
-        )
+        self.current_subvolume = BtrbkSubvolume(path=path, line=path_token.line)
         self.current_volume.subvolumes.append(self.current_subvolume)
 
     def _parse_target(self) -> None:
@@ -434,10 +515,8 @@ class BtrbkParser:
                 self._advance()
                 path_token = self._current()
 
-        self._advance()
-        target = BtrbkTarget(
-            path=path_token.value, line=path_token.line, target_type=target_type
-        )
+        path = self._consume_rest_of_line(path_token)
+        target = BtrbkTarget(path=path, line=path_token.line, target_type=target_type)
         self.current_target = target
 
         # Add to current scope
@@ -497,7 +576,7 @@ def parse_btrbk_config(content: str) -> BtrbkConfig:
     """
     lexer = BtrbkLexer(content)
     tokens = lexer.tokenize()
-    parser = BtrbkParser(tokens)
+    parser = BtrbkParser(tokens, content)
     return parser.parse()
 
 
