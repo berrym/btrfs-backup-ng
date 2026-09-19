@@ -1,5 +1,16 @@
 # Shell Completions for btrfs-backup-ng
 
+These scripts are **generated from the argument parser**. Do not edit them by
+hand: `tests/test_completions_up_to_date.py` regenerates and compares, so a
+manual change fails the suite. To update them after changing the CLI:
+
+```bash
+python -c "from btrfs_backup_ng.cli.completion_gen import generate; \
+           import pathlib; \
+           [pathlib.Path(f'completions/btrfs-backup-ng.{s}').write_text(generate(s)) \
+            for s in ('bash','zsh','fish')]"
+```
+
 This directory contains shell completion scripts for bash, zsh, and fish.
 
 ## Installation

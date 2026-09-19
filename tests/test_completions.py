@@ -1,8 +1,72 @@
 """Tests for shell completions installation command."""
 
+import pathlib
+import re
 from argparse import Namespace
 from pathlib import Path
 from unittest.mock import MagicMock, patch
+
+
+# ---------------------------------------------------------------------------
+# The completions are generated from the parser (see cli/completion_gen.py), so
+# their internal layout is an implementation detail and may change when the
+# generator does. These helpers read "what does shell X offer for command Y"
+# without depending on that layout -- the tests below assert PROPERTIES (this
+# flag belongs here, that one must not) which outlive any format.
+# ---------------------------------------------------------------------------
+def _completions_root():
+    return pathlib.Path(__file__).resolve().parent.parent / "completions"
+
+
+def _offered(shell, command, subcommand=None):
+    """Long flags the generated completion offers for a command context."""
+    text = (_completions_root() / f"btrfs-backup-ng.{shell}").read_text()
+
+    if shell == "fish":
+        if subcommand:
+            needle = f"__fish_btrfs_backup_ng_using_subcommand {command} {subcommand}"
+        else:
+            needle = f"__fish_btrfs_backup_ng_using_command {command}"
+        return {
+            "--" + m.group(1)
+            for line in text.splitlines()
+            if needle in line
+            for m in re.finditer(r"-l ([a-z0-9-]+)", line)
+        }
+
+    if shell == "bash":
+        block = re.search(
+            rf"\n        {re.escape(command)}\)(.*?)(?=\n        [a-z-]+\)|\n    esac)",
+            text,
+            re.S,
+        )
+        if not block:
+            return set()
+        body = block.group(1)
+        if subcommand:
+            sub = re.search(
+                rf"\n                {re.escape(subcommand)}\)(.*?);;", body, re.S
+            )
+            body = sub.group(1) if sub else ""
+        return set(re.findall(r"--[a-z0-9-]+", body))
+
+    # zsh
+    block = re.search(
+        rf"\n                {re.escape(command)}\)(.*?)(?=\n                [a-z-]+\)|\n            esac)",
+        text,
+        re.S,
+    )
+    if not block:
+        return set()
+    body = block.group(1)
+    if subcommand:
+        sub = re.search(
+            rf"\n                            {re.escape(subcommand)}\)(.*?);;",
+            body,
+            re.S,
+        )
+        body = sub.group(1) if sub else ""
+    return set(re.findall(r"'(--[a-z0-9-]+)\[", body))
 
 
 class TestGetCompletionsDir:
@@ -489,18 +553,27 @@ class TestDecryptCompletionFlags:
     def _completions_dir(self):
         return Path(__file__).resolve().parent.parent / "completions"
 
-    def test_decrypt_flags_in_bash_opt_lines(self):
-        bash = (self._completions_dir() / "btrfs-backup-ng.bash").read_text()
-        for opt_var in ("restore_opts=", "snapper_restore_opts="):
-            line = next(line for line in bash.splitlines() if opt_var in line)
-            assert "--gpg-keyring" in line, f"{opt_var} missing --gpg-keyring"
-            assert "--openssl-cipher" in line, f"{opt_var} missing --openssl-cipher"
+    def test_decrypt_flags_offered_where_decryption_happens(self):
+        """restore and snapper restore read encrypted backups; both need them."""
+        for shell in ("bash", "zsh", "fish"):
+            assert {"--gpg-keyring", "--openssl-cipher"} <= _offered(
+                shell, "restore"
+            ), f"{shell}: restore is missing the decrypt flags"
+            assert {"--gpg-keyring", "--openssl-cipher"} <= _offered(
+                shell, "snapper", "restore"
+            ), f"{shell}: snapper restore is missing the decrypt flags"
 
-    def test_verify_bash_opts_have_no_decrypt_flags(self):
-        bash = (self._completions_dir() / "btrfs-backup-ng.bash").read_text()
-        line = next(line for line in bash.splitlines() if "verify_opts=" in line)
-        assert "--gpg-keyring" not in line
-        assert "--openssl-cipher" not in line
+    def test_verify_is_not_offered_decrypt_flags(self):
+        """verify checks recorded checksums; it never decrypts, so offering
+        these would advertise options the command rejects."""
+        for shell in ("bash", "zsh", "fish"):
+            offered = _offered(shell, "verify")
+            assert "--gpg-keyring" not in offered, (
+                f"{shell}: verify offers --gpg-keyring"
+            )
+            assert "--openssl-cipher" not in offered, (
+                f"{shell}: verify offers --openssl-cipher"
+            )
 
     def test_decrypt_flags_present_in_zsh_and_fish(self):
         d = self._completions_dir()
@@ -520,23 +593,14 @@ class TestRunCompletionNoStaleFlags:
         return Path(__file__).resolve().parent.parent / "completions"
 
     def test_run_has_no_fs_checks_or_positive_check_space(self):
-        import re
-
-        d = self._dir()
-        fish = (d / "btrfs-backup-ng.fish").read_text()
-        assert "_using_command run' -l fs-checks" not in fish
-        assert "_using_command run' -l check-space" not in fish  # positive is stale
-
-        bash = (d / "btrfs-backup-ng.bash").read_text()
-        run_opts = next(line for line in bash.splitlines() if "run_opts=" in line)
-        assert "--fs-checks" not in run_opts
-        assert "--check-space" not in run_opts.replace("--no-check-space", "")
-
-        zsh = (d / "btrfs-backup-ng.zsh").read_text()
-        block = re.search(r"\brun\)(.*?);;", zsh, re.S)
-        assert block is not None
-        assert "--fs-checks" not in block.group(1)
-        assert "--check-space" not in block.group(1).replace("--no-check-space", "")
+        """`run` accepts neither; offering them would be a stale suggestion."""
+        for shell in ("bash", "zsh", "fish"):
+            offered = _offered(shell, "run")
+            assert "--fs-checks" not in offered, f"{shell}: run offers --fs-checks"
+            assert "--check-space" not in offered, f"{shell}: run offers --check-space"
+            assert "--no-check-space" in offered, (
+                f"{shell}: run should still offer --no-check-space"
+            )
 
 
 class TestSshAuthSockCompletions:
@@ -547,17 +611,20 @@ class TestSshAuthSockCompletions:
     def _dir(self):
         return Path(__file__).resolve().parent.parent / "completions"
 
-    def test_bash_opt_arrays_have_it(self):
-        bash = (self._dir() / "btrfs-backup-ng.bash").read_text()
-        for opt in (
-            "restore_opts=",
-            "verify_opts=",
-            "estimate_opts=",
-            "snapper_backup_opts=",
-            "snapper_restore_opts=",
-        ):
-            line = next(line for line in bash.splitlines() if opt in line)
-            assert "--ssh-auth-sock" in line, f"{opt} missing --ssh-auth-sock"
+    def test_every_command_that_reaches_a_remote_offers_it(self):
+        contexts = [
+            ("restore", None),
+            ("verify", None),
+            ("estimate", None),
+            ("snapper", "backup"),
+            ("snapper", "restore"),
+        ]
+        for shell in ("bash", "zsh", "fish"):
+            for cmd, sub in contexts:
+                label = f"{cmd} {sub}".strip()
+                assert "--ssh-auth-sock" in _offered(shell, cmd, sub), (
+                    f"{shell}: {label} is missing --ssh-auth-sock"
+                )
 
     def test_zsh_and_fish_cover_all_five(self):
         d = self._dir()

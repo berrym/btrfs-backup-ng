@@ -1,426 +1,181 @@
-# Bash completion for btrfs-backup-ng
-# Install: Copy to /etc/bash_completion.d/ or source in ~/.bashrc
+# bash completion for btrfs-backup-ng
+# Generated from the argument parser; edit the parser, not this file.
+# Install: source this file, or place it in /etc/bash_completion.d/
 
 _btrfs_backup_ng() {
-    local cur prev words cword split
-    _init_completion -s || return
+    local cur prev words cword
+    cur="${COMP_WORDS[COMP_CWORD]}"
+    prev="${COMP_WORDS[COMP_CWORD-1]}"
 
-    local commands="run snapshot transfer prune list status config install uninstall restore verify estimate doctor completions manpages transfers snapper raw"
-    local config_subcommands="validate init import detect"
-    local completions_subcommands="install path"
-    local manpages_subcommands="install path"
-    local transfers_subcommands="list show resume pause cleanup operations"
-    local snapper_subcommands="detect list backup status restore generate-config"
-    local raw_subcommands="list verify backfill-metadata encrypt"
-
-    # Global options
+    local commands="completions config doctor estimate install list manpages prune raw restore run snapper snapshot status transfer transfers uninstall verify"
     local global_opts="-h --help -v --verbose -q --quiet --debug -V --version -c --config"
 
-    # Command-specific options
-    local run_opts="--dry-run --parallel-volumes --parallel-targets --compress --rate-limit --progress --no-progress --no-check-space --force"
-    local snapshot_opts="--dry-run --volume"
-    local transfer_opts="--dry-run --volume --compress --rate-limit --progress --no-progress"
-    local prune_opts="--dry-run"
-    local list_opts="--volume --json"
-    local status_opts="-t --transactions -n --limit"
-    local install_opts="--timer --oncalendar --user"
-    local uninstall_opts=""
-    local restore_opts="-l --list -s --snapshot --before -a --all -i --interactive --dry-run --no-incremental --overwrite --in-place --yes-i-know-what-i-am-doing --prefix --ssh-sudo --ssh-key --ssh-auth-sock --gpg-keyring --openssl-cipher --compress --rate-limit --fs-checks --status --unlock --cleanup --progress --no-progress -c --config --volume --target --list-volumes --to"
-    local config_validate_opts=""
-    local config_init_opts="-i --interactive -o --output"
-    local config_import_opts="-o --output"
-    local config_detect_opts="--json"
-    local verify_opts="--level --snapshot --temp-dir --no-cleanup --prefix --ssh-sudo --ssh-key --ssh-auth-sock --fs-checks --json -q --quiet"
-    local estimate_opts="-c --config --volume --target --prefix --ssh-sudo --ssh-key --ssh-auth-sock --fs-checks --check-space --safety-margin --json"
-    local doctor_opts="--json --check --fix --interactive -q --quiet --volume"
-    local doctor_categories="config snapshots transfers system"
-    local completions_install_opts="--shell --system"
-    local manpages_install_opts="--system --prefix"
-    local transfers_list_opts="--json"
-    local transfers_show_opts="--json"
-    local transfers_resume_opts="--dry-run"
-    local transfers_cleanup_opts="--force --all --age"
-    local snapper_detect_opts="--json"
-    local snapper_list_opts="--config --type --json"
-    local snapper_backup_opts="--snapshot --type --min-age --dry-run --ssh-sudo --ssh-key --ssh-auth-sock --compress --rate-limit --progress --no-progress"
-    local snapper_status_opts="--json"
-    local snapper_restore_opts="--snapshot --backup-name --date --all --list --json --config --dry-run --ssh-sudo --ssh-key --ssh-auth-sock --gpg-keyring --openssl-cipher"
-    local snapper_generate_config_opts="-o --output"
-    local raw_list_opts="--json --ssh-sudo"
-    local raw_verify_opts="--snapshot --json --ssh-sudo"
-    local raw_backfill_opts="--dry-run --json --ssh-sudo"
-    local raw_encrypt_opts="--encrypt --gpg-recipient --openssl-cipher --shred --yes --dry-run --json"
-    local snapper_types="single pre post"
-    local verify_levels="metadata stream full"
-    local shell_types="bash zsh fish"
-    local fs_checks_modes="auto strict skip"
+    case "$prev" in
+        --shell)
+            COMPREPLY=($(compgen -W "bash zsh fish" -- "$cur")); return ;;
+        -o|--output)
+            COMPREPLY=($(compgen -f -- "$cur")); return ;;
+        --check)
+            COMPREPLY=($(compgen -W "config snapshots transfers system" -- "$cur")); return ;;
+        --volume)
+            COMPREPLY=($(compgen -f -- "$cur")); return ;;
+        -c|--config)
+            COMPREPLY=($(compgen -f -- "$cur")); return ;;
+        --ssh-key)
+            COMPREPLY=($(compgen -f -- "$cur")); return ;;
+        --ssh-auth-sock)
+            COMPREPLY=($(compgen -f -- "$cur")); return ;;
+        --fs-checks)
+            COMPREPLY=($(compgen -W "auto strict skip" -- "$cur")); return ;;
+        --ssh-host-key-policy)
+            COMPREPLY=($(compgen -W "accept-new strict" -- "$cur")); return ;;
+        --timer)
+            COMPREPLY=($(compgen -W "hourly daily weekly" -- "$cur")); return ;;
+        --prefix)
+            COMPREPLY=($(compgen -f -- "$cur")); return ;;
+        --encrypt)
+            COMPREPLY=($(compgen -W "gpg openssl_enc" -- "$cur")); return ;;
+        --gpg-recipient)
+            COMPREPLY=($(compgen -f -- "$cur")); return ;;
+        --gpg-keyring)
+            COMPREPLY=($(compgen -f -- "$cur")); return ;;
+        --compress)
+            COMPREPLY=($(compgen -W "none bzip2 gzip lz4 lzo lzop pbzip2 pigz xz zstd" -- "$cur")); return ;;
+        --to)
+            COMPREPLY=($(compgen -f -- "$cur")); return ;;
+        -t|--type)
+            COMPREPLY=($(compgen -W "single pre post" -- "$cur")); return ;;
+        -t|--target)
+            COMPREPLY=($(compgen -f -- "$cur")); return ;;
+        -a|--append)
+            COMPREPLY=($(compgen -f -- "$cur")); return ;;
+        --type)
+            COMPREPLY=($(compgen -W "single pre post" -- "$cur")); return ;;
+        --level)
+            COMPREPLY=($(compgen -W "metadata stream full" -- "$cur")); return ;;
+        --temp-dir)
+            COMPREPLY=($(compgen -f -- "$cur")); return ;;
+    esac
 
-    # Compression methods (including raw target compression algorithms)
-    local compress_methods="none zstd gzip lz4 pigz lzop xz bzip2 pbzip2 lzo"
-
-    # Timer presets
-    local timer_presets="hourly daily weekly"
-
-    # Determine the command being used
-    local cmd=""
-    local subcmd=""
+    local cmd="" sub=""
     local i
-    for ((i=1; i < cword; i++)); do
-        case "${words[i]}" in
-            run|snapshot|transfer|prune|status|config|install|uninstall|restore|estimate|doctor|completions|manpages|transfers|snapper|raw)
-                cmd="${words[i]}"
-                ;;
-            list)
-                # `list` is both a top-level command and a subcommand of
-                # transfers/raw: only treat it as the command when none is set yet,
-                # otherwise it is the subcommand (a plain command list first, then
-                # the combined-arm check, would let it overwrite $cmd to "list").
-                if [[ -z "$cmd" ]]; then
-                    cmd="list"
-                elif [[ "$cmd" == "transfers" || "$cmd" == "raw" ]]; then
-                    subcmd="list"
-                fi
-                ;;
-            verify)
-                # `verify` is both a top-level command and a raw subcommand (same
-                # reasoning as `list` above).
-                if [[ -z "$cmd" ]]; then
-                    cmd="verify"
-                elif [[ "$cmd" == "raw" ]]; then
-                    subcmd="verify"
-                fi
-                ;;
-            backfill-metadata|encrypt)
-                if [[ "$cmd" == "raw" ]]; then
-                    subcmd="${words[i]}"
-                fi
-                ;;
-            validate|init|import|detect)
-                if [[ "$cmd" == "config" ]]; then
-                    subcmd="${words[i]}"
-                fi
-                ;;
-            show|resume|pause|cleanup|operations)
-                if [[ "$cmd" == "transfers" ]]; then
-                    subcmd="${words[i]}"
-                fi
-                ;;
-            detect|backup|status|restore|generate-config)
-                if [[ "$cmd" == "snapper" ]]; then
-                    subcmd="${words[i]}"
-                fi
-                ;;
-            path|install)
-                if [[ "$cmd" == "completions" || "$cmd" == "manpages" ]]; then
-                    subcmd="${words[i]}"
-                fi
-                ;;
+    for ((i=1; i<COMP_CWORD; i++)); do
+        case "${COMP_WORDS[i]}" in
+            -*) ;;
+            *) if [ -z "$cmd" ]; then cmd="${COMP_WORDS[i]}"; elif [ -z "$sub" ]; then sub="${COMP_WORDS[i]}"; fi ;;
         esac
     done
 
-    # Handle option arguments
-    case "$prev" in
-        -c|--config|--ssh-key)
-            _filedir
-            return
-            ;;
-        --volume)
-            _filedir -d
-            return
-            ;;
-        -o|--output)
-            _filedir
-            return
-            ;;
-        --compress)
-            COMPREPLY=($(compgen -W "$compress_methods" -- "$cur"))
-            return
-            ;;
-        --timer)
-            COMPREPLY=($(compgen -W "$timer_presets" -- "$cur"))
-            return
-            ;;
-        --parallel-volumes|--parallel-targets|-n|--limit)
-            # Numeric argument
-            return
-            ;;
-        --rate-limit)
-            # Rate limit like 10M, 1G
-            return
-            ;;
-        --oncalendar|--before|--snapshot|--prefix|--unlock)
-            # Free-form text arguments
-            return
-            ;;
-        --level)
-            COMPREPLY=($(compgen -W "$verify_levels" -- "$cur"))
-            return
-            ;;
-        --shell)
-            COMPREPLY=($(compgen -W "$shell_types" -- "$cur"))
-            return
-            ;;
-        --temp-dir)
-            _filedir -d
-            return
-            ;;
-        --fs-checks)
-            COMPREPLY=($(compgen -W "$fs_checks_modes" -- "$cur"))
-            return
-            ;;
-        --check)
-            COMPREPLY=($(compgen -W "$doctor_categories" -- "$cur"))
-            return
-            ;;
-        --safety-margin)
-            # Numeric percentage
-            return
-            ;;
-    esac
-
-    # Handle command completion
-    if [[ -z "$cmd" ]]; then
-        # No command yet, complete commands or global options
-        if [[ "$cur" == -* ]]; then
-            COMPREPLY=($(compgen -W "$global_opts" -- "$cur"))
-        else
-            COMPREPLY=($(compgen -W "$commands" -- "$cur"))
-        fi
+    if [ -z "$cmd" ]; then
+        COMPREPLY=($(compgen -W "$commands $global_opts" -- "$cur"))
         return
     fi
 
-    # Complete based on command
     case "$cmd" in
-        run)
-            COMPREPLY=($(compgen -W "$run_opts" -- "$cur"))
-            ;;
-        snapshot)
-            COMPREPLY=($(compgen -W "$snapshot_opts" -- "$cur"))
-            ;;
-        transfer)
-            COMPREPLY=($(compgen -W "$transfer_opts" -- "$cur"))
-            ;;
-        prune)
-            COMPREPLY=($(compgen -W "$prune_opts" -- "$cur"))
-            ;;
-        list)
-            COMPREPLY=($(compgen -W "$list_opts" -- "$cur"))
-            ;;
-        status)
-            COMPREPLY=($(compgen -W "$status_opts" -- "$cur"))
-            ;;
-        install)
-            COMPREPLY=($(compgen -W "$install_opts" -- "$cur"))
-            ;;
-        uninstall)
-            COMPREPLY=($(compgen -W "$uninstall_opts" -- "$cur"))
-            ;;
-        restore)
-            if [[ "$cur" == -* ]]; then
-                COMPREPLY=($(compgen -W "$restore_opts" -- "$cur"))
-            else
-                # Complete paths for SOURCE and DESTINATION
-                _filedir -d
-            fi
-            ;;
-        config)
-            if [[ -z "$subcmd" ]]; then
-                if [[ "$cur" == -* ]]; then
-                    COMPREPLY=($(compgen -W "-h --help" -- "$cur"))
-                else
-                    COMPREPLY=($(compgen -W "$config_subcommands" -- "$cur"))
-                fi
-            else
-                case "$subcmd" in
-                    validate)
-                        COMPREPLY=($(compgen -W "$config_validate_opts" -- "$cur"))
-                        ;;
-                    init)
-                        COMPREPLY=($(compgen -W "$config_init_opts" -- "$cur"))
-                        ;;
-                    import)
-                        if [[ "$cur" == -* ]]; then
-                            COMPREPLY=($(compgen -W "$config_import_opts" -- "$cur"))
-                        else
-                            _filedir conf
-                        fi
-                        ;;
-                    detect)
-                        if [[ "$cur" == -* ]]; then
-                            COMPREPLY=($(compgen -W "$config_detect_opts" -- "$cur"))
-                        else
-                            _filedir -d
-                        fi
-                        ;;
-                esac
-            fi
-            ;;
-        verify)
-            if [[ "$cur" == -* ]]; then
-                COMPREPLY=($(compgen -W "$verify_opts" -- "$cur"))
-            else
-                # Complete paths for LOCATION
-                _filedir -d
-            fi
-            ;;
-        estimate)
-            if [[ "$cur" == -* ]]; then
-                COMPREPLY=($(compgen -W "$estimate_opts" -- "$cur"))
-            else
-                # Complete paths for SOURCE and DESTINATION
-                _filedir -d
-            fi
-            ;;
-        doctor)
-            COMPREPLY=($(compgen -W "$doctor_opts" -- "$cur"))
-            ;;
         completions)
-            if [[ -z "$subcmd" ]]; then
-                if [[ "$cur" == -* ]]; then
-                    COMPREPLY=($(compgen -W "-h --help" -- "$cur"))
-                else
-                    COMPREPLY=($(compgen -W "$completions_subcommands" -- "$cur"))
-                fi
-            else
-                case "$subcmd" in
-                    install)
-                        COMPREPLY=($(compgen -W "$completions_install_opts" -- "$cur"))
-                        ;;
-                    path)
-                        # No additional options
-                        ;;
-                esac
-            fi
-            ;;
+            case "$sub" in
+                install)
+                    COMPREPLY=($(compgen -W "-h --help --shell --system -h --help $global_opts" -- "$cur")) ;;
+                path)
+                    COMPREPLY=($(compgen -W "-h --help -h --help $global_opts" -- "$cur")) ;;
+                *)
+                    COMPREPLY=($(compgen -W "install path -h --help $global_opts" -- "$cur")) ;;
+            esac ;;
+        config)
+            case "$sub" in
+                detect)
+                    COMPREPLY=($(compgen -W "-h --help --json -w --wizard -h --help $global_opts" -- "$cur")) ;;
+                import)
+                    COMPREPLY=($(compgen -W "-h --help -o --output --force -h --help $global_opts" -- "$cur")) ;;
+                init)
+                    COMPREPLY=($(compgen -W "-h --help -i --interactive -o --output --force -h --help $global_opts" -- "$cur")) ;;
+                migrate-systemd)
+                    COMPREPLY=($(compgen -W "-h --help --dry-run -h --help $global_opts" -- "$cur")) ;;
+                validate)
+                    COMPREPLY=($(compgen -W "-h --help -h --help $global_opts" -- "$cur")) ;;
+                *)
+                    COMPREPLY=($(compgen -W "detect import init migrate-systemd validate -h --help $global_opts" -- "$cur")) ;;
+            esac ;;
+        doctor)
+            COMPREPLY=($(compgen -W "-h --help --json --check --fix -i --interactive -q --quiet --volume $global_opts" -- "$cur")) ;;
+        estimate)
+            COMPREPLY=($(compgen -W "-h --help -c --config --volume --target --prefix --ssh-sudo --ssh-key --ssh-auth-sock --timestamp-format --fs-checks --no-fs-checks --ssh-host-key-policy --skip-remote-lock --json --check-space --safety-margin $global_opts" -- "$cur")) ;;
+        install)
+            COMPREPLY=($(compgen -W "-h --help --timer --oncalendar --user $global_opts" -- "$cur")) ;;
+        list)
+            COMPREPLY=($(compgen -W "-h --help --volume --json $global_opts" -- "$cur")) ;;
         manpages)
-            if [[ -z "$subcmd" ]]; then
-                if [[ "$cur" == -* ]]; then
-                    COMPREPLY=($(compgen -W "-h --help" -- "$cur"))
-                else
-                    COMPREPLY=($(compgen -W "$manpages_subcommands" -- "$cur"))
-                fi
-            else
-                case "$subcmd" in
-                    install)
-                        COMPREPLY=($(compgen -W "$manpages_install_opts" -- "$cur"))
-                        ;;
-                    path)
-                        # No additional options
-                        ;;
-                esac
-            fi
-            ;;
-        transfers)
-            if [[ -z "$subcmd" ]]; then
-                if [[ "$cur" == -* ]]; then
-                    COMPREPLY=($(compgen -W "-h --help" -- "$cur"))
-                else
-                    COMPREPLY=($(compgen -W "$transfers_subcommands" -- "$cur"))
-                fi
-            else
-                case "$subcmd" in
-                    list)
-                        COMPREPLY=($(compgen -W "$transfers_list_opts" -- "$cur"))
-                        ;;
-                    show)
-                        COMPREPLY=($(compgen -W "$transfers_show_opts" -- "$cur"))
-                        ;;
-                    resume)
-                        COMPREPLY=($(compgen -W "$transfers_resume_opts" -- "$cur"))
-                        ;;
-                    cleanup)
-                        COMPREPLY=($(compgen -W "$transfers_cleanup_opts" -- "$cur"))
-                        ;;
-                    pause|operations)
-                        # No additional options
-                        ;;
-                esac
-            fi
-            ;;
-        snapper)
-            if [[ -z "$subcmd" ]]; then
-                if [[ "$cur" == -* ]]; then
-                    COMPREPLY=($(compgen -W "-h --help" -- "$cur"))
-                else
-                    COMPREPLY=($(compgen -W "$snapper_subcommands" -- "$cur"))
-                fi
-            else
-                case "$subcmd" in
-                    detect)
-                        COMPREPLY=($(compgen -W "$snapper_detect_opts" -- "$cur"))
-                        ;;
-                    list)
-                        if [[ "$prev" == "--type" ]]; then
-                            COMPREPLY=($(compgen -W "$snapper_types" -- "$cur"))
-                        else
-                            COMPREPLY=($(compgen -W "$snapper_list_opts" -- "$cur"))
-                        fi
-                        ;;
-                    backup)
-                        if [[ "$cur" == -* ]]; then
-                            COMPREPLY=($(compgen -W "$snapper_backup_opts" -- "$cur"))
-                        else
-                            _filedir -d
-                        fi
-                        ;;
-                    status)
-                        COMPREPLY=($(compgen -W "$snapper_status_opts" -- "$cur"))
-                        ;;
-                    restore)
-                        if [[ "$cur" == -* ]]; then
-                            COMPREPLY=($(compgen -W "$snapper_restore_opts" -- "$cur"))
-                        else
-                            _filedir -d
-                        fi
-                        ;;
-                    generate-config)
-                        COMPREPLY=($(compgen -W "$snapper_generate_config_opts" -- "$cur"))
-                        ;;
-                esac
-            fi
-            ;;
+            case "$sub" in
+                install)
+                    COMPREPLY=($(compgen -W "-h --help --system --prefix -h --help $global_opts" -- "$cur")) ;;
+                path)
+                    COMPREPLY=($(compgen -W "-h --help -h --help $global_opts" -- "$cur")) ;;
+                *)
+                    COMPREPLY=($(compgen -W "install path -h --help $global_opts" -- "$cur")) ;;
+            esac ;;
+        prune)
+            COMPREPLY=($(compgen -W "-h --help --dry-run -y --yes --force $global_opts" -- "$cur")) ;;
         raw)
-            if [[ -z "$subcmd" ]]; then
-                if [[ "$cur" == -* ]]; then
-                    COMPREPLY=($(compgen -W "-h --help" -- "$cur"))
-                else
-                    COMPREPLY=($(compgen -W "$raw_subcommands" -- "$cur"))
-                fi
-            else
-                case "$subcmd" in
-                    list)
-                        if [[ "$cur" == -* ]]; then
-                            COMPREPLY=($(compgen -W "$raw_list_opts" -- "$cur"))
-                        else
-                            _filedir -d
-                        fi
-                        ;;
-                    verify)
-                        if [[ "$cur" == -* ]]; then
-                            COMPREPLY=($(compgen -W "$raw_verify_opts" -- "$cur"))
-                        else
-                            _filedir -d
-                        fi
-                        ;;
-                    backfill-metadata)
-                        if [[ "$cur" == -* ]]; then
-                            COMPREPLY=($(compgen -W "$raw_backfill_opts" -- "$cur"))
-                        else
-                            _filedir -d
-                        fi
-                        ;;
-                    encrypt)
-                        if [[ "$prev" == "--encrypt" ]]; then
-                            COMPREPLY=($(compgen -W "gpg openssl_enc" -- "$cur"))
-                        elif [[ "$cur" == -* ]]; then
-                            COMPREPLY=($(compgen -W "$raw_encrypt_opts" -- "$cur"))
-                        else
-                            _filedir -d
-                        fi
-                        ;;
-                esac
-            fi
-            ;;
+            case "$sub" in
+                backfill-metadata)
+                    COMPREPLY=($(compgen -W "-h --help --dry-run --json --ssh-sudo -h --help $global_opts" -- "$cur")) ;;
+                encrypt)
+                    COMPREPLY=($(compgen -W "-h --help --encrypt --gpg-recipient --gpg-keyring --openssl-cipher --shred --yes --dry-run --json -h --help $global_opts" -- "$cur")) ;;
+                list)
+                    COMPREPLY=($(compgen -W "-h --help --json --ssh-sudo -h --help $global_opts" -- "$cur")) ;;
+                verify)
+                    COMPREPLY=($(compgen -W "-h --help --snapshot --json --ssh-sudo -h --help $global_opts" -- "$cur")) ;;
+                *)
+                    COMPREPLY=($(compgen -W "backfill-metadata encrypt list verify -h --help $global_opts" -- "$cur")) ;;
+            esac ;;
+        restore)
+            COMPREPLY=($(compgen -W "-h --help -l --list -s --snapshot --before -a --all -i --interactive --dry-run --no-incremental --skip-verify --overwrite --in-place --yes-i-know-what-i-am-doing --prefix --timestamp-format --ssh-sudo --ssh-key --ssh-auth-sock --compress --rate-limit --gpg-keyring --openssl-cipher --fs-checks --no-fs-checks --ssh-host-key-policy --skip-remote-lock -c --config --volume --target --list-volumes --to --status --unlock --cleanup --progress --no-progress $global_opts" -- "$cur")) ;;
+        run)
+            COMPREPLY=($(compgen -W "-h --help --dry-run --parallel-volumes --parallel-targets --compress --rate-limit --newest-only --no-check-space --force --safety-margin --progress --no-progress $global_opts" -- "$cur")) ;;
+        snapper)
+            case "$sub" in
+                backup)
+                    COMPREPLY=($(compgen -W "-h --help -s --snapshot -t --type --min-age --dry-run --ssh-sudo --ssh-key --ssh-auth-sock --ssh-host-key-policy --skip-remote-lock --compress --rate-limit --timestamp-format --encrypt --gpg-recipient --gpg-keyring --openssl-cipher --progress --no-progress -h --help $global_opts" -- "$cur")) ;;
+                detect)
+                    COMPREPLY=($(compgen -W "-h --help --json -h --help $global_opts" -- "$cur")) ;;
+                generate-config)
+                    COMPREPLY=($(compgen -W "-h --help -c --config -t --target -o --output -a --append --type --min-age --ssh-sudo --json -h --help $global_opts" -- "$cur")) ;;
+                list)
+                    COMPREPLY=($(compgen -W "-h --help -c --config -t --type --json --timestamp-format -h --help $global_opts" -- "$cur")) ;;
+                restore)
+                    COMPREPLY=($(compgen -W "-h --help -s --snapshot -a --all --backup-name --date --from-config --dry-run --ssh-sudo --ssh-key --ssh-auth-sock --gpg-keyring --openssl-cipher --ssh-host-key-policy --skip-remote-lock -l --list --json -h --help $global_opts" -- "$cur")) ;;
+                status)
+                    COMPREPLY=($(compgen -W "-h --help -c --config --json --timestamp-format -h --help $global_opts" -- "$cur")) ;;
+                *)
+                    COMPREPLY=($(compgen -W "backup detect generate-config list restore status -h --help $global_opts" -- "$cur")) ;;
+            esac ;;
+        snapshot)
+            COMPREPLY=($(compgen -W "-h --help --dry-run --volume $global_opts" -- "$cur")) ;;
+        status)
+            COMPREPLY=($(compgen -W "-h --help -t --transactions -n --limit $global_opts" -- "$cur")) ;;
+        transfer)
+            COMPREPLY=($(compgen -W "-h --help --dry-run --volume --compress --rate-limit --no-check-space --force --safety-margin --progress --no-progress $global_opts" -- "$cur")) ;;
+        transfers)
+            case "$sub" in
+                cleanup)
+                    COMPREPLY=($(compgen -W "-h --help --max-age --force --dry-run -h --help $global_opts" -- "$cur")) ;;
+                list)
+                    COMPREPLY=($(compgen -W "-h --help --json -h --help $global_opts" -- "$cur")) ;;
+                operations)
+                    COMPREPLY=($(compgen -W "-h --help --all --json -h --help $global_opts" -- "$cur")) ;;
+                pause)
+                    COMPREPLY=($(compgen -W "-h --help -h --help $global_opts" -- "$cur")) ;;
+                resume)
+                    COMPREPLY=($(compgen -W "-h --help --dry-run -h --help $global_opts" -- "$cur")) ;;
+                show)
+                    COMPREPLY=($(compgen -W "-h --help --json -h --help $global_opts" -- "$cur")) ;;
+                *)
+                    COMPREPLY=($(compgen -W "cleanup list operations pause resume show -h --help $global_opts" -- "$cur")) ;;
+            esac ;;
+        uninstall)
+            COMPREPLY=($(compgen -W "-h --help $global_opts" -- "$cur")) ;;
+        verify)
+            COMPREPLY=($(compgen -W "-h --help --level --snapshot --all --temp-dir --no-cleanup --prefix --timestamp-format --ssh-sudo --ssh-key --ssh-auth-sock --fs-checks --no-fs-checks --ssh-host-key-policy --skip-remote-lock --json -q --quiet $global_opts" -- "$cur")) ;;
     esac
 }
 
