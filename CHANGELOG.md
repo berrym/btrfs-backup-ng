@@ -142,6 +142,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   warnings were collected, logged, and then dropped, so an empty configuration
   reported "4 passed, 0 warnings" and exit 0 — for a file the loader had
   described as having no volumes at all.
+
 - **`run` now transfers what a destination is MISSING, not only the snapshot it
   just created.** A target that missed a run — a drive that was unplugged, a
   host that was down, a transfer that failed — stayed behind for ever, because
