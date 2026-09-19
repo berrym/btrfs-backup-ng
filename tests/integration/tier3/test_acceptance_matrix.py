@@ -49,18 +49,13 @@ from .conftest import (
 
 pytestmark = [pytest.mark.tier3, requires_local]
 
-#: NOT a marker on any cell -- an untested hypothesis, recorded so it is not
-#: mistaken for covered ground. The nearest real code is ssh.py's compressed
-#: receive, which under ssh_sudo WITHOUT passwordless sudo elevates a shell
-#: (`sudo -S sh -c "<decompressor> | btrfs receive"`) rather than the btrfs
-#: binary, and a strictly btrfs-only sudoers policy would refuse that. The
-#: matrix cannot reach it: the branch is taken only when `sudo -n btrfs` fails
-#: on the remote, and the host this suite runs against has passwordless sudo
-#: for btrfs. Proving or disproving it needs a password-sudo host.
-UNTESTED_SUDO_SH = (
-    "ssh:// with compression and ssh_sudo but no passwordless sudo elevates "
-    "`sh`, not `btrfs`; unverified against a btrfs-only sudoers policy"
-)
+#: Recorded here as an untested hypothesis, then RESOLVED. ssh.py's compressed
+#: receive did elevate a shell under ssh_sudo without passwordless sudo, which a
+#: btrfs-only sudoers policy refuses; it now scopes sudo to the btrfs binary on
+#: every path, and TestSudoersPolicies below exercises the emitted command
+#: against six policies on three remote shells. Nothing here is unverified any
+#: more -- the note is kept only so the resolution is legible to anyone who read
+#: the earlier version.
 
 
 def _lifecycle(rig, config, *, location, prefix, extra_args=(), snapper=False):
