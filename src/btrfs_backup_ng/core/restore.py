@@ -436,6 +436,18 @@ def _retry_with_inferred_prefix(backup_endpoint: Any) -> list[Any]:
     if configured:
         logger.debug("Not inferring a prefix: %r was asked for explicitly", configured)
         return []
+    if (config or {}).get("snap_prefix_explicit"):
+        # An EXPLICIT empty prefix -- `--prefix ""`, or snapshot_prefix = "" on
+        # the volume -- means bare-timestamp names, and is exactly as much of a
+        # choice as any other prefix. Truthiness cannot tell it from "nobody
+        # said", so this ran and replaced it: measured, a location holding
+        # another source's `home.` snapshots had the operator's explicit "no
+        # prefix" silently rewritten to `home.` and those snapshots listed for
+        # restore. That is the harm this function's own docstring describes --
+        # "a prefix that was given and matches nothing is a mismatch to report,
+        # not a guess to make" -- reached through the one value that is falsy.
+        logger.debug("Not inferring a prefix: an empty prefix was asked for")
+        return []
 
     discover = getattr(backup_endpoint, "prefixes_present", None)
     if not callable(discover):
@@ -1717,6 +1729,14 @@ def restore_snapper_snapshot(
         logger.info("Dry run - would restore as snapshot %d", next_num)
         return next_num, Path("/dev/null")
 
+    # Recorded BEFORE anything is created. get_next_snapshot_number is supposed to
+    # hand back a free slot, but the failure path below removes the whole numbered
+    # directory, and "supposed to be free" is the kind of unchecked premise that
+    # turns a failed restore into the loss of a snapshot that was already there --
+    # a stale scan, a concurrent snapper, or a slot made by hand is enough.
+    slot_preexisted = dest_snapshot_dir.exists()
+    snapshot_preexisted = dest_snapshot_path.exists()
+
     transfer_start = time.monotonic()
 
     log_transaction(
@@ -1833,8 +1853,13 @@ def restore_snapper_snapshot(
                 stderr=subprocess.PIPE,
             )
 
-            if send_process.stdout:
-                send_process.stdout.close()
+            # One idiom for releasing a handed-over pipe, everywhere. There are
+            # no intermediate stages here, so there is nothing for chain_stages
+            # to chain -- but the handoff itself is the same one, and the same
+            # omission elsewhere left a stage blocked forever.
+            from . import transfer as transfer_utils
+
+            transfer_utils.hand_over(send_process.stdout)
 
             receive_stdout, receive_stderr = receive_process.communicate()
             send_process.wait()
@@ -1995,9 +2020,19 @@ def restore_snapper_snapshot(
             error=str(e),
         )
 
-        # Clean up partial restore
+        # Clean up partial restore -- only what this run put there. The subvolume
+        # and the numbered directory are judged separately: a restore can fail
+        # after creating the directory but before receiving into it, and it can
+        # also fail into a slot that already held one.
+        if snapshot_preexisted or slot_preexisted:
+            logger.warning(
+                "Not removing %s after the failed restore: it was already present "
+                "before this restore started, so it is not this run's partial. "
+                "Inspect it before deleting anything.",
+                dest_snapshot_path if snapshot_preexisted else dest_snapshot_dir,
+            )
         try:
-            if dest_snapshot_path.exists():
+            if dest_snapshot_path.exists() and not snapshot_preexisted:
                 if os.geteuid() != 0:
                     subprocess.run(
                         [
@@ -2036,7 +2071,7 @@ def restore_snapper_snapshot(
                         capture_output=True,
                     )
                     __util__.delete_subvolume(dest_snapshot_path)
-            if dest_snapshot_dir.exists():
+            if dest_snapshot_dir.exists() and not slot_preexisted:
                 __util__.privileged_rmtree(dest_snapshot_dir, allow_prompt=True)
         except Exception as cleanup_e:
             logger.warning("Cleanup failed: %s", cleanup_e)

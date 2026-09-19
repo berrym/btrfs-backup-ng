@@ -47,8 +47,16 @@ def test_time_obj_is_struct_time_like_btrfs_snapshot():
     the exact restore paths raw snapshots are meant to support."""
     s = _raw("root.20240115", 15)
     assert isinstance(s.time_obj, time.struct_time)
-    # The two operations the CLI restore paths actually perform:
-    assert time.strftime("%Y-%m-%d", s.time_obj) == "2024-01-15"
+    # The two operations the CLI restore paths actually perform. The rendered
+    # date is the LOCAL one for that instant, not the UTC one: `created` is
+    # UTC-aware, and every consumer -- the restore listing beside the snapshot's
+    # own local-time name, and `restore --before` against a local-time target --
+    # reads these fields as local. This previously asserted the UTC date, which
+    # is the same only on a UTC host.
+    expected = (
+        datetime.datetime(2024, 1, 15, tzinfo=UTC).astimezone().strftime("%Y-%m-%d")
+    )
+    assert time.strftime("%Y-%m-%d", s.time_obj) == expected
     later = time.strptime("2024-06-01", "%Y-%m-%d")
     assert s.time_obj <= later  # `restore --before` comparison must not raise
 

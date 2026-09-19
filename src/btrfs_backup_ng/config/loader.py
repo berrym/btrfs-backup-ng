@@ -139,10 +139,19 @@ def _parse_retention(data: dict[str, Any]) -> RetentionConfig:
     # (ConfigError) instead of silently reaching the destructive prune path -- matching the
     # fail-closed validation already done for compress/encrypt/source. Function-local import
     # avoids a config<->retention import cycle.
-    from ..retention import parse_duration
+    #
+    # Validated through subtract_duration, which is what apply_retention actually
+    # calls. Checking parse_duration instead tested a DIFFERENT function with a
+    # wider domain: "3000y", "999999999d" and "100000000w" all parse to a valid
+    # timedelta and only fail when subtracted from the current time, so the
+    # boundary check passed them and the failure landed in the prune path -- a
+    # check whose verdict did not describe the operation it was guarding.
+    from datetime import datetime
+
+    from ..retention import subtract_duration
 
     try:
-        parse_duration(str(min_value))
+        subtract_duration(datetime.now(), str(min_value))
     except ValueError as e:
         raise ConfigError(
             f"Invalid retention 'min' duration: {min_value!r} ({e})"
@@ -254,6 +263,9 @@ def _parse_target(data: dict[str, Any]) -> TargetConfig:
         ssh_key=data.get("ssh_key"),
         ssh_auth_sock=data.get("ssh_auth_sock"),
         ssh_password_auth=data.get("ssh_password_auth", True),
+        skip_remote_lock=_parse_bool_option(
+            data.get("skip_remote_lock", False), "skip_remote_lock"
+        ),
         ssh_host_key_policy=ssh_host_key_policy,
         compress=compress,
         rate_limit=data.get("rate_limit"),

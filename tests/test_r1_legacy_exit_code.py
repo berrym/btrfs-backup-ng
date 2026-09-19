@@ -29,7 +29,9 @@ def _patch_run_task_deps(monkeypatch):
     monkeypatch.setattr(
         legacy, "prepare_destination_endpoints", lambda o, s: [MagicMock()]
     )
-    monkeypatch.setattr(legacy, "cleanup_snapshots", lambda *a, **k: None)
+    # cleanup_snapshots reports whether retention succeeded; run_task treats a
+    # failed prune as a failed run, so the stub must model a clean one.
+    monkeypatch.setattr(legacy, "cleanup_snapshots", lambda *a, **k: True)
     monkeypatch.setattr(legacy.time, "sleep", lambda *a, **k: None)
 
 

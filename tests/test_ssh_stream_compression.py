@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import contextlib
 import os
+import re
 import shlex
 import signal
 import subprocess
@@ -67,6 +68,11 @@ def _captured_argv(*, euid, compress):
     endpoint.ssh_manager = MagicMock()
     endpoint.ssh_manager.control_path = "/run/cm.sock"
     endpoint._check_command_exists = lambda c: False  # no pv/mbuffer
+    # The pre-transfer "does anything already occupy the destination path" probe
+    # is a remote round trip this helper's fake Popen cannot serve, and it is not
+    # what these tests are about; it has its own coverage. False = the path is
+    # free, i.e. the ordinary case.
+    endpoint.artifact_exists = lambda *a, **k: False
     endpoint._estimate_snapshot_size = lambda *a, **k: None
     endpoint._diagnostics_cache = {}
     # Every probe passes, and passwordless sudo in particular: that is what
@@ -423,16 +429,26 @@ class TestEveryTransferStrategyIsCovered:
         remote = " ".join(captured["remote"] or [])
         assert "zstd -dc" in remote, remote
 
-    def test_the_password_sudo_path_nests_the_pipeline_inside_sudo(self):
-        """`sudo -S` reads the password from its own stdin. A decompressor in
-        FRONT of sudo eats the password line, so sudo never authenticates and
-        the decompressor chokes on plaintext."""
+    def test_the_password_reaches_sudo_and_not_the_decompressor(self):
+        """`sudo -S` reads the password from its own stdin, so a decompressor
+        that sees the password line first eats it: sudo never authenticates and
+        the decompressor chokes on plaintext.
+
+        The command no longer nests the pipeline inside `sudo sh -c` to arrange
+        that -- asking sudoers for permission to run a shell is what broke a
+        btrfs-only policy. The password is taken off stdin by `read` before any
+        decompressor starts, and where it must still be spent it is prefixed to
+        the decompressor's OUTPUT, which is sudo's stdin.
+        """
         cmd = _build_receive_command(
             DEST, use_sudo=True, password_on_stdin=True, decompress="zstd"
         )
-        assert "sudo -S sh -c" in cmd, cmd
-        # the decompressor must be INSIDE the sudo invocation, not before it
-        assert cmd.index("sudo -S") < cmd.index("zstd -dc"), cmd
+        assert cmd.index("read -r __bbng_pw") < cmd.index("zstd -dc"), cmd
+        fallback = re.search(r"\{ printf[^|]*\| sudo -S btrfs receive", cmd)
+        assert fallback, cmd
+        assert "zstd -dc" in fallback.group(0), (
+            f"the decompressor is not inside the prefixed group: {fallback.group(0)}"
+        )
 
     def test_the_passwordless_path_keeps_the_decompressor_in_front(self):
         cmd = _build_receive_command(DEST, use_sudo=True, decompress="zstd")
@@ -769,7 +785,7 @@ class TestElevationIsOnlyWhatWasAskedFor:
         cmd = _build_receive_command(
             DEST, use_sudo=True, password_on_stdin=True, decompress="zstd"
         )
-        assert "sudo -S sh -c" in cmd, cmd
+        assert "sudo -S btrfs receive" in cmd, cmd
 
 
 class TestAFailedCompressorFailsTheTransfer:
@@ -984,7 +1000,12 @@ class TestThePayloadActuallyReachesTheRemote:
 
     def _deliver(self, shell, tmp_path, **kwargs):
         """Run the emitted command and report how many bytes reached btrfs."""
-        (tmp_path / "btrfs").write_text("#!/bin/sh\nwc -c\n")
+        # The real btrfs answers --version without reading stdin; a stub that
+        # counts bytes regardless would swallow the payload when the command
+        # probes for sudo capability, and report the product as broken.
+        (tmp_path / "btrfs").write_text(
+            '#!/bin/sh\ncase "${1:-}" in --version) echo v6.17; exit 0;; esac\nwc -c\n'
+        )
         # `read` takes EXACTLY one line, as sudo -S does; `head -n 1` would read a
         # block and swallow part of the stream.
         (tmp_path / "sudo").write_text(

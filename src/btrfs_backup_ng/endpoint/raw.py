@@ -30,7 +30,7 @@ from typing import Any, Optional, TypedDict
 
 from btrfs_backup_ng import __util__
 from btrfs_backup_ng.__logger__ import logger
-from btrfs_backup_ng.endpoint.common import Endpoint
+from btrfs_backup_ng.endpoint.common import DeletionResult, Endpoint
 from btrfs_backup_ng.endpoint.raw_metadata import (
     COMPRESSION_CONFIG,
     ChecksumVerdict,
@@ -534,6 +534,13 @@ class RawEndpoint(Endpoint):
             self.encrypt = None
         self.gpg_recipient = config.get("gpg_recipient")
         self.gpg_keyring = config.get("gpg_keyring")
+
+        # Streams whose sealed sha256 has already been confirmed by this endpoint.
+        # A restore verifies via preflight_send and then calls send(), which
+        # preflights again -- without this the whole stream is hashed TWICE per
+        # restore (twice ACROSS THE NETWORK for raw+ssh). Per instance, so it lasts
+        # a run and no longer.
+        self._integrity_verified: set[str] = set()
         # Validated at construction so a bad cipher fails fast rather than
         # surfacing as a cryptic openssl error mid-transfer. An explicit None or
         # "" (the CLI threads openssl_cipher=None for gpg/plaintext targets) means
@@ -715,7 +722,14 @@ class RawEndpoint(Endpoint):
         if timeout is None:
             timeout = float(self.config.get("lock_timeout", 30.0))
         path = Path(self.config["path"])
-        path.mkdir(parents=True, exist_ok=True, mode=0o700)
+        if not path.is_dir():
+            # Recreating here would undo the refusal in _prepare: the lock lives
+            # inside the target directory, so this ran for every locked
+            # operation and would have rebuilt the tree on the root filesystem.
+            raise __util__.AbortError(
+                f"Raw target {path} does not exist, so it cannot be locked. "
+                f"The filesystem holding it is most likely not mounted."
+            )
         with __util__.exclusive_lock(
             path / LOCK_FILENAME,
             timeout=timeout,
@@ -726,9 +740,26 @@ class RawEndpoint(Endpoint):
     def _prepare(self) -> None:
         """Prepare the endpoint for use."""
         path = Path(self.config["path"])
-        if not path.exists():
-            logger.info("Creating raw target directory: %s", path)
-            path.mkdir(parents=True, exist_ok=True, mode=0o700)
+        if not path.is_dir():
+            # The target was created on first use, which is convenient right up
+            # until the disk holding it is not mounted: the whole mount-point
+            # tree got built on the ROOT filesystem and the streams written
+            # there. This endpoint applies no filesystem check at all -- no
+            # fs_checks, no btrfs test -- so nothing else would have noticed,
+            # and raw streams are as large as the data. require_mount catches it
+            # only when the configured path IS the mount point, and it is off by
+            # default.
+            #
+            # A configured target is a statement that something is there. Create
+            # it once by hand; everything BELOW it is still created here.
+            logger.error("Configured raw target does not exist: %s", path)
+            raise __util__.AbortError(
+                f"Raw target {path} does not exist. btrfs-backup-ng does not "
+                f"create a configured target: if it lives on a removable or "
+                f"network filesystem, it is most likely not mounted. Check the "
+                f"path for a typo, mount the filesystem, or create the directory "
+                f"yourself to proceed."
+            )
 
         # Fail loud (before any transfer) with an actionable message if a required
         # compression/encryption tool is missing, instead of a raw errno part-way
@@ -802,8 +833,16 @@ class RawEndpoint(Endpoint):
         # sha256 was then sealed over the corruption, so both processes exited 0,
         # the engine's return-code gate passed, `raw verify` reported ok, and the
         # damage surfaced only at restore.
+        #
+        # Neither component distinguishes MACHINES, though, and a raw+ssh target is
+        # routinely shared by several: pids collide across hosts by nature, and
+        # monotonic_ns is uptime on Linux, so two boxes that boot together and run
+        # the same timer are not an exotic case. The random token closes that, and
+        # is random rather than a hostname because it has to be a filename on an
+        # unknown remote filesystem without needing to be sanitised into one.
         part_path = Path(
-            f"{output_path}.{os.getpid()}.{time.monotonic_ns():x}{PARTIAL_SUFFIX}"
+            f"{output_path}.{os.getpid()}.{time.monotonic_ns():x}"
+            f".{os.urandom(4).hex()}{PARTIAL_SUFFIX}"
         )
 
         logger.info("Writing raw stream to: %s", part_path)
@@ -1415,7 +1454,12 @@ class RawEndpoint(Endpoint):
                 snapshot.name,
             )
             return
+        key = str(snapshot.stream_path)
+        if key in self._integrity_verified:
+            return
         verdict = self.verify_stream_checksum(snapshot)
+        if verdict.status == "ok":
+            self._integrity_verified.add(key)
         if verdict.status == "unverifiable":
             # Nothing to compare against (legacy backup, or a non-sha256 algorithm) --
             # the restore's own decode step still surfaces a genuinely unreadable stream.
@@ -1746,13 +1790,19 @@ class RawEndpoint(Endpoint):
         }
         return {n for n in batch_names if n in referenced_by_survivors}
 
-    def delete_snapshots(self, snapshots: list[RawSnapshot], **kwargs: Any) -> None:
+    def delete_snapshots(
+        self, snapshots: list[RawSnapshot], **kwargs: Any
+    ) -> DeletionResult:
         """Delete raw snapshot files and their metadata.
 
         Args:
             snapshots: List of snapshots to delete
             **kwargs: ``delete_session`` (set[str]) -- the full set of names being deleted this
                 pass, so the chain guard does not mistake a whole-chain delete for orphaning.
+
+        Returns a :class:`DeletionResult`. A busy target means the whole batch was
+        refused, which used to be a warning and a None indistinguishable from a
+        completed prune.
         """
         delete_session = kwargs.get("delete_session")
         # Prune under the per-target lock so it cannot race a concurrent backup
@@ -1760,15 +1810,28 @@ class RawEndpoint(Endpoint):
         # during contention); retention retries on the next run.
         try:
             with self.target_lock():
-                self._delete_snapshots_locked(snapshots, delete_session)
+                return self._delete_snapshots_locked(snapshots, delete_session)
         except RuntimeError as e:
             logger.warning("Skipping raw delete (target busy): %s", e)
+            result = DeletionResult()
+            result.fail_all(snapshots, f"the target is busy: {e}")
+            return result
 
     def _delete_snapshots_locked(
         self, snapshots: list[RawSnapshot], delete_session: set[str] | None = None
-    ) -> None:
+    ) -> DeletionResult:
+        result = DeletionResult()
         protected = self._chain_referenced_parents(snapshots, delete_session)
         for snapshot in snapshots:
+            # A retention lock is what a restore holds while it reads a stream.
+            # The base Endpoint.delete_snapshots checks it; this override
+            # replaces that method wholesale and never did, so `set_lock` on a
+            # raw target pinned nothing: a prune deleted the stream a restore was
+            # reading, in the same process, with the lock set. Measured.
+            if snapshot.locks or snapshot.parent_locks:
+                logger.info("Skipping locked raw stream: %s", snapshot.get_name())
+                result.skip(snapshot, "held by a retention lock")
+                continue
             if snapshot.get_name() in protected:
                 logger.error(
                     "Refusing to delete raw stream %r: it is the incremental parent of a stream "
@@ -1776,12 +1839,25 @@ class RawEndpoint(Endpoint):
                     "Skipping.",
                     snapshot.get_name(),
                 )
+                result.skip(
+                    snapshot, "needed as the incremental parent of a kept stream"
+                )
                 continue
             try:
                 # Delete stream file
                 if snapshot.stream_path.exists():
                     snapshot.stream_path.unlink()
                     logger.info("Deleted stream file: %s", snapshot.stream_path)
+                    result.deleted.append(snapshot)
+                else:
+                    # Previously silent: a batch whose every stream was already
+                    # gone produced no log line at all and was reported as a
+                    # completed prune of that many snapshots.
+                    logger.warning(
+                        "Stream file already absent, nothing to delete: %s",
+                        snapshot.stream_path,
+                    )
+                    result.skip(snapshot, "stream file already absent")
 
                 # Delete metadata file
                 if snapshot.metadata_path.exists():
@@ -1796,17 +1872,19 @@ class RawEndpoint(Endpoint):
 
             except OSError as e:
                 logger.error("Failed to delete snapshot %s: %s", snapshot.name, e)
+                result.fail(snapshot, e)
+        return result
 
-    def delete_snapshot(self, snapshot: RawSnapshot, **kwargs: Any) -> None:
+    def delete_snapshot(self, snapshot: RawSnapshot, **kwargs: Any) -> DeletionResult:
         """Delete a single raw snapshot.
 
         Args:
             snapshot: Snapshot to delete
             **kwargs: Additional arguments
         """
-        self.delete_snapshots([snapshot], **kwargs)
+        return self.delete_snapshots([snapshot], **kwargs)
 
-    def delete_old_snapshots(self, keep: int) -> None:
+    def delete_old_snapshots(self, keep: int) -> DeletionResult:
         """Delete old snapshots, keeping only the most recent.
 
         LEGACY count-based path (see ``Endpoint.delete_old_snapshots``); the modern retention
@@ -1816,13 +1894,21 @@ class RawEndpoint(Endpoint):
             keep: Number of snapshots to keep
         """
         if keep <= 0:
-            return
+            return DeletionResult()
 
         snapshots = self.list_snapshots()
-        if len(snapshots) <= keep:
-            return
+        # Locked streams are excluded BEFORE the slice, as Endpoint.delete_old_
+        # snapshots does. Slicing the full list instead made `keep` count total
+        # streams rather than usable ones, so a lock inside the keep window cost
+        # a real backup: measured with 5 streams under -N 2 and the newest one
+        # locked by a restore, the operator was left with ONE usable backup
+        # instead of two. A retention lock is supposed to protect a stream, not
+        # to spend one of the slots the operator asked to keep.
+        unlocked = [s for s in snapshots if not s.locks and not s.parent_locks]
+        if len(unlocked) <= keep:
+            return DeletionResult()
 
-        to_delete = snapshots[:-keep]
+        to_delete = unlocked[:-keep]
         for snapshot in to_delete:
             logger.info("Deleting old raw snapshot: %s", snapshot.name)
         # One lock for the whole prune pass so it is atomic as a unit (a concurrent
@@ -1831,9 +1917,12 @@ class RawEndpoint(Endpoint):
         # delete_snapshot would re-take the lock per snapshot and self-deadlock.
         try:
             with self.target_lock():
-                self._delete_snapshots_locked(to_delete)
+                return self._delete_snapshots_locked(to_delete)
         except RuntimeError as e:
             logger.warning("Skipping raw prune (target busy): %s", e)
+            result = DeletionResult()
+            result.fail_all(to_delete, f"the target is busy: {e}")
+            return result
 
     def get_space_info(self, path: str | None = None) -> Any:
         """Get space information for the raw target directory.
@@ -1860,6 +1949,14 @@ class SSHRawEndpoint(RawEndpoint):
     with optional local compression/encryption before transfer.
     """
 
+    #: Declared on the CLASS, as SSHEndpoint does. It used to be assigned in
+    #: __init__ AFTER super().__init__(), so the base initialiser still saw the
+    #: default and `_normalize_path` took its local branch: `config["path"]`
+    #: became a pathlib.Path, `~` expanded against the LOCAL user, and a relative
+    #: path resolved against the LOCAL working directory -- all for a location on
+    #: another machine.
+    _is_remote = True
+
     def __init__(self, config: dict[str, Any] | None = None, **kwargs: Any) -> None:
         """Initialize the SSH Raw Endpoint.
 
@@ -1871,12 +1968,26 @@ class SSHRawEndpoint(RawEndpoint):
         super().__init__(config, **kwargs)
 
         # SSH configuration
-        self.hostname = config.get("hostname", kwargs.get("hostname", ""))
+        # Same validation as SSHEndpoint: raw+ssh builds its own ssh command
+        # strings, so an unchecked host is dangerous here too. A MISSING host
+        # keeps its own specific message below -- "not a usable ssh host" is
+        # true but unhelpful when the answer is that none was configured.
+        _raw_host = config.get("hostname", kwargs.get("hostname", ""))
+        self.hostname = (
+            __util__.validated_ssh_host(_raw_host) if _raw_host else _raw_host
+        )
         self.username = config.get("username")
         self.port = config.get("port", 22)
         self.ssh_key = config.get("ssh_key")
         self.ssh_opts = config.get("ssh_opts", [])
         self.ssh_sudo = config.get("ssh_sudo", False)
+        #: Whether the login user can work in the target directory unaided.
+        #: None until probed. A raw+ssh target is a FILE store -- no btrfs
+        #: command ever runs on the remote -- so when the destination is already
+        #: the user's, every file operation should run as that user even with
+        #: ssh_sudo set. Elevating regardless is what made a valid config fail
+        #: against the btrfs-only sudoers policy the README documents.
+        self._file_ops_direct: bool | None = None
         # Host-key policy: "accept-new" (default; unifies raw+ssh with the btrfs transport --
         # previously it set no StrictHostKeyChecking and inherited the ambient ssh default)
         # or "strict" (refuse an unknown host). R12b.
@@ -2149,8 +2260,64 @@ class SSHRawEndpoint(RawEndpoint):
 
         return cmd
 
+    @property
+    def _should_elevate(self) -> bool:
+        """Whether remote file operations need sudo for this session.
+
+        ``ssh_sudo`` alone is not the answer: it says the operator is willing to
+        elevate, not that elevation is required. _prepare probes whether the
+        login user can create and write the destination, and when it can there
+        is nothing here to elevate for -- a raw target runs no btrfs command.
+
+        Deciding ONCE, rather than per command, is deliberate. ``cat >``, ``mv``
+        and ``rm`` are not idempotent, so a per-command "try direct, else sudo"
+        retry can apply an operation twice; and a session that created the
+        directory directly but wrote files as root would leave behind files the
+        login user cannot read back -- which is how a refused sudo once listed
+        as an empty target.
+        """
+        if not self.ssh_sudo:
+            return False
+        if self._file_ops_direct is None:
+            # list/verify construct an endpoint and read from it WITHOUT calling
+            # _prepare, so the decision cannot live only there: those commands
+            # would elevate against a directory they can read perfectly well.
+            self._file_ops_direct = self._probe_direct_access()
+        return not self._file_ops_direct
+
+    def _probe_direct_access(self) -> bool:
+        """Whether the target is usable as the login user, without side effects.
+
+        Deliberately does NOT create anything: this runs on read-only commands
+        too, and `raw verify` against a mistyped path must not answer the
+        question by bringing the directory into existence. _prepare, which has
+        to create the directory anyway, probes by doing so and records the
+        answer here before this is ever consulted.
+        """
+        quoted = shlex.quote(str(self.config["path"]))
+        probe = f"[ -d {quoted} ] && [ -r {quoted} ] && [ -w {quoted} ]"
+        try:
+            result = subprocess.run(
+                self._build_ssh_command() + [probe], check=False, capture_output=True
+            )
+            direct = result.returncode == 0
+        except Exception as e:  # noqa: BLE001 - the probe must never be the failure
+            # The probe answers "is elevation unnecessary". If it cannot run at
+            # all, that question is unanswered, and the safe answer is the
+            # behaviour that existed before it did: elevate. Raising here would
+            # make a diagnostic step the thing that breaks the operation.
+            logger.debug("raw+ssh: direct-access probe could not run (%s)", e)
+            direct = False
+        logger.debug(
+            "raw+ssh: %s is %s as the login user; ssh_sudo will %s file operations.",
+            self.config["path"],
+            "usable" if direct else "NOT usable",
+            "not elevate" if direct else "elevate",
+        )
+        return direct
+
     def _elevate(self, remote_command: str) -> str:
-        """Wrap a remote command in sudo when ``ssh_sudo`` is set.
+        """Wrap a remote command in sudo when elevation is needed.
 
         ``-n`` (non-interactive) because the ssh connection carries no tty: sudo
         would otherwise try to prompt and report "a terminal is required to read
@@ -2174,7 +2341,7 @@ class SSHRawEndpoint(RawEndpoint):
         # this code parses (stat's mtime/size) then carries no locale formatting.
         # Correctness does not rest on any of this: _is_sudo_denial keys on the
         # untranslated "sudo:" prefix, not on the wording.
-        if not self.ssh_sudo:
+        if not self._should_elevate:
             return remote_command
         return f"LC_ALL=C sudo -n {remote_command}"
 
@@ -2191,7 +2358,7 @@ class SSHRawEndpoint(RawEndpoint):
         stderr to protect, and rewriting the wire format for no reason would be a
         gratuitous behaviour change on the path that already works.
         """
-        if not self.ssh_sudo:
+        if not self._should_elevate:
             return inner
         # The sentinel runs only if sudo actually handed the shell over, and is
         # emitted regardless of the inner command's exit status (find exits 1/2
@@ -2282,7 +2449,32 @@ class SSHRawEndpoint(RawEndpoint):
         path = self.config["path"]
         ssh_cmd = self._build_ssh_command()
 
-        mkdir_cmd = self._elevate(f"mkdir -p {shlex.quote(str(path))}")
+        quoted = shlex.quote(str(path))
+        # Try as the login user FIRST, even when ssh_sudo is set. A raw+ssh
+        # target stores plain files and runs no btrfs command, so when the
+        # destination is already the user's there is nothing to elevate for --
+        # and elevating regardless made a valid config fail against the
+        # btrfs-only sudoers policy the README documents for ssh://.
+        #
+        # The probe must test WRITABILITY, not just mkdir: `mkdir -p` succeeds
+        # on an existing root-owned directory (exist_ok), and the writes would
+        # then be the thing that failed, much later and less legibly.
+        if self.ssh_sudo and self._file_ops_direct is not False:
+            probe = (
+                f"mkdir -p {quoted} && t=$(mktemp {quoted}/.bbng-probe.XXXXXX) "
+                f'&& rm -f "$t"'
+            )
+            direct = subprocess.run(ssh_cmd + [probe], check=False, capture_output=True)
+            if direct.returncode == 0:
+                self._file_ops_direct = True
+                logger.debug(
+                    "raw+ssh: %s is writable as the login user, so ssh_sudo "
+                    "will not elevate file operations for this target.",
+                    path,
+                )
+                return self._preflight_remote_tools()
+
+        mkdir_cmd = self._elevate(f"mkdir -p {quoted}")
 
         full_cmd = ssh_cmd + [mkdir_cmd]
         logger.debug("Creating remote directory: %s", full_cmd)
@@ -2308,6 +2500,19 @@ class SSHRawEndpoint(RawEndpoint):
             logger.error("Failed to create remote directory: %s", stderr)
             raise
 
+        # Reached only when the direct attempt above was refused, so elevation
+        # is genuinely required; record it rather than leaving it to be probed
+        # again by the first file operation.
+        self._file_ops_direct = False
+        self._preflight_remote_tools()
+
+    def _preflight_remote_tools(self) -> None:
+        """Confirm the remote can host raw+ssh, and this host can feed it.
+
+        Shared by both _prepare paths -- the direct one and the elevated
+        one -- so the checks cannot drift apart depending on whether the
+        destination happened to need sudo.
+        """
         # Preflight: raw+ssh runs POSIX shell commands on the remote (cat/mv/chmod
         # + a size tool). The mkdir above already proved connectivity + a POSIX-ish
         # shell, so a missing tool here means the remote can't host raw+ssh (e.g. a
@@ -2359,7 +2564,25 @@ class SSHRawEndpoint(RawEndpoint):
         # with spaces/metacharacters writes to the intended file, and so the
         # receive-write and commit_receive halves quote identically (they must
         # agree on the target or a valid config could fail at commit).
-        remote_cmd = f"cat > {shlex.quote(str(output_path))}"
+        #
+        # `set -C` is the remote counterpart of the O_EXCL|O_NOFOLLOW the local
+        # path opens its .part with (_open_part_file), and it was missing: a plain
+        # `cat >` truncates whatever is at the path and follows a symlink to write
+        # through it. So two hosts that did land on the same .part name interleaved
+        # into one stream -- the corruption the name's pid/monotonic components
+        # exist to prevent, but with nothing to catch it if they collided anyway --
+        # and a symlink planted in a target directory that untrusted users can
+        # write redirected a root-run backup onto whatever it pointed at. Under
+        # `set -C` the redirect fails outright (measured on dash, bash and POSIX
+        # sh; each refuses an existing file, a symlink, and a DANGLING symlink,
+        # and each exits non-zero so the transfer is reported failed).
+        #
+        # `umask 077` gives the stream the same 0600 the local path opens it with
+        # and the same mode the .meta sidecar beside it is already chmod'd to; a
+        # remote `cat >` otherwise left the most sensitive file at the remote's
+        # umask, typically 0644. `mv` preserves the mode, so this is the mode the
+        # published backup keeps.
+        remote_cmd = f"umask 077; set -C; cat > {shlex.quote(str(output_path))}"
         remote_cmd = self._elevate(f"sh -c {shlex.quote(remote_cmd)}")
 
         if not pipeline or pipeline == [["cat"]]:
@@ -2408,6 +2631,14 @@ class SSHRawEndpoint(RawEndpoint):
             return
         part_path = pending["part_path"]
         final_path = pending["stream_path"]
+        # Size and digest are read from the ``.part`` file, BEFORE the lock. `mv`
+        # is a pure rename, so both describe the committed stream exactly -- and
+        # hashing a multi-GB stream, even on the remote's own kernel, can take
+        # minutes. Holding the target lock across it would make a legitimately
+        # parallel commit exceed its wait and FAIL instead of serialize, which is
+        # why the local path hashes its ``.part`` outside the lock too. The
+        # ``.part`` name is this transfer's alone, so no peer can touch it.
+        size, checksum = self._remote_size_and_digest(Path(str(part_path)))
         # The leading sync flushes the just-written bytes BEFORE the rename (so
         # the final name can never refer to unflushed data); the trailing sync
         # makes the rename itself durable, matching the local path's post-rename
@@ -2417,29 +2648,43 @@ class SSHRawEndpoint(RawEndpoint):
             f"sync && mv -f {shlex.quote(str(part_path))} "
             f"{shlex.quote(str(final_path))} && sync"
         )
-        result = self._exec_remote_command(["sh", "-c", mv_script], check=False)
-        if result.returncode != 0:
-            stderr = result.stderr
-            if isinstance(stderr, (bytes, bytearray)):
-                stderr = stderr.decode(errors="replace")
-            raise RuntimeError(
-                f"Failed to publish remote raw stream {final_path}: "
-                f"{(stderr or '').strip()}"
-            )
-        # Write the authoritative sidecar remotely (best-effort: the stream is
-        # already durable, so a sidecar error must not fail the backup).
-        self._write_remote_sidecar(Path(str(final_path)))
+        # The rename makes the stream visible under its shared final name, so from
+        # here to the sidecar write must be mutually exclusive: a concurrent prune
+        # or backfill that looks in between sees a stream with no sidecar and
+        # mislabels it (backfill stamps it `unknown`/inferred, overwriting the
+        # authoritative record this commit is about to write). The local path has
+        # taken the lock over exactly this window since R7; the remote path never
+        # did, though its window is WIDER -- a network round trip, not a rename --
+        # and its peers can be on other machines, where a flock would not have
+        # helped anyway. This section is now metadata-only and sub-second.
+        with self.target_lock():
+            result = self._exec_remote_command(["sh", "-c", mv_script], check=False)
+            if result.returncode != 0:
+                stderr = result.stderr
+                if isinstance(stderr, (bytes, bytearray)):
+                    stderr = stderr.decode(errors="replace")
+                raise RuntimeError(
+                    f"Failed to publish remote raw stream {final_path}: "
+                    f"{(stderr or '').strip()}"
+                )
+            # Write the authoritative sidecar remotely (best-effort: the stream is
+            # already durable, so a sidecar error must not fail the backup).
+            self._write_remote_sidecar(Path(str(final_path)), (size, checksum))
         self._cached_snapshots = None
         logger.debug("Committed remote raw stream + sidecar: %s", final_path)
 
-    def _write_remote_sidecar(self, final_path: Path) -> None:
-        """Stat the committed remote stream for its size, then write its .meta
-        sidecar remotely and atomically (temp -> sync -> mv -> chmod 600)."""
+    def _remote_size_and_digest(self, path: Path) -> tuple[int, str | None]:
+        """Portable remote byte count + sha256 of ``path``, best-effort.
+
+        Split out of ``_write_remote_sidecar`` so a commit can measure the
+        ``.part`` file before taking the target lock and hand the results in,
+        rather than paying a full remote hash with the lock held.
+        """
         size = 0
         # Portable remote size: GNU `stat -c %s`, else BSD/macOS `stat -f %z`,
         # else POSIX `wc -c`. A raw target is often a non-Linux box (NAS, macOS),
         # so GNU-only stat would record a bogus size on those.
-        q = shlex.quote(str(final_path))
+        q = shlex.quote(str(path))
         size_cmd = (
             f"stat -c %s {q} 2>/dev/null || stat -f %z {q} 2>/dev/null || wc -c < {q}"
         )
@@ -2455,21 +2700,52 @@ class SSHRawEndpoint(RawEndpoint):
                 # the failure observable (size stays 0, best-effort).
                 logger.warning(
                     "Remote size of %s failed (rc=%s); recording sidecar size=0",
-                    final_path,
+                    path,
                     stat_res.returncode,
                 )
         except (ValueError, TypeError, OSError) as e:
             logger.warning(
                 "Could not size remote stream %s: %s; recording sidecar size=0",
-                final_path,
+                path,
                 e,
             )
-        # Best-effort: the stream is already durable, so a checksum or sidecar error
-        # must not fail the backup (mirrors the local commit path). Both the remote
-        # hash and write_sidecar are inside the try so neither can flip an
-        # already-successful transfer into a reported failure (the PR1/R1 contract).
         try:
-            checksum = self._remote_sha256(final_path)
+            checksum = self._remote_sha256(path)
+        except Exception as e:
+            # Best-effort, as at every other seal site: the backup data itself has
+            # already succeeded, so a failed digest must not fail the transfer.
+            logger.warning("Could not hash remote stream %s: %s", path, e)
+            checksum = None
+        return size, checksum
+
+    def _write_remote_sidecar(
+        self,
+        final_path: Path,
+        measured: tuple[int, str | None] | None = None,
+    ) -> None:
+        """Write ``final_path``'s .meta sidecar remotely and atomically
+        (temp -> sync -> mv -> chmod 600).
+
+        ``measured`` is a ``(size, checksum)`` pair from a caller that already
+        measured the stream under its ``.part`` name -- ``mv`` is a pure rename,
+        so those figures describe this file. Omitted, the file is measured here,
+        which is what the backfill path needs (it has no ``.part`` to measure).
+
+        One optional PAIR rather than two optional values, because a failed remote
+        hash legitimately yields ``None``: keyed on the checksum alone, exactly the
+        streams whose digest could not be taken would be hashed a second time, at
+        full cost, to fail again.
+        """
+        size, checksum = (
+            measured
+            if measured is not None
+            else self._remote_size_and_digest(final_path)
+        )
+        # Best-effort: the stream is already durable, so a sidecar error must not
+        # fail the backup (mirrors the local commit path) -- write_sidecar is
+        # inside the try so it cannot flip an already-successful transfer into a
+        # reported failure (the PR1/R1 contract).
+        try:
             self.write_sidecar(self._sidecar_snapshot(final_path, size, checksum))
         except Exception as e:
             logger.warning("Failed to write remote sidecar for %s: %s", final_path, e)
@@ -2538,7 +2814,7 @@ class SSHRawEndpoint(RawEndpoint):
             text=True,
         )
         # Never let an unreachable host look like an empty target (false all-clear).
-        _check_remote_listing(res, self.hostname, base, elevated=self.ssh_sudo)
+        _check_remote_listing(res, self.hostname, base, elevated=self._should_elevate)
         out: list[str] = []
         for p in res.stdout.split("\x00"):
             if not p or "\n" in p:
@@ -2682,19 +2958,86 @@ class SSHRawEndpoint(RawEndpoint):
                 f"Failed to write remote sidecar {meta}: {(stderr or '').strip()}"
             )
 
-    def send(
-        self,
-        snapshot: Any,
-        parent: Any | None = None,
-        clones: list[Any] | None = None,
-    ) -> subprocess.Popen[bytes]:
-        """Read a raw stream back from the REMOTE host for restore.
+    def get_space_info(self, path: str | None = None) -> Any:
+        """Free/used space of the REMOTE filesystem holding the raw target.
 
-        The base RawEndpoint.send() opens a local file; for raw+ssh the stream
-        lives on the remote, so we stream it down over ssh and decrypt/decompress
-        it LOCALLY -- ``ssh host 'cat <remote>' | <decrypt> | <decompress>``. The
-        gpg key / openssl passphrase stay on the restore host; secrets are never
-        sent to the (untrusted) remote.
+        The base implementation runs ``os.statvfs`` on this host. For a raw+ssh
+        target that measured the wrong machine entirely: the pre-transfer check
+        (``core/operations.py``) and ``estimate`` both reported the BACKING-UP
+        host's free space, so a full remote target passed the check and the
+        transfer ran until the remote ran out mid-stream.
+
+        ``df -Pk`` rather than the ``python3``/``statvfs`` probe
+        ``core.space.get_space_info``'s ``exec_func`` hook would run: a raw target
+        is a plain file store, often a NAS or a macOS box with no python3 on
+        PATH. ``-P`` is the POSIX single-line format and ``-k`` fixes the unit at
+        1 KiB, so GNU, BSD/macOS and BusyBox all answer the same way.
+
+        No qgroup query: a raw target holds files and need not be btrfs at all
+        (the .25 macOS/APFS cell in the acceptance matrix is exactly this), so
+        there is no quota to read.
+        """
+        from btrfs_backup_ng.core.space import SpaceInfo
+
+        if path is None:
+            path = str(self.config["path"])
+        else:
+            path = str(path)
+
+        res = self._exec_remote_command(
+            ["sh", "-c", f"df -Pk {shlex.quote(path)}"], check=False
+        )
+        out = res.stdout
+        if isinstance(out, (bytes, bytearray)):
+            out = out.decode(errors="replace")
+        err = res.stderr
+        if isinstance(err, (bytes, bytearray)):
+            err = err.decode(errors="replace")
+
+        # Fields are located by SHAPE, not by position: `df -P` puts the device
+        # first and the mount point last, and either may contain spaces
+        # (/Volumes/Backup Drive on the macOS cell), which splits the row into a
+        # column count that varies by host. The 1k-blocks/used/available/capacity%
+        # run is unambiguous wherever it sits.
+        match = None
+        for line in (out or "").splitlines():
+            match = re.search(r"(\d+)\s+(\d+)\s+(\d+)\s+(\d+)%", line) or match
+        if res.returncode != 0 or match is None:
+            # Report nothing rather than a figure measured on the wrong host or
+            # parsed out of an unrecognised table. The caller treats the raised
+            # error as "space unverified" and proceeds with a warning, which is
+            # the honest outcome; a fabricated 0 would abort a sound transfer and
+            # a fabricated total would green-light a doomed one.
+            detail = (err or out or "").strip().splitlines()
+            raise OSError(
+                f"Cannot read remote free space for {self.hostname}:{path}"
+                + (f": {detail[-1]}" if detail else " (df returned no usable row)")
+            )
+
+        blocks, used, available = (int(match.group(i)) * 1024 for i in (1, 2, 3))
+        return SpaceInfo(
+            path=path,
+            total_bytes=blocks,
+            used_bytes=used,
+            available_bytes=available,
+            quota_enabled=False,
+            source="remote df",
+        )
+
+    def preflight_send(self, snapshot: Any) -> None:
+        """Every read-side check ``send`` makes, performed on the REMOTE host.
+
+        The base implementation asks the LOCAL filesystem whether the stream
+        exists (``snapshot.stream_path.exists()``), which for a raw+ssh backup is
+        a path on the other machine. ``core/restore.py`` calls this before
+        ``send``, so restoring from a raw+ssh target failed every time with
+        "Stream file not found" while ``send`` -- which has always checked the
+        remote -- would have delivered the stream. Where both hosts happen to use
+        the same directory it was worse than a failure: the check passed against
+        an unrelated local file of the same name.
+
+        These are the checks ``send`` used to perform inline; ``send`` now calls
+        this, so there is one implementation rather than two that can drift.
         """
         if not isinstance(snapshot, RawSnapshot):
             raise TypeError(f"Expected RawSnapshot, got {type(snapshot)}")
@@ -2716,6 +3059,24 @@ class SSHRawEndpoint(RawEndpoint):
         # no re-download) before streaming it down, so a corrupted remote backup is
         # refused up front rather than decoded into a corrupt subvolume.
         self._verify_stream_integrity(snapshot)
+
+    def send(
+        self,
+        snapshot: Any,
+        parent: Any | None = None,
+        clones: list[Any] | None = None,
+    ) -> subprocess.Popen[bytes]:
+        """Read a raw stream back from the REMOTE host for restore.
+
+        The base RawEndpoint.send() opens a local file; for raw+ssh the stream
+        lives on the remote, so we stream it down over ssh and decrypt/decompress
+        it LOCALLY -- ``ssh host 'cat <remote>' | <decrypt> | <decompress>``. The
+        gpg key / openssl passphrase stay on the restore host; secrets are never
+        sent to the (untrusted) remote.
+        """
+        self.preflight_send(snapshot)
+        remote = str(snapshot.stream_path)
+        pipeline = self._build_restore_pipeline(snapshot)
 
         ssh_cmd = self._build_ssh_command()
         remote_cat = f"cat {shlex.quote(remote)}"
@@ -2770,7 +3131,9 @@ class SSHRawEndpoint(RawEndpoint):
 
         result = subprocess.run(full_cmd, check=False, capture_output=True, text=True)
         # Never let an unreachable host look like an empty target (false all-clear).
-        _check_remote_listing(result, self.hostname, path, elevated=self.ssh_sudo)
+        _check_remote_listing(
+            result, self.hostname, path, elevated=self._should_elevate
+        )
         meta_files = result.stdout.strip().split("\n") if result.stdout.strip() else []
 
         # For each metadata file, fetch and parse
@@ -2845,7 +3208,9 @@ class SSHRawEndpoint(RawEndpoint):
         # but DROPS before/at this second pass (e.g. a ServerAlive keepalive timeout
         # mid-listing) must still fail loudly rather than truncate the legacy-stream
         # pass to [] and under-report the target's backups.
-        _check_remote_listing(result, self.hostname, path, elevated=self.ssh_sudo)
+        _check_remote_listing(
+            result, self.hostname, path, elevated=self._should_elevate
+        )
         stream_files = (
             result.stdout.strip().split("\n") if result.stdout.strip() else []
         )
@@ -2943,7 +3308,7 @@ class SSHRawEndpoint(RawEndpoint):
 
     def _delete_snapshots_locked(
         self, snapshots: list[RawSnapshot], delete_session: set[str] | None = None
-    ) -> None:
+    ) -> DeletionResult:
         """Delete snapshots on the remote host (issuing a remote ``rm``).
 
         This overrides the LOCAL delete primitive rather than ``delete_snapshots``,
@@ -2979,10 +3344,20 @@ class SSHRawEndpoint(RawEndpoint):
                 ", ".join(sorted(remote_locked)),
             )
 
+        result = DeletionResult()
         protected = self._chain_referenced_parents(snapshots, delete_session)
         ssh_cmd = self._build_ssh_command()
 
         for snapshot in snapshots:
+            # The remote lock below is the cross-process guard and covers the
+            # ordinary case. This is the in-process one, and it is what still
+            # holds when --skip-remote-lock was passed: the operator accepted
+            # running without protection from OTHER machines, not without
+            # protection from the restore running in this one.
+            if snapshot.locks or snapshot.parent_locks:
+                logger.info("Skipping locked raw+ssh stream: %s", snapshot.get_name())
+                result.skip(snapshot, "held by a retention lock")
+                continue
             if snapshot.get_name() in protected:
                 logger.error(
                     "Refusing to delete raw+ssh stream %r: it is the incremental parent of a "
@@ -2990,8 +3365,12 @@ class SSHRawEndpoint(RawEndpoint):
                     "unrestorable. Skipping.",
                     snapshot.get_name(),
                 )
+                result.skip(
+                    snapshot, "needed as the incremental parent of a kept stream"
+                )
                 continue
             if snapshot_lock_name(snapshot) in remote_locked:
+                result.skip(snapshot, "locked by another process on this target")
                 continue
             try:
                 # Build rm command for stream and metadata
@@ -3004,6 +3383,7 @@ class SSHRawEndpoint(RawEndpoint):
                 full_cmd = ssh_cmd + [rm_cmd]
                 subprocess.run(full_cmd, check=True, capture_output=True)
                 logger.info("Deleted remote snapshot: %s", snapshot.name)
+                result.deleted.append(snapshot)
 
                 # Update cache
                 if self._cached_snapshots is not None:
@@ -3030,3 +3410,7 @@ class SSHRawEndpoint(RawEndpoint):
                         "btrfs; alternatively give the user ownership of the "
                         "backup directory and turn ssh_sudo off."
                     ) from e
+                # Not a denial, so the rest of the batch may still succeed --
+                # but this one did not, and the caller has to be told which.
+                result.fail(snapshot, stderr or e)
+        return result

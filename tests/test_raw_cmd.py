@@ -152,14 +152,22 @@ def test_raw_list_rejects_non_raw_scheme(capsys):
     assert "not a raw target" in capsys.readouterr().out
 
 
-def test_raw_list_warns_on_missing_local_target(tmp_path, capsys):
-    """A nonexistent local target warns (on stderr) instead of silently reporting
-    an empty target as if it held no backups."""
+def test_raw_list_refuses_a_missing_local_target(tmp_path, capsys):
+    """A nonexistent local target is an error, not a warning attached to a pass.
+
+    This previously warned on stderr and then returned 0 with an empty listing.
+    The docstring it carried named the problem exactly -- "instead of silently
+    reporting an empty target as if it held no backups" -- but a warning beside
+    a zero exit IS that silent report to anything reading the status, which is
+    what a timer unit or a script does. The detection was right; only the
+    verdict was missing.
+    """
     missing = tmp_path / "no-such-dir"
     rc = raw_cmd.execute_raw(_args(raw_action="list", target=str(missing), json=False))
-    assert rc == 0
+    assert rc == 2
     captured = capsys.readouterr()
-    assert "does not exist or is not mounted" in captured.err
+    assert "does not exist or is not mounted" in (captured.out + captured.err)
+    assert "0 snapshots" not in captured.out
 
 
 # --------------------------------------------------------------------------- #

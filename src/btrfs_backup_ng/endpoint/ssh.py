@@ -71,10 +71,13 @@ from btrfs_backup_ng.core.retry import (  # noqa: E402
     RetryPolicy,
 )
 from btrfs_backup_ng.core.space import SpaceInfo  # noqa: E402
-from btrfs_backup_ng.core.transfer import DEFAULT_TRANSFER_TIMEOUT  # noqa: E402
+from btrfs_backup_ng.core.transfer import (  # noqa: E402
+    DEFAULT_TRANSFER_TIMEOUT,
+    UNMEASURABLE_FALLBACK_TIMEOUT,
+)
 from btrfs_backup_ng.sshutil.master import SSHMasterManager  # noqa: E402
 
-from .common import Endpoint  # noqa: E402
+from .common import DeletionResult, Endpoint  # noqa: E402
 
 __all__ = ["SSHEndpoint"]
 
@@ -200,17 +203,79 @@ def _build_receive_command(
             # `sudo -S` reads the password from ITS stdin. Putting the
             # decompressor in front of sudo would feed the password line into the
             # decompressor instead, so sudo would never receive it and the
-            # decompressor would choke on plaintext. Nesting the pipeline INSIDE
-            # sudo keeps the ordering the caller relies on: sudo consumes the
-            # password line, then the remaining stdin -- the compressed stream --
-            # reaches the decompressor.
+            # decompressor would choke on plaintext ("not in gzip format",
+            # measured). Ordering is therefore not free to change.
+            #
+            # But elevating a SHELL -- `sudo -S sh -c '<decompress> | btrfs
+            # receive'` -- asks sudoers for permission to run sh, and the sudoers
+            # recipe this project's own README gives grants only /usr/bin/btrfs.
+            # Measured against a host configured exactly that way: "Sorry, user
+            # is not allowed to execute '/usr/sbin/sh -c ...'", and the backup
+            # never ran. So the shell form is what breaks a restricted host, and
+            # the ordering is what breaks every host -- neither one alone can be
+            # fixed by rewriting the other.
+            #
+            # Both are satisfied without ever elevating a shell. The password
+            # primes sudo's credential cache, after which the pipeline runs with
+            # `sudo -n` scoped to btrfs alone. Where that cache is refused
+            # (timestamp_timeout=0) the decompressor runs UNELEVATED and its
+            # output is prefixed with the password line, so `sudo -S` consumes
+            # that line and btrfs receive gets the decompressed stream -- scoped
+            # to btrfs again. Root therefore runs exactly one known binary on
+            # every path. Measured across six sudoers policies, on remotes whose
+            # /bin/sh is bash, dash and busybox ash:
+            #
+            #   full sudo, caching               scoped    works
+            #   btrfs-only, caching              scoped    works  (was BROKEN)
+            #   full sudo, timestamp_timeout=0   prefixed  works
+            #   btrfs-only, timestamp_timeout=0  prefixed  works  (was BROKEN)
+            #   btrfs-only NOPASSWD              scoped    works
+            #   no sudo rights at all            --        fails loudly
+            #
+            # The remote decides for itself. sudo deliberately gives the same
+            # answer ("a password is required") whether a command is forbidden or
+            # merely needs authenticating, so NO non-interactive probe from this
+            # side can tell those apart -- the choice cannot be made here.
+            #
+            # `printf` is a shell builtin in dash, bash and busybox ash (checked
+            # in all three), so the password never reaches a process argument
+            # list; and `printf %s` preserves backslashes, which dash's `echo`
+            # would eat.
             #
             # Gated on use_sudo, not on password_on_stdin alone: a caller that
             # asked for no elevation must not be handed a `sudo -S` command
             # merely because it offered a password. The uncompressed branch has
             # always honoured use_sudo, and this branch has to agree with it.
-            inner = _guarded_pipeline(f"{decompressor} | btrfs receive {quoted_dest}")
-            script = f'trap "" PIPE; exec sudo -S sh -c {shlex.quote(inner)}'
+            # Priming, the decision and the transfer all live INSIDE the guarded
+            # group, and that placement is load-bearing. With no tty -- which is
+            # every ssh command -- sudo keys its credential ticket on the PARENT
+            # PID. _guarded_pipeline runs the transfer in a BACKGROUNDED subshell,
+            # so priming outside it records a ticket against this shell that the
+            # subshell's `sudo -n` cannot see: measured as "a password is
+            # required" on bash and dash alike, with the payload never delivered,
+            # while the identical commands unbackgrounded succeeded.
+            group = (
+                'printf "%s\\n" "$__bbng_pw" | sudo -S -v 2>/dev/null; '
+                # </dev/null so the capability probe cannot consume a single byte of
+                # the stream: its stdin is fd 3, the transfer itself. `btrfs
+                # --version` does not read stdin, but a probe sharing the
+                # payload's file description should not depend on that.
+                "if sudo -n btrfs --version </dev/null >/dev/null 2>&1; then "
+                f"{decompressor} | sudo -n btrfs receive {quoted_dest}; "
+                "else "
+                # No usable credential cache (timestamp_timeout=0). Decompress
+                # UNELEVATED and prefix the decompressed stream with the password
+                # line, so `sudo -S` eats that line and hands the rest to btrfs
+                # receive. sudo stays scoped to btrfs here too, so this path needs
+                # no permission to run a shell as root either -- and a host that
+                # does not actually want a password is caught by the branch above,
+                # whose `sudo -n` probe succeeds there, so the password line can
+                # never reach btrfs as stream data.
+                f'{{ printf "%s\\n" "$__bbng_pw"; {decompressor}; }} | '
+                f"sudo -S btrfs receive {quoted_dest}; "
+                "fi"
+            )
+            script = 'trap "" PIPE; IFS= read -r __bbng_pw; ' + _guarded_pipeline(group)
             return f"exec sh -c {shlex.quote(script)}"
         script = (
             f'trap "" PIPE; {_guarded_pipeline(f"{decompressor} | {base_receive}")}'
@@ -354,7 +419,11 @@ class SSHEndpoint(Endpoint):
             if config.get(_ssh_key) is not None:
                 self.config[_ssh_key] = config[_ssh_key]
 
-        self.hostname = hostname
+        # Validated HERE, at construction, so every call site is covered --
+        # the host reaches both a shell=True pipeline and ssh's own option
+        # parser, and a check at the config boundary alone would leave the
+        # hand-written, wizard and direct-CLI forms unprotected.
+        self.hostname = __util__.validated_ssh_host(hostname)
         logger.debug("SSHEndpoint initialized with hostname: %s", self.hostname)
         logger.debug("SSHEndpoint: kwargs provided: %s", list(kwargs.keys()))
         self.config["username"] = self.config.get("username")
@@ -651,7 +720,7 @@ class SSHEndpoint(Endpoint):
         username: str = self.config.get("username", "")
         return f"(SSH) {username}@{self.hostname}:{self.config['path']}"
 
-    def delete_snapshots(self, snapshots: List[Any], **kwargs: Any) -> None:
+    def delete_snapshots(self, snapshots: List[Any], **kwargs: Any) -> DeletionResult:
         """Delete the given snapshots (subvolumes) on the remote host via SSH.
 
         Consults the locks recorded ON THE TARGET as well as the in-memory ones.
@@ -659,6 +728,11 @@ class SSHEndpoint(Endpoint):
         destination fresh, so every snapshot it sees has an empty in-memory lock
         set -- including one a restore is reading at that moment. The guard
         existed; it simply could not see the other process.
+
+        Returns a :class:`DeletionResult`. This method has six distinct outcomes
+        -- refused for an unusable remote lock, skipped for a local or a remote
+        lock, skipped because the path is not a subvolume, failed at the delete,
+        failed with an exception, deleted -- and reported all six as None.
         """
         from ..sshutil.lock import (
             RemoteLockUnavailable,
@@ -666,6 +740,7 @@ class SSHEndpoint(Endpoint):
             snapshot_lock_name,
         )
 
+        result = DeletionResult()
         remote_locked: set[str] = set()
         if self._lock_target_path() is not None:
             try:
@@ -676,12 +751,15 @@ class SSHEndpoint(Endpoint):
                 # Deleting without knowing risks removing what a restore is
                 # reading, so nothing is deleted -- said plainly, because a
                 # deletion pass that quietly removes nothing reads as success.
+                # It said so in the log and returned None anyway, which is how
+                # the caller went on to report the batch as deleted.
                 logger.error(
                     "Not deleting anything on this destination: %s. Nothing was "
                     "removed; resolve the error above and run this again.",
                     exc,
                 )
-                return
+                result.fail_all(snapshots, f"the remote lock is unusable: {exc}")
+                return result
         if remote_locked:
             logger.info(
                 "Skipping %d snapshot(s) locked by another process on this "
@@ -695,8 +773,10 @@ class SSHEndpoint(Endpoint):
                 snapshot.locks or getattr(snapshot, "parent_locks", False)
             ):
                 logger.info("Skipping locked snapshot: %s", snapshot)
+                result.skip(snapshot, "held by a retention lock")
                 continue
             if snapshot_lock_name(snapshot) in remote_locked:
+                result.skip(snapshot, "locked by another process on this destination")
                 continue
 
             # Handle remote path normalization properly
@@ -727,9 +807,15 @@ class SSHEndpoint(Endpoint):
                     logger.warning(
                         f"Not an existing btrfs subvolume, skipping deletion: {remote_path}"
                     )
+                    result.skip(snapshot, "not an existing btrfs subvolume")
                     continue
             except Exception as e:
                 logger.warning(f"Could not verify snapshot path {remote_path}: {e}")
+                # Could not even establish whether there is anything to delete.
+                # Not a skip: the deletion was asked for and did not happen, and
+                # the cause (a dead connection, an unmounted remote filesystem)
+                # applies to every snapshot in the batch.
+                result.fail(snapshot, f"could not verify the path: {e}")
                 continue
 
             # Build deletion command with proper sudo handling
@@ -740,7 +826,7 @@ class SSHEndpoint(Endpoint):
                 # Use retry mechanism for commands that may require authentication
                 use_sudo = self.config.get("ssh_sudo", False)
                 if use_sudo:
-                    result = self._exec_remote_command_with_retry(
+                    proc = self._exec_remote_command_with_retry(
                         cmd,
                         max_retries=2,
                         check=False,
@@ -748,18 +834,19 @@ class SSHEndpoint(Endpoint):
                         stderr=subprocess.PIPE,
                     )
                 else:
-                    result = self._exec_remote_command(
+                    proc = self._exec_remote_command(
                         cmd,
                         check=False,
                         stdout=subprocess.PIPE,
                         stderr=subprocess.PIPE,
                     )
-                if result.returncode == 0:
+                if proc.returncode == 0:
                     logger.info("Deleted remote snapshot subvolume: %s", remote_path)
+                    result.deleted.append(snapshot)
                 else:
                     stderr = (
-                        result.stderr.decode(errors="replace").strip()
-                        if hasattr(result, "stderr") and result.stderr
+                        proc.stderr.decode(errors="replace").strip()
+                        if hasattr(proc, "stderr") and proc.stderr
                         else "Unknown error"
                     )
                     # Check for common btrfs deletion errors
@@ -767,6 +854,7 @@ class SSHEndpoint(Endpoint):
                         logger.warning(
                             f"Snapshot already deleted or path not found: {remote_path}"
                         )
+                        result.skip(snapshot, "already absent on the destination")
                     elif "statfs" in stderr.lower():
                         logger.error(
                             f"Filesystem access error when deleting {remote_path}: {stderr}"
@@ -774,18 +862,22 @@ class SSHEndpoint(Endpoint):
                         logger.error(
                             "This may indicate the remote path is not accessible or the filesystem is unmounted"
                         )
+                        result.fail(snapshot, f"filesystem access error: {stderr}")
                     else:
                         logger.error(
                             f"Failed to delete remote snapshot {remote_path}: {stderr}"
                         )
+                        result.fail(snapshot, stderr)
             except Exception as e:
                 logger.error(
                     f"Exception while deleting remote snapshot {remote_path}: {e}"
                 )
                 # Log additional diagnostic information
                 logger.debug(f"Deletion exception details: {e}", exc_info=True)
+                result.fail(snapshot, e)
+        return result
 
-    def delete_old_snapshots(self, keep: int) -> None:
+    def delete_old_snapshots(self, keep: int) -> DeletionResult:
         """Delete old snapshots on the remote host, keeping the most recent ``keep`` unlocked.
 
         LEGACY count-based path (see ``Endpoint.delete_old_snapshots``); the modern retention
@@ -803,11 +895,13 @@ class SSHEndpoint(Endpoint):
                 keep,
                 len(unlocked),
             )
-            return
+            return DeletionResult()
         to_delete = unlocked[:-keep]
+        result = DeletionResult()
         for snap in to_delete:
             logger.info("Deleting old remote snapshot: %s", str(snap))
-            self.delete_snapshots([snap])
+            result.extend(self.delete_snapshots([snap]))
+        return result
 
     #: ssh:// writes its snapshot locks on the remote destination, so they
     #: survive the process and are visible to any other process or machine
@@ -2384,6 +2478,26 @@ print(json.dumps(result))
                 bufsize=0,
             )
 
+            # The receive owns that pipe now, so this process must let go of its
+            # copy -- the same reason the two stages upstream do it, one of which
+            # says so in as many words ("Allow send_process to receive SIGPIPE").
+            # This was the third and last handoff in the chain and the only one
+            # that did not.
+            #
+            # Keeping it open leaves a reader alive that never reads, so the
+            # LAST local stage -- pv, mbuffer, or the compressor -- blocks
+            # forever writing into it when the receive exits, instead of taking
+            # SIGPIPE and ending. Observed on a real transfer: `btrfs-backup-ng
+            # run` sleeping in a poll loop with one child, `pv -q -B 32M`, parked
+            # in poll_schedule_timeout on a pipe whose read end this process
+            # still held. The run never terminated, and it held the per-config
+            # run lock while it sat there, so the next run refused to start.
+            if stdin_pipe is not None and hasattr(stdin_pipe, "close"):
+                try:
+                    stdin_pipe.close()
+                except Exception as e:  # noqa: BLE001 - never fail a started transfer
+                    logger.debug("Could not close the handed-over pipe: %s", e)
+
             logger.debug(
                 "btrfs receive process started with PID: %d", receive_process.pid
             )
@@ -2906,7 +3020,34 @@ print(json.dumps(result))
             logger.debug(f"Verification exception details: {e}", exc_info=True)
             return False
 
-    def _cleanup_partial_subvolume(self, dest_path: str, received_name: str) -> None:
+    def artifact_exists(self, dest_path: str, received_name: str) -> bool:
+        """Whether ``{dest_path}/{received_name}`` is already on the REMOTE.
+
+        Asked before a transfer begins, to establish whether the partial cleanup
+        on the failure path would be deleting its own work or somebody else's.
+        Answers True when it cannot tell: the failure being guarded against is
+        removing a backup that was not ours, so uncertainty resolves to leaving
+        it alone.
+        """
+        expected = f"{dest_path.rstrip('/')}/{received_name}"
+        try:
+            return (
+                self._exec_remote_command(
+                    ["test", "-e", expected], check=False
+                ).returncode
+                == 0
+            )
+        except Exception as e:  # noqa: BLE001 - see docstring
+            logger.debug("Could not determine whether %s pre-existed: %s", expected, e)
+            return True
+
+    def _cleanup_partial_subvolume(
+        self,
+        dest_path: str,
+        received_name: str,
+        *,
+        created_by_this_run: bool,
+    ) -> None:
         """Remove a partial/failed received subvolume at its exact destination path.
 
         Called after a transfer is judged failed so that a leftover partial cannot
@@ -2915,9 +3056,30 @@ print(json.dumps(result))
         ``{dest_path}/{received_name}`` — never a filesystem-wide search — for the
         same reason exact-path verification is: sibling snapshots must not be touched.
 
+        ``created_by_this_run`` is what makes the removal safe, and it is the
+        caller's to establish: being at the path proves only that something is
+        there, not that this transfer put it there. Skip-detection works by UUID
+        correspondence rather than by name, so a destination subvolume that merely
+        shares a name -- one another tool wrote, a second source machine using the
+        same snap_prefix, a restored copy -- is planned for transfer and would be
+        deleted here when that transfer failed.
+
+        REQUIRED, with no default. It briefly had one, which silently exempted
+        every caller inside this module -- six of them, on every ssh:// transfer
+        route -- while the guard read as applied. A parameter that can be omitted
+        on the path it protects is not a guard.
+
         Best-effort: failures are logged and swallowed (the caller has already
         decided the transfer failed).
         """
+        if not created_by_this_run:
+            logger.warning(
+                "Not cleaning up %s on %s: it was already at that path before this "
+                "transfer started, so it is not this run's partial.",
+                received_name,
+                self.hostname,
+            )
+            return
         expected_path = f"{dest_path.rstrip('/')}/{received_name}"
         use_sudo = self.config.get("ssh_sudo", False)
 
@@ -3396,6 +3558,12 @@ print(json.dumps(result))
         Returns:
             True if transfer succeeded, False otherwise
         """
+        # Recorded BEFORE the transfer: once bytes have been written, a partial
+        # this run left and a backup that was already at that path are the same
+        # observation, and the failure path below deletes by path.
+        received_name = Path(source_path).name
+        artifact_preexisted = self.artifact_exists(dest_path, received_name)
+
         import sys
 
         control_path = str(self.ssh_manager.control_path)
@@ -3455,7 +3623,11 @@ print(json.dumps(result))
         ssh_parts.append("-T")
         if ssh_port:
             ssh_parts.extend(["-p", str(ssh_port)])
-        ssh_parts.append(remote_host)
+        # Quoted because ssh_parts is joined into ONE string and run with
+        # shell=True below; validated_ssh_host already refuses a host that
+        # could exploit this, and quoting means the shell path does not
+        # depend on that being the only guard.
+        ssh_parts.append(shlex.quote(remote_host))
 
         # Build remote command with orphan protection.
         # _build_receive_command escapes the destination itself; do not pre-quote.
@@ -3583,19 +3755,47 @@ print(json.dumps(result))
             stderr_thread = threading.Thread(target=stream_stderr, daemon=True)
             stderr_thread.start()
 
-            proc.wait()
+            # This path runs whenever ssh_sudo is set without passwordless sudo.
+            # It used to be a bare proc.wait(): no stall check, no wall clock, no
+            # bound of any kind, so a remote that wedged mid-apply hung the client
+            # forever -- while the README promised a fallback limit would apply.
+            # wait_with_progress is the same primitive the other receive paths
+            # use and is a drop-in for the blocking call: it gives up when bytes
+            # stop moving, and falls back to a wall limit when progress cannot be
+            # measured at all.
+            from ..core.transfer import wait_with_progress
+
+            try:
+                wait_with_progress(
+                    proc,
+                    stall_pids=[proc.pid],
+                    stall_timeout=int(
+                        self.config.get("transfer_stall_timeout", STALL_TIMEOUT_SECONDS)
+                    ),
+                    description="ssh sudo pipeline transfer",
+                )
+            except subprocess.TimeoutExpired:
+                logger.error(
+                    "Transfer stopped making progress and was ended; the remote "
+                    "receive may have wedged mid-apply."
+                )
+                proc.kill()
+                proc.wait()
             stderr_thread.join(timeout=5)
 
-            # The received subvolume is named after the source basename
-            # (== snapshot_name for native, "snapshot" for snapper).
-            received_name = Path(source_path).name
-
+            # received_name (the source basename: == snapshot_name for native,
+            # "snapshot" for snapper) was resolved before the transfer, together
+            # with whether anything already occupied that destination path.
             if proc.returncode != 0:
                 stderr_output = "".join(stderr_lines)
                 logger.error(f"Transfer failed (exit {proc.returncode})")
                 if stderr_output:
                     logger.error(f"Error output: {stderr_output}")
-                self._cleanup_partial_subvolume(dest_path, received_name)
+                self._cleanup_partial_subvolume(
+                    dest_path,
+                    received_name,
+                    created_by_this_run=not artifact_preexisted,
+                )
                 return False
 
             logger.info("Transfer completed successfully")
@@ -3723,13 +3923,18 @@ print(json.dumps(result))
         # report failure and delete a backup that transferred correctly.
         received_name = Path(source_path).name
         logger.debug(f"Received subvolume name (for verification): {received_name}")
+        # Recorded BEFORE the transfer, for the reason above.
+        artifact_preexisted = self.artifact_exists(dest_path, received_name)
 
         # Check if source path exists
         if not os.path.exists(source_path):
             logger.error(f"Source path does not exist: {source_path}")
             return False
 
-        # Run pre-transfer diagnostics
+        # Run pre-transfer diagnostics. NOT force_refresh: send_receive has just
+        # refreshed this exact cache key on the way in, so this reads a verdict
+        # seconds old. Refreshing again would pay for all eight probes twice per
+        # snapshot to answer the same question.
         logger.info("Verifying SSH connectivity and filesystem readiness...")
         diagnostics = self._run_diagnostics(dest_path)
         if not all(
@@ -3807,31 +4012,31 @@ print(json.dumps(result))
                 send_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0
             )
 
-            # Set up buffering if available
-            if buffer_cmd:
+            # Stages, in THIS path's order: buffer first, then compress. Built by
+            # the shared chainer rather than by hand -- three hand-written copies
+            # of this construction is how the same descriptor leak came to exist
+            # in all three, and chain_stages releases each pipe as it hands it on.
+            def _buffer(stdin):
+                if not buffer_cmd:
+                    return None
                 logger.debug(f"Using {buffer_name} to improve transfer reliability")
-                buffer_args = buffer_cmd.split()
-                buffer_process = subprocess.Popen(
-                    buffer_args,
-                    stdin=send_process.stdout,
+                return subprocess.Popen(
+                    buffer_cmd.split(),
+                    stdin=stdin,
                     stdout=subprocess.PIPE,
                     bufsize=0,
                 )
-                if send_process.stdout:  # Only close if stdout exists
-                    send_process.stdout.close()  # Allow send_process to receive SIGPIPE
-                pipe_output = buffer_process.stdout
-            else:
-                pipe_output = send_process.stdout
-                buffer_process = None
 
             # Stream compression: compress BEFORE the wire, decompress after it.
             # The decompressor is added to the remote command by _btrfs_receive,
             # so the two halves are always configured from the same value -- the
             # missing half is what made this option a no-op for ssh:// targets.
             # Nothing changes when compression is off.
-            compress_process = None
             compress_method = self._stream_compress_method()
-            if compress_method:
+
+            def _compress(stdin):
+                if not compress_method:
+                    return None
                 from ..core.transfer import COMPRESSION_PROGRAMS
 
                 logger.info(
@@ -3839,16 +4044,22 @@ print(json.dumps(result))
                     "remote before btrfs receive)",
                     compress_method,
                 )
-                compress_process = subprocess.Popen(
+                return subprocess.Popen(
                     COMPRESSION_PROGRAMS[compress_method]["compress"],
-                    stdin=pipe_output,
+                    stdin=stdin,
                     stdout=subprocess.PIPE,
                     bufsize=0,
                 )
-                if pipe_output:
-                    # Let the upstream process see SIGPIPE if the compressor dies.
-                    pipe_output.close()
-                pipe_output = compress_process.stdout
+
+            from ..core.transfer import chain_stages
+
+            pipe_output, stage_list = chain_stages(
+                send_process.stdout,
+                [("buffer", _buffer), ("compress", _compress)],
+            )
+            staged = dict(stage_list)
+            buffer_process = staged.get("buffer")
+            compress_process = staged.get("compress")
 
             # Start the remote receive process
             logger.debug("Starting remote btrfs receive process")
@@ -3961,7 +4172,11 @@ print(json.dumps(result))
             receive_failed = recv_rc is not None and recv_rc != 0
             send_failed = send_rc is not None and send_rc != 0
             if receive_failed or send_failed:
-                self._cleanup_partial_subvolume(dest_path, received_name)
+                self._cleanup_partial_subvolume(
+                    dest_path,
+                    received_name,
+                    created_by_this_run=not artifact_preexisted,
+                )
             else:
                 logger.warning(
                     "Receive completed but verification was inconclusive; leaving "
@@ -4067,9 +4282,26 @@ print(json.dumps(result))
             logger.error("Error verifying/creating destination: %s", e)
             return False
 
-        # Run diagnostics to ensure everything is ready
+        # Run diagnostics to ensure everything is ready.
+        #
+        # force_refresh, because this is the gate that decides whether to start
+        # moving data. The cache holds a verdict for 300s, and force_refresh
+        # existed with no caller anywhere -- so "verifying SSH connectivity and
+        # filesystem readiness" passed for five minutes after the host went away,
+        # the destination was unmounted, or the remote filesystem went read-only.
+        #
+        # It is worse than a stale pass: the cached value is also written back to
+        # config["passwordless_sudo_available"], which _build_remote_command reads
+        # for EVERY remote command, and the sudo branch below is chosen by the
+        # same stale boolean -- a stale True keeps the run on the direct path and
+        # skips _try_sudo_cached_transfer, the one route that checks the transport
+        # is still alive.
+        #
+        # The cost is eight probes once per snapshot over an already-multiplexed
+        # connection, and _try_direct_transfer's own call below then reads what
+        # this just wrote.
         logger.debug("Verifying pre-transfer readiness")
-        diagnostics = self._run_diagnostics(dest_path)
+        diagnostics = self._run_diagnostics(dest_path, force_refresh=True)
         if not all(
             [
                 diagnostics["ssh_connection"],
@@ -4199,6 +4431,8 @@ print(json.dumps(result))
         # (== snapshot_name for native, "snapshot" for snapper). Compute it up front
         # so partial-cleanup on the failure paths can target the exact path.
         received_name = Path(manifest.snapshot_path).name
+        # Recorded BEFORE the receive, for the reason above.
+        artifact_preexisted = self.artifact_exists(dest_path, received_name)
         use_sudo = self.config.get("ssh_sudo", False)
         passwordless = self.config.get("passwordless", False) or self.config.get(
             "passwordless_sudo_available", False
@@ -4260,7 +4494,11 @@ print(json.dumps(result))
                         chunks_sent,
                         stderr,
                     )
-                    self._cleanup_partial_subvolume(dest_path, received_name)
+                    self._cleanup_partial_subvolume(
+                        dest_path,
+                        received_name,
+                        created_by_this_run=not artifact_preexisted,
+                    )
                     return False
 
                 # Write chunk data
@@ -4305,7 +4543,11 @@ print(json.dumps(result))
             except subprocess.TimeoutExpired:
                 logger.error("Timeout waiting for SSH receive to complete")
                 receive_process.kill()
-                self._cleanup_partial_subvolume(dest_path, received_name)
+                self._cleanup_partial_subvolume(
+                    dest_path,
+                    received_name,
+                    created_by_this_run=not artifact_preexisted,
+                )
                 return False
 
             if return_code != 0:
@@ -4319,7 +4561,11 @@ print(json.dumps(result))
                     return_code,
                     stderr,
                 )
-                self._cleanup_partial_subvolume(dest_path, received_name)
+                self._cleanup_partial_subvolume(
+                    dest_path,
+                    received_name,
+                    created_by_this_run=not artifact_preexisted,
+                )
                 return False
 
             elapsed = time.time() - start_time
@@ -4354,8 +4600,44 @@ print(json.dumps(result))
             except Exception:
                 pass
             # The stream did not complete normally: remove any partial subvolume.
-            self._cleanup_partial_subvolume(dest_path, received_name)
+            self._cleanup_partial_subvolume(
+                dest_path,
+                received_name,
+                created_by_this_run=not artifact_preexisted,
+            )
             return False
+
+    def _unbounded_tail_expired(
+        self, send_exit_time: Optional[float], max_wait_time: int, now: float
+    ) -> bool:
+        """Whether an unbounded post-send tail has outlived its fallback limit.
+
+        Once the local send exits, no bytes move on this side, so the stall check
+        is deliberately disarmed -- the remote is applying what it already
+        received, and killing it there would destroy a transfer about to succeed.
+        Both monitor loops described that tail as covered by the wall clock, but
+        `transfer_timeout` defaults to 0, which means NO wall clock. On a default
+        configuration nothing bounded the tail at all, so a remote wedged
+        mid-apply hung the run forever (issue #107).
+
+        The fallback is the same generous limit an unmeasurable transfer gets,
+        for the same reason: guard by measurement where possible, by clock where
+        not. An operator wanting a tighter deadline sets `transfer_timeout`.
+        """
+        return (
+            send_exit_time is not None
+            and max_wait_time <= 0
+            and now - send_exit_time >= UNMEASURABLE_FALLBACK_TIMEOUT
+        )
+
+    def _tail_timeout_error(self, waited: float) -> str:
+        return (
+            f"the local send finished but the remote never completed applying "
+            f"the stream after {waited:.0f}s, so the transfer was terminated. "
+            f"This is btrfs-backup-ng's fallback limit for an unbounded tail, "
+            f"NOT an ssh timeout. Set transfer_timeout to impose your own "
+            f"deadline."
+        )
 
     def _monitor_transfer_progress(
         self,
@@ -4409,6 +4691,8 @@ print(json.dumps(result))
         )
         last_bytes = __util__.any_bytes_moved(stall_pids)
         last_progress_time = start_time
+        #: When the local send exited, if it has; see _unbounded_tail_expired.
+        send_exit_time: Optional[float] = None
         stall_detection = stall_limit > 0 and last_bytes is not None
         if not stall_detection:
             # Never silently downgrade to "no bytes moved": that would read as a
@@ -4435,8 +4719,34 @@ print(json.dumps(result))
             # bytes move on this side -- which is completion, not a stall, and
             # killing it there would destroy a transfer that was about to
             # succeed. A remote wedged MID-receive still blocks the send, so
-            # that case is caught; only the tail is exempt, and the wall clock
-            # covers it.
+            # that case is caught; only the tail is exempt, and it is bounded by
+            # _unbounded_tail_expired rather than left to run forever.
+            if not send_alive and send_exit_time is None:
+                send_exit_time = current_time
+                if max_wait_time <= 0:
+                    logger.info(
+                        "Send finished; the remote is applying what it received. "
+                        "No wall-clock limit is configured, so this tail is "
+                        "guarded by a %ds fallback.",
+                        UNMEASURABLE_FALLBACK_TIMEOUT,
+                    )
+            if self._unbounded_tail_expired(
+                send_exit_time, max_wait_time, current_time
+            ):
+                assert send_exit_time is not None
+                self._last_transfer_error = self._tail_timeout_error(
+                    current_time - send_exit_time
+                )
+                logger.error("FAILED: %s", self._last_transfer_error)
+                for proc in (send_process, receive_process, buffer_process):
+                    if proc is not None and proc.poll() is None:
+                        proc.terminate()
+                        try:
+                            proc.wait(timeout=5)
+                        except Exception:
+                            proc.kill()
+                return False
+
             if stall_detection and send_alive:
                 moved = __util__.any_bytes_moved(stall_pids)
                 if moved is None:
@@ -4672,6 +4982,8 @@ print(json.dumps(result))
         )
         last_bytes = __util__.any_bytes_moved(stall_pids)
         last_progress_time = start_time
+        #: When the local send exited, if it has; see _unbounded_tail_expired.
+        send_exit_time: Optional[float] = None
         stall_detection = stall_limit > 0 and last_bytes is not None
 
         # Simple polling loop with timeout
@@ -4691,6 +5003,32 @@ print(json.dumps(result))
 
             # Judged only while the SEND is alive: after it finishes the remote
             # is applying what it already has, which is completion, not a stall.
+            # The tail that follows is bounded by _unbounded_tail_expired.
+            tail_now = time.time()
+            if send_process.poll() is not None and send_exit_time is None:
+                send_exit_time = tail_now
+                if max_wait_time <= 0:
+                    logger.info(
+                        "Send finished; the remote is applying what it received. "
+                        "No wall-clock limit is configured, so this tail is "
+                        "guarded by a %ds fallback.",
+                        UNMEASURABLE_FALLBACK_TIMEOUT,
+                    )
+            if self._unbounded_tail_expired(send_exit_time, max_wait_time, tail_now):
+                assert send_exit_time is not None
+                self._last_transfer_error = self._tail_timeout_error(
+                    tail_now - send_exit_time
+                )
+                logger.error("FAILED: %s", self._last_transfer_error)
+                for proc in processes_to_wait:
+                    if proc.poll() is None:
+                        proc.terminate()
+                        try:
+                            proc.wait(timeout=5)
+                        except Exception:
+                            proc.kill()
+                return False
+
             if stall_detection and send_process.poll() is None:
                 now = time.time()
                 moved = __util__.any_bytes_moved(stall_pids)

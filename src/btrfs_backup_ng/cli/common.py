@@ -391,21 +391,32 @@ def get_timestamp_format(config=None) -> str:
     return fmt or __util__.DATE_FORMAT
 
 
-def resolve_timestamp_format(explicit: str | None = None) -> str:
+def resolve_timestamp_format(
+    explicit: str | None = None, config_path: str | None = None
+) -> str:
     """Resolve the snapshot timestamp_format for direct-mode commands.
 
     ``verify`` and ``restore`` operate on a location argument and may have no
     config object, so without this they parse snapshot names with only the
     default format and silently skip custom-named snapshots. An explicit
     ``--timestamp-format`` wins; otherwise honor ``[global] timestamp_format``
-    from a discoverable config; else the built-in default.
+    from the config; else the built-in default.
+
+    ``config_path`` is the operator's ``-c``. It used to be ignored: the lookup
+    passed None and DISCOVERED a config from the default locations instead, so a
+    timestamp_format set in the file actually named on the command line was
+    silently replaced by the default. A pool named under that format then parsed
+    as nothing, and `restore` reported the location as holding no snapshots --
+    while advising a prefix that did not exist. That is the wrong answer to give
+    anyone, and `restore` is the command people run when something has already
+    gone wrong.
     """
     if explicit:
         return explicit
     try:
         from ..config import find_config_file, load_config
 
-        path = find_config_file(None)
+        path = find_config_file(config_path)
         if path is not None:
             config, _ = load_config(path)
             return get_timestamp_format(config)
@@ -496,3 +507,35 @@ def thread_raw_compression(kwargs: dict, target, override: str | None = None) ->
     value (otherwise the guard is tautological and cannot catch a dropped override).
     """
     kwargs["compress"] = override or getattr(target, "compress", None)
+
+
+def resolve_snapshot_dir(configured: str, source_path: Path) -> Path:
+    """Return the directory snapshots are stored in, refusing an absent base.
+
+    ``snapshot_dir`` may be relative to the source (the ``.snapshots`` default)
+    or an absolute path somewhere else, which is how an operator moves snapshots
+    off the root filesystem onto a bigger disk. The absolute form is the one
+    that bites: the whole tree was created with ``parents=True``, so when that
+    disk was not mounted the snapshots were written to the root filesystem
+    instead -- and they SUCCEED there, because a btrfs snapshot only needs to
+    share a filesystem with its source, which on a btrfs root it does. The
+    operator moved snapshots away from root precisely to stop filling it, and
+    an unmounted disk quietly put them back.
+
+    So an absolute base must already exist. The per-source directory BELOW it is
+    still created, which keeps first use working on a mounted disk. A relative
+    snapshot_dir is unaffected: it resolves under the source, which the endpoint
+    has already established is there.
+    """
+    configured_path = Path(configured)
+    if not configured_path.is_absolute():
+        return (source_path / configured_path).resolve()
+
+    if not configured_path.is_dir():
+        raise __util__.AbortError(
+            f"snapshot_dir {configured_path} does not exist. An absolute "
+            f"snapshot_dir is not created for you: if it lives on a removable "
+            f"or network filesystem, it is most likely not mounted. Snapshots "
+            f"would otherwise be written to the filesystem holding the source."
+        )
+    return (configured_path / source_path.name).resolve()

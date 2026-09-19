@@ -8,6 +8,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from btrfs_backup_ng.endpoint.common import Endpoint
+from btrfs_backup_ng.__util__ import AbortError
 from btrfs_backup_ng.endpoint.local import LocalEndpoint
 
 
@@ -33,13 +34,7 @@ class TestLocalEndpointOperations:
         assert endpoint.config["path"] == dest
         assert endpoint.config["snap_prefix"] == "test-"
 
-    def test_endpoint_prepare_creates_directories(self, tmp_path):
-        """Test endpoint prepare creates required directories."""
-        source = tmp_path / "source"
-        dest = tmp_path / "dest"
-        source.mkdir()
-        # dest doesn't exist yet
-
+    def _prepare(self, source, dest):
         with patch("shutil.which", return_value="/usr/bin/btrfs"):
             with patch("btrfs_backup_ng.__util__.is_subvolume", return_value=True):
                 with patch("btrfs_backup_ng.__util__.is_btrfs", return_value=True):
@@ -52,8 +47,35 @@ class TestLocalEndpointOperations:
                     )
                     endpoint.prepare()
 
-        assert dest.exists()
+    def test_endpoint_prepare_creates_infrastructure_below_the_destination(
+        self, tmp_path
+    ):
+        """An EXISTING destination still gets its .btrfs-backup-ng tree."""
+        source = tmp_path / "source"
+        dest = tmp_path / "dest"
+        source.mkdir()
+        dest.mkdir()
+
+        self._prepare(source, dest)
+
         assert (dest / ".btrfs-backup-ng").exists()
+
+    def test_endpoint_prepare_refuses_a_destination_that_does_not_exist(self, tmp_path):
+        """It used to create it.
+
+        A configured destination on an unmounted removable or network filesystem
+        got its mount point built on the ROOT filesystem, and the backup written
+        there -- hidden once the real disk returned, and charged to the wrong
+        filesystem's free space.
+        """
+        source = tmp_path / "source"
+        dest = tmp_path / "dest"
+        source.mkdir()
+
+        with pytest.raises(AbortError):
+            self._prepare(source, dest)
+
+        assert not dest.exists(), "refused, then created it anyway"
 
     def test_endpoint_get_id(self, tmp_path):
         """Test endpoint ID generation."""

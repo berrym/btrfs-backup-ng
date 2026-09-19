@@ -1,0 +1,223 @@
+"""A configured path is a statement that something is there, not a request to make it.
+
+Reported by a contributor against local targets (#102): a target on an external
+disk may or may not be present depending on whether the disk is mounted, and the
+tool created the path unconditionally. The backup then landed on the ROOT
+filesystem, underneath what later becomes a mount point -- invisible once the
+real disk is mounted over it, and counted against the wrong filesystem's free
+space. `require_mount` does not cover this: it works only when the configured
+path IS the mount point, because that one always exists.
+
+Refusing also catches a typo, which is the same argument from the other side.
+
+The reporter suspected his patch was incomplete, and it was. There were FOUR
+places that create a configured path, and fixing only the first would have been
+undone by the third:
+
+    endpoint/local.py   _prepare, the destination and the source
+    endpoint/local.py   an ABSOLUTE snapshot_dir, which can name another filesystem
+    endpoint/common.py  Endpoint.receive, immediately before receiving
+    endpoint/raw.py     RawEndpoint._prepare, and target_lock
+
+Raw was the worst of them. It created the target on first use -- convenient
+until the disk is not mounted -- and it applies no filesystem check at all: no
+fs_checks, no btrfs test. Nothing else would have noticed, and raw streams are
+as large as the data being backed up, so an unmounted disk filled the root
+filesystem silently. Its target_lock rebuilt the directory too, for every locked
+operation, which would have undone the refusal in _prepare.
+
+Directories BELOW an existing configured path are still created: the
+.btrfs-backup-ng tree, and a relative snapshot_dir.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+from unittest.mock import patch
+
+import pytest
+
+from btrfs_backup_ng.__util__ import AbortError
+from btrfs_backup_ng.endpoint.local import LocalEndpoint
+
+
+def _endpoint(source, dest, **extra):
+    config = {
+        "source": str(source) if source else None,
+        "path": str(dest),
+        "fs_checks": "auto",
+    }
+    config.update(extra)
+    return LocalEndpoint(config=config)
+
+
+def _prepare(source, dest, **extra):
+    with patch("shutil.which", return_value="/usr/bin/btrfs"):
+        with patch("btrfs_backup_ng.__util__.is_subvolume", return_value=True):
+            with patch("btrfs_backup_ng.__util__.is_btrfs", return_value=True):
+                _endpoint(source, dest, **extra).prepare()
+
+
+class TestTheUnmountedDiskScenario:
+    def test_the_mount_point_tree_is_not_built_on_the_root_filesystem(self, tmp_path):
+        """The reported bug, end to end."""
+        source = tmp_path / "source"
+        source.mkdir()
+        # Nothing of this exists: it is where an external disk would be mounted.
+        dest = tmp_path / "mnt" / "external" / "backups"
+
+        with pytest.raises(AbortError):
+            _prepare(source, dest)
+
+        assert not dest.exists()
+        assert not (tmp_path / "mnt").exists(), (
+            "refused the destination but still created its parents"
+        )
+
+    def test_the_message_names_the_likely_cause(self, tmp_path):
+        source = tmp_path / "source"
+        source.mkdir()
+        dest = tmp_path / "absent"
+
+        with pytest.raises(AbortError) as excinfo:
+            _prepare(source, dest)
+
+        message = str(excinfo.value)
+        assert str(dest) in message
+        assert "mounted" in message.lower(), (
+            "an operator hitting this has an unmounted disk and should be told so"
+        )
+
+
+class TestSourceAndDestination:
+    def test_a_missing_destination_is_refused(self, tmp_path):
+        source = tmp_path / "source"
+        source.mkdir()
+        with pytest.raises(AbortError):
+            _prepare(source, tmp_path / "absent")
+
+    def test_a_missing_source_is_refused(self, tmp_path):
+        dest = tmp_path / "dest"
+        dest.mkdir()
+        with pytest.raises(AbortError):
+            _prepare(tmp_path / "absent", dest)
+
+    def test_a_missing_source_is_not_created(self, tmp_path):
+        dest = tmp_path / "dest"
+        dest.mkdir()
+        source = tmp_path / "absent"
+        with pytest.raises(AbortError):
+            _prepare(source, dest)
+        assert not source.exists()
+
+    def test_both_present_succeeds(self, tmp_path):
+        source = tmp_path / "source"
+        dest = tmp_path / "dest"
+        source.mkdir()
+        dest.mkdir()
+        _prepare(source, dest)
+        assert (dest / ".btrfs-backup-ng" / "snapshots").is_dir()
+
+
+class TestSnapshotFolderIsDeliberatelyUnchanged:
+    """The snapshot directory is the SOURCE side, and is not what #102 is about.
+
+    `local.py` used to read `config["snapshot_dir"]` in `_prepare`, but nothing
+    ever put that key in an endpoint config -- the endpoint layer uses
+    `snapshot_folder`. That block had never executed and is now deleted: left in
+    place it would have re-created an absolute path unconditionally the moment
+    anyone wired the key up, reintroducing the defect this file is about.
+
+    The absolute case is handled where the path is actually computed, by
+    `cli.common.resolve_snapshot_dir`.
+    """
+
+    def test_a_relative_snapshot_folder_is_created_under_the_source(self, tmp_path):
+        source = tmp_path / "source"
+        source.mkdir()
+        endpoint = _endpoint(source, tmp_path / "dest", snapshot_folder="snaps")
+        with patch("btrfs_backup_ng.__util__.is_subvolume", return_value=True):
+            with patch.object(type(endpoint), "_build_snapshot_cmd", create=True):
+                folder = Path(endpoint.config["snapshot_folder"])
+        assert not folder.is_absolute()
+
+
+class TestReceiveDoesNotRebuildWhatPrepareRefused:
+    """The site that would have silently undone the fix."""
+
+    def test_receive_refuses_a_missing_destination(self, tmp_path):
+        dest = tmp_path / "mnt" / "external"
+        endpoint = _endpoint(None, dest)
+
+        with pytest.raises(AbortError) as excinfo:
+            endpoint.receive(stdin=None, snapshot_name="snap")
+
+        assert str(dest) in str(excinfo.value)
+        assert not dest.exists()
+
+    def test_receive_no_longer_merely_warns(self, tmp_path):
+        """It logged a warning and carried on, leaving a less specific failure later."""
+        dest = tmp_path / "absent"
+        endpoint = _endpoint(None, dest)
+
+        with pytest.raises(AbortError):
+            endpoint.receive(stdin=None)
+
+
+class TestRawTargetsGetTheSameRule:
+    """Raw applies no filesystem check of its own, so nothing else catches this."""
+
+    @staticmethod
+    def _raw(dest):
+        from btrfs_backup_ng.endpoint.raw import RawEndpoint
+
+        return RawEndpoint(config={"path": str(dest), "fs_checks": "skip"})
+
+    def test_prepare_refuses_a_target_that_does_not_exist(self, tmp_path):
+        dest = tmp_path / "mnt" / "usb" / "backups"
+
+        with pytest.raises(AbortError) as excinfo:
+            self._raw(dest)._prepare()
+
+        assert str(dest) in str(excinfo.value)
+        assert "mounted" in str(excinfo.value).lower()
+
+    def test_prepare_creates_nothing_when_it_refuses(self, tmp_path):
+        dest = tmp_path / "mnt" / "usb" / "backups"
+
+        with pytest.raises(AbortError):
+            self._raw(dest)._prepare()
+
+        assert not dest.exists()
+        assert not (tmp_path / "mnt").exists(), (
+            "refused the target but still built its parents on this filesystem"
+        )
+
+    def test_prepare_accepts_a_target_that_exists(self, tmp_path):
+        dest = tmp_path / "rawtarget"
+        dest.mkdir()
+
+        self._raw(dest)._prepare()
+
+        assert dest.is_dir()
+
+    def test_target_lock_does_not_rebuild_a_missing_target(self, tmp_path):
+        """It ran for every locked operation and would have undone the refusal."""
+        dest = tmp_path / "mnt" / "usb" / "backups"
+        endpoint = self._raw(dest)
+
+        with pytest.raises(AbortError):
+            with endpoint.target_lock():
+                pass
+
+        assert not dest.exists()
+
+    def test_target_lock_still_works_when_the_target_exists(self, tmp_path):
+        dest = tmp_path / "rawtarget"
+        dest.mkdir()
+        endpoint = self._raw(dest)
+
+        with endpoint.target_lock():
+            pass
+
+        assert dest.is_dir()

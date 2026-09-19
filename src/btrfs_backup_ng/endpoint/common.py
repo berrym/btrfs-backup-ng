@@ -8,6 +8,7 @@ import os
 import stat
 import subprocess
 import tempfile
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -67,6 +68,77 @@ def _command_lock_path() -> Path:
     return d / "command.lock"
 
 
+@dataclass
+class DeletionResult:
+    """What a deletion batch actually did, per snapshot.
+
+    ``deleted`` holds the snapshots removed from the target. ``skipped`` holds
+    ``(snapshot, reason)`` for those deliberately left alone -- a retention lock
+    held here or by another process, a chain guard refusing to orphan a child,
+    a stream that was already gone. ``failed`` holds ``(snapshot, error)`` for
+    those the target was asked to remove and did not.
+
+    Every deletion path used to return None, and none of them raise: locked
+    snapshots were skipped, unreadable lock files refused the whole batch,
+    btrfs failures were logged, and the caller saw the same None for all of it.
+    ``prune`` therefore counted each call that did not throw, so a pass that
+    removed NOTHING reported "Deleted N snapshot(s)", exited 0 and sent a
+    success notification -- while the target filled up. This is the verdict that
+    was missing, in the shape of ``TransferResult`` (core/operations.py), which
+    exists for the same reason on the transfer side.
+
+    A skip is not a failure: refusing to delete a locked snapshot is the guard
+    working. Only ``failed`` makes ``ok`` False.
+    """
+
+    deleted: List[Any] = field(default_factory=list)
+    skipped: List[Any] = field(default_factory=list)
+    failed: List[Any] = field(default_factory=list)
+
+    @property
+    def ok(self) -> bool:
+        return not self.failed
+
+    @property
+    def deleted_count(self) -> int:
+        return len(self.deleted)
+
+    @property
+    def skipped_count(self) -> int:
+        return len(self.skipped)
+
+    @property
+    def failed_count(self) -> int:
+        return len(self.failed)
+
+    @property
+    def attempted(self) -> int:
+        return len(self.deleted) + len(self.skipped) + len(self.failed)
+
+    def skip(self, snapshot: Any, reason: str) -> None:
+        self.skipped.append((snapshot, reason))
+
+    def fail(self, snapshot: Any, error: Any) -> None:
+        self.failed.append((snapshot, error))
+
+    def fail_all(self, snapshots: List[Any], error: Any) -> None:
+        """Record a whole-batch refusal: nothing was even attempted.
+
+        These are failures rather than skips because the operator asked for the
+        deletion and it did not happen. The distinction matters at exactly one
+        place -- prune's exit code -- and that is the place it was wrong.
+        """
+        for snapshot in snapshots:
+            self.failed.append((snapshot, error))
+
+    def extend(self, other: "DeletionResult") -> "DeletionResult":
+        """Accumulate another batch's outcome into this one."""
+        self.deleted.extend(other.deleted)
+        self.skipped.extend(other.skipped)
+        self.failed.extend(other.failed)
+        return self
+
+
 def require_source(method):
     """Decorator to ensure the endpoint has a source set."""
 
@@ -96,6 +168,13 @@ class Endpoint:
         self.config["source"] = self._normalize_path(config.get("source"))
         self.config["path"] = self._normalize_path(config.get("path"))
         self.config["snap_prefix"] = config.get("snap_prefix", "")
+        # Whether that prefix was CHOSEN, which the value alone cannot express:
+        # "" is both "the operator asked for no prefix" (issue #6 -- bare
+        # timestamp names) and "nobody said". Only the second may be overridden
+        # by prefix inference, and truthiness cannot tell them apart.
+        self.config["snap_prefix_explicit"] = bool(
+            config.get("snap_prefix_explicit", False)
+        )
         self.config["convert_rw"] = config.get("convert_rw", False)
         self.config["subvolume_sync"] = config.get("subvolume_sync", False)
         self.config["btrfs_debug"] = config.get("btrfs_debug", False)
@@ -247,7 +326,23 @@ class Endpoint:
                 logger.debug("Executing snapshot command: %s", cmd)
                 self._exec_command({"command": cmd})
                 logger.debug("Snapshot command executed successfully: %s", cmd)
-                self.add_snapshot(snapshot)
+            # ONE registration for one snapshot. This sat inside the loop above,
+            # and `sync` defaults to True, so there are normally two commands --
+            # the create and the `btrfs subvolume sync` -- and the snapshot was
+            # registered twice.
+            #
+            # Count-based retention then budgeted for a snapshot that does not
+            # exist. Measured with the cache populated: 4 existing + 1 new under
+            # `-N 2` left ONE, and `-N 1` left NONE at all -- the duplicate of the
+            # newest pushes the real newest into `unlocked[:-keep]`, so the
+            # snapshot just taken is destroyed along with every other one.
+            #
+            # Unreachable from any shipped flow today, because add_snapshot
+            # returns early while the cache is None and nothing lists the source
+            # before snapshotting it. That is a coincidence of call order, not a
+            # property anyone maintains: one pre-flight listing added to `run`
+            # for an unrelated reason turns `-N 1` into total loss.
+            self.add_snapshot(snapshot)
         return snapshot
 
     def preflight_send(self, snapshot: Any) -> None:
@@ -315,25 +410,31 @@ class Endpoint:
         logger.debug("Receive endpoint type: %s", type(self).__name__)
         logger.debug("Is remote endpoint: %s", getattr(self, "_is_remote", False))
 
-        # Verify path exists or create it
-        try:
-            if isinstance(normalized_path, (str, Path)) and not getattr(
-                self, "_is_remote", False
-            ):
-                path_obj = (
-                    Path(normalized_path)
-                    if isinstance(normalized_path, str)
-                    else normalized_path
-                )
-                if not path_obj.exists():
-                    logger.warning(
-                        "Destination path doesn't exist, creating it: %s", path_obj
-                    )
-                    path_obj.mkdir(parents=True, exist_ok=True)
-        except Exception as e:
-            logger.warning(
-                "Error verifying or creating path %s: %s", normalized_path, e
+        # The destination is NOT created here. This ran immediately before the
+        # receive and rebuilt whatever _prepare had just refused, so declining to
+        # create a configured path there would have been undone here -- and the
+        # failure to create it was only warned about, leaving the receive to fail
+        # afterwards with something less specific.
+        #
+        # A missing destination at this point means the filesystem holding it is
+        # not mounted, so the stream would land on the root filesystem: hidden
+        # once the real disk returns, and charged to the wrong free space.
+        if isinstance(normalized_path, (str, Path)) and not getattr(
+            self, "_is_remote", False
+        ):
+            path_obj = (
+                Path(normalized_path)
+                if isinstance(normalized_path, str)
+                else normalized_path
             )
+            if not path_obj.is_dir():
+                logger.error("Destination path does not exist: %s", path_obj)
+                raise __util__.AbortError(
+                    f"Destination {path_obj} does not exist, so there is nowhere "
+                    f"to receive into. It is most likely on a filesystem that is "
+                    f"not mounted; btrfs-backup-ng does not create a configured "
+                    f"destination."
+                )
 
         cmd = self._build_receive_command(normalized_path)
         loglevel = logging.getLogger().getEffectiveLevel()
@@ -728,7 +829,16 @@ class Endpoint:
         )
 
     def add_snapshot(self, snapshot: Any, rewrite: bool = True) -> None:
-        """Add a snapshot to the cache."""
+        """Add a snapshot to the cache, once.
+
+        Idempotent by PATH. The caller above registers exactly one snapshot per
+        create, but a cache that can hold the same snapshot twice is a retention
+        budget that can be wrong by that many -- and the damage is not
+        proportional: a single duplicate of the newest entry makes `-N 1` delete
+        everything, including the snapshot just taken. Belt as well as braces,
+        because the cost of the guard is one comparison and the cost of it being
+        absent was measured at total loss.
+        """
         if self.__cached_snapshots is None:
             return
         if rewrite:
@@ -739,51 +849,96 @@ class Endpoint:
                 time_obj=snapshot.time_obj,
                 time_format=snapshot.time_format,
             )
+        path = str(snapshot.get_path())
+        if any(str(s.get_path()) == path for s in self.__cached_snapshots):
+            logger.debug("Snapshot already in the cache, not adding again: %s", path)
+            return
         self.__cached_snapshots.append(snapshot)
         self.__cached_snapshots.sort()
 
-    def delete_snapshots(self, snapshots: List[Any], **kwargs: Any) -> None:
-        """Delete the given snapshots (subvolumes)."""
+    def delete_snapshots(self, snapshots: List[Any], **kwargs: Any) -> DeletionResult:
+        """Delete the given snapshots (subvolumes), reporting what happened to each.
+
+        Returns a :class:`DeletionResult` rather than None. Nothing here raises --
+        a corrupt lock file refuses the batch, a locked snapshot is skipped, a
+        failed ``btrfs subvolume delete`` is logged -- so a caller that inferred
+        success from the absence of an exception was counting every one of those
+        as a deletion.
+        """
+        result = DeletionResult()
         if getattr(self, "_locks_read_failed", False):
-            logger.error(
-                "Refusing to delete snapshots: the lock file is unreadable/corrupt, so "
-                "locked (still-needed) snapshots cannot be identified. Repair or remove "
-                "%s and retry.",
-                self._get_lock_file_path(),
+            reason = (
+                "the lock file is unreadable/corrupt, so locked (still-needed) "
+                f"snapshots cannot be identified; repair or remove "
+                f"{self._get_lock_file_path()} and retry"
             )
-            return
+            logger.error("Refusing to delete snapshots: %s.", reason)
+            result.fail_all(snapshots, reason)
+            return result
         for snapshot in snapshots:
             if snapshot.locks or snapshot.parent_locks:
                 logger.info("Skipping locked snapshot: %s", snapshot)
+                result.skip(snapshot, "held by a retention lock")
                 continue
-            cmd = [
-                ("btrfs", False),
-                ("subvolume", False),
-                ("delete", False),
-                (str(snapshot.get_path()), True),
-            ]
-            logger.debug(
-                "Executing deletion command: %s",
-                [(arg, is_path) for arg, is_path in cmd],
-            )
-            try:
-                logger.debug("Deleting snapshot with path: %s", snapshot.get_path())
-                self._exec_command({"command": cmd})
+            # Built by _build_deletion_commands rather than hand-rolled here, so
+            # `convert_rw` gets its `btrfs property set -ts ... ro false` ahead of
+            # the delete. Both are legacy CLI flags -- `-w/--convert-rw` and
+            # `-s/--sync` -- that reach this endpoint's config and were then
+            # dropped, because this method assembled its own single command and
+            # consulted neither. Their help text promised behaviour that never
+            # happened. `subvolume_sync` is deliberately excluded per snapshot:
+            # it is one trailing command for the whole batch, issued below.
+            commands = self._build_deletion_commands([snapshot], subvolume_sync=False)
+            logger.debug("Executing deletion command(s): %s", commands)
+            for cmd in commands:
+                try:
+                    logger.debug("Deleting snapshot with path: %s", snapshot.get_path())
+                    self._exec_command({"command": cmd})
+                except Exception as e:
+                    logger.error(
+                        "Failed to delete snapshot %s: %s", snapshot.get_path(), e
+                    )
+                    logger.error("Deletion command was: %s", cmd)
+                    result.fail(snapshot, e)
+                    break
+            else:
                 logger.info("Deleted snapshot subvolume: %s", snapshot.get_path())
-            except Exception as e:
-                logger.error("Failed to delete snapshot %s: %s", snapshot.get_path(), e)
-                logger.error(
-                    "Deletion command was: %s", [(arg, is_path) for arg, is_path in cmd]
-                )
-            if self.__cached_snapshots is not None:
-                with contextlib.suppress(ValueError):
-                    self.__cached_snapshots.remove(snapshot)
+                result.deleted.append(snapshot)
+                # Evicted only on success, inside this branch. It used to sit at
+                # the loop's own indent, so a snapshot whose deletion FAILED was
+                # dropped from the cache anyway and every later list_snapshots()
+                # in the process reported it gone -- the listing agreeing with a
+                # deletion that did not happen.
+                if self.__cached_snapshots is not None:
+                    with contextlib.suppress(ValueError):
+                        self.__cached_snapshots.remove(snapshot)
+        # `btrfs subvolume sync` waits for the deletions to finish being cleaned
+        # up, so it belongs after the batch and only if the batch deleted
+        # something. It is not a per-snapshot verdict: the subvolumes are already
+        # gone from the tree, and failing the deletions over a failed wait would
+        # report a loss that did not happen.
+        if result.deleted and self.config.get("subvolume_sync", False):
+            for cmd in self._build_deletion_commands(
+                [], convert_rw=False, subvolume_sync=True
+            ):
+                try:
+                    self._exec_command({"command": cmd})
+                except Exception as e:
+                    logger.error(
+                        "Deleted %d snapshot(s), but 'btrfs subvolume sync' on %s "
+                        "failed: %s. The deletions stand; the filesystem may still "
+                        "be reclaiming their space.",
+                        result.deleted_count,
+                        self.config["path"],
+                        e,
+                    )
+        return result
 
-    def delete_snapshot(self, snapshot: Any, **kwargs: Any) -> None:
+    def delete_snapshot(self, snapshot: Any, **kwargs: Any) -> DeletionResult:
         """Delete a snapshot."""
-        self.delete_snapshots([snapshot], **kwargs)
+        return self.delete_snapshots([snapshot], **kwargs)
 
-    def delete_old_snapshots(self, keep: int) -> None:
+    def delete_old_snapshots(self, keep: int) -> DeletionResult:
         """Delete old snapshots, keeping only the most recent ``keep`` unlocked snapshots.
 
         LEGACY COUNT-based retention: keeps a fixed NUMBER of snapshots, ignoring age/time
@@ -802,7 +957,13 @@ class Endpoint:
                 "remove %s and retry.",
                 self._get_lock_file_path(),
             )
-            return
+            result = DeletionResult()
+            result.fail_all(
+                snapshots,
+                "the lock file is unreadable/corrupt, so locked (still-needed) "
+                "snapshots cannot be identified",
+            )
+            return result
         unlocked = [s for s in snapshots if not s.locks and not s.parent_locks]
         if keep <= 0 or len(unlocked) <= keep:
             logger.debug(
@@ -810,11 +971,13 @@ class Endpoint:
                 keep,
                 len(unlocked),
             )
-            return
+            return DeletionResult()
         to_delete = unlocked[:-keep]
+        result = DeletionResult()
         for snap in to_delete:
             logger.info("Deleting old snapshot: %s", snap)
-            self.delete_snapshots([snap])
+            result.extend(self.delete_snapshots([snap]))
+        return result
 
     def protect_incremental_parents(
         self, to_keep: List[Any], to_delete: List[Any]

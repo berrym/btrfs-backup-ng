@@ -275,8 +275,8 @@ btrfs-backup-ng install --user --timer=daily
 | `list` | Show snapshots and backups |
 | `status` | Show job status and statistics |
 | `config validate` | Validate configuration file |
-| `config init` | Generate example configuration (use `-i` for interactive wizard) |
-| `config import` | Import btrbk configuration |
+| `config init` | Generate example configuration (use `-i` for interactive wizard; `-o FILE` will not replace an existing file without `--force`) |
+| `config import` | Import btrbk configuration (`-o FILE` will not replace an existing file without `--force`) |
 | `config detect` | Detect btrfs subvolumes on the system (use `--wizard` for guided setup) |
 | `install` | Install systemd timer/service |
 | `uninstall` | Remove systemd timer/service |
@@ -755,8 +755,8 @@ On a desktop that auto-mounts removable drives (udisks2, as on Fedora), the moun
 
 ```toml
 [[volumes.targets]]
-path = "/run/media/mberry/My Backup/box1"
-require_mount = "/run/media/mberry/My Backup"
+path = "/run/media/operator/My Backup/box1"
+require_mount = "/run/media/operator/My Backup"
 ```
 
 A value that cannot work is reported when the config is read — by `config validate`, `doctor`, `list` and `run`, and in `log_file` — rather than only when a backup runs. A quoted `"true"`, a number, or a path the target does not live under still loads, with a warning naming it and what it was read as; the target itself is refused at backup time. Only two values stop the file loading: an empty string, which would turn the check off silently, and a type that has no interpretation at all.
@@ -908,6 +908,9 @@ btrfs-backup-ng config init
 
 # Save to file
 btrfs-backup-ng config init -o config.toml
+
+# -o refuses to replace a file that already exists. Pass --force to overwrite.
+btrfs-backup-ng config init -o config.toml --force
 ```
 
 #### Validate Configuration
@@ -931,7 +934,14 @@ btrfs-backup-ng config import /etc/btrbk/btrbk.conf
 
 # Convert and save to file
 btrfs-backup-ng config import /etc/btrbk/btrbk.conf -o config.toml
+
+# -o refuses to replace a file that already exists. Pass --force to overwrite.
+btrfs-backup-ng config import /etc/btrbk/btrbk.conf -o config.toml --force
 ```
+
+The conversion is checked before anything is written: if the generated
+configuration cannot be loaded back, it is printed to stdout and nothing is
+saved, rather than reporting a successful write of a file that does not work.
 
 See [Migrating from btrbk](#migrating-from-btrbk) for more details.
 

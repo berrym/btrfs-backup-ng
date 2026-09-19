@@ -316,10 +316,18 @@ def test_ssh_list_snapshots_stamps_filename_inferred(monkeypatch):
 # empty / nonexistent target
 # --------------------------------------------------------------------------- #
 def test_backfill_nonexistent_target(tmp_path, capsys):
+    """A target that is not there is not a target with nothing in it.
+
+    This reported "0 legacy streams" and exited 0. The condition was already
+    detected -- the command printed a warning about it -- but the warning did
+    not change the verdict, so an unmounted disk read as a clean, complete
+    scan. It now refuses.
+    """
     rc = _backfill(tmp_path, target=str(tmp_path / "nope"))
     out = capsys.readouterr().out
-    assert rc == 0
-    assert "0 legacy stream" in out
+    assert rc != 0, "reported a clean scan of a target it could not read"
+    assert "does not exist or is not mounted" in out
+    assert "0 legacy stream" not in out
 
 
 def test_ssh_streams_without_sidecar_empty(monkeypatch):

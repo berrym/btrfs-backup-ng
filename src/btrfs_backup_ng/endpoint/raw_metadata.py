@@ -230,8 +230,25 @@ class RawSnapshot:
         is a struct_time (``restore --before``); returning the same type as a
         btrfs Snapshot makes those paths work uniformly across snapshot types
         (and makes cross-type ordering well-defined) instead of raising TypeError.
+
+        LOCAL fields, because that is what the type means to every consumer.
+        ``__util__.Snapshot.time_obj`` comes from parsing the snapshot's NAME,
+        which this project writes in local time, and ``restore --before`` builds
+        its target from a local-time string the operator typed. ``created`` is
+        UTC-aware at every site that sets it, and ``.timetuple()`` on an aware
+        datetime yields ITS OWN fields with the offset discarded -- so returning
+        it directly handed UTC fields to code that reads them as local.
+
+        On a non-UTC host that made ``restore --before`` select the wrong backup
+        for every raw target, and made ``restore --list`` print a timestamp
+        disagreeing with the snapshot's own name on the same row, by the host's
+        UTC offset. A naive ``created`` is treated as UTC, which is what it has
+        always meant here.
         """
-        return self.created.timetuple()
+        created = self.created
+        if created.tzinfo is None:
+            created = created.replace(tzinfo=timezone.utc)
+        return created.astimezone().timetuple()
 
     def __repr__(self) -> str:
         return self.name
@@ -544,6 +561,26 @@ def discover_raw_snapshots(
                 snapshot.name,
                 filename_name,
             )
+        # A sidecar describes a stream; it is not itself the backup. Nothing here
+        # checked that the stream still exists, so a .meta whose stream had been
+        # deleted was reported as a present backup carrying its RECORDED size --
+        # measured, a 999999-byte backup listed from a directory holding only the
+        # sidecar. `raw list` showed it, restore would fail on it, and retention
+        # counted it against the keep budget, so a real backup was pruned in its
+        # place to make room for one that does not exist.
+        #
+        # WARNING, not silence: a sidecar without its stream means a backup is
+        # gone, which is exactly what an operator needs told. The second pass
+        # cannot list it either -- there is no file for it to find.
+        if not snapshot.stream_path.exists():
+            logger.warning(
+                "Raw sidecar %s describes a backup whose stream file %s is "
+                "missing; NOT listing it as a backup. The stream was deleted or "
+                "moved without its sidecar -- that backup is gone.",
+                meta_path,
+                snapshot.stream_path,
+            )
+            continue
         if not prefix or snapshot.name.startswith(prefix):
             snapshots.append(snapshot)
 

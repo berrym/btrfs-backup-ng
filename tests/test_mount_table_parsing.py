@@ -56,8 +56,8 @@ def _table(monkeypatch, tmp_path, lines):
 class TestTheFedoraLayoutWorks:
     """udisks2: /run/media/<user>/<Volume Label>, label containing a space."""
 
-    LABEL = "/run/media/mberry/My Backup"
-    LINE = "/dev/sdb1 /run/media/mberry/My\\040Backup btrfs rw,relatime 0 0\n"
+    LABEL = "/run/media/operator/My Backup"
+    LINE = "/dev/sdb1 /run/media/operator/My\\040Backup btrfs rw,relatime 0 0\n"
 
     def test_is_mounted_finds_a_mount_point_containing_a_space(
         self, monkeypatch, tmp_path
@@ -111,7 +111,7 @@ class TestAMemoryBackedMountIsRefused:
 
         _table(monkeypatch, tmp_path, [f"tmpfs /run {fs_type} rw 0 0\n"])
         with pytest.raises(__util__.AbortError, match="held in memory"):
-            assert_target_mounted("/run/media/mberry/USB/backups", "/run")
+            assert_target_mounted("/run/media/operator/USB/backups", "/run")
 
     def test_a_real_filesystem_is_accepted(self, monkeypatch, tmp_path):
         from btrfs_backup_ng.cli.common import assert_target_mounted

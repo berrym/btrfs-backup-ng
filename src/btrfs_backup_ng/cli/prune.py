@@ -256,10 +256,18 @@ def delete_snapper_backups(
                 )
         if wanted:
             try:
-                endpoint_obj.delete_snapshots(
+                outcome = endpoint_obj.delete_snapshots(
                     wanted, delete_session={s.get_name() for s in wanted}
                 )
-                deleted += len(wanted)
+                # `deleted += len(wanted)` credited the whole batch to the mere
+                # absence of an exception, and the raw delete path does not raise:
+                # a chain-guarded stream, an already-absent file and a busy target
+                # were all counted as deletions.
+                deleted += outcome.deleted_count
+                for snapshot, reason in outcome.failed:
+                    errors.append(f"Delete {snapshot.get_name()}: {reason}")
+                for snapshot, reason in outcome.skipped:
+                    logger.info("  Kept %s: %s", snapshot.get_name(), reason)
             except Exception as e:  # noqa: BLE001 - record, do not abort
                 errors.append(f"Delete raw snapper backups: {e}")
         return deleted, errors
@@ -313,7 +321,19 @@ def execute_retention_deletes(
     """Delete ``to_delete`` on one endpoint, passing the full batch as the delete-session (so the
     chain guard never mistakes a whole-chain delete for orphaning). Returns
     ``(deleted_count, error_messages)`` -- a per-snapshot failure is recorded, not raised, so one
-    bad delete does not abort the rest."""
+    bad delete does not abort the rest.
+
+    The count comes from the endpoint's ``DeletionResult``, not from how many calls
+    returned. ``deleted += 1`` after a call that did not throw counted every
+    outcome as a deletion, and no delete path raises: an unreadable lock file, a
+    locked snapshot, a busy raw target, a refused remote sudo and a plain
+    ``btrfs subvolume delete`` failure all scored as pruned. A pass that removed
+    nothing reported "Deleted N snapshot(s)" and exited 0.
+
+    A skip is not an error. Refusing to delete a snapshot a restore is reading, or
+    one another stream still needs as its incremental parent, is the guard doing
+    its job; those are reported and do not fail the run.
+    """
     if not to_delete:
         return 0, []
     delete_session = {s.get_name() for s in to_delete}
@@ -321,10 +341,17 @@ def execute_retention_deletes(
     errors: list[str] = []
     for snap in to_delete:
         try:
-            endpoint_obj.delete_snapshots([snap], delete_session=delete_session)
-            deleted += 1
+            outcome = endpoint_obj.delete_snapshots(
+                [snap], delete_session=delete_session
+            )
         except Exception as e:  # noqa: BLE001 - record and continue
             errors.append(f"Delete {snap.get_name()}: {e}")
+            continue
+        deleted += outcome.deleted_count
+        for snapshot, reason in outcome.failed:
+            errors.append(f"Delete {snapshot.get_name()}: {reason}")
+        for snapshot, reason in outcome.skipped:
+            logger.info("  Kept %s: %s", snapshot.get_name(), reason)
     return deleted, errors
 
 
@@ -648,11 +675,18 @@ def _send_prune_notifications(
     if not notif_config.is_enabled():
         return
 
-    # Determine overall status
+    # Determine overall status.
+    #
+    # `volumes_failed` counts only volumes that failed while being PLANNED. A
+    # deletion that fails during execution is recorded in `errors` and makes the
+    # command exit 1, but it never touches that counter -- so a prune in which
+    # every deletion failed used to notify "success" while exiting non-zero. The
+    # notification is what an unattended operator actually sees, so it must not
+    # be the more optimistic of the two.
     status: Literal["success", "failure", "partial"]
-    if volumes_failed == 0:
+    if volumes_failed == 0 and not errors:
         status = "success"
-    elif volumes_failed == volumes_processed:
+    elif volumes_processed > 0 and volumes_failed == volumes_processed:
         status = "failure"
     else:
         status = "partial"
@@ -679,6 +713,7 @@ def _send_prune_notifications(
         to_addrs=notif_config.email.to_addrs,
         on_success=notif_config.email.on_success,
         on_failure=notif_config.email.on_failure,
+        timeout=notif_config.email.timeout,
     )
 
     webhook_config = WebhookConfig(

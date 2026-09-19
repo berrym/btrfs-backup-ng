@@ -44,7 +44,7 @@ class TestCleanupPartialLocalSubvolume:
             return SimpleNamespace(returncode=0)
 
         monkeypatch.setattr(ops.subprocess, "run", fake_run)
-        ops._cleanup_partial_local_subvolume(ep, "snap-1")
+        ops._cleanup_partial_local_subvolume(ep, "snap-1", created_by_this_run=True)
 
         deletes = [c for c in calls if c[-3:-1] == ["subvolume", "delete"]]
         assert deletes, "expected a btrfs subvolume delete of the partial"
@@ -54,7 +54,7 @@ class TestCleanupPartialLocalSubvolume:
         ep = self._local_endpoint(tmp_path)
         called: list[int] = []
         monkeypatch.setattr(ops.subprocess, "run", lambda *a, **k: called.append(1))
-        ops._cleanup_partial_local_subvolume(ep, "absent")
+        ops._cleanup_partial_local_subvolume(ep, "absent", created_by_this_run=True)
         assert not called
 
     def test_skips_remote_endpoint(self, monkeypatch, tmp_path):
@@ -64,7 +64,7 @@ class TestCleanupPartialLocalSubvolume:
         ep.config = {"path": str(tmp_path)}
         called: list[int] = []
         monkeypatch.setattr(ops.subprocess, "run", lambda *a, **k: called.append(1))
-        ops._cleanup_partial_local_subvolume(ep, "snap-1")
+        ops._cleanup_partial_local_subvolume(ep, "snap-1", created_by_this_run=True)
         assert not called
 
     def test_bad_config_does_not_escape(self):
@@ -73,7 +73,9 @@ class TestCleanupPartialLocalSubvolume:
         ep = MagicMock()
         ep._is_remote = False
         ep.config = {}  # missing "path"
-        ops._cleanup_partial_local_subvolume(ep, "snap-1")  # must not raise
+        ops._cleanup_partial_local_subvolume(
+            ep, "snap-1", created_by_this_run=True
+        )  # must not raise
 
     def test_skips_raw_endpoint(self, monkeypatch, tmp_path):
         from btrfs_backup_ng.endpoint.raw import RawEndpoint
@@ -84,7 +86,7 @@ class TestCleanupPartialLocalSubvolume:
         ep.config = {"path": str(tmp_path)}
         called: list[int] = []
         monkeypatch.setattr(ops.subprocess, "run", lambda *a, **k: called.append(1))
-        ops._cleanup_partial_local_subvolume(ep, "snap-1")
+        ops._cleanup_partial_local_subvolume(ep, "snap-1", created_by_this_run=True)
         assert not called
 
 
@@ -160,9 +162,9 @@ class TestChunkedPartialCleanup:
         manifest = SimpleNamespace(snapshot_path="/src/snapshot")
         ep = MagicMock()
         ep.config = {"path": "/remote/dest"}
-        ops._cleanup_partial_remote_subvolume(ep, manifest)
+        ops._cleanup_partial_remote_subvolume(ep, manifest, created_by_this_run=True)
         ep._cleanup_partial_subvolume.assert_called_once_with(
-            "/remote/dest", "snapshot"
+            "/remote/dest", "snapshot", created_by_this_run=True
         )
 
     def test_remote_cleanup_noop_without_cleaner(self):
@@ -170,7 +172,7 @@ class TestChunkedPartialCleanup:
         ep = MagicMock(spec=["config"])  # no _cleanup_partial_subvolume
         ep.config = {"path": "/remote/dest"}
         # must not raise
-        ops._cleanup_partial_remote_subvolume(ep, manifest)
+        ops._cleanup_partial_remote_subvolume(ep, manifest, created_by_this_run=True)
 
 
 class TestRawPartialCleanup:

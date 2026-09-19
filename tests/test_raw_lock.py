@@ -353,3 +353,95 @@ def test_backup_commit_still_works_under_lock(tmp_path):
     (snap,) = ep.list_snapshots(flush_cache=True)
     assert snap.name == "root.20240101T120000"
     assert snap.metadata_path.exists()
+
+
+def test_rawssh_backup_commit_publishes_stream_and_sidecar_under_the_lock(
+    monkeypatch, tmp_path
+):
+    """The raw+ssh commit cycle, judged by the target directory rather than by the
+    commands it emitted.
+
+    The remote's whole shell runs locally against a sandbox (tests/lockshell.py),
+    so the endpoint's own scripts do the work: the receive writes a ``.part``,
+    the commit takes the real remote lock, renames, and writes the sidecar. What
+    is asserted is what a restore would later find there.
+
+    This also pins the absence of a deadlock. ``commit_receive`` now takes the
+    target lock, and ``sshutil.lock`` is NOT reentrant -- ``delete_old_snapshots``
+    has a comment saying so -- which makes "some caller already holds it" a
+    hang rather than a failure.
+    """
+    from .lockshell import local_remote, local_remote_popen
+
+    remote = tmp_path / "backup"
+    remote.mkdir()
+    ep = SSHRawEndpoint(config={"path": "/backup", "hostname": "nas"})
+    monkeypatch.setattr(raw_mod.subprocess, "run", local_remote(remote))
+    monkeypatch.setattr(raw_mod.subprocess, "Popen", local_remote_popen(remote))
+
+    payload = b"btrfs-send-stream" * 500
+    src = tmp_path / "src"
+    src.write_bytes(payload)
+    with open(src, "rb") as stream:
+        ep.receive(stream, snapshot_name="root.20240101T120000").communicate()
+
+    part = Path(str(ep._pending_metadata["part_path"]).replace("/backup", str(remote)))
+    assert part.exists(), "the receive wrote nothing to the remote"
+    assert not (remote / "root.20240101T120000.btrfs").exists(), (
+        "the stream was published before commit_receive confirmed the transfer"
+    )
+
+    ep.commit_receive()
+
+    published = remote / "root.20240101T120000.btrfs"
+    assert published.read_bytes() == payload
+    assert not part.exists(), "the .part file survived the rename"
+    sidecar = remote / "root.20240101T120000.btrfs.meta"
+    assert sidecar.exists(), "no authoritative sidecar beside the published stream"
+
+    import hashlib
+    import json
+
+    recorded = json.loads(sidecar.read_text())
+    assert recorded["checksum"]["value"] == hashlib.sha256(payload).hexdigest(), (
+        "the sealed checksum does not describe the published bytes"
+    )
+    assert recorded["size"] == len(payload), (
+        "the sidecar records a size the published stream does not have"
+    )
+
+    # The lock was given back, demonstrated by using it again rather than by
+    # inspecting the lock directory: a commit that acquires and never releases
+    # leaves no trace the next run can distinguish from a stale lock it is
+    # entitled to break, but it does make the next backup fail.
+    second = b"a-later-snapshot"
+    (tmp_path / "src2").write_bytes(second)
+    with open(tmp_path / "src2", "rb") as stream:
+        ep.receive(stream, snapshot_name="root.20240102T120000").communicate()
+    ep.commit_receive()
+    assert (remote / "root.20240102T120000.btrfs").read_bytes() == second, (
+        "the second backup to this target did not publish -- the first commit "
+        "did not give the target lock back"
+    )
+
+
+def test_rawssh_part_file_is_not_world_readable(monkeypatch, tmp_path):
+    """The stream is the most sensitive file this tool writes. A remote `cat >`
+    left it at the remote's umask (typically 0644) while the .meta sidecar beside
+    it was chmod'd 600 and the local path opened its .part 0600."""
+    from .lockshell import local_remote, local_remote_popen
+
+    remote = tmp_path / "backup"
+    remote.mkdir()
+    ep = SSHRawEndpoint(config={"path": "/backup", "hostname": "nas"})
+    monkeypatch.setattr(raw_mod.subprocess, "run", local_remote(remote))
+    monkeypatch.setattr(raw_mod.subprocess, "Popen", local_remote_popen(remote))
+
+    src = tmp_path / "src"
+    src.write_bytes(b"stream")
+    with open(src, "rb") as stream:
+        ep.receive(stream, snapshot_name="root.20240101T120000").communicate()
+    ep.commit_receive()
+
+    mode = (remote / "root.20240101T120000.btrfs").stat().st_mode & 0o777
+    assert mode == 0o600, f"published remote stream is mode {mode:o}, not 600"

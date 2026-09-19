@@ -83,10 +83,15 @@ def _open_target(args: argparse.Namespace):
         raise ValueError(f"Cannot open raw target: {e}") from e
     if spec.startswith("raw://"):
         local_path = Path(spec[len("raw://") :])
-        if not local_path.exists():
-            print(
-                f"warning: {local_path} does not exist or is not mounted",
-                file=sys.stderr,
+        if not local_path.is_dir():
+            # This was a warning, and the command then carried on to report
+            # "0 backups" / "0 legacy streams" and exit 0. For a target that is
+            # simply not mounted, a clean empty result is the worst available
+            # answer: it reads as "nothing to do" when the truth is "I could not
+            # look". The condition was already detected -- only the verdict was
+            # missing.
+            raise ValueError(
+                f"{local_path} does not exist or is not mounted, so it cannot be read"
             )
     return ep, spec
 
@@ -193,7 +198,20 @@ def _raw_verify(args: argparse.Namespace) -> int:
 
     # Fail if any backup is corrupt or its stream could not be read.
     bad = any(r["status"] in ("corrupt", "error") for r in results)
-    return 1 if bad else 0
+    if bad:
+        return 1
+    if not results:
+        # `any([])` is False, so a target that enumerated to NOTHING reported a
+        # clean pass and exit 0 -- "everything I checked was fine" where the
+        # number checked was zero. The general `verify` command already reports
+        # this state; the raw one silently agreed that an empty target is a
+        # healthy one.
+        print(
+            "No backups were verified: this location holds no readable raw "
+            "streams. That is not a clean result -- check the path and prefix."
+        )
+        return 2
+    return 0
 
 
 def _raw_backfill(args: argparse.Namespace) -> int:

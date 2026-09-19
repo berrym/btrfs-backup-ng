@@ -96,22 +96,34 @@ def parse_duration(duration_str: str) -> timedelta:
     value = int(match.group("value"))
     unit = match.group("unit")
 
-    if unit == "s":
-        return timedelta(seconds=value)
-    elif unit == "m":
-        return timedelta(minutes=value)
-    elif unit == "h":
-        return timedelta(hours=value)
-    elif unit == "d":
-        return timedelta(days=value)
-    elif unit == "w":
-        return timedelta(weeks=value)
-    elif unit == "M":
-        return timedelta(days=value * 30)  # Approximate
-    elif unit == "y":
-        return timedelta(days=value * 365)  # Approximate
-    else:
-        raise ValueError(f"Unknown duration unit: {unit}")
+    # timedelta raises OverflowError, not ValueError, once the value exceeds its
+    # range -- and OverflowError is an ArithmeticError, so none of the three
+    # `except ValueError` guards that wrap this function catch it. It escaped
+    # the loader's boundary check and surfaced inside the destructive prune
+    # path. Out-of-range is a bad duration like any other, so it is reported as
+    # one here, at the producer, and every existing guard works unchanged.
+    try:
+        if unit == "s":
+            return timedelta(seconds=value)
+        elif unit == "m":
+            return timedelta(minutes=value)
+        elif unit == "h":
+            return timedelta(hours=value)
+        elif unit == "d":
+            return timedelta(days=value)
+        elif unit == "w":
+            return timedelta(weeks=value)
+        elif unit == "M":
+            return timedelta(days=value * 30)  # Approximate
+        elif unit == "y":
+            return timedelta(days=value * 365)  # Approximate
+        else:
+            raise ValueError(f"Unknown duration unit: {unit}")
+    except OverflowError as e:
+        raise ValueError(
+            f"Duration out of range: {duration_str!r}. The longest duration this "
+            f"tool can represent is about 999999999 days (roughly 2.7 million years)."
+        ) from e
 
 
 def _subtract_months(dt: datetime, months: int) -> datetime:
@@ -140,11 +152,24 @@ def subtract_duration(now: datetime, duration_str: str) -> datetime:
         raise ValueError(f"Invalid duration format: {duration_str}")
     value = int(match.group("value"))
     unit = match.group("unit")
-    if unit == "M":
-        return _subtract_months(now, value)
-    if unit == "y":
-        return _subtract_months(now, value * 12)
-    return now - parse_duration(s)
+    # Two ways the arithmetic goes out of range, neither of them a ValueError as
+    # written: `now - timedelta` raises OverflowError for a duration parse_duration
+    # itself accepted (999999999d parses, then overflows the subtraction), and the
+    # calendar arm raises ValueError naming a negative year, which tells the
+    # operator nothing about the value they typed. Both become one plain report
+    # against the duration string.
+    try:
+        if unit == "M":
+            return _subtract_months(now, value)
+        if unit == "y":
+            return _subtract_months(now, value * 12)
+        return now - parse_duration(s)
+    except (OverflowError, ValueError) as e:
+        raise ValueError(
+            f"Duration out of range: {duration_str!r}. Subtracting it from the "
+            f"current time lands outside the dates this tool can represent "
+            f"(years 1 through 9999)."
+        ) from e
 
 
 @dataclass
@@ -156,6 +181,30 @@ class SnapshotInfo:
     snapshot: object  # The actual snapshot object
     keep: bool = False
     keep_reason: str = ""
+
+
+def _naive_local(moment: datetime) -> datetime:
+    """Return ``moment`` as a naive local datetime.
+
+    A ``timestamp_format`` containing ``%z`` makes ``strptime`` return an AWARE
+    datetime, and every comparison in this module is against a naive
+    ``datetime.now()`` -- so retention died with an uncaught
+    ``TypeError: can't compare offset-naive and offset-aware datetimes`` the
+    moment it met one. Not a btrbk concern: it is our own parser handing our own
+    comparisons a value they cannot use, for a documented config option.
+
+    Reachable from a shipped feature. ``config import`` maps btrbk's
+    ``long-iso`` to ``%Y%m%dT%H%M%S%z`` and writes it verbatim, so importing
+    such a config produced one whose prune could never run -- the failure
+    landing in a destructive path, long after the import that caused it.
+
+    Converted rather than merely stripped: ``astimezone()`` moves the instant to
+    local time first, so two snapshots written in different zones still order
+    against each other correctly.
+    """
+    if moment.tzinfo is None:
+        return moment
+    return moment.astimezone().replace(tzinfo=None)
 
 
 def extract_timestamp(
@@ -193,7 +242,7 @@ def extract_timestamp(
 
     for fmt in formats:
         try:
-            return datetime.strptime(name, fmt)
+            return _naive_local(datetime.strptime(name, fmt))
         except ValueError:
             continue
 
@@ -212,7 +261,12 @@ def extract_timestamp(
                 # Reconstruct with separator if needed
                 if "-" in fmt or "_" in fmt:
                     timestamp_str = match.group(0)
-                return datetime.strptime(timestamp_str, fmt)
+                # Defensive, and known to be so: the patterns above carry no
+                # %z, so this site cannot currently produce an aware datetime
+                # (removing the call breaks no test, checked). It matches the
+                # format-loop site so the two cannot drift if a pattern with an
+                # offset is ever added.
+                return _naive_local(datetime.strptime(timestamp_str, fmt))
             except ValueError:
                 continue
 

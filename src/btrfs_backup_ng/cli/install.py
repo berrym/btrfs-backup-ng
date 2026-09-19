@@ -357,6 +357,9 @@ def execute_uninstall(args: argparse.Namespace) -> int:
     ]
 
     found = False
+    #: Locations found but left in place for want of privilege. Without this the
+    #: only record was a printed line, and the exit code said success.
+    skipped: list = []
     for systemd_dir, is_user in locations:
         service_file = systemd_dir / "btrfs-backup-ng.service"
         timer_file = systemd_dir / "btrfs-backup-ng.timer"
@@ -367,6 +370,11 @@ def execute_uninstall(args: argparse.Namespace) -> int:
             if not is_user and os.geteuid() != 0:
                 print(f"Found system files in {systemd_dir}")
                 print("Run with sudo to remove system-wide installation")
+                # Recorded, because `found` was set ABOVE this branch and the
+                # exit stayed 0: `uninstall` reported success having removed
+                # nothing, and a user or script checking $? concluded the timer
+                # was gone while the units were still installed and still firing.
+                skipped.append(systemd_dir)
                 continue
 
             mode = "--user" if is_user else ""
@@ -393,5 +401,14 @@ def execute_uninstall(args: argparse.Namespace) -> int:
 
     if not found:
         print("No btrfs-backup-ng systemd files found")
+        return 0
+
+    if skipped:
+        print("")
+        print(
+            f"NOT removed: {len(skipped)} system-wide location(s) needed root. "
+            "The timer is still installed and will still fire. Re-run with sudo."
+        )
+        return 1
 
     return 0

@@ -3241,8 +3241,14 @@ class TestExecuteCleanupDetailed:
         assert "Dry run" in captured.out
 
     @patch("btrfs_backup_ng.cli.restore.__util__.is_subvolume")
-    def test_cleanup_finds_empty_subvolume(self, mock_is_sub, tmp_path, capsys):
-        """Test cleanup finds empty subvolumes."""
+    def test_cleanup_reports_but_does_not_claim_an_empty_subvolume(
+        self, mock_is_sub, tmp_path, capsys
+    ):
+        """An empty subvolume is surfaced to the operator but not claimed as ours.
+
+        Emptiness is what an operator's own `btrfs subvolume create` looks like,
+        so it is reported for a human to judge rather than selected for deletion.
+        """
         from btrfs_backup_ng.cli.restore import _execute_cleanup
 
         # Create an empty subvolume (mocked)
@@ -3257,7 +3263,8 @@ class TestExecuteCleanupDetailed:
         assert result == 0
         captured = capsys.readouterr()
         assert "snap-empty" in captured.out
-        assert "empty subvolume" in captured.out
+        assert "not identifiable as ours" in captured.out
+        assert "No partial restores found." in captured.out
 
     @patch("btrfs_backup_ng.cli.restore.__util__.is_subvolume")
     def test_cleanup_finds_metadata_only(self, mock_is_sub, tmp_path, capsys):

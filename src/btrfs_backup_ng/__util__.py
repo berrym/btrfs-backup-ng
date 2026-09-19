@@ -10,8 +10,10 @@ import errno
 import os
 from collections.abc import Iterator
 import stat as stat_module
+import re
 import subprocess
 import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
 
@@ -87,7 +89,13 @@ class Snapshot:
         self.prefix = prefix
         self.endpoint = endpoint
         if time_obj is None:
-            time_obj = str_to_date()
+            # localtime() directly, NOT str_to_date(): that round-trips through
+            # DATE_FORMAT, and strptime returns tm_gmtoff=None / tm_isdst=-1, so
+            # a snapshot created under a timestamp_format containing %z was
+            # named without its offset and the tool could then not resolve its
+            # own path. The round trip's stated purpose was to drop sub-second
+            # precision, which struct_time cannot hold in the first place.
+            time_obj = time.localtime()
         self.time_obj = time_obj
         # The format used to render/parse this snapshot's timestamp. Stored per
         # instance so a snapshot parsed under a legacy format regenerates the
@@ -295,14 +303,120 @@ def log_heading(caption: str) -> str:
     return f"{f'--[ {caption} ]':-<50}"
 
 
+#: A host this project will hand to ssh. Deliberately narrower than DNS: an
+#: allow-list of what a hostname, IPv4 literal or bracketed IPv6 literal may
+#: contain, with an optional user, because everything outside it is either
+#: meaningless to ssh or dangerous.
+_SSH_HOST_RE = re.compile(
+    r"^(?:[A-Za-z0-9_][A-Za-z0-9_.\-]*@)?"
+    r"(?:\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9](?:[A-Za-z0-9.\-]*[A-Za-z0-9])?)$"
+)
+
+
+# TOML basic strings must escape the backslash, the double quote, and every C0
+# control character plus DEL (TOML 1.0, "Basic strings"). Tab is legal raw but is
+# escaped here too, so the output is readable.
+_TOML_SIMPLE_ESCAPES = {
+    "\\": "\\\\",
+    '"': '\\"',
+    "\b": "\\b",
+    "\t": "\\t",
+    "\n": "\\n",
+    "\f": "\\f",
+    "\r": "\\r",
+}
+
+
+def toml_str(value: str) -> str:
+    """Return ``value`` as a quoted, escaped TOML basic string.
+
+    THE canonical way this project turns a Python string into TOML. Config
+    generators interpolated values straight into ``f'key = "{value}"'``, which
+    fails two ways on a path a user can legitimately have. A double quote ends
+    the string early and the file will not parse -- loud, at least. A backslash
+    is worse: ``/mnt/a\\backup`` emits ``"/mnt/a\\backup"``, TOML reads ``\\b`` as
+    a backspace, and the config loads CLEANLY pointing at ``/mnt/a\\x08ackup``.
+    A backup tool then snapshots and prunes a directory the operator never named.
+
+    Escaping every character TOML requires makes the round trip lossless, so a
+    generated config means what the source it was converted from meant.
+    """
+    out: list[str] = []
+    for char in str(value):
+        escape = _TOML_SIMPLE_ESCAPES.get(char)
+        if escape is not None:
+            out.append(escape)
+        elif char < " " or char == "\x7f":
+            out.append(f"\\u{ord(char):04X}")
+        else:
+            out.append(char)
+    return '"' + "".join(out) + '"'
+
+
+def validated_ssh_host(host: str, *, username: str | None = None) -> str:
+    """Return ``host`` (or ``user@host``) after checking ssh can be given it.
+
+    The host reached two kinds of harm unvalidated:
+
+    * **The shell.** ``_do_shell_pipeline_transfer`` joins its ssh arguments into
+      ONE string and runs it with ``shell=True``, quoting the ControlPath and the
+      remote command but not the host -- so a host containing ``;`` ran a command
+      on the machine doing the backup, which is running ``btrfs send``, typically
+      as root.
+    * **ssh's own option parser.** A host beginning with ``-`` is read as an
+      option however it is quoted, so ``-oProxyCommand=...`` runs a command even
+      on the argv paths, where no shell is involved.
+
+    Validated once, where the endpoint is built, so every present and future call
+    site is covered. A check at the config-import boundary alone would leave a
+    hand-written config, a wizard entry and the direct CLI forms unprotected.
+    """
+    candidate = f"{username}@{host}" if username else host
+    if not host or not _SSH_HOST_RE.fullmatch(candidate):
+        raise ValueError(
+            f"{candidate!r} is not a usable ssh host: expected [user@]host where "
+            f"host is a hostname, an IPv4 address, or a bracketed IPv6 address"
+        )
+    return candidate
+
+
 def date_to_str(
     timestamp: time.struct_time | None = None, fmt: str | None = None
 ) -> str:
-    """Convert date format to string."""
+    """Convert date format to string.
+
+    ``%z`` is rendered here rather than by ``time.strftime``, which takes the
+    offset from ``tm_zone`` -- a field ``time.strptime`` leaves as None. So a
+    name that CARRIED an offset lost it on re-render: parsing
+    ``20260919T011855-0400`` gives ``tm_gmtoff=-14400`` but ``tm_zone=None``,
+    and strftime returned ``20260919T011855``. Since ``Snapshot.get_name()``
+    regenerates the on-disk name through here and ``get_path()`` builds a path
+    from it, every caller that resolves a path from a Snapshot -- delete, lock,
+    send, verify -- was pointed at a name that does not exist. Reachable from a
+    shipped feature: ``config import`` emits ``%Y%m%dT%H%M%S%z`` for btrbk's
+    ``long-iso``.
+
+    ``%Z`` (the zone NAME) is deliberately left to strftime: it has no
+    equivalent in ``tm_gmtoff`` and inventing one would be worse than omitting
+    it.
+    """
     if timestamp is None:
         timestamp = time.localtime()
     if fmt is None:
         fmt = DATE_FORMAT
+    offset = getattr(timestamp, "tm_gmtoff", None)
+    if "%z" in fmt and offset is not None:
+        try:
+            aware = datetime(*timestamp[:6], tzinfo=timezone(timedelta(seconds=offset)))
+        except (ValueError, TypeError, OverflowError):
+            # datetime rejects a leap second (tm_sec == 60) where strftime
+            # accepts it. Naming a snapshot is too central to fail over
+            # rendering an offset, so fall back rather than refuse to name it.
+            # A struct_time malformed beyond that is NOT rescued here -- the
+            # fallback rejects it too (measured) -- but the stdlib does not
+            # produce one.
+            return time.strftime(fmt, timestamp)
+        return aware.strftime(fmt)
     return time.strftime(fmt, timestamp)
 
 

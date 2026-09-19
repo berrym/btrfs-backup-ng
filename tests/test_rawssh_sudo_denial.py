@@ -38,10 +38,21 @@ from btrfs_backup_ng.endpoint.raw import (
 SUDO_DENIED = "sudo: a password is required"
 
 
-def _endpoint(**config):
+def _endpoint(*, direct=False, **config):
+    """An endpoint pinned to a known elevation regime.
+
+    ssh_sudo no longer means "always elevate": the endpoint probes whether the
+    login user can use the destination and elevates only when they cannot.
+    Every test in this file is about what happens WHILE elevating -- that a
+    refusal is never read as an empty target -- so the default here pins the
+    elevated regime rather than leaving it to a probe the mocks would answer
+    by accident.
+    """
     base = {"path": "/backup", "hostname": "nas", "ssh_sudo": True}
     base.update(config)
-    return SSHRawEndpoint(config=base)
+    endpoint = SSHRawEndpoint(config=base)
+    endpoint._file_ops_direct = direct
+    return endpoint
 
 
 class TestSudoDenialIsRecognised:
@@ -285,9 +296,14 @@ class TestElevationIsNonInteractive:
         for probe in probes:
             assert "sudo" not in probe, f"capability probe was elevated: {probe}"
 
-    def test_the_directory_creation_is_still_elevated(self):
-        """Guard against over-correcting: mkdir does touch the backup location."""
-        ep = _endpoint()
+    def test_the_directory_creation_is_elevated_when_the_user_cannot_do_it(self):
+        """Guard against over-correcting: mkdir does touch the backup location.
+
+        ssh_sudo elevates only where elevation is needed, but "needed" must
+        still include this: a destination the login user cannot create is
+        exactly what the option exists for.
+        """
+        ep = _endpoint(direct=False)
         sent = []
 
         def fake_run(cmd, **_):
@@ -299,6 +315,26 @@ class TestElevationIsNonInteractive:
                 ep._prepare()
 
         assert any(c.startswith("LC_ALL=C sudo -n mkdir") for c in sent), sent
+
+    def test_the_directory_creation_is_not_elevated_when_the_user_can_do_it(self):
+        """The other half of the same contract, and the reason it changed: a
+        target the user owns needs no sudo, and demanding it made a valid config
+        fail against the btrfs-only sudoers policy the README documents."""
+        ep = _endpoint(direct=True)
+        sent = []
+
+        def fake_run(cmd, **_):
+            sent.append(cmd[-1])
+            return MagicMock(returncode=0, stdout=b"RAWSSHOK\n", stderr=b"")
+
+        with patch.object(raw_mod.subprocess, "run", side_effect=fake_run):
+            with patch.object(ep, "_check_tools", return_value=[]):
+                ep._prepare()
+
+        assert not any("sudo" in c for c in sent), (
+            f"elevated against a destination the user can already use: {sent}"
+        )
+        assert any("mkdir" in c for c in sent), "the directory was never created"
 
 
 class TestPrepareExplainsWhatRawSshNeeds:
@@ -868,7 +904,7 @@ class TestFindsStderrReachesTheGuard:
     told only "the listing command failed" with no reason. On real hardware the
     difference is between a bare exit code and
 
-        find: '/home/mberry/bbng-p1': Permission denied
+        find: '/home/operator/bbng-p1': Permission denied
 
     which is the whole diagnosis. The suppression is also what made the original
     bug invisible: rc=1 with an empty stderr looked like an empty target.

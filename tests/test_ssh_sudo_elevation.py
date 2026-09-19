@@ -12,9 +12,9 @@ pruning silently deleted nothing while reporting success.
 
 Reproduced on a real host with exactly that policy::
 
-    $ sudo -n test -d /home/mberry/btrfs-backup-test
+    $ sudo -n test -d /home/operator/btrfs-backup-test
     sudo: a password is required                       # rc=1
-    $ sudo -n btrfs subvolume show /home/mberry/btrfs-backup-test/test-...
+    $ sudo -n btrfs subvolume show /home/operator/btrfs-backup-test/test-...
                                                        # rc=0
 
 Mutation-verified: re-admitting ``test`` to the elevation predicate, or restoring

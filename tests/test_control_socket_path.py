@@ -26,7 +26,7 @@ class TestControlPathLength:
         )
 
     def test_socket_name_is_short_fixed_length(self, tmp_path):
-        m = self._mgr(tmp_path, "192.168.0.70", "mberry")
+        m = self._mgr(tmp_path, "198.51.100.70", "operator")
         name = m.control_path.name
         assert name.startswith("cm-") and name.endswith(".sock")
         # cm- (3) + 12 hex + .sock (5) = 20, always.

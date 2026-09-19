@@ -10,7 +10,7 @@ so `snapper restore --list ssh://...` reported "No snapper backups found" and
 exited 0 without ever opening a connection. That is the README's flagship
 disaster-recovery walkthrough, and it was answering a question it never asked.
 
-Verified against a real destination on 192.168.0.70 produced by an actual
+Verified against a real destination on 198.51.100.70 produced by an actual
 `snapper backup`: two slots enumerate with number, type, date and description
 parsed from the remote info.xml.
 """

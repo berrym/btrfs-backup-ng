@@ -391,7 +391,10 @@ class TestSendEmail:
 
         result = send_email(config, event)
         assert result is True
-        mock_smtp.assert_called_once_with("localhost", 25)
+        # An explicit timeout: smtplib otherwise inherits the process-wide socket
+        # default (None = block forever), and a hung SMTP host would pin the run
+        # process that is sending this notification after its backup finished.
+        mock_smtp.assert_called_once_with("localhost", 25, timeout=30)
         mock_server.sendmail.assert_called_once()
 
     @patch("btrfs_backup_ng.notifications.smtplib.SMTP")

@@ -497,6 +497,10 @@ def verify_full(
 
     # Initialize to_verify before try block to avoid "possibly unbound" in finally
     to_verify: list[Any] = []
+    # Paths THIS run restored into the temp directory, and so the only ones it may
+    # delete. Bound here for the same reason as to_verify: the finally block runs
+    # however the try exits.
+    restored_here: list[Path] = []
 
     try:
         backup_snapshots = backup_endpoint.list_snapshots()
@@ -555,6 +559,16 @@ def verify_full(
                 report.results.append(result)
                 continue
 
+            restored_path = temp_path / name
+            # Recorded BEFORE the restore, because the cleanup below deletes by
+            # path and --temp-dir may be a directory the operator already uses.
+            # A subvolume of this name that is already sitting there is not ours
+            # to remove, and after the restore there is no way to tell the two
+            # apart. Appended before _test_restore rather than after, so a
+            # restore that fails half-way still has its own partial cleaned up.
+            if not restored_path.exists():
+                restored_here.append(restored_path)
+
             try:
                 # FULL send (no parent): materialize the target standalone in temp. Reads
                 # every data block of the target -> btrfs checksums catch corruption.
@@ -562,7 +576,6 @@ def verify_full(
                 _test_restore(backup_endpoint, local_endpoint, snap, None)
 
                 # Verify restored snapshot
-                restored_path = temp_path / name
                 if not restored_path.exists():
                     raise VerifyError(f"Restored snapshot not found at {restored_path}")
 
@@ -617,13 +630,20 @@ def verify_full(
         logger.error("Full verification failed: %s", e)
 
     finally:
-        # Cleanup. Delete EVERY restored subvolume regardless of who owns the temp dir --
-        # a user-supplied --temp-dir must never leak received subvolumes (which carry a
-        # received_uuid and could be mistaken for real backups). Only the temp DIRECTORY
-        # itself is removed just for a temp we created (never a user-supplied one).
+        # Cleanup. Delete every subvolume THIS RUN restored, regardless of who owns
+        # the temp dir -- a user-supplied --temp-dir must never leak received
+        # subvolumes (which carry a received_uuid and could be mistaken for real
+        # backups). Only the temp DIRECTORY itself is removed just for a temp we
+        # created (never a user-supplied one).
+        #
+        # Iterating `restored_here` rather than `to_verify` is the correction: the
+        # latter includes snapshots whose restore never ran (a space shortfall
+        # `continue`s before _test_restore) and says nothing about whether the path
+        # it names was put there by this run. Against a --temp-dir the operator
+        # supplied, that deleted a subvolume of theirs that merely shared a backup's
+        # name.
         if cleanup:
-            for snap in to_verify:
-                snap_path = temp_path / snap.get_name()
+            for snap_path in restored_here:
                 try:
                     if snap_path.exists() and __util__.is_subvolume(snap_path):
                         _delete_temp_subvolume(snap_path)

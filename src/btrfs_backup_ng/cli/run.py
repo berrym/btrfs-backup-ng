@@ -20,7 +20,11 @@ from ..config import (
     find_config_file,
     load_config,
 )
-from ..core.operations import DEFAULT_TRANSFER_TIMEOUT, sync_snapshots
+from ..core.operations import (
+    DEFAULT_TRANSFER_TIMEOUT,
+    TransferResult,
+    sync_snapshots,
+)
 from ..notifications import (
     EmailConfig,
     WebhookConfig,
@@ -41,6 +45,7 @@ from .common import (
     thread_raw_compression,
     thread_raw_encryption,
     thread_ssh_target_config,
+    resolve_snapshot_dir,
 )
 from .prune import (
     execute_retention_deletes,
@@ -241,6 +246,9 @@ def _run_configured_backups(args: argparse.Namespace, config: Config) -> int:
     # Space-check flags (--no-check-space/--force/--safety-margin); threaded into the
     # transfer options so they actually take effect (see space_options_from_args).
     space_options = space_options_from_args(args)
+    # Default is to catch up: send whatever each destination is missing, not
+    # only the snapshot just taken (issue #104).
+    newest_only = bool(getattr(args, "newest_only", False))
 
     # Determine if progress should be shown
     show_progress = should_show_progress(args)
@@ -254,7 +262,16 @@ def _run_configured_backups(args: argparse.Namespace, config: Config) -> int:
     logger.info("Processing %d volume(s)", len(enabled_volumes))
 
     results = []
-    transfer_stats = {"completed": 0, "failed": 0, "snapshots_created": 0}
+    transfer_stats = {
+        "completed": 0,
+        "failed": 0,
+        "snapshots_created": 0,
+        # Targets vs SNAPSHOTS. "completed" counts targets that finished without
+        # error, which is what the notification has always reported as
+        # "transfers completed" -- a target whose plan was empty because it was
+        # already up to date counted the same as one that delivered a backup.
+        "snapshots_transferred": 0,
+    }
     error_messages = []
 
     if parallel_volumes > 1 and len(enabled_volumes) > 1:
@@ -270,6 +287,7 @@ def _run_configured_backups(args: argparse.Namespace, config: Config) -> int:
                     rate_limit_override,
                     show_progress,
                     space_options,
+                    newest_only,
                 ): volume
                 for volume in enabled_volumes
             }
@@ -280,6 +298,9 @@ def _run_configured_backups(args: argparse.Namespace, config: Config) -> int:
                     results.append((volume.path, success))
                     transfer_stats["completed"] += vol_stats.get("completed", 0)
                     transfer_stats["failed"] += vol_stats.get("failed", 0)
+                    transfer_stats["snapshots_transferred"] += vol_stats.get(
+                        "snapshots_transferred", 0
+                    )
                     transfer_stats["snapshots_created"] += vol_stats.get(
                         "snapshots_created", 0
                     )
@@ -300,10 +321,14 @@ def _run_configured_backups(args: argparse.Namespace, config: Config) -> int:
                     rate_limit_override,
                     show_progress,
                     space_options,
+                    newest_only,
                 )
                 results.append((volume.path, success))
                 transfer_stats["completed"] += vol_stats.get("completed", 0)
                 transfer_stats["failed"] += vol_stats.get("failed", 0)
+                transfer_stats["snapshots_transferred"] += vol_stats.get(
+                    "snapshots_transferred", 0
+                )
                 transfer_stats["snapshots_created"] += vol_stats.get(
                     "snapshots_created", 0
                 )
@@ -327,7 +352,16 @@ def _run_configured_backups(args: argparse.Namespace, config: Config) -> int:
         )
         exit_code = 1
     else:
-        logger.info("All %d volume(s) completed successfully", success_count)
+        # The snapshot count, not the target count: "all volumes completed" is
+        # equally true of a run that delivered nothing because every target was
+        # already up to date, and an operator reading a summary after an incident
+        # needs to know which of those happened.
+        moved = transfer_stats.get("snapshots_transferred", 0)
+        logger.info(
+            "All %d volume(s) completed successfully; %d snapshot(s) transferred",
+            success_count,
+            moved,
+        )
         exit_code = 0
 
     # Send notifications if configured
@@ -418,6 +452,7 @@ def _backup_volume(
     rate_limit_override: str | None = None,
     show_progress: bool = False,
     space_options: dict[str, Any] | None = None,
+    newest_only: bool = False,
 ) -> tuple[bool, dict[str, int], list[str]]:
     """Execute backup for a single volume.
 
@@ -433,7 +468,16 @@ def _backup_volume(
     Returns:
         Tuple of (success, transfer_stats, error_messages)
     """
-    stats = {"completed": 0, "failed": 0, "snapshots_created": 0}
+    stats = {
+        "completed": 0,
+        "failed": 0,
+        "snapshots_created": 0,
+        # Targets vs SNAPSHOTS. "completed" counts targets that finished without
+        # error, which is what the notification has always reported as
+        # "transfers completed" -- a target whose plan was empty because it was
+        # already up to date counted the same as one that delivered a backup.
+        "snapshots_transferred": 0,
+    }
     errors = []
     logger.info(__util__.log_heading(f"Volume: {volume.path}"))
 
@@ -463,15 +507,9 @@ def _backup_volume(
         source_path = Path(volume.path).resolve()
 
         # Set up snapshot directory
-        snapshot_dir = Path(volume.snapshot_dir)
-        if not snapshot_dir.is_absolute():
-            # Relative snapshot_dir: relative to source volume
-            # e.g., ".btrfs-backup-ng/snapshots" -> source/.btrfs-backup-ng/snapshots
-            full_snapshot_dir = (source_path / snapshot_dir).resolve()
-        else:
-            # Absolute snapshot_dir: use it directly, add source name as subdirectory
-            # e.g., "/snapshots" + source "myvolume" -> /snapshots/myvolume
-            full_snapshot_dir = (snapshot_dir / source_path.name).resolve()
+        # An absolute snapshot_dir must already exist; the per-source directory
+        # below it is still created. See resolve_snapshot_dir.
+        full_snapshot_dir = resolve_snapshot_dir(volume.snapshot_dir, source_path)
 
         full_snapshot_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
 
@@ -599,15 +637,17 @@ def _backup_volume(
                     show_progress,
                     space_options,
                     config.global_config.transfer_timeout,
+                    newest_only,
                 ): (dest_endpoint, target_config)
                 for dest_endpoint, target_config in destination_endpoints
             }
             for future in as_completed(futures):
                 dest, target_cfg = futures[future]
                 try:
-                    success = future.result()
-                    if success:
+                    outcome = future.result()
+                    if outcome is not None:
                         stats["completed"] += 1
+                        stats["snapshots_transferred"] += outcome.transferred_count
                         succeeded_targets.append((dest, target_cfg))
                     else:
                         stats["failed"] += 1
@@ -621,7 +661,7 @@ def _backup_volume(
         # Sequential transfers
         for dest_endpoint, target_config in destination_endpoints:
             try:
-                success = _transfer_to_target(
+                outcome = _transfer_to_target(
                     source_endpoint,
                     dest_endpoint,
                     target_config,
@@ -632,9 +672,11 @@ def _backup_volume(
                     show_progress,
                     space_options,
                     config.global_config.transfer_timeout,
+                    newest_only,
                 )
-                if success:
+                if outcome is not None:
                     stats["completed"] += 1
+                    stats["snapshots_transferred"] += outcome.transferred_count
                     succeeded_targets.append((dest_endpoint, target_config))
                 else:
                     stats["failed"] += 1
@@ -786,7 +828,16 @@ def _backup_snapper_volume(
     from ..snapper import SnapperScanner
     from ..snapper.scanner import SnapperNotFoundError
 
-    stats = {"completed": 0, "failed": 0, "snapshots_created": 0}
+    stats = {
+        "completed": 0,
+        "failed": 0,
+        "snapshots_created": 0,
+        # Targets vs SNAPSHOTS. "completed" counts targets that finished without
+        # error, which is what the notification has always reported as
+        # "transfers completed" -- a target whose plan was empty because it was
+        # already up to date counted the same as one that delivered a backup.
+        "snapshots_transferred": 0,
+    }
     # snapshots_created stays 0 on this path deliberately: snapper creates the
     # snapshots, this pipeline only transfers them. Previously the notification
     # derived the count from successful VOLUMES, so a snapper volume reported a
@@ -1012,8 +1063,9 @@ def _transfer_to_target(
     show_progress: bool = False,
     space_options: dict[str, Any] | None = None,
     transfer_timeout: int = DEFAULT_TRANSFER_TIMEOUT,
-) -> bool:
-    """Transfer snapshot to a single target.
+    newest_only: bool = False,
+) -> TransferResult | None:
+    """Transfer to a single target, catching up whatever it is missing.
 
     Args:
         source_endpoint: Source endpoint
@@ -1043,21 +1095,49 @@ def _transfer_to_target(
             **(space_options or {}),
         }
 
-        sync_snapshots(
+        result = sync_snapshots(
             source_endpoint,
             destination_endpoint,
             keep_num_backups=0,
             no_incremental=not incremental,
-            snapshot=snapshot,
+            # None lets the planner consider every source snapshot and send
+            # whatever THIS destination is missing. Passing the snapshot just
+            # created pinned the plan to that one, so a target that missed a run
+            # -- drive unplugged, host down, a transfer that failed -- stayed
+            # behind for ever, because every later run offered it only the
+            # newest. `transfer` has always caught up and snapper sources have
+            # always caught up, so `run` disagreed with the rest of the tool and
+            # with itself. Issue #104; newest-only is kept behind a flag.
+            snapshot=snapshot if newest_only else None,
             options=transfer_options,
         )
-        return True
     except __util__.AbortError as e:
-        logger.error("Transfer to %s aborted: %s", destination_endpoint, e)
-        return False
+        # sync_snapshots attaches the outcome to the exception precisely so a
+        # partial run can be reported as one (operations._raise_transfer_failures).
+        # Nothing read it, so "3 of 5 delivered, 2 failed" and "nothing moved at
+        # all" were the same line in the log.
+        partial = getattr(e, "result", None)
+        if partial is not None and partial.transferred:
+            logger.error(
+                "Transfer to %s aborted after %d of %d snapshot(s): %s",
+                destination_endpoint,
+                partial.transferred_count,
+                partial.attempted,
+                e,
+            )
+        else:
+            logger.error("Transfer to %s aborted: %s", destination_endpoint, e)
+        return None
     except Exception as e:
         logger.error("Transfer to %s failed: %s", destination_endpoint, e)
-        return False
+        return None
+
+    # An empty plan means the destination already holds every source snapshot.
+    # That is a legitimate no-op, and it is not a delivery: saying so is the
+    # whole point of returning the result instead of True.
+    if result.transferred_count == 0:
+        logger.info("%s is already up to date", destination_endpoint)
+    return result
 
 
 def _send_backup_notifications(
@@ -1123,6 +1203,7 @@ def _send_backup_notifications(
         to_addrs=notif_config.email.to_addrs,
         on_success=notif_config.email.on_success,
         on_failure=notif_config.email.on_failure,
+        timeout=notif_config.email.timeout,
     )
 
     webhook_config = WebhookConfig(

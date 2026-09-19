@@ -22,6 +22,7 @@ import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from .__util__ import toml_str
 from .core.transfer import COMPRESSION_PROGRAMS
 from .endpoint.raw_metadata import COMPRESSION_CONFIG
 
@@ -67,6 +68,12 @@ class Token:
     value: str
     line: int
     column: int
+    # Absolute offsets into the source. btrbk's grammar is line-oriented -- a
+    # directive is a keyword and then the REST OF THE LINE, verbatim -- so a
+    # value cannot be rebuilt by rejoining tokens without inventing whitespace
+    # that was not there. The parser slices the original text instead.
+    start: int = 0
+    end: int = 0
 
 
 @dataclass
@@ -200,6 +207,7 @@ class BtrbkLexer:
     def _read_keyword_or_value(self) -> None:
         """Read a keyword or unquoted value."""
         start_col = self.column
+        start_pos = self.pos
         word = ""
 
         # First, read the initial word part
@@ -255,7 +263,11 @@ class BtrbkLexer:
         }
 
         if word in keywords:
-            self.tokens.append(Token(TokenType.KEYWORD, word, self.line, start_col))
+            self.tokens.append(
+                Token(
+                    TokenType.KEYWORD, word, self.line, start_col, start_pos, self.pos
+                )
+            )
         else:
             # If followed by path characters, continue reading as a value
             # This handles cases like "ssh://..." or "user@host:..."
@@ -264,11 +276,14 @@ class BtrbkLexer:
                 if char in " \t\n#":
                     break
                 word += self._advance()
-            self.tokens.append(Token(TokenType.VALUE, word, self.line, start_col))
+            self.tokens.append(
+                Token(TokenType.VALUE, word, self.line, start_col, start_pos, self.pos)
+            )
 
     def _read_quoted_string(self) -> None:
         """Read a quoted string value."""
         start_col = self.column
+        start_pos = self.pos
         quote = self._advance()
         value = ""
         while self.pos < len(self.content) and self.content[self.pos] != quote:
@@ -280,25 +295,31 @@ class BtrbkLexer:
                 value += self._advance()
         if self.pos < len(self.content):
             self._advance()  # closing quote
-        self.tokens.append(Token(TokenType.VALUE, value, self.line, start_col))
+        self.tokens.append(
+            Token(TokenType.VALUE, value, self.line, start_col, start_pos, self.pos)
+        )
 
     def _read_value(self) -> None:
         """Read an unquoted value (path, URL, etc)."""
         start_col = self.column
+        start_pos = self.pos
         value = ""
         while self.pos < len(self.content):
             char = self.content[self.pos]
             if char in " \t\n#":
                 break
             value += self._advance()
-        self.tokens.append(Token(TokenType.VALUE, value, self.line, start_col))
+        self.tokens.append(
+            Token(TokenType.VALUE, value, self.line, start_col, start_pos, self.pos)
+        )
 
 
 class BtrbkParser:
     """Parser for btrbk configuration files."""
 
-    def __init__(self, tokens: list[Token]):
+    def __init__(self, tokens: list[Token], content: str = ""):
         self.tokens = tokens
+        self.content = content
         self.pos = 0
         self.config = BtrbkConfig()
         self.current_volume: BtrbkVolume | None = None
@@ -371,6 +392,69 @@ class BtrbkParser:
         else:
             self._advance()
 
+    @staticmethod
+    def _strip_comment(text: str) -> str:
+        """Drop an unquoted ``#`` and everything after it, as btrbk does.
+
+        btrbk removes comments with a quote-aware substitution before it splits
+        the line, and a ``#`` needs no preceding space: ``volume /mnt/a#b`` is
+        the path ``/mnt/a`` (measured).
+        """
+        quote = ""
+        for index, char in enumerate(text):
+            if quote:
+                if char == quote:
+                    quote = ""
+            elif char in "\"'":
+                quote = char
+            elif char == "#":
+                return text[:index]
+        return text
+
+    @staticmethod
+    def _unquote(text: str) -> str:
+        """Strip one layer of matching surrounding quotes, as btrbk does."""
+        if len(text) >= 2 and text[0] == text[-1] and text[0] in "\"'":
+            return text[1:-1]
+        return text
+
+    def _consume_rest_of_line(self, first: Token) -> str:
+        """Return the value the way btrbk reads it: the whole rest of the line.
+
+        btrbk matches ``^([a-zA-Z_]+)(?:\\s+(.*))?$`` against the comment-stripped,
+        whitespace-trimmed line, so a directive's value runs to end of line and
+        keeps its internal spacing exactly as written. Measured against btrbk
+        0.32.7:
+
+            volume /mnt/sp ace          ->  /mnt/sp ace
+            volume /mnt/two  spaces     ->  /mnt/two  spaces   (both spaces kept)
+            volume "/mnt/quoted path"   ->  /mnt/quoted path   (quotes stripped)
+            volume /mnt/a#b             ->  /mnt/a
+
+        This parser is token-based, and the section directives took only the
+        FIRST token, so every path was truncated at its first space and a
+        converted config silently named a different directory. Rejoining the
+        tokens would not be correct either -- it invents single spaces where the
+        source had a tab or several. The original text is sliced instead.
+        """
+        if not self.content:
+            self._advance()
+            return first.value
+
+        newline = self.content.find("\n", first.start)
+        line_end = len(self.content) if newline == -1 else newline
+        raw = self._strip_comment(self.content[first.start : line_end]).rstrip()
+
+        while not self._is_at_end():
+            token = self._current()
+            if token.type not in (TokenType.VALUE, TokenType.KEYWORD):
+                break
+            if token.line != first.line:
+                break
+            self._advance()
+
+        return self._unquote(raw)
+
     def _parse_volume(self) -> None:
         """Parse a volume section."""
         path_token = self._current()
@@ -380,8 +464,8 @@ class BtrbkParser:
             )
             return
 
-        self._advance()
-        self.current_volume = BtrbkVolume(path=path_token.value, line=path_token.line)
+        path = self._consume_rest_of_line(path_token)
+        self.current_volume = BtrbkVolume(path=path, line=path_token.line)
         self.current_subvolume = None
         self.current_target = None
         self.config.volumes.append(self.current_volume)
@@ -395,7 +479,7 @@ class BtrbkParser:
             )
             return
 
-        self._advance()
+        path = self._consume_rest_of_line(path_token)
 
         if self.current_volume is None:
             self.config.warnings.append(
@@ -404,9 +488,7 @@ class BtrbkParser:
             return
 
         self.current_target = None
-        self.current_subvolume = BtrbkSubvolume(
-            path=path_token.value, line=path_token.line
-        )
+        self.current_subvolume = BtrbkSubvolume(path=path, line=path_token.line)
         self.current_volume.subvolumes.append(self.current_subvolume)
 
     def _parse_target(self) -> None:
@@ -433,10 +515,8 @@ class BtrbkParser:
                 self._advance()
                 path_token = self._current()
 
-        self._advance()
-        target = BtrbkTarget(
-            path=path_token.value, line=path_token.line, target_type=target_type
-        )
+        path = self._consume_rest_of_line(path_token)
+        target = BtrbkTarget(path=path, line=path_token.line, target_type=target_type)
         self.current_target = target
 
         # Add to current scope
@@ -496,7 +576,7 @@ def parse_btrbk_config(content: str) -> BtrbkConfig:
     """
     lexer = BtrbkLexer(content)
     tokens = lexer.tokenize()
-    parser = BtrbkParser(tokens)
+    parser = BtrbkParser(tokens, content)
     return parser.parse()
 
 
@@ -652,7 +732,7 @@ def _retention_block(
         warnings += w
     else:
         min_str = "1d"
-    lines.append(f'min = "{min_str}"')
+    lines.append("min = " + toml_str(min_str))
 
     if preserve is not None:
         counts, w = _parse_preserve_counts(preserve)
@@ -726,7 +806,9 @@ def convert_to_toml(btrbk_config: BtrbkConfig) -> tuple[str, list[str]]:
 
     # Map btrbk options to btrfs-backup-ng
     if "snapshot_dir" in btrbk_config.global_options:
-        lines.append(f'snapshot_dir = "{btrbk_config.global_options["snapshot_dir"]}"')
+        lines.append(
+            "snapshot_dir = " + toml_str(btrbk_config.global_options["snapshot_dir"])
+        )
     else:
         lines.append('snapshot_dir = ".snapshots"')
 
@@ -736,14 +818,14 @@ def convert_to_toml(btrbk_config: BtrbkConfig) -> tuple[str, list[str]]:
     )
     if btrbk_ts_format in BTRBK_TIMESTAMP_FORMATS:
         strftime_format = BTRBK_TIMESTAMP_FORMATS[btrbk_ts_format]
-        lines.append(f'timestamp_format = "{strftime_format}"')
+        lines.append("timestamp_format = " + toml_str(strftime_format))
     else:
         # Unknown format, use btrbk's default (long)
         warnings.append(
             f"Unknown btrbk timestamp_format '{btrbk_ts_format}', "
             f"using 'long' format for compatibility"
         )
-        lines.append(f'timestamp_format = "{BTRBK_TIMESTAMP_FORMATS["long"]}"')
+        lines.append("timestamp_format = " + toml_str(BTRBK_TIMESTAMP_FORMATS["long"]))
 
     incremental = btrbk_config.global_options.get("incremental", "yes")
     lines.append(f"incremental = {str(incremental != 'no').lower()}")
@@ -792,7 +874,7 @@ def convert_to_toml(btrbk_config: BtrbkConfig) -> tuple[str, list[str]]:
                 full_path = volume.path
 
             lines.append("[[volumes]]")
-            lines.append(f'path = "{full_path}"')
+            lines.append("path = " + toml_str(full_path))
 
             # Snapshot prefix from options or generate from path
             prefix = subvolume.options.get(
@@ -800,7 +882,7 @@ def convert_to_toml(btrbk_config: BtrbkConfig) -> tuple[str, list[str]]:
             )
             if not prefix:
                 prefix = full_path.strip("/").replace("/", "-") or "root"
-            lines.append(f'snapshot_prefix = "{prefix}"')
+            lines.append("snapshot_prefix = " + toml_str(prefix))
 
             # Snapshot directory
             snap_dir = subvolume.options.get(
@@ -810,7 +892,7 @@ def convert_to_toml(btrbk_config: BtrbkConfig) -> tuple[str, list[str]]:
                     btrbk_config.global_options.get("snapshot_dir", ".snapshots"),
                 ),
             )
-            lines.append(f'snapshot_dir = "{snap_dir}"')
+            lines.append("snapshot_dir = " + toml_str(snap_dir))
 
             # Per-volume retention override. Emit a [volumes.retention] block only
             # when the subvolume or its parent volume explicitly set a preserve
@@ -1003,7 +1085,7 @@ def convert_to_toml(btrbk_config: BtrbkConfig) -> tuple[str, list[str]]:
                             target_path = f"{scheme}{ssh_user}@{rest}"
                             break
 
-                lines.append(f'path = "{target_path}"')
+                lines.append("path = " + toml_str(target_path))
 
                 # A local target has no ssh connection to configure. Emitting
                 # these put irrelevant credentials in the block and made the
@@ -1013,7 +1095,7 @@ def convert_to_toml(btrbk_config: BtrbkConfig) -> tuple[str, list[str]]:
                 # layout (/mnt/backup/@snapshots), which is not a remote target.
                 is_remote_target = bool(_REMOTE_TARGET_RE.match(target_path))
                 if ssh_identity and is_remote_target:
-                    lines.append(f'ssh_key = "{ssh_identity}"')
+                    lines.append("ssh_key = " + toml_str(ssh_identity))
                 if ssh_port and is_remote_target:
                     port = str(ssh_port).strip()
                     if port.isdigit():
@@ -1024,7 +1106,7 @@ def convert_to_toml(btrbk_config: BtrbkConfig) -> tuple[str, list[str]]:
                             f"number and was not carried over"
                         )
                 if target_rate_limit and str(target_rate_limit) not in ("no", "0"):
-                    lines.append(f'rate_limit = "{target_rate_limit}"')
+                    lines.append("rate_limit = " + toml_str(target_rate_limit))
 
                 # stream_compress -> compress, for targets that are not raw. A raw
                 # target takes its method from raw_target_compress below, and setting
@@ -1050,7 +1132,7 @@ def convert_to_toml(btrbk_config: BtrbkConfig) -> tuple[str, list[str]]:
                     method = str(stream_compress)
                     method = _BTRBK_METHOD_ALIASES.get(method, method)
                     if method in _STREAM_COMPRESS_SUPPORTED:
-                        lines.append(f'compress = "{method}"')
+                        lines.append("compress = " + toml_str(method))
                     else:
                         warnings.append(
                             f"Line {target.line}: stream_compress '{method}' is not "
@@ -1107,7 +1189,7 @@ def convert_to_toml(btrbk_config: BtrbkConfig) -> tuple[str, list[str]]:
                         # appeared to succeed and the first run died on its own
                         # output. Say so here, and leave the setting out.
                         if compress in _RAW_COMPRESS_SUPPORTED:
-                            lines.append(f'compress = "{compress}"')
+                            lines.append("compress = " + toml_str(compress))
                         else:
                             warnings.append(
                                 f"Line {target.line}: raw_target_compress "
@@ -1129,7 +1211,9 @@ def convert_to_toml(btrbk_config: BtrbkConfig) -> tuple[str, list[str]]:
                             )
                             if gpg_recipient:
                                 lines.append('encrypt = "gpg"')
-                                lines.append(f'gpg_recipient = "{gpg_recipient}"')
+                                lines.append(
+                                    "gpg_recipient = " + toml_str(gpg_recipient)
+                                )
                             else:
                                 # The loader REFUSES encrypt=gpg without a
                                 # recipient, so emitting it produced a file that
@@ -1154,7 +1238,7 @@ def convert_to_toml(btrbk_config: BtrbkConfig) -> tuple[str, list[str]]:
                                 or btrbk_config.global_options.get("gpg_keyring")
                             )
                             if gpg_keyring:
-                                lines.append(f'gpg_keyring = "{gpg_keyring}"')
+                                lines.append("gpg_keyring = " + toml_str(gpg_keyring))
                         elif raw_encrypt == "openssl_enc":
                             lines.append('encrypt = "openssl_enc"')
                             warnings.append(

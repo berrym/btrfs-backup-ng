@@ -8,7 +8,7 @@ from pathlib import Path
 from .. import __util__, endpoint
 from ..__logger__ import add_file_handler, create_logger
 from ..config import ConfigError, find_config_file, load_config
-from .common import get_log_level, get_timestamp_format
+from .common import get_log_level, get_timestamp_format, resolve_snapshot_dir
 
 logger = logging.getLogger(__name__)
 
@@ -96,13 +96,9 @@ def execute_snapshot(args: argparse.Namespace) -> int:
             # Prepare source endpoint
             source_path = Path(volume.path).resolve()
 
-            snapshot_dir = Path(volume.snapshot_dir)
-            if not snapshot_dir.is_absolute():
-                # Relative snapshot_dir: relative to source volume
-                full_snapshot_dir = (source_path / snapshot_dir).resolve()
-            else:
-                # Absolute snapshot_dir: add source name as subdirectory
-                full_snapshot_dir = (snapshot_dir / source_path.name).resolve()
+            # An absolute snapshot_dir must already exist; the per-source
+            # directory below it is still created. See resolve_snapshot_dir.
+            full_snapshot_dir = resolve_snapshot_dir(volume.snapshot_dir, source_path)
             full_snapshot_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
 
             source_kwargs = dict(endpoint_kwargs)

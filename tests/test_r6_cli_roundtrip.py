@@ -18,6 +18,7 @@ from btrfs_backup_ng.config.schema import (
     TargetConfig,
     VolumeConfig,
 )
+from btrfs_backup_ng.core.operations import TransferResult
 
 
 def _spy_choose(captured):
@@ -47,6 +48,8 @@ class TestRunThreadsEncryption:
         dest = tmp_path / "dest"
         dest.mkdir(exist_ok=True)
         target = TargetConfig(path=f"raw://{dest}", **target_kw)
+        # An absolute snapshot_dir must exist; the tool no longer creates one.
+        (tmp_path / "snaps").mkdir(parents=True, exist_ok=True)
         return VolumeConfig(
             path=str(src),
             snapshot_prefix="t-",
@@ -61,7 +64,11 @@ class TestRunThreadsEncryption:
         config = Config(global_config=GlobalConfig(), volumes=[volume])
         captured: dict = {}
         monkeypatch.setattr(run_mod.endpoint, "choose_endpoint", _spy_choose(captured))
-        monkeypatch.setattr(run_mod, "_transfer_to_target", lambda *a, **k: True)
+        monkeypatch.setattr(
+            run_mod,
+            "_transfer_to_target",
+            lambda *a, **k: TransferResult(transferred=[object()]),
+        )
         # This test targets encryption threading, not the post-transfer prune phase (which
         # operates on the spy's mock endpoints); stub it to a clean success.
         monkeypatch.setattr(run_mod, "_prune_after_transfer", lambda *a, **k: True)
@@ -80,7 +87,11 @@ class TestRunThreadsEncryption:
         config = Config(global_config=GlobalConfig(), volumes=[volume])
         captured: dict = {}
         monkeypatch.setattr(run_mod.endpoint, "choose_endpoint", _spy_choose(captured))
-        monkeypatch.setattr(run_mod, "_transfer_to_target", lambda *a, **k: True)
+        monkeypatch.setattr(
+            run_mod,
+            "_transfer_to_target",
+            lambda *a, **k: TransferResult(transferred=[object()]),
+        )
         monkeypatch.setattr(run_mod, "thread_raw_encryption", lambda kw, t: None)
 
         ok, _stats, errors = run_mod._backup_volume(volume, config, parallel_targets=1)
@@ -96,7 +107,11 @@ class TestRunThreadsEncryption:
         config = Config(global_config=GlobalConfig(), volumes=[volume])
         captured: dict = {}
         monkeypatch.setattr(run_mod.endpoint, "choose_endpoint", _spy_choose(captured))
-        monkeypatch.setattr(run_mod, "_transfer_to_target", lambda *a, **k: True)
+        monkeypatch.setattr(
+            run_mod,
+            "_transfer_to_target",
+            lambda *a, **k: TransferResult(transferred=[object()]),
+        )
         # Not exercising the prune phase here (spy endpoints); stub it to a clean success.
         monkeypatch.setattr(run_mod, "_prune_after_transfer", lambda *a, **k: True)
 
@@ -130,7 +145,9 @@ class TestTransferThreadsEncryption:
         monkeypatch.setattr(
             transfer_mod.endpoint, "choose_endpoint", _spy_choose(captured)
         )
-        monkeypatch.setattr(transfer_mod, "sync_snapshots", lambda *a, **k: MagicMock())
+        monkeypatch.setattr(
+            transfer_mod, "sync_snapshots", lambda *a, **k: TransferResult()
+        )
         monkeypatch.setattr(transfer_mod, "load_config", lambda *a, **k: (config, []))
         monkeypatch.setattr(
             transfer_mod, "find_config_file", lambda *a, **k: "cfg.toml"

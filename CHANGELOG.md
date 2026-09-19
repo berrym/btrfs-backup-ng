@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.9.7] - 2026-09-04
+## [0.9.7] - 2026-09-19
 
 ### Added
 
@@ -97,6 +97,105 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **A configured path is no longer created for you.** A target on an external
+  disk may or may not be present depending on whether that disk is mounted, and
+  the path was created unconditionally — so with the disk absent the mount-point
+  tree was built on the ROOT filesystem and the backup written there, invisible
+  once the real disk came back and charged against the wrong filesystem's free
+  space. `require_mount` does not cover this: it only works where the configured
+  path IS the mount point, because that one always exists, and it is off by
+  default. Local and `raw://` targets, and a source, must now exist; the failure
+  names the likely cause. Directories BELOW an existing configured path are
+  still created, so nothing changes for a configuration whose paths are there
+  ([#102](https://github.com/berrym/btrfs-backup-ng/pull/102)).
+
+- **An absolute `snapshot_dir` must exist before snapshots are written into it.**
+  The absolute form is how snapshots are moved off the root filesystem onto a
+  bigger disk. It was created with its parents, so an unmounted disk put the
+  directory on root — and the snapshots then SUCCEEDED there, because a btrfs
+  snapshot only needs to share a filesystem with its source, which on a btrfs
+  root it does. The snapshots an operator moved away from root were silently
+  put back, with every command reporting success. The per-source directory below
+  the configured base is still created, and a relative `snapshot_dir` is
+  unaffected.
+
+- **`raw list`, `raw verify` and `raw backfill-metadata` now fail on a target
+  they cannot read.** A missing target produced a warning on stderr and then
+  "0 snapshots" with exit 0. A warning beside a zero exit is still a clean empty
+  report to a timer unit or a script reading the status.
+
+- **`config import -o` and `config init -o` refuse to replace an existing file.**
+  `config import` had no existence check at all, and `config init` had one only
+  when running interactively, so any non-interactive invocation silently
+  replaced the file. What is replaced is the statement of which subvolumes
+  matter and how long their history is kept. Pass `--force` to overwrite; the
+  interactive prompt is unchanged.
+
+- **A retention `min` that cannot be used is rejected when the config loads.**
+  Values like `3000y`, `999999999d` and `100000000w` were accepted by the loader
+  and then failed inside the prune path, reporting an internal-sounding
+  "year -974 is out of range". The boundary check tested a different function
+  from the one the engine runs; it now validates through the engine's own, and
+  names the value.
+
+- **`doctor` exits 1 when the configuration it loaded produced warnings.** The
+  warnings were collected, logged, and then dropped, so an empty configuration
+  reported "4 passed, 0 warnings" and exit 0 — for a file the loader had
+  described as having no volumes at all.
+- **`run` now transfers what a destination is MISSING, not only the snapshot it
+  just created.** A target that missed a run — a drive that was unplugged, a
+  host that was down, a transfer that failed — stayed behind for ever, because
+  every later run offered it only the newest snapshot. Nothing went back for the
+  gap and nothing said so. `transfer` has always caught up, and so have snapper
+  sources, so `run` disagreed with the rest of the tool and with itself.
+
+  **Before upgrading, know this:** a first run against a *new* target now sends
+  the source's whole history rather than one snapshot. Measured with six
+  snapshots of history against an empty destination, 7 transferred where 0.9.6
+  sent 1. That is correct — the destination holds none of them — but on an
+  established source it is a long first run.
+
+  `--newest-only` restores the previous behaviour.
+
+  ```sh
+  btrfs-backup-ng run --newest-only
+  ```
+
+- **`ssh_sudo` on a `raw://`/`raw+ssh://` target now means "elevate only where
+  elevation is needed".** A raw target stores plain files and runs no btrfs
+  command, so setting `ssh_sudo` used to make a valid configuration fail against
+  the very sudoers policy this project's README documents (`NOPASSWD:
+  /usr/bin/btrfs`), which refuses `mkdir`, `find`, `cat`, `stat`, `mv` and `rm`.
+  The destination is now probed once as the login user, and when it is usable no
+  file operation elevates. A destination the user genuinely cannot write — a
+  root-owned directory — still elevates exactly as before, so nothing an
+  operator could previously do has been taken away.
+
+- **The compressed `ssh://` receive no longer needs permission to run a shell as
+  root.** It ran `sudo -S sh -c '<decompress> | btrfs receive'`, which asks
+  sudoers for `sh`; a host configured with the documented btrfs-only policy
+  refused the backup outright. `sudo` is now scoped to the `btrfs` binary on
+  every path. Verified against six sudoers policies on hosts whose `/bin/sh` is
+  bash, dash and busybox ash.
+
+- **A transfer that stops making progress is now given up on.** Once the local
+  `btrfs send` finishes, the remote is still applying the stream and no bytes
+  move on this side, so the stall check is deliberately disarmed. That tail was
+  documented as covered by the wall clock, but `transfer_timeout` defaults to
+  `0` — meaning *no* wall clock — so a remote wedged mid-apply hung the run for
+  ever. The tail now falls back to a generous 24-hour ceiling, logged when it
+  takes effect, and the failure names the limit as this tool's own rather than
+  leaving an operator hunting an ssh timeout. Set `transfer_timeout` for a
+  tighter deadline. The `ssh_sudo` pipeline, which had no bound of any kind, is
+  bounded too.
+
+- **The legacy CLI exits non-zero when its retention fails.** It discarded the
+  deletion result and logged the failure at debug, so a prune that removed
+  nothing — an unreadable lock file, a busy target, every delete failing — was
+  indistinguishable from a clean one and the run still exited 0 while the target
+  filled up. This matches the `run` command, which already refused to report
+  success for skipped retention.
+
 - **Retention scopes inherit key by key instead of replacing the whole policy** —
   a narrower scope now overrides only the keys it actually writes and inherits
   the rest, resolving global to volume to source or target.
@@ -144,6 +243,90 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   or a mount point that resolves to `/`, is reported by `config validate`.
 
 ### Fixed
+
+- **A `timestamp_format` containing `%z` broke retention and snapshot naming.**
+  `strptime` returns an aware datetime for `%z` while every comparison in
+  retention is against a naive `datetime.now()`, so pruning died with an
+  uncaught `TypeError` — in a destructive path, on a documented option that
+  `config import` emits for btrbk's `long-iso`. Separately, a snapshot's name
+  was rendered through a round trip that dropped the UTC offset, so the tool
+  could not parse the names it had just written.
+
+- **An ssh host reached a shell and ssh's own option parser unchecked.** A
+  hostname is now validated where each endpoint stores it, and quoted at the
+  one site that builds a shell string. A host beginning with `-` is read by ssh
+  as an option, `-oProxyCommand=` among them, no matter how it is quoted.
+
+- **`restore` ignored `-c`.** It resolved `timestamp_format` by searching the
+  default locations rather than the configuration it was given, so a pool under
+  a custom format was reported as empty with advice naming the wrong prefix.
+
+- **`config import` wrote configurations it could not read back.** Values were
+  interpolated straight into TOML, so a path containing a quote produced an
+  unparseable file, and — worse — a path containing a backslash produced a
+  valid one that loaded as a DIFFERENT directory: `/mnt/a\backup` became
+  `/mnt/a\x08ackup`, because TOML reads `\b` as a backspace. Both write paths
+  now verify the result loads before saving, and print the conversion instead
+  of reporting a successful write of a file that does not work.
+
+- **A btrbk path containing a space was truncated at the space.** btrbk reads a
+  directive's value as the rest of the line, verbatim; this importer took only
+  the first token, so `volume /mnt/sp ace` converted to `/mnt/sp` — a
+  configuration naming a directory the operator never wrote. Internal spacing,
+  tabs, surrounding quotes and mid-line comments now match btrbk 0.32.7 exactly.
+- `raw+ssh://` asked the **local** filesystem about a **remote** target:
+  `preflight_send` checked for the stream locally, so a restore from a raw+ssh
+  backup failed every time — or, where both hosts use the same path, passed
+  against the wrong file — and the pre-transfer space check measured the machine
+  being backed up rather than the one receiving.
+- A `raw+ssh` publish could be interrupted or collide: the rename-and-sidecar
+  window took no lock, and the `.part` name was built from the local pid, so two
+  hosts backing up to one target could overwrite each other.
+- `prune` reported success for deletions that never happened. Every delete path
+  returned `None` and none of them raised, so an unreadable lock file, a locked
+  snapshot, a busy raw target, a refused remote sudo and a plain `btrfs
+  subvolume delete` failure all counted as pruned: a pass that removed nothing
+  reported "Deleted N snapshot(s)" and exited 0. Deletion now returns what it
+  actually did, and `prune` reports and exits from that.
+- A retention lock on a raw target pinned nothing — a prune deleted the stream a
+  restore was reading — and on the count-based path a locked stream was paid for
+  out of the number of backups asked for, leaving one usable where two were
+  requested.
+- `--convert-rw` and `--sync` were accepted and ignored.
+- Cleanup deleted things it had not created. A failed transfer removed
+  `{dest}/{name}` on the sole evidence that the path existed, so a pre-existing
+  subvolume of the same name was destroyed; `restore --cleanup` treated any
+  empty subvolume as debris, which is what an operator's own `btrfs subvolume
+  create` looks like. Both now require positive evidence of authorship.
+- `transfer_timeout = 0` means "no limit", but it was passed to a poll that read
+  it as "zero seconds", so every transfer could fail instantly.
+- Notification email could hang indefinitely: the SMTP connection had no timeout.
+- A raw snapshot's timestamp lost its timezone, so its fields described the
+  wrong moment.
+- A run reported how many snapshots it *planned* to move rather than how many it
+  delivered, and "3 of 5 delivered, 2 failed" logged the same as "nothing moved".
+- SSH readiness was cached for five minutes, so "connectivity and filesystem
+  readiness" passed for a host that had gone down.
+- `doctor` reported OK for checks that did not run, and said a configuration was
+  valid when it contained no usable volumes.
+- `restore` overrode an explicitly empty `snapshot_prefix`, which is a supported
+  choice, by inferring one from the names it found.
+- A transfer could deadlock: the parent kept a pipe open after handing it to a
+  child, so the pipeline never saw EOF. All pipeline construction now goes
+  through one builder.
+- A raw sidecar whose stream had been deleted was listed as a restorable backup.
+- `list`, `status`, `config validate`, `raw` and `install` exited 0 for the very
+  state they exist to detect — an unreadable source, an empty target, a config
+  with no volumes, a skipped install step.
+- A newly created snapshot was registered once per command rather than once.
+- `skip_remote_lock` was documented and honoured by the endpoint but silently
+  dropped by the config parser, so setting it did nothing — and it is the option
+  a read-only destination needs.
+- `--remove-locks` was accepted and did nothing at all.
+- `estimate --check-space` skipped the check while announcing "No data to
+  transfer" when it simply could not measure the snapshots.
+- `prune` sent a "success" notification for a prune whose own exit code reported
+  failure.
 
 - **`prune` ignored the per-scope retention keys and deleted what `run` keeps** —
   the resolution added for `source_retention` and per-target `retention` landed

@@ -13,6 +13,7 @@ from unittest.mock import MagicMock
 
 from btrfs_backup_ng.cli.run import _prune_after_transfer
 from btrfs_backup_ng.config.schema import RetentionConfig
+from btrfs_backup_ng.endpoint.common import DeletionResult
 
 NORMAL = RetentionConfig(min="1d", hourly=0, daily=3, weekly=0, monthly=0, yearly=0)
 DEGENERATE = RetentionConfig(min="1d", hourly=0, daily=0, weekly=0, monthly=0, yearly=0)
@@ -39,7 +40,10 @@ def _endpoint(n_old):
     ep.list_snapshots.return_value = snaps
     ep.protect_incremental_parents.side_effect = lambda keep, delete: (keep, delete)
     ep.deleted = []
-    ep.delete_snapshots.side_effect = lambda batch, **k: ep.deleted.extend(batch)
+    ep.delete_snapshots.side_effect = lambda batch, **k: (
+        ep.deleted.extend(batch),
+        DeletionResult(deleted=list(batch)),
+    )[1]
     return ep
 
 

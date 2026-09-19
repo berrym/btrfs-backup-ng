@@ -505,10 +505,25 @@ class TestDoctor:
         )
 
     def test_is_lock_stale_not_pid(self):
-        """Test _is_lock_stale with non-PID lock ID."""
+        """A lock id with no pid yields None, not False.
+
+        None means "cannot determine" and False means "the holder is alive".
+        Collapsing them is what made this check inert: NO lock id this project
+        writes carries a pid -- a restore session is restore:{session_id} and a
+        destination id is a path or a URL -- so every real input took the False
+        branch and doctor reported "no stale locks found" for a lock file full
+        of them.
+        """
         doctor = Doctor()
-        # Session ID format - can't determine staleness
-        assert doctor._is_lock_stale("restore:abc123") is False
+        assert doctor._is_lock_stale("restore:abc123") is None
+        # The forms this project actually writes, all undeterminable:
+        for lock_id in (
+            "/mnt/backup",
+            "ssh://user@host:/mnt/backup",
+            "raw:///mnt/backup",
+            "unknown://mnt/backup",
+        ):
+            assert doctor._is_lock_stale(lock_id) is None, lock_id
 
     @patch("os.kill")
     def test_is_lock_stale_process_running(self, mock_kill):
@@ -1581,11 +1596,17 @@ class TestDoctorStaleLockLoop:
         doctor = Doctor(config=mock_config)
         findings = doctor._check_stale_locks()
 
-        # Should find OK - no stale locks
+        # A live pid-bearing holder is not stale, and is not reported as a
+        # problem. It is also not "no locks held": one IS held, by a process that
+        # is running, so the OK summary must not be emitted alongside it.
+        assert not any(f.severity == DiagnosticSeverity.WARN for f in findings)
+        # A lock IS held, by a process that is running. "No locks held" would be
+        # false; the all-clear has to say which all-clear it is.
         assert any(
-            f.severity == DiagnosticSeverity.OK and "No stale locks" in f.message
+            f.severity == DiagnosticSeverity.OK
+            and "1 lock(s) held, none stale" in f.message
             for f in findings
-        )
+        ), [f.message for f in findings]
 
     @patch("btrfs_backup_ng.__util__.read_locks")
     @patch("btrfs_backup_ng.core.doctor.Path.exists")

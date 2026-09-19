@@ -32,6 +32,13 @@ from btrfs_backup_ng.config.schema import (
     TargetConfig,
     VolumeConfig,
 )
+from btrfs_backup_ng.core.operations import TransferResult
+
+
+def _ensure_snaps(path):
+    """An absolute snapshot_dir must exist; the tool no longer creates one."""
+    path.mkdir(parents=True, exist_ok=True)
+    return path
 
 
 def _mounted(*paths):
@@ -70,9 +77,11 @@ def rig(tmp_path, monkeypatch):
 
     def _fake_transfer(*a, **k):
         # Records that a transfer was REACHED. If the mount check works, an
-        # unmounted target never gets here.
+        # unmounted target never gets here. Returns the outcome type the real
+        # function returns -- None means the transfer failed, so a bool here
+        # would make a reached target look like a failed one.
         state["transferred"].append(True)
-        return True
+        return TransferResult(transferred=[object()])
 
     monkeypatch.setattr(run_mod.endpoint, "choose_endpoint", _fake_endpoint)
     monkeypatch.setattr(run_mod, "_transfer_to_target", _fake_transfer)
@@ -88,7 +97,7 @@ def _run_backup(rig, target_path, require_mount, mounted):
     volume = VolumeConfig(
         path=str(rig["src"]),
         snapshot_prefix="t-",
-        snapshot_dir=str(rig["dest"].parent / "snaps"),
+        snapshot_dir=str(_ensure_snaps(rig["dest"].parent / "snaps")),
         targets=[TargetConfig(path=target_path, require_mount=require_mount)],
     )
     config = Config(global_config=GlobalConfig(), volumes=[volume])
@@ -191,7 +200,9 @@ class TestTheTransferCommandEnforcesItToo:
 
         synced: list = []
         monkeypatch.setattr(
-            transfer_mod, "sync_snapshots", lambda *a, **k: synced.append(True)
+            transfer_mod,
+            "sync_snapshots",
+            lambda *a, **k: (synced.append(True), TransferResult())[1],
         )
         monkeypatch.setattr(
             transfer_mod, "find_config_file", lambda *a, **k: str(tmp_path / "c.toml")
@@ -267,7 +278,7 @@ class TestValidationIsWiredIntoTheLoader:
         cfg = tmp_path / "c.toml"
         cfg.write_text(
             "[global]\n"
-            f'snapshot_dir = "{tmp_path}/snaps"\n\n'
+            f'snapshot_dir = "{_ensure_snaps(tmp_path / "snaps")}"\n\n'
             "[[volumes]]\n"
             f'path = "{tmp_path}"\n\n'
             "[[volumes.targets]]\n"
@@ -349,7 +360,7 @@ class TestTheWizardDerivesAUsableValue:
         """
         assert self._derive("/mnt/usb-drive/backup", []) is True
 
-    @pytest.mark.parametrize("target", ["/mnt/backup", "/run/media/mberry/USB-DRIVE"])
+    @pytest.mark.parametrize("target", ["/mnt/backup", "/run/media/operator/USB-DRIVE"])
     def test_it_never_invents_a_mount_point_that_cannot_exist(self, target):
         """/mnt and /run/media/<user> are directories, never mount points."""
         derived = self._derive(target, [])
@@ -378,7 +389,7 @@ class TestTheWizardDerivesAUsableValue:
             patch.object(__util__, "is_mounted", _mounted("/run")),
             patch.object(__util__, "get_mount_info", lambda p: {"fs_type": "tmpfs"}),
         ):
-            assert _derive_require_mount("/run/media/mberry/USB/backups") is True
+            assert _derive_require_mount("/run/media/operator/USB/backups") is True
 
     def test_an_unreadable_mount_table_does_not_crash_the_wizard(self):
         """The wizard never read /proc/mounts before this change."""
@@ -416,7 +427,7 @@ class TestAMountPointIsRefusedForARemoteTarget:
         cfg = tmp_path / "c.toml"
         cfg.write_text(
             "[global]\n"
-            f'snapshot_dir = "{tmp_path}/snaps"\n\n'
+            f'snapshot_dir = "{_ensure_snaps(tmp_path / "snaps")}"\n\n'
             "[[volumes]]\n"
             f'path = "{tmp_path}"\n\n'
             "[[volumes.targets]]\n"
@@ -495,7 +506,7 @@ class TestAConfigThatCanNeverRunIsNamedAtLoad:
         cfg = tmp_path / "c.toml"
         cfg.write_text(
             "[global]\n"
-            f'snapshot_dir = "{tmp_path}/snaps"\n\n'
+            f'snapshot_dir = "{_ensure_snaps(tmp_path / "snaps")}"\n\n'
             "[[volumes]]\n"
             f'path = "{tmp_path}"\n\n'
             "[[volumes.targets]]\n"

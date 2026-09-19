@@ -226,8 +226,11 @@ def _execute_config_restore(args: argparse.Namespace, volume_path: str) -> int:
             args.ssh_key = target.ssh_key
         if not getattr(args, "ssh_host_key_policy", None):
             args.ssh_host_key_policy = target.ssh_host_key_policy
-        # Use volume's snapshot prefix
-        if volume.snapshot_prefix and not getattr(args, "prefix", None):
+        # Use volume's snapshot prefix. `is None`, not truthiness: a volume's
+        # prefix is "" only when the operator wrote snapshot_prefix = "" (an
+        # unset one is auto-derived and non-empty), so a falsy test dropped
+        # exactly the deliberate choice issue #6 exists to honour.
+        if getattr(args, "prefix", None) is None:
             args.prefix = volume.snapshot_prefix
         return _execute_list(args)
 
@@ -262,8 +265,9 @@ def _execute_config_restore(args: argparse.Namespace, volume_path: str) -> int:
     if target.rate_limit and not getattr(args, "rate_limit", None):
         args.rate_limit = target.rate_limit
 
-    # Use volume's snapshot prefix if not overridden
-    if volume.snapshot_prefix and not getattr(args, "prefix", None):
+    # Use volume's snapshot prefix if not overridden. `is None` for the same
+    # reason as the listing path above: an explicit empty prefix is a choice.
+    if getattr(args, "prefix", None) is None:
         args.prefix = volume.snapshot_prefix
 
     # Now call the main restore logic (fall through to execute_restore's main path)
@@ -332,7 +336,9 @@ def _execute_main_restore(args: argparse.Namespace) -> int:
     try:
         local_endpoint = _prepare_local_endpoint(
             dest_path,
-            resolve_timestamp_format(getattr(args, "timestamp_format", None)),
+            resolve_timestamp_format(
+                getattr(args, "timestamp_format", None), getattr(args, "config", None)
+            ),
             snap_prefix=getattr(args, "prefix", "") or "",
         )
     except Exception as e:
@@ -575,12 +581,17 @@ def _prepare_backup_endpoint(args: argparse.Namespace, source: str):
     # are parsed rather than silently skipped when listing/matching backups.
     endpoint_kwargs = {
         "snap_prefix": getattr(args, "prefix", "") or "",
+        # Whether a prefix was CHOSEN, which the value alone cannot express: ""
+        # is both "the operator asked for no prefix" and "nobody said". Prefix
+        # inference must override the second and never the first.
+        "snap_prefix_explicit": getattr(args, "prefix", None) is not None,
         "convert_rw": False,
         "subvolume_sync": False,
         "btrfs_debug": False,
         "fs_checks": get_fs_checks_mode(args),
         "timestamp_format": resolve_timestamp_format(
-            getattr(args, "timestamp_format", None)
+            getattr(args, "timestamp_format", None),
+            getattr(args, "config", None),
         ),
     }
 
@@ -1120,13 +1131,11 @@ def _execute_cleanup(args: argparse.Namespace) -> int:
     print("=" * 60)
     print()
 
-    # Look for partial subvolumes
-    # Partial restores typically:
-    # 1. Have incomplete btrfs receive (no received_uuid)
-    # 2. Are empty or nearly empty
-    # 3. May have .partial suffix or similar markers
+    # Look for partial subvolumes. Only markers this tool writes itself count
+    # as evidence; see the classification below for why emptiness does not.
 
-    partial_subvolumes = []
+    partial_subvolumes: list[tuple[Path, str]] = []
+    unclear: list[tuple[Path, str]] = []
 
     try:
         for item in dest_path.iterdir():
@@ -1137,39 +1146,64 @@ def _execute_cleanup(args: argparse.Namespace) -> int:
             if not __util__.is_subvolume(item):
                 continue
 
-            # Check for signs of incomplete restore
+            # This command runs long after the restore that left the debris, so
+            # there is no run record to consult and authorship has to be read
+            # off the disk. Exactly two things identify a subvolume as this
+            # tool's unfinished work: the .partial suffix it writes itself, and
+            # a body holding nothing but the .btrfs-backup-ng directory it
+            # creates. Emptiness is NOT evidence -- an operator's own `btrfs
+            # subvolume create` is indistinguishable from an interrupted
+            # receive -- so an unmarked empty subvolume is reported and left
+            # alone. It used to be deleted on emptiness alone.
             is_partial = False
             reason = ""
+            unclear_reason = ""
 
-            # Check if subvolume is empty or very small
             try:
-                contents = list(item.iterdir())
-                if len(contents) == 0:
-                    is_partial = True
-                    reason = "empty subvolume"
-                elif len(contents) == 1 and contents[0].name == ".btrfs-backup-ng":
-                    is_partial = True
-                    reason = "only contains metadata directory"
+                contents: list[Path] | None = list(item.iterdir())
             except PermissionError:
-                pass
+                contents = None
 
-            # Check for .partial marker in name
             if item.name.endswith(".partial"):
                 is_partial = True
                 reason = "has .partial suffix"
+            elif (
+                contents is not None
+                and len(contents) == 1
+                and contents[0].name == ".btrfs-backup-ng"
+            ):
+                is_partial = True
+                reason = "only contains metadata directory"
+            elif contents is None:
+                unclear_reason = "cannot be read, so it cannot be identified"
+            elif not contents:
+                unclear_reason = "empty, but nothing marks it as this tool's"
 
             if is_partial:
                 partial_subvolumes.append((item, reason))
+            elif unclear_reason:
+                unclear.append((item, unclear_reason))
 
     except Exception as e:
         logger.error("Error scanning destination: %s", e)
         return 1
 
+    if unclear:
+        print(
+            f"Leaving {len(unclear)} subvolume(s) alone -- not identifiable as ours:\n"
+        )
+        for subvol, why in unclear:
+            print(f"  {subvol.name}")
+            print(f"      {why}")
+        print()
+        print("Delete these yourself if you know they are debris.")
+        print()
+
     if not partial_subvolumes:
         print("No partial restores found.")
         return 0
 
-    print(f"Found {len(partial_subvolumes)} potentially incomplete restore(s):\n")
+    print(f"Found {len(partial_subvolumes)} incomplete restore(s):\n")
     for i, (subvol, reason) in enumerate(partial_subvolumes, 1):
         print(f"  {i}. {subvol.name}")
         print(f"      Reason: {reason}")
@@ -1181,7 +1215,7 @@ def _execute_cleanup(args: argparse.Namespace) -> int:
         print("Dry run - no changes made.")
         return 0
 
-    print("These subvolumes appear to be from incomplete restores.")
+    print("These subvolumes carry this tool's own partial-restore markers.")
     confirm = input("Delete all partial subvolumes? [y/N]: ").strip().lower()
 
     if confirm not in ("y", "yes"):

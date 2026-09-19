@@ -12,7 +12,7 @@ import time
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Optional
 
 from .target import TargetKind, TargetScheme, parse_target
 
@@ -221,15 +221,22 @@ class Doctor:
         self,
         config: Any | None = None,
         config_path: Path | str | None = None,
+        config_warnings: list[str] | None = None,
     ):
         """Initialize the diagnostic engine.
 
         Args:
             config: Loaded configuration object (optional)
             config_path: Path to configuration file (optional)
+            config_warnings: Warnings the CALLER collected when IT loaded the
+                config. Required whenever ``config`` is supplied: the load in
+                ``_check_config_valid`` is skipped in that case, so warnings
+                gathered outside never became findings and the summary reported
+                none for a config the loader had complained about.
         """
         self.config = config
         self.config_path = Path(config_path) if config_path else None
+        self.config_warnings = list(config_warnings or [])
         self._checks: list[DiagnosticCheck] = []
         self._register_all_checks()
 
@@ -529,6 +536,21 @@ class Doctor:
         if not self.config_path or not self.config_path.exists():
             # Already reported by config_exists check
             return findings
+
+        # Warnings from a config the CALLER loaded. Emitted here so they are
+        # counted and displayed like any other finding. `doctor` is the command
+        # an operator runs precisely when something looks wrong, so a summary
+        # saying zero warnings for a config the loader complained about is the
+        # worst available answer.
+        for warning in self.config_warnings:
+            findings.append(
+                DiagnosticFinding(
+                    category=DiagnosticCategory.CONFIG,
+                    severity=DiagnosticSeverity.WARN,
+                    check_name="config_valid",
+                    message=f"Configuration warning: {warning}",
+                )
+            )
 
         if self.config is None:
             # Try to load config
@@ -1188,6 +1210,11 @@ class Doctor:
     def _check_stale_locks(self) -> list[DiagnosticFinding]:
         """Check for stale locks from crashed operations."""
         findings: list[DiagnosticFinding] = []
+        #: Locks examined, so the all-clear can say which all-clear it is. "No
+        #: stale locks found" used to cover a lock file with none, a lock file
+        #: full of locks nothing could identify, and a lock file that could not
+        #: be read at all.
+        locks_seen = 0
 
         if not self.config:
             return findings
@@ -1216,9 +1243,36 @@ class Doctor:
                 for snapshot_name, lock_info in locks.items():
                     snapshot_locks = lock_info.get("locks", [])
                     for lock_id in snapshot_locks:
+                        locks_seen += 1
                         # Check if process is still running
                         # Lock ID format: "operation:session_id" or contains PID
                         is_stale = self._is_lock_stale(lock_id)
+
+                        if is_stale is None:
+                            # A lock is held and nothing in its id says by whom.
+                            # Reported rather than passed over: a lock is what
+                            # stops retention pruning a snapshot, so one nobody
+                            # can account for is exactly what the operator ran
+                            # this command to find.
+                            findings.append(
+                                DiagnosticFinding(
+                                    category=DiagnosticCategory.TRANSFERS,
+                                    severity=DiagnosticSeverity.INFO,
+                                    check_name="stale_locks",
+                                    message=(
+                                        f"Lock held on {snapshot_name} by "
+                                        f"{lock_id!r}; whether its holder is still "
+                                        "running cannot be determined from the "
+                                        "lock record"
+                                    ),
+                                    details={
+                                        "snapshot": snapshot_name,
+                                        "lock_id": lock_id,
+                                        "lock_file": str(lock_file),
+                                    },
+                                )
+                            )
+                            continue
 
                         if is_stale:
                             finding = DiagnosticFinding(
@@ -1241,15 +1295,37 @@ class Doctor:
                             findings.append(finding)
 
             except Exception as e:
+                # Previously a bare logger.warning and no finding, so an
+                # unreadable lock file produced the same "No stale locks found"
+                # as a lock file that was read and had none. An unreadable lock
+                # file is precisely the state that silently stops retention.
                 logger.warning("Could not check locks at %s: %s", lock_file, e)
+                findings.append(
+                    DiagnosticFinding(
+                        category=DiagnosticCategory.TRANSFERS,
+                        severity=DiagnosticSeverity.WARN,
+                        check_name="stale_locks",
+                        message=f"Could not read the lock file {lock_file}: {e}",
+                        details={"lock_file": str(lock_file), "error": str(e)},
+                    )
+                )
 
-        if not any(f.severity != DiagnosticSeverity.OK for f in findings):
+        if not findings:
+            # Said precisely, because "no stale locks found" was previously
+            # printed for three different states: no locks at all, locks whose
+            # staleness could not be determined, and a lock file that could not
+            # be read. Only the first is a clean bill of health.
             findings.append(
                 DiagnosticFinding(
                     category=DiagnosticCategory.TRANSFERS,
                     severity=DiagnosticSeverity.OK,
                     check_name="stale_locks",
-                    message="No stale locks found",
+                    message=(
+                        "No locks held"
+                        if locks_seen == 0
+                        else f"{locks_seen} lock(s) held, none stale"
+                    ),
+                    details={"locks_examined": locks_seen},
                 )
             )
 
@@ -1265,26 +1341,37 @@ class Doctor:
 
         return fix_action
 
-    def _is_lock_stale(self, lock_id: str) -> bool:
-        """Check if a lock is stale (process no longer running)."""
-        # Try to extract PID from lock_id
+    def _is_lock_stale(self, lock_id: str) -> Optional[bool]:
+        """True if the holder is gone, False if it is alive, None if unknowable.
+
+        Staleness is decided by looking for a pid in the lock id. NO LOCK ID THIS
+        PROJECT WRITES CONTAINS ONE. The ids are a restore session
+        (``restore:{session_id}``, core/restore.py) and a destination id
+        (``/path``, ``ssh://user@host:/path``, ``raw:///path``,
+        ``unknown://path``) -- measured, every one of them returns "not a pid".
+
+        So the check was inert for every real input and, returning False for all
+        of them, reported "no stale locks found" for a lock file full of them.
+        The third answer is the honest one: nothing in the current lock format
+        says which process holds a lock, so doctor can report that a lock is
+        HELD without claiming to know whether its holder still exists. Giving it
+        that knowledge means putting a pid and a host in the lock record, which
+        is a format change, not a fix to this function.
+        """
         # Common formats: "restore:abc123", "transfer:12345", etc.
         parts = lock_id.split(":")
         if len(parts) >= 2:
             try:
-                # Check if second part is a PID
                 pid = int(parts[1])
-                # Check if process is running
-                try:
-                    os.kill(pid, 0)
-                    return False  # Process is running
-                except OSError:
-                    return True  # Process not running
             except ValueError:
-                pass  # Not a PID
+                return None  # Not a pid: staleness is not determinable
+            try:
+                os.kill(pid, 0)
+                return False  # Process is running
+            except OSError:
+                return True  # Process not running
 
-        # Can't determine - assume not stale
-        return False
+        return None
 
     def _fix_stale_lock(
         self, lock_file: Path, snapshot_name: str, lock_id: str
@@ -1368,6 +1455,34 @@ class Doctor:
 
             failed = [t for t in transactions if t.get("status") == "failed"]
             successful = [t for t in transactions if t.get("status") == "completed"]
+            # The logger writes THREE statuses. TransactionContext.__enter__ emits
+            # "started", and a run killed part-way through leaves that record with
+            # no completed/failed partner. Such a transaction was in neither list
+            # above, so a log full of half-finished runs reported OK.
+            started = [t for t in transactions if t.get("status") == "started"]
+            finished = {
+                t.get("snapshot") for t in transactions if t.get("status") != "started"
+            }
+            unfinished = [t for t in started if t.get("snapshot") not in finished]
+
+            if unfinished:
+                findings.append(
+                    DiagnosticFinding(
+                        category=DiagnosticCategory.TRANSFERS,
+                        severity=DiagnosticSeverity.WARN,
+                        check_name="recent_failures",
+                        message=(
+                            f"{len(unfinished)} operation(s) started in the last "
+                            "24h and never finished"
+                        ),
+                        details={
+                            "unfinished_count": len(unfinished),
+                            "actions": [
+                                t.get("action", "unknown") for t in unfinished[:3]
+                            ],
+                        },
+                    )
+                )
 
             if failed:
                 findings.append(
@@ -1385,7 +1500,20 @@ class Doctor:
                         },
                     )
                 )
-            else:
+            elif not transactions:
+                # "All 0 operation(s) successful in last 24h" is a green line for
+                # a backup system that has not run. For a tool whose whole job is
+                # to run on a timer, nothing having happened is the finding.
+                findings.append(
+                    DiagnosticFinding(
+                        category=DiagnosticCategory.TRANSFERS,
+                        severity=DiagnosticSeverity.WARN,
+                        check_name="recent_failures",
+                        message="No operations recorded in the last 24h",
+                        details={"log": str(log_path)},
+                    )
+                )
+            elif not unfinished:
                 findings.append(
                     DiagnosticFinding(
                         category=DiagnosticCategory.TRANSFERS,
