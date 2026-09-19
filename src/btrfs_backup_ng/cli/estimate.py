@@ -201,7 +201,9 @@ def _estimate_direct(args: argparse.Namespace, source: str, destination: str) ->
     fs_checks_mode = get_fs_checks_mode(args)
     # Thread timestamp_format so custom-named snapshots are counted, not skipped
     # (which would undercount and hide an existing incremental parent).
-    ts_fmt = resolve_timestamp_format(getattr(args, "timestamp_format", None))
+    ts_fmt = resolve_timestamp_format(
+        getattr(args, "timestamp_format", None), getattr(args, "config", None)
+    )
 
     try:
         source_kwargs = {

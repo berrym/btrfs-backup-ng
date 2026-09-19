@@ -336,7 +336,9 @@ def _execute_main_restore(args: argparse.Namespace) -> int:
     try:
         local_endpoint = _prepare_local_endpoint(
             dest_path,
-            resolve_timestamp_format(getattr(args, "timestamp_format", None)),
+            resolve_timestamp_format(
+                getattr(args, "timestamp_format", None), getattr(args, "config", None)
+            ),
             snap_prefix=getattr(args, "prefix", "") or "",
         )
     except Exception as e:
@@ -588,7 +590,8 @@ def _prepare_backup_endpoint(args: argparse.Namespace, source: str):
         "btrfs_debug": False,
         "fs_checks": get_fs_checks_mode(args),
         "timestamp_format": resolve_timestamp_format(
-            getattr(args, "timestamp_format", None)
+            getattr(args, "timestamp_format", None),
+            getattr(args, "config", None),
         ),
     }
 

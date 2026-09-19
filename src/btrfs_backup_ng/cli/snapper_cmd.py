@@ -132,7 +132,9 @@ def _handle_list(args: argparse.Namespace) -> int:
 
     # Backup names honor --timestamp-format (else [global] config) so the
     # displayed name matches what a backup would write on disk.
-    backup_fmt = resolve_timestamp_format(getattr(args, "timestamp_format", None))
+    backup_fmt = resolve_timestamp_format(
+        getattr(args, "timestamp_format", None), getattr(args, "config", None)
+    )
 
     all_data: list[dict[str, Any]] = []
 
@@ -227,7 +229,8 @@ def _handle_backup(args: argparse.Namespace) -> int:
         "snap_prefix": "",
         # Honor --timestamp-format, else [global] config, else the default.
         "timestamp_format": resolve_timestamp_format(
-            getattr(args, "timestamp_format", None)
+            getattr(args, "timestamp_format", None),
+            getattr(args, "config", None),
         ),
     }
     # Thread SSH options so ssh:// (remote btrfs receive) and raw+ssh:// targets
@@ -419,7 +422,9 @@ def _handle_status(args: argparse.Namespace) -> int:
         # Resolve the format the same way `snapper backup` does, so the local
         # names we recompute match the on-disk backup filenames (else the
         # backed-up/pending counts are wrong under a custom timestamp_format).
-        status_fmt = resolve_timestamp_format(getattr(args, "timestamp_format", None))
+        status_fmt = resolve_timestamp_format(
+            getattr(args, "timestamp_format", None), getattr(args, "config", None)
+        )
         try:
             endpoint_config = {
                 "path": args.target,

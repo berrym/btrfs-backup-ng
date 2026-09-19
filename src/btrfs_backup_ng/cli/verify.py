@@ -40,7 +40,8 @@ def execute(args: argparse.Namespace) -> int:
         "btrfs_debug": False,
         "fs_checks": get_fs_checks_mode(args),
         "timestamp_format": resolve_timestamp_format(
-            getattr(args, "timestamp_format", None)
+            getattr(args, "timestamp_format", None),
+            getattr(args, "config", None),
         ),
     }
 
