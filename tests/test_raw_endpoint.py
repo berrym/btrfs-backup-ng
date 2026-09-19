@@ -6,6 +6,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from btrfs_backup_ng.__util__ import AbortError
 from btrfs_backup_ng.endpoint.raw import RawEndpoint, SSHRawEndpoint
 from btrfs_backup_ng.endpoint.raw_metadata import COMPRESSION_CONFIG, RawSnapshot
 
@@ -97,15 +98,31 @@ class TestRawEndpoint:
         endpoint = RawEndpoint(config={"path": tmp_path})
         assert endpoint.get_id().startswith("raw://")
 
-    def test_prepare_creates_directory(self, tmp_path):
-        """Test that prepare creates the target directory."""
+    def test_prepare_accepts_an_existing_target(self, tmp_path):
         target_dir = tmp_path / "backups"
+        target_dir.mkdir()
         endpoint = RawEndpoint(config={"path": target_dir})
 
         with patch.object(endpoint, "_check_tools", return_value=[]):
             endpoint.prepare()
 
-        assert target_dir.exists()
+        assert target_dir.is_dir()
+
+    def test_prepare_refuses_a_target_that_does_not_exist(self, tmp_path):
+        """It used to create it.
+
+        Raw applies no filesystem check at all, so an unmounted disk meant the
+        mount-point tree was built on the root filesystem and the streams -- as
+        large as the data -- written there, with nothing to notice.
+        """
+        target_dir = tmp_path / "mnt" / "usb" / "backups"
+        endpoint = RawEndpoint(config={"path": target_dir})
+
+        with patch.object(endpoint, "_check_tools", return_value=[]):
+            with pytest.raises(AbortError):
+                endpoint.prepare()
+
+        assert not target_dir.exists()
 
     def test_check_tools_finds_missing(self, tmp_path):
         """Test tool availability checking."""

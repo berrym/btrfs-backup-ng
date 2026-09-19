@@ -17,11 +17,14 @@ undone by the third:
     endpoint/local.py   _prepare, the destination and the source
     endpoint/local.py   an ABSOLUTE snapshot_dir, which can name another filesystem
     endpoint/common.py  Endpoint.receive, immediately before receiving
-    endpoint/raw.py     RawEndpoint._prepare        <- the following commit
+    endpoint/raw.py     RawEndpoint._prepare, and target_lock
 
-The raw endpoint is fixed separately because withdrawing its first-run
-convenience is a distinct decision, not because it is a lesser problem. It is
-the worse one: RawEndpoint._prepare applies no filesystem check at all.
+Raw was the worst of them. It created the target on first use -- convenient
+until the disk is not mounted -- and it applies no filesystem check at all: no
+fs_checks, no btrfs test. Nothing else would have noticed, and raw streams are
+as large as the data being backed up, so an unmounted disk filled the root
+filesystem silently. Its target_lock rebuilt the directory too, for every locked
+operation, which would have undone the refusal in _prepare.
 
 Directories BELOW an existing configured path are still created: the
 .btrfs-backup-ng tree, and a relative snapshot_dir.
@@ -169,3 +172,62 @@ class TestReceiveDoesNotRebuildWhatPrepareRefused:
 
         with pytest.raises(AbortError):
             endpoint.receive(stdin=None)
+
+
+class TestRawTargetsGetTheSameRule:
+    """Raw applies no filesystem check of its own, so nothing else catches this."""
+
+    @staticmethod
+    def _raw(dest):
+        from btrfs_backup_ng.endpoint.raw import RawEndpoint
+
+        return RawEndpoint(config={"path": str(dest), "fs_checks": "skip"})
+
+    def test_prepare_refuses_a_target_that_does_not_exist(self, tmp_path):
+        dest = tmp_path / "mnt" / "usb" / "backups"
+
+        with pytest.raises(AbortError) as excinfo:
+            self._raw(dest)._prepare()
+
+        assert str(dest) in str(excinfo.value)
+        assert "mounted" in str(excinfo.value).lower()
+
+    def test_prepare_creates_nothing_when_it_refuses(self, tmp_path):
+        dest = tmp_path / "mnt" / "usb" / "backups"
+
+        with pytest.raises(AbortError):
+            self._raw(dest)._prepare()
+
+        assert not dest.exists()
+        assert not (tmp_path / "mnt").exists(), (
+            "refused the target but still built its parents on this filesystem"
+        )
+
+    def test_prepare_accepts_a_target_that_exists(self, tmp_path):
+        dest = tmp_path / "rawtarget"
+        dest.mkdir()
+
+        self._raw(dest)._prepare()
+
+        assert dest.is_dir()
+
+    def test_target_lock_does_not_rebuild_a_missing_target(self, tmp_path):
+        """It ran for every locked operation and would have undone the refusal."""
+        dest = tmp_path / "mnt" / "usb" / "backups"
+        endpoint = self._raw(dest)
+
+        with pytest.raises(AbortError):
+            with endpoint.target_lock():
+                pass
+
+        assert not dest.exists()
+
+    def test_target_lock_still_works_when_the_target_exists(self, tmp_path):
+        dest = tmp_path / "rawtarget"
+        dest.mkdir()
+        endpoint = self._raw(dest)
+
+        with endpoint.target_lock():
+            pass
+
+        assert dest.is_dir()

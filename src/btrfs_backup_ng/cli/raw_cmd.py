@@ -83,10 +83,15 @@ def _open_target(args: argparse.Namespace):
         raise ValueError(f"Cannot open raw target: {e}") from e
     if spec.startswith("raw://"):
         local_path = Path(spec[len("raw://") :])
-        if not local_path.exists():
-            print(
-                f"warning: {local_path} does not exist or is not mounted",
-                file=sys.stderr,
+        if not local_path.is_dir():
+            # This was a warning, and the command then carried on to report
+            # "0 backups" / "0 legacy streams" and exit 0. For a target that is
+            # simply not mounted, a clean empty result is the worst available
+            # answer: it reads as "nothing to do" when the truth is "I could not
+            # look". The condition was already detected -- only the verdict was
+            # missing.
+            raise ValueError(
+                f"{local_path} does not exist or is not mounted, so it cannot be read"
             )
     return ep, spec
 

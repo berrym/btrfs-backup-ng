@@ -722,7 +722,14 @@ class RawEndpoint(Endpoint):
         if timeout is None:
             timeout = float(self.config.get("lock_timeout", 30.0))
         path = Path(self.config["path"])
-        path.mkdir(parents=True, exist_ok=True, mode=0o700)
+        if not path.is_dir():
+            # Recreating here would undo the refusal in _prepare: the lock lives
+            # inside the target directory, so this ran for every locked
+            # operation and would have rebuilt the tree on the root filesystem.
+            raise __util__.AbortError(
+                f"Raw target {path} does not exist, so it cannot be locked. "
+                f"The filesystem holding it is most likely not mounted."
+            )
         with __util__.exclusive_lock(
             path / LOCK_FILENAME,
             timeout=timeout,
@@ -733,9 +740,26 @@ class RawEndpoint(Endpoint):
     def _prepare(self) -> None:
         """Prepare the endpoint for use."""
         path = Path(self.config["path"])
-        if not path.exists():
-            logger.info("Creating raw target directory: %s", path)
-            path.mkdir(parents=True, exist_ok=True, mode=0o700)
+        if not path.is_dir():
+            # The target was created on first use, which is convenient right up
+            # until the disk holding it is not mounted: the whole mount-point
+            # tree got built on the ROOT filesystem and the streams written
+            # there. This endpoint applies no filesystem check at all -- no
+            # fs_checks, no btrfs test -- so nothing else would have noticed,
+            # and raw streams are as large as the data. require_mount catches it
+            # only when the configured path IS the mount point, and it is off by
+            # default.
+            #
+            # A configured target is a statement that something is there. Create
+            # it once by hand; everything BELOW it is still created here.
+            logger.error("Configured raw target does not exist: %s", path)
+            raise __util__.AbortError(
+                f"Raw target {path} does not exist. btrfs-backup-ng does not "
+                f"create a configured target: if it lives on a removable or "
+                f"network filesystem, it is most likely not mounted. Check the "
+                f"path for a typo, mount the filesystem, or create the directory "
+                f"yourself to proceed."
+            )
 
         # Fail loud (before any transfer) with an actionable message if a required
         # compression/encryption tool is missing, instead of a raw errno part-way
