@@ -354,7 +354,7 @@ class TestTheWizardDerivesAUsableValue:
         """
         assert self._derive("/mnt/usb-drive/backup", []) is True
 
-    @pytest.mark.parametrize("target", ["/mnt/backup", "/run/media/mberry/USB-DRIVE"])
+    @pytest.mark.parametrize("target", ["/mnt/backup", "/run/media/operator/USB-DRIVE"])
     def test_it_never_invents_a_mount_point_that_cannot_exist(self, target):
         """/mnt and /run/media/<user> are directories, never mount points."""
         derived = self._derive(target, [])
@@ -383,7 +383,7 @@ class TestTheWizardDerivesAUsableValue:
             patch.object(__util__, "is_mounted", _mounted("/run")),
             patch.object(__util__, "get_mount_info", lambda p: {"fs_type": "tmpfs"}),
         ):
-            assert _derive_require_mount("/run/media/mberry/USB/backups") is True
+            assert _derive_require_mount("/run/media/operator/USB/backups") is True
 
     def test_an_unreadable_mount_table_does_not_crash_the_wizard(self):
         """The wizard never read /proc/mounts before this change."""

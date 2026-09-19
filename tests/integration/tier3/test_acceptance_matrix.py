@@ -223,7 +223,7 @@ class TestAnExplicitEmptyPrefix:
         #
         # Basenames: both subvol helpers return the `path` field of
         # `btrfs subvolume list`, which is a path relative to the filesystem
-        # root ("@home/mberry/.../t3ssh-...") rather than a bare name.
+        # root ("@home/operator/.../t3ssh-...") rather than a bare name.
         landed = [n.rsplit("/", 1)[-1] for n in rig.local_btrfs_subvols(rig.dst)]
         assert landed, "nothing landed at the destination"
         bare = [n for n in landed if n[:1].isdigit()]

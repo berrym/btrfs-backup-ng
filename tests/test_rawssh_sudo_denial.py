@@ -904,7 +904,7 @@ class TestFindsStderrReachesTheGuard:
     told only "the listing command failed" with no reason. On real hardware the
     difference is between a bare exit code and
 
-        find: '/home/mberry/bbng-p1': Permission denied
+        find: '/home/operator/bbng-p1': Permission denied
 
     which is the whole diagnosis. The suppression is also what made the original
     bug invisible: rc=1 with an empty stderr looked like an empty target.

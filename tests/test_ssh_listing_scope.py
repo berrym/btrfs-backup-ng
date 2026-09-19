@@ -27,20 +27,20 @@ from btrfs_backup_ng.endpoint.ssh import SSHEndpoint
 
 DEST = "/backups/home"
 
-# Real `btrfs subvolume list -o -u -R` output shape, captured from 192.168.0.70.
+# Real `btrfs subvolume list -o -u -R` output shape, captured from 198.51.100.70.
 # Note the paths are relative to the FILESYSTEM root and carry the top-level
 # subvolume name (@home), which is why a naive suffix comparison is not enough.
 OUTPUT = (
     "ID 5816 gen 341546 top level 263 received_uuid -                    "
     "uuid eceff1db-d300-c94e-8735-d5980e5ac4f9 "
-    "path @home/mberry/snaps/src/home-20260818-021031\n"
+    "path @home/operator/snaps/src/home-20260818-021031\n"
     "ID 5817 gen 341550 top level 263 received_uuid "
     "eceff1db-d300-c94e-8735-d5980e5ac4f9 "
     "uuid 4f9583c7-fd4a-0d48-8fb8-4c116d2b60a6 "
-    "path @home/mberry/backups/home/home-20260818-021031\n"
+    "path @home/operator/backups/home/home-20260818-021031\n"
     "ID 5818 gen 341560 top level 263 received_uuid -                    "
     "uuid aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee "
-    "path @home/mberry/snaps/src/home-20260818-021257\n"
+    "path @home/operator/snaps/src/home-20260818-021257\n"
 )
 
 # The same two-copies-of-one-name situation with the DESTINATION line FIRST.
@@ -50,10 +50,10 @@ OUTPUT_DEST_FIRST = (
     "ID 5817 gen 341550 top level 263 received_uuid "
     "eceff1db-d300-c94e-8735-d5980e5ac4f9 "
     "uuid 4f9583c7-fd4a-0d48-8fb8-4c116d2b60a6 "
-    "path @home/mberry/backups/home/home-20260818-021031\n"
+    "path @home/operator/backups/home/home-20260818-021031\n"
     "ID 5816 gen 341546 top level 263 received_uuid -                    "
     "uuid eceff1db-d300-c94e-8735-d5980e5ac4f9 "
-    "path @home/mberry/snaps/src/home-20260818-021031\n"
+    "path @home/operator/snaps/src/home-20260818-021031\n"
 )
 
 

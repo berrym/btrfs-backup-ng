@@ -8,8 +8,8 @@ holding a backup:
     $ btrfs-backup-ng restore --list ~/bbng-e2e/dest
     No snapshots found at backup location                  (exit 0)
 
-    $ btrfs-backup-ng restore --list --prefix 'home-mberry-bbng-e2e-src-' ...
-        1. home-mberry-bbng-e2e-src-20260818-021031
+    $ btrfs-backup-ng restore --list --prefix 'home-operator-bbng-e2e-src-' ...
+        1. home-operator-bbng-e2e-src-20260818-021031
 
 Identical wording for "this location is empty" and "your prefix matched nothing"
 -- and an operator reading the first during disaster recovery concludes the
@@ -43,7 +43,10 @@ class TestInferringThePrefixFromAName:
         "name,expected",
         [
             ("home-20260818-021031", "home-"),
-            ("home-mberry-bbng-e2e-src-20260818-021031", "home-mberry-bbng-e2e-src-"),
+            (
+                "home-operator-bbng-e2e-src-20260818-021031",
+                "home-operator-bbng-e2e-src-",
+            ),
             ("20260818-021031", ""),
             ("README.md", None),
             ("snapshot", None),
@@ -125,8 +128,8 @@ class TestTheRemoteVariant:
     filesystem-wide, so it must separate 'here' from 'elsewhere'."""
 
     OUTPUT = (
-        "ID 1 gen 1 top level 5 path @home/mberry/backups/home/home-20260818-021031\n"
-        "ID 2 gen 1 top level 5 path @home/mberry/snaps/src/other-20260818-030000\n"
+        "ID 1 gen 1 top level 5 path @home/operator/backups/home/home-20260818-021031\n"
+        "ID 2 gen 1 top level 5 path @home/operator/snaps/src/other-20260818-030000\n"
     )
 
     def _ssh(self, present):

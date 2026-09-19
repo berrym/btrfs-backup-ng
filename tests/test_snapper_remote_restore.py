@@ -46,7 +46,7 @@ INFO_XML = """<?xml version="1.0"?>
   </userdata>
   <userdata>
     <key>requestor</key>
-    <value>mberry</value>
+    <value>operator</value>
   </userdata>
 </snapshot>
 """
@@ -280,7 +280,7 @@ class TestRestoringFromAnSshTarget:
         assert "<type>pre</type>" in xml
         assert "<description>before upgrade</description>" in xml
         assert "<key>reason</key>" in xml and "<value>manual</value>" in xml
-        assert "<key>requestor</key>" in xml and "<value>mberry</value>" in xml
+        assert "<key>requestor</key>" in xml and "<value>operator</value>" in xml
         # <uid> is the element that separates RENUMBERING from regenerating:
         # SnapperMetadata does not model it, so a parse-and-regenerate round trip
         # silently drops it (measured). Asserting it here is what stops this test
