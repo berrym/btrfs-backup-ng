@@ -1944,7 +1944,14 @@ class SSHRawEndpoint(RawEndpoint):
         super().__init__(config, **kwargs)
 
         # SSH configuration
-        self.hostname = config.get("hostname", kwargs.get("hostname", ""))
+        # Same validation as SSHEndpoint: raw+ssh builds its own ssh command
+        # strings, so an unchecked host is dangerous here too. A MISSING host
+        # keeps its own specific message below -- "not a usable ssh host" is
+        # true but unhelpful when the answer is that none was configured.
+        _raw_host = config.get("hostname", kwargs.get("hostname", ""))
+        self.hostname = (
+            __util__.validated_ssh_host(_raw_host) if _raw_host else _raw_host
+        )
         self.username = config.get("username")
         self.port = config.get("port", 22)
         self.ssh_key = config.get("ssh_key")

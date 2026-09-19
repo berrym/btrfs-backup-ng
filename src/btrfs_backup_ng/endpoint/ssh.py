@@ -419,7 +419,11 @@ class SSHEndpoint(Endpoint):
             if config.get(_ssh_key) is not None:
                 self.config[_ssh_key] = config[_ssh_key]
 
-        self.hostname = hostname
+        # Validated HERE, at construction, so every call site is covered --
+        # the host reaches both a shell=True pipeline and ssh's own option
+        # parser, and a check at the config boundary alone would leave the
+        # hand-written, wizard and direct-CLI forms unprotected.
+        self.hostname = __util__.validated_ssh_host(hostname)
         logger.debug("SSHEndpoint initialized with hostname: %s", self.hostname)
         logger.debug("SSHEndpoint: kwargs provided: %s", list(kwargs.keys()))
         self.config["username"] = self.config.get("username")
@@ -3619,7 +3623,11 @@ print(json.dumps(result))
         ssh_parts.append("-T")
         if ssh_port:
             ssh_parts.extend(["-p", str(ssh_port)])
-        ssh_parts.append(remote_host)
+        # Quoted because ssh_parts is joined into ONE string and run with
+        # shell=True below; validated_ssh_host already refuses a host that
+        # could exploit this, and quoting means the shell path does not
+        # depend on that being the only guard.
+        ssh_parts.append(shlex.quote(remote_host))
 
         # Build remote command with orphan protection.
         # _build_receive_command escapes the destination itself; do not pre-quote.

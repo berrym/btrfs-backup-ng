@@ -10,6 +10,7 @@ import errno
 import os
 from collections.abc import Iterator
 import stat as stat_module
+import re
 import subprocess
 import time
 from datetime import datetime, timedelta, timezone
@@ -300,6 +301,43 @@ def exec_subprocess(
 def log_heading(caption: str) -> str:
     """Formatted heading for logging output sections."""
     return f"{f'--[ {caption} ]':-<50}"
+
+
+#: A host this project will hand to ssh. Deliberately narrower than DNS: an
+#: allow-list of what a hostname, IPv4 literal or bracketed IPv6 literal may
+#: contain, with an optional user, because everything outside it is either
+#: meaningless to ssh or dangerous.
+_SSH_HOST_RE = re.compile(
+    r"^(?:[A-Za-z0-9_][A-Za-z0-9_.\-]*@)?"
+    r"(?:\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9](?:[A-Za-z0-9.\-]*[A-Za-z0-9])?)$"
+)
+
+
+def validated_ssh_host(host: str, *, username: str | None = None) -> str:
+    """Return ``host`` (or ``user@host``) after checking ssh can be given it.
+
+    The host reached two kinds of harm unvalidated:
+
+    * **The shell.** ``_do_shell_pipeline_transfer`` joins its ssh arguments into
+      ONE string and runs it with ``shell=True``, quoting the ControlPath and the
+      remote command but not the host -- so a host containing ``;`` ran a command
+      on the machine doing the backup, which is running ``btrfs send``, typically
+      as root.
+    * **ssh's own option parser.** A host beginning with ``-`` is read as an
+      option however it is quoted, so ``-oProxyCommand=...`` runs a command even
+      on the argv paths, where no shell is involved.
+
+    Validated once, where the endpoint is built, so every present and future call
+    site is covered. A check at the config-import boundary alone would leave a
+    hand-written config, a wizard entry and the direct CLI forms unprotected.
+    """
+    candidate = f"{username}@{host}" if username else host
+    if not host or not _SSH_HOST_RE.fullmatch(candidate):
+        raise ValueError(
+            f"{candidate!r} is not a usable ssh host: expected [user@]host where "
+            f"host is a hostname, an IPv4 address, or a bracketed IPv6 address"
+        )
+    return candidate
 
 
 def date_to_str(
