@@ -223,7 +223,7 @@ def create_subcommand_parser() -> argparse.ArgumentParser:
         action="store_true",
         help=(
             "Transfer only the snapshot just created, leaving any earlier "
-            "un-transferred ones behind (the pre-0.9.8 behaviour)"
+            "un-transferred ones behind (the behaviour before 0.9.7)"
         ),
     )
     run_parser.add_argument(

@@ -74,20 +74,36 @@ class LocalEndpoint(Endpoint):
             logger.error("Error verifying btrfs command: %s", e)
             raise __util__.AbortError(f"Failed to verify btrfs command: {e}")
 
-        # Create directories, if needed
-        dirs = []
-        if self.config["source"] is not None:
-            dirs.append(self.config["source"])
-        dirs.append(self.config["path"])
+        # A configured path is NOT created. It was created unconditionally, so a
+        # target on a removable or network filesystem that happened to be
+        # unmounted got its mount point built on the ROOT filesystem instead, and
+        # the backup was written there -- invisible under the mount once the real
+        # disk came back, and counting against the wrong filesystem's free space.
+        # require_mount only covers the case where the configured path IS the
+        # mount point, because that one always exists.
+        #
+        # Refusing also catches a typo: an explicit path is a statement that
+        # something is there, not a request to make it. Directories BELOW an
+        # existing configured path are still created; see snapshot_dir below.
+        source = self.config["source"]
+        if source is not None and not Path(source).is_dir():
+            logger.error("Configured source does not exist: %s", source)
+            raise __util__.AbortError(
+                f"Source {source} does not exist. btrfs-backup-ng does not create "
+                f"a configured source; check the path, or check that the "
+                f"filesystem holding it is mounted."
+            )
 
-        for d in dirs:
-            if not d.is_dir():
-                logger.info("Creating directory: %s", d)
-                try:
-                    d.mkdir(parents=True, exist_ok=True)
-                except OSError as e:
-                    logger.error("Error creating new location %s: %s", d, e)
-                    raise __util__.AbortError(f"Failed to create directory {d}: {e}")
+        destination = self.config["path"]
+        if not Path(destination).is_dir():
+            logger.error("Configured destination does not exist: %s", destination)
+            raise __util__.AbortError(
+                f"Destination {destination} does not exist. btrfs-backup-ng does "
+                f"not create a configured destination: if it lives on a removable "
+                f"or network filesystem, it is most likely not mounted. Check the "
+                f"path for a typo, mount the filesystem, or create the directory "
+                f"yourself to proceed."
+            )
 
         # Create snapshot directory if it exists in config
         if self.config.get("snapshot_dir") and isinstance(

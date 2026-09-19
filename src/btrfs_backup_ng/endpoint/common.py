@@ -410,25 +410,31 @@ class Endpoint:
         logger.debug("Receive endpoint type: %s", type(self).__name__)
         logger.debug("Is remote endpoint: %s", getattr(self, "_is_remote", False))
 
-        # Verify path exists or create it
-        try:
-            if isinstance(normalized_path, (str, Path)) and not getattr(
-                self, "_is_remote", False
-            ):
-                path_obj = (
-                    Path(normalized_path)
-                    if isinstance(normalized_path, str)
-                    else normalized_path
-                )
-                if not path_obj.exists():
-                    logger.warning(
-                        "Destination path doesn't exist, creating it: %s", path_obj
-                    )
-                    path_obj.mkdir(parents=True, exist_ok=True)
-        except Exception as e:
-            logger.warning(
-                "Error verifying or creating path %s: %s", normalized_path, e
+        # The destination is NOT created here. This ran immediately before the
+        # receive and rebuilt whatever _prepare had just refused, so declining to
+        # create a configured path there would have been undone here -- and the
+        # failure to create it was only warned about, leaving the receive to fail
+        # afterwards with something less specific.
+        #
+        # A missing destination at this point means the filesystem holding it is
+        # not mounted, so the stream would land on the root filesystem: hidden
+        # once the real disk returns, and charged to the wrong free space.
+        if isinstance(normalized_path, (str, Path)) and not getattr(
+            self, "_is_remote", False
+        ):
+            path_obj = (
+                Path(normalized_path)
+                if isinstance(normalized_path, str)
+                else normalized_path
             )
+            if not path_obj.is_dir():
+                logger.error("Destination path does not exist: %s", path_obj)
+                raise __util__.AbortError(
+                    f"Destination {path_obj} does not exist, so there is nowhere "
+                    f"to receive into. It is most likely on a filesystem that is "
+                    f"not mounted; btrfs-backup-ng does not create a configured "
+                    f"destination."
+                )
 
         cmd = self._build_receive_command(normalized_path)
         loglevel = logging.getLogger().getEffectiveLevel()
