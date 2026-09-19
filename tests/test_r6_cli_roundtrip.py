@@ -48,6 +48,8 @@ class TestRunThreadsEncryption:
         dest = tmp_path / "dest"
         dest.mkdir(exist_ok=True)
         target = TargetConfig(path=f"raw://{dest}", **target_kw)
+        # An absolute snapshot_dir must exist; the tool no longer creates one.
+        (tmp_path / "snaps").mkdir(parents=True, exist_ok=True)
         return VolumeConfig(
             path=str(src),
             snapshot_prefix="t-",

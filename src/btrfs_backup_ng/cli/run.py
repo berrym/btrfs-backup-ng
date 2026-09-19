@@ -45,6 +45,7 @@ from .common import (
     thread_raw_compression,
     thread_raw_encryption,
     thread_ssh_target_config,
+    resolve_snapshot_dir,
 )
 from .prune import (
     execute_retention_deletes,
@@ -506,15 +507,9 @@ def _backup_volume(
         source_path = Path(volume.path).resolve()
 
         # Set up snapshot directory
-        snapshot_dir = Path(volume.snapshot_dir)
-        if not snapshot_dir.is_absolute():
-            # Relative snapshot_dir: relative to source volume
-            # e.g., ".btrfs-backup-ng/snapshots" -> source/.btrfs-backup-ng/snapshots
-            full_snapshot_dir = (source_path / snapshot_dir).resolve()
-        else:
-            # Absolute snapshot_dir: use it directly, add source name as subdirectory
-            # e.g., "/snapshots" + source "myvolume" -> /snapshots/myvolume
-            full_snapshot_dir = (snapshot_dir / source_path.name).resolve()
+        # An absolute snapshot_dir must already exist; the per-source directory
+        # below it is still created. See resolve_snapshot_dir.
+        full_snapshot_dir = resolve_snapshot_dir(volume.snapshot_dir, source_path)
 
         full_snapshot_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
 

@@ -60,6 +60,9 @@ def _run(rig, targets, mounted=()):
     tmp_path, monkeypatch = rig
     wanted = {str(m) for m in mounted}
     monkeypatch.setattr(__util__, "is_mounted", lambda p: str(p) in wanted)
+    # An absolute snapshot_dir must exist; the tool no longer creates one, so a
+    # rig that names one has to make it, the same as a real operator would.
+    (tmp_path / "snaps").mkdir(parents=True, exist_ok=True)
     volume = VolumeConfig(
         path=str(tmp_path / "src"),
         snapshot_prefix="t-",

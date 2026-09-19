@@ -35,6 +35,12 @@ from btrfs_backup_ng.config.schema import (
 from btrfs_backup_ng.core.operations import TransferResult
 
 
+def _ensure_snaps(path):
+    """An absolute snapshot_dir must exist; the tool no longer creates one."""
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
 def _mounted(*paths):
     """Replace is_mounted with an exact-match stub over the given mount points."""
     wanted = {str(p) for p in paths}
@@ -91,7 +97,7 @@ def _run_backup(rig, target_path, require_mount, mounted):
     volume = VolumeConfig(
         path=str(rig["src"]),
         snapshot_prefix="t-",
-        snapshot_dir=str(rig["dest"].parent / "snaps"),
+        snapshot_dir=str(_ensure_snaps(rig["dest"].parent / "snaps")),
         targets=[TargetConfig(path=target_path, require_mount=require_mount)],
     )
     config = Config(global_config=GlobalConfig(), volumes=[volume])
@@ -272,7 +278,7 @@ class TestValidationIsWiredIntoTheLoader:
         cfg = tmp_path / "c.toml"
         cfg.write_text(
             "[global]\n"
-            f'snapshot_dir = "{tmp_path}/snaps"\n\n'
+            f'snapshot_dir = "{_ensure_snaps(tmp_path / "snaps")}"\n\n'
             "[[volumes]]\n"
             f'path = "{tmp_path}"\n\n'
             "[[volumes.targets]]\n"
@@ -421,7 +427,7 @@ class TestAMountPointIsRefusedForARemoteTarget:
         cfg = tmp_path / "c.toml"
         cfg.write_text(
             "[global]\n"
-            f'snapshot_dir = "{tmp_path}/snaps"\n\n'
+            f'snapshot_dir = "{_ensure_snaps(tmp_path / "snaps")}"\n\n'
             "[[volumes]]\n"
             f'path = "{tmp_path}"\n\n'
             "[[volumes.targets]]\n"
@@ -500,7 +506,7 @@ class TestAConfigThatCanNeverRunIsNamedAtLoad:
         cfg = tmp_path / "c.toml"
         cfg.write_text(
             "[global]\n"
-            f'snapshot_dir = "{tmp_path}/snaps"\n\n'
+            f'snapshot_dir = "{_ensure_snaps(tmp_path / "snaps")}"\n\n'
             "[[volumes]]\n"
             f'path = "{tmp_path}"\n\n'
             "[[volumes.targets]]\n"
