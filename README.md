@@ -3178,8 +3178,11 @@ ssh_sudo = true
 
 **Snapshot directory doesn't exist:**
 ```bash
-# btrfs-backup-ng creates it automatically, but ensure parent exists
-mkdir -p /path/to/.snapshots
+# A RELATIVE snapshot_dir (the ".snapshots" default) is created under the
+# source on first use. An ABSOLUTE one is not: it can name another filesystem,
+# and creating it silently would put snapshots on the root filesystem whenever
+# the intended disk is not mounted. Create the base yourself once:
+mkdir -p /path/to/snapshots
 ```
 
 **Transfer fails with compression:**
