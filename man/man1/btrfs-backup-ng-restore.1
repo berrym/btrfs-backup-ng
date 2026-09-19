@@ -50,6 +50,23 @@ Restore all snapshots from the backup location (full mirror).
 .TP
 .BR \-i ", " \-\-interactive
 Interactively select which snapshot to restore from a list.
+.TP
+.BI \-\-fs-checks " auto|strict|skip"
+Filesystem verification mode: 'auto' (warn and continue), 'strict' (error
+on failure), 'skip' (no checks). Default: auto.
+.TP
+.B \-\-skip-remote-lock
+Proceed even if a lock cannot be recorded on the remote target. Only safe
+when nothing else can prune this target during the run.
+.TP
+.B \-\-skip-verify
+Skip the pre-restore integrity check for raw backups (restore even if the
+stored stream's checksum no longer matches, and skip the extra read). Use
+for last-copy recovery of a partially-corrupt backup.
+.TP
+.BI \-\-timestamp-format " FMT"
+strftime format for parsing snapshot timestamps in direct mode (defaults
+to the config's [global] timestamp_format, else the built-in).
 .SS Transfer Options
 .TP
 .B \-\-dry-run

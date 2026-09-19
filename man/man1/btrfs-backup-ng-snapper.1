@@ -118,6 +118,26 @@ Show what would be backed up without making changes.
 .TP
 .BR \-v ", " \-\-verbose
 Enable verbose output.
+.TP
+.BI \-\-encrypt " METHOD"
+Encrypt the backup (raw:// / raw+ssh:// targets only).
+.TP
+.BI \-\-gpg-recipient " KEYID"
+GPG recipient key (required with --encrypt gpg).
+.TP
+.B \-\-no-progress
+Disable progress bars (default when not in terminal).
+.TP
+.B \-\-progress
+Show progress bars (default when running in terminal).
+.TP
+.B \-\-skip-remote-lock
+Proceed even if a lock cannot be recorded on the remote target. Only safe
+when nothing else can prune this target during the run.
+.TP
+.BI \-\-timestamp-format " FMT"
+strftime format for the timestamp in backup names (default:
+%Y%m%d-%H%M%S).
 .SS restore
 Restore Snapper snapshots from a backup location.
 .PP
@@ -193,6 +213,9 @@ a raw target can hold two backups with the same number; \fB\-\-snapshot \fINUM\f
 the newest by date and warns. To restore an older copy, use \fB\-\-backup-name \fINAME\fR
 (names are shown by \fB\-\-list\fR) or narrow \fB\-\-snapshot \fINUM\fR with
 \fB\-\-date \fIYYYY-MM-DD\fR.
+.TP
+.BI \-\-from-config " NAME"
+Only restore from this snapper config in backup.
 .SS status
 Show backup status for Snapper configurations.
 .PP

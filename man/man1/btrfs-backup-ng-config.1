@@ -127,6 +127,9 @@ btrfs-backup-ng config import /etc/btrbk/btrbk.conf
 btrfs-backup-ng config import /etc/btrbk/btrbk.conf -o config.toml
 .fi
 .RE
+.TP
+.B \-\-force
+Overwrite the output file if it already exists.
 .SS detect
 Scan the system for btrfs subvolumes and suggest backup configurations.
 This command helps discover what subvolumes exist on your system and

@@ -43,6 +43,19 @@ Show progress bars during transfers. Default when running in a terminal.
 .TP
 .B \-\-no-progress
 Disable progress bars. Default when not running in a terminal (e.g., cron).
+.TP
+.B \-\-force
+Proceed with transfers even if space check fails.
+.TP
+.B \-\-newest-only
+Transfer only the snapshot just created, leaving any earlier un-
+transferred ones behind (the behaviour before 0.9.7).
+.TP
+.B \-\-no-check-space
+Disable pre-flight space availability check.
+.TP
+.BI \-\-safety-margin " PERCENT"
+Safety margin percentage for space check (default: 10%).
 .SH EXAMPLES
 .TP
 Run all backup jobs:

@@ -42,6 +42,14 @@ target(s) configured for that volume.
 .TP
 .BI \-\-target " INDEX"
 Target index to estimate for (0-based). Default: first target (0).
+.TP
+.B \-\-skip-remote-lock
+Proceed even if a lock cannot be recorded on the remote target. Only safe
+when nothing else can prune this target during the run.
+.TP
+.BI \-\-timestamp-format " FMT"
+strftime format for parsing snapshot timestamps in direct mode (defaults
+to the config's [global] timestamp_format, else the built-in).
 .SS Filtering Options
 .TP
 .BI \-\-prefix " PREFIX"

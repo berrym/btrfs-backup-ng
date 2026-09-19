@@ -117,6 +117,14 @@ Output results in JSON format for scripting and automation.
 .TP
 .BR \-q ", " \-\-quiet
 Suppress progress output.
+.TP
+.B \-\-skip-remote-lock
+Proceed even if a lock cannot be recorded on the remote target. Only safe
+when nothing else can prune this target during the run.
+.TP
+.BI \-\-timestamp-format " FMT"
+strftime format for parsing snapshot timestamps in direct mode (defaults
+to the config's [global] timestamp_format, else the built-in).
 .SH VERIFICATION LEVELS
 .SS Metadata (Fast)
 Checks performed, per snapshot:
