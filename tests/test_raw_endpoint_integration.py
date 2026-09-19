@@ -571,7 +571,24 @@ Expire-Date: 0
         if result.returncode != 0:
             pytest.skip(f"Failed to generate GPG key: {result.stderr}")
 
-        return gpg_dir
+        try:
+            yield gpg_dir
+        finally:
+            # Generating a key starts gpg-agent and scdaemon against this home.
+            # This fixture used to `return`, so nothing ever stopped them: they
+            # outlived the run, kept holding a deleted tmp directory, and
+            # accumulated four per run until something swept them by hand.
+            # test_r6_raw_encryption.isolated_gpg already does this correctly.
+            # GNUPGHOME in the environment, NOT `gpgconf --homedir`: the flag
+            # form exits 0 and leaves the agent running, which is how this leak
+            # survived its first fix. Measured, not assumed.
+            import os
+
+            subprocess.run(
+                ["gpgconf", "--kill", "all"],
+                capture_output=True,
+                env={**os.environ, "GNUPGHOME": str(gpg_dir)},
+            )
 
     @pytest.mark.skipif(not tool_available("gpg"), reason="gpg not available")
     def test_gpg_roundtrip(self, tmp_path, gpg_home):
