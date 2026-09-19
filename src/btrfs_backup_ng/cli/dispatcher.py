@@ -413,6 +413,11 @@ def create_subcommand_parser() -> argparse.ArgumentParser:
         metavar="FILE",
         help="Output file (default: stdout)",
     )
+    init_parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Overwrite the output file if it already exists",
+    )
 
     import_parser = config_subs.add_parser(
         "import",
@@ -428,6 +433,11 @@ def create_subcommand_parser() -> argparse.ArgumentParser:
         "--output",
         metavar="FILE",
         help="Output file (default: stdout)",
+    )
+    import_parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Overwrite the output file if it already exists",
     )
 
     detect_parser = config_subs.add_parser(

@@ -275,8 +275,8 @@ btrfs-backup-ng install --user --timer=daily
 | `list` | Show snapshots and backups |
 | `status` | Show job status and statistics |
 | `config validate` | Validate configuration file |
-| `config init` | Generate example configuration (use `-i` for interactive wizard) |
-| `config import` | Import btrbk configuration |
+| `config init` | Generate example configuration (use `-i` for interactive wizard; `-o FILE` will not replace an existing file without `--force`) |
+| `config import` | Import btrbk configuration (`-o FILE` will not replace an existing file without `--force`) |
 | `config detect` | Detect btrfs subvolumes on the system (use `--wizard` for guided setup) |
 | `install` | Install systemd timer/service |
 | `uninstall` | Remove systemd timer/service |
@@ -908,6 +908,9 @@ btrfs-backup-ng config init
 
 # Save to file
 btrfs-backup-ng config init -o config.toml
+
+# -o refuses to replace a file that already exists. Pass --force to overwrite.
+btrfs-backup-ng config init -o config.toml --force
 ```
 
 #### Validate Configuration
@@ -931,7 +934,14 @@ btrfs-backup-ng config import /etc/btrbk/btrbk.conf
 
 # Convert and save to file
 btrfs-backup-ng config import /etc/btrbk/btrbk.conf -o config.toml
+
+# -o refuses to replace a file that already exists. Pass --force to overwrite.
+btrfs-backup-ng config import /etc/btrbk/btrbk.conf -o config.toml --force
 ```
+
+The conversion is checked before anything is written: if the generated
+configuration cannot be loaded back, it is printed to stdout and nothing is
+saved, rather than reporting a successful write of a file that does not work.
 
 See [Migrating from btrbk](#migrating-from-btrbk) for more details.
 

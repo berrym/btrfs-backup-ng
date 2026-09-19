@@ -138,6 +138,20 @@ def _prompt_int(
 _toml_str = toml_str
 
 
+def _output_would_clobber(output: str | None, *, force: bool) -> bool:
+    """Whether writing to ``output`` would destroy a file that is already there.
+
+    ``config import -o`` had no existence check of any kind, and ``config init
+    -o`` had one only when running interactively, so both silently replaced an
+    existing configuration -- including the one the operator is currently backing
+    up with. A configuration file is not a scratch artifact; it is the thing that
+    says which subvolumes matter and how long their history is kept.
+    """
+    if not output or force:
+        return False
+    return os.path.exists(output)
+
+
 def _unloadable_reason(content: str) -> str | None:
     """Return why ``content`` is not a configuration this tool can load back.
 
@@ -782,10 +796,17 @@ def _init_config(args: argparse.Namespace) -> int:
         content = generate_example_config()
 
     if output:
-        # Check if file exists
-        if os.path.exists(output) and interactive:
-            if not prompt_bool(f"\nFile {output} exists. Overwrite?", False):
-                console.print("[yellow]Aborted.[/yellow]")
+        if _output_would_clobber(output, force=getattr(args, "force", False)):
+            if interactive:
+                if not prompt_bool(f"\nFile {output} exists. Overwrite?", False):
+                    console.print("[yellow]Aborted.[/yellow]")
+                    return 1
+            else:
+                print(
+                    f"Error: {output} already exists. "
+                    "Re-run with --force to replace it.",
+                    file=sys.stderr,
+                )
                 return 1
 
         try:
@@ -872,6 +893,14 @@ def _import_config(args: argparse.Namespace) -> int:
         print("Error: btrbk configuration file path required")
         return 1
 
+    output = getattr(args, "output", None)
+    if _output_would_clobber(output, force=getattr(args, "force", False)):
+        print(
+            f"Error: {output} already exists. Re-run with --force to replace it.",
+            file=sys.stderr,
+        )
+        return 1
+
     try:
         toml_content, warnings = import_btrbk_config(btrbk_file)
     except FileNotFoundError as e:
@@ -904,7 +933,6 @@ def _import_config(args: argparse.Namespace) -> int:
         return 1
 
     # Output TOML
-    output = getattr(args, "output", None)
     if output:
         try:
             with open(output, "w") as f:
