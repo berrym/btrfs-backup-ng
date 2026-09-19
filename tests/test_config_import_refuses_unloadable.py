@@ -47,16 +47,6 @@ AWKWARD_VALUES = [
     "/mnt/\x7fdel",
 ]
 
-# A path containing a space is NOT in the conversion set below. Real btrbk
-# 0.32.7 accepts `volume /mnt/sp ace` and keeps the whole path (measured against
-# the installed binary: `btrbk config print` dumps `/mnt/sp ace` and exits 0),
-# but this project's btrbk LEXER splits the line on whitespace and keeps
-# `/mnt/sp`. That is a separate, unfixed defect in the lexer rather than in
-# emission, and it is the same silent-wrong-path class as the backslash bug
-# above. It is tracked separately; escaping it correctly, which is what the
-# round trip above proves, does not repair it.
-CONVERTIBLE_VALUES = [v for v in AWKWARD_VALUES if " " not in v]
-
 
 class TestTheEscaperIsLossless:
     @pytest.mark.parametrize("value", AWKWARD_VALUES)
@@ -71,7 +61,7 @@ class TestTheEscaperIsLossless:
 
 
 class TestConversionSurvivesAwkwardPaths:
-    @pytest.mark.parametrize("value", CONVERTIBLE_VALUES)
+    @pytest.mark.parametrize("value", AWKWARD_VALUES)
     def test_converted_config_loads_back_with_the_original_path(self, tmp_path, value):
         source = tmp_path / "btrbk.conf"
         source.write_text(f"volume {value}\n  subvolume home\n    target /backup\n")
