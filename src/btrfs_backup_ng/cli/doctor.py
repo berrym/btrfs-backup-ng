@@ -43,6 +43,9 @@ def execute_doctor(args: argparse.Namespace) -> int:
 
     # Try to load config (doctor will work even without valid config)
     config = None
+    # Bound before the try: a ConfigError leaves the assignment below unreached,
+    # and the Doctor call at the end of this function reads it either way.
+    config_warnings: list[str] = []
     if config_path:
         try:
             config, config_warnings = load_config(config_path)
@@ -77,7 +80,11 @@ def execute_doctor(args: argparse.Namespace) -> int:
         volume_filter = volume_filter_arg
 
     # Create doctor and run diagnostics
-    doctor = Doctor(config=config, config_path=config_path)
+    # config_warnings threaded: this function loads the config itself, so the
+    # Doctor skips its own load and would otherwise never see them.
+    doctor = Doctor(
+        config=config, config_path=config_path, config_warnings=config_warnings
+    )
 
     quiet = getattr(args, "quiet", False)
     json_output = getattr(args, "json", False)

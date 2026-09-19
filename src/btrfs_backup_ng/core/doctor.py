@@ -221,15 +221,22 @@ class Doctor:
         self,
         config: Any | None = None,
         config_path: Path | str | None = None,
+        config_warnings: list[str] | None = None,
     ):
         """Initialize the diagnostic engine.
 
         Args:
             config: Loaded configuration object (optional)
             config_path: Path to configuration file (optional)
+            config_warnings: Warnings the CALLER collected when IT loaded the
+                config. Required whenever ``config`` is supplied: the load in
+                ``_check_config_valid`` is skipped in that case, so warnings
+                gathered outside never became findings and the summary reported
+                none for a config the loader had complained about.
         """
         self.config = config
         self.config_path = Path(config_path) if config_path else None
+        self.config_warnings = list(config_warnings or [])
         self._checks: list[DiagnosticCheck] = []
         self._register_all_checks()
 
@@ -529,6 +536,21 @@ class Doctor:
         if not self.config_path or not self.config_path.exists():
             # Already reported by config_exists check
             return findings
+
+        # Warnings from a config the CALLER loaded. Emitted here so they are
+        # counted and displayed like any other finding. `doctor` is the command
+        # an operator runs precisely when something looks wrong, so a summary
+        # saying zero warnings for a config the loader complained about is the
+        # worst available answer.
+        for warning in self.config_warnings:
+            findings.append(
+                DiagnosticFinding(
+                    category=DiagnosticCategory.CONFIG,
+                    severity=DiagnosticSeverity.WARN,
+                    check_name="config_valid",
+                    message=f"Configuration warning: {warning}",
+                )
+            )
 
         if self.config is None:
             # Try to load config
