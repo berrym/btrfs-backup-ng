@@ -122,17 +122,14 @@ class TestSourceAndDestination:
 class TestSnapshotFolderIsDeliberatelyUnchanged:
     """The snapshot directory is the SOURCE side, and is not what #102 is about.
 
-    Note `local.py` reads `config["snapshot_dir"]` in `_prepare`, but nothing
-    ever puts that key in an endpoint config -- the endpoint layer uses
-    `snapshot_folder`, set by the base Endpoint. That block has never executed.
-    It is left exactly as found rather than quietly deleted or quietly fixed.
+    `local.py` used to read `config["snapshot_dir"]` in `_prepare`, but nothing
+    ever put that key in an endpoint config -- the endpoint layer uses
+    `snapshot_folder`. That block had never executed and is now deleted: left in
+    place it would have re-created an absolute path unconditionally the moment
+    anyone wired the key up, reintroducing the defect this file is about.
 
-    The live creation is `Endpoint.snapshot()`, which creates the snapshot
-    folder under the source on first use. That is wanted for the relative
-    default (`.snapshots`). Whether an ABSOLUTE snapshot_folder should instead
-    be required to exist -- it can name another filesystem, so it carries the
-    same unmounted-disk hazard -- is an open decision, not a defect fix, and is
-    pinned here so that changing it is deliberate.
+    The absolute case is handled where the path is actually computed, by
+    `cli.common.resolve_snapshot_dir`.
     """
 
     def test_a_relative_snapshot_folder_is_created_under_the_source(self, tmp_path):
@@ -143,13 +140,6 @@ class TestSnapshotFolderIsDeliberatelyUnchanged:
             with patch.object(type(endpoint), "_build_snapshot_cmd", create=True):
                 folder = Path(endpoint.config["snapshot_folder"])
         assert not folder.is_absolute()
-
-    def test_the_dead_snapshot_dir_key_is_still_absent_from_endpoint_config(
-        self, tmp_path
-    ):
-        """If this ever starts passing a value, local.py's block goes live."""
-        endpoint = _endpoint(tmp_path / "s", tmp_path / "d", snapshot_dir="whatever")
-        assert endpoint.config.get("snapshot_dir") is None
 
 
 class TestReceiveDoesNotRebuildWhatPrepareRefused:

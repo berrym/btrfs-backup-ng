@@ -84,7 +84,8 @@ class LocalEndpoint(Endpoint):
         #
         # Refusing also catches a typo: an explicit path is a statement that
         # something is there, not a request to make it. Directories BELOW an
-        # existing configured path are still created; see snapshot_dir below.
+        # existing configured path are still created (the .btrfs-backup-ng tree
+        # at the end of this method, and the snapshot folder under the source).
         source = self.config["source"]
         if source is not None and not Path(source).is_dir():
             logger.error("Configured source does not exist: %s", source)
@@ -104,25 +105,6 @@ class LocalEndpoint(Endpoint):
                 f"path for a typo, mount the filesystem, or create the directory "
                 f"yourself to proceed."
             )
-
-        # Create snapshot directory if it exists in config
-        if self.config.get("snapshot_dir") and isinstance(
-            self.config["snapshot_dir"], (str, Path)
-        ):
-            snapshot_dir = Path(self.config["snapshot_dir"])
-            if not snapshot_dir.is_absolute():
-                snapshot_dir = self.config["path"] / snapshot_dir
-
-            logger.debug("Ensuring snapshot directory exists: %s", snapshot_dir)
-            try:
-                snapshot_dir.mkdir(parents=True, exist_ok=True)
-            except OSError as e:
-                logger.error(
-                    "Error creating snapshot directory %s: %s", snapshot_dir, e
-                )
-                raise __util__.AbortError(
-                    f"Failed to create snapshot directory {snapshot_dir}: {e}"
-                )
 
         # Validate filesystem and subvolume checks
         # fs_checks can be: "strict" (error), "auto" (warn and continue), "skip" (no check)
