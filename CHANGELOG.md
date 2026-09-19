@@ -244,6 +244,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The shell completions and man pages had fallen behind the CLI** — 24 flags
+  had no entry in their man page and 89 flag/shell combinations were offered by
+  no completion at all, `--newest-only` among them: the flag restoring the
+  previous `run` behaviour was the hardest one to discover. The man pages ship
+  inside the wheel, so this reached users as authoritative documentation of a
+  tool that behaved differently.
+
+  The completions are now generated from the argument parser and a test
+  regenerates and compares them, so they cannot drift again. Value suggestions
+  come from the project's own tables — compression methods from the compression
+  table rather than a copied list that had already fallen out of step. Man pages
+  stay hand-written, because their prose says things an argparse help string
+  cannot, but a test now requires every flag to appear in its page.
+
+
 - **A `timestamp_format` containing `%z` broke retention and snapshot naming.**
   `strptime` returns an aware datetime for `%z` while every comparison in
   retention is against a naive `datetime.now()`, so pruning died with an
