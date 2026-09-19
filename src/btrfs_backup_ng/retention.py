@@ -158,6 +158,30 @@ class SnapshotInfo:
     keep_reason: str = ""
 
 
+def _naive_local(moment: datetime) -> datetime:
+    """Return ``moment`` as a naive local datetime.
+
+    A ``timestamp_format`` containing ``%z`` makes ``strptime`` return an AWARE
+    datetime, and every comparison in this module is against a naive
+    ``datetime.now()`` -- so retention died with an uncaught
+    ``TypeError: can't compare offset-naive and offset-aware datetimes`` the
+    moment it met one. Not a btrbk concern: it is our own parser handing our own
+    comparisons a value they cannot use, for a documented config option.
+
+    Reachable from a shipped feature. ``config import`` maps btrbk's
+    ``long-iso`` to ``%Y%m%dT%H%M%S%z`` and writes it verbatim, so importing
+    such a config produced one whose prune could never run -- the failure
+    landing in a destructive path, long after the import that caused it.
+
+    Converted rather than merely stripped: ``astimezone()`` moves the instant to
+    local time first, so two snapshots written in different zones still order
+    against each other correctly.
+    """
+    if moment.tzinfo is None:
+        return moment
+    return moment.astimezone().replace(tzinfo=None)
+
+
 def extract_timestamp(
     snapshot_name: str, prefix: str = "", preferred_fmt: str | None = None
 ) -> datetime | None:
@@ -193,7 +217,7 @@ def extract_timestamp(
 
     for fmt in formats:
         try:
-            return datetime.strptime(name, fmt)
+            return _naive_local(datetime.strptime(name, fmt))
         except ValueError:
             continue
 
@@ -212,7 +236,12 @@ def extract_timestamp(
                 # Reconstruct with separator if needed
                 if "-" in fmt or "_" in fmt:
                     timestamp_str = match.group(0)
-                return datetime.strptime(timestamp_str, fmt)
+                # Defensive, and known to be so: the patterns above carry no
+                # %z, so this site cannot currently produce an aware datetime
+                # (removing the call breaks no test, checked). It matches the
+                # format-loop site so the two cannot drift if a pattern with an
+                # offset is ever added.
+                return _naive_local(datetime.strptime(timestamp_str, fmt))
             except ValueError:
                 continue
 
