@@ -47,15 +47,25 @@ class TestTheConfigLayerStillHonoursIt:
         assert VolumeConfig(path="/home", snapshot_prefix="").snapshot_prefix == ""
 
     def test_a_bare_timestamp_name_results(self):
+        """An empty prefix must leave the timestamp standing alone.
+
+        This pinned the literal "20231114-171320", which is that instant
+        rendered in US Eastern time. It passed here and failed in CI, which
+        runs UTC, because `Snapshot` formats LOCAL time -- so the digits
+        depend on the machine. The claim worth making is that nothing is
+        prepended, not what the clock says.
+        """
         import time
         from pathlib import Path
 
         from btrfs_backup_ng import __util__
 
-        snap = __util__.Snapshot(
-            Path("/x"), "", None, time_obj=time.localtime(1700000000)
-        )
-        assert snap.get_name() == "20231114-171320"
+        moment = time.localtime(1700000000)
+        snap = __util__.Snapshot(Path("/x"), "", None, time_obj=moment)
+        name = snap.get_name()
+
+        assert name == time.strftime(__util__.DATE_FORMAT, moment)
+        assert name[0].isdigit(), f"{name!r} is not a bare timestamp"
 
 
 class TestInferenceRespectsAnExplicitEmptyPrefix:
