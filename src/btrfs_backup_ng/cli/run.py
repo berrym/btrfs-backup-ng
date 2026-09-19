@@ -245,6 +245,9 @@ def _run_configured_backups(args: argparse.Namespace, config: Config) -> int:
     # Space-check flags (--no-check-space/--force/--safety-margin); threaded into the
     # transfer options so they actually take effect (see space_options_from_args).
     space_options = space_options_from_args(args)
+    # Default is to catch up: send whatever each destination is missing, not
+    # only the snapshot just taken (issue #104).
+    newest_only = bool(getattr(args, "newest_only", False))
 
     # Determine if progress should be shown
     show_progress = should_show_progress(args)
@@ -283,6 +286,7 @@ def _run_configured_backups(args: argparse.Namespace, config: Config) -> int:
                     rate_limit_override,
                     show_progress,
                     space_options,
+                    newest_only,
                 ): volume
                 for volume in enabled_volumes
             }
@@ -316,6 +320,7 @@ def _run_configured_backups(args: argparse.Namespace, config: Config) -> int:
                     rate_limit_override,
                     show_progress,
                     space_options,
+                    newest_only,
                 )
                 results.append((volume.path, success))
                 transfer_stats["completed"] += vol_stats.get("completed", 0)
@@ -446,6 +451,7 @@ def _backup_volume(
     rate_limit_override: str | None = None,
     show_progress: bool = False,
     space_options: dict[str, Any] | None = None,
+    newest_only: bool = False,
 ) -> tuple[bool, dict[str, int], list[str]]:
     """Execute backup for a single volume.
 
@@ -636,6 +642,7 @@ def _backup_volume(
                     show_progress,
                     space_options,
                     config.global_config.transfer_timeout,
+                    newest_only,
                 ): (dest_endpoint, target_config)
                 for dest_endpoint, target_config in destination_endpoints
             }
@@ -670,6 +677,7 @@ def _backup_volume(
                     show_progress,
                     space_options,
                     config.global_config.transfer_timeout,
+                    newest_only,
                 )
                 if outcome is not None:
                     stats["completed"] += 1
@@ -1060,8 +1068,9 @@ def _transfer_to_target(
     show_progress: bool = False,
     space_options: dict[str, Any] | None = None,
     transfer_timeout: int = DEFAULT_TRANSFER_TIMEOUT,
+    newest_only: bool = False,
 ) -> TransferResult | None:
-    """Transfer snapshot to a single target.
+    """Transfer to a single target, catching up whatever it is missing.
 
     Args:
         source_endpoint: Source endpoint
@@ -1096,7 +1105,15 @@ def _transfer_to_target(
             destination_endpoint,
             keep_num_backups=0,
             no_incremental=not incremental,
-            snapshot=snapshot,
+            # None lets the planner consider every source snapshot and send
+            # whatever THIS destination is missing. Passing the snapshot just
+            # created pinned the plan to that one, so a target that missed a run
+            # -- drive unplugged, host down, a transfer that failed -- stayed
+            # behind for ever, because every later run offered it only the
+            # newest. `transfer` has always caught up and snapper sources have
+            # always caught up, so `run` disagreed with the rest of the tool and
+            # with itself. Issue #104; newest-only is kept behind a flag.
+            snapshot=snapshot if newest_only else None,
             options=transfer_options,
         )
     except __util__.AbortError as e:

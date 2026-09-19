@@ -219,6 +219,14 @@ def create_subcommand_parser() -> argparse.ArgumentParser:
         help="Bandwidth limit (e.g., '10M', '1G') (overrides config)",
     )
     run_parser.add_argument(
+        "--newest-only",
+        action="store_true",
+        help=(
+            "Transfer only the snapshot just created, leaving any earlier "
+            "un-transferred ones behind (the pre-0.9.8 behaviour)"
+        ),
+    )
+    run_parser.add_argument(
         "--no-check-space",
         action="store_true",
         help="Disable pre-flight space availability check",
