@@ -97,6 +97,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **A configured path is no longer created for you.** A target on an external
+  disk may or may not be present depending on whether that disk is mounted, and
+  the path was created unconditionally — so with the disk absent the mount-point
+  tree was built on the ROOT filesystem and the backup written there, invisible
+  once the real disk came back and charged against the wrong filesystem's free
+  space. `require_mount` does not cover this: it only works where the configured
+  path IS the mount point, because that one always exists, and it is off by
+  default. Local and `raw://` targets, and a source, must now exist; the failure
+  names the likely cause. Directories BELOW an existing configured path are
+  still created, so nothing changes for a configuration whose paths are there
+  ([#102](https://github.com/berrym/btrfs-backup-ng/pull/102)).
+
+- **An absolute `snapshot_dir` must exist before snapshots are written into it.**
+  The absolute form is how snapshots are moved off the root filesystem onto a
+  bigger disk. It was created with its parents, so an unmounted disk put the
+  directory on root — and the snapshots then SUCCEEDED there, because a btrfs
+  snapshot only needs to share a filesystem with its source, which on a btrfs
+  root it does. The snapshots an operator moved away from root were silently
+  put back, with every command reporting success. The per-source directory below
+  the configured base is still created, and a relative `snapshot_dir` is
+  unaffected.
+
+- **`raw list`, `raw verify` and `raw backfill-metadata` now fail on a target
+  they cannot read.** A missing target produced a warning on stderr and then
+  "0 snapshots" with exit 0. A warning beside a zero exit is still a clean empty
+  report to a timer unit or a script reading the status.
+
+- **`config import -o` and `config init -o` refuse to replace an existing file.**
+  `config import` had no existence check at all, and `config init` had one only
+  when running interactively, so any non-interactive invocation silently
+  replaced the file. What is replaced is the statement of which subvolumes
+  matter and how long their history is kept. Pass `--force` to overwrite; the
+  interactive prompt is unchanged.
+
+- **A retention `min` that cannot be used is rejected when the config loads.**
+  Values like `3000y`, `999999999d` and `100000000w` were accepted by the loader
+  and then failed inside the prune path, reporting an internal-sounding
+  "year -974 is out of range". The boundary check tested a different function
+  from the one the engine runs; it now validates through the engine's own, and
+  names the value.
+
+- **`doctor` exits 1 when the configuration it loaded produced warnings.** The
+  warnings were collected, logged, and then dropped, so an empty configuration
+  reported "4 passed, 0 warnings" and exit 0 — for a file the loader had
+  described as having no volumes at all.
 - **`run` now transfers what a destination is MISSING, not only the snapshot it
   just created.** A target that missed a run — a drive that was unplugged, a
   host that was down, a transfer that failed — stayed behind for ever, because
@@ -199,6 +244,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A `timestamp_format` containing `%z` broke retention and snapshot naming.**
+  `strptime` returns an aware datetime for `%z` while every comparison in
+  retention is against a naive `datetime.now()`, so pruning died with an
+  uncaught `TypeError` — in a destructive path, on a documented option that
+  `config import` emits for btrbk's `long-iso`. Separately, a snapshot's name
+  was rendered through a round trip that dropped the UTC offset, so the tool
+  could not parse the names it had just written.
+
+- **An ssh host reached a shell and ssh's own option parser unchecked.** A
+  hostname is now validated where each endpoint stores it, and quoted at the
+  one site that builds a shell string. A host beginning with `-` is read by ssh
+  as an option, `-oProxyCommand=` among them, no matter how it is quoted.
+
+- **`restore` ignored `-c`.** It resolved `timestamp_format` by searching the
+  default locations rather than the configuration it was given, so a pool under
+  a custom format was reported as empty with advice naming the wrong prefix.
+
+- **`config import` wrote configurations it could not read back.** Values were
+  interpolated straight into TOML, so a path containing a quote produced an
+  unparseable file, and — worse — a path containing a backslash produced a
+  valid one that loaded as a DIFFERENT directory: `/mnt/a\backup` became
+  `/mnt/a\x08ackup`, because TOML reads `\b` as a backspace. Both write paths
+  now verify the result loads before saving, and print the conversion instead
+  of reporting a successful write of a file that does not work.
+
+- **A btrbk path containing a space was truncated at the space.** btrbk reads a
+  directive's value as the rest of the line, verbatim; this importer took only
+  the first token, so `volume /mnt/sp ace` converted to `/mnt/sp` — a
+  configuration naming a directory the operator never wrote. Internal spacing,
+  tabs, surrounding quotes and mid-line comments now match btrbk 0.32.7 exactly.
 - `raw+ssh://` asked the **local** filesystem about a **remote** target:
   `preflight_send` checked for the stream locally, so a restore from a raw+ssh
   backup failed every time — or, where both hosts use the same path, passed
