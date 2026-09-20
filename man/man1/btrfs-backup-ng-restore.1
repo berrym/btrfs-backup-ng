@@ -31,7 +31,10 @@ Backup location to restore from. Can be a local path (e.g., /mnt/backup/home)
 or an SSH URL (e.g., ssh://user@host:/path/to/backup).
 .TP
 .I DESTINATION
-Local path to restore snapshots to. Must be on a btrfs filesystem.
+Local path to restore snapshots to. Must be on a btrfs filesystem. Created if
+it does not exist: it is an output location, the place this command was asked
+to put something new, unlike a backup location, which must exist (see
+\fBPATHS\fR in \fBbtrfs-backup-ng\fR(1)).
 .SH OPTIONS
 .SS Listing and Selection
 .TP

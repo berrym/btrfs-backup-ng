@@ -8,6 +8,10 @@ btrfs-backup-ng-snapshot \- create snapshots only
 .SH DESCRIPTION
 Create snapshots of configured volumes without transferring to targets.
 Useful for frequent local snapshots between less frequent remote backups.
+.PP
+The volume and an absolute \fBsnapshot_dir\fR must exist and are not created;
+a relative \fBsnapshot_dir\fR is created under the volume on first use. See
+\fBPATHS\fR in \fBbtrfs-backup-ng\fR(1).
 .SH OPTIONS
 .TP
 .B \-\-dry-run
