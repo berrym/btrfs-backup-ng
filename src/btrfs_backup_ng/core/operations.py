@@ -943,49 +943,47 @@ def _verify_destination_space(snapshot, destination_endpoint, parent, options) -
 
 
 def _ensure_destination_exists(destination_endpoint) -> None:
-    """Ensure destination path exists, creating it if necessary."""
-    try:
-        if (
-            hasattr(destination_endpoint, "_is_remote")
-            and destination_endpoint._is_remote
-        ):
-            if hasattr(destination_endpoint, "_exec_remote_command"):
-                path = destination_endpoint._normalize_path(
-                    destination_endpoint.config["path"]
+    """Verify the destination path exists -- NEVER create it.
+
+    This was the SIXTH creation site of the class 34904c6 closed, and the one
+    every audit missed: it lives in the transfer engine, not the endpoint
+    layer, and its name reads like a check while its body ran a remote
+    ``mkdir -p`` (locally, ``Path.mkdir``). It also explains why the local
+    sites appeared to need fixing repeatedly -- whatever the endpoint's
+    prepare() refused to create, this function rebuilt at send time, behind a
+    catch-all that logged "will try transfer anyway".
+
+    Remote endpoints that carry their own refusal check are asked through it,
+    so there is exactly one message and one probe (ssh's unelevated
+    ``test -d``, with its rc-1-only missing verdict). raw+ssh has no check
+    here by design: its _prepare already refused a missing target before the
+    engine can run. The local arm refuses in the same words prepare() uses --
+    it exists for the mid-run vanish, where prepare() passed long ago.
+    """
+    if getattr(destination_endpoint, "_is_remote", False):
+        if hasattr(destination_endpoint, "_require_remote_destination"):
+            if not destination_endpoint._require_remote_destination(
+                destination_endpoint.config["path"]
+            ):
+                raise __util__.SnapshotTransferError(
+                    getattr(destination_endpoint, "_last_transfer_error", None)
+                    or "The remote destination could not be verified."
                 )
-                logger.debug("Ensuring remote destination path exists: %s", path)
-                cmd = ["test", "-d", path]
-                result = destination_endpoint._exec_remote_command(cmd, check=False)
-                if result.returncode != 0:
-                    logger.warning(
-                        "Destination path doesn't exist, creating it: %s", path
-                    )
-                    mkdir_cmd = ["mkdir", "-p", path]
-                    mkdir_result = destination_endpoint._exec_remote_command(
-                        mkdir_cmd, check=False
-                    )
-                    if mkdir_result.returncode != 0:
-                        stderr = mkdir_result.stderr.decode("utf-8", errors="replace")
-                        logger.error(
-                            "Failed to create destination directory: %s", stderr
-                        )
-                        raise __util__.SnapshotTransferError(
-                            f"Cannot create destination directory: {stderr}"
-                        )
-        else:
-            path = destination_endpoint.config.get("path")
-            if path:
-                path_obj = Path(path)
-                if not path_obj.exists():
-                    logger.warning(
-                        "Local destination path doesn't exist, creating it: %s", path
-                    )
-                    path_obj.mkdir(parents=True, exist_ok=True)
-    except __util__.SnapshotTransferError:
-        raise
-    except Exception as e:
-        logger.warning(
-            "Error during destination verification (will try transfer anyway): %s", e
+        return
+    path = destination_endpoint.config.get("path")
+    if not path:
+        return
+    path_obj = Path(path)
+    if not path_obj.is_dir():
+        detail = (
+            " (the path exists but is not a directory)" if path_obj.exists() else ""
+        )
+        raise __util__.SnapshotTransferError(
+            f"Destination {path} does not exist{detail}. btrfs-backup-ng "
+            "does not create a configured destination: if it lives on a "
+            "removable or network filesystem, it is most likely not mounted. "
+            "Mount it, check the path for a typo, or create the directory "
+            "yourself. Nothing was created."
         )
 
 
@@ -2354,7 +2352,9 @@ def send_snapper_snapshot(
                 destination_endpoint.config["path"] = saved_path
 
         # Metadata sidecar (endpoint-aware; carries original_xml for restore).
-        _write_snapper_metadata(snapper_snapshot, destination_endpoint)
+        _write_snapper_metadata(
+            snapper_snapshot, destination_endpoint, source_wrapper.get_name()
+        )
 
         duration = time.monotonic() - transfer_start
         log_transaction(
@@ -2429,27 +2429,24 @@ def _create_snapper_snapshot_wrapper(snapper_snapshot, destination_endpoint=None
     )
 
     # Create wrapper - use the snapper subvolume path as the location's parent
-    # and the backup name as the effective name
+    # and the backup name as the snapshot's native (remembered) name, so every
+    # consumer -- transfer, metadata, correspondence keys -- sees the one
+    # string rendered here rather than re-deriving it.
     wrapper = __util__.Snapshot(
         location=snapper_snapshot.subvolume_path.parent,
         prefix="",  # No prefix - we use the full backup name
         endpoint=source_endpoint,
         time_obj=time_obj,
+        name=backup_name,
     )
 
-    # Override get_name and get_path to return snapper-specific values
-    # Use setattr to avoid type checker complaints about dynamic attributes
-    setattr(wrapper, "_snapper_name", backup_name)
+    # Only get_path needs an override: the snapper subvolume does not live at
+    # location/name. Use setattr to avoid type checker complaints.
     setattr(wrapper, "_snapper_path", snapper_snapshot.subvolume_path)
-
-    # Monkey-patch methods to return correct values
-    def get_name_override():
-        return getattr(wrapper, "_snapper_name")
 
     def get_path_override():
         return getattr(wrapper, "_snapper_path")
 
-    wrapper.get_name = get_name_override
     wrapper.get_path = get_path_override
 
     # Enrich the wrapper's btrfs uuid / received_uuid (sudo-escalated `subvolume show` via the
@@ -2462,12 +2459,19 @@ def _create_snapper_snapshot_wrapper(snapper_snapshot, destination_endpoint=None
     return wrapper
 
 
-def _write_snapper_metadata(snapper_snapshot, destination_endpoint) -> None:
+def _write_snapper_metadata(
+    snapper_snapshot, destination_endpoint, backup_name: str
+) -> None:
     """Write snapper metadata file to destination.
 
     Args:
         snapper_snapshot: SnapperSnapshot object
         destination_endpoint: Destination endpoint
+        backup_name: The name the backup was actually written under -- the ONE
+            string rendered when the transfer wrapper was built. Re-rendering
+            it here from the destination's timestamp_format named the sidecar
+            after a format that may since have changed, splitting the metadata
+            from its stream.
     """
     from ..snapper.metadata import BackupMetadata, save_backup_metadata
 
@@ -2485,10 +2489,7 @@ def _write_snapper_metadata(snapper_snapshot, destination_endpoint) -> None:
         original_xml=original_xml,
     )
 
-    # Determine metadata file path at destination
-    backup_name = snapper_snapshot.get_backup_name(
-        destination_endpoint.config.get("timestamp_format")
-    )
+    # Metadata file path at destination, from the name the backup actually used
     dest_path = Path(destination_endpoint.config["path"])
     meta_file = dest_path / f"{backup_name}.snapper-meta.json"
 

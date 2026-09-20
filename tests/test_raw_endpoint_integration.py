@@ -995,7 +995,15 @@ class TestSSHRawEndpointIntegration:
             }
         )
 
-        # This should create the directory via SSH
+        # Prepare refuses a missing target (the 34904c6 rule, extended to
+        # remote) and succeeds once the operator has created it.
+        from btrfs_backup_ng import __util__
+
+        with pytest.raises(__util__.AbortError, match="does not exist"):
+            endpoint._prepare()
+        assert not remote_path.exists(), "prepare created the target"
+
+        remote_path.mkdir()
         endpoint._prepare()
 
         # Verify directory was created

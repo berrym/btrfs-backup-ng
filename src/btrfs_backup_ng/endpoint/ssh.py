@@ -2612,9 +2612,14 @@ print(json.dumps(result))
             # Parse, then keep only what is really AT this destination. The list
             # command is filesystem-wide, so the second step is what stops a
             # never-transferred source snapshot being reported as a backup.
-            return self._scope_to_destination(
+            scoped = self._scope_to_destination(
                 self._parse_snapshot_list(output, path), path
             )
+            # Announce AFTER scoping: an entry scoping rejected is not at this
+            # destination, and announcing it here would report a snapshot the
+            # listing does not return.
+            self._report_newly_visible(scoped)
+            return scoped
         except RuntimeError:
             raise
         except Exception as e:
@@ -2693,23 +2698,23 @@ print(json.dumps(result))
         snapshots: List[Any] = []
         for snap_name, (_score, line, _snap_path) in best.items():
             date_part = snap_name[len(snap_prefix) :]
-            try:
-                time_obj, matched_fmt = __util__.parse_snapshot_time(
-                    date_part, self.config.get("timestamp_format")
-                )
-            except Exception as e:
-                # Debug level - it's normal for a directory to hold items that do
-                # not match the snapshot naming pattern.
-                logger.debug("Skipping non-snapshot item: %r (%s)", snap_name, e)
-                continue
+            # Every candidate here came off a `btrfs subvolume list` line, so
+            # each one IS a subvolume -- the "is this a snapshot at all"
+            # question the local listing answers with is_subvolume() is
+            # already answered. A name that yields no timestamp is therefore a
+            # snapshot with no extractable time, listed rather than skipped.
+            time_obj, parsed_as_written = __util__.derive_snapshot_time(
+                date_part, self.config.get("timestamp_format")
+            )
 
             snapshot = __util__.Snapshot(
                 self.config["path"],
                 snap_prefix,
                 self,
                 time_obj=time_obj,
-                time_format=matched_fmt,
+                name=snap_name,
             )
+            snapshot.newly_visible = not parsed_as_written
             # Identity comes from the chosen line, which is the destination's own
             # copy -- never a same-named subvolume elsewhere on the filesystem.
             line_ids = __util__.parse_subvolume_list(line)
@@ -4202,6 +4207,61 @@ print(json.dumps(result))
         dest = str(self._normalize_path(self.config["path"])).rstrip("/")
         return f"{dest}/{Path(str(source_path)).name}"
 
+    def _require_remote_destination(self, dest_path) -> bool:
+        """Refuse -- never create -- a missing remote destination.
+
+        Returns True when the destination directory exists on the remote.
+        On refusal, ``_last_transfer_error`` carries the diagnosis INCLUDING
+        the remedy, because a refusal that does not name the fix merely
+        relocates the confusion. The probe is a plain, unelevated ``test -d``
+        on purpose: the documented sudoers policy for ssh:// scopes NOPASSWD
+        to /usr/bin/btrfs alone, so elevating a file utility here would fail
+        against exactly the policy the README recommends -- hence the message
+        says "does not exist (or cannot be read)" rather than claiming more
+        than the probe can know.
+        """
+        normalized_path = self._normalize_path(dest_path)
+        self._last_transfer_error: Optional[str]
+        try:
+            result = self._exec_remote_command(
+                ["test", "-d", normalized_path], check=False
+            )
+        except Exception as e:  # noqa: BLE001 - a probe failure must not raise here
+            self._last_transfer_error = (
+                f"Could not check the remote destination {normalized_path}: {e}"
+            )
+            logger.error("%s", self._last_transfer_error)
+            return False
+        if result.returncode != 0 and result.returncode != 1:
+            # `test -d` answers with 1; any other code (255 = the ssh
+            # transport) is not a verdict about the directory. Refuse, but
+            # with the failure's own identity.
+            stderr = (
+                result.stderr.decode("utf-8", errors="replace")
+                if getattr(result, "stderr", None)
+                else ""
+            )
+            self._last_transfer_error = (
+                f"Could not check the remote destination {normalized_path}: "
+                f"the probe exited {result.returncode}. {stderr}".strip()
+            )
+            logger.error("%s", self._last_transfer_error)
+            return False
+        if result.returncode != 0:
+            user = self.config.get("username")
+            host = f"{user}@{self.hostname}" if user else str(self.hostname)
+            self._last_transfer_error = (
+                f"Destination {normalized_path} does not exist on {host} (or "
+                "cannot be read by that user). btrfs-backup-ng does not create "
+                "a configured destination: if it lives on a removable or "
+                "network filesystem, it is most likely not mounted. Mount it, "
+                "check the path for a typo, or create it yourself: "
+                f"ssh {host} 'mkdir -p {normalized_path}'. Nothing was created."
+            )
+            logger.error("%s", self._last_transfer_error)
+            return False
+        return True
+
     def send_receive(
         self,
         snapshot: "__util__.Snapshot",
@@ -4234,7 +4294,7 @@ print(json.dumps(result))
         # receive stderr here so _do_direct_pipe_transfer can surface the actionable
         # cause in the raised error (not just a separate ERROR log line). Reset once
         # up front; across retries it holds the LAST attempt's cause.
-        self._last_transfer_error: Optional[str] = None
+        self._last_transfer_error = None
 
         # Get snapshot details
         snapshot_path = str(snapshot.get_path())
@@ -4251,35 +4311,13 @@ print(json.dumps(result))
             parent_path = str(parent.get_path())
             logger.debug("Parent snapshot path: %s", parent_path)
 
-        # Verify destination path exists and create if needed
-        try:
-            if hasattr(self, "_exec_remote_command"):
-                normalized_path = self._normalize_path(dest_path)
-                logger.debug(
-                    "Ensuring remote destination path exists: %s", normalized_path
-                )
-
-                cmd = ["test", "-d", normalized_path]
-                result = self._exec_remote_command(cmd, check=False)
-                if result.returncode != 0:
-                    logger.warning(
-                        "Destination path doesn't exist, creating it: %s",
-                        normalized_path,
-                    )
-                    mkdir_cmd = ["mkdir", "-p", normalized_path]
-                    mkdir_result = self._exec_remote_command(mkdir_cmd, check=False)
-                    if mkdir_result.returncode != 0:
-                        stderr = (
-                            mkdir_result.stderr.decode("utf-8", errors="replace")
-                            if mkdir_result.stderr
-                            else ""
-                        )
-                        logger.error(
-                            "Failed to create destination directory: %s", stderr
-                        )
-                        return False
-        except Exception as e:
-            logger.error("Error verifying/creating destination: %s", e)
+        # The destination is NOT created here (34904c6, extended to remote):
+        # an unmounted remote NFS share or secondary mount would take the
+        # backup onto the remote ROOT filesystem, exactly the local failure
+        # that rule closed. This block used to run `mkdir -p` on the remote,
+        # so a fresh or vanished destination was silently invented at the
+        # moment of the first transfer. It now refuses, naming the remedy.
+        if not self._require_remote_destination(dest_path):
             return False
 
         # Run diagnostics to ensure everything is ready.

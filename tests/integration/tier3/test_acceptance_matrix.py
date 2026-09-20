@@ -477,6 +477,116 @@ echo "DELIVERED:$(cat /tmp/received.bin 2>/dev/null || echo NOTHING)"
 # --------------------------------------------------------------------------- #
 # restore honesty -- independent of any one target
 # --------------------------------------------------------------------------- #
+class TestAMissingLocationIsNeverEmpty:
+    """A backup location that cannot be enumerated must never read as empty.
+
+    "No snapshots found" from an unmounted drive is how an operator concludes
+    their backups are gone -- at the disaster-recovery moment. Locally the
+    refusal is layered (prepare() first, then the listing primitive itself);
+    remotely the ssh listing carries the same contract. Both must also create
+    NOTHING: a read that builds the mount point on the root filesystem turns
+    the next backup into full re-sends landing on the wrong filesystem.
+    """
+
+    def test_a_missing_local_location_refuses_and_creates_nothing(self, rig):
+        missing = rig.root / "never-mounted" / "backups"
+        assert not missing.exists()
+
+        r = rig.cli("restore", "--list", str(missing))
+
+        assert r.returncode != 0, (
+            f"restore --list exited {r.returncode} for a location that does "
+            f"not exist; output: {(r.stdout + r.stderr)[-500:]}"
+        )
+        assert not (rig.root / "never-mounted").exists(), (
+            "a READ created the missing location"
+        )
+
+    @requires_remote
+    def test_a_missing_remote_location_refuses_and_creates_nothing(self, rig):
+        from .conftest import REMOTE_SPEC, remote_sh
+
+        remote_missing = f"{rig.remote_base}/never-mounted/backups"
+        loc = f"ssh://{REMOTE_SPEC}:{remote_missing}"
+
+        r = rig.cli("restore", "--list", loc, "--ssh-sudo")
+
+        assert r.returncode != 0, (
+            f"restore --list exited {r.returncode} for a remote location that "
+            f"does not exist; output: {(r.stdout + r.stderr)[-500:]}"
+        )
+        probe = remote_sh(
+            f"test -d {rig.remote_base}/never-mounted && echo CREATED || echo ABSENT"
+        )
+        assert "ABSENT" in probe.stdout, (
+            "a READ created the missing location on the remote"
+        )
+
+
+class TestARemoteDestinationIsNeverCreated:
+    """The 34904c6 rule, extended to remote: a transfer pointed at a missing
+    remote destination refuses -- naming the remedy -- and creates NOTHING on
+    the far side. Before this, ssh:// send_receive ran a remote `mkdir -p` at
+    the moment of first transfer, and raw+ssh's prepare created its target,
+    so an unmounted remote share took the backup onto the remote ROOT
+    filesystem.
+    """
+
+    @requires_remote
+    def test_ssh_transfer_to_a_missing_destination_refuses(self, rig):
+        from .conftest import REMOTE_SPEC, remote_sh
+
+        missing = f"{rig.remote_base}/never-created/btrfs"
+        loc = f"ssh://{REMOTE_SPEC}:{missing}"
+        cfg = rig.write_config(
+            rig.root / "cfg-missing-ssh.toml",
+            f'path = "{loc}"\nssh_sudo = true',
+            prefix="t3miss-",
+        )
+
+        r = rig.cli("run", config=cfg)
+
+        assert r.returncode != 0, (
+            f"run exited {r.returncode} against a destination that does not "
+            f"exist; output: {(r.stdout + r.stderr)[-800:]}"
+        )
+        probe = remote_sh(
+            f"test -d {rig.remote_base}/never-created && echo CREATED || echo ABSENT"
+        )
+        assert "ABSENT" in probe.stdout, (
+            "the transfer created the missing remote destination"
+        )
+
+    @requires_raw_remote
+    def test_rawssh_prepare_of_a_missing_target_refuses(self, rig):
+        from .conftest import RAW_REMOTE_SPEC, raw_remote_sh
+
+        missing = f"{rig.raw_remote_base}/never-created/raw"
+        loc = f"raw+ssh://{RAW_REMOTE_SPEC}:{missing}"
+        cfg = rig.write_config(
+            rig.root / "cfg-missing-rawssh.toml", f'path = "{loc}"', prefix="t3rmiss-"
+        )
+
+        r = rig.cli("run", config=cfg)
+
+        assert r.returncode != 0, (
+            f"run exited {r.returncode} against a raw target that does not "
+            f"exist; output: {(r.stdout + r.stderr)[-800:]}"
+        )
+        # Rich wraps console output at terminal width, so a phrase can be
+        # split across lines; normalise whitespace before asserting.
+        out = " ".join((r.stdout + r.stderr).split())
+        assert "does not exist" in out, (
+            f"the refusal does not say what is wrong: {out[-800:]}"
+        )
+        probe = raw_remote_sh(
+            f"test -d {rig.raw_remote_base}/never-created && echo CREATED || echo ABSENT"
+        )
+        assert "ABSENT" in probe.stdout, (
+            "prepare created the missing raw target on the remote"
+        )
+
+
 class TestRestoreReportsHonestly:
     def test_restoring_from_an_empty_location_is_not_success(self, rig, tmp_path):
         """An empty backup location must not produce a successful restore.

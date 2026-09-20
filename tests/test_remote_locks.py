@@ -54,6 +54,42 @@ def _manager(sandbox: Path, **kw) -> RemoteLockManager:
     return RemoteLockManager(_runner(sandbox), str(sandbox), hostname="testhost", **kw)
 
 
+class TestTheLockTreeNeverInventsTheTarget:
+    """The lock tree is created only BELOW an existing target. A bare
+    `mkdir -p` on the full lock path built every missing component -- so a
+    lock acquisition against an unmounted destination rebuilt the mount
+    point on the root filesystem (the 34904c6 class, seventh site). A
+    missing target now yields the NOLOCKDIR verdict, which was already
+    reported distinctly from contention."""
+
+    def test_acquire_on_a_missing_target_refuses_and_creates_nothing(self, tmp_path):
+        gone = tmp_path / "unmounted" / "backups"
+        manager = _manager(gone)
+        with pytest.raises(RemoteLockUnavailable):
+            manager.acquire_once("snap", operation="prune")
+        assert not (tmp_path / "unmounted").exists(), (
+            "the lock acquisition invented the target"
+        )
+
+    def test_acquire_shared_on_a_missing_target_refuses_and_creates_nothing(
+        self, tmp_path
+    ):
+        gone = tmp_path / "unmounted" / "backups"
+        manager = _manager(gone)
+        with pytest.raises(RemoteLockUnavailable):
+            manager.acquire_shared("snap", "lock-1", operation="restore")
+        assert not (tmp_path / "unmounted").exists(), (
+            "the shared acquisition invented the target"
+        )
+
+    def test_an_existing_target_still_gets_its_lock_tree(self, tmp_path):
+        """The carve-out survives: everything BELOW an existing target is
+        still created."""
+        manager = _manager(tmp_path)
+        manager.acquire_once("snap", operation="prune")
+        assert (tmp_path / ".btrfs-backup-ng.locks").is_dir()
+
+
 def _snap(name: str):
     return SimpleNamespace(locks=set(), parent_locks=set(), get_name=lambda: name)
 

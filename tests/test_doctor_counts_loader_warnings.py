@@ -30,6 +30,7 @@ import io
 import pytest
 
 from btrfs_backup_ng.cli.doctor import execute_doctor
+from btrfs_backup_ng.config import load_config
 from btrfs_backup_ng.core.doctor import (
     DiagnosticCategory,
     DiagnosticSeverity,
@@ -40,10 +41,19 @@ EMPTY_CONFIG_WARNING = "No volumes configured"
 
 
 class StubConfig:
-    """Stands in for a loaded Config: _check_config_valid asks it for volumes."""
+    """Stands in for a loaded Config with ONE healthy enabled volume.
+
+    _check_config_valid asks for both the declared and the enabled volumes; a
+    config with none enabled now (correctly) draws its own WARN, which would
+    pollute the loader-warning mapping these tests pin -- so the stub models
+    the healthy case.
+    """
+
+    def __init__(self):
+        self.volumes = [object()]
 
     def get_enabled_volumes(self):
-        return []
+        return list(self.volumes)
 
 
 def _doctor_args(config_path, **overrides):
@@ -154,3 +164,65 @@ class TestUnloadableConfigStillRuns:
         bad.write_text("this is not = = toml [[[\n")
         exit_code, _ = _run_doctor(bad)
         assert exit_code == 2, "a malformed config should be reported, not crash"
+
+
+class TestAConfigThatBacksUpNothingIsNotBlessed:
+    """`run` and `prune` operate only on ENABLED volumes, so a valid config
+    with none enabled -- or none declared -- performs no backups at all,
+    while doctor said "Configuration is valid" with a clean summary and exit
+    0. Reproduced: one volume with enabled = false gave "Summary: 3 passed,
+    0 warnings, 0 errors". A verdict of all-clear for a machine backing up
+    nothing is the exact false-comfort doctor exists to prevent."""
+
+    def _doctor_for(self, tmp_path, toml):
+        cfg = tmp_path / "c.toml"
+        cfg.write_text(toml)
+        config, warnings = load_config(cfg)
+        return Doctor(config=config, config_path=cfg, config_warnings=warnings)
+
+    def test_all_volumes_disabled_draws_a_warning(self, tmp_path):
+        doctor = self._doctor_for(
+            tmp_path,
+            """
+[[volumes]]
+path = "/home"
+enabled = false
+
+[[volumes.targets]]
+path = "/mnt/backup"
+""",
+        )
+        findings = doctor._check_config_valid()
+        warns = [f for f in findings if f.severity == DiagnosticSeverity.WARN]
+        assert any("back up NOTHING" in f.message for f in warns), findings
+        assert any("disabled" in f.message for f in warns)
+        assert not any(
+            f.severity == DiagnosticSeverity.OK and f.check_name == "config_valid"
+            for f in findings
+        ), "doctor blessed a config that backs up nothing"
+
+    def test_zero_declared_volumes_draws_a_warning(self, tmp_path):
+        doctor = self._doctor_for(tmp_path, 'snapshot_prefix = "x-"\n')
+        findings = doctor._check_config_valid()
+        assert any(
+            f.severity == DiagnosticSeverity.WARN and "declares no volumes" in f.message
+            for f in findings
+        ), findings
+
+    def test_an_enabled_volume_still_gets_the_ok(self, tmp_path):
+        doctor = self._doctor_for(
+            tmp_path,
+            """
+[[volumes]]
+path = "/home"
+
+[[volumes.targets]]
+path = "/mnt/backup"
+""",
+        )
+        findings = doctor._check_config_valid()
+        assert any(
+            f.severity == DiagnosticSeverity.OK and f.check_name == "config_valid"
+            for f in findings
+        )
+        assert not any("back up NOTHING" in f.message for f in findings)

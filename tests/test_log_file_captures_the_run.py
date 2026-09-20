@@ -122,24 +122,58 @@ class TestTheHandlerIsDetachedCleanly:
 
 
 class TestTheWarningsAreEmittedAfterTheHandlerExists:
-    """Config warnings are produced during load, before the file handler is
-    installed from that same config. Logged in the original order they reached
-    the console only."""
+    """A config warning must end up in the log file that config configures.
 
-    @pytest.mark.parametrize("module", ["run", "transfer"])
-    def test_the_file_handler_is_installed_first(self, module):
-        import inspect
+    The warnings are produced during load, BEFORE the file handler can be
+    installed from that same config; emitted in that order they reach the
+    console only, and under cron/systemd the console goes nowhere -- a
+    warning that was collected and then dropped.
 
-        import btrfs_backup_ng.cli.run as run_mod
-        import btrfs_backup_ng.cli.transfer as transfer_mod
+    This class REPLACES a source-text test that asserted
+    ``source.index("add_file_handler(") < source.index('logger.warning(...')``
+    over run and transfer only -- the two modules already fixed. It compared
+    character offsets, not behaviour, and it was parametrised over exactly
+    the modules that could not fail, so prune and snapshot shipped the same
+    defect for a full release while it passed. This one drives each REAL
+    command as a subprocess with a warning-producing config and reads the
+    log file back; reverting any one module's fix kills exactly that
+    module's parameter (mutation-verified per module)."""
 
-        mod = {"run": run_mod, "transfer": transfer_mod}[module]
-        source = inspect.getsource(mod)
-        handler_at = source.index("add_file_handler(")
-        warn_at = source.index('logger.warning("Config: %s"')
-        assert handler_at < warn_at, (
-            f"cli/{module}.py logs config warnings before installing the file "
-            f"handler, so log_file omits them"
+    @pytest.mark.parametrize("command", ["run", "transfer", "prune", "snapshot"])
+    def test_a_config_warning_reaches_the_log_file(self, tmp_path, command):
+        import subprocess
+        import sys
+
+        log_file = tmp_path / f"{command}.log"
+        cfg = tmp_path / "cfg.toml"
+        # `[[volume]]` (singular) is the classic typo: the loader warns
+        # "Unknown config key 'volume'" and "No volumes configured", loads
+        # successfully, and the command proceeds far enough to install the
+        # file handler and then exit having nothing to do.
+        cfg.write_text(
+            f"""
+[global]
+log_file = "{log_file}"
+
+[[volume]]
+path = "/nowhere"
+"""
+        )
+
+        subprocess.run(
+            [sys.executable, "-m", "btrfs_backup_ng", "-c", str(cfg), command],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+
+        assert log_file.exists(), (
+            f"{command} never installed the file handler for a loadable config"
+        )
+        content = log_file.read_text()
+        assert "Config:" in content and "Unknown config key" in content, (
+            f"{command} dropped its config warnings from the log file; "
+            f"file contains: {content[-500:]!r}"
         )
 
 

@@ -346,6 +346,10 @@ class TestTheEndpointIsHandedTheMethodBeforeItIsZeroed:
         ep = SSHEndpoint.__new__(SSHEndpoint)
         ep.config = {"path": "/dest"}
         ep._is_remote = True
+        # The engine now VERIFIES the destination before handing anything to
+        # the endpoint (it used to create it); this fixture's subject is the
+        # compress hand-off, so the environment probe is stubbed to "exists".
+        ep._require_remote_destination = lambda path: True
         return ep
 
     def test_the_ssh_endpoint_receives_the_requested_method(self):

@@ -74,12 +74,41 @@ def plan_transfer_sequence(
     """
     present = snapshots_present_on(source_snapshots, destination_endpoint)
 
+    # A snapshot whose name yields no timestamp cannot be ordered against the
+    # others, so it takes no part in candidacy, parent search, or the
+    # keep_num_backups budget -- and NEVER silently: each exclusion is
+    # reported, because "not transferred" must be a fact the operator was
+    # told, not one they discover during a restore.
+    dated = []
+    for snap in source_snapshots:
+        if getattr(snap, "time_obj", None) is None:
+            logger.info(
+                "Not planning a transfer for %s: its name yields no "
+                "timestamp, so it cannot be ordered against the other "
+                "snapshots. It remains listed at the source.",
+                snap.get_name(),
+            )
+        else:
+            dated.append(snap)
+
     if only is not None:
+        if getattr(only, "time_obj", None) is None:
+            # An EXPLICIT single-snapshot request is honoured even without a
+            # timestamp: no ordering is needed for a full send, which always
+            # works. Presence still short-circuits it.
+            if only.get_name() in present:
+                return []
+            logger.info(
+                "Transferring %s as a full send: its name yields no "
+                "timestamp to choose an incremental parent by.",
+                only.get_name(),
+            )
+            return [(only, None)]
         candidates = [only]
     elif keep_num_backups > 0:
-        candidates = source_snapshots[-keep_num_backups:]
+        candidates = dated[-keep_num_backups:]
     else:
-        candidates = list(source_snapshots)
+        candidates = list(dated)
 
     # A TOTAL order over snapshots: primary = creation time, secondary = position in the source
     # enumeration (snapper number / btrfs subvol-id order, which is creation order -- and unlike
@@ -109,7 +138,7 @@ def plan_transfer_sequence(
         parent = None
         if not no_incremental:
             older_newest_first = sorted(
-                (o for o in source_snapshots if _order_key(o) < _order_key(snap)),
+                (o for o in dated if _order_key(o) < _order_key(snap)),
                 key=_order_key,
                 reverse=True,
             )

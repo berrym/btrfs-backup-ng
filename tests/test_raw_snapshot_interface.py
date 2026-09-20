@@ -88,7 +88,6 @@ def test_cross_type_equality_with_btrfs_snapshot():
         "root.",
         None,
         time_obj=time.strptime("20240115-120000", fmt),
-        time_format=fmt,
     )
     raw = RawSnapshot(name=btrfs.get_name(), stream_path=Path("/b/x.btrfs"))
     assert raw == btrfs

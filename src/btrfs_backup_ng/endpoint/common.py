@@ -20,6 +20,13 @@ from btrfs_backup_ng.core.space import SpaceInfo
 from btrfs_backup_ng.core.space import get_space_info as _get_space_info
 from btrfs_backup_ng.endpoint.raw_metadata import StructureVerdict
 
+#: The highest ``_N`` collision suffix creation will allocate before refusing.
+#: btrbk increments its counter unboundedly; a bound here means a pathological
+#: directory (hundreds of same-name collisions) still ends in a diagnosis
+#: instead of an unbounded scan. Within _TRAILING_ORDINAL_RE's 9-digit limit,
+#: so every allocated name derives its timestamp on the next listing.
+_MAX_COLLISION_ORDINAL = 999
+
 
 def _secure_lock_dir(base: Path, euid: int) -> Optional[Path]:
     """Return a euid-owned 0700 ``btrfs-backup-ng-<euid>`` subdir of ``base`` for lock files,
@@ -303,17 +310,82 @@ class Endpoint:
         with FileLock(lock_path):
             logger.debug("Snapshot lock acquired: %s", lock_path)
             if Path(snapshot_path).exists():
-                # A snapshot with this exact name already exists. The usual cause is two
-                # snapshots requested within the same second (identical timestamp, hence
-                # identical name). btrfs would otherwise fail here with the misleading
-                # "Could not create subvolume: Read-only file system"; give the real
-                # reason and what to do instead.
-                raise __util__.AbortError(
-                    f"A snapshot named '{snapshot.get_name()}' already exists at "
-                    f"{snapshot_path}. Two snapshots were likely requested within the "
-                    "same second (identical timestamp). Wait a second and retry; if the "
-                    "existing snapshot is incomplete, remove it first."
-                )
+                # A snapshot with this exact name already exists. Allocate the
+                # lowest free ``_N`` -- btrbk's collision counter -- INSIDE
+                # this lock, the same critical section that performs the
+                # create, so two concurrent runs cannot pick the same N. This
+                # is what makes a coarse timestamp_format usable (its second
+                # snapshot of the period used to be refused outright) and what
+                # absorbs the DST fall-back, where two instants an hour apart
+                # render the same default-format name once a year. Safe only
+                # because names are remembered facts and suffixed names are
+                # visible on every destination type; the suffixed snapshot is
+                # dated by its base timestamp on every later listing.
+                base_name = snapshot.get_name()
+                for ordinal in range(1, _MAX_COLLISION_ORDINAL + 1):
+                    candidate = f"{base_name}_{ordinal}"
+                    if not (snapshot_dir / candidate).exists():
+                        snapshot = __util__.Snapshot(
+                            snapshot_dir,
+                            snap_prefix,
+                            self,
+                            time_obj=snapshot.time_obj,
+                            name=candidate,
+                        )
+                        # Every listing re-derives this flag; set it on the
+                        # object in hand too, so prune surfaces mark it in
+                        # this very run.
+                        snapshot.newly_visible = True
+                        snapshot_path = snapshot.get_path()
+                        logger.info(
+                            "A snapshot named %s already exists (the "
+                            "configured timestamp_format renders this moment "
+                            "to the same name); creating %s instead -- _N is "
+                            "the btrbk-compatible collision counter.",
+                            base_name,
+                            candidate,
+                        )
+                        break
+                else:
+                    # Every suffix up to the bound is taken: fall back to the
+                    # diagnosis. Under a seconds-resolving format the cause is
+                    # two requests in the same second (or the repeated hour of
+                    # a DST fall-back), and waiting is real advice; under a
+                    # coarser format the format itself cannot name another
+                    # snapshot this period, and "wait a second" cannot work.
+                    fmt = self.config.get("timestamp_format") or __util__.DATE_FORMAT
+                    period = __util__.indistinguishable_period(fmt)
+                    where = (
+                        f"A snapshot named '{base_name}' already exists at "
+                        f"{snapshot_path}, and every collision suffix up to "
+                        f"_{_MAX_COLLISION_ORDINAL} is taken."
+                    )
+                    if period is None:
+                        raise __util__.AbortError(
+                            f"{where} Two snapshots were likely requested "
+                            "within the same second (identical timestamp); "
+                            "during a daylight-saving fall-back, requests an "
+                            "hour apart can also collide. Wait a second and "
+                            "retry; if the existing snapshot is incomplete, "
+                            "remove it first."
+                        )
+                    if period == "more than a day":
+                        raise __util__.AbortError(
+                            f"{where} The configured timestamp_format {fmt!r} "
+                            "renders the same name for snapshots taken even "
+                            "days apart, so every new snapshot collides with "
+                            "this one. Configure a timestamp_format with "
+                            "finer resolution, or remove the existing "
+                            "snapshot first if it is not needed."
+                        )
+                    raise __util__.AbortError(
+                        f"{where} The configured timestamp_format {fmt!r} "
+                        f"gives every snapshot taken in the same {period} "
+                        "the same name, so waiting a second cannot help. "
+                        f"Retry in the next {period}, configure a "
+                        "timestamp_format with finer resolution, or remove "
+                        "the existing snapshot first if it is not needed."
+                    )
             self._remount(self.config["source"], read_write=True)
             commands = [
                 self._build_snapshot_cmd(
@@ -472,7 +544,53 @@ class Endpoint:
         """
         snapshot_dir = Path(self.config["path"]).resolve()
         snap_prefix = self.config["snap_prefix"]
-        snapshot_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        # A listing is a READ: it must never create the path it was asked to
+        # enumerate. It used to mkdir here, which quietly undid _prepare's
+        # refusal to create a configured path (34904c6): every CLI command
+        # calls prepare() first, but that is a per-command convention, not a
+        # property of this primitive -- and the convention has a real gap.
+        # Measured: with the path present, prepare() passes and a pool lists
+        # its backups; the drive then unmounts mid-run, and the next listing
+        # REBUILT the mount point on the root filesystem and reported the pool
+        # empty -- so presence checks saw nothing and the planner scheduled
+        # full re-sends into the directory the read had just invented.
+        #
+        # The discriminator between the two honest answers is the endpoint's
+        # role, read from config["source"]: every source-side endpoint carries
+        # its subvolume there, and destination endpoints do not. A missing
+        # snapshot dir on the SOURCE is a legitimate baseline (a volume that
+        # has never been snapshotted; snapshot() creates the directory at
+        # first creation). A missing BACKUP DESTINATION is not empty, it is
+        # unreadable, and saying "empty" is how an operator concludes their
+        # backups are gone -- same contract as the ssh listing, which raises
+        # rather than ever presenting a failed enumeration as an empty target.
+        if not snapshot_dir.is_dir():
+            if snapshot_dir.exists():
+                # A file (or other non-directory) at the configured path is a
+                # misconfiguration for either role. The old mkdir path let
+                # this escape as a raw FileExistsError, which is not a
+                # diagnosis.
+                raise RuntimeError(
+                    f"Cannot list snapshots at {snapshot_dir}: the path "
+                    "exists but is not a directory."
+                )
+            if self.config.get("source"):
+                logger.debug(
+                    "Snapshot directory %s does not exist yet; a source "
+                    "volume with no snapshots is a legitimate empty baseline "
+                    "(nothing was created).",
+                    snapshot_dir,
+                )
+                self.__cached_snapshots = []
+                return []
+            raise RuntimeError(
+                f"Cannot list snapshots at {snapshot_dir}: the directory does "
+                "not exist. The location could NOT be enumerated -- this is "
+                "NOT an empty target. If the backups live on a removable or "
+                "network filesystem it is most likely not mounted; mount it, "
+                "check the path for a typo, or create the directory yourself. "
+                "Nothing was created."
+            )
 
         logger.debug("Listing snapshots in: %s", snapshot_dir)
         logger.debug("Snapshot prefix: %s", snap_prefix)
@@ -495,24 +613,27 @@ class Endpoint:
             ):
                 date_part = item_path.name[len(snap_prefix) :]
                 logger.debug("Parsing date from: %r", date_part)
-                try:
-                    time_obj, matched_fmt = __util__.parse_snapshot_time(
-                        date_part, self.config.get("timestamp_format")
-                    )
-                except Exception as e:
-                    # Debug level - it's normal for directories to contain
-                    # files that don't match the snapshot naming pattern
-                    logger.debug(
-                        "Skipping non-snapshot item: %r (%s)", item_path.name, e
-                    )
+                time_obj, parsed_as_written = __util__.derive_snapshot_time(
+                    date_part, self.config.get("timestamp_format")
+                )
+                if time_obj is None and not __util__.is_subvolume(item_path):
+                    # Two different facts used to share this rejection: "not a
+                    # snapshot at all" (README.md, lost+found) and "a snapshot
+                    # whose name I cannot parse". What something IS answers the
+                    # first: not a subvolume means not a snapshot -- debug
+                    # level, normal directory clutter. A subvolume whose name
+                    # yields no timestamp falls through: it IS a snapshot, with
+                    # no extractable time.
+                    logger.debug("Skipping non-snapshot item: %r", item_path.name)
                     continue
                 snapshot = __util__.Snapshot(
                     snapshot_dir,
                     snap_prefix,
                     self,
                     time_obj=time_obj,
-                    time_format=matched_fmt,
+                    name=item_path.name,
                 )
+                snapshot.newly_visible = not parsed_as_written
                 snapshots.append(snapshot)
         # R3: load persisted retention locks back onto the snapshots. set_lock writes them
         # to the lock file, but nothing read them back, so a snapshot kept locked after a
@@ -524,6 +645,7 @@ class Endpoint:
         # with empty uuids.
         self._load_subvolume_ids_into(snapshots)
         snapshots.sort()
+        self._report_newly_visible(snapshots)
         self.__cached_snapshots = snapshots
         logger.debug(
             "Populated snapshot cache of %r with %d items.", self, len(snapshots)
@@ -613,6 +735,30 @@ class Endpoint:
                 continue
             snap.locks = set(entry.get("locks", []))
             snap.parent_locks = set(entry.get("parent_locks", []))
+
+    def _report_newly_visible(self, snapshots: List[Any]) -> None:
+        """Announce, once per listing refresh, snapshots that earlier releases
+        could not list. The first run that can see such a snapshot is also the
+        first that could prune it: a trailing ``_N`` (or any name retention's
+        own parser can date) enters retention buckets immediately, so the
+        operator hears about it BEFORE a deletion list does. INFO, not debug --
+        silence here is how a foreign pool gets managed without anyone being
+        told."""
+        fresh = [s for s in snapshots if getattr(s, "newly_visible", False)]
+        if not fresh:
+            return
+        shown = ", ".join(s.get_name() for s in fresh[:5])
+        more = f" (and {len(fresh) - 5} more)" if len(fresh) > 5 else ""
+        logger.info(
+            "%d snapshot(s) at %s were not visible to earlier btrfs-backup-ng "
+            "releases: %s%s. Those with a derivable timestamp are now managed "
+            "by retention; those without are listed and kept but never "
+            "deleted automatically.",
+            len(fresh),
+            self.config.get("path"),
+            shown,
+            more,
+        )
 
     def correspondent_of(self, snapshot: Any) -> Optional[Any]:
         """Return THIS endpoint's snapshot that is the btrfs-receive copy of ``snapshot``.
@@ -847,7 +993,7 @@ class Endpoint:
                 snapshot.prefix,
                 self,
                 time_obj=snapshot.time_obj,
-                time_format=snapshot.time_format,
+                name=snapshot.get_name(),
             )
         path = str(snapshot.get_path())
         if any(str(s.get_path()) == path for s in self.__cached_snapshots):
@@ -965,6 +1111,22 @@ class Endpoint:
             )
             return result
         unlocked = [s for s in snapshots if not s.locks and not s.parent_locks]
+        # A snapshot with no derivable timestamp neither counts toward the
+        # keep budget nor can be deleted by it: count-based retention keeps
+        # "the newest N", and these have no place in that order. They sort
+        # LAST, so leaving them in would let them occupy keep slots and push
+        # real, dated snapshots into the delete slice. Reported, never silent.
+        undated = [s for s in unlocked if getattr(s, "time_obj", None) is None]
+        if undated:
+            logger.info(
+                "%d unlocked snapshot(s) have no derivable timestamp; they "
+                "are kept, and occupy none of the %d keep slot(s): %s",
+                len(undated),
+                keep,
+                ", ".join(s.get_name() for s in undated[:5])
+                + (f" (and {len(undated) - 5} more)" if len(undated) > 5 else ""),
+            )
+            unlocked = [s for s in unlocked if getattr(s, "time_obj", None) is not None]
         if keep <= 0 or len(unlocked) <= keep:
             logger.debug(
                 "No unlocked snapshots to delete (keep=%d, unlocked=%d)",

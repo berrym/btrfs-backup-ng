@@ -771,8 +771,17 @@ def _find_parent_snapshot(snapshot, all_snapshots: list):
 
     Returns the most recent snapshot that is older than the given snapshot.
     """
+    if getattr(snapshot, "time_obj", None) is None:
+        # No derivable time, no honest "older": verify it as a full restore.
+        logger.debug(
+            "No parent for %s: its name yields no timestamp.",
+            snapshot.get_name(),
+        )
+        return None
     candidates = []
     for s in all_snapshots:
+        # A timestamp-less candidate sorts AFTER every dated snapshot, so the
+        # `s < snapshot` filter can never admit one.
         if s.get_name() != snapshot.get_name() and s < snapshot:
             candidates.append(s)
 

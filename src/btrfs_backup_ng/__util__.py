@@ -39,6 +39,8 @@ __all__ = [
     "DATE_FORMAT",
     "MOUNTS_FILE",
     "infer_snapshot_prefix",
+    "indistinguishable_period",
+    "derive_snapshot_time",
     "parse_snapshot_time",
 ]
 
@@ -73,9 +75,37 @@ def _endpoint_timestamp_format(endpoint: Any) -> str:
     return DATE_FORMAT
 
 
+#: A trailing ``_N`` in a snapshot name -- btrbk's collision counter. Bounded
+#: at 9 digits so a pathological name cannot allocate a huge int; anything
+#: longer is treated as not-an-ordinal.
+_TRAILING_ORDINAL_RE = re.compile(r"_(\d{1,9})$")
+
+
+def _name_ordinal(name: str) -> int:
+    """The numeric value of a trailing ``_N`` in a snapshot name, else 0.
+
+    ORDERING metadata only, never identity: two snapshots sharing a timestamp
+    sort by it, so ``X_2`` precedes ``X_10`` where the bare name string would
+    order them the other way round. The value is DERIVED from the name on each
+    comparison; nothing stores it.
+    """
+    match = _TRAILING_ORDINAL_RE.search(name)
+    return int(match.group(1)) if match else 0
+
+
 @functools.total_ordering
 class Snapshot:
-    """Represents a snapshot with comparison by prefix and time_obj."""
+    """A snapshot whose identity is its NAME, observed once and never recomputed.
+
+    A listing constructs this with the on-disk name it OBSERVED; the creation
+    path renders the name exactly once, in ``__init__``, from the endpoint's
+    configured timestamp_format. Either way ``get_name()``/``get_path()``
+    always resolve to the entry the snapshot came from -- prune deletes and
+    lock keys go through them, so a name that parses but does not re-render
+    identically (strptime accepts single-digit fields the format would pad)
+    must never be rebuilt from its timestamp. ``time_obj`` is a derived
+    attribute for ordering and retention math, not a source of the name.
+    """
 
     def __init__(
         self,
@@ -83,47 +113,66 @@ class Snapshot:
         prefix: str,
         endpoint: Any,
         time_obj: time.struct_time | None = None,
-        time_format: str | None = None,
+        name: str | None = None,
     ) -> None:
         self.location = Path(location)
         self.prefix = prefix
         self.endpoint = endpoint
-        if time_obj is None:
-            # localtime() directly, NOT str_to_date(): that round-trips through
-            # DATE_FORMAT, and strptime returns tm_gmtoff=None / tm_isdst=-1, so
-            # a snapshot created under a timestamp_format containing %z was
-            # named without its offset and the tool could then not resolve its
-            # own path. The round trip's stated purpose was to drop sub-second
-            # precision, which struct_time cannot hold in the first place.
+        if time_obj is None and name is None:
+            # The creation path defaults to "now". localtime() directly, NOT
+            # str_to_date(): that round-trips through DATE_FORMAT, and strptime
+            # returns tm_gmtoff=None / tm_isdst=-1, so a snapshot created under
+            # a timestamp_format containing %z was named without its offset and
+            # the tool could then not resolve its own path. The round trip's
+            # stated purpose was to drop sub-second precision, which
+            # struct_time cannot hold in the first place.
+            #
+            # A listing that passes an observed NAME passes the time it derived
+            # from that name -- or None when the name yields none. "Now" is
+            # never invented for an observed snapshot: a fictitious age would
+            # feed ordering and retention a fact the filesystem does not hold.
             time_obj = time.localtime()
         self.time_obj = time_obj
-        # The format used to render/parse this snapshot's timestamp. Stored per
-        # instance so a snapshot parsed under a legacy format regenerates the
-        # exact on-disk name even when a different timestamp_format is configured.
-        if time_format is None:
-            time_format = _endpoint_timestamp_format(endpoint)
-        self.time_format = time_format
+        if name is None:
+            # The creation path: render the name ONCE, here, under the
+            # endpoint's configured timestamp_format. From this point the name
+            # is a fact about the snapshot, never a function of its attributes;
+            # every listing passes the observed on-disk string instead.
+            name = prefix + date_to_str(
+                time_obj, fmt=_endpoint_timestamp_format(endpoint)
+            )
+        self.name = name
+        # Set by listings: True when this name would have been INVISIBLE to
+        # releases that required a plain timestamp parse -- a trailing _N, or
+        # no derivable timestamp at all. The listing announces such snapshots
+        # and prune marks them, because the first run that can see one is also
+        # the first run that could delete it.
+        self.newly_visible = False
         self.locks: set = set()
         self.parent_locks: set = set()
         # btrfs subvolume identity, populated best-effort at enumeration (Phase 0).
         # ``uuid`` is this snapshot's own UUID; ``received_uuid`` is set on a subvolume
         # produced by ``btrfs receive`` and equals the source subvolume's UUID -- the
         # correspondence btrfs incremental send/receive actually uses. Empty when it
-        # could not be read (non-root, non-btrfs, older btrfs-progs). NOT part of
-        # identity yet: __eq__/__lt__ remain name/time based in Phase 0.
+        # could not be read (non-root, non-btrfs, older btrfs-progs). NOT part
+        # of identity: __eq__ is name-based, __lt__ time-then-name.
         self.uuid = ""
         self.received_uuid = ""
 
     def __eq__(self, other: object) -> bool:
-        # NotImplemented, not an AttributeError. Annotating this signature (which
-        # must take `object` -- Python compares a Snapshot against anything)
-        # exposed that the body assumed the other side was a Snapshot, so
-        # `snapshot == None` raised AttributeError instead of returning False.
-        # Returning NotImplemented lets Python fall back to identity, which is
-        # the documented contract and what every caller already assumed.
-        if not isinstance(other, Snapshot):
+        # Identity is the NAME -- the one fact a comparison shares with the
+        # filesystem. Duck-typed via get_name(), mirroring RawSnapshot.__eq__,
+        # so a raw backup equals the btrfs snapshot it came from. Two snapshots
+        # sharing a timestamp but not a name (a trailing _N, a foreign spelling)
+        # are DIFFERENT snapshots and no longer collide in presence checks,
+        # dedup, or lock keys. NotImplemented, not AttributeError, for anything
+        # without get_name(): Python then falls back to identity, so
+        # `snapshot == None` is False rather than a crash -- the documented
+        # contract every caller assumes.
+        other_get_name = getattr(other, "get_name", None)
+        if other_get_name is None:
             return NotImplemented
-        return self.prefix == other.prefix and self.time_obj == other.time_obj
+        return self.name == other_get_name()
 
     def __lt__(self, other: "Snapshot") -> bool:
         if self.prefix != other.prefix:
@@ -131,14 +180,37 @@ class Snapshot:
             raise NotImplementedError(
                 msg,
             )
-        return self.time_obj < other.time_obj
+        other_time = getattr(other, "time_obj", None)
+        if self.time_obj is not None and other_time is not None:
+            if self.time_obj != other_time:
+                return self.time_obj < other_time
+        elif (self.time_obj is None) != (other_time is None):
+            # A snapshot with no derivable time sorts AFTER every timestamped
+            # one. Unknown age is never treated as old: "oldest" is where
+            # count-based deletion slices from, and a decision that needs age
+            # must partition these out explicitly rather than rely on order.
+            return other_time is None
+        # Same timestamp: break the tie so ordering is total and deterministic
+        # -- find_parent must never pick one of two same-second snapshots
+        # arbitrarily. A trailing _N (btrbk's collision counter) orders
+        # numerically, so X_2 precedes X_10; any other difference falls back
+        # to the name string. Ordering metadata only -- the ordinal is derived
+        # from the name, never stored on the snapshot.
+        self_name = self.get_name()
+        other_name = other.get_name()
+        return (_name_ordinal(self_name), self_name) < (
+            _name_ordinal(other_name),
+            other_name,
+        )
 
     def __repr__(self) -> str:
         return self.get_name()
 
     def get_name(self) -> str:
-        """Return a snapshot's name."""
-        return self.prefix + date_to_str(self.time_obj, fmt=self.time_format)
+        """Return the snapshot's name: observed at listing, or rendered once
+        at creation. Never recomputed -- prune deletes by the path built from
+        this, so it must be the string the filesystem actually holds."""
+        return self.name
 
     def get_path(self) -> Path:
         """Return full path to a snapshot."""
@@ -150,15 +222,35 @@ class Snapshot:
         if none found.
         """
         if self in present_snapshots:
-            # snapshot already transferred
+            # snapshot already transferred (name identity -- works whether or
+            # not either side carries a timestamp)
             return None
-        for present_snapshot in reversed(present_snapshots):
+        if self.time_obj is None:
+            # No derivable time means no honest claim about which present
+            # snapshot is older: no parent, full send -- which always works.
+            logger.debug(
+                "find_parent(%s): the name yields no timestamp; "
+                "sending in full rather than guessing at a parent.",
+                self.get_name(),
+            )
+            return None
+        candidates = [
+            p for p in present_snapshots if getattr(p, "time_obj", None) is not None
+        ]
+        if len(candidates) != len(present_snapshots):
+            logger.debug(
+                "find_parent(%s): ignoring %d present snapshot(s) with no "
+                "derivable timestamp as parent candidates.",
+                self.get_name(),
+                len(present_snapshots) - len(candidates),
+            )
+        for present_snapshot in reversed(candidates):
             if present_snapshot < self:
                 return present_snapshot
         # no snapshot older than snapshot is present ...
-        if present_snapshots:
+        if candidates:
             # ... hence we choose the oldest one present as parent
-            return present_snapshots[0]
+            return candidates[0]
 
         return None
 
@@ -441,9 +533,10 @@ def parse_snapshot_time(
     ``preferred_fmt`` (a configured ``timestamp_format``) is tried first when
     given, then the built-in ``DATE_FORMAT`` is tried as a fallback so snapshots
     created under a previous format stay readable after the format changes.
-    ``matched_fmt`` is the format that actually parsed the string, so the caller
-    can regenerate the identical on-disk name. Raises ``ValueError`` if no
-    candidate format matches.
+    ``matched_fmt`` is the format that actually parsed the string. Nothing may
+    regenerate a name from it -- names are observed and remembered
+    (``Snapshot.name``) -- but a caller can still use it to report WHICH format
+    matched. Raises ``ValueError`` if no candidate format matches.
     """
     formats = []
     if preferred_fmt:
@@ -457,6 +550,47 @@ def parse_snapshot_time(
         except ValueError as e:
             last_error = e
     raise last_error or ValueError(f"unparseable snapshot timestamp: {time_string!r}")
+
+
+def derive_snapshot_time(
+    time_string: str, preferred_fmt: str | None = None
+) -> tuple[time.struct_time | None, bool]:
+    """Best-effort timestamp DERIVATION from an observed name's timestamp part.
+
+    Returns ``(time_obj, parsed_as_written)``. ``time_obj`` is None when no
+    timestamp can be derived -- never an exception, because under the
+    remembered-name contract an unparseable name is a fact about a snapshot,
+    not an error. ``parsed_as_written`` is True only when the string parsed
+    without help; False means the snapshot was invisible to releases that
+    required a plain parse (callers mark it ``newly_visible``).
+
+    The string is tried AS WRITTEN first (``parse_snapshot_time``: the
+    configured format, then the default), and only then with one trailing
+    ``_N`` stripped -- btrbk's collision counter, which it appends whenever a
+    timestamp recurs under a coarse format (its daily ``short`` format plus an
+    hourly schedule makes such names the norm, not the exception). With
+    today's two candidate formats the two orderings agree on every input
+    (measured; a stripped base can only match a date-only format, which can
+    only arrive as ``preferred_fmt``, in which case the full string does not
+    parse either) -- the as-written-first order is kept because it FAILS SAFE
+    if a date-only candidate is ever added: ``20260904_120000`` must stay
+    noon-with-no-ordinal, never midnight-with-ordinal-120000.
+    """
+    try:
+        time_obj, _ = parse_snapshot_time(time_string, preferred_fmt)
+        return time_obj, True
+    except ValueError:
+        pass
+    match = _TRAILING_ORDINAL_RE.search(time_string)
+    if match:
+        try:
+            time_obj, _ = parse_snapshot_time(
+                time_string[: match.start()], preferred_fmt
+            )
+            return time_obj, False
+        except ValueError:
+            pass
+    return None, False
 
 
 def infer_snapshot_prefix(name: str, preferred_fmt: str | None = None) -> str | None:
@@ -480,6 +614,47 @@ def infer_snapshot_prefix(name: str, preferred_fmt: str | None = None) -> str | 
             continue
         return name[:i]
     return None
+
+
+def indistinguishable_period(fmt: str) -> str | None:
+    """Return the widest period within which ``fmt`` renders identical names, or None.
+
+    Decides which diagnosis a snapshot-name collision gets. Under a
+    seconds-resolving format a collision means two requests in the same second
+    (or the repeated hour of a daylight-saving fall-back), and "wait a second
+    and retry" is real advice. Under a coarser format the format itself cannot
+    name a second snapshot within its period, and that advice cannot work --
+    the previous message gave it anyway, so a user with
+    ``timestamp_format = "%Y%m%d"`` got one snapshot per day and a misdiagnosis
+    on every later run.
+
+    The format is probed with real instants rather than inspected as a string:
+    two moments are rendered and compared, so every strftime directive -- and
+    any literal text -- is judged by what it actually produces. Probes render
+    with ``time.gmtime`` on a fixed epoch, so the verdict cannot depend on the
+    machine's timezone or clock. The base instant sits mid-period (12:30:30 on
+    January 15th): a probe step from a boundary would roll the next field over
+    and misread the resolution (from 12:30:59, one second later is 12:31:00,
+    which a minute-coarse format renders differently -- it would look
+    seconds-fine).
+
+    Returns ``None`` when instants one second apart render differently (the
+    format resolves seconds); otherwise ``"minute"``, ``"hour"`` or ``"day"``
+    -- the period whose instants all share one rendering, named by the first
+    probe step that renders differently -- or ``"more than a day"`` when even
+    day-apart instants share a name.
+    """
+    base = 979561830  # 2001-01-15T12:30:30Z
+    reference = time.strftime(fmt, time.gmtime(base))
+    for period, step in (
+        ("second", 1),
+        ("minute", 60),
+        ("hour", 3600),
+        ("day", 86400),
+    ):
+        if time.strftime(fmt, time.gmtime(base + step)) != reference:
+            return None if period == "second" else period
+    return "more than a day"
 
 
 def unescape_mount_field(field: str) -> str:

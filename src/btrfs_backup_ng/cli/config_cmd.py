@@ -812,7 +812,7 @@ def _init_config(args: argparse.Namespace) -> int:
         try:
             # Create parent directory if needed
             Path(output).parent.mkdir(parents=True, exist_ok=True)
-            with open(output, "w") as f:
+            with open(output, "w", encoding="utf-8") as f:
                 f.write(content)
             if interactive:
                 console.print()
@@ -864,7 +864,7 @@ def _init_config(args: argparse.Namespace) -> int:
                     console.print("[yellow]Aborted.[/yellow]")
                     return 1
 
-            save_file.write_text(content)
+            save_file.write_text(content, encoding="utf-8")
             console.print()
             console.print(f"[green]Configuration saved to:[/green] {save_path}")
             console.print()
@@ -935,7 +935,7 @@ def _import_config(args: argparse.Namespace) -> int:
     # Output TOML
     if output:
         try:
-            with open(output, "w") as f:
+            with open(output, "w", encoding="utf-8") as f:
                 f.write(toml_content)
             print(f"Configuration written to: {output}", file=sys.stderr)
             print("Review the file and adjust as needed.", file=sys.stderr)
@@ -1270,7 +1270,7 @@ def _save_wizard_config(content: str) -> int:
                 console.print("[yellow]Aborted.[/yellow]")
                 return 0
 
-        save_file.write_text(content)
+        save_file.write_text(content, encoding="utf-8")
         console.print()
         console.print(f"[green]Configuration saved to:[/green] {save_path}")
         console.print()
@@ -1777,7 +1777,7 @@ def _run_detection_wizard(result) -> int:
                 console.print("[yellow]Save cancelled.[/yellow]")
                 return 0
 
-        save_file.write_text(new_config)
+        save_file.write_text(new_config, encoding="utf-8")
         console.print()
         console.print(f"[green]Configuration saved to:[/green] {save_path}")
         console.print()

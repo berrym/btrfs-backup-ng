@@ -25,7 +25,6 @@ def _snap(stamp, uuid="", received_uuid=""):
         "home-",
         None,
         time_obj=time.strptime(stamp, "%Y%m%d-%H%M%S"),
-        time_format="%Y%m%d-%H%M%S",
     )
     s.uuid = uuid
     s.received_uuid = received_uuid

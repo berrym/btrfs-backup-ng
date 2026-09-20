@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import subprocess
+import time
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -105,31 +106,13 @@ def test_failed_command_includes_captured_stderr():
 
 
 def test_same_second_snapshot_collision_is_explained(tmp_path, monkeypatch):
-    """Two snapshots requested in the same second collide on name. btrfs would report
-    the misleading 'Could not create subvolume: Read-only file system'; the tool must
-    detect the pre-existing name first and explain the real cause. Mutation guard:
-    removing the ``snapshot_path.exists()`` pre-check drops the AbortError (the code
-    would instead reach the btrfs command, which is not run here)."""
-    src = tmp_path / "src"
-    src.mkdir()
-    snaps = tmp_path / "snaps"
-
-    # Freeze the timestamp so both the pre-created path and the endpoint's internal
-    # snapshot derive the SAME name -- a deterministic collision, no real clock race.
-    fixed = __util__.str_to_date("2026-01-02 03:04:05", fmt="%Y-%m-%d %H:%M:%S")
-    monkeypatch.setattr(__util__, "str_to_date", lambda *a, **k: fixed)
-
-    ep = LocalEndpoint(
-        config={
-            "source": str(src),
-            "path": str(snaps),
-            "snapshot_folder": str(snaps),
-            "snap_prefix": "t-",
-        }
-    )
-    name = __util__.Snapshot(snaps, "t-", ep).get_name()
-    snaps.mkdir(parents=True, exist_ok=True)
-    (snaps / name).mkdir()  # the pre-existing colliding snapshot
+    """A name collision is absorbed by the ``_N`` counter; the refusal exists
+    only when every suffix up to the bound is taken -- and then it must
+    explain the real cause, never btrfs's misleading 'Could not create
+    subvolume: Read-only file system'. Mutation guard: removing the
+    ``snapshot_path.exists()`` pre-check drops the AbortError (the code would
+    instead reach the btrfs command, which is not run here)."""
+    ep = _colliding_endpoint(tmp_path, monkeypatch, exhaust=True)
 
     with pytest.raises(__util__.AbortError) as ei:
         ep.snapshot()
@@ -137,6 +120,99 @@ def test_same_second_snapshot_collision_is_explained(tmp_path, monkeypatch):
     assert "already exists" in msg
     assert "same second" in msg
     assert "Read-only file system" not in msg
+
+
+def _colliding_endpoint(tmp_path, monkeypatch, timestamp_format=None, exhaust=False):
+    """A LocalEndpoint plus a pre-created snapshot whose name collides with the
+    next ``snapshot()`` call. ``time.localtime`` is frozen so the name computed
+    here and the one the endpoint computes are the SAME regardless of when the
+    test straddles a second/day boundary -- the collision is deterministic, not
+    a clock race. The granularity probe is unaffected: it renders with
+    ``time.gmtime`` on a fixed epoch precisely so a frozen local clock cannot
+    reach it.
+
+    ``exhaust=True`` also takes every ``_N`` collision suffix up to the
+    allocator's bound, which is the only route to the refusal since creation
+    started suffixing collisions instead of refusing them."""
+    src = tmp_path / "src"
+    src.mkdir()
+    snaps = tmp_path / "snaps"
+    fixed = __util__.str_to_date("2026-01-02 03:04:05", fmt="%Y-%m-%d %H:%M:%S")
+    monkeypatch.setattr(time, "localtime", lambda *args: fixed)
+    config = {
+        "source": str(src),
+        "path": str(snaps),
+        "snapshot_folder": str(snaps),
+        "snap_prefix": "t-",
+    }
+    if timestamp_format is not None:
+        config["timestamp_format"] = timestamp_format
+    ep = LocalEndpoint(config=config)
+    name = __util__.Snapshot(snaps, "t-", ep).get_name()
+    snaps.mkdir(parents=True, exist_ok=True)
+    (snaps / name).mkdir()
+    if exhaust:
+        from btrfs_backup_ng.endpoint.common import _MAX_COLLISION_ORDINAL
+
+        for i in range(1, _MAX_COLLISION_ORDINAL + 1):
+            (snaps / f"{name}_{i}").mkdir()
+    return ep
+
+
+def test_coarse_format_collision_names_the_period_not_the_second(tmp_path, monkeypatch):
+    """With ``timestamp_format = "%Y%m%d"`` the second snapshot of the DAY
+    collides; the message must say so and must not repeat the old misdiagnosis
+    ("same second... wait a second and retry"), which for this format is advice
+    that cannot work. The negative assertions are the teeth: a dispatch that
+    routes every collision to the same-second wording passes the positive
+    checks of neither this test nor the seconds-branch test, and each test
+    rejects the other branch's distinguishing phrases."""
+    ep = _colliding_endpoint(
+        tmp_path, monkeypatch, timestamp_format="%Y%m%d", exhaust=True
+    )
+    with pytest.raises(__util__.AbortError) as ei:
+        ep.snapshot()
+    msg = str(ei.value)
+    assert "already exists" in msg
+    assert "every collision suffix" in msg  # refusal is the EXHAUSTION path now
+    assert "same day" in msg
+    assert "'%Y%m%d'" in msg  # names the format so the operator can act on it
+    assert "same second" not in msg
+    assert "Wait a second" not in msg
+
+
+def test_seconds_format_collision_keeps_same_second_diagnosis(tmp_path, monkeypatch):
+    """Under the default seconds-resolving format the same-second diagnosis is
+    truthful and stays -- now alongside the one other honest cause, the
+    repeated hour of a daylight-saving fall-back. The fold mention is this
+    branch's distinguishing phrase: a mutation that leaks the "second" period
+    label into the coarse-format wording still contains "same second", but
+    never mentions the fold."""
+    ep = _colliding_endpoint(tmp_path, monkeypatch, exhaust=True)
+    with pytest.raises(__util__.AbortError) as ei:
+        ep.snapshot()
+    msg = str(ei.value)
+    assert "already exists" in msg
+    assert "same second" in msg
+    assert "daylight-saving" in msg
+    assert "Wait a second and retry" in msg
+    assert "same day" not in msg
+    assert "timestamp_format" not in msg  # this branch has no format to blame
+
+
+def test_constant_format_collision_blames_the_format(tmp_path, monkeypatch):
+    """A format with no time-varying output ("%Y" until New Year, or literal
+    text) makes EVERY snapshot collide; retrying can never help, so the message
+    must say the format is the problem and not counsel waiting."""
+    ep = _colliding_endpoint(tmp_path, monkeypatch, timestamp_format="%Y", exhaust=True)
+    with pytest.raises(__util__.AbortError) as ei:
+        ep.snapshot()
+    msg = str(ei.value)
+    assert "already exists" in msg
+    assert "even days apart" in msg
+    assert "'%Y'" in msg
+    assert "Wait a second" not in msg
+    assert "same second" not in msg
 
 
 # --- openssl: an unsupported cipher fails clearly, not with an EVP dump -------

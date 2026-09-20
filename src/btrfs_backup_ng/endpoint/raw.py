@@ -2445,23 +2445,34 @@ class SSHRawEndpoint(RawEndpoint):
         return subprocess.run(full_cmd, input=input, check=check, **kwargs)
 
     def _prepare(self) -> None:
-        """Prepare the endpoint by creating the remote directory."""
+        """Prepare the endpoint: confirm the remote target EXISTS, never create it."""
         path = self.config["path"]
         ssh_cmd = self._build_ssh_command()
 
         quoted = shlex.quote(str(path))
+        # The remote target is NOT created (the 34904c6 rule, extended to
+        # remote): an unmounted remote NFS share or secondary mount would take
+        # the streams onto the remote ROOT filesystem, exactly the failure the
+        # local RawEndpoint refuses. A configured target is a statement that
+        # something is there; the operator creates it once, explicitly, and
+        # everything BELOW an existing target is still created by the write
+        # paths. This method used to run `mkdir -p` here (and its login-user
+        # probe ALSO began with `mkdir -p`, so even the probe invented the
+        # directory).
+        #
         # Try as the login user FIRST, even when ssh_sudo is set. A raw+ssh
         # target stores plain files and runs no btrfs command, so when the
         # destination is already the user's there is nothing to elevate for --
         # and elevating regardless made a valid config fail against the
         # btrfs-only sudoers policy the README documents for ssh://.
         #
-        # The probe must test WRITABILITY, not just mkdir: `mkdir -p` succeeds
-        # on an existing root-owned directory (exist_ok), and the writes would
-        # then be the thing that failed, much later and less legibly.
+        # The probe tests EXISTENCE and WRITABILITY, creating nothing: a
+        # root-owned existing directory passes `test -d` but fails the mktemp,
+        # and the writes would otherwise be the thing that failed, much later
+        # and less legibly.
         if self.ssh_sudo and self._file_ops_direct is not False:
             probe = (
-                f"mkdir -p {quoted} && t=$(mktemp {quoted}/.bbng-probe.XXXXXX) "
+                f"test -d {quoted} && t=$(mktemp {quoted}/.bbng-probe.XXXXXX) "
                 f'&& rm -f "$t"'
             )
             direct = subprocess.run(ssh_cmd + [probe], check=False, capture_output=True)
@@ -2474,10 +2485,10 @@ class SSHRawEndpoint(RawEndpoint):
                 )
                 return self._preflight_remote_tools()
 
-        mkdir_cmd = self._elevate(f"mkdir -p {quoted}")
+        exists_cmd = self._elevate(f"test -d {quoted}")
 
-        full_cmd = ssh_cmd + [mkdir_cmd]
-        logger.debug("Creating remote directory: %s", full_cmd)
+        full_cmd = ssh_cmd + [exists_cmd]
+        logger.debug("Checking remote directory exists: %s", full_cmd)
 
         try:
             subprocess.run(full_cmd, check=True, capture_output=True)
@@ -2497,8 +2508,21 @@ class SSHRawEndpoint(RawEndpoint):
                     "safer -- give the user ownership of the backup directory "
                     "(chown/setfacl) and turn ssh_sudo off."
                 ) from e
-            logger.error("Failed to create remote directory: %s", stderr)
-            raise
+            if e.returncode != 1:
+                # `test -d` answers with 1; anything else (255 = the ssh
+                # transport itself) is NOT a verdict about the directory and
+                # must keep its own identity rather than being relabelled
+                # "does not exist".
+                logger.error("Could not check remote directory %s: %s", path, stderr)
+                raise
+            raise __util__.AbortError(
+                f"Raw target {path} does not exist on {self.hostname} (or "
+                "cannot be read). btrfs-backup-ng does not create a configured "
+                "target: if it lives on a removable or network filesystem, it "
+                "is most likely not mounted. Mount it, check the path for a "
+                "typo, or create it yourself: "
+                f"ssh {self.hostname} 'mkdir -p {path}'. Nothing was created."
+            ) from e
 
         # Reached only when the direct attempt above was refused, so elevation
         # is genuinely required; record it rather than leaving it to be probed

@@ -24,6 +24,7 @@ from ..notifications import (
 )
 from ..retention import RetentionError, apply_retention, parse_duration
 from .common import (
+    resolve_snapshot_dir,
     assert_target_mounted,
     get_log_level,
     get_timestamp_format,
@@ -348,11 +349,33 @@ def execute_retention_deletes(
             errors.append(f"Delete {snap.get_name()}: {e}")
             continue
         deleted += outcome.deleted_count
+        for snapshot in outcome.deleted:
+            # Named individually when earlier releases could not list it: a
+            # count alone reads the same whether this week's snapshots died or
+            # a foreign pool that had been invisible for months did.
+            if getattr(snapshot, "newly_visible", False):
+                logger.info(
+                    "  Deleted %s -- not visible to earlier btrfs-backup-ng "
+                    "releases; this may be the first run able to see or "
+                    "delete it.",
+                    snapshot.get_name(),
+                )
         for snapshot, reason in outcome.failed:
             errors.append(f"Delete {snapshot.get_name()}: {reason}")
         for snapshot, reason in outcome.skipped:
             logger.info("  Kept %s: %s", snapshot.get_name(), reason)
     return deleted, errors
+
+
+def newly_visible_mark(snap: Any) -> str:
+    """The marker a deletion surface appends to a snapshot earlier releases
+    could not list. Until this release such a snapshot was invisible to every
+    listing, so an operator may have had it for months without the tool ever
+    showing it -- and the first prune that can see it is exactly the wrong
+    moment to find out. Empty for ordinarily-visible snapshots."""
+    if getattr(snap, "newly_visible", False):
+        return " [not visible to earlier releases]"
+    return ""
 
 
 def _log_retention(label: str, retention: Any) -> None:
@@ -425,9 +448,6 @@ def execute_prune(args: argparse.Namespace) -> int:
         logger.info("Loading configuration from: %s", config_path)
         config, warnings = load_config(config_path)
 
-        for warning in warnings:
-            logger.warning("Config: %s", warning)
-
     except ConfigError as e:
         logger.error("Configuration error: %s", e)
         return 1
@@ -435,6 +455,13 @@ def execute_prune(args: argparse.Namespace) -> int:
     # Enable file logging if configured
     if config.global_config.log_file:
         add_file_handler(config.global_config.log_file)
+
+    # Emitted AFTER the file handler is installed. Logged before it, these
+    # went to the console only -- an operator running from cron or systemd
+    # with log_file set had a log that silently omitted every config
+    # warning, which is the one place they would look afterwards.
+    for warning in warnings:
+        logger.warning("Config: %s", warning)
 
     volumes = config.get_enabled_volumes()
 
@@ -501,13 +528,17 @@ def execute_prune(args: argparse.Namespace) -> int:
             try:
                 source_path = Path(volume.path).resolve()
 
-                snapshot_dir = Path(volume.snapshot_dir)
-                if not snapshot_dir.is_absolute():
-                    # Relative snapshot_dir: relative to source volume
-                    full_snapshot_dir = (source_path / snapshot_dir).resolve()
-                else:
-                    # Absolute snapshot_dir: add source name as subdirectory
-                    full_snapshot_dir = (snapshot_dir / source_path.name).resolve()
+                # ONE resolution for every command (resolve_snapshot_dir), so
+                # this command reads exactly the directory run/snapshot write. A
+                # missing absolute base is refused there with the mount diagnosis
+                # instead of the generic warning below.
+                try:
+                    full_snapshot_dir = resolve_snapshot_dir(
+                        volume.snapshot_dir, source_path
+                    )
+                except __util__.AbortError as e:
+                    logger.warning("  %s", e)
+                    continue
 
                 if not full_snapshot_dir.exists():
                     # Skip the SOURCE only. `continue` here skipped this
@@ -607,7 +638,12 @@ def execute_prune(args: argparse.Namespace) -> int:
     if dry_run:
         for _ep, to_delete, label in plan:
             for snap in to_delete:
-                logger.info("  Would delete (%s): %s", label, snap.get_name())
+                logger.info(
+                    "  Would delete (%s): %s%s",
+                    label,
+                    snap.get_name(),
+                    newly_visible_mark(snap),
+                )
         total_deleted = total_to_delete
     elif total_to_delete == 0:
         logger.info("Nothing to prune")
@@ -621,7 +657,7 @@ def execute_prune(args: argparse.Namespace) -> int:
             for _ep, to_delete, label in plan:
                 print(f"  {label} -- {len(to_delete)}:")
                 for snap in to_delete:
-                    print(f"    - {snap.get_name()}")
+                    print(f"    - {snap.get_name()}{newly_visible_mark(snap)}")
             print(f"Proceed with deleting {total_to_delete}? [y/N] ", end="")
             proceed = input().strip().lower() in ("y", "yes")
         if not proceed:

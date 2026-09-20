@@ -14,6 +14,7 @@ from btrfs_backup_ng.__util__ import (
     Snapshot,
     SnapshotTransferError,
     date_to_str,
+    indistinguishable_period,
     log_heading,
     parse_snapshot_time,
     read_locks,
@@ -808,26 +809,67 @@ class TestParseSnapshotTime:
             parse_snapshot_time("not-a-date", "%Y%m%dT%H%M%S")
 
 
-class TestSnapshotTimeFormat:
-    """Tests for per-snapshot timestamp_format handling."""
+class TestIndistinguishablePeriod:
+    """indistinguishable_period drives the snapshot-collision diagnosis: None
+    means the same-second wording is truthful, a period name means the
+    configured format cannot express a second snapshot within that period.
+
+    Boundary safety is load-bearing and these five tests enforce it together:
+    the probe base must sit mid-period, or a step crosses the next field's
+    rollover and misreads the resolution. A base at second 59 makes the minute
+    test fail (the +1s probe rolls the minute and the format looks
+    seconds-fine); a base at minute 59 fails the hour test; a base at hour 23
+    fails the day test; a base in late December fails the more-than-a-day
+    test. Moving the base onto any boundary breaks at least one of these.
+    """
+
+    def test_seconds_resolving_format_is_none(self):
+        assert indistinguishable_period("%Y%m%d-%H%M%S") is None
+
+    def test_default_format_is_seconds_resolving(self):
+        assert indistinguishable_period(DATE_FORMAT) is None
+
+    def test_minute_coarse_format(self):
+        assert indistinguishable_period("%Y%m%d-%H%M") == "minute"
+
+    def test_hour_coarse_format(self):
+        assert indistinguishable_period("%Y%m%d-%H") == "hour"
+
+    def test_day_coarse_format(self):
+        assert indistinguishable_period("%Y%m%d") == "day"
+
+    def test_year_format_is_more_than_a_day(self):
+        assert indistinguishable_period("%Y") == "more than a day"
+
+    def test_literal_text_judged_by_output_not_directives(self):
+        """A constant format string never varies, so every snapshot collides;
+        the probe must reach that verdict from the rendering, not from
+        scanning for %-directives."""
+        assert indistinguishable_period("static-name") == "more than a day"
+
+
+class TestSnapshotNaming:
+    """Naming under the remembered-name contract: creation renders the name
+    ONCE from the endpoint's configured timestamp_format; a listing passes the
+    observed on-disk string; get_name() never re-renders either."""
 
     def test_default_format_from_plain_endpoint(self):
-        """A MagicMock endpoint (no dict config) yields the built-in default format."""
+        """A MagicMock endpoint (no dict config) renders under the built-in default."""
         endpoint = MagicMock()
         snap = Snapshot("/snap", "home-", endpoint, str_to_date("20240115-143022"))
-        assert snap.time_format == DATE_FORMAT
         assert snap.get_name() == "home-20240115-143022"
 
     def test_new_snapshot_uses_configured_format(self):
-        """A new snapshot inherits the endpoint config's timestamp_format."""
+        """A created snapshot renders its name under the endpoint's timestamp_format."""
         endpoint = MagicMock()
         endpoint.config = {"timestamp_format": "%Y%m%dT%H%M%S"}
         snap = Snapshot("/snap", "home-", endpoint, str_to_date("20240115-143022"))
-        assert snap.time_format == "%Y%m%dT%H%M%S"
         assert snap.get_name() == "home-20240115T143022"
 
-    def test_explicit_time_format_overrides_endpoint(self):
-        """An explicit time_format is preserved regardless of endpoint config."""
+    def test_an_observed_name_wins_over_the_endpoint_format(self):
+        """A name passed in (the listing path) is remembered verbatim; the
+        endpoint's configured format does not re-render it. Mutation guard: a
+        constructor that ignores ``name`` renders home-20240115T143022 here."""
         endpoint = MagicMock()
         endpoint.config = {"timestamp_format": "%Y%m%dT%H%M%S"}
         snap = Snapshot(
@@ -835,21 +877,21 @@ class TestSnapshotTimeFormat:
             "home-",
             endpoint,
             str_to_date("20240115-143022"),
-            time_format=DATE_FORMAT,
+            name="home-20240115-143022",
         )
         assert snap.get_name() == "home-20240115-143022"
 
-    def test_legacy_snapshot_regenerates_legacy_name(self):
-        """A legacy-named snapshot regenerates its exact on-disk name even when a
-        different format is configured (round-trip safety for existing chains)."""
+    def test_legacy_name_is_remembered_not_regenerated(self):
+        """The list_snapshots shape: the preferred format was tried, the parse
+        fell back to the default, and the snapshot carries the OBSERVED string
+        -- not whatever the configured format would render."""
         endpoint = MagicMock()
         endpoint.config = {"timestamp_format": "%Y%m%dT%H%M%S"}
-        # Simulate the list_snapshots parse path: preferred format tried, fell back.
-        time_obj, matched = parse_snapshot_time(
+        time_obj, _ = parse_snapshot_time(
             "20240115-143022", endpoint.config["timestamp_format"]
         )
         snap = Snapshot(
-            "/snap", "home-", endpoint, time_obj=time_obj, time_format=matched
+            "/snap", "home-", endpoint, time_obj=time_obj, name="home-20240115-143022"
         )
         assert snap.get_name() == "home-20240115-143022"
 
@@ -858,4 +900,84 @@ class TestSnapshotTimeFormat:
         endpoint = MagicMock()
         endpoint.config = {"timestamp_format": ""}
         snap = Snapshot("/snap", "home-", endpoint, str_to_date("20240115-143022"))
-        assert snap.time_format == DATE_FORMAT
+        assert snap.get_name() == "home-20240115-143022"
+
+    def test_a_parse_but_no_roundtrip_name_resolves_to_its_own_path(self, tmp_path):
+        """THE defect the remembered name fixes. strptime accepts single-digit
+        fields the format would zero-pad, so 'home.2026-9-8_020304' parses
+        under %Y-%m-%d_%H%M%S yet re-renders as 'home.2026-09-08_020304'; on a
+        regenerating get_name(), get_path() pointed at that phantom -- and
+        prune deletes by get_path(). Self-check FIRST: if strptime ever stops
+        accepting the fixture, this test fails loudly instead of quietly
+        pinning nothing."""
+        fmt = "%Y-%m-%d_%H%M%S"
+        observed = "home.2026-9-8_020304"
+        time_obj, matched = parse_snapshot_time(observed[len("home.") :], fmt)
+        regenerated = "home." + time.strftime(matched, time_obj)
+        assert regenerated != observed, (
+            "fixture self-check: the name must NOT round-trip, or this test "
+            "no longer tests the remembered name"
+        )
+        endpoint = MagicMock()
+        endpoint.config = {"timestamp_format": fmt}
+        snap = Snapshot(tmp_path, "home.", endpoint, time_obj=time_obj, name=observed)
+        (tmp_path / observed).mkdir()
+        assert snap.get_name() == observed
+        assert snap.get_path() == tmp_path / observed
+        assert snap.get_path().exists()
+
+
+class TestNameIdentityAndOrdering:
+    """__eq__ is the NAME (duck-typed via get_name); __lt__ is time_obj, then
+    a tie-break derived from the name so ordering is total and deterministic."""
+
+    def _snap(self, name, stamp="20240115-143022", prefix="home-"):
+        return Snapshot("/snap", prefix, MagicMock(), str_to_date(stamp), name=name)
+
+    def test_same_timestamp_different_names_are_different_snapshots(self):
+        """The _N collision class: equal (prefix, time_obj), unequal names.
+        Under (prefix, time)-identity these collided in presence checks,
+        dedup, and lock keys. Paired with the positive case below so an
+        __eq__ returning NotImplemented for everything cannot pass both."""
+        a = self._snap("home-20240115-143022")
+        b = self._snap("home-20240115-143022_1")
+        assert a != b
+
+    def test_same_name_is_the_same_snapshot_across_objects(self):
+        a = self._snap("home-20240115-143022")
+        b = self._snap("home-20240115-143022")
+        assert a == b
+
+    def test_equality_is_duck_typed_on_get_name(self):
+        """A non-Snapshot carrying get_name() -- RawSnapshot's shape -- compares
+        by name: the cross-type relation raw restore relies on."""
+
+        class NamedThing:
+            def get_name(self):
+                return "home-20240115-143022"
+
+        assert self._snap("home-20240115-143022") == NamedThing()
+        assert self._snap("home-20240115-143023") != NamedThing()
+
+    def test_comparison_against_nameless_objects_falls_back(self):
+        """No get_name() -> NotImplemented -> identity fallback, never a crash."""
+        snap = self._snap("home-20240115-143022")
+        assert snap != None  # noqa: E711
+        assert snap != 5
+
+    def test_same_second_ordering_is_total_and_deterministic(self):
+        """Two same-second snapshots must order the same way every run --
+        find_parent walks a sorted list and must not pick arbitrarily. Without
+        the tie-break neither a < b nor b < a is true and this fails."""
+        a = self._snap("home-20240115-143022")
+        b = self._snap("home-20240115-143022_1")
+        assert a < b
+        assert not b < a
+
+    def test_trailing_ordinals_order_numerically(self):
+        """X_2 before X_10: the btrbk counter is a number, and a bare
+        name-string tie-break inverts it. Mutation guard for exactly that."""
+        two = self._snap("home-20240115-143022_2")
+        ten = self._snap("home-20240115-143022_10")
+        assert two < ten
+        assert not ten < two

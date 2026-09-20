@@ -22,7 +22,6 @@ def _snap(stamp, uuid="", received_uuid=""):
         "home-",
         None,
         time_obj=time.strptime(stamp, "%Y%m%d-%H%M%S"),
-        time_format="%Y%m%d-%H%M%S",
     )
     s.uuid = uuid
     s.received_uuid = received_uuid
@@ -33,8 +32,15 @@ def _snap_named(name, stamp, uuid="", received_uuid=""):
     """A snapshot with an EXPLICIT name decoupled from its timestamp -- the real snapper shape
     (``{config}-{number}-{date}``), so two snapshots can share a same-second ``time_obj`` yet
     keep distinct identities/uuids (which the vanilla name==timestamp ``_snap`` cannot express)."""
-    s = _snap(stamp, uuid=uuid, received_uuid=received_uuid)
-    s.get_name = lambda: name  # type: ignore[method-assign]
+    s = __util__.Snapshot(
+        "/snaps",
+        "home-",
+        None,
+        time_obj=time.strptime(stamp, "%Y%m%d-%H%M%S"),
+        name=name,
+    )
+    s.uuid = uuid
+    s.received_uuid = received_uuid
     return s
 
 

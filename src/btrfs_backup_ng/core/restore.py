@@ -95,9 +95,18 @@ def _find_older_parent(snapshot, all_snapshots: list):
     Returns:
         The most recent snapshot older than `snapshot`, or None if none exists.
     """
+    if getattr(snapshot, "time_obj", None) is None:
+        # No derivable time, no honest "older": a wrong parent fails the
+        # receive; no parent is a full restore, which always works.
+        logger.debug(
+            "No parent for %s: its name yields no timestamp.",
+            snapshot.get_name(),
+        )
+        return None
     candidates = []
     for s in all_snapshots:
-        # Only consider snapshots that are strictly older
+        # Only consider snapshots that are strictly older. A timestamp-less
+        # candidate sorts AFTER every dated snapshot, so it can never pass.
         if s < snapshot:
             candidates.append(s)
 
@@ -124,6 +133,14 @@ def find_snapshot_by_name(name: str, snapshots: list):
     return None
 
 
+def _receive_order_key(snap):
+    """Total order for receive sequencing: dated snapshots oldest-first, any
+    timestamp-less member ahead of them (see the caller's comment). The tuple
+    keys are only ever compared within the same has-time class."""
+    time_obj = getattr(snap, "time_obj", None)
+    return (time_obj is not None, time_obj if time_obj is not None else ())
+
+
 def find_snapshot_before_time(
     target_time: time.struct_time,
     snapshots: list,
@@ -138,10 +155,19 @@ def find_snapshot_before_time(
         Most recent Snapshot before target_time, or None
     """
     candidates = []
+    undated = 0
     for snap in snapshots:
         if hasattr(snap, "time_obj") and snap.time_obj is not None:
             if snap.time_obj <= target_time:
                 candidates.append(snap)
+        else:
+            undated += 1
+    if undated:
+        logger.info(
+            "%d snapshot(s) have no derivable timestamp and cannot be matched "
+            "against a time bound; they were not considered.",
+            undated,
+        )
 
     if not candidates:
         return None
@@ -781,8 +807,14 @@ def restore_snapshots(
             if snap not in all_to_restore:
                 all_to_restore.append(snap)
 
-    # Sort by time (oldest first for proper parent chain)
-    all_to_restore.sort(key=lambda s: s.time_obj if s.time_obj else 0)
+    # Sort by time (oldest first for proper parent chain). A snapshot with no
+    # derivable timestamp is placed FIRST: in practice such a member is an old
+    # base (a foreign-named full snapshot a chain was built on), and a base
+    # must be received before anything that parents off it. If that guess is
+    # ever wrong, btrfs receive fails LOUDLY on the missing parent -- it never
+    # applies a delta to the wrong subvolume. The sort is stable, so
+    # discovery order is preserved among equals.
+    all_to_restore.sort(key=_receive_order_key)
 
     # Filter out existing if skip_existing
     if skip_existing:

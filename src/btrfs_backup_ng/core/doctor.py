@@ -580,6 +580,35 @@ class Doctor:
 
         # Config loaded successfully
         volumes = self.config.get_enabled_volumes() if self.config else []
+        declared = list(self.config.volumes) if self.config else []
+        if not volumes:
+            # A valid configuration that backs up NOTHING is the one verdict
+            # doctor must not bless: `run` and `prune` operate only on
+            # enabled volumes, so an unattended machine with this config
+            # performs no backups while doctor said all-clear.
+            if declared:
+                message = (
+                    f"Configuration is valid, but all {len(declared)} "
+                    "volume(s) are disabled: `run` will back up NOTHING. "
+                    "Enable at least one volume (only `snapshot` and "
+                    "`transfer` accept --volume overrides; `run` and "
+                    "`prune` do not)."
+                )
+            else:
+                message = (
+                    "Configuration is valid, but declares no volumes: "
+                    "`run` will back up NOTHING. Add a [[volumes]] entry."
+                )
+            findings.append(
+                DiagnosticFinding(
+                    category=DiagnosticCategory.CONFIG,
+                    severity=DiagnosticSeverity.WARN,
+                    check_name="config_valid",
+                    message=message,
+                    details={"declared": len(declared), "enabled": 0},
+                )
+            )
+            return findings
         findings.append(
             DiagnosticFinding(
                 category=DiagnosticCategory.CONFIG,

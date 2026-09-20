@@ -8,7 +8,14 @@ from .. import endpoint
 from ..__logger__ import create_logger
 from ..config import ConfigError, find_config_file, load_config
 from ..transaction import get_transaction_stats, read_transaction_log
-from .common import get_log_level, get_timestamp_format, thread_ssh_target_config
+from btrfs_backup_ng import __util__
+
+from .common import (
+    get_log_level,
+    get_timestamp_format,
+    resolve_snapshot_dir,
+    thread_ssh_target_config,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -101,13 +108,17 @@ def execute_status(args: argparse.Namespace) -> int:
         try:
             source_path = Path(volume.path).resolve()
 
-            snapshot_dir = Path(volume.snapshot_dir)
-            if not snapshot_dir.is_absolute():
-                # Relative snapshot_dir: relative to source volume
-                full_snapshot_dir = (source_path / snapshot_dir).resolve()
-            else:
-                # Absolute snapshot_dir: add source name as subdirectory
-                full_snapshot_dir = (snapshot_dir / source_path.name).resolve()
+            # ONE resolution for every command (resolve_snapshot_dir), so
+            # this command reads exactly the directory run/snapshot write. A
+            # missing absolute base is refused there with the mount diagnosis
+            # instead of the generic warning below.
+            try:
+                full_snapshot_dir = resolve_snapshot_dir(
+                    volume.snapshot_dir, source_path
+                )
+            except __util__.AbortError as e:
+                logger.warning("  %s", e)
+                continue
 
             if full_snapshot_dir.exists():
                 source_kwargs = dict(endpoint_kwargs)
