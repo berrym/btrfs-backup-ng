@@ -24,10 +24,10 @@ from btrfs_backup_ng.__util__ import Snapshot
 
 
 def _snapshot(prefix="home-", time_obj=None):
-    snap = Snapshot("/snapshots", prefix, None)
-    if time_obj is not None:
-        snap.time_obj = time_obj
-    return snap
+    # time_obj goes through the constructor: the name is set once there, so
+    # mutating .time_obj afterwards would no longer change identity -- a
+    # different time means a different NAME, which is what these tests pin.
+    return Snapshot("/snapshots", prefix, None, time_obj=time_obj)
 
 
 class TestComparingAgainstAForeignType:

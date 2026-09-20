@@ -2354,7 +2354,9 @@ def send_snapper_snapshot(
                 destination_endpoint.config["path"] = saved_path
 
         # Metadata sidecar (endpoint-aware; carries original_xml for restore).
-        _write_snapper_metadata(snapper_snapshot, destination_endpoint)
+        _write_snapper_metadata(
+            snapper_snapshot, destination_endpoint, source_wrapper.get_name()
+        )
 
         duration = time.monotonic() - transfer_start
         log_transaction(
@@ -2429,27 +2431,24 @@ def _create_snapper_snapshot_wrapper(snapper_snapshot, destination_endpoint=None
     )
 
     # Create wrapper - use the snapper subvolume path as the location's parent
-    # and the backup name as the effective name
+    # and the backup name as the snapshot's native (remembered) name, so every
+    # consumer -- transfer, metadata, correspondence keys -- sees the one
+    # string rendered here rather than re-deriving it.
     wrapper = __util__.Snapshot(
         location=snapper_snapshot.subvolume_path.parent,
         prefix="",  # No prefix - we use the full backup name
         endpoint=source_endpoint,
         time_obj=time_obj,
+        name=backup_name,
     )
 
-    # Override get_name and get_path to return snapper-specific values
-    # Use setattr to avoid type checker complaints about dynamic attributes
-    setattr(wrapper, "_snapper_name", backup_name)
+    # Only get_path needs an override: the snapper subvolume does not live at
+    # location/name. Use setattr to avoid type checker complaints.
     setattr(wrapper, "_snapper_path", snapper_snapshot.subvolume_path)
-
-    # Monkey-patch methods to return correct values
-    def get_name_override():
-        return getattr(wrapper, "_snapper_name")
 
     def get_path_override():
         return getattr(wrapper, "_snapper_path")
 
-    wrapper.get_name = get_name_override
     wrapper.get_path = get_path_override
 
     # Enrich the wrapper's btrfs uuid / received_uuid (sudo-escalated `subvolume show` via the
@@ -2462,12 +2461,19 @@ def _create_snapper_snapshot_wrapper(snapper_snapshot, destination_endpoint=None
     return wrapper
 
 
-def _write_snapper_metadata(snapper_snapshot, destination_endpoint) -> None:
+def _write_snapper_metadata(
+    snapper_snapshot, destination_endpoint, backup_name: str
+) -> None:
     """Write snapper metadata file to destination.
 
     Args:
         snapper_snapshot: SnapperSnapshot object
         destination_endpoint: Destination endpoint
+        backup_name: The name the backup was actually written under -- the ONE
+            string rendered when the transfer wrapper was built. Re-rendering
+            it here from the destination's timestamp_format named the sidecar
+            after a format that may since have changed, splitting the metadata
+            from its stream.
     """
     from ..snapper.metadata import BackupMetadata, save_backup_metadata
 
@@ -2485,10 +2491,7 @@ def _write_snapper_metadata(snapper_snapshot, destination_endpoint) -> None:
         original_xml=original_xml,
     )
 
-    # Determine metadata file path at destination
-    backup_name = snapper_snapshot.get_backup_name(
-        destination_endpoint.config.get("timestamp_format")
-    )
+    # Metadata file path at destination, from the name the backup actually used
     dest_path = Path(destination_endpoint.config["path"])
     meta_file = dest_path / f"{backup_name}.snapper-meta.json"
 

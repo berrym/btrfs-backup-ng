@@ -52,7 +52,6 @@ def _snap_named(ep, path, stamp):
         "home-",
         ep,
         time_obj=time.strptime(stamp, "%Y%m%d-%H%M%S"),
-        time_format="%Y%m%d-%H%M%S",
     )
 
 

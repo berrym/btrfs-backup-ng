@@ -2694,7 +2694,7 @@ print(json.dumps(result))
         for snap_name, (_score, line, _snap_path) in best.items():
             date_part = snap_name[len(snap_prefix) :]
             try:
-                time_obj, matched_fmt = __util__.parse_snapshot_time(
+                time_obj, _ = __util__.parse_snapshot_time(
                     date_part, self.config.get("timestamp_format")
                 )
             except Exception as e:
@@ -2708,7 +2708,7 @@ print(json.dumps(result))
                 snap_prefix,
                 self,
                 time_obj=time_obj,
-                time_format=matched_fmt,
+                name=snap_name,
             )
             # Identity comes from the chosen line, which is the destination's own
             # copy -- never a same-named subvolume elsewhere on the filesystem.

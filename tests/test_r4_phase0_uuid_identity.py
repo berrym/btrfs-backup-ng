@@ -95,7 +95,6 @@ def _named_snaps(ep, path):
             "home-",
             ep,
             time_obj=time.strptime(stamp, "%Y%m%d-%H%M%S"),
-            time_format="%Y%m%d-%H%M%S",
         )
         for stamp in ("20240101-000000", "20240102-000000")
     ]
@@ -274,15 +273,11 @@ def test_identity_unchanged_despite_differing_uuids(tmp_path):
     identity."""
     ep = _local(tmp_path)
     t = time.strptime("20240101-000000", "%Y%m%d-%H%M%S")
-    a = __util__.Snapshot(
-        tmp_path, "home-", ep, time_obj=t, time_format="%Y%m%d-%H%M%S"
-    )
-    b = __util__.Snapshot(
-        tmp_path, "home-", ep, time_obj=t, time_format="%Y%m%d-%H%M%S"
-    )
+    a = __util__.Snapshot(tmp_path, "home-", ep, time_obj=t)
+    b = __util__.Snapshot(tmp_path, "home-", ep, time_obj=t)
     a.uuid, a.received_uuid = "aaaa", "xxxx"
     b.uuid, b.received_uuid = "bbbb", "yyyy"
-    assert a == b  # identity is still (prefix, time_obj)
+    assert a == b  # identity is the name; uuids are carried, not consulted
     # find_parent still treats them as the same snapshot (already-present -> None)
     assert a.find_parent([b]) is None
 

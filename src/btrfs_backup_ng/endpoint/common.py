@@ -314,7 +314,7 @@ class Endpoint:
                 # period -- this message used to say "wait a second and retry"
                 # there too, which cannot work and misdiagnosed a same-day
                 # collision as a same-second one.
-                fmt = snapshot.time_format
+                fmt = self.config.get("timestamp_format") or __util__.DATE_FORMAT
                 period = __util__.indistinguishable_period(fmt)
                 where = (
                     f"A snapshot named '{snapshot.get_name()}' already exists "
@@ -527,7 +527,7 @@ class Endpoint:
                 date_part = item_path.name[len(snap_prefix) :]
                 logger.debug("Parsing date from: %r", date_part)
                 try:
-                    time_obj, matched_fmt = __util__.parse_snapshot_time(
+                    time_obj, _ = __util__.parse_snapshot_time(
                         date_part, self.config.get("timestamp_format")
                     )
                 except Exception as e:
@@ -542,7 +542,7 @@ class Endpoint:
                     snap_prefix,
                     self,
                     time_obj=time_obj,
-                    time_format=matched_fmt,
+                    name=item_path.name,
                 )
                 snapshots.append(snapshot)
         # R3: load persisted retention locks back onto the snapshots. set_lock writes them
@@ -878,7 +878,7 @@ class Endpoint:
                 snapshot.prefix,
                 self,
                 time_obj=snapshot.time_obj,
-                time_format=snapshot.time_format,
+                name=snapshot.get_name(),
             )
         path = str(snapshot.get_path())
         if any(str(s.get_path()) == path for s in self.__cached_snapshots):

@@ -74,9 +74,37 @@ def _endpoint_timestamp_format(endpoint: Any) -> str:
     return DATE_FORMAT
 
 
+#: A trailing ``_N`` in a snapshot name -- btrbk's collision counter. Bounded
+#: at 9 digits so a pathological name cannot allocate a huge int; anything
+#: longer is treated as not-an-ordinal.
+_TRAILING_ORDINAL_RE = re.compile(r"_(\d{1,9})$")
+
+
+def _name_ordinal(name: str) -> int:
+    """The numeric value of a trailing ``_N`` in a snapshot name, else 0.
+
+    ORDERING metadata only, never identity: two snapshots sharing a timestamp
+    sort by it, so ``X_2`` precedes ``X_10`` where the bare name string would
+    order them the other way round. The value is DERIVED from the name on each
+    comparison; nothing stores it.
+    """
+    match = _TRAILING_ORDINAL_RE.search(name)
+    return int(match.group(1)) if match else 0
+
+
 @functools.total_ordering
 class Snapshot:
-    """Represents a snapshot with comparison by prefix and time_obj."""
+    """A snapshot whose identity is its NAME, observed once and never recomputed.
+
+    A listing constructs this with the on-disk name it OBSERVED; the creation
+    path renders the name exactly once, in ``__init__``, from the endpoint's
+    configured timestamp_format. Either way ``get_name()``/``get_path()``
+    always resolve to the entry the snapshot came from -- prune deletes and
+    lock keys go through them, so a name that parses but does not re-render
+    identically (strptime accepts single-digit fields the format would pad)
+    must never be rebuilt from its timestamp. ``time_obj`` is a derived
+    attribute for ordering and retention math, not a source of the name.
+    """
 
     def __init__(
         self,
@@ -84,7 +112,7 @@ class Snapshot:
         prefix: str,
         endpoint: Any,
         time_obj: time.struct_time | None = None,
-        time_format: str | None = None,
+        name: str | None = None,
     ) -> None:
         self.location = Path(location)
         self.prefix = prefix
@@ -98,33 +126,40 @@ class Snapshot:
             # precision, which struct_time cannot hold in the first place.
             time_obj = time.localtime()
         self.time_obj = time_obj
-        # The format used to render/parse this snapshot's timestamp. Stored per
-        # instance so a snapshot parsed under a legacy format regenerates the
-        # exact on-disk name even when a different timestamp_format is configured.
-        if time_format is None:
-            time_format = _endpoint_timestamp_format(endpoint)
-        self.time_format = time_format
+        if name is None:
+            # The creation path: render the name ONCE, here, under the
+            # endpoint's configured timestamp_format. From this point the name
+            # is a fact about the snapshot, never a function of its attributes;
+            # every listing passes the observed on-disk string instead.
+            name = prefix + date_to_str(
+                time_obj, fmt=_endpoint_timestamp_format(endpoint)
+            )
+        self.name = name
         self.locks: set = set()
         self.parent_locks: set = set()
         # btrfs subvolume identity, populated best-effort at enumeration (Phase 0).
         # ``uuid`` is this snapshot's own UUID; ``received_uuid`` is set on a subvolume
         # produced by ``btrfs receive`` and equals the source subvolume's UUID -- the
         # correspondence btrfs incremental send/receive actually uses. Empty when it
-        # could not be read (non-root, non-btrfs, older btrfs-progs). NOT part of
-        # identity yet: __eq__/__lt__ remain name/time based in Phase 0.
+        # could not be read (non-root, non-btrfs, older btrfs-progs). NOT part
+        # of identity: __eq__ is name-based, __lt__ time-then-name.
         self.uuid = ""
         self.received_uuid = ""
 
     def __eq__(self, other: object) -> bool:
-        # NotImplemented, not an AttributeError. Annotating this signature (which
-        # must take `object` -- Python compares a Snapshot against anything)
-        # exposed that the body assumed the other side was a Snapshot, so
-        # `snapshot == None` raised AttributeError instead of returning False.
-        # Returning NotImplemented lets Python fall back to identity, which is
-        # the documented contract and what every caller already assumed.
-        if not isinstance(other, Snapshot):
+        # Identity is the NAME -- the one fact a comparison shares with the
+        # filesystem. Duck-typed via get_name(), mirroring RawSnapshot.__eq__,
+        # so a raw backup equals the btrfs snapshot it came from. Two snapshots
+        # sharing a timestamp but not a name (a trailing _N, a foreign spelling)
+        # are DIFFERENT snapshots and no longer collide in presence checks,
+        # dedup, or lock keys. NotImplemented, not AttributeError, for anything
+        # without get_name(): Python then falls back to identity, so
+        # `snapshot == None` is False rather than a crash -- the documented
+        # contract every caller assumes.
+        other_get_name = getattr(other, "get_name", None)
+        if other_get_name is None:
             return NotImplemented
-        return self.prefix == other.prefix and self.time_obj == other.time_obj
+        return self.name == other_get_name()
 
     def __lt__(self, other: "Snapshot") -> bool:
         if self.prefix != other.prefix:
@@ -132,14 +167,29 @@ class Snapshot:
             raise NotImplementedError(
                 msg,
             )
-        return self.time_obj < other.time_obj
+        if self.time_obj != other.time_obj:
+            return self.time_obj < other.time_obj
+        # Same timestamp: break the tie so ordering is total and deterministic
+        # -- find_parent must never pick one of two same-second snapshots
+        # arbitrarily. A trailing _N (btrbk's collision counter) orders
+        # numerically, so X_2 precedes X_10; any other difference falls back
+        # to the name string. Ordering metadata only -- the ordinal is derived
+        # from the name, never stored on the snapshot.
+        self_name = self.get_name()
+        other_name = other.get_name()
+        return (_name_ordinal(self_name), self_name) < (
+            _name_ordinal(other_name),
+            other_name,
+        )
 
     def __repr__(self) -> str:
         return self.get_name()
 
     def get_name(self) -> str:
-        """Return a snapshot's name."""
-        return self.prefix + date_to_str(self.time_obj, fmt=self.time_format)
+        """Return the snapshot's name: observed at listing, or rendered once
+        at creation. Never recomputed -- prune deletes by the path built from
+        this, so it must be the string the filesystem actually holds."""
+        return self.name
 
     def get_path(self) -> Path:
         """Return full path to a snapshot."""
@@ -442,9 +492,10 @@ def parse_snapshot_time(
     ``preferred_fmt`` (a configured ``timestamp_format``) is tried first when
     given, then the built-in ``DATE_FORMAT`` is tried as a fallback so snapshots
     created under a previous format stay readable after the format changes.
-    ``matched_fmt`` is the format that actually parsed the string, so the caller
-    can regenerate the identical on-disk name. Raises ``ValueError`` if no
-    candidate format matches.
+    ``matched_fmt`` is the format that actually parsed the string. Nothing may
+    regenerate a name from it -- names are observed and remembered
+    (``Snapshot.name``) -- but a caller can still use it to report WHICH format
+    matched. Raises ``ValueError`` if no candidate format matches.
     """
     formats = []
     if preferred_fmt:

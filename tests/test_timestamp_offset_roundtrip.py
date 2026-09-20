@@ -12,6 +12,7 @@ send, verify -- was pointed at a name that does not exist.
 """
 
 import time
+from types import SimpleNamespace
 
 import pytest
 
@@ -36,7 +37,7 @@ def test_the_path_a_snapshot_reports_is_the_one_it_came_from(tmp_path):
         "home.",
         None,
         time_obj=time.strptime(name, OFFSET_FMT),
-        time_format=OFFSET_FMT,
+        name=f"home.{name}",
     )
     on_disk = tmp_path / f"home.{name}"
     on_disk.mkdir()
@@ -50,7 +51,8 @@ def test_a_new_snapshot_is_named_with_its_offset():
     """Snapshot.__init__ used to round-trip its time through DATE_FORMAT, which
     has no %z, so strptime returned tm_gmtoff=None and a freshly created
     snapshot was named without the offset its own format asked for."""
-    snap = Snapshot("/snaps", "home.", None, time_format=OFFSET_FMT)
+    endpoint = SimpleNamespace(config={"timestamp_format": OFFSET_FMT})
+    snap = Snapshot("/snaps", "home.", endpoint)
     rendered = snap.get_name()
 
     assert rendered[-5] in "+-", f"no offset in {rendered!r}"
