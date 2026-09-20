@@ -180,6 +180,63 @@ path = "/mnt/backup"
         with pytest.raises(ConfigError, match="retention"):
             load_config(bad_config)
 
+    @pytest.mark.parametrize(
+        "line,culprit",
+        [
+            ("daily = true", "daily"),  # True is 1: keeps ONE where 7 was meant
+            ('hourly = "seven"', "hourly"),  # crashed mid-prune with TypeError
+            ('hourly = "7"', "hourly"),  # same rule as keep: int-only, no coercion
+            ("monthly = -3", "monthly"),  # silently disabled the tier
+            ("yearly = false", "yearly"),  # bool, not a count
+            ("weekly = 4.0", "weekly"),  # float, not a count
+        ],
+    )
+    def test_load_invalid_retention_bucket_counts(self, tmp_config_dir, line, culprit):
+        """A bucket count that is not a non-negative int fails LOUD at load.
+
+        Reproduced before the fix: `daily = true` loaded with ZERO warnings,
+        and over 11 daily snapshots a policy meant to keep 7 kept 2 and
+        deleted 9 -- Python counts True as 1, so a one-character TOML slip
+        silently destroyed six snapshots the policy said to keep. Strings
+        instead crashed with a TypeError in the middle of the prune. Mutation
+        guards: dropping the bool arm re-admits `daily = true`; dropping the
+        negative arm re-admits `monthly = -3`; dropping the isinstance arm
+        re-admits the strings and the float."""
+        bad_config = tmp_config_dir / "bad_bucket.toml"
+        bad_config.write_text(f"""
+[global.retention]
+{line}
+
+[[volumes]]
+path = "/home"
+
+[[volumes.targets]]
+path = "/mnt/backup"
+""")
+        with pytest.raises(ConfigError, match=culprit):
+            load_config(bad_config)
+
+    def test_load_valid_retention_bucket_counts_still_load(self, tmp_config_dir):
+        """The rule rejects only non-counts: real ints, including 0 (tier
+        disabled), load exactly as before."""
+        good_config = tmp_config_dir / "good_buckets.toml"
+        good_config.write_text("""
+[global.retention]
+hourly = 0
+daily = 14
+yearly = 2
+
+[[volumes]]
+path = "/home"
+
+[[volumes.targets]]
+path = "/mnt/backup"
+""")
+        config, warnings = load_config(good_config)
+        retention = config.global_config.retention
+        assert (retention.hourly, retention.daily, retention.yearly) == (0, 14, 2)
+        assert retention.weekly == 4  # untouched default
+
     def test_load_nonexistent_file(self, tmp_path):
         """Test error when loading nonexistent file."""
         with pytest.raises(ConfigError, match="Cannot read config file"):

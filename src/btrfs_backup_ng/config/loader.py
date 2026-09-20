@@ -164,13 +164,39 @@ def _parse_retention(data: dict[str, Any]) -> RetentionConfig:
             f"(0 means use the time buckets instead)."
         )
 
+    # The five time buckets get the same fail-loud rule as `keep` above: a
+    # count must be a non-negative int and never a bool. Unvalidated, these
+    # were the project's worst live typo: TOML `daily = true` loaded with zero
+    # warnings, Python counts True as 1, and a policy meant to keep 7 daily
+    # snapshots kept one -- measured over 11 snapshots, daily=7 kept 8 and
+    # deleted 3 while daily=true kept 2 and deleted 9. A string ("seven", or
+    # even "7") instead crashed with a TypeError mid-prune, long after the
+    # load that should have refused it.
+    buckets: dict[str, int] = {}
+    for bucket, default in (
+        ("hourly", 24),
+        ("daily", 7),
+        ("weekly", 4),
+        ("monthly", 12),
+        ("yearly", 0),
+    ):
+        value = data.get(bucket, default)
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            raise ConfigError(
+                f"Invalid retention {bucket!r}: {value!r}. It is the NUMBER of "
+                f"{bucket} bucket snapshots to keep, so it must be a "
+                f"non-negative whole number (a boolean is not a count: "
+                f"`{bucket} = true` would silently mean 1)."
+            )
+        buckets[bucket] = value
+
     return RetentionConfig(
         min=min_value,
-        hourly=data.get("hourly", 24),
-        daily=data.get("daily", 7),
-        weekly=data.get("weekly", 4),
-        monthly=data.get("monthly", 12),
-        yearly=data.get("yearly", 0),
+        hourly=buckets["hourly"],
+        daily=buckets["daily"],
+        weekly=buckets["weekly"],
+        monthly=buckets["monthly"],
+        yearly=buckets["yearly"],
         keep=keep,
         # Which keys this block actually wrote, so a narrower scope inherits the
         # rest from the scope above instead of resetting them to the defaults
