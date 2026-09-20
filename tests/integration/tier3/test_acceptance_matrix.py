@@ -35,17 +35,22 @@ exists to prevent. There are currently no such cells.
 
 from __future__ import annotations
 
+import hashlib
+from pathlib import Path
 import shlex
 
 import pytest
 
 from .conftest import (
+    DELTA_BYTES,
     requires_container,
+    requires_snapper,
     assert_increment_restored,
     assert_payload_restored,
     requires_local,
     requires_raw_remote,
     requires_remote,
+    sh,
 )
 
 pytestmark = [pytest.mark.tier3, requires_local]
@@ -676,4 +681,136 @@ class TestRestoreReportsHonestly:
         assert r.returncode != 0, (
             f"restore exited {r.returncode} having restored nothing from an empty "
             f"location; output: {(r.stdout + r.stderr)[-500:]}"
+        )
+
+
+# --------------------------------------------------------------------------- #
+# snapper source
+# --------------------------------------------------------------------------- #
+
+
+def _received_uuid_local(subvol: Path) -> str:
+    r = sh(["btrfs", "subvolume", "show", str(subvol)])
+    for line in r.stdout.splitlines():
+        if "Received UUID" in line:
+            return line.split(":", 1)[1].strip()
+    return ""
+
+
+def _received_uuid_remote(subvol: str) -> str:
+    from .conftest import remote_sh
+
+    r = remote_sh(f"sudo -n btrfs subvolume show '{subvol}' 2>/dev/null")
+    for line in r.stdout.splitlines():
+        if "Received UUID" in line:
+            return line.split(":", 1)[1].strip()
+    return ""
+
+
+def _snapper_lifecycle(rig, snap, target, *, extra_args=()):
+    """Base backup, a real delta, an incremental backup -- each rc asserted
+    here, and the increment proven by its bytes at the destination, never
+    by a snapshot merely having arrived.
+
+    This is the cell 0.9.7 did not have. A snapper backup to a btrfs target
+    receives into `.snapshots/<n>.incoming` and publishes it as
+    `.snapshots/<n>`; that slot had only ever existed as a side effect of
+    the `mkdir -p` the endpoints ran on any path a receive was pointed at,
+    and removing those (a backup location is never created) removed the slot
+    with them. The engine then refused the missing slot and every snapper
+    backup to btrfs failed, while every unit test mocked the send.
+    """
+    results = {}
+    base_num = snap.take("base")
+    r1 = rig.cli("snapper", "backup", snap.name, target, *extra_args)
+    results["backup_rc"] = r1.returncode
+    results["backup_out"] = (r1.stdout + r1.stderr)[-2000:]
+    assert results["backup_rc"] == 0, results["backup_out"]
+
+    delta = snap.mutate()
+    delta_num = snap.take("delta")
+    r2 = rig.cli("snapper", "backup", snap.name, target, *extra_args)
+    results["incremental_rc"] = r2.returncode
+    results["incremental_out"] = (r2.stdout + r2.stderr)[-3000:]
+    assert results["incremental_rc"] == 0, results["incremental_out"]
+    # The console renderer wraps long lines, so the log is compared with its
+    # whitespace collapsed.
+    flat = " ".join(results["incremental_out"].split())
+    assert f"incremental from {base_num}" in flat, (
+        "the second backup was not sent as an increment of the first\n"
+        + results["incremental_out"]
+    )
+    results["delta"] = delta
+    results["numbers"] = (base_num, delta_num)
+    return results
+
+
+@requires_snapper
+class TestSnapperSource:
+    def test_local_btrfs(self, rig, snapper_source):
+        target = rig.dst / "snapper"
+        target.mkdir()
+        res = _snapper_lifecycle(rig, snapper_source, str(target))
+
+        base_num, delta_num = res["numbers"]
+        for n in res["numbers"]:
+            slot = target / ".snapshots" / str(n) / "snapshot"
+            assert slot.is_dir(), f"slot {n} was not published: {res}"
+            assert _received_uuid_local(slot), f"slot {n} has no Received UUID"
+            assert (target / ".snapshots" / str(n) / "info.xml").is_file()
+        assert not (target / ".snapshots" / f"{delta_num}.incoming").exists(), (
+            "the receive slot was left unpublished"
+        )
+        landed = (
+            target / ".snapshots" / str(delta_num) / "snapshot" / "extra.bin"
+        ).read_bytes()
+        assert landed == res["delta"], (
+            f"the increment's bytes did not land in slot {delta_num}"
+        )
+        assert len(landed) == DELTA_BYTES
+
+    def test_local_missing_target_is_refused_and_not_created(self, rig, snapper_source):
+        target = rig.dst / "unmounted" / "snapper"
+        r = rig.cli("snapper", "backup", snapper_source.name, str(target))
+        out = r.stdout + r.stderr
+        assert r.returncode != 0, out
+        assert "Nothing was created" in out, out
+        assert not (rig.dst / "unmounted").exists(), "the missing target was built"
+
+    @requires_remote
+    def test_ssh(self, rig, snapper_source):
+        from .conftest import REMOTE_SPEC, remote_sh
+
+        base = f"{rig.remote_base}/snapper"
+        remote_sh(f"mkdir -p '{base}'")
+        loc = f"ssh://{REMOTE_SPEC}:{base}"
+        res = _snapper_lifecycle(rig, snapper_source, loc, extra_args=("--ssh-sudo",))
+
+        base_num, delta_num = res["numbers"]
+        for n in res["numbers"]:
+            slot = f"{base}/.snapshots/{n}/snapshot"
+            assert _received_uuid_remote(slot), f"slot {n} not published on the remote"
+        assert (
+            remote_sh(f"test -e '{base}/.snapshots/{delta_num}.incoming'").returncode
+            != 0
+        )
+        digest = hashlib.sha256(res["delta"]).hexdigest()
+        r = remote_sh(f"sha256sum '{base}/.snapshots/{delta_num}/snapshot/extra.bin'")
+        assert r.stdout.split()[:1] == [digest], (
+            f"the increment's bytes did not land in slot {delta_num} on the "
+            f"remote: {r.stdout} {r.stderr}"
+        )
+
+    @requires_remote
+    def test_ssh_missing_target_is_refused_and_not_created(self, rig, snapper_source):
+        from .conftest import REMOTE_SPEC, remote_sh
+
+        never = f"{rig.remote_base}/never-snapper"
+        loc = f"ssh://{REMOTE_SPEC}:{never}"
+        r = rig.cli("snapper", "backup", snapper_source.name, loc, "--ssh-sudo")
+        out = r.stdout + r.stderr
+        assert r.returncode != 0, out
+        assert "Nothing was created" in out, out
+        assert remote_sh(f"test -e '{never}'").returncode != 0, (
+            "the missing remote target was built"
         )
