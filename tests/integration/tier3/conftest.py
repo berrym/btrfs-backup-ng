@@ -44,6 +44,7 @@ REMOTE_SPEC = os.environ.get("BBNG_TEST_SSH_HOST", "")
 RAW_REMOTE_SPEC = os.environ.get("BBNG_TEST_RAW_SSH_HOST", "")
 RIG_ROOT = Path(os.environ.get("BBNG_TEST_RIG", "/tmp/bbng-tier3"))
 PAYLOAD_BYTES = 2 * 1024 * 1024
+DELTA_BYTES = 1024 * 1024
 
 
 def _have_local() -> bool:
@@ -199,6 +200,11 @@ class Rig:
     remote_base: str
     raw_remote_base: str
     payload: bytes
+    #: Bytes written by the most recent mutate_source(). payload.bin is
+    #: identical in every snapshot of the chain, so it can only prove that SOME
+    #: snapshot arrived; this is the file that differs between the base and the
+    #: increment, and therefore the only thing that can prove the second leg.
+    delta: bytes = b""
 
     @property
     def source_volume(self) -> Path:
@@ -258,19 +264,19 @@ class Rig:
         path.write_text("\n".join(lines))
         return path
 
-    def mutate_source(self) -> None:
-        """Change the source so the next backup has a genuine delta to send."""
+    def mutate_source(self) -> bytes:
+        """Change the source so the next backup has a genuine delta to send.
+
+        Returns the delta bytes, and remembers them as ``self.delta``, so a
+        caller can prove the INCREMENTAL leg actually landed. Without that a
+        cell can only compare payload.bin, which this method deliberately does
+        not touch and which is therefore byte-identical in every snapshot of
+        the chain -- matching it proves a snapshot arrived, never which one.
+        """
+        self.delta = os.urandom(DELTA_BYTES)
         (self.source_volume / "generation").write_text(str(time.time()))
-        sh(
-            [
-                "dd",
-                "if=/dev/urandom",
-                f"of={self.source_volume}/extra.bin",
-                "bs=1M",
-                "count=1",
-                "status=none",
-            ]
-        )
+        (self.source_volume / "extra.bin").write_bytes(self.delta)
+        return self.delta
 
     # -- effect checks: never trust the exit code -------------------------- #
 
@@ -357,9 +363,20 @@ def _rig_up(remote_base: str, raw_remote_base: str) -> Rig:
     raw = RIG_ROOT / "raw"
     raw.mkdir(parents=True, exist_ok=True)
 
+    # A destination used ONLY by the empty-prefix cells. An empty prefix is not
+    # a filter, so a cell configured with one restores whatever is newest at its
+    # destination -- including a prefixed sibling cell's snapshots when the
+    # destination is shared. That made the increment unprovable there (payload
+    # .bin is identical in every snapshot, so the payload check passed on
+    # another cell's data). Isolating the destination is what lets those cells
+    # prove they restored their OWN increment.
+    (dst / "bare").mkdir(parents=True, exist_ok=True)
+
     if REMOTE_SPEC:
         remote_sh(
-            f"rm -rf '{remote_base}'; mkdir -p '{remote_base}/btrfs' '{remote_base}/raw'"
+            f"rm -rf '{remote_base}'; "
+            f"mkdir -p '{remote_base}/btrfs' '{remote_base}/btrfs-bare' "
+            f"'{remote_base}/raw'"
         )
     if RAW_REMOTE_SPEC:
         raw_remote_sh(f"rm -rf '{raw_remote_base}'; mkdir -p '{raw_remote_base}/raw'")
@@ -430,24 +447,78 @@ def rig():
         _rig_down(base, raw_base)
 
 
+def _restored_roots(dest: Path) -> list[Path]:
+    """Every directory a restore may have landed a subvolume in."""
+    return [dest, *(p for p in sorted(dest.iterdir()) if p.is_dir())]
+
+
+def _restored_listing(dest: Path) -> list[str]:
+    return sorted(
+        str(f.relative_to(dest)) for r in _restored_roots(dest) for f in r.iterdir()
+    )
+
+
 def assert_payload_restored(dest: Path, expected: bytes) -> None:
     """A restore counts only when the source bytes are actually present.
 
     The .btrfs-backup-ng bookkeeping directory is created regardless, so
     "the directory is not empty" reports success for a restore that moved no
     data -- observed on master returning rc=0 with exactly that.
+
+    EVERY restored root is checked, not just the first match. Returning on the
+    first meant a restore that delivered one good subvolume and one corrupt one
+    passed, and under --all that is precisely the interesting case.
     """
     assert dest.exists(), f"restore produced no destination at {dest}"
-    for base in [dest, *(p for p in dest.iterdir() if p.is_dir())]:
+    found = 0
+    for base in _restored_roots(dest):
         candidate = base / "payload.bin"
         if candidate.is_file():
             actual = candidate.read_bytes()
             assert actual == expected, (
-                f"restored payload differs from the source: {len(actual)} bytes vs "
-                f"{len(expected)} expected"
+                f"restored payload at {candidate} differs from the source: "
+                f"{len(actual)} bytes vs {len(expected)} expected"
             )
-            return
-    listing = sorted(p.name for p in dest.iterdir())
+            found += 1
+    if not found:
+        raise AssertionError(
+            f"no payload.bin anywhere under {dest}; restore moved no data. "
+            f"Contents: {_restored_listing(dest)}"
+        )
+
+
+def assert_increment_restored(
+    dest: Path, expected_delta: bytes, context: str = ""
+) -> None:
+    """The INCREMENTAL snapshot landed, not merely the base it descends from.
+
+    This is the assertion the suite did not have. payload.bin is written once
+    at rig setup and never changed, so it is identical in the base and in every
+    increment: assert_payload_restored cannot tell a restore that delivered the
+    whole chain from one that delivered the parent and silently dropped the
+    delta. extra.bin exists only after mutate_source, so its presence AND its
+    content are what prove the second leg arrived.
+
+    EVERY restored root is searched, and the check passes if ANY holds the
+    delta. Restoring an incremental snapshot necessarily delivers its parent
+    too, so the destination legitimately holds both; an earlier version stopped
+    at the first extra.bin it found, which under a shared rig is the PARENT
+    carrying a previous cell's delta -- a false failure that accused the
+    product of dropping an increment it had in fact delivered.
+    """
+    assert dest.exists(), f"restore produced no destination at {dest}"
+    assert expected_delta, "no delta recorded; mutate_source() was never called"
+    seen = []
+    for base in _restored_roots(dest):
+        candidate = base / "extra.bin"
+        if candidate.is_file():
+            if candidate.read_bytes() == expected_delta:
+                return
+            seen.append(str(candidate.relative_to(dest)))
     raise AssertionError(
-        f"no payload.bin anywhere under {dest}; restore moved no data. Contents: {listing}"
+        f"the increment's bytes are nowhere under {dest}. The delta written "
+        f"immediately before the second backup is in none of the restored "
+        f"roots, so the restore delivered the parent and dropped the increment. "
+        f"extra.bin present but stale at: {seen or 'nowhere'}. "
+        f"Contents: {_restored_listing(dest)}" + context
     )

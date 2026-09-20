@@ -41,6 +41,7 @@ import pytest
 
 from .conftest import (
     requires_container,
+    assert_increment_restored,
     assert_payload_restored,
     requires_local,
     requires_raw_remote,
@@ -59,26 +60,45 @@ pytestmark = [pytest.mark.tier3, requires_local]
 
 
 def _lifecycle(rig, config, *, location, prefix, extra_args=(), snapper=False):
-    """Backup, incremental, verify, prune, restore -- asserting on effects."""
+    """Backup, incremental, verify, prune, restore -- asserting on effects.
+
+    The restore half asserts here rather than at the call site, deliberately.
+    It used to return a dict and leave every check to the caller, and the
+    result was that the restore's return code was discarded outright and
+    ``incremental_rc`` was recorded by this function and asserted by no cell at
+    all -- so a restore that failed, or that delivered the parent and dropped
+    the increment, passed every cell in the matrix. A proof a caller can forget
+    to demand is not a proof.
+    """
     results = {}
 
     r = rig.cli("run", config=config)
     results["backup_rc"] = r.returncode
     results["backup_out"] = (r.stdout + r.stderr)[-2000:]
 
-    rig.mutate_source()
+    delta = rig.mutate_source()
     r2 = rig.cli("run", config=config)
     results["incremental_rc"] = r2.returncode
+    results["incremental_out"] = (r2.stdout + r2.stderr)[-2000:]
 
     rv = rig.cli("verify", location, "--prefix", prefix, *extra_args)
     results["verify_rc"] = rv.returncode
     results["verify_out"] = (rv.stdout + rv.stderr)[-2000:]
 
+    before = rig.cli("list", config=config)
+    results["listed_before_prune"] = (before.stdout + before.stderr)[-1500:]
     rp = rig.cli("prune", "--yes", config=config)
     results["prune_rc"] = rp.returncode
+    results["prune_out"] = (rp.stdout + rp.stderr)[-1500:]
+    after = rig.cli("list", config=config)
+    results["listed_after_prune"] = (after.stdout + after.stderr)[-1500:]
 
-    dest = rig.src / f"restored-{prefix.strip('-')}"
-    rig.cli(
+    # Keyed by the config stem, not the prefix: the rig is module-scoped and
+    # two cells legitimately share an empty prefix, so a prefix-derived name
+    # aimed both of them at the same directory and let the second pass on the
+    # first one's restored artifacts.
+    dest = rig.src / f"restored-{config.stem}"
+    rr = rig.cli(
         "restore",
         location,
         str(dest),
@@ -87,7 +107,30 @@ def _lifecycle(rig, config, *, location, prefix, extra_args=(), snapper=False):
         "--yes-i-know-what-i-am-doing",
         *extra_args,
     )
+    results["restore_rc"] = rr.returncode
+    results["restore_out"] = (rr.stdout + rr.stderr)[-2000:]
     results["restore_dest"] = dest
+    results["delta"] = delta
+
+    assert results["incremental_rc"] == 0, results["incremental_out"]
+    # verify and prune join the in-lifecycle asserts for the same reason the
+    # restore did: verify_rc was asserted by three cells and forgotten by four
+    # -- raw+ssh, the target whose broken restore hid through 0.9.6, among
+    # them -- and prune_rc by one. verify exits 2 on zero matching snapshots
+    # (core/verify.py), so rc 0 proves snapshots were found AND verified.
+    assert results["verify_rc"] == 0, results["verify_out"]
+    assert results["prune_rc"] == 0, results["prune_out"]
+    assert results["restore_rc"] == 0, results["restore_out"]
+    assert_payload_restored(dest, rig.payload)
+    assert_increment_restored(
+        dest,
+        delta,
+        context=(
+            f"\n\n--- listed BEFORE prune ---\n{results['listed_before_prune']}"
+            f"\n--- prune rc={results['prune_rc']} ---\n{results['prune_out']}"
+            f"\n--- listed AFTER prune ---\n{results['listed_after_prune']}"
+        ),
+    )
     return results
 
 
@@ -208,28 +251,39 @@ class TestAnExplicitEmptyPrefix:
     def test_the_whole_cycle_under_a_bare_timestamp_name(self, rig):
         cfg = rig.write_config(
             rig.root / "cfg-empty-prefix.toml",
-            f'path = "{rig.dst}"',
+            f'path = "{rig.dst / "bare"}"',
             prefix="",
             snapshot_dir="snapshots-bare-local",
         )
-        res = _lifecycle(rig, cfg, location=str(rig.dst), prefix="")
+        res = _lifecycle(rig, cfg, location=str(rig.dst / "bare"), prefix="")
 
         assert res["backup_rc"] == 0, res["backup_out"]
 
-        # At least one BARE-timestamp name landed. Not "every name here is
-        # bare": the rig is shared, so other cells' prefixed snapshots sit at
-        # this same destination, and with an empty prefix there is no prefix to
-        # filter them out by -- which is the point of the configuration.
+        # EVERY name here is bare. This cell owns its destination, so there is
+        # no prefixed sibling to excuse a derived name -- the weaker "at least
+        # one is bare" was a concession to a shared destination that also made
+        # the increment unprovable, since an empty prefix is not a filter and
+        # the restore could return another cell's snapshot.
         #
         # Basenames: both subvol helpers return the `path` field of
         # `btrfs subvolume list`, which is a path relative to the filesystem
         # root ("@home/operator/.../t3ssh-...") rather than a bare name.
-        landed = [n.rsplit("/", 1)[-1] for n in rig.local_btrfs_subvols(rig.dst)]
+        # `btrfs subvolume list -o` scopes to the CONTAINING SUBVOLUME, not
+        # the directory argument -- the trap endpoint/ssh.py documents -- so
+        # the raw listing includes every sibling cell's snapshot on this
+        # filesystem. Filter to entries whose fs-relative path lives under
+        # bare/ before judging their names, or the strengthened assert below
+        # fails on a sibling's prefixed snapshot (measured: t3loc-* leaked in).
+        landed = [
+            n.rsplit("/", 1)[-1]
+            for n in rig.local_btrfs_subvols(rig.dst / "bare")
+            if n.startswith("bare/") or "/bare/" in n
+        ]
         assert landed, "nothing landed at the destination"
-        bare = [n for n in landed if n[:1].isdigit()]
-        assert bare, (
-            f"no bare-timestamp name at the destination, only {landed} -- an "
-            "empty prefix was replaced by a derived one"
+        derived = [n for n in landed if not n[:1].isdigit()]
+        assert not derived, (
+            f"a non-bare name at the destination: {derived} -- an empty prefix "
+            "was replaced by a derived one"
         )
 
         assert_payload_restored(res["restore_dest"], rig.payload)
@@ -238,7 +292,7 @@ class TestAnExplicitEmptyPrefix:
     def test_the_same_over_ssh(self, rig):
         from .conftest import REMOTE_SPEC
 
-        loc = f"ssh://{REMOTE_SPEC}:{rig.remote_base}/btrfs"
+        loc = f"ssh://{REMOTE_SPEC}:{rig.remote_base}/btrfs-bare"
         cfg = rig.write_config(
             rig.root / "cfg-empty-prefix-ssh.toml",
             # ssh_sudo, as every other ssh:// cell does: btrfs on the remote
@@ -250,18 +304,30 @@ class TestAnExplicitEmptyPrefix:
             prefix="",
             snapshot_dir="snapshots-bare-ssh",
         )
-        res = _lifecycle(rig, cfg, location=loc, prefix="")
+        # --ssh-sudo, matching this cell's own `ssh_sudo = true`: `btrfs
+        # subvolume list` needs root on the remote, so without it the restore
+        # leg cannot enumerate and exits 1. It went unnoticed while the restore
+        # return code was discarded and the payload check was satisfied by the
+        # sibling cell's artifacts at a shared destination.
+        res = _lifecycle(rig, cfg, location=loc, prefix="", extra_args=("--ssh-sudo",))
 
         assert res["backup_rc"] == 0, res["backup_out"]
+        # Same -o scoping trap as the local cell, plus this listing still
+        # pointed at the OLD shared /btrfs directory after the destination
+        # moved to /btrfs-bare -- it passed only because -o enumerates the
+        # whole containing subvolume, which happened to include both. List
+        # the cell's own destination and filter to it, then hold the same
+        # every-name-bare bar as the local cell.
         landed = [
             n.rsplit("/", 1)[-1]
-            for n in rig.remote_btrfs_subvols(f"{rig.remote_base}/btrfs")
+            for n in rig.remote_btrfs_subvols(f"{rig.remote_base}/btrfs-bare")
+            if "btrfs-bare/" in n
         ]
         assert landed, "nothing landed on the remote"
-        bare = [n for n in landed if n[:1].isdigit()]
-        assert bare, (
-            f"no bare-timestamp name on the remote, only {landed} -- an empty "
-            "prefix was replaced by a derived one"
+        derived = [n for n in landed if not n[:1].isdigit()]
+        assert not derived, (
+            f"a non-bare name on the remote: {derived} -- an empty prefix "
+            "was replaced by a derived one"
         )
 
         assert_payload_restored(res["restore_dest"], rig.payload)
