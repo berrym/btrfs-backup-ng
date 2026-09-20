@@ -2057,6 +2057,45 @@ def _destination_subvolume(destination_endpoint, source_path) -> str:
     return f"{dest}/{_Path(str(source_path)).name}"
 
 
+def _snapper_prepare_slot(destination_endpoint, snapshot_num) -> None:
+    """Create the ``.snapshots/{num}.incoming`` receive slot BELOW an existing target.
+
+    The slot used to appear as a side effect: the transfer engine and every
+    endpoint ran ``mkdir -p`` on whatever path the receive was pointed at, and
+    this flow points it at the slot. When those sites were removed (a
+    backup location is never created, #102) nothing created the slot
+    any more, and a snapper backup to a btrfs target failed with "does not
+    exist" for a directory that had only ever existed because of the defect.
+
+    The slot is this flow's own transactional temp, so this flow creates it:
+    explicitly, one component at a time, under a target that must already be
+    there. There is no ``-p`` anywhere in the script, so a missing target
+    cannot be rebuilt by it; it is refused with the same diagnosis every other
+    path gives a missing configured destination.
+    """
+    base = str(destination_endpoint.config["path"]).rstrip("/")
+    q = shlex.quote
+    snap_dir = f"{base}/.snapshots"
+    incoming_dir = f"{snap_dir}/{snapshot_num}.incoming"
+    script = (
+        f"[ -d {q(base)} ] || {{ echo NOTARGET; exit 3; }}; "
+        f"[ -d {q(snap_dir)} ] || mkdir {q(snap_dir)} || exit 1; "
+        f"[ -d {q(incoming_dir)} ] || mkdir {q(incoming_dir)} || exit 1"
+    )
+    rc, out = _snapper_run_shell(destination_endpoint, script)
+    if rc == 3 or "NOTARGET" in (out or ""):
+        raise __util__.SnapshotTransferError(
+            __util__.missing_backup_location_message("Snapper backup target", base)
+        )
+    if rc != 0:
+        raise __util__.SnapshotTransferError(
+            f"Could not create the receive slot {incoming_dir} for snapshot "
+            f"{snapshot_num} (shell exit {rc}): the backup user cannot write "
+            f"the .snapshots tree under {base}, or the target is not there. "
+            "Nothing was created."
+        )
+
+
 def _snapper_publish_slot(destination_endpoint, snapshot_num) -> None:
     """Publish ``.snapshots/{num}.incoming`` as ``.snapshots/{num}``, replacing an occupied slot
     (a recycled snapper number) WITHOUT a data-loss window.
@@ -2322,6 +2361,13 @@ def send_snapper_snapshot(
             # be kept out for BOTH halves, not just the transfer, or it can
             # publish between this receive and this rename.
             #
+            # The target is checked BEFORE the slot lock is taken: the lock
+            # lives under the target, so against a missing target the lock
+            # acquisition would fail first and report a lock directory that
+            # "could not be created" instead of the actual condition. This is
+            # the engine's own check, with the same diagnosis on every
+            # transport; nothing is created by it.
+            _ensure_destination_exists(destination_endpoint)
             # The lock is named for exactly what the transfer beneath will lock,
             # so that call finds it already held rather than taking a second one.
             slot_lock = _receiving_lock(
@@ -2330,6 +2376,8 @@ def send_snapper_snapshot(
             with slot_lock:
                 # Clear any leftover temp from a prior crashed run before receiving.
                 _cleanup_snapper_backup(destination_endpoint, snapshot_num, is_raw)
+                # Then make the slot, below the target and only there.
+                _snapper_prepare_slot(destination_endpoint, snapshot_num)
                 saved_path = destination_endpoint.config["path"]
                 destination_endpoint.config["path"] = incoming
                 try:
