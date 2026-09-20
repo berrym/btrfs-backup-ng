@@ -237,6 +237,57 @@ path = "/mnt/backup"
         assert (retention.hourly, retention.daily, retention.yearly) == (0, 14, 2)
         assert retention.weekly == 4  # untouched default
 
+    def test_load_non_utf8_config_is_a_config_error(self, tmp_config_dir):
+        """A non-UTF-8 byte made load_config raise a raw UnicodeDecodeError --
+        a ValueError, not a ConfigError -- so every caller that catches
+        ConfigError showed a traceback instead of a config error. TOML
+        mandates UTF-8, so strict decoding is kept; the refusal names the
+        file and the fix. Mutation guard: dropping the except arm re-raises
+        the raw UnicodeDecodeError and pytest.raises(ConfigError) fails."""
+        bad = tmp_config_dir / "latin1.toml"
+        bad.write_bytes(b'path = "/mnt/x\xff"\n')
+        with pytest.raises(ConfigError, match="not valid UTF-8"):
+            load_config(bad)
+
+    @pytest.mark.parametrize(
+        "literal",
+        ["42", '["key-a", "key-b"]', '{ id = "x" }'],
+    )
+    def test_load_non_string_gpg_recipient_is_a_config_error(
+        self, tmp_config_dir, literal
+    ):
+        """gpg_recipient accepted any type and only died mid-backup, when the
+        endpoint built ["gpg", "--encrypt", "--recipient", value] against an
+        often-offsite destination. Every other encryption key in that block
+        fails at load; now this one does too. Mutation guard: dropping the
+        isinstance check lets all three shapes load clean."""
+        bad = tmp_config_dir / "gpg.toml"
+        bad.write_text(f"""
+[[volumes]]
+path = "/home"
+
+[[volumes.targets]]
+path = "raw:///mnt/backup"
+encrypt = "gpg"
+gpg_recipient = {literal}
+""")
+        with pytest.raises(ConfigError, match="gpg_recipient"):
+            load_config(bad)
+
+    def test_load_string_gpg_recipient_still_loads(self, tmp_config_dir):
+        good = tmp_config_dir / "gpg-ok.toml"
+        good.write_text("""
+[[volumes]]
+path = "/home"
+
+[[volumes.targets]]
+path = "raw:///mnt/backup"
+encrypt = "gpg"
+gpg_recipient = "ABCD1234"
+""")
+        config, _warnings = load_config(good)
+        assert config.volumes[0].targets[0].gpg_recipient == "ABCD1234"
+
     def test_load_nonexistent_file(self, tmp_path):
         """Test error when loading nonexistent file."""
         with pytest.raises(ConfigError, match="Cannot read config file"):

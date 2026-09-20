@@ -440,7 +440,8 @@ class TestDoctor:
         config_file.write_text("[global]\n")
 
         mock_config = MagicMock()
-        mock_config.get_enabled_volumes.return_value = []
+        mock_config.volumes = [MagicMock()]
+        mock_config.get_enabled_volumes.return_value = mock_config.volumes
         mock_load.return_value = (mock_config, [])
 
         doctor = Doctor(config_path=config_file)
@@ -455,7 +456,8 @@ class TestDoctor:
         config_file.write_text("[global]\n")
 
         mock_config = MagicMock()
-        mock_config.get_enabled_volumes.return_value = []
+        mock_config.volumes = [MagicMock()]
+        mock_config.get_enabled_volumes.return_value = mock_config.volumes
         mock_load.return_value = (mock_config, ["Warning 1", "Warning 2"])
 
         doctor = Doctor(config_path=config_file)

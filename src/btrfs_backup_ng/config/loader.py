@@ -274,6 +274,15 @@ def _parse_target(data: dict[str, Any]) -> TargetConfig:
         )
     if encrypt == "gpg" and not gpg_recipient:
         raise ConfigError(f"gpg_recipient is required when encrypt=gpg (target {path})")
+    if gpg_recipient is not None and not isinstance(gpg_recipient, str):
+        # Every other encryption key in this block fails at load; this one
+        # accepted any type and only died mid-backup, when endpoint code
+        # built ["gpg", "--encrypt", "--recipient", <value>] against an
+        # often-offsite destination.
+        raise ConfigError(
+            f"Invalid gpg_recipient for target {path}: {gpg_recipient!r}. "
+            "It must be a string (a GPG key ID, fingerprint, or user id)."
+        )
 
     # Host-key policy is a SECURITY selector: fail CLOSED on an unrecognized value rather
     # than silently falling back to a default (a typo'd "strict" must not degrade to
@@ -944,6 +953,18 @@ def load_config(path: Path | str) -> tuple[Config, list[str]]:
             data = tomllib.load(f)
     except tomllib.TOMLDecodeError as e:
         raise ConfigError(f"Invalid TOML syntax: {e}")
+    except UnicodeDecodeError as e:
+        # tomllib mandates UTF-8; a config byte outside it escaped as a raw
+        # UnicodeDecodeError, which nothing catching ConfigError could see --
+        # every caller showed a traceback instead of a config error. Strict
+        # decoding is kept deliberately: TOML forbids other encodings, and
+        # silently accepting them would let a file load here that no other
+        # TOML tool can read.
+        raise ConfigError(
+            f"Config file is not valid UTF-8: {path}: {e}. TOML files must "
+            "be UTF-8; re-save the file in UTF-8 (the bad byte is at the "
+            "position named above)."
+        )
     except OSError as e:
         raise ConfigError(f"Cannot read config file: {e}")
 
