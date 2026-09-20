@@ -128,3 +128,54 @@ class TestRememberedNamesOnRealBtrfs:
                 if (snap_dir / name).exists():
                     delete_subvolume(snap_dir / name)
             delete_subvolume(source)
+
+
+@pytest.mark.tier2
+@requires_btrfs
+class TestCollisionSuffixOnRealBtrfs:
+    def test_same_period_snapshots_become_base_and_suffixes(self, btrfs_volume: Path):
+        """The Phase D proof the unit tests cannot give: THE REAL
+        endpoint.snapshot() -- real btrfs subvolume snapshot commands, real
+        filesystem -- called three times under a daily timestamp_format
+        produces X, X_1 and X_2 as three DISTINCT subvolumes, each returned
+        name matching its on-disk entry. Before this change the second call
+        of the day was refused."""
+        source = btrfs_volume / "source"
+        subprocess.run(
+            ["btrfs", "subvolume", "create", str(source)],
+            check=True,
+            capture_output=True,
+        )
+        (source / "data.txt").write_text("payload")
+        snap_dir = btrfs_volume / "snapshots"
+        snap_dir.mkdir()
+
+        endpoint = LocalEndpoint(
+            config={
+                "source": str(source),
+                "path": str(snap_dir),
+                "snapshot_folder": str(snap_dir),
+                "snap_prefix": "home.",
+                "timestamp_format": "%Y%m%d",
+            }
+        )
+        created = []
+        try:
+            for _ in range(3):
+                snap = endpoint.snapshot()
+                created.append(snap.get_name())
+                on_disk = snap_dir / snap.get_name()
+                assert on_disk.is_dir(), f"{snap.get_name()} returned but not on disk"
+                assert on_disk.stat().st_ino == 256, (
+                    f"{snap.get_name()} is not a subvolume"
+                )
+
+            assert len(set(created)) == 3, f"names not distinct: {created}"
+            base = created[0]
+            assert created[1] == f"{base}_1"
+            assert created[2] == f"{base}_2"
+        finally:
+            for name in created:
+                if (snap_dir / name).exists():
+                    delete_subvolume(snap_dir / name)
+            delete_subvolume(source)

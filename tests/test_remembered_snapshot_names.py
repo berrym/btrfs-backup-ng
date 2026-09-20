@@ -444,3 +444,133 @@ def test_the_confirmation_marker_discriminates():
     plain.newly_visible = False
     assert "not visible to earlier releases" in newly_visible_mark(marked)
     assert newly_visible_mark(plain) == ""
+
+
+# --------------------------------------------------------------------------- #
+# Phase D: creation-side _N suffixing -- a collision creates a sibling, and
+# the refusal survives only as the exhaustion diagnosis.
+# --------------------------------------------------------------------------- #
+
+
+def _creation_endpoint(tmp_path, monkeypatch, timestamp_format=None):
+    """An endpoint whose ``snapshot()`` runs for real up to the btrfs command,
+    which is replaced by a fake that records the EMITTED command and creates
+    the destination directory -- the environment substituted, never the
+    allocation logic under test. The clock is frozen so names are
+    deterministic."""
+    src = tmp_path / "src"
+    src.mkdir()
+    snaps = tmp_path / "snaps"
+    snaps.mkdir()
+    fixed = __util__.str_to_date("2026-01-02 03:04:05", fmt="%Y-%m-%d %H:%M:%S")
+    monkeypatch.setattr(time, "localtime", lambda *args: fixed)
+    config = {
+        "source": str(src),
+        "path": str(snaps),
+        "snapshot_folder": str(snaps),
+        "snap_prefix": "t-",
+    }
+    if timestamp_format is not None:
+        config["timestamp_format"] = timestamp_format
+    ep = LocalEndpoint(config=config)
+    emitted = []
+
+    def fake_exec(options, **kwargs):
+        command = options.get("command")
+        args = [a[0] if isinstance(a, tuple) else a for a in command]
+        emitted.append(args)
+        if "snapshot" in args:
+            Path(str(args[-1])).mkdir()
+
+    monkeypatch.setattr(ep, "_exec_command", fake_exec)
+    monkeypatch.setattr(ep, "_remount", lambda *a, **k: None)
+    return ep, snaps, emitted
+
+
+def test_a_collision_creates_the_suffixed_sibling(tmp_path, monkeypatch):
+    """The btrbk-compatible counter replaces the refusal: with t-X on disk,
+    snapshot() creates t-X_1. Asserted on the FILESYSTEM and on the emitted
+    command -- "no exception" alone would let a silent no-op pass. Mutation
+    guards: an empty allocator range falls through to the refusal and this
+    dies on AbortError; dropping the newly_visible assignment dies on the
+    flag assert."""
+    ep, snaps, emitted = _creation_endpoint(tmp_path, monkeypatch)
+    base = "t-20260102-030405"
+    (snaps / base).mkdir()  # the colliding snapshot
+
+    snap = ep.snapshot()
+
+    assert snap.get_name() == f"{base}_1"
+    assert (snaps / f"{base}_1").is_dir(), "the sibling is not on disk"
+    assert (snaps / base).is_dir(), "the original was disturbed"
+    create = next(args for args in emitted if "snapshot" in args)
+    assert str(create[-1]).endswith(f"{base}_1"), (
+        "the emitted btrfs command targets a different name than the one returned"
+    )
+    assert snap.get_path() == snaps / f"{base}_1"
+    assert snap.time_obj is not None, "the sibling lost its creation time"
+    assert snap.newly_visible, "prune surfaces would not mark it this run"
+
+
+def test_the_lowest_free_suffix_wins(tmp_path, monkeypatch):
+    """btrbk semantics: with X, X_1 and X_3 taken, the next is X_2 -- the
+    lowest free, not max+1 and not a blind retry of _1. Mutation guard: an
+    allocator pinned to _1 attempts a name that exists and dies here."""
+    ep, snaps, _ = _creation_endpoint(tmp_path, monkeypatch)
+    base = "t-20260102-030405"
+    for name in (base, f"{base}_1", f"{base}_3"):
+        (snaps / name).mkdir()
+
+    snap = ep.snapshot()
+
+    assert snap.get_name() == f"{base}_2"
+    assert (snaps / f"{base}_2").is_dir()
+    assert (snaps / f"{base}_3").is_dir(), "an unrelated sibling was disturbed"
+
+
+def test_the_dst_fold_pair_lands_as_base_and_suffix(tmp_path, monkeypatch):
+    """America/New_York fall-back, 2026-11-01: 01:30 EDT and 01:30 EST are an
+    hour apart and render the SAME default-format name. The pair must land as
+    X and X_1 -- before this change the second snapshot of the fold was
+    refused with advice that could not work for another hour."""
+    ep, snaps, _ = _creation_endpoint(tmp_path, monkeypatch)
+    edt = time.struct_time((2026, 11, 1, 1, 30, 0, 6, 305, 1))
+    est = time.struct_time((2026, 11, 1, 1, 30, 0, 6, 305, 0))
+    assert time.strftime(__util__.DATE_FORMAT, edt) == time.strftime(
+        __util__.DATE_FORMAT, est
+    ), "fixture self-check: the fold pair must render identically"
+
+    monkeypatch.setattr(time, "localtime", lambda *args: edt)
+    first = ep.snapshot()
+    monkeypatch.setattr(time, "localtime", lambda *args: est)
+    second = ep.snapshot()
+
+    assert first.get_name() == "t-20261101-013000"
+    assert second.get_name() == "t-20261101-013000_1"
+    assert (snaps / first.get_name()).is_dir()
+    assert (snaps / second.get_name()).is_dir()
+
+
+def test_btrfs_correspondence_never_matches_by_name_even_for_suffixes(tmp_path):
+    """The boundary Phase D must not move: a suffixed name changes nothing
+    about correspondence, which stays received_uuid == uuid for btrfs. A
+    same-named destination entry without the uuid is NOT a correspondent; a
+    differently-named entry with it IS."""
+    from btrfs_backup_ng.endpoint.common import Endpoint
+
+    ep = Endpoint.__new__(Endpoint)
+    ep.config = {"path": tmp_path, "snap_prefix": "t-"}
+
+    source = __util__.Snapshot(tmp_path, "t-", None, name="t-20260102-030405_1")
+    source.uuid = "u-source"
+
+    name_twin = __util__.Snapshot(tmp_path, "t-", None, name="t-20260102-030405_1")
+    name_twin.received_uuid = ""
+    real_copy = __util__.Snapshot(tmp_path, "t-", None, name="t-other-name")
+    real_copy.received_uuid = "u-source"
+
+    ep.list_snapshots = lambda flush_cache=False: [name_twin]  # type: ignore[method-assign]
+    assert ep.correspondent_of(source) is None
+
+    ep.list_snapshots = lambda flush_cache=False: [real_copy]  # type: ignore[method-assign]
+    assert ep.correspondent_of(source) is real_copy

@@ -20,6 +20,13 @@ from btrfs_backup_ng.core.space import SpaceInfo
 from btrfs_backup_ng.core.space import get_space_info as _get_space_info
 from btrfs_backup_ng.endpoint.raw_metadata import StructureVerdict
 
+#: The highest ``_N`` collision suffix creation will allocate before refusing.
+#: btrbk increments its counter unboundedly; a bound here means a pathological
+#: directory (hundreds of same-name collisions) still ends in a diagnosis
+#: instead of an unbounded scan. Within _TRAILING_ORDINAL_RE's 9-digit limit,
+#: so every allocated name derives its timestamp on the next listing.
+_MAX_COLLISION_ORDINAL = 999
+
 
 def _secure_lock_dir(base: Path, euid: int) -> Optional[Path]:
     """Return a euid-owned 0700 ``btrfs-backup-ng-<euid>`` subdir of ``base`` for lock files,
@@ -303,48 +310,82 @@ class Endpoint:
         with FileLock(lock_path):
             logger.debug("Snapshot lock acquired: %s", lock_path)
             if Path(snapshot_path).exists():
-                # A snapshot with this exact name already exists; btrfs would
-                # otherwise fail here with the misleading "Could not create
-                # subvolume: Read-only file system". Diagnose by what the
-                # configured timestamp_format can actually express, not by
-                # assumption: under a seconds-resolving format the cause is two
-                # requests in the same second (or the repeated hour of a DST
-                # fall-back), and waiting is real advice. Under a coarser format
-                # the format itself cannot name a second snapshot within its
-                # period -- this message used to say "wait a second and retry"
-                # there too, which cannot work and misdiagnosed a same-day
-                # collision as a same-second one.
-                fmt = self.config.get("timestamp_format") or __util__.DATE_FORMAT
-                period = __util__.indistinguishable_period(fmt)
-                where = (
-                    f"A snapshot named '{snapshot.get_name()}' already exists "
-                    f"at {snapshot_path}."
-                )
-                if period is None:
-                    raise __util__.AbortError(
-                        f"{where} Two snapshots were likely requested within "
-                        "the same second (identical timestamp); during a "
-                        "daylight-saving fall-back, requests an hour apart can "
-                        "also collide. Wait a second and retry; if the "
-                        "existing snapshot is incomplete, remove it first."
+                # A snapshot with this exact name already exists. Allocate the
+                # lowest free ``_N`` -- btrbk's collision counter -- INSIDE
+                # this lock, the same critical section that performs the
+                # create, so two concurrent runs cannot pick the same N. This
+                # is what makes a coarse timestamp_format usable (its second
+                # snapshot of the period used to be refused outright) and what
+                # absorbs the DST fall-back, where two instants an hour apart
+                # render the same default-format name once a year. Safe only
+                # because names are remembered facts and suffixed names are
+                # visible on every destination type; the suffixed snapshot is
+                # dated by its base timestamp on every later listing.
+                base_name = snapshot.get_name()
+                for ordinal in range(1, _MAX_COLLISION_ORDINAL + 1):
+                    candidate = f"{base_name}_{ordinal}"
+                    if not (snapshot_dir / candidate).exists():
+                        snapshot = __util__.Snapshot(
+                            snapshot_dir,
+                            snap_prefix,
+                            self,
+                            time_obj=snapshot.time_obj,
+                            name=candidate,
+                        )
+                        # Every listing re-derives this flag; set it on the
+                        # object in hand too, so prune surfaces mark it in
+                        # this very run.
+                        snapshot.newly_visible = True
+                        snapshot_path = snapshot.get_path()
+                        logger.info(
+                            "A snapshot named %s already exists (the "
+                            "configured timestamp_format renders this moment "
+                            "to the same name); creating %s instead -- _N is "
+                            "the btrbk-compatible collision counter.",
+                            base_name,
+                            candidate,
+                        )
+                        break
+                else:
+                    # Every suffix up to the bound is taken: fall back to the
+                    # diagnosis. Under a seconds-resolving format the cause is
+                    # two requests in the same second (or the repeated hour of
+                    # a DST fall-back), and waiting is real advice; under a
+                    # coarser format the format itself cannot name another
+                    # snapshot this period, and "wait a second" cannot work.
+                    fmt = self.config.get("timestamp_format") or __util__.DATE_FORMAT
+                    period = __util__.indistinguishable_period(fmt)
+                    where = (
+                        f"A snapshot named '{base_name}' already exists at "
+                        f"{snapshot_path}, and every collision suffix up to "
+                        f"_{_MAX_COLLISION_ORDINAL} is taken."
                     )
-                if period == "more than a day":
+                    if period is None:
+                        raise __util__.AbortError(
+                            f"{where} Two snapshots were likely requested "
+                            "within the same second (identical timestamp); "
+                            "during a daylight-saving fall-back, requests an "
+                            "hour apart can also collide. Wait a second and "
+                            "retry; if the existing snapshot is incomplete, "
+                            "remove it first."
+                        )
+                    if period == "more than a day":
+                        raise __util__.AbortError(
+                            f"{where} The configured timestamp_format {fmt!r} "
+                            "renders the same name for snapshots taken even "
+                            "days apart, so every new snapshot collides with "
+                            "this one. Configure a timestamp_format with "
+                            "finer resolution, or remove the existing "
+                            "snapshot first if it is not needed."
+                        )
                     raise __util__.AbortError(
                         f"{where} The configured timestamp_format {fmt!r} "
-                        "renders the same name for snapshots taken even days "
-                        "apart, so every new snapshot collides with this one. "
-                        "Configure a timestamp_format with finer resolution, "
-                        "or remove the existing snapshot first if it is not "
-                        "needed."
+                        f"gives every snapshot taken in the same {period} "
+                        "the same name, so waiting a second cannot help. "
+                        f"Retry in the next {period}, configure a "
+                        "timestamp_format with finer resolution, or remove "
+                        "the existing snapshot first if it is not needed."
                     )
-                raise __util__.AbortError(
-                    f"{where} The configured timestamp_format {fmt!r} gives "
-                    f"every snapshot taken in the same {period} the same "
-                    "name, so waiting a second cannot help. Retry in the "
-                    f"next {period}, configure a timestamp_format with finer "
-                    "resolution, or remove the existing snapshot first if it "
-                    "is not needed."
-                )
             self._remount(self.config["source"], read_write=True)
             commands = [
                 self._build_snapshot_cmd(
