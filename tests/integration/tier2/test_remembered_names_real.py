@@ -24,6 +24,8 @@ from .conftest import (
 FMT = "%Y-%m-%d_%H%M%S"
 OBSERVED = "home.2026-9-8_020304"  # parses under FMT, does NOT round-trip
 CANONICAL = "home.2026-09-08_020305"
+ORDINAL = "home.2026-09-08_020306_1"  # dated by stripping one trailing _N
+WEIRD = "home.imported-base"  # a subvolume with no derivable timestamp
 
 
 @pytest.mark.tier2
@@ -72,6 +74,57 @@ class TestRememberedNamesOnRealBtrfs:
             assert (snap_dir / CANONICAL).exists(), "the delete took the sibling"
         finally:
             for name in (OBSERVED, CANONICAL):
+                if (snap_dir / name).exists():
+                    delete_subvolume(snap_dir / name)
+            delete_subvolume(source)
+
+    def test_a_foreign_pool_lists_fully_and_deletes_exactly(self, btrfs_volume: Path):
+        """The Phase C acceptance bar on real btrfs, where is_subvolume() runs
+        for real: a pool of 4 subvolumes -- canonical, non-round-tripping,
+        _N-suffixed, and one with no derivable timestamp -- lists as 4, while
+        a README file and a plain lost+found directory are excluded by the
+        inode check, not by name parsing. Deleting the _N snapshot removes
+        exactly that subvolume. Before this release the same pool listed as 2
+        (canonical + non-round-tripping) and the other two were invisible to
+        every listing and every prune."""
+        source = btrfs_volume / "source"
+        subprocess.run(
+            ["btrfs", "subvolume", "create", str(source)],
+            check=True,
+            capture_output=True,
+        )
+        (source / "data.txt").write_text("payload")
+        snap_dir = btrfs_volume / "snapshots"
+        snap_dir.mkdir()
+        for name in (CANONICAL, OBSERVED, ORDINAL, WEIRD):
+            create_snapshot(source, snap_dir / name, readonly=True)
+        (snap_dir / "README.md").write_text("not a snapshot")
+        (snap_dir / "lost+found").mkdir()  # a plain directory, not a subvolume
+
+        endpoint = LocalEndpoint(
+            config={
+                "source": str(source),
+                "path": str(snap_dir),
+                "snap_prefix": "home.",
+                "timestamp_format": FMT,
+            }
+        )
+        try:
+            snaps = {s.get_name(): s for s in endpoint.list_snapshots()}
+            assert set(snaps) == {CANONICAL, OBSERVED, ORDINAL, WEIRD}
+            assert snaps[ORDINAL].time_obj is not None
+            assert snaps[WEIRD].time_obj is None
+            for snap in snaps.values():
+                assert snap.get_path().exists()
+
+            result = endpoint.delete_snapshots([snaps[ORDINAL]])
+
+            assert result.deleted_count == 1
+            assert not (snap_dir / ORDINAL).exists()
+            for name in (CANONICAL, OBSERVED, WEIRD):
+                assert (snap_dir / name).exists(), f"the delete took {name}"
+        finally:
+            for name in (CANONICAL, OBSERVED, ORDINAL, WEIRD):
                 if (snap_dir / name).exists():
                     delete_subvolume(snap_dir / name)
             delete_subvolume(source)

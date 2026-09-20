@@ -2612,9 +2612,14 @@ print(json.dumps(result))
             # Parse, then keep only what is really AT this destination. The list
             # command is filesystem-wide, so the second step is what stops a
             # never-transferred source snapshot being reported as a backup.
-            return self._scope_to_destination(
+            scoped = self._scope_to_destination(
                 self._parse_snapshot_list(output, path), path
             )
+            # Announce AFTER scoping: an entry scoping rejected is not at this
+            # destination, and announcing it here would report a snapshot the
+            # listing does not return.
+            self._report_newly_visible(scoped)
+            return scoped
         except RuntimeError:
             raise
         except Exception as e:
@@ -2693,15 +2698,14 @@ print(json.dumps(result))
         snapshots: List[Any] = []
         for snap_name, (_score, line, _snap_path) in best.items():
             date_part = snap_name[len(snap_prefix) :]
-            try:
-                time_obj, _ = __util__.parse_snapshot_time(
-                    date_part, self.config.get("timestamp_format")
-                )
-            except Exception as e:
-                # Debug level - it's normal for a directory to hold items that do
-                # not match the snapshot naming pattern.
-                logger.debug("Skipping non-snapshot item: %r (%s)", snap_name, e)
-                continue
+            # Every candidate here came off a `btrfs subvolume list` line, so
+            # each one IS a subvolume -- the "is this a snapshot at all"
+            # question the local listing answers with is_subvolume() is
+            # already answered. A name that yields no timestamp is therefore a
+            # snapshot with no extractable time, listed rather than skipped.
+            time_obj, parsed_as_written = __util__.derive_snapshot_time(
+                date_part, self.config.get("timestamp_format")
+            )
 
             snapshot = __util__.Snapshot(
                 self.config["path"],
@@ -2710,6 +2714,7 @@ print(json.dumps(result))
                 time_obj=time_obj,
                 name=snap_name,
             )
+            snapshot.newly_visible = not parsed_as_written
             # Identity comes from the chosen line, which is the destination's own
             # copy -- never a same-named subvolume elsewhere on the filesystem.
             line_ids = __util__.parse_subvolume_list(line)

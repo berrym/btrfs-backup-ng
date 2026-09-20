@@ -348,11 +348,33 @@ def execute_retention_deletes(
             errors.append(f"Delete {snap.get_name()}: {e}")
             continue
         deleted += outcome.deleted_count
+        for snapshot in outcome.deleted:
+            # Named individually when earlier releases could not list it: a
+            # count alone reads the same whether this week's snapshots died or
+            # a foreign pool that had been invisible for months did.
+            if getattr(snapshot, "newly_visible", False):
+                logger.info(
+                    "  Deleted %s -- not visible to earlier btrfs-backup-ng "
+                    "releases; this may be the first run able to see or "
+                    "delete it.",
+                    snapshot.get_name(),
+                )
         for snapshot, reason in outcome.failed:
             errors.append(f"Delete {snapshot.get_name()}: {reason}")
         for snapshot, reason in outcome.skipped:
             logger.info("  Kept %s: %s", snapshot.get_name(), reason)
     return deleted, errors
+
+
+def newly_visible_mark(snap: Any) -> str:
+    """The marker a deletion surface appends to a snapshot earlier releases
+    could not list. Until this release such a snapshot was invisible to every
+    listing, so an operator may have had it for months without the tool ever
+    showing it -- and the first prune that can see it is exactly the wrong
+    moment to find out. Empty for ordinarily-visible snapshots."""
+    if getattr(snap, "newly_visible", False):
+        return " [not visible to earlier releases]"
+    return ""
 
 
 def _log_retention(label: str, retention: Any) -> None:
@@ -607,7 +629,12 @@ def execute_prune(args: argparse.Namespace) -> int:
     if dry_run:
         for _ep, to_delete, label in plan:
             for snap in to_delete:
-                logger.info("  Would delete (%s): %s", label, snap.get_name())
+                logger.info(
+                    "  Would delete (%s): %s%s",
+                    label,
+                    snap.get_name(),
+                    newly_visible_mark(snap),
+                )
         total_deleted = total_to_delete
     elif total_to_delete == 0:
         logger.info("Nothing to prune")
@@ -621,7 +648,7 @@ def execute_prune(args: argparse.Namespace) -> int:
             for _ep, to_delete, label in plan:
                 print(f"  {label} -- {len(to_delete)}:")
                 for snap in to_delete:
-                    print(f"    - {snap.get_name()}")
+                    print(f"    - {snap.get_name()}{newly_visible_mark(snap)}")
             print(f"Proceed with deleting {total_to_delete}? [y/N] ", end="")
             proceed = input().strip().lower() in ("y", "yes")
         if not proceed:

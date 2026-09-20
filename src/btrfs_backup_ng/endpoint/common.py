@@ -526,16 +526,18 @@ class Endpoint:
             ):
                 date_part = item_path.name[len(snap_prefix) :]
                 logger.debug("Parsing date from: %r", date_part)
-                try:
-                    time_obj, _ = __util__.parse_snapshot_time(
-                        date_part, self.config.get("timestamp_format")
-                    )
-                except Exception as e:
-                    # Debug level - it's normal for directories to contain
-                    # files that don't match the snapshot naming pattern
-                    logger.debug(
-                        "Skipping non-snapshot item: %r (%s)", item_path.name, e
-                    )
+                time_obj, parsed_as_written = __util__.derive_snapshot_time(
+                    date_part, self.config.get("timestamp_format")
+                )
+                if time_obj is None and not __util__.is_subvolume(item_path):
+                    # Two different facts used to share this rejection: "not a
+                    # snapshot at all" (README.md, lost+found) and "a snapshot
+                    # whose name I cannot parse". What something IS answers the
+                    # first: not a subvolume means not a snapshot -- debug
+                    # level, normal directory clutter. A subvolume whose name
+                    # yields no timestamp falls through: it IS a snapshot, with
+                    # no extractable time.
+                    logger.debug("Skipping non-snapshot item: %r", item_path.name)
                     continue
                 snapshot = __util__.Snapshot(
                     snapshot_dir,
@@ -544,6 +546,7 @@ class Endpoint:
                     time_obj=time_obj,
                     name=item_path.name,
                 )
+                snapshot.newly_visible = not parsed_as_written
                 snapshots.append(snapshot)
         # R3: load persisted retention locks back onto the snapshots. set_lock writes them
         # to the lock file, but nothing read them back, so a snapshot kept locked after a
@@ -555,6 +558,7 @@ class Endpoint:
         # with empty uuids.
         self._load_subvolume_ids_into(snapshots)
         snapshots.sort()
+        self._report_newly_visible(snapshots)
         self.__cached_snapshots = snapshots
         logger.debug(
             "Populated snapshot cache of %r with %d items.", self, len(snapshots)
@@ -644,6 +648,30 @@ class Endpoint:
                 continue
             snap.locks = set(entry.get("locks", []))
             snap.parent_locks = set(entry.get("parent_locks", []))
+
+    def _report_newly_visible(self, snapshots: List[Any]) -> None:
+        """Announce, once per listing refresh, snapshots that earlier releases
+        could not list. The first run that can see such a snapshot is also the
+        first that could prune it: a trailing ``_N`` (or any name retention's
+        own parser can date) enters retention buckets immediately, so the
+        operator hears about it BEFORE a deletion list does. INFO, not debug --
+        silence here is how a foreign pool gets managed without anyone being
+        told."""
+        fresh = [s for s in snapshots if getattr(s, "newly_visible", False)]
+        if not fresh:
+            return
+        shown = ", ".join(s.get_name() for s in fresh[:5])
+        more = f" (and {len(fresh) - 5} more)" if len(fresh) > 5 else ""
+        logger.info(
+            "%d snapshot(s) at %s were not visible to earlier btrfs-backup-ng "
+            "releases: %s%s. Those with a derivable timestamp are now managed "
+            "by retention; those without are listed and kept but never "
+            "deleted automatically.",
+            len(fresh),
+            self.config.get("path"),
+            shown,
+            more,
+        )
 
     def correspondent_of(self, snapshot: Any) -> Optional[Any]:
         """Return THIS endpoint's snapshot that is the btrfs-receive copy of ``snapshot``.
@@ -996,6 +1024,22 @@ class Endpoint:
             )
             return result
         unlocked = [s for s in snapshots if not s.locks and not s.parent_locks]
+        # A snapshot with no derivable timestamp neither counts toward the
+        # keep budget nor can be deleted by it: count-based retention keeps
+        # "the newest N", and these have no place in that order. They sort
+        # LAST, so leaving them in would let them occupy keep slots and push
+        # real, dated snapshots into the delete slice. Reported, never silent.
+        undated = [s for s in unlocked if getattr(s, "time_obj", None) is None]
+        if undated:
+            logger.info(
+                "%d unlocked snapshot(s) have no derivable timestamp; they "
+                "are kept, and occupy none of the %d keep slot(s): %s",
+                len(undated),
+                keep,
+                ", ".join(s.get_name() for s in undated[:5])
+                + (f" (and {len(undated) - 5} more)" if len(undated) > 5 else ""),
+            )
+            unlocked = [s for s in unlocked if getattr(s, "time_obj", None) is not None]
         if keep <= 0 or len(unlocked) <= keep:
             logger.debug(
                 "No unlocked snapshots to delete (keep=%d, unlocked=%d)",

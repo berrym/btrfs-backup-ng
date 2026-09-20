@@ -341,9 +341,21 @@ def estimate_transfer(
     # Use sudo if configured
     use_sudo = source_endpoint.config.get("ssh_sudo", False)
 
-    # Sort snapshots by time for incremental parent detection
+    # Sort snapshots by time for incremental parent detection. A snapshot
+    # whose name yields no timestamp is not part of the estimate -- the
+    # planner will not transfer it -- and is reported, not silently dropped.
+    undated = [s for s in source_snapshots if getattr(s, "time_obj", None) is None]
+    if undated:
+        logger.info(
+            "%d snapshot(s) have no derivable timestamp and are not part of "
+            "the transfer estimate: %s",
+            len(undated),
+            ", ".join(s.get_name() for s in undated[:5])
+            + (f" (and {len(undated) - 5} more)" if len(undated) > 5 else ""),
+        )
     sorted_snapshots = sorted(
-        source_snapshots, key=lambda s: s.time_obj if hasattr(s, "time_obj") else 0
+        (s for s in source_snapshots if getattr(s, "time_obj", None) is not None),
+        key=lambda s: s.time_obj,
     )
 
     last_snapshot = None

@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import subprocess
 import time
+from pathlib import Path
 
 import pytest
 
@@ -160,3 +161,286 @@ def test_snapper_metadata_is_named_after_the_name_the_backup_used(tmp_path):
     _write_snapper_metadata(snap, dest, transferred_as)
 
     assert (tmp_path / f"{transferred_as}.snapper-meta.json").exists()
+
+
+# --------------------------------------------------------------------------- #
+# Phase C: the listing separation -- what something IS decides whether it is a
+# snapshot; whether its name parses decides only whether it has a timestamp.
+# --------------------------------------------------------------------------- #
+
+ORDINAL = "home.2026-09-08_020306_1"  # dated via one stripped _N
+WEIRD = "home.imported-base"  # a subvolume with no derivable timestamp
+
+
+@pytest.fixture()
+def endpoint_log():
+    """Capture records from the endpoint modules' shared logger.
+
+    That logger (``btrfs_backup_ng.__logger__.logger``) is a standalone
+    ``logging.Logger`` outside the manager tree: it does not propagate to
+    root, so ``caplog`` sees nothing from it whether a message is emitted or
+    not -- an assertion built on caplog here cannot fail. A handler attached
+    directly to it can.
+    """
+    import logging
+
+    from btrfs_backup_ng.__logger__ import logger as pkg_logger
+
+    class _Capture(logging.Handler):
+        def __init__(self):
+            super().__init__(level=logging.DEBUG)
+            self.records = []
+
+        def emit(self, record):
+            self.records.append(record)
+
+    handler = _Capture()
+    previous_level = pkg_logger.level
+    pkg_logger.addHandler(handler)
+    pkg_logger.setLevel(logging.INFO)
+    try:
+        yield handler
+    finally:
+        pkg_logger.removeHandler(handler)
+        pkg_logger.setLevel(previous_level)
+
+
+def _mixed_pool(tmp_path, monkeypatch):
+    """A directory holding every kind of entry, with subvolume-ness injected
+    (tmpdirs cannot hold real subvolumes; the inode probe is the ENVIRONMENT,
+    not the unit under test -- tier2 runs the same scenario on real btrfs)."""
+    for name in (CANONICAL, ORDINAL, WEIRD, "lost+found"):
+        (tmp_path / name).mkdir()
+    (tmp_path / "README.md").write_text("not a snapshot")
+    subvols = {CANONICAL, ORDINAL, WEIRD}
+    monkeypatch.setattr(
+        "btrfs_backup_ng.__util__.is_subvolume",
+        lambda path: Path(path).name in subvols,
+    )
+    return _endpoint(tmp_path)
+
+
+def test_a_subvolume_is_a_snapshot_and_clutter_is_not(tmp_path, monkeypatch):
+    """The pincer, unit-level. List-everything fails on README.md/lost+found
+    being absent; list-nothing-new fails on ORDINAL/WEIRD being present. The
+    empty-prefix landmine (tests/test_explicit_empty_prefix.py) and the
+    diagnosis landmine (tests/test_empty_listing_diagnosis.py) run unmodified
+    beside this."""
+    ep = _mixed_pool(tmp_path, monkeypatch)
+    snaps = {s.get_name(): s for s in ep.list_snapshots()}
+
+    assert set(snaps) == {CANONICAL, ORDINAL, WEIRD}
+    assert "README.md" not in snaps
+    assert "lost+found" not in snaps
+
+    # ORDINAL: dated by stripping one trailing _N, and marked newly visible.
+    assert snaps[ORDINAL].time_obj is not None
+    assert time.strftime(FMT, snaps[ORDINAL].time_obj) == "2026-09-08_020306"
+    assert snaps[ORDINAL].newly_visible
+
+    # WEIRD: a snapshot with no extractable timestamp -- listed, marked.
+    assert snaps[WEIRD].time_obj is None
+    assert snaps[WEIRD].newly_visible
+
+    # CANONICAL: visible to every release, not marked.
+    assert not snaps[CANONICAL].newly_visible
+
+
+def test_with_an_empty_prefix_only_the_inode_check_separates_clutter(
+    tmp_path, monkeypatch
+):
+    """The true pincer tooth. With the supported empty prefix (issue #6) EVERY
+    entry matches the prefix filter, so is_subvolume() is the ONLY thing
+    keeping README.md and lost+found out of the listing. A gate that lists
+    everything fails here; a gate that skips every unparseable name fails on
+    'importbase' being absent. (The prefixed variant above cannot catch the
+    first failure -- its clutter never reaches the gate.)"""
+    (tmp_path / "2026-09-08_020310").mkdir()  # bare timestamp: parses
+    (tmp_path / "importbase").mkdir()  # subvolume, no timestamp
+    (tmp_path / "lost+found").mkdir()  # plain directory
+    (tmp_path / "README.md").write_text("not a snapshot")
+    subvols = {"2026-09-08_020310", "importbase"}
+    monkeypatch.setattr(
+        "btrfs_backup_ng.__util__.is_subvolume",
+        lambda path: Path(path).name in subvols,
+    )
+    ep = LocalEndpoint(
+        config={
+            "path": tmp_path,
+            "source": "/src",
+            "snapshot_folder": ".snapshots",
+            "snap_prefix": "",
+            "timestamp_format": FMT,
+        }
+    )
+    names = {s.get_name() for s in ep.list_snapshots()}
+    assert names == {"2026-09-08_020310", "importbase"}
+    assert "README.md" not in names
+    assert "lost+found" not in names
+
+
+def test_a_timestamp_less_snapshot_sorts_last(tmp_path, monkeypatch):
+    """Unknown age is never treated as old: "oldest" is where count-based
+    deletion slices from."""
+    ep = _mixed_pool(tmp_path, monkeypatch)
+    names = [s.get_name() for s in ep.list_snapshots()]
+    assert names[-1] == WEIRD
+
+
+def test_newly_visible_snapshots_are_announced(tmp_path, monkeypatch, endpoint_log):
+    """Reported, never silent: the first run that can see a foreign pool says
+    so at INFO, naming the snapshots, BEFORE any deletion surface does.
+    Mutation guard: removing the announcement leaves this log empty."""
+    ep = _mixed_pool(tmp_path, monkeypatch)
+    ep.list_snapshots()
+    announcement = [
+        r.getMessage()
+        for r in endpoint_log.records
+        if "not visible to earlier" in r.getMessage()
+    ]
+    assert len(announcement) == 1
+    assert ORDINAL in announcement[0]
+    assert WEIRD in announcement[0]
+    assert CANONICAL not in announcement[0]
+
+
+def test_an_all_canonical_pool_is_not_announced(tmp_path, monkeypatch, endpoint_log):
+    """The announcement is for pools that CHANGED meaning under this release;
+    an ordinary pool stays quiet. Fixture self-check: the same capture is
+    proven able to see announcements by the positive test above -- this
+    absence assertion is not blind."""
+    (tmp_path / CANONICAL).mkdir()
+    ep = _endpoint(tmp_path)
+    ep.list_snapshots()
+    assert not [
+        r for r in endpoint_log.records if "not visible to earlier" in r.getMessage()
+    ]
+
+
+def test_a_lock_on_a_timestamp_less_snapshot_survives_relisting(tmp_path, monkeypatch):
+    """Locks key by name, and a name needs no timestamp to be a stable key."""
+    ep = _mixed_pool(tmp_path, monkeypatch)
+    weird = next(s for s in ep.list_snapshots() if s.get_name() == WEIRD)
+    ep.set_lock(weird, "test-lock", True)
+    fresh = next(
+        s for s in ep.list_snapshots(flush_cache=True) if s.get_name() == WEIRD
+    )
+    assert "test-lock" in fresh.locks
+
+
+def test_the_ssh_listing_separates_the_same_way():
+    """The ssh twin: every candidate line IS a subvolume, so an unparseable
+    prefix-matching name is a timestamp-less snapshot, and a stripped _N
+    yields a dated one -- both marked newly visible."""
+    from btrfs_backup_ng.endpoint.ssh import SSHEndpoint
+
+    dest = "/backups/home"
+    output = (
+        f"ID 258 gen 5 top level 5 path backups/home/{OBSERVED}\n"
+        f"ID 259 gen 6 top level 5 path backups/home/{ORDINAL}\n"
+        f"ID 260 gen 7 top level 5 path backups/home/{WEIRD}\n"
+    )
+    ep = SSHEndpoint.__new__(SSHEndpoint)
+    ep.config = {
+        "path": dest,
+        "hostname": "nas",
+        "username": "backup",
+        "snap_prefix": "home.",
+        "timestamp_format": FMT,
+    }
+    ep.hostname = "nas"
+
+    parsed = {s.get_name(): s for s in ep._parse_snapshot_list(output, dest)}
+
+    assert set(parsed) == {OBSERVED, ORDINAL, WEIRD}
+    assert not parsed[OBSERVED].newly_visible
+    assert parsed[ORDINAL].time_obj is not None
+    assert parsed[ORDINAL].newly_visible
+    assert parsed[WEIRD].time_obj is None
+    assert parsed[WEIRD].newly_visible
+
+
+def test_count_based_retention_neither_counts_nor_deletes_the_undated(
+    tmp_path, monkeypatch, endpoint_log
+):
+    """delete_old_snapshots keeps "the newest N". A timestamp-less snapshot
+    sorts LAST, so without the partition it would occupy a keep slot and push
+    a real, dated snapshot into the delete slice -- deleting MORE real
+    backups than the operator asked to lose. Mutation guard: dropping the
+    partition deletes two dated snapshots here instead of one, and the
+    exclusion INFO disappears."""
+    for name in (
+        "home.2026-09-06_020306",
+        "home.2026-09-07_020306",
+        CANONICAL,
+        WEIRD,
+    ):
+        (tmp_path / name).mkdir()
+    subvols = {WEIRD}
+    monkeypatch.setattr(
+        "btrfs_backup_ng.__util__.is_subvolume",
+        lambda path: Path(path).name in subvols,
+    )
+    ep = _endpoint(tmp_path)
+    deleted_batches = []
+    monkeypatch.setattr(
+        ep,
+        "delete_snapshots",
+        lambda snaps, **kw: (
+            deleted_batches.append([s.get_name() for s in snaps])
+            or __import__(
+                "btrfs_backup_ng.endpoint.common", fromlist=["DeletionResult"]
+            ).DeletionResult()
+        ),
+    )
+    ep.delete_old_snapshots(keep=2)
+
+    assert deleted_batches == [["home.2026-09-06_020306"]]
+    assert any(
+        "no derivable timestamp" in r.getMessage() and WEIRD in r.getMessage()
+        for r in endpoint_log.records
+    )
+
+
+def test_prune_marks_a_newly_visible_deletion(caplog):
+    """execute_retention_deletes names each deleted snapshot that earlier
+    releases could not list. Mutation guard: dropping the loop silences the
+    INFO line and this fails."""
+    import logging
+    from unittest.mock import MagicMock
+
+    from btrfs_backup_ng.cli.prune import execute_retention_deletes
+    from btrfs_backup_ng.endpoint.common import DeletionResult
+
+    snap = MagicMock()
+    snap.get_name.return_value = WEIRD
+    snap.newly_visible = True
+    outcome = DeletionResult()
+    outcome.deleted.append(snap)
+    endpoint = MagicMock()
+    endpoint.delete_snapshots.return_value = outcome
+
+    with caplog.at_level(logging.INFO, logger="btrfs_backup_ng.cli.prune"):
+        deleted, errors = execute_retention_deletes(endpoint, [snap])
+
+    assert deleted == outcome.deleted_count
+    assert errors == []
+    assert any(
+        "not visible to earlier" in r.getMessage() and WEIRD in r.getMessage()
+        for r in caplog.records
+    )
+
+
+def test_the_confirmation_marker_discriminates():
+    """newly_visible_mark is the string every deletion surface appends; it
+    must be non-empty exactly for marked snapshots."""
+    from unittest.mock import MagicMock
+
+    from btrfs_backup_ng.cli.prune import newly_visible_mark
+
+    marked = MagicMock()
+    marked.newly_visible = True
+    plain = MagicMock()
+    plain.newly_visible = False
+    assert "not visible to earlier releases" in newly_visible_mark(marked)
+    assert newly_visible_mark(plain) == ""
