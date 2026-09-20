@@ -45,7 +45,7 @@ from .common import (
     thread_raw_compression,
     thread_raw_encryption,
     thread_ssh_target_config,
-    resolve_snapshot_dir,
+    create_snapshot_dir,
 )
 from .prune import (
     execute_retention_deletes,
@@ -506,12 +506,10 @@ def _backup_volume(
     try:
         source_path = Path(volume.path).resolve()
 
-        # Set up snapshot directory
-        # An absolute snapshot_dir must already exist; the per-source directory
-        # below it is still created. See resolve_snapshot_dir.
-        full_snapshot_dir = resolve_snapshot_dir(volume.snapshot_dir, source_path)
-
-        full_snapshot_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        # Set up snapshot directory. The source and an absolute snapshot_dir
+        # must already exist; only what lies below them is created. See
+        # create_snapshot_dir.
+        full_snapshot_dir = create_snapshot_dir(volume.snapshot_dir, source_path)
 
         source_kwargs = dict(endpoint_kwargs)
         source_kwargs["path"] = full_snapshot_dir

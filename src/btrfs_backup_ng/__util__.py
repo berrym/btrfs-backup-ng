@@ -998,6 +998,72 @@ def _current_user() -> str:
         return f"uid {os.geteuid()}"
 
 
+def missing_backup_location_message(what: str, path: str | Path) -> str:
+    """The one diagnosis for a backup location that is not there.
+
+    A backup location -- a source, a target, a snapshot base, however it was
+    given -- is a statement that something is there, not a request to make
+    it (#102). The likely causes need different remedies, so every refusal
+    names them all and says that nothing was created.
+    """
+    return (
+        f"{what} {path} does not exist. btrfs-backup-ng does not create a "
+        f"backup location: if it lives on a removable or network filesystem, "
+        f"it is most likely not mounted. Mount it, check the path for a typo, "
+        f"or create the directory yourself. Nothing was created."
+    )
+
+
+def create_below(
+    base: str | Path,
+    *parts: str,
+    mode: int | None = None,
+    what: str = "Directory",
+) -> Path:
+    """Create ``base/parts...`` one component at a time, never ``base`` itself.
+
+    This is the only way a directory under a backup location may be created.
+    ``base`` -- the source, the target, the snapshot base -- must already
+    exist, whoever named it and however; each
+    component under it is created with a plain ``mkdir`` -- no ``parents`` --
+    so the call is structurally unable to invent an ancestor. If the base
+    vanishes between the check and the mkdir (a drive unmounted mid-run), the
+    kernel refuses the first component and that refusal is reported as the
+    missing base, not repaired by rebuilding the tree on whatever filesystem
+    is underneath.
+
+    ``parts`` are relative; a component may contain ``/`` and is split. An
+    absolute or ``..`` component is a programming error, not a path to create.
+    Returns the leaf.
+    """
+    base_path = Path(base)
+    if not base_path.is_dir():
+        raise AbortError(missing_backup_location_message(what, base_path))
+    components = [c for part in parts for c in str(part).split("/") if c]
+    if any(c == ".." for c in components) or any(
+        str(part).startswith("/") for part in parts
+    ):
+        raise ValueError(f"create_below: {parts!r} must be relative to {base_path}")
+    current = base_path
+    for component in components:
+        current = current / component
+        try:
+            if mode is None:
+                current.mkdir(exist_ok=True)
+            else:
+                current.mkdir(mode=mode, exist_ok=True)
+        except FileNotFoundError as e:
+            # The base (or a component just created) is gone: the filesystem
+            # holding it went away. Rebuilding it here is exactly the
+            # defect this primitive exists to make impossible.
+            raise AbortError(missing_backup_location_message(what, base_path)) from e
+        except FileExistsError as e:
+            raise AbortError(
+                f"Cannot create {current}: the path exists but is not a directory."
+            ) from e
+    return current
+
+
 def privileged_mkdir(
     path: str | Path,
     *,

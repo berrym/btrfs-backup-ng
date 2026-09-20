@@ -254,6 +254,8 @@ class TestRunThreadsTimestampFormat:
     def test_native_volume_endpoint_carries_custom_format(
         self, mock_find, mock_load, mock_choose, tmp_path
     ):
+        # The source must exist: a configured path is never created (#102).
+        (tmp_path / "data").mkdir()
         volume = VolumeConfig(
             path=str(tmp_path / "data"),
             snapshot_prefix="data-",
@@ -335,6 +337,8 @@ class TestConfigDrivenCommandsThreadTimestampFormat:
     def test_snapshot_endpoint_carries_custom_format(
         self, mock_find, mock_load, mock_choose, tmp_path
     ):
+        # The source must exist: a configured path is never created (#102).
+        (tmp_path / "data").mkdir()
         volume = VolumeConfig(
             path=str(tmp_path / "data"),
             snapshot_prefix="data-",

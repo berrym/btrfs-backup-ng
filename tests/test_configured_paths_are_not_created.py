@@ -19,6 +19,11 @@ undone by the third:
     endpoint/common.py  Endpoint.receive, immediately before receiving
     endpoint/raw.py     RawEndpoint._prepare, and target_lock
 
+and, found afterwards and covered here too:
+
+    endpoint/common.py  Endpoint.snapshot, an absolute snapshot_folder
+    endpoint/local.py   the .btrfs-backup-ng tree, built with parents=True
+
 Raw was the worst of them. It created the target on first use -- convenient
 until the disk is not mounted -- and it applies no filesystem check at all: no
 fs_checks, no btrfs test. Nothing else would have noticed, and raw streams are
@@ -32,7 +37,6 @@ Directories BELOW an existing configured path are still created: the
 
 from __future__ import annotations
 
-from pathlib import Path
 from unittest.mock import patch
 
 import pytest
@@ -119,27 +123,110 @@ class TestSourceAndDestination:
         assert (dest / ".btrfs-backup-ng" / "snapshots").is_dir()
 
 
-class TestSnapshotFolderIsDeliberatelyUnchanged:
-    """The snapshot directory is the SOURCE side, and is not what #102 is about.
+class TestSnapshotCreatesOnlyBelowTheSource:
+    """Endpoint.snapshot() built its snapshot directory with parents=True. For
+    an absolute snapshot_folder that meant the base was created wherever it
+    pointed -- reproduced on real btrfs: an absolute folder that did not
+    exist was built and the snapshot taken into it, exit 0. It is the
+    endpoint-level twin of the CLI's absolute snapshot_dir rule, reached by
+    legacy mode and by any API caller, and it would also rebuild a folder
+    the CLI had created if the disk went away mid-run.
 
-    `local.py` used to read `config["snapshot_dir"]` in `_prepare`, but nothing
-    ever put that key in an endpoint config -- the endpoint layer uses
-    `snapshot_folder`. That block had never executed and is now deleted: left in
-    place it would have re-created an absolute path unconditionally the moment
-    anyone wired the key up, reintroducing the defect this file is about.
+    Now: an absolute folder must exist; a relative one is created one
+    component at a time below the source, which must itself exist."""
 
-    The absolute case is handled where the path is actually computed, by
-    `cli.common.resolve_snapshot_dir`.
-    """
+    def _stop_after_the_directory(self, monkeypatch):
+        class Stop(Exception):
+            pass
 
-    def test_a_relative_snapshot_folder_is_created_under_the_source(self, tmp_path):
+        def raiser(*a, **k):
+            raise Stop()
+
+        import btrfs_backup_ng.__util__ as util
+
+        monkeypatch.setattr(util, "Snapshot", raiser)
+        return Stop
+
+    def test_an_absolute_folder_that_does_not_exist_is_refused(
+        self, tmp_path, monkeypatch
+    ):
         source = tmp_path / "source"
         source.mkdir()
+        folder = tmp_path / "unmounted" / "snapshots"
+        stop = self._stop_after_the_directory(monkeypatch)
+        endpoint = _endpoint(source, tmp_path / "dest", snapshot_folder=str(folder))
+        with pytest.raises(AbortError, match="Nothing was created"):
+            endpoint.snapshot()
+        assert not (tmp_path / "unmounted").exists()
+        assert stop  # the seam was never reached
+
+    def test_an_absolute_folder_that_exists_is_used(self, tmp_path, monkeypatch):
+        source = tmp_path / "source"
+        source.mkdir()
+        folder = tmp_path / "bigdisk" / "snapshots"
+        folder.mkdir(parents=True)
+        stop = self._stop_after_the_directory(monkeypatch)
+        endpoint = _endpoint(source, tmp_path / "dest", snapshot_folder=str(folder))
+        with pytest.raises(stop):
+            endpoint.snapshot()
+        assert endpoint.config["path"] == folder.resolve()
+
+    def test_a_relative_folder_is_created_under_the_source(self, tmp_path, monkeypatch):
+        source = tmp_path / "source"
+        source.mkdir()
+        stop = self._stop_after_the_directory(monkeypatch)
+        endpoint = _endpoint(source, tmp_path / "dest", snapshot_folder="snaps/hourly")
+        with pytest.raises(stop):
+            endpoint.snapshot()
+        assert (source / "snaps" / "hourly").is_dir()
+
+    def test_a_relative_folder_is_not_created_beside_a_missing_source(
+        self, tmp_path, monkeypatch
+    ):
+        """Mutation guard: a parents=True here rebuilds <source>/snaps and
+        the source with it."""
+        source = tmp_path / "gone" / "source"
+        self._stop_after_the_directory(monkeypatch)
         endpoint = _endpoint(source, tmp_path / "dest", snapshot_folder="snaps")
-        with patch("btrfs_backup_ng.__util__.is_subvolume", return_value=True):
-            with patch.object(type(endpoint), "_build_snapshot_cmd", create=True):
-                folder = Path(endpoint.config["snapshot_folder"])
-        assert not folder.is_absolute()
+        with pytest.raises(AbortError, match="Source"):
+            endpoint.snapshot()
+        assert not (tmp_path / "gone").exists()
+
+
+class TestInfrastructureBelowTheDestinationCannotRebuildIt:
+    def test_prepare_creates_the_tree_one_level_at_a_time(self, tmp_path):
+        source = tmp_path / "source"
+        source.mkdir()
+        dest = tmp_path / "dest"
+        dest.mkdir()
+        _prepare(source, dest)
+        assert (dest / ".btrfs-backup-ng" / "snapshots").is_dir()
+
+    def test_a_destination_that_vanishes_after_the_check_is_not_rebuilt(
+        self, tmp_path, monkeypatch
+    ):
+        """prepare() verified the destination, then the drive went away
+        before the .btrfs-backup-ng tree was made. With parents=True the
+        tree -- and the destination -- were rebuilt on the root filesystem."""
+        source = tmp_path / "source"
+        source.mkdir()
+        dest = tmp_path / "dest"
+        dest.mkdir()
+        real_is_btrfs = __import__("btrfs_backup_ng").__util__.is_btrfs
+
+        def vanish(path):
+            import shutil
+
+            shutil.rmtree(dest)
+            return True
+
+        with patch("shutil.which", return_value="/usr/bin/btrfs"):
+            with patch("btrfs_backup_ng.__util__.is_subvolume", return_value=True):
+                with patch("btrfs_backup_ng.__util__.is_btrfs", side_effect=vanish):
+                    with pytest.raises(AbortError, match="Nothing was created"):
+                        _endpoint(source, dest).prepare()
+        assert not dest.exists(), "the infrastructure mkdir rebuilt the destination"
+        assert real_is_btrfs  # keep the reference honest
 
 
 class TestReceiveDoesNotRebuildWhatPrepareRefused:

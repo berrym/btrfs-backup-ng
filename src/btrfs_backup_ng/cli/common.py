@@ -539,3 +539,48 @@ def resolve_snapshot_dir(configured: str, source_path: Path) -> Path:
             f"would otherwise be written to the filesystem holding the source."
         )
     return (configured_path / source_path.name).resolve()
+
+
+def create_snapshot_dir(configured: str, source_path: Path) -> Path:
+    """Resolve the snapshot directory and create what may be created below it.
+
+    The commands that WRITE snapshots (run, snapshot) go through this; the ones
+    that only read go through resolve_snapshot_dir. Two backup locations are
+    involved and both must already exist: the source volume, and for an
+    absolute snapshot_dir its base. Only what lies BELOW a base is created,
+    one component at a time (``__util__.create_below``), so nothing here can
+    build a missing base.
+
+    The order matters. The directory used to be created with ``parents=True``
+    before anyone had looked at the source, so a volume whose path was not
+    there -- an unmounted data disk, a typo in ``path`` -- had its snapshot
+    tree built on the root filesystem first, and from then on the source
+    EXISTED as a plain directory, which is what every later check saw.
+    """
+    if not source_path.is_dir():
+        raise __util__.AbortError(
+            __util__.missing_backup_location_message("Source volume", source_path)
+        )
+    full = resolve_snapshot_dir(configured, source_path)
+    configured_path = Path(configured)
+    if configured_path.is_absolute():
+        # resolve_snapshot_dir has established the base; the per-source
+        # directory is the one component below it.
+        __util__.create_below(
+            configured_path, source_path.name, mode=0o700, what="snapshot_dir"
+        )
+        return full
+    base = source_path.resolve()
+    if full == base or full.is_relative_to(base):
+        __util__.create_below(
+            base, str(full.relative_to(base)), mode=0o700, what="Source volume"
+        )
+        return full
+    # A relative snapshot_dir that climbs out of the source ("../snapshots")
+    # names a place outside the one base that was verified, so it is treated
+    # exactly like an absolute one: it must be there already.
+    if not full.is_dir():
+        raise __util__.AbortError(
+            __util__.missing_backup_location_message("snapshot_dir", full)
+        )
+    return full
