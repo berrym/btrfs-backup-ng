@@ -296,12 +296,11 @@ class TestElevationIsNonInteractive:
         for probe in probes:
             assert "sudo" not in probe, f"capability probe was elevated: {probe}"
 
-    def test_the_directory_creation_is_elevated_when_the_user_cannot_do_it(self):
-        """Guard against over-correcting: mkdir does touch the backup location.
-
-        ssh_sudo elevates only where elevation is needed, but "needed" must
-        still include this: a destination the login user cannot create is
-        exactly what the option exists for.
+    def test_the_existence_check_is_elevated_when_the_user_cannot_do_it(self):
+        """Guard against over-correcting: the existence check does touch the
+        backup location (a root-owned 0700 target is legitimate under
+        ssh_sudo). Prepare no longer creates anything, but "elevate only
+        where needed" must still include the check itself.
         """
         ep = _endpoint(direct=False)
         sent = []
@@ -314,9 +313,12 @@ class TestElevationIsNonInteractive:
             with patch.object(ep, "_check_tools", return_value=[]):
                 ep._prepare()
 
-        assert any(c.startswith("LC_ALL=C sudo -n mkdir") for c in sent), sent
+        assert any(c.startswith("LC_ALL=C sudo -n test -d") for c in sent), sent
+        assert not any("mkdir" in c for c in sent), (
+            f"prepare created the remote target: {sent}"
+        )
 
-    def test_the_directory_creation_is_not_elevated_when_the_user_can_do_it(self):
+    def test_the_existence_check_is_not_elevated_when_the_user_can_do_it(self):
         """The other half of the same contract, and the reason it changed: a
         target the user owns needs no sudo, and demanding it made a valid config
         fail against the btrfs-only sudoers policy the README documents."""
@@ -334,7 +336,10 @@ class TestElevationIsNonInteractive:
         assert not any("sudo" in c for c in sent), (
             f"elevated against a destination the user can already use: {sent}"
         )
-        assert any("mkdir" in c for c in sent), "the directory was never created"
+        assert any("test -d" in c for c in sent), "the target was never checked"
+        assert not any("mkdir" in c for c in sent), (
+            f"prepare created the remote target: {sent}"
+        )
 
 
 class TestPrepareExplainsWhatRawSshNeeds:
@@ -351,12 +356,12 @@ class TestPrepareExplainsWhatRawSshNeeds:
         assert "btrfs" in message
         assert "chown" in message or "ownership" in message
 
-    def test_an_unrelated_mkdir_failure_is_not_relabelled(self):
-        """Only a sudo refusal gets the sudo explanation."""
+    def test_an_unrelated_ssh_failure_is_not_relabelled(self):
+        """Only a sudo refusal gets the sudo explanation, and only `test -d`'s
+        own exit 1 means "does not exist" -- the ssh transport's 255 must keep
+        its identity rather than becoming a claim about the directory."""
         ep = _endpoint()
-        error = subprocess.CalledProcessError(
-            1, "ssh", stderr=b"mkdir: cannot create directory: Read-only file system"
-        )
+        error = subprocess.CalledProcessError(255, "ssh", stderr=b"Connection refused")
         with patch.object(raw_mod.subprocess, "run", side_effect=error):
             with pytest.raises(subprocess.CalledProcessError):
                 ep._prepare()

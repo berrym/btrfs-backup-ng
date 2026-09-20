@@ -806,8 +806,9 @@ class TestRawEndpointGetSpaceInfo:
 class TestSSHRawEndpointMethods:
     """Additional tests for SSHRawEndpoint methods."""
 
-    def test_prepare_creates_remote_directory(self):
-        """Test that prepare creates remote directory via SSH."""
+    def test_prepare_confirms_the_remote_directory_exists(self):
+        """Prepare CONFIRMS the remote target exists; it never creates it
+        (the 34904c6 rule, extended to remote)."""
         endpoint = SSHRawEndpoint(
             config={
                 "path": "/backup/data",
@@ -821,11 +822,16 @@ class TestSSHRawEndpointMethods:
             with patch.object(endpoint, "_check_tools", return_value=[]):
                 endpoint._prepare()
 
-        # First remote call is mkdir; a POSIX-tools preflight follows.
+        # First remote call is the existence check; a POSIX-tools preflight
+        # follows. Nothing may create the target.
         call_args = mock_run.call_args_list[0][0][0]
         assert "ssh" in call_args
         assert "backup@nas" in call_args
-        assert "mkdir -p /backup/data" in call_args
+        assert "test -d /backup/data" in call_args
+        for call in mock_run.call_args_list:
+            assert "mkdir" not in " ".join(str(a) for a in call[0][0]), (
+                "prepare created the remote target"
+            )
 
     def test_prepare_with_sudo(self):
         """Test that prepare uses sudo when configured."""
@@ -847,11 +853,11 @@ class TestSSHRawEndpointMethods:
             with patch.object(endpoint, "_check_tools", return_value=[]):
                 endpoint._prepare()
 
-        call_args = mock_run.call_args_list[0][0][0]  # first call = mkdir
+        call_args = mock_run.call_args_list[0][0][0]  # first call = test -d
         # `-n` is load-bearing: the ssh connection has no tty, so an
         # interactive sudo can only hang or report "a terminal is required"
         # instead of the actual refusal.
-        assert "sudo -n mkdir" in call_args[-1]
+        assert "sudo -n test -d" in call_args[-1]
 
     def test_prepare_failure(self):
         """Test prepare handles SSH failure."""
@@ -865,8 +871,10 @@ class TestSSHRawEndpointMethods:
         with patch("subprocess.run") as mock_run:
             import subprocess
 
+            # 255 is the ssh transport's own failure, which must keep its
+            # identity -- never be relabelled "target does not exist".
             mock_run.side_effect = subprocess.CalledProcessError(
-                1, "ssh", stderr=b"Connection refused"
+                255, "ssh", stderr=b"Connection refused"
             )
             with pytest.raises(subprocess.CalledProcessError):
                 endpoint._prepare()

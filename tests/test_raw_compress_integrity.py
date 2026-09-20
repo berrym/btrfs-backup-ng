@@ -202,10 +202,12 @@ def test_send_snapshot_neutralises_transfer_compress_for_non_raw(tmp_path, monke
 
     monkeypatch.setattr(operations, "_do_process_transfer", fake_process_transfer)
 
-    # A non-raw destination (plain object, NOT a RawEndpoint instance).
+    # A non-raw destination (plain object, NOT a RawEndpoint instance). The
+    # path must EXIST: the engine now verifies the destination instead of
+    # creating it, and this test's subject is compress neutralisation.
     class _NotRaw:
         _is_remote = False
-        config = {"path": "/dest"}
+        config = {"path": str(tmp_path)}
 
     snap = Mock()
     snap.get_path.return_value = "/x/snap"

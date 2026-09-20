@@ -943,49 +943,47 @@ def _verify_destination_space(snapshot, destination_endpoint, parent, options) -
 
 
 def _ensure_destination_exists(destination_endpoint) -> None:
-    """Ensure destination path exists, creating it if necessary."""
-    try:
-        if (
-            hasattr(destination_endpoint, "_is_remote")
-            and destination_endpoint._is_remote
-        ):
-            if hasattr(destination_endpoint, "_exec_remote_command"):
-                path = destination_endpoint._normalize_path(
-                    destination_endpoint.config["path"]
+    """Verify the destination path exists -- NEVER create it.
+
+    This was the SIXTH creation site of the class 34904c6 closed, and the one
+    every audit missed: it lives in the transfer engine, not the endpoint
+    layer, and its name reads like a check while its body ran a remote
+    ``mkdir -p`` (locally, ``Path.mkdir``). It also explains why the local
+    sites appeared to need fixing repeatedly -- whatever the endpoint's
+    prepare() refused to create, this function rebuilt at send time, behind a
+    catch-all that logged "will try transfer anyway".
+
+    Remote endpoints that carry their own refusal check are asked through it,
+    so there is exactly one message and one probe (ssh's unelevated
+    ``test -d``, with its rc-1-only missing verdict). raw+ssh has no check
+    here by design: its _prepare already refused a missing target before the
+    engine can run. The local arm refuses in the same words prepare() uses --
+    it exists for the mid-run vanish, where prepare() passed long ago.
+    """
+    if getattr(destination_endpoint, "_is_remote", False):
+        if hasattr(destination_endpoint, "_require_remote_destination"):
+            if not destination_endpoint._require_remote_destination(
+                destination_endpoint.config["path"]
+            ):
+                raise __util__.SnapshotTransferError(
+                    getattr(destination_endpoint, "_last_transfer_error", None)
+                    or "The remote destination could not be verified."
                 )
-                logger.debug("Ensuring remote destination path exists: %s", path)
-                cmd = ["test", "-d", path]
-                result = destination_endpoint._exec_remote_command(cmd, check=False)
-                if result.returncode != 0:
-                    logger.warning(
-                        "Destination path doesn't exist, creating it: %s", path
-                    )
-                    mkdir_cmd = ["mkdir", "-p", path]
-                    mkdir_result = destination_endpoint._exec_remote_command(
-                        mkdir_cmd, check=False
-                    )
-                    if mkdir_result.returncode != 0:
-                        stderr = mkdir_result.stderr.decode("utf-8", errors="replace")
-                        logger.error(
-                            "Failed to create destination directory: %s", stderr
-                        )
-                        raise __util__.SnapshotTransferError(
-                            f"Cannot create destination directory: {stderr}"
-                        )
-        else:
-            path = destination_endpoint.config.get("path")
-            if path:
-                path_obj = Path(path)
-                if not path_obj.exists():
-                    logger.warning(
-                        "Local destination path doesn't exist, creating it: %s", path
-                    )
-                    path_obj.mkdir(parents=True, exist_ok=True)
-    except __util__.SnapshotTransferError:
-        raise
-    except Exception as e:
-        logger.warning(
-            "Error during destination verification (will try transfer anyway): %s", e
+        return
+    path = destination_endpoint.config.get("path")
+    if not path:
+        return
+    path_obj = Path(path)
+    if not path_obj.is_dir():
+        detail = (
+            " (the path exists but is not a directory)" if path_obj.exists() else ""
+        )
+        raise __util__.SnapshotTransferError(
+            f"Destination {path} does not exist{detail}. btrfs-backup-ng "
+            "does not create a configured destination: if it lives on a "
+            "removable or network filesystem, it is most likely not mounted. "
+            "Mount it, check the path for a typo, or create the directory "
+            "yourself. Nothing was created."
         )
 
 

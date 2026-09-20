@@ -338,7 +338,8 @@ class RemoteLockManager:
         create the lock directory. Backup destinations are commonly root-owned,
         and the lock has to live beside the data it protects."""
         self._run = run_remote
-        self._root = f"{str(target_path).rstrip('/')}/{LOCK_DIR_NAME}"
+        self._target = str(target_path).rstrip("/") or "/"
+        self._root = f"{self._target}/{LOCK_DIR_NAME}"
         self._heartbeat_interval = heartbeat_interval
         self._stale_after = stale_after
         self._hostname = hostname
@@ -362,6 +363,7 @@ class RemoteLockManager:
         root = shlex.quote(self._root)
         hb = shlex.quote(f"{self._lock_dir(name)}/heartbeat")
         info = shlex.quote(f"{self._lock_dir(name)}/info.json")
+        target = shlex.quote(self._target)
         stale_dir = shlex.quote(f"{self._lock_dir(name)}.stale.{token}")
         age = _remote_age_expr(
             f"{self._lock_dir(name)}/heartbeat", self._lock_dir(name)
@@ -370,7 +372,13 @@ class RemoteLockManager:
             # A lock directory that cannot be created is NOT contention. Reported
             # as BUSY -- which is what a bare mkdir failure looks like -- it sends
             # an operator hunting for a competing process that does not exist.
-            f"mkdir -p {root} 2>/dev/null; "
+            # The lock tree is created only BELOW an existing target: a bare
+            # `mkdir -p` on the full path would invent a missing target (the
+            # 34904c6 class -- an unmounted destination rebuilt on the root
+            # filesystem by a lock acquisition). A missing target therefore
+            # falls through to the NOLOCKDIR verdict below, which callers
+            # already report distinctly from contention.
+            f"if [ -d {target} ]; then mkdir -p {root} 2>/dev/null; fi; "
             f"if [ ! -d {root} ] || [ ! -w {root} ]; then echo NOLOCKDIR; exit 0; fi; "
             f"if mkdir {lock} 2>/dev/null; then "
             f"  printf '%s' {shlex.quote(payload)} > {info}; touch {hb}; echo ACQUIRED; "
@@ -436,10 +444,13 @@ class RemoteLockManager:
             }
         )
         root = shlex.quote(self._root)
+        target = shlex.quote(self._target)
         holders = shlex.quote(self._holders_dir(name))
         holder = shlex.quote(self._holder_file(name, lock_id))
         script = (
-            f"mkdir -p {holders} 2>/dev/null; "
+            # Same rule as acquisition: create only below an existing target,
+            # never the target itself (mkdir -p would build every component).
+            f"if [ -d {target} ]; then mkdir -p {holders} 2>/dev/null; fi; "
             # Reported distinctly from contention: a bare mkdir failure looks
             # exactly like losing a race, and sends an operator hunting for a
             # competing process that does not exist.
