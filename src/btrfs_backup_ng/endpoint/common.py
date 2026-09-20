@@ -544,7 +544,53 @@ class Endpoint:
         """
         snapshot_dir = Path(self.config["path"]).resolve()
         snap_prefix = self.config["snap_prefix"]
-        snapshot_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        # A listing is a READ: it must never create the path it was asked to
+        # enumerate. It used to mkdir here, which quietly undid _prepare's
+        # refusal to create a configured path (34904c6): every CLI command
+        # calls prepare() first, but that is a per-command convention, not a
+        # property of this primitive -- and the convention has a real gap.
+        # Measured: with the path present, prepare() passes and a pool lists
+        # its backups; the drive then unmounts mid-run, and the next listing
+        # REBUILT the mount point on the root filesystem and reported the pool
+        # empty -- so presence checks saw nothing and the planner scheduled
+        # full re-sends into the directory the read had just invented.
+        #
+        # The discriminator between the two honest answers is the endpoint's
+        # role, read from config["source"]: every source-side endpoint carries
+        # its subvolume there, and destination endpoints do not. A missing
+        # snapshot dir on the SOURCE is a legitimate baseline (a volume that
+        # has never been snapshotted; snapshot() creates the directory at
+        # first creation). A missing BACKUP DESTINATION is not empty, it is
+        # unreadable, and saying "empty" is how an operator concludes their
+        # backups are gone -- same contract as the ssh listing, which raises
+        # rather than ever presenting a failed enumeration as an empty target.
+        if not snapshot_dir.is_dir():
+            if snapshot_dir.exists():
+                # A file (or other non-directory) at the configured path is a
+                # misconfiguration for either role. The old mkdir path let
+                # this escape as a raw FileExistsError, which is not a
+                # diagnosis.
+                raise RuntimeError(
+                    f"Cannot list snapshots at {snapshot_dir}: the path "
+                    "exists but is not a directory."
+                )
+            if self.config.get("source"):
+                logger.debug(
+                    "Snapshot directory %s does not exist yet; a source "
+                    "volume with no snapshots is a legitimate empty baseline "
+                    "(nothing was created).",
+                    snapshot_dir,
+                )
+                self.__cached_snapshots = []
+                return []
+            raise RuntimeError(
+                f"Cannot list snapshots at {snapshot_dir}: the directory does "
+                "not exist. The location could NOT be enumerated -- this is "
+                "NOT an empty target. If the backups live on a removable or "
+                "network filesystem it is most likely not mounted; mount it, "
+                "check the path for a typo, or create the directory yourself. "
+                "Nothing was created."
+            )
 
         logger.debug("Listing snapshots in: %s", snapshot_dir)
         logger.debug("Snapshot prefix: %s", snap_prefix)

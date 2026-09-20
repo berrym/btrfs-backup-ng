@@ -477,6 +477,52 @@ echo "DELIVERED:$(cat /tmp/received.bin 2>/dev/null || echo NOTHING)"
 # --------------------------------------------------------------------------- #
 # restore honesty -- independent of any one target
 # --------------------------------------------------------------------------- #
+class TestAMissingLocationIsNeverEmpty:
+    """A backup location that cannot be enumerated must never read as empty.
+
+    "No snapshots found" from an unmounted drive is how an operator concludes
+    their backups are gone -- at the disaster-recovery moment. Locally the
+    refusal is layered (prepare() first, then the listing primitive itself);
+    remotely the ssh listing carries the same contract. Both must also create
+    NOTHING: a read that builds the mount point on the root filesystem turns
+    the next backup into full re-sends landing on the wrong filesystem.
+    """
+
+    def test_a_missing_local_location_refuses_and_creates_nothing(self, rig):
+        missing = rig.root / "never-mounted" / "backups"
+        assert not missing.exists()
+
+        r = rig.cli("restore", "--list", str(missing))
+
+        assert r.returncode != 0, (
+            f"restore --list exited {r.returncode} for a location that does "
+            f"not exist; output: {(r.stdout + r.stderr)[-500:]}"
+        )
+        assert not (rig.root / "never-mounted").exists(), (
+            "a READ created the missing location"
+        )
+
+    @requires_remote
+    def test_a_missing_remote_location_refuses_and_creates_nothing(self, rig):
+        from .conftest import REMOTE_SPEC, remote_sh
+
+        remote_missing = f"{rig.remote_base}/never-mounted/backups"
+        loc = f"ssh://{REMOTE_SPEC}:{remote_missing}"
+
+        r = rig.cli("restore", "--list", loc, "--ssh-sudo")
+
+        assert r.returncode != 0, (
+            f"restore --list exited {r.returncode} for a remote location that "
+            f"does not exist; output: {(r.stdout + r.stderr)[-500:]}"
+        )
+        probe = remote_sh(
+            f"test -d {rig.remote_base}/never-mounted && echo CREATED || echo ABSENT"
+        )
+        assert "ABSENT" in probe.stdout, (
+            "a READ created the missing location on the remote"
+        )
+
+
 class TestRestoreReportsHonestly:
     def test_restoring_from_an_empty_location_is_not_success(self, rig, tmp_path):
         """An empty backup location must not produce a successful restore.
