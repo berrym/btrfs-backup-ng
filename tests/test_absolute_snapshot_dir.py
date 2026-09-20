@@ -89,10 +89,20 @@ class TestAbsoluteRequiresItsBase:
             resolve_snapshot_dir(str(not_a_dir), source)
 
 
-class TestBothCallSitesUseIt:
-    """run and snapshot both created the directory; neither may do it unguarded."""
+class TestEveryCallSiteUsesIt:
+    """Seven commands resolve a volume's snapshot directory; every one must
+    resolve it through the shared helper. Five carried byte-identical inline
+    copies, and the sixth divergence was not cosmetic: estimate joined by
+    hand (`source / configured`), and pathlib resolves that to the absolute
+    RIGHT operand, so with an absolute snapshot_dir the one command whose job
+    is to predict a transfer enumerated the BASE while the transfer reads
+    <base>/<source name>. Presence-scanned here (helper referenced, hand
+    branch absent) and pinned behaviourally below."""
 
-    @pytest.mark.parametrize("module", ["run", "snapshot"])
+    @pytest.mark.parametrize(
+        "module",
+        ["run", "snapshot", "transfer", "prune", "list_cmd", "status", "estimate"],
+    )
     def test_the_cli_resolves_through_the_helper(self, module):
         import importlib
         import inspect
@@ -105,4 +115,66 @@ class TestBothCallSitesUseIt:
         )
         assert "snapshot_dir.is_absolute()" not in source, (
             f"cli/{module}.py still branches on absoluteness itself"
+        )
+
+
+class TestEstimateReadsWhatTransferReads:
+    def test_estimate_counts_the_snapshots_the_listing_sees(self, tmp_path):
+        """The reproduce, pinned: absolute snapshot_dir, two snapshots on
+        disk at <base>/<source name>. Before the fix estimate enumerated
+        <base> and reported snapshot_count 0 / 0 bytes for a config whose
+        `list` showed both snapshots. Mutation guards: reverting the hand
+        join, or the helper dropping the per-source component, both put the
+        count back to 0."""
+        import json
+        import subprocess
+        import sys
+
+        vol = tmp_path / "vol"
+        vol.mkdir()
+        store = tmp_path / "store"
+        (store / "vol").mkdir(parents=True)
+        (store / "vol" / "vol-20260101-000000").mkdir()
+        (store / "vol" / "vol-20260102-000000").mkdir()
+        target = tmp_path / "target"
+        target.mkdir()
+        cfg = tmp_path / "cfg.toml"
+        cfg.write_text(
+            f"""
+[[volumes]]
+path = "{vol}"
+snapshot_dir = "{store}"
+snapshot_prefix = "vol-"
+
+[[volumes.targets]]
+path = "{target}"
+"""
+        )
+
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "btrfs_backup_ng",
+                "-c",
+                str(cfg),
+                "estimate",
+                "--volume",
+                str(vol),
+                "--json",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        assert result.returncode == 0, result.stderr[-500:]
+        # Rich log lines share stdout with the report; the JSON block is the
+        # last thing printed.
+        report = json.loads(result.stdout[result.stdout.rindex("\n{") + 1 :])
+        assert report["source"] == str(store / "vol"), (
+            "estimate reads a different directory than the transfer will"
+        )
+        assert report["snapshot_count"] == 2, (
+            f"estimate saw {report['snapshot_count']} snapshots where the "
+            f"listing sees 2: {report}"
         )

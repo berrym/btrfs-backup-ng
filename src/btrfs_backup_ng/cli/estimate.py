@@ -13,7 +13,7 @@ import logging
 from pathlib import Path
 from typing import Any
 
-from .. import endpoint
+from .. import __util__, endpoint
 from ..__logger__ import create_logger
 from ..config import ConfigError, find_config_file, load_config
 from ..core.estimate import (
@@ -28,6 +28,7 @@ from ..core.space import (
     format_space_check,
 )
 from .common import (
+    resolve_snapshot_dir,
     get_fs_checks_mode,
     get_log_level,
     get_timestamp_format,
@@ -124,9 +125,19 @@ def _estimate_from_config(args: argparse.Namespace, volume_path: str) -> int:
     target = volume.targets[target_idx]
     json_output = getattr(args, "json", False)
 
-    # Prepare source endpoint
-    source_path = Path(volume.path)
-    snapshot_dir = source_path / volume.snapshot_dir
+    # Prepare source endpoint. The one command whose job is to PREDICT a
+    # transfer must read exactly the directory the transfer will. This joined
+    # by hand, and pathlib resolves `source / absolute` to the absolute RIGHT
+    # operand -- so with an absolute snapshot_dir the estimate enumerated the
+    # BASE directory while the transfer reads <base>/<source name>. Measured
+    # on one config: `list` showed 2 source snapshots where `estimate`
+    # reported snapshot_count 0 and 0 bytes.
+    source_path = Path(volume.path).resolve()
+    try:
+        snapshot_dir = resolve_snapshot_dir(volume.snapshot_dir, source_path)
+    except __util__.AbortError as e:
+        logger.error("%s", e)
+        return 1
 
     try:
         source_ep = endpoint.choose_endpoint(
