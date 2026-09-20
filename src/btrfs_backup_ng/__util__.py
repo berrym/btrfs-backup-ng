@@ -39,6 +39,7 @@ __all__ = [
     "DATE_FORMAT",
     "MOUNTS_FILE",
     "infer_snapshot_prefix",
+    "indistinguishable_period",
     "parse_snapshot_time",
 ]
 
@@ -480,6 +481,47 @@ def infer_snapshot_prefix(name: str, preferred_fmt: str | None = None) -> str | 
             continue
         return name[:i]
     return None
+
+
+def indistinguishable_period(fmt: str) -> str | None:
+    """Return the widest period within which ``fmt`` renders identical names, or None.
+
+    Decides which diagnosis a snapshot-name collision gets. Under a
+    seconds-resolving format a collision means two requests in the same second
+    (or the repeated hour of a daylight-saving fall-back), and "wait a second
+    and retry" is real advice. Under a coarser format the format itself cannot
+    name a second snapshot within its period, and that advice cannot work --
+    the previous message gave it anyway, so a user with
+    ``timestamp_format = "%Y%m%d"`` got one snapshot per day and a misdiagnosis
+    on every later run.
+
+    The format is probed with real instants rather than inspected as a string:
+    two moments are rendered and compared, so every strftime directive -- and
+    any literal text -- is judged by what it actually produces. Probes render
+    with ``time.gmtime`` on a fixed epoch, so the verdict cannot depend on the
+    machine's timezone or clock. The base instant sits mid-period (12:30:30 on
+    January 15th): a probe step from a boundary would roll the next field over
+    and misread the resolution (from 12:30:59, one second later is 12:31:00,
+    which a minute-coarse format renders differently -- it would look
+    seconds-fine).
+
+    Returns ``None`` when instants one second apart render differently (the
+    format resolves seconds); otherwise ``"minute"``, ``"hour"`` or ``"day"``
+    -- the period whose instants all share one rendering, named by the first
+    probe step that renders differently -- or ``"more than a day"`` when even
+    day-apart instants share a name.
+    """
+    base = 979561830  # 2001-01-15T12:30:30Z
+    reference = time.strftime(fmt, time.gmtime(base))
+    for period, step in (
+        ("second", 1),
+        ("minute", 60),
+        ("hour", 3600),
+        ("day", 86400),
+    ):
+        if time.strftime(fmt, time.gmtime(base + step)) != reference:
+            return None if period == "second" else period
+    return "more than a day"
 
 
 def unescape_mount_field(field: str) -> str:

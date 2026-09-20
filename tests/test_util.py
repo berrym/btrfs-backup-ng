@@ -14,6 +14,7 @@ from btrfs_backup_ng.__util__ import (
     Snapshot,
     SnapshotTransferError,
     date_to_str,
+    indistinguishable_period,
     log_heading,
     parse_snapshot_time,
     read_locks,
@@ -806,6 +807,45 @@ class TestParseSnapshotTime:
         """An unparseable string raises ValueError."""
         with pytest.raises(ValueError):
             parse_snapshot_time("not-a-date", "%Y%m%dT%H%M%S")
+
+
+class TestIndistinguishablePeriod:
+    """indistinguishable_period drives the snapshot-collision diagnosis: None
+    means the same-second wording is truthful, a period name means the
+    configured format cannot express a second snapshot within that period.
+
+    Boundary safety is load-bearing and these five tests enforce it together:
+    the probe base must sit mid-period, or a step crosses the next field's
+    rollover and misreads the resolution. A base at second 59 makes the minute
+    test fail (the +1s probe rolls the minute and the format looks
+    seconds-fine); a base at minute 59 fails the hour test; a base at hour 23
+    fails the day test; a base in late December fails the more-than-a-day
+    test. Moving the base onto any boundary breaks at least one of these.
+    """
+
+    def test_seconds_resolving_format_is_none(self):
+        assert indistinguishable_period("%Y%m%d-%H%M%S") is None
+
+    def test_default_format_is_seconds_resolving(self):
+        assert indistinguishable_period(DATE_FORMAT) is None
+
+    def test_minute_coarse_format(self):
+        assert indistinguishable_period("%Y%m%d-%H%M") == "minute"
+
+    def test_hour_coarse_format(self):
+        assert indistinguishable_period("%Y%m%d-%H") == "hour"
+
+    def test_day_coarse_format(self):
+        assert indistinguishable_period("%Y%m%d") == "day"
+
+    def test_year_format_is_more_than_a_day(self):
+        assert indistinguishable_period("%Y") == "more than a day"
+
+    def test_literal_text_judged_by_output_not_directives(self):
+        """A constant format string never varies, so every snapshot collides;
+        the probe must reach that verdict from the rendering, not from
+        scanning for %-directives."""
+        assert indistinguishable_period("static-name") == "more than a day"
 
 
 class TestSnapshotTimeFormat:

@@ -303,16 +303,47 @@ class Endpoint:
         with FileLock(lock_path):
             logger.debug("Snapshot lock acquired: %s", lock_path)
             if Path(snapshot_path).exists():
-                # A snapshot with this exact name already exists. The usual cause is two
-                # snapshots requested within the same second (identical timestamp, hence
-                # identical name). btrfs would otherwise fail here with the misleading
-                # "Could not create subvolume: Read-only file system"; give the real
-                # reason and what to do instead.
+                # A snapshot with this exact name already exists; btrfs would
+                # otherwise fail here with the misleading "Could not create
+                # subvolume: Read-only file system". Diagnose by what the
+                # configured timestamp_format can actually express, not by
+                # assumption: under a seconds-resolving format the cause is two
+                # requests in the same second (or the repeated hour of a DST
+                # fall-back), and waiting is real advice. Under a coarser format
+                # the format itself cannot name a second snapshot within its
+                # period -- this message used to say "wait a second and retry"
+                # there too, which cannot work and misdiagnosed a same-day
+                # collision as a same-second one.
+                fmt = snapshot.time_format
+                period = __util__.indistinguishable_period(fmt)
+                where = (
+                    f"A snapshot named '{snapshot.get_name()}' already exists "
+                    f"at {snapshot_path}."
+                )
+                if period is None:
+                    raise __util__.AbortError(
+                        f"{where} Two snapshots were likely requested within "
+                        "the same second (identical timestamp); during a "
+                        "daylight-saving fall-back, requests an hour apart can "
+                        "also collide. Wait a second and retry; if the "
+                        "existing snapshot is incomplete, remove it first."
+                    )
+                if period == "more than a day":
+                    raise __util__.AbortError(
+                        f"{where} The configured timestamp_format {fmt!r} "
+                        "renders the same name for snapshots taken even days "
+                        "apart, so every new snapshot collides with this one. "
+                        "Configure a timestamp_format with finer resolution, "
+                        "or remove the existing snapshot first if it is not "
+                        "needed."
+                    )
                 raise __util__.AbortError(
-                    f"A snapshot named '{snapshot.get_name()}' already exists at "
-                    f"{snapshot_path}. Two snapshots were likely requested within the "
-                    "same second (identical timestamp). Wait a second and retry; if the "
-                    "existing snapshot is incomplete, remove it first."
+                    f"{where} The configured timestamp_format {fmt!r} gives "
+                    f"every snapshot taken in the same {period} the same "
+                    "name, so waiting a second cannot help. Retry in the "
+                    f"next {period}, configure a timestamp_format with finer "
+                    "resolution, or remove the existing snapshot first if it "
+                    "is not needed."
                 )
             self._remount(self.config["source"], read_write=True)
             commands = [
