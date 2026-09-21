@@ -1499,13 +1499,22 @@ class TestExecuteSnapper:
 class TestSnapperEndpointRouting:
     """Snapper backup routes through the endpoint layer (issue #1)."""
 
-    def test_send_snapper_btrfs_receives_into_incoming_temp_slot(self):
+    def test_send_snapper_btrfs_receives_into_incoming_temp_slot(self, tmp_path):
         """btrfs dispatch receives into the transactional .snapshots/{num}.incoming slot (NOT
-        the final slot), then publishes; the endpoint's base path is restored afterward."""
+        the final slot), then publishes; the endpoint's base path is restored afterward.
+
+        The destination is a directory this test creates. It used to be the
+        literal ``/backup/home``, which the engine's existence check -- a
+        backup location is never created -- accepts only on a machine that
+        happens to have one. The maintainer's does; CI does not; the test
+        passed for months on exactly one host.
+        """
         from btrfs_backup_ng.core import operations
 
+        target = tmp_path / "home"
+        target.mkdir()
         ep = MagicMock()
-        ep.config = {"path": "/backup/home"}
+        ep.config = {"path": str(target)}
         ep._is_remote = False
 
         snap = MagicMock()
@@ -1531,10 +1540,10 @@ class TestSnapperEndpointRouting:
             operations.send_snapper_snapshot(snap, ep)
 
         # Received into the .incoming temp slot, never the final one.
-        assert captured["path"] == "/backup/home/.snapshots/5.incoming"
+        assert captured["path"] == f"{target}/.snapshots/5.incoming"
         pub.assert_called_once_with(ep, 5)  # then published atomically
         # The endpoint's base path is restored after the transfer.
-        assert ep.config["path"] == "/backup/home"
+        assert ep.config["path"] == str(target)
 
     def test_send_snapper_raw_forces_no_compression(self, tmp_path):
         """Raw dispatch sends on the base endpoint with compression disabled."""
