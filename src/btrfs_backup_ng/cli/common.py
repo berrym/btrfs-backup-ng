@@ -532,11 +532,14 @@ def resolve_snapshot_dir(configured: str, source_path: Path) -> Path:
         return (source_path / configured_path).resolve()
 
     if not configured_path.is_dir():
+        # The one diagnosis every missing backup location gets, plus the
+        # consequence particular to this one: a btrfs snapshot only has to
+        # share a filesystem with its source, so a base built on the root
+        # filesystem would take the snapshots there and report success.
         raise __util__.AbortError(
-            f"snapshot_dir {configured_path} does not exist. An absolute "
-            f"snapshot_dir is not created for you: if it lives on a removable "
-            f"or network filesystem, it is most likely not mounted. Snapshots "
-            f"would otherwise be written to the filesystem holding the source."
+            __util__.missing_backup_location_message("snapshot_dir", configured_path)
+            + " Snapshots would otherwise be written to the filesystem holding "
+            "the source."
         )
     return (configured_path / source_path.name).resolve()
 

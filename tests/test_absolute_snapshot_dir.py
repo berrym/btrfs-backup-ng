@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import pytest
 
+from btrfs_backup_ng import __util__
 from btrfs_backup_ng.__util__ import AbortError
 from btrfs_backup_ng.cli.common import create_snapshot_dir, resolve_snapshot_dir
 
@@ -71,6 +72,27 @@ class TestAbsoluteRequiresItsBase:
 
         assert str(missing) in str(excinfo.value)
         assert "mounted" in str(excinfo.value).lower()
+
+    def test_the_refusal_is_the_shared_diagnosis_plus_the_consequence(
+        self, tmp_path, source
+    ):
+        """One diagnosis for every missing backup location, not a private one.
+
+        This refusal was the last to carry its own wording: it lacked the
+        "Nothing was created" sentence every other backup-location refusal
+        states, so the same rule read differently depending on which path was
+        missing. It is now the shared message with the consequence particular
+        to a snapshot base appended.
+        """
+        missing = tmp_path / "mnt" / "big"
+        with pytest.raises(AbortError) as excinfo:
+            resolve_snapshot_dir(str(missing), source)
+        text = str(excinfo.value)
+        assert text.startswith(
+            __util__.missing_backup_location_message("snapshot_dir", missing)
+        )
+        assert "Nothing was created." in text
+        assert "filesystem holding the source" in text
 
     def test_a_missing_base_is_not_created(self, tmp_path, source):
         missing = tmp_path / "mnt" / "big"
