@@ -52,6 +52,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Legacy mode no longer describes an `ssh://` source it cannot use.** The
+  help text dated from the original btrfs-backup, whose remote sources were
+  built on sshfs; nothing of that exists here, and the form was never
+  dispatched -- it fell through to the subcommand parser and was rejected as
+  "invalid choice" with every subcommand listed. The source help now says a
+  source is a local path, and an `ssh://` first argument is refused with the
+  reason and where `ssh://` is accepted. The feature is tracked in
+  [#108](https://github.com/berrym/btrfs-backup-ng/issues/108).
 - **Legacy mode's default snapshot folder is `.snapshots` inside the source**
   -- what has in fact happened on every run, and what the config-driven
   commands do -- so a run that never passed `-f` sees no change. A run that

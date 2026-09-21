@@ -1972,6 +1972,19 @@ def main(argv: list[str] | None = None) -> int:
     if is_legacy_mode(argv):
         return run_legacy_mode(argv)
 
+    # A URL in the first position is a legacy-mode invocation with a remote
+    # SOURCE, which is not supported: taking a snapshot on a remote host is
+    # not implemented (#108). Without this the subcommand parser rejected it
+    # as "invalid choice", which says nothing about why.
+    if argv and argv[0].startswith("ssh://"):
+        print(
+            f"btrfs-backup-ng: error: {argv[0]!r} is a remote source. A source "
+            "must be a local subvolume path; taking a snapshot on a remote host "
+            "is not supported. ssh:// is accepted for destinations.",
+            file=sys.stderr,
+        )
+        return 2
+
     # Parse with new subcommand interface
     parser = create_subcommand_parser()
     args = parser.parse_args(argv)
