@@ -9,6 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A failed send or receive now reports what btrfs said, not only how it
+  exited.** The local `btrfs send` and `btrfs receive` -- and by inheritance
+  the `ssh://` receive, and the remote send -- sent stderr to DEVNULL, so a
+  restore from a corrupt stream reported "btrfs send/receive failed with
+  return codes: [-13, 1]" and nothing else, while "ERROR: crc32 mismatch in
+  command" had been printed and discarded. Every send and receive an endpoint
+  starts now has its stderr drained on a thread as it is written, with the
+  last 64 KiB kept for the report and the pipe closed at EOF. The drain is
+  what makes a pipe safe: `--btrfs-debug` puts `-vv` on both commands, one
+  line per file operation, and a pipe read only after exit would fill, stop
+  the child, and read as a stall (verified: 30,000 files under `-vv`, local
+  and over ssh, complete without one). The transfer engine also hands the
+  receive it starts back to the failure report, which had been given None.
+  Raw transfers no longer leave a stderr pipe open until garbage collection.
+
 - **The `restore` man page said `--overwrite` overwrites.** The option was
   withdrawn in 0.9.6 and the CLI help has said so since; the man page kept the
   original sentence. It now matches the CLI, and a test pins the help text,

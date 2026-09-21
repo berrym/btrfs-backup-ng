@@ -3,9 +3,11 @@
 Provides stream processing for btrfs send/receive pipelines.
 """
 
+import io
 import logging
 import shutil
 import subprocess
+import threading
 import time
 from typing import Any, Optional, TypedDict
 
@@ -332,6 +334,136 @@ def hand_over(pipe: Any) -> None:
         pipe.close()
     except Exception as e:  # noqa: BLE001 - a started pipeline must not fail on this
         logger.debug("Could not release a handed-over pipe: %s", e)
+
+
+#: How much of a process's stderr is kept for the report: the last 64 KiB. A
+#: diagnosis is at the END of the output (the error line follows whatever
+#: progress preceded it), and 64 KiB is also the size of the pipe buffer, so
+#: the tail is at least what read-after-exit could ever have seen.
+STDERR_TAIL_BYTES = 64 * 1024
+
+
+class StderrTail:
+    """Drain a child's stderr as it is written, keeping the tail for the report.
+
+    A child whose stderr is a pipe nobody reads blocks once the kernel buffer
+    (64 KiB) is full. ``btrfs send``/``receive`` print one line each in normal
+    use, which is why reading the pipe after the process has exited seemed to
+    work -- but ``btrfs_debug`` puts ``-vv`` on both, one line per file
+    operation, and a large volume under that option would fill the buffer, the
+    child would stop, and the stall detector would then kill a healthy
+    transfer. So the pipe is read on a thread from the moment the process
+    starts, only the last ``keep`` bytes are retained, and the pipe is closed at
+    EOF -- which is also what stops these pipes leaking until garbage
+    collection.
+
+    ``text()`` waits for EOF (bounded) and returns what was kept. It may be
+    called any number of times.
+
+    The tail OWNS the pipe. A pipe can have one reader, so ``tail_stderr``
+    detaches it from the process (``proc.stderr`` becomes None) the moment the
+    tail takes it: ``communicate()`` then returns ``(stdout, None)`` instead of
+    racing the drain for bytes and reading a file the drain has closed, and
+    every caller that wants the text goes through :func:`stderr_text`.
+    """
+
+    def __init__(self, proc: Any, keep: int = STDERR_TAIL_BYTES) -> None:
+        self._pipe = proc.stderr
+        proc.stderr = None
+        self._keep = keep
+        self._buf = bytearray()
+        self._lock = threading.Lock()
+        self._thread = threading.Thread(
+            target=self._drain, name=f"stderr-tail-{proc.pid}", daemon=True
+        )
+        self._thread.start()
+
+    def _drain(self) -> None:
+        pipe = self._pipe
+        try:
+            while True:
+                chunk = (
+                    pipe.read1(65536) if hasattr(pipe, "read1") else pipe.read(65536)
+                )
+                if not isinstance(chunk, bytes) or not chunk:
+                    break
+                with self._lock:
+                    # Trim by BYTES, not by chunk: dropping whole chunks while
+                    # over the limit left as little as one chunk behind, so the
+                    # kept size depended on where the reads happened to split.
+                    self._buf += chunk
+                    excess = len(self._buf) - self._keep
+                    if excess > 0:
+                        del self._buf[:excess]
+        except (OSError, ValueError):
+            # The pipe was closed under us (a kill, or the process object being
+            # torn down); whatever was read stands.
+            pass
+        finally:
+            try:
+                pipe.close()
+            except (OSError, ValueError):
+                pass
+
+    def text(self, timeout: float = 5.0) -> str:
+        """The retained tail, decoded, after EOF (or after ``timeout`` seconds).
+
+        EOF follows the exit of every holder of the pipe's write end. A child
+        that exited has released it; a grandchild that inherited it and lingers
+        would delay EOF, so the wait is bounded and the report is whatever has
+        arrived, rather than a hang on a process that already finished.
+        """
+        self._thread.join(timeout)
+        with self._lock:
+            data = bytes(self._buf)
+        return data.decode("utf-8", errors="replace")
+
+
+def tail_stderr(proc: Any) -> Any:
+    """Attach a :class:`StderrTail` to ``proc`` (as ``proc.stderr_tail``) and return it.
+
+    A no-op returning None when the process has no stderr pipe. Endpoints call
+    this right after ``Popen(stderr=PIPE)``; the engine reads the result through
+    :func:`stderr_text`, so a process started without a pipe (or by a caller
+    that did not attach a tail) still reports what it can. After this call
+    ``proc.stderr`` is None: the pipe belongs to the tail.
+    """
+    # Only a real pipe gets a drain. A test double whose ``stderr`` is a mock
+    # object answers every read with another truthy mock, and a thread reading
+    # it would spin for the rest of the process; the isinstance check is what
+    # keeps a mocked endpoint from starting one.
+    if proc is None or not isinstance(getattr(proc, "stderr", None), io.IOBase):
+        return None
+    tail = StderrTail(proc)
+    proc.stderr_tail = tail
+    return tail
+
+
+def stderr_text(proc: Any) -> str:
+    """Everything a finished process said on stderr, from its tail if it has one.
+
+    Falls back to a direct read for a process that has a pipe but no tail (a
+    caller that built its own ``Popen``), closing the pipe afterwards so it is
+    not left to garbage collection. Returns "" for a process without stderr.
+    """
+    if proc is None:
+        return ""
+    tail = getattr(proc, "stderr_tail", None)
+    if isinstance(tail, StderrTail):
+        return tail.text()
+    pipe = getattr(proc, "stderr", None)
+    if not isinstance(pipe, io.IOBase):
+        return ""
+    try:
+        data = pipe.read()
+        return data.decode("utf-8", errors="replace") if isinstance(data, bytes) else ""
+    except (OSError, ValueError):
+        return ""
+    finally:
+        try:
+            pipe.close()
+        except (OSError, ValueError):
+            pass
 
 
 def chain_stages(source_stdout: Any, stages: list) -> tuple:

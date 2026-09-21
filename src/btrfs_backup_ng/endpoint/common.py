@@ -18,6 +18,7 @@ from btrfs_backup_ng import __util__
 from btrfs_backup_ng.__logger__ import logger
 from btrfs_backup_ng.core.space import SpaceInfo
 from btrfs_backup_ng.core.space import get_space_info as _get_space_info
+from btrfs_backup_ng.core.transfer import tail_stderr
 from btrfs_backup_ng.endpoint.raw_metadata import StructureVerdict
 
 #: The highest ``_N`` collision suffix creation will allocate before refusing.
@@ -476,13 +477,20 @@ class Endpoint:
         SSHEndpoint gains a remote-aware send.
         """
         cmd = self._build_send_command(snapshot, parent=parent, clones=clones)
-        # Suppress stderr ("At subvol" messages) - they're just informational
-        return self._exec_command(
+        # stderr is a pipe, drained as it is written and kept as a tail for the
+        # report (core.transfer.StderrTail). It used to go to DEVNULL, so a
+        # failed send reported its exit status and nothing else -- the
+        # "ERROR: ..." line btrfs printed was discarded. DEVNULL was chosen
+        # because an undrained pipe fills and stalls the child; the tail is
+        # what makes a pipe safe here.
+        proc = self._exec_command(
             {"command": cmd},
             method="Popen",
             stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
         )
+        tail_stderr(proc)
+        return proc
 
     def receive(
         self, stdin: Any, snapshot_name: str = "", parent_name: str | None = None
@@ -540,14 +548,23 @@ class Endpoint:
 
         logger.debug("Running receive command: %s", cmd)
         try:
-            # Suppress stderr ("At subvol" messages) - they're just informational
-            return self._exec_command(
+            # stderr is a pipe, drained as it is written and kept as a tail for
+            # the report (core.transfer.StderrTail). It used to go to DEVNULL:
+            # a failed receive -- a corrupt stream, a missing parent, ENOSPC --
+            # reported "failed with return codes [-13, 1]" and nothing else,
+            # while the reason had been printed and thrown away. The concurrent
+            # drain is what makes a pipe safe: btrfs_debug puts -vv on this
+            # command, one line per file operation, and a pipe read only after
+            # exit would fill, stop the child, and read as a stall.
+            proc = self._exec_command(
                 {"command": cmd},
                 method="Popen",
                 stdin=stdin,
                 stdout=stdout,
-                stderr=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
             )
+            tail_stderr(proc)
+            return proc
         except Exception as e:
             logger.error("Error executing receive command: %s", e)
             raise

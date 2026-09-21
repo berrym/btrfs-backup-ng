@@ -308,6 +308,9 @@ def send_snapshot(
                 ),
             )
         else:
+            # The receive is started inside; ``started`` brings it back so the
+            # report below can read what it said, not only how it exited.
+            started: dict[str, Any] = {}
             return_codes = _do_process_transfer(
                 send_process,
                 destination_endpoint,
@@ -325,7 +328,9 @@ def send_snapshot(
                 wall_timeout=int(
                     options.get("transfer_timeout", DEFAULT_TRANSFER_TIMEOUT)
                 ),
+                processes=started,
             )
+            receive_process = started.get("receive", receive_process)
 
         if any(rc != 0 for rc in return_codes):
             error_message = (
@@ -538,14 +543,7 @@ def _do_chunked_transfer(
             # truncated stream would be transferred and reported as a successful
             # backup.
             if send_process.returncode not in (0, None):
-                send_stderr = ""
-                if send_process.stderr is not None:
-                    try:
-                        send_stderr = send_process.stderr.read().decode(
-                            errors="replace"
-                        )
-                    except Exception:
-                        pass
+                send_stderr = transfer_utils.stderr_text(send_process)
                 raise __util__.SnapshotTransferError(
                     f"btrfs send failed during chunking "
                     f"(exit {send_process.returncode}): {send_stderr}"
@@ -704,9 +702,7 @@ def _transfer_chunks_local(
         )
 
         if return_code != 0:
-            stderr = ""
-            if receive_process.stderr:
-                stderr = receive_process.stderr.read().decode("utf-8", errors="replace")
+            stderr = transfer_utils.stderr_text(receive_process)
             raise __util__.SnapshotTransferError(
                 f"btrfs receive failed with code {return_code}: {stderr}"
             )
@@ -836,11 +832,7 @@ def _transfer_chunks_ssh(
             )
 
             if return_code != 0:
-                stderr = ""
-                if receive_process.stderr:
-                    stderr = receive_process.stderr.read().decode(
-                        "utf-8", errors="replace"
-                    )
+                stderr = transfer_utils.stderr_text(receive_process)
                 raise __util__.SnapshotTransferError(
                     f"SSH btrfs receive failed with code {return_code}: {stderr}"
                 )
@@ -1049,13 +1041,21 @@ def _do_process_transfer(
     stall_timeout: int = DEFAULT_STALL_TIMEOUT,
     wall_timeout: int = DEFAULT_TRANSFER_TIMEOUT,
     parent_name: str | None = None,
+    processes: dict[str, Any] | None = None,
 ) -> list[int]:
     """Perform transfer using traditional process piping.
 
     Args:
         send_process: btrfs send subprocess
         destination_endpoint: Destination endpoint
-        receive_process: Placeholder for receive process
+        receive_process: Placeholder for receive process. The receive is
+            started HERE, so the caller's variable is None; a caller that
+            wants the real process afterwards -- to read what btrfs receive
+            said when it failed -- passes ``processes`` and finds it there.
+        processes: When given, filled with ``{"receive": <Popen>}`` as soon as
+            the receive starts (on either progress path). This is what lets
+            the failure report carry the receive's own words instead of only
+            its exit status.
         is_ssh_endpoint: Whether destination is SSH
         compress: Compression method (none, gzip, zstd, lz4, etc.)
         rate_limit: Bandwidth limit (e.g., '10M', '1G')
@@ -1100,6 +1100,7 @@ def _do_process_transfer(
             snapshot_name,
             estimated_size,
             parent_name=parent_name,
+            processes=processes,
         )
 
     pipeline_processes = []
@@ -1123,6 +1124,8 @@ def _do_process_transfer(
         receive_process = destination_endpoint.receive(
             current_stdout, snapshot_name, parent_name=parent_name
         )
+        if processes is not None:
+            processes["receive"] = receive_process
         # The receive owns that pipe now. This is the LAST handoff in the chain,
         # which is where the omission always is: keeping a copy leaves a reader
         # that never reads, so the final local stage -- pv, mbuffer or the
@@ -1214,6 +1217,7 @@ def _do_rich_progress_transfer(
     snapshot_name: str,
     estimated_size: int | None,
     parent_name: str | None = None,
+    processes: dict[str, Any] | None = None,
 ) -> list[int]:
     """Perform transfer with Rich progress bar display.
 
@@ -1245,6 +1249,8 @@ def _do_rich_progress_transfer(
         except Exception:
             pass
         raise __util__.SnapshotTransferError(f"Receive process failed to start: {e}")
+    if processes is not None:
+        processes["receive"] = receive_process
     if receive_process is None:
         logger.error("Failed to start receive process")
         if is_ssh_endpoint and not destination_endpoint.config.get("ssh_sudo", False):
@@ -1282,22 +1288,16 @@ def _log_process_errors(send_process, receive_process) -> tuple[str, str]:
     subvolume') in the raised error instead of losing it to the log -- callers that
     classify the failure (verify's restore test) need the message, not just a return
     code."""
-    send_err = ""
-    recv_err = ""
-    if hasattr(send_process, "stderr") and send_process.stderr:
-        send_err = send_process.stderr.read().decode("utf-8", errors="replace")
-        if send_err:
-            logger.error("Send process stderr: %s", send_err)
-
-    if (
-        receive_process
-        and hasattr(receive_process, "stderr")
-        and receive_process.stderr
-    ):
-        recv_err = receive_process.stderr.read().decode("utf-8", errors="replace")
-        if recv_err:
-            logger.error("Receive process stderr: %s", recv_err)
-
+    # Each process's stderr is a pipe drained on a thread from the moment it
+    # started (core.transfer.StderrTail); this reads the retained tail. A
+    # process built without a tail is read directly, and either way the pipe
+    # is closed here rather than by garbage collection.
+    send_err = transfer_utils.stderr_text(send_process)
+    if send_err:
+        logger.error("Send process stderr: %s", send_err)
+    recv_err = transfer_utils.stderr_text(receive_process)
+    if recv_err:
+        logger.error("Receive process stderr: %s", recv_err)
     return send_err, recv_err
 
 

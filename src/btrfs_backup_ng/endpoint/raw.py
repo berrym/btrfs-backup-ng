@@ -30,6 +30,7 @@ from typing import Any, Optional, TypedDict
 
 from btrfs_backup_ng import __util__
 from btrfs_backup_ng.__logger__ import logger
+from btrfs_backup_ng.core.transfer import tail_stderr
 from btrfs_backup_ng.endpoint.common import DeletionResult, Endpoint
 from btrfs_backup_ng.endpoint.raw_metadata import (
     COMPRESSION_CONFIG,
@@ -949,6 +950,10 @@ class RawEndpoint(Endpoint):
                 )
             finally:
                 os.close(fd)
+            # Drained as it is written and kept as a tail (core.transfer.StderrTail):
+            # the engine used to read this pipe only on failure, so on every
+            # success it was left open until garbage collection.
+            tail_stderr(proc)
             return proc
 
         # For multiple commands, chain them together
@@ -974,6 +979,7 @@ class RawEndpoint(Endpoint):
             )
         finally:
             os.close(part_fd)
+        tail_stderr(proc)
         return proc
 
     @staticmethod
@@ -1616,6 +1622,7 @@ class RawEndpoint(Endpoint):
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
                 )
+            tail_stderr(proc)
             return proc
 
         # Chain commands with shell; quote every argv element and the input path
@@ -1629,12 +1636,14 @@ class RawEndpoint(Endpoint):
         # a truncated stream) is NOT masked by the last stage exiting 0 -- otherwise a
         # garbage/partial stream could be fed to btrfs receive and reported as a
         # successful restore. Mirrors the write pipeline.
-        return _popen_pipeline_pipefail(
+        proc = _popen_pipeline_pipefail(
             shell_cmd,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
         )
+        tail_stderr(proc)
+        return proc
 
     def _entry_snapshot_name(self, entry: str) -> str | None:
         """A raw entry is a FILE, not a subvolume: strip the stream suffixes.
@@ -3118,12 +3127,14 @@ class SSHRawEndpoint(RawEndpoint):
         else:
             shell_cmd = ssh_part
         logger.debug("Executing remote restore pipeline: %s", shell_cmd)
-        return _popen_pipeline_pipefail(
+        proc = _popen_pipeline_pipefail(
             shell_cmd,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
         )
+        tail_stderr(proc)
+        return proc
 
     def list_snapshots(self, flush_cache: bool = False) -> list[RawSnapshot]:
         """List raw snapshots on the remote host.
