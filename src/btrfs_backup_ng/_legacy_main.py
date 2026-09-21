@@ -252,7 +252,8 @@ files is allowed as well."""
     )
     group.add_argument(
         "source",
-        help="Subvolume to backup. Formats: /path/to/subvolume or ssh://[user@]host[:port]/path",
+        help="Subvolume to back up: a local path. A remote (ssh://) source is not "
+        "supported; ssh:// is accepted for destinations.",
     )
     group.add_argument(
         "destinations",
