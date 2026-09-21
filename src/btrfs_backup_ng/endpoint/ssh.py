@@ -65,6 +65,7 @@ from btrfs_backup_ng.core.errors import (  # noqa: E402
     TransientNetworkError,
     classify_error,
 )
+from btrfs_backup_ng.core.transfer import tail_stderr  # noqa: E402
 from btrfs_backup_ng.core.retry import (  # noqa: E402
     DEFAULT_TRANSFER_POLICY,
     RetryContext,
@@ -1227,20 +1228,23 @@ class SSHEndpoint(Endpoint):
                 f"passwordless sudo for /usr/bin/btrfs."
             )
 
-        # stderr -> DEVNULL, matching the base send and every other send in the codebase.
-        # The transfer supervisor blocks on the RECEIVE and does NOT drain the send's
-        # stderr during the stream, so a PIPE here could (pathologically) fill -- ssh also
-        # forwards the remote command's stderr -- stall the send, starve the receive, and
-        # hang until the overall timeout. A failed remote send still surfaces cleanly: ssh
-        # exits non-zero and the receive fails, and the supervisor terminates the send and
-        # reports the failure. (Never redirect remote stderr into stdout -- it corrupts the
-        # btrfs stream.)
+        # stderr -> a pipe drained as it is written (core.transfer.StderrTail),
+        # like the base send. It was DEVNULL, and the reason recorded here was
+        # exactly the drain's absence: the supervisor blocks on the RECEIVE and
+        # never read the send's stderr during the stream, so a pipe could fill
+        # -- ssh forwards the remote command's stderr too -- stall the send,
+        # starve the receive, and hang until the overall timeout. A failed
+        # remote send then surfaced only as ssh's exit status. The tail reads
+        # concurrently and keeps the last 64 KiB, so the remote "ERROR: ..."
+        # line reaches the report. (Never redirect remote stderr into stdout
+        # -- it corrupts the btrfs stream.)
         process = subprocess.Popen(
             ssh_cmd,
             stdin=subprocess.PIPE if password else None,
             stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
         )
+        tail_stderr(process)
         if password and process.stdin:
             # The password line, then EOF. ssh forwards our stdin to the remote
             # command; sudo consumes the line and `btrfs send` never reads stdin,
@@ -2298,6 +2302,7 @@ print(json.dumps(result))
             process = subprocess.Popen(
                 command, stdout=stdout_pipe, stderr=subprocess.PIPE
             )
+            tail_stderr(process)
             logger.debug("btrfs send process started successfully: %s", command)
             return process
         except Exception as e:
