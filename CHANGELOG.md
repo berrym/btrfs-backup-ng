@@ -5,17 +5,37 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.9.8] - 2026-09-21
 
 ### Fixed
 
 - **The remaining ways a backup location could be created are closed, on
   every layer and every entry point**
   ([#102](https://github.com/berrym/btrfs-backup-ng/pull/102)). 0.9.7 stopped
-  the endpoints, the transfer engine and the listing from creating a target, a
-  source or an absolute `snapshot_dir`. Five sites were still live, each
-  reproduced on real btrfs before it was fixed:
+  the local endpoints from creating a target, a source or an absolute
+  `snapshot_dir`, and said the class was closed. It was not: ten more sites
+  were live in every other layer, each reproduced on real btrfs -- one of them
+  only by a real cross-machine transfer -- before it was fixed:
 
+  - The listing created the path it was asked to enumerate. A drive that
+    unmounted mid-run had its mount point rebuilt on the root filesystem by
+    the next read, the pool was reported empty, and the planner scheduled full
+    re-sends into the directory the read had just invented. A backup
+    destination that cannot be enumerated is now refused as exactly that,
+    never presented as empty.
+  - `ssh://` ran `mkdir -p` on the remote at the moment of first transfer
+    ("Destination path doesn't exist, creating it"), and `raw+ssh://`
+    created its target outright -- its writability probe itself began with
+    `mkdir -p`, so even asking whether the target was writable invented it.
+  - The transfer engine's `_ensure_destination_exists` rebuilt whatever the
+    endpoint's `prepare()` had just refused, one layer above every endpoint
+    audit, behind a name that reads as a check. A green unit suite, exact
+    mutation kills and a green loopback suite all agreed the class was
+    closed; a real transfer to a real host created the directory, transferred
+    into it, and exited 0.
+  - The remote lock scripts ran `mkdir -p` on the full lock-tree path, so
+    acquiring a lock against an unmounted destination rebuilt the mount
+    point. The lock tree is now created only below an existing target.
   - `run` and `snapshot` created `<volume path>/.snapshots` *before* looking at
     the volume, so a volume whose path was not there (an unmounted data disk, a
     typo in `path`) had its snapshot tree built on the root filesystem, and from
@@ -50,6 +70,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   legacy-mode snapshot went to `<source>/.snapshots` whatever the option said.
   The option is now honoured.
 
+- **A retention bucket count of `true` kept one snapshot, not seven.** The
+  five time buckets (`hourly` … `yearly`) were read with no check while `min`
+  and `keep` were validated; `daily = true` loaded clean, counted as 1, and a
+  policy meant to keep seven kept one -- measured over eleven snapshots, six
+  the policy said to keep were deleted. A string crashed mid-prune; a negative
+  silently disabled the tier. Each bucket now takes the rule `keep` already
+  had: a non-negative integer, with a boolean rejected by name, refused when
+  the config loads.
+
+- **`estimate` predicted the wrong directory under an absolute
+  `snapshot_dir`.** It joined `source / snapshot_dir` by hand, which resolves
+  to the absolute right operand, so it enumerated the base while the transfer
+  reads `<base>/<source name>`: `list` showed two snapshots, `estimate`
+  reported zero. All seven commands that resolve a snapshot directory now go
+  through the one helper, and the four that carried inline copies gain its
+  diagnosis when the base is missing.
+
+- **`prune` and `snapshot` dropped configuration warnings from the log file.**
+  Both logged them before installing the log file named by that same config,
+  so under cron or a timer -- where the console goes nowhere -- a collected
+  warning vanished. `run` and `transfer` had been fixed; these two were missed
+  because the test that guarded the ordering compared character offsets in
+  source text and was parametrised over exactly the two modules already fixed.
+  It is replaced by a test that drives each command as a subprocess and reads
+  the warning back from the file.
+
+- **A configuration file that is not UTF-8 produced a traceback** instead of
+  a configuration error; it is now a `ConfigError` naming the file. A
+  non-string `gpg_recipient` died mid-backup while building the gpg command;
+  it is refused at load like every other encryption key. `doctor` blessed a
+  valid configuration with every volume disabled ("3 passed, 0 warnings") --
+  a machine that performs no backups while doctor says all clear; it now
+  warns and names the remedy. Configuration writers state `encoding="utf-8"`
+  at every site, so a file written on one host reads on another whatever the
+  locale.
+
 ### Changed
 
 - **Legacy mode no longer describes an `ssh://` source it cannot use.** The
@@ -76,6 +132,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a relative one is created under the source, which must exist.
 
 ### Added
+
+- **A snapshot's name is a remembered fact, and a collision is absorbed with
+  the `_N` counter instead of refused.** A snapshot regenerated its name on
+  every call from its parsed timestamp, so a listing could name an entry that
+  is not on disk (strptime accepts `2026-9-8`, strftime writes `2026-09-08`),
+  and prune, lock and verify by that path; two snapshots sharing a timestamp
+  compared equal whatever their names. The name is now set once, from what is
+  on disk or at creation, and identity is the name. A second snapshot whose
+  name collides -- the second of the day under a coarse `timestamp_format`,
+  the repeated hour of a daylight-saving fall-back, a scheduler double-fire --
+  was refused with advice to wait a second, which under a coarse format could
+  never work. It now takes the lowest free `_N`, btrbk's own collision
+  counter, allocated inside the creation lock; the diagnosis that remains is
+  judged by what the configured format actually renders at one second, one
+  minute, one hour and one day apart, not by scanning the format string.
+
+- **Foreign snapshot names are listed instead of hidden.** Anything whose
+  name did not parse was skipped silently, so a btrbk pool full of `_N`
+  names, or any subvolume named by another tool, listed as empty while
+  holding restorable data. A prefix-matching subvolume whose name yields no
+  timestamp is now listed, restorable and reported; a plain file or directory
+  is still skipped. A trailing `_N` is stripped when deriving a timestamp, so
+  migrated btrbk pools enter retention buckets. A snapshot with no derivable
+  timestamp takes part in nothing that needs an age -- never a parent, never
+  counted, never deleted by count -- and each exclusion is logged.
+
+- **The acceptance matrix's restore proof can fail.** Seven hardware cells
+  byte-verified restored data and could not fail on the defects that matter:
+  the restore's return code was discarded, the incremental run's return code
+  was recorded and asserted nowhere, and every cell compared a file identical
+  in every snapshot of the chain. A restore that delivered the parent and
+  dropped the increment passed the whole matrix. Every cell now asserts every
+  return code and that the increment's own bytes were restored, and the two
+  empty-prefix cells own their destinations. With that, incremental restore
+  is proven on local btrfs, `ssh://`, `raw://`, `raw+ssh://` and a macOS raw
+  target.
 
 - **The rule is structural, not a list of known sites.** A test walks the
   package's syntax tree for every way a directory can be created -- `mkdir`,
