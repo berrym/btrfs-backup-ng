@@ -155,7 +155,7 @@ complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_using_command restore' -l
 complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_using_command restore' -l no-incremental -d 'Force full transfers (don'\''t use incremental)'
 complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_using_command restore' -l skip-verify -d 'Skip the pre-restore integrity check for raw backups (restore even if the stored stream'\''s checksum no longer matches, and skip the extra read). Use for last-copy recovery of a partially-corrupt backup.'
 complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_using_command restore' -l overwrite -d 'Not supported in this release: existing snapshots are left in place and a warning is printed. Remove a snapshot yourself to replace it'
-complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_using_command restore' -l in-place -d 'Restore to original location (DANGEROUS)'
+complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_using_command restore' -l in-place -d 'Not implemented in this release: the command refuses and restores nothing. Restore to a staging directory, verify it, and swap the subvolumes yourself (README, Strategy 2)'
 complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_using_command restore' -l yes-i-know-what-i-am-doing -d 'Confirm dangerous operations like in-place restore'
 complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_using_command restore' -l prefix -d 'Snapshot prefix filter' -x
 complete -c btrfs-backup-ng -n '__fish_btrfs_backup_ng_using_command restore' -l timestamp-format -d 'strftime format for parsing snapshot timestamps in direct mode (defaults to the config'\''s [global] timestamp_format, else the built-in)' -x

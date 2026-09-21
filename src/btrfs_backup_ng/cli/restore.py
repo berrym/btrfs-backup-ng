@@ -47,6 +47,30 @@ def execute_restore(args: argparse.Namespace) -> int:
     log_level = get_log_level(args)
     create_logger(False, level=log_level)
 
+    # --in-place is NOT implemented, and the command refuses rather than
+    # proceed as if it were. Accepting the flag and running the ordinary
+    # restore -- which lands the snapshot NESTED at DESTINATION/<name> and
+    # replaces nothing -- reported success for a location that was never
+    # replaced, and the README documented that as a disaster-recovery
+    # strategy; the config-driven path (--volume) did not even read the
+    # flag. The refusal sits ahead of every mode, before any endpoint is
+    # prepared, so nothing is touched, and it names the procedure that does
+    # work today.
+    if getattr(args, "in_place", False):
+        logger.error(
+            "--in-place is not implemented in this release, and this command "
+            "refuses rather than pretend: nothing was restored. A restore "
+            "receives each snapshot as a NESTED subvolume at "
+            "DESTINATION/<snapshot name>; it never replaces DESTINATION "
+            "itself. To replace a location: restore into a staging directory, "
+            "verify it, then swap the subvolumes yourself -- the README's "
+            "Strategy 2 gives the exact commands, including the rollback. The "
+            "running root filesystem can only be replaced from a rescue "
+            "system. In-place restore that verifies the staged copy before "
+            "swapping is planned and tracked in issue #109."
+        )
+        return 2
+
     # Handle --list-volumes mode (list configured volumes)
     if getattr(args, "list_volumes", False):
         return _execute_list_volumes(args)

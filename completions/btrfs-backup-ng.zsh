@@ -320,7 +320,7 @@ _btrfs_backup_ng() {
                         '--no-incremental[Force full transfers (don'\''t use incremental)]' \
                         '--skip-verify[Skip the pre-restore integrity check for raw backups (restore even if the stored stream'\''s checksum no longer matches, and skip the extra read). Use for last-copy recovery of a partially-corrupt backup.]' \
                         '--overwrite[Not supported in this release: existing snapshots are left in place and a warning is printed. Remove a snapshot yourself to replace it]' \
-                        '--in-place[Restore to original location (DANGEROUS)]' \
+                        '--in-place[Not implemented in this release: the command refuses and restores nothing. Restore to a staging directory, verify it, and swap the subvolumes yourself (README, Strategy 2)]' \
                         '--yes-i-know-what-i-am-doing[Confirm dangerous operations like in-place restore]' \
                         '--prefix[Snapshot prefix filter]:prefix:' \
                         '--timestamp-format[strftime format for parsing snapshot timestamps in direct mode (defaults to the config'\''s [global] timestamp_format, else the built-in)]:fmt:' \
