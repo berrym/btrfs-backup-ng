@@ -5,6 +5,7 @@ Provides stream processing for btrfs send/receive pipelines.
 
 import io
 import logging
+import queue
 import shutil
 import subprocess
 import threading
@@ -367,14 +368,43 @@ class StderrTail:
     every caller that wants the text goes through :func:`stderr_text`.
     """
 
-    def __init__(self, proc: Any, keep: int = STDERR_TAIL_BYTES) -> None:
+    def __init__(
+        self, proc: Any, keep: int = STDERR_TAIL_BYTES, log_as: str | None = None
+    ) -> None:
         self._pipe = proc.stderr
         proc.stderr = None
         self._keep = keep
         self._buf = bytearray()
         self._lock = threading.Lock()
+        # With ``log_as``, every complete line is also logged at DEBUG as it
+        # arrives, prefixed with that name. This is what btrfs_debug means:
+        # the -vv it puts on send and receive prints a line per file
+        # operation, and without a reader those lines went to DEVNULL and the
+        # option was a no-op. The tail for the failure report is unchanged.
+        #
+        # Logging happens on a SECOND thread fed by a queue. Rendering a line
+        # on the console costs far more than reading it from the pipe, and a
+        # drain that logged as it read fell behind on a slow terminal, the pipe
+        # filled, and the child blocked on stderr -- the transfer's throughput
+        # became bound by terminal rendering, the very coupling the drain
+        # exists to break (measured: 3,000 files, 9 s logging inline against
+        # 1 s without). The reader never waits on the logger.
+        self._log_as = log_as
+        self._partial = b""
+        self._lines: queue.SimpleQueue[bytes | None] | None = None
+        self._log_thread: threading.Thread | None = None
+        if log_as is not None:
+            self._lines = queue.SimpleQueue()
+            self._log_thread = threading.Thread(
+                target=self._log_worker,
+                name=f"stderr-log-{getattr(proc, 'pid', '?')}",
+                daemon=True,
+            )
+            self._log_thread.start()
         self._thread = threading.Thread(
-            target=self._drain, name=f"stderr-tail-{proc.pid}", daemon=True
+            target=self._drain,
+            name=f"stderr-tail-{getattr(proc, 'pid', '?')}",
+            daemon=True,
         )
         self._thread.start()
 
@@ -395,15 +425,38 @@ class StderrTail:
                     excess = len(self._buf) - self._keep
                     if excess > 0:
                         del self._buf[:excess]
+                if self._log_as is not None:
+                    self._log_lines(chunk)
         except (OSError, ValueError):
             # The pipe was closed under us (a kill, or the process object being
             # torn down); whatever was read stands.
             pass
         finally:
+            if self._lines is not None:
+                if self._partial:
+                    self._lines.put(self._partial)
+                    self._partial = b""
+                self._lines.put(None)
             try:
                 pipe.close()
             except (OSError, ValueError):
                 pass
+
+    def _log_lines(self, chunk: bytes) -> None:
+        assert self._lines is not None
+        data = self._partial + chunk
+        lines = data.split(b"\n")
+        self._partial = lines.pop()
+        for line in lines:
+            self._lines.put(line)
+
+    def _log_worker(self) -> None:
+        assert self._lines is not None
+        while True:
+            line = self._lines.get()
+            if line is None:
+                return
+            logger.debug("%s: %s", self._log_as, line.decode("utf-8", "replace"))
 
     def text(self, timeout: float = 5.0) -> str:
         """The retained tail, decoded, after EOF (or after ``timeout`` seconds).
@@ -413,14 +466,34 @@ class StderrTail:
         would delay EOF, so the wait is bounded and the report is whatever has
         arrived, rather than a hang on a process that already finished.
         """
-        self._thread.join(timeout)
+        self.finish(timeout)
         with self._lock:
             data = bytes(self._buf)
         return data.decode("utf-8", errors="replace")
 
+    def finish(self, timeout: float = 5.0) -> None:
+        """Wait (bounded) for EOF, then log every line read so far.
 
-def tail_stderr(proc: Any) -> Any:
+        The engine calls this at the end of every transfer, success included.
+        Without it the success path never waited on the logger thread, and a
+        run under btrfs_debug exited with most of its lines still queued
+        (measured: 348 of 24,000 logged). The drain's wait is bounded because
+        EOF may never come -- an ssh control master that inherited the pipe
+        holds it open -- but the logger is then told to stop after what is
+        already queued and is waited for without a bound: that wait is bounded
+        by the lines in the queue, and finishing them is the whole point.
+        """
+        self._thread.join(timeout)
+        if self._log_thread is not None and self._lines is not None:
+            self._lines.put(None)
+            self._log_thread.join()
+
+
+def tail_stderr(proc: Any, log_as: str | None = None) -> Any:
     """Attach a :class:`StderrTail` to ``proc`` (as ``proc.stderr_tail``) and return it.
+
+    With ``log_as`` (a name such as "btrfs receive"), each line is also logged
+    at DEBUG as it arrives; endpoints pass it when ``btrfs_debug`` is on.
 
     A no-op returning None when the process has no stderr pipe. Endpoints call
     this right after ``Popen(stderr=PIPE)``; the engine reads the result through
@@ -434,9 +507,19 @@ def tail_stderr(proc: Any) -> Any:
     # keeps a mocked endpoint from starting one.
     if proc is None or not isinstance(getattr(proc, "stderr", None), io.IOBase):
         return None
-    tail = StderrTail(proc)
+    tail = StderrTail(proc, log_as=log_as)
     proc.stderr_tail = tail
     return tail
+
+
+def finish_stderr(*procs: Any) -> None:
+    """Finish the tails of the given processes: wait for EOF (bounded) and let
+    every queued debug line reach the log. Safe on None, on a process without
+    a tail, and more than once."""
+    for proc in procs:
+        tail = getattr(proc, "stderr_tail", None)
+        if isinstance(tail, StderrTail):
+            tail.finish()
 
 
 def stderr_text(proc: Any) -> str:

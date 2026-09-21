@@ -39,6 +39,24 @@ Suppress non-essential output.
 .B \-\-debug
 Enable debug output with detailed logging.
 .TP
+.B \-\-btrfs-debug
+Run every
+.B btrfs send
+and
+.B btrfs receive
+with
+.BR \-vv ,
+and log each line they print, one per file operation, as it arrives, prefixed
+with the process that printed it. Implies
+.BR \-\-debug ,
+since the lines are logged at that level. The same setting is available as
+.B btrfs_debug = true
+under
+.B [global]
+in the configuration file. In legacy mode the option has always existed as
+.BR \-\-btrfs-debug ;
+until this release its output was discarded.
+.TP
 .BR \-V ", " \-\-version
 Show version and exit.
 .TP

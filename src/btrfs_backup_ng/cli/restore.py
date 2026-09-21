@@ -24,6 +24,7 @@ from ..core.restore import (
     validate_restore_destination,
 )
 from .common import (
+    btrfs_debug_enabled,
     get_fs_checks_mode,
     get_log_level,
     resolve_timestamp_format,
@@ -364,6 +365,7 @@ def _execute_main_restore(args: argparse.Namespace) -> int:
                 getattr(args, "timestamp_format", None), getattr(args, "config", None)
             ),
             snap_prefix=getattr(args, "prefix", "") or "",
+            btrfs_debug=btrfs_debug_enabled(args),
         )
     except Exception as e:
         logger.error("Failed to prepare local endpoint: %s", e)
@@ -611,7 +613,7 @@ def _prepare_backup_endpoint(args: argparse.Namespace, source: str):
         "snap_prefix_explicit": getattr(args, "prefix", None) is not None,
         "convert_rw": False,
         "subvolume_sync": False,
-        "btrfs_debug": False,
+        "btrfs_debug": btrfs_debug_enabled(args),
         "fs_checks": get_fs_checks_mode(args),
         "timestamp_format": resolve_timestamp_format(
             getattr(args, "timestamp_format", None),
@@ -717,6 +719,7 @@ def _prepare_local_endpoint(
     dest_path: Path,
     timestamp_format: str | None = None,
     snap_prefix: str = "",
+    btrfs_debug: bool = False,
 ):
     """Prepare the local endpoint for receiving restored snapshots.
 
@@ -744,7 +747,7 @@ def _prepare_local_endpoint(
         "snap_prefix": snap_prefix,
         "convert_rw": False,
         "subvolume_sync": False,
-        "btrfs_debug": False,
+        "btrfs_debug": btrfs_debug,
         "fs_checks": "auto",
         "timestamp_format": timestamp_format,
     }

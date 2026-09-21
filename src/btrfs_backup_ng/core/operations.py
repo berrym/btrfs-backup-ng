@@ -332,6 +332,12 @@ def send_snapshot(
             )
             receive_process = started.get("receive", receive_process)
 
+        # Both processes have exited (or been terminated) by now. Finish their
+        # stderr tails whatever the outcome: on success nothing else reads
+        # them, and a run under btrfs_debug would otherwise exit with most of
+        # its lines still queued.
+        transfer_utils.finish_stderr(send_process, receive_process)
+
         if any(rc != 0 for rc in return_codes):
             error_message = (
                 f"btrfs send/receive failed with return codes: {return_codes}"

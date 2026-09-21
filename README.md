@@ -323,6 +323,9 @@ parallel_volumes = 2                   # Concurrent volume backups
 parallel_targets = 3                   # Concurrent target transfers
 quiet = false                          # Suppress non-essential output
 verbose = false                        # Enable verbose output
+btrfs_debug = false                    # Run btrfs send/receive with -vv and log every
+                                       # line they print (one per file operation);
+                                       # implies debug logging. Also --btrfs-debug
 transfer_timeout = 0                   # Wall-clock limit per transfer, in seconds.
                                        # 0 = unlimited (the default): a transfer that is
                                        # moving data is succeeding, and any fixed value is

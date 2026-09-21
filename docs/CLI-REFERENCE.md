@@ -12,6 +12,10 @@ These options can be used with any command:
 -c, --config FILE   Path to configuration file
 -v, --verbose       Increase output verbosity (can be repeated: -vv)
 -q, --quiet         Suppress non-essential output
+--debug             Enable debug output
+--btrfs-debug       Run btrfs send and receive with -vv and log every line they
+                    print, one per file operation, as it arrives; implies
+                    --debug. Same as [global] btrfs_debug = true
 ```
 
 ## Where SSH Options Live

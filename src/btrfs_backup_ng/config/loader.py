@@ -497,6 +497,14 @@ def _parse_global(data: dict[str, Any]) -> GlobalConfig:
     if "notifications" in data:
         notifications = _parse_notifications(data["notifications"])
 
+    # A bool, refused at load otherwise: a string ("yes") or an int would be
+    # truthy and quietly put -vv on every send and receive.
+    btrfs_debug = data.get("btrfs_debug", False)
+    if not isinstance(btrfs_debug, bool):
+        raise ConfigError(
+            f"Invalid [global] btrfs_debug: {btrfs_debug!r}. It must be true or false."
+        )
+
     return GlobalConfig(
         snapshot_dir=data.get("snapshot_dir", ".snapshots"),
         timestamp_format=data.get("timestamp_format", "%Y%m%d-%H%M%S"),
@@ -511,6 +519,7 @@ def _parse_global(data: dict[str, Any]) -> GlobalConfig:
         parallel_targets=data.get("parallel_targets", 3),
         quiet=data.get("quiet", False),
         verbose=data.get("verbose", False),
+        btrfs_debug=btrfs_debug,
     )
 
 
@@ -535,6 +544,7 @@ _KNOWN_GLOBAL_KEYS = {
     "parallel_targets",
     "quiet",
     "verbose",
+    "btrfs_debug",
 }
 _KNOWN_RETENTION_KEYS = {
     "min",

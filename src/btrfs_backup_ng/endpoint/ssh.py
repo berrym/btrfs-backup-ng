@@ -65,7 +65,11 @@ from btrfs_backup_ng.core.errors import (  # noqa: E402
     TransientNetworkError,
     classify_error,
 )
-from btrfs_backup_ng.core.transfer import tail_stderr  # noqa: E402
+from btrfs_backup_ng.core.transfer import (  # noqa: E402
+    finish_stderr,
+    stderr_text,
+    tail_stderr,
+)
 from btrfs_backup_ng.core.retry import (  # noqa: E402
     DEFAULT_TRANSFER_POLICY,
     RetryContext,
@@ -143,6 +147,7 @@ def _build_receive_command(
     use_sudo: bool = False,
     password_on_stdin: bool = False,
     decompress: str | None = None,
+    verbose: bool = False,
 ) -> str:
     """Build a btrfs receive command with orphan process protection.
 
@@ -169,16 +174,19 @@ def _build_receive_command(
     # levels of shell parsing regardless of spaces, quotes or metacharacters.
     quoted_dest = shlex.quote(dest_path)
 
+    # btrfs_debug: -vv on the remote receive too, one line per file operation,
+    # forwarded back over ssh's stderr and drained by the caller's tail.
+    flags = " -vv" if verbose else ""
     # Build the base btrfs receive command
     if use_sudo:
         if password_on_stdin:
             # sudo -S reads password from stdin first, then btrfs receive reads data
-            base_receive = f"sudo -S btrfs receive {quoted_dest}"
+            base_receive = f"sudo -S btrfs receive{flags} {quoted_dest}"
         else:
             # sudo -n for passwordless sudo
-            base_receive = f"sudo -n btrfs receive {quoted_dest}"
+            base_receive = f"sudo -n btrfs receive{flags} {quoted_dest}"
     else:
-        base_receive = f"btrfs receive {quoted_dest}"
+        base_receive = f"btrfs receive{flags} {quoted_dest}"
 
     # Set up a cleanup trap for disconnect signals. When SSH disconnects, SIGHUP
     # is sent to the shell, which triggers the trap.
@@ -1244,7 +1252,10 @@ class SSHEndpoint(Endpoint):
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
         )
-        tail_stderr(process)
+        tail_stderr(
+            process,
+            log_as="remote btrfs send" if self.config.get("btrfs_debug") else None,
+        )
         if password and process.stdin:
             # The password line, then EOF. ssh forwards our stdin to the remote
             # command; sudo consumes the line and `btrfs send` never reads stdin,
@@ -2302,7 +2313,9 @@ print(json.dumps(result))
             process = subprocess.Popen(
                 command, stdout=stdout_pipe, stderr=subprocess.PIPE
             )
-            tail_stderr(process)
+            tail_stderr(
+                process, log_as="btrfs send" if self.config.get("btrfs_debug") else None
+            )
             logger.debug("btrfs send process started successfully: %s", command)
             return process
         except Exception as e:
@@ -2464,11 +2477,13 @@ print(json.dumps(result))
         # Build remote command with orphan protection.
         # _build_receive_command escapes the destination itself; do not pre-quote.
         use_sudo = self.config.get("ssh_sudo", False)
+        debug = bool(self.config.get("btrfs_debug"))
         remote_cmd = _build_receive_command(
             destination,
             use_sudo=use_sudo,
             password_on_stdin=False,
             decompress=decompress,
+            verbose=debug,
         )
         ssh_cmd.extend([remote_host, remote_cmd])
 
@@ -2481,6 +2496,13 @@ print(json.dumps(result))
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 bufsize=0,
+            )
+            # The remote receive's stderr comes back over ssh. Drained as it
+            # arrives (core.transfer.StderrTail): with -vv it is a line per
+            # file operation, and read only after exit it would fill the pipe
+            # and stop the receive.
+            tail_stderr(
+                receive_process, log_as="remote btrfs receive" if debug else None
             )
 
             # The receive owns that pipe now, so this process must let go of its
@@ -3999,7 +4021,7 @@ print(json.dumps(result))
             start_time = time.time()
 
             # Create the btrfs send command
-            send_cmd = ["btrfs", "send"]
+            send_cmd = ["btrfs", "send", *self.btrfs_flags]
             if parent_path and os.path.exists(parent_path):
                 send_cmd.extend(["-p", parent_path])
                 logger.debug(f"Using incremental send with parent: {parent_path}")
@@ -4020,6 +4042,10 @@ print(json.dumps(result))
             # Start the local btrfs send process
             send_process = subprocess.Popen(
                 send_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0
+            )
+            tail_stderr(
+                send_process,
+                log_as="btrfs send" if self.config.get("btrfs_debug") else None,
             )
 
             # Stages, in THIS path's order: buffer first, then compress. Built by
@@ -4164,6 +4190,11 @@ print(json.dumps(result))
 
             elapsed_time = time.time() - start_time
             logger.info(f"Transfer completed in {elapsed_time:.2f} seconds")
+
+            # Both processes are done. Finish their stderr tails whatever the
+            # outcome, so a run under btrfs_debug does not exit with the
+            # remote receive's lines still queued (core.transfer.finish_stderr).
+            finish_stderr(send_process, receive_process)
 
             if transfer_succeeded:
                 logger.info("SUCCESS: TRANSFER VERIFICATION SUCCESSFUL")
@@ -4964,11 +4995,10 @@ print(json.dumps(result))
         Returning the text lets the caller thread the actionable cause into the
         raised transfer error instead of leaving it only in a separate log line."""
         try:
-            if process.stderr:
-                stderr_data = process.stderr.read().decode("utf-8", errors="replace")
-                if stderr_data.strip():
-                    logger.error(f"{process_name} process stderr: {stderr_data}")
-                    return stderr_data.strip()
+            stderr_data = stderr_text(process)
+            if stderr_data.strip():
+                logger.error(f"{process_name} process stderr: {stderr_data}")
+                return stderr_data.strip()
         except Exception as e:
             logger.debug(f"Could not read stderr from {process_name} process: {e}")
         return None
@@ -5191,11 +5221,10 @@ print(json.dumps(result))
         Simple-monitor twin of ``_log_process_error``; returning the text lets the
         caller surface the actionable cause in the raised transfer error."""
         try:
-            if hasattr(process, "stderr") and process.stderr:
-                stderr_data = process.stderr.read().decode("utf-8", errors="replace")
-                if stderr_data.strip():
-                    logger.error(f"{process_name} process stderr: {stderr_data}")
-                    return stderr_data.strip()
+            stderr_data = stderr_text(process)
+            if stderr_data.strip():
+                logger.error(f"{process_name} process stderr: {stderr_data}")
+                return stderr_data.strip()
         except Exception as e:
             logger.debug(f"Could not read stderr from {process_name} process: {e}")
         return None

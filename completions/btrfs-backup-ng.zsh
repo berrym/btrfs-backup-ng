@@ -13,6 +13,7 @@ _btrfs_backup_ng() {
         '-q[Suppress non-essential output]' \
         '--quiet[Suppress non-essential output]' \
         '--debug[Enable debug output]' \
+        '--btrfs-debug[Run btrfs send and receive with -vv and log every line they print, one per file operation; implies --debug. Same as [global] btrfs_debug]' \
         '-V[Show version and exit]' \
         '--version[Show version and exit]' \
         '-c[Path to configuration file]' \
