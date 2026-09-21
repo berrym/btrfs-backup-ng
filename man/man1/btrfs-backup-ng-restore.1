@@ -94,7 +94,11 @@ Disable progress bars.
 .SS Safety Options
 .TP
 .B \-\-overwrite
-Overwrite existing snapshots at destination instead of skipping them.
+Not supported in this release. Snapshots already at the destination are
+left exactly as they are and a warning says so; anything missing is still
+restored. To replace an existing snapshot, remove it yourself and run the
+restore again. Why the option does not replace, and what a replacement
+must satisfy, is in \fIdocs/RESTORE-OVERWRITE.md\fR.
 .TP
 .B \-\-in-place
 Not implemented in this release. The command refuses and restores nothing

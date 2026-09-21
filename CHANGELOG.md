@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **The `restore` man page said `--overwrite` overwrites.** The option was
+  withdrawn in 0.9.6 and the CLI help has said so since; the man page kept the
+  original sentence. It now matches the CLI, and a test pins the help text,
+  the man page and the README's options table to each other for every option
+  whose truth is "does not do what its name says".
+
 ### Changed
 
 - **`restore --in-place` refuses instead of pretending.** The flag was
