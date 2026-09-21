@@ -10,6 +10,7 @@ from ..__logger__ import add_file_handler, create_logger
 from ..config import ConfigError, find_config_file, load_config
 from ..core.operations import sync_snapshots
 from .common import (
+    btrfs_debug_enabled,
     resolve_snapshot_dir,
     assert_target_mounted,
     get_log_level,
@@ -118,7 +119,7 @@ def execute_transfer(args: argparse.Namespace) -> int:
                 "snap_prefix": volume.snapshot_prefix,
                 "convert_rw": False,
                 "subvolume_sync": False,
-                "btrfs_debug": False,
+                "btrfs_debug": btrfs_debug_enabled(args, config),
                 "fs_checks": "auto",
                 "timestamp_format": get_timestamp_format(config),
             }

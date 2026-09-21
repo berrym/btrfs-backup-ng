@@ -16,7 +16,7 @@ from ..core.verify import (
     verify_raw_checksums,
     verify_stream,
 )
-from .common import get_fs_checks_mode, resolve_timestamp_format
+from .common import btrfs_debug_enabled, get_fs_checks_mode, resolve_timestamp_format
 
 logger = logging.getLogger(__name__)
 console = Console()
@@ -37,7 +37,7 @@ def execute(args: argparse.Namespace) -> int:
         "snap_prefix": args.prefix or "",
         "convert_rw": False,
         "subvolume_sync": False,
-        "btrfs_debug": False,
+        "btrfs_debug": btrfs_debug_enabled(args),
         "fs_checks": get_fs_checks_mode(args),
         "timestamp_format": resolve_timestamp_format(
             getattr(args, "timestamp_format", None),

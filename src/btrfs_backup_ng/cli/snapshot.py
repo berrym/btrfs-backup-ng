@@ -8,7 +8,12 @@ from pathlib import Path
 from .. import __util__, endpoint
 from ..__logger__ import add_file_handler, create_logger
 from ..config import ConfigError, find_config_file, load_config
-from .common import create_snapshot_dir, get_log_level, get_timestamp_format
+from .common import (
+    btrfs_debug_enabled,
+    create_snapshot_dir,
+    get_log_level,
+    get_timestamp_format,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -92,7 +97,7 @@ def execute_snapshot(args: argparse.Namespace) -> int:
                 "snap_prefix": volume.snapshot_prefix,
                 "convert_rw": False,
                 "subvolume_sync": False,
-                "btrfs_debug": False,
+                "btrfs_debug": btrfs_debug_enabled(args, config),
                 "fs_checks": "auto",
                 "timestamp_format": get_timestamp_format(config),
             }

@@ -22,6 +22,7 @@ complete -c btrfs-backup-ng -s h -l help -d 'show this help message and exit'
 complete -c btrfs-backup-ng -s v -l verbose -d 'Enable verbose output'
 complete -c btrfs-backup-ng -s q -l quiet -d 'Suppress non-essential output'
 complete -c btrfs-backup-ng -l debug -d 'Enable debug output'
+complete -c btrfs-backup-ng -l btrfs-debug -d 'Run btrfs send and receive with -vv and log every line they print, one per file operation; implies --debug. Same as [global] btrfs_debug'
 complete -c btrfs-backup-ng -s V -l version -d 'Show version and exit'
 complete -c btrfs-backup-ng -s c -l config -d 'Path to configuration file' -r -F
 

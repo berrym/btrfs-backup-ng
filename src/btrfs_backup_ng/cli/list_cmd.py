@@ -12,6 +12,7 @@ from ..config import ConfigError, find_config_file, load_config
 from btrfs_backup_ng import __util__
 
 from .common import (
+    btrfs_debug_enabled,
     get_log_level,
     get_timestamp_format,
     resolve_snapshot_dir,
@@ -82,7 +83,7 @@ def execute_list(args: argparse.Namespace) -> int:
             "snap_prefix": volume.snapshot_prefix,
             "convert_rw": False,
             "subvolume_sync": False,
-            "btrfs_debug": False,
+            "btrfs_debug": btrfs_debug_enabled(args, config),
             "fs_checks": "auto",
             "timestamp_format": get_timestamp_format(config),
         }

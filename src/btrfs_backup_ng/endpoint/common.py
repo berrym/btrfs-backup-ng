@@ -201,7 +201,6 @@ class Endpoint:
         # built-in default is used when naming/parsing snapshots for this endpoint.
         self.config["timestamp_format"] = config.get("timestamp_format")
 
-        self.btrfs_flags = ["-vv"] if self.config["btrfs_debug"] else []
         self.__cached_snapshots: List[Any] | None = None
         # Set True when the lock file could not be read (corrupt/permission); retention
         # then refuses to delete so a still-needed locked snapshot is never pruned.
@@ -209,6 +208,17 @@ class Endpoint:
 
         for key, value in kwargs.items():
             self.config[key] = value
+
+    @property
+    def btrfs_flags(self) -> list[str]:
+        """Flags every ``btrfs send``/``receive`` this endpoint runs gets.
+
+        Derived from ``config["btrfs_debug"]`` each time it is read, not stored
+        by ``__init__``: the transfer paths consult it, and an endpoint built
+        without ``__init__`` (as the unit tests do) still answers from its
+        config.
+        """
+        return ["-vv"] if self.config.get("btrfs_debug") else []
 
     def _normalize_path(self, val: Any) -> Any:
         if val is None:
@@ -489,7 +499,9 @@ class Endpoint:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
         )
-        tail_stderr(proc)
+        tail_stderr(
+            proc, log_as="btrfs send" if self.config.get("btrfs_debug") else None
+        )
         return proc
 
     def receive(
@@ -563,7 +575,9 @@ class Endpoint:
                 stdout=stdout,
                 stderr=subprocess.PIPE,
             )
-            tail_stderr(proc)
+            tail_stderr(
+                proc, log_as="btrfs receive" if self.config.get("btrfs_debug") else None
+            )
             return proc
         except Exception as e:
             logger.error("Error executing receive command: %s", e)

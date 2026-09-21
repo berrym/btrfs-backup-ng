@@ -8,7 +8,7 @@ _btrfs_backup_ng() {
     prev="${COMP_WORDS[COMP_CWORD-1]}"
 
     local commands="completions config doctor estimate install list manpages prune raw restore run snapper snapshot status transfer transfers uninstall verify"
-    local global_opts="-h --help -v --verbose -q --quiet --debug -V --version -c --config"
+    local global_opts="-h --help -v --verbose -q --quiet --debug --btrfs-debug -V --version -c --config"
 
     case "$prev" in
         --shell)

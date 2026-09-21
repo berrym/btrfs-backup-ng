@@ -383,6 +383,8 @@ class GlobalConfig:
         parallel_targets: Max concurrent target transfers per volume
         quiet: Suppress non-essential output
         verbose: Enable verbose output
+        btrfs_debug: Run btrfs send and receive with -vv and log every line
+            they print at DEBUG; implies DEBUG logging
     """
 
     snapshot_dir: str = ".snapshots"
@@ -398,6 +400,7 @@ class GlobalConfig:
     parallel_targets: int = 3
     quiet: bool = False
     verbose: bool = False
+    btrfs_debug: bool = False
 
 
 @dataclass

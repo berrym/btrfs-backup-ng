@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`--btrfs-debug` for every command, and `[global] btrfs_debug`.** Legacy
+  mode has had `--btrfs-debug` since the original tool; it put `-vv` on
+  `btrfs send` and `btrfs receive`, whose output then went to DEVNULL, so the
+  option did nothing anyone could see. The config-driven commands did not have
+  it at all: nine of them hard-coded it off. The stderr drain now logs each
+  line as it arrives, prefixed with the process that printed it (`btrfs
+  receive: At subvol ...`), the option implies `--debug` because that is the
+  level the lines are logged at, one helper answers every command, and a
+  non-boolean value in the configuration is refused at load. The `ssh://`
+  direct path, which builds its own local send and remote receive, carries
+  `-vv` on both and drains the remote receive's lines as they come back over
+  ssh; it had ignored the option entirely. Lines are logged on their own
+  thread so a slow console cannot slow the transfer, and every transfer waits
+  for its queued lines before it returns, so none are lost at exit.
+
 ### Fixed
 
 - **A failed send or receive now reports what btrfs said, not only how it

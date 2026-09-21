@@ -276,6 +276,12 @@ def add_verbosity_args(parser: argparse.ArgumentParser) -> None:
         action="store_true",
         help="Enable debug output",
     )
+    group.add_argument(
+        "--btrfs-debug",
+        action="store_true",
+        help="Run btrfs send and receive with -vv and log every line they print, "
+        "one per file operation; implies --debug. Same as [global] btrfs_debug",
+    )
 
 
 def get_log_level(args: argparse.Namespace) -> str:
@@ -287,7 +293,10 @@ def get_log_level(args: argparse.Namespace) -> str:
     Returns:
         Log level string (DEBUG, INFO, WARNING, ERROR)
     """
-    if getattr(args, "debug", False):
+    # --btrfs-debug implies --debug: its lines are logged at DEBUG, so at any
+    # other level they would be produced and dropped and the option would do
+    # nothing visible -- which is what it did for years with stderr at DEVNULL.
+    if getattr(args, "debug", False) or getattr(args, "btrfs_debug", False):
         return "DEBUG"
     elif getattr(args, "quiet", False):
         return "WARNING"
@@ -371,6 +380,21 @@ def get_fs_checks_mode(args: argparse.Namespace) -> str:
         One of "auto", "strict", or "skip"
     """
     return getattr(args, "fs_checks", "auto") or "auto"
+
+
+def btrfs_debug_enabled(args: argparse.Namespace | None, config=None) -> bool:
+    """Whether btrfs send and receive run with -vv and their output is logged.
+
+    On when the command line says ``--btrfs-debug`` or the configuration says
+    ``[global] btrfs_debug = true``. The ONE place the answer comes from: every
+    command that builds endpoint kwargs asks here, so the modern CLI cannot go
+    back to hard-coding False the way nine of them did while legacy mode had
+    the option to itself.
+    """
+    if args is not None and getattr(args, "btrfs_debug", False):
+        return True
+    global_config = getattr(config, "global_config", None)
+    return bool(getattr(global_config, "btrfs_debug", False))
 
 
 def get_timestamp_format(config=None) -> str:

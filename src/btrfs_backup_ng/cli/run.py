@@ -45,6 +45,7 @@ from .common import (
     thread_raw_compression,
     thread_raw_encryption,
     thread_ssh_target_config,
+    btrfs_debug_enabled,
     create_snapshot_dir,
 )
 from .prune import (
@@ -288,6 +289,7 @@ def _run_configured_backups(args: argparse.Namespace, config: Config) -> int:
                     show_progress,
                     space_options,
                     newest_only,
+                    btrfs_debug_enabled(args, config),
                 ): volume
                 for volume in enabled_volumes
             }
@@ -322,6 +324,7 @@ def _run_configured_backups(args: argparse.Namespace, config: Config) -> int:
                     show_progress,
                     space_options,
                     newest_only,
+                    btrfs_debug_enabled(args, config),
                 )
                 results.append((volume.path, success))
                 transfer_stats["completed"] += vol_stats.get("completed", 0)
@@ -453,6 +456,7 @@ def _backup_volume(
     show_progress: bool = False,
     space_options: dict[str, Any] | None = None,
     newest_only: bool = False,
+    btrfs_debug: bool = False,
 ) -> tuple[bool, dict[str, int], list[str]]:
     """Execute backup for a single volume.
 
@@ -497,7 +501,7 @@ def _backup_volume(
         "snap_prefix": volume.snapshot_prefix,
         "convert_rw": False,
         "subvolume_sync": False,
-        "btrfs_debug": False,
+        "btrfs_debug": btrfs_debug,
         "fs_checks": "auto",
         "timestamp_format": get_timestamp_format(config),
     }
