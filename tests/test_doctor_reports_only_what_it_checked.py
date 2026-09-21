@@ -45,7 +45,8 @@ UNIMPLEMENTED_WORDING = (
 
 
 def _check_methods():
-    source = io.open(inspect.getfile(doctor_mod), encoding="utf-8").read()
+    with io.open(inspect.getfile(doctor_mod), encoding="utf-8") as f:
+        source = f.read()
     lines = source.split("\n")
     tree = ast.parse(source)
     for node in ast.walk(tree):
