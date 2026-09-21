@@ -732,7 +732,9 @@ Config-driven restore:
     restore_parser.add_argument(
         "--in-place",
         action="store_true",
-        help="Restore to original location (DANGEROUS)",
+        help="Not implemented in this release: the command refuses and restores "
+        "nothing. Restore to a staging directory, verify it, and swap the "
+        "subvolumes yourself (README, Strategy 2)",
     )
     restore_parser.add_argument(
         "--yes-i-know-what-i-am-doing",

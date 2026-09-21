@@ -5,6 +5,24 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- **`restore --in-place` refuses instead of pretending.** The flag was
+  accepted and ignored: the ordinary restore ran, landed the snapshot as a
+  nested subvolume at `DESTINATION/<name>`, replaced nothing, and exited 0 --
+  while the README documented `--in-place` as a disaster-recovery strategy
+  with copy-paste commands, and the config-driven `--volume` path never read
+  the flag at all. The command now refuses ahead of every mode, before any
+  endpoint is prepared (exit 2), and names the procedure that works today:
+  restore into a staging directory, verify, swap the subvolumes by hand
+  (README Strategy 2, whose commands now include making the received
+  snapshot writable). In-place restore that verifies the staged copy against
+  the backup's identity before swapping is scheduled; the running root will
+  only ever be replaceable from a rescue system, because btrfs-backup-ng does
+  not touch the bootloader.
+
 ## [0.9.8] - 2026-09-21
 
 ### Fixed

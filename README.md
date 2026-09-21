@@ -1724,8 +1724,8 @@ The restore command:
 | `--dry-run` | Show what would be restored without making changes |
 | `--no-incremental` | Force full transfers (skip incremental) |
 | `--overwrite` | **Not supported.** Reports that existing snapshots were left in place and continues; nothing at the destination is deleted. Remove a snapshot yourself to replace it |
-| `--in-place` | Restore to original location (DANGEROUS, requires confirmation) |
-| `--yes-i-know-what-i-am-doing` | Confirm dangerous operations like in-place restore |
+| `--in-place` | **Not implemented.** The command refuses and restores nothing. Restore to a staging directory, verify it, and swap the subvolumes yourself (Strategy 2 below) |
+| `--yes-i-know-what-i-am-doing` | Confirm dangerous operations; it does not unlock `--in-place` |
 | `--prefix PREFIX` | Snapshot prefix filter (include trailing hyphen, e.g., `home-`) |
 | `--ssh-sudo` | Use sudo on remote for btrfs commands |
 | `--ssh-key FILE` | SSH private key file for authentication |
@@ -1892,9 +1892,11 @@ sudo btrfs-backup-ng restore /mnt/backup/home /mnt/btrfs-restore \
 # 3. Verify the restore looks correct
 ls -la /mnt/btrfs-restore/home-20260104-120000/
 
-# 4. Rename current to old, restored to current
+# 4. Rename current to old, restored to current. A received snapshot is
+#    read-only; make the new /home writable or nobody can log in.
 sudo mv /home /home.old
 sudo mv /mnt/btrfs-restore/home-20260104-120000 /home
+sudo btrfs property set /home ro false
 
 # 5. If everything works, clean up old versions later
 sudo btrfs subvolume delete /home.old
@@ -1950,46 +1952,27 @@ ssh backup@server "sudo btrfs send -p /backups/home/home-20260103-120000 \
 - Easy to make mistakes with complex commands
 - Must manually manage snapshot prefixes and naming
 
-#### Strategy 4: In-Place Restore (Use with Caution)
+#### Strategy 4: In-Place Restore (not available in this release)
 
-**Best for:** Disaster recovery when you're certain, automated recovery scripts
+`restore --in-place` is accepted by the parser and **refuses**: it restores
+nothing and exits 2. Earlier releases accepted the flag and ran the ordinary
+restore, which lands the snapshot as a nested subvolume at
+`DESTINATION/<snapshot name>` and replaces nothing -- reporting success for a
+location that was never replaced. The refusal is deliberate until the real
+thing exists.
 
-Direct replacement of the target location. This is the most dangerous but fastest approach.
+What in-place restore will be, when it lands: receive the backup into a
+staging subvolume next to the live one, **verify the staged copy against the
+backup's recorded identity** (`received_uuid` for btrfs backups, the sealed
+sha256 for raw), and only on a positive verdict rename the live subvolume
+aside and the staged one into place. Nothing is deleted at any step; rollback
+is the rename in reverse. It applies to any subvolume that is not the running
+root; the running root can only be replaced from a rescue system, where it is
+just another subvolume. btrfs-backup-ng does not touch the bootloader and
+never will.
 
-```bash
-# WARNING: This will OVERWRITE existing data at /home
-# Make absolutely sure you have the right snapshot!
-
-# 1. First, verify what you're about to restore
-btrfs-backup-ng restore --list ssh://backup@server:/backups/home \
-    --prefix "home-" --no-fs-checks
-
-# 2. Do a dry-run first
-btrfs-backup-ng restore ssh://backup@server:/backups/home /home \
-    --in-place \
-    --snapshot home-20260104-120000 \
-    --prefix "home-" \
-    --dry-run
-
-# 3. If dry-run looks correct, proceed with actual restore
-btrfs-backup-ng restore ssh://backup@server:/backups/home /home \
-    --in-place \
-    --yes-i-know-what-i-am-doing \
-    --snapshot home-20260104-120000 \
-    --prefix "home-" \
-    --ssh-sudo
-```
-
-**Pros:**
-- Fastest for full recovery
-- Single command, minimal steps
-- Handles incremental chains automatically
-
-**Cons:**
-- **DESTRUCTIVE** - existing data is overwritten
-- No easy rollback if wrong snapshot chosen
-- Requires explicit confirmation flag
-- Not suitable for partial recovery
+Until then, Strategy 2 is that procedure done by hand, with the same
+deliver-then-swap ordering and the same rollback.
 
 #### Strategy Comparison
 
@@ -1998,7 +1981,7 @@ btrfs-backup-ng restore ssh://backup@server:/backups/home /home \
 | Temporary location | Highest | Slow | Requires extra | Low | File recovery, verification |
 | Rename with snapshots | High | Medium | Minimal extra | Medium | Full replacement with rollback |
 | Manual btrfs commands | Medium | Fast | Minimal | High | Advanced users, scripting |
-| In-place restore | Lowest | Fastest | None | Low | Disaster recovery, automation |
+| In-place restore | -- | -- | -- | -- | Not available in this release; the command refuses |
 
 #### Recommendations by Scenario
 
@@ -2006,13 +1989,13 @@ btrfs-backup-ng restore ssh://backup@server:/backups/home /home \
 → Use Strategy 1 (temporary location), copy just the files you need
 
 **"My system is corrupted, I need to restore /home":**
-→ Use Strategy 2 (rename with snapshots) for safety, or Strategy 4 if you're confident
+→ Use Strategy 2 (rename with snapshots)
 
 **"I'm setting up a new machine from backups":**
 → Use Strategy 1 or the restore command directly - there's nothing to lose
 
 **"I'm writing an automated disaster recovery script":**
-→ Use Strategy 3 (manual commands) or Strategy 4 (in-place) depending on your safety requirements
+→ Use Strategy 3 (manual commands); `--in-place` is not available in this release
 
 **"I'm in a minimal recovery environment without btrfs-backup-ng":**
 → Use Strategy 3 (manual btrfs send/receive)

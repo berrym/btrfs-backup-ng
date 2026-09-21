@@ -97,11 +97,16 @@ Disable progress bars.
 Overwrite existing snapshots at destination instead of skipping them.
 .TP
 .B \-\-in-place
-Restore to the original location. This is dangerous and requires
-\fB\-\-yes-i-know-what-i-am-doing\fR.
+Not implemented in this release. The command refuses and restores nothing
+(exit status 2). A restore receives each snapshot as a nested subvolume at
+\fIDESTINATION\fR/\fIname\fR and never replaces \fIDESTINATION\fR itself.
+To replace a location, restore into a staging directory, verify it, and
+swap the subvolumes yourself; the README's Strategy 2 gives the commands
+and the rollback. The running root filesystem can only be replaced from a
+rescue system.
 .TP
 .B \-\-yes-i-know-what-i-am-doing
-Confirm dangerous operations like in-place restore.
+Confirm dangerous operations. It does not unlock \fB\-\-in-place\fR.
 .SS SSH Options
 .TP
 .B \-\-ssh-sudo
