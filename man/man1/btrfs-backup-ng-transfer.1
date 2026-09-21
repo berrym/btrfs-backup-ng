@@ -8,6 +8,9 @@ btrfs-backup-ng-transfer \- transfer existing snapshots to targets
 .SH DESCRIPTION
 Transfer existing snapshots to configured targets without creating new ones.
 Uses incremental transfers when possible for efficiency.
+.PP
+Target paths must exist and are not created, on any transport. See \fBPATHS\fR
+in \fBbtrfs-backup-ng\fR(1).
 .SH OPTIONS
 .TP
 .B \-\-dry-run

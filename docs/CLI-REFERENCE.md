@@ -824,7 +824,7 @@ btrfs-backup-ng snapper backup CONFIG TARGET [OPTIONS]
 | Argument | Description |
 |----------|-------------|
 | `CONFIG` | Snapper configuration name (e.g., 'root', 'home') |
-| `TARGET` | Destination: a local path or `ssh://user@host:/path` for btrfs destinations, or a raw target (`raw:///path`, `raw+ssh://user@host/path`) for non-btrfs destinations. See [Raw Targets](#raw-targets). |
+| `TARGET` | Destination: a local path or `ssh://user@host:/path` for btrfs destinations, or a raw target (`raw:///path`, `raw+ssh://user@host/path`) for non-btrfs destinations. See [Raw Targets](#raw-targets). The target must exist; the `.snapshots` tree is created below it. |
 
 **Options:**
 | Option | Description |
@@ -1185,6 +1185,30 @@ btrfs-backup-ng raw encrypt raw:///mnt/usb/backups --encrypt openssl_enc --shred
 
 ---
 
+## Paths That Must Exist, and Paths That Are Created
+
+Stated by what a path is, not by where it was typed, so there are no exceptions. A **backup location** (a source, a target on any transport, an absolute snapshot base -- from the configuration file, from `snapper backup TARGET`, or from legacy mode's arguments) is a statement that something is there and is never created. An **output location** (where a command was asked to put something new) is created. The program's **own state** is created. Anything **below** a location that exists is created one level at a time, never the location itself.
+
+```
+MUST EXIST (refused, nothing created)      CREATED ON REQUEST (output locations)
+  [[volumes]] path                           restore DESTINATION / --to
+  [[volumes.targets]] path  (all schemes)    verify --temp-dir
+  snapshot_dir when absolute                 config init -o, completions install,
+  snapper backup TARGET                        manpages install
+  legacy SOURCE, DESTINATION, absolute -f
+
+CREATED BELOW AN EXISTING LOCATION, ONE LEVEL AT A TIME
+  <target>/.btrfs-backup-ng/snapshots        the target's own bookkeeping
+  <volume>/<snapshot_dir>                    a RELATIVE snapshot_dir
+  <snapshot_dir>/<volume name>               under an ABSOLUTE snapshot_dir
+  <target>/.snapshots/<n>                    a snapper backup's slots
+  <target>/.btrfs-backup-ng.locks            locks on a remote target
+```
+
+The refusal names the path and the remedy. Create a missing directory once by hand (`mkdir -p PATH`, or `ssh HOST 'mkdir -p PATH'` for a remote target), or mount the filesystem that should hold it, and run again.
+
+---
+
 ## Filesystem Checks
 
 The `--fs-checks` option controls how btrfs-backup-ng validates source and destination paths:
@@ -1213,7 +1237,7 @@ btrfs-backup-ng restore --list /mnt/backup --no-fs-checks
 
 ## Legacy Mode
 
-When the first argument is a path (not a subcommand), btrfs-backup-ng runs in legacy mode for backwards compatibility.
+When the first argument is a path (not a subcommand), btrfs-backup-ng runs in legacy mode for backwards compatibility. The source, the destination and an absolute `-f/--snapshot-folder` are backup locations: they must exist and are not created; a relative folder is created under the source. See [Paths That Must Exist, and Paths That Are Created](#paths-that-must-exist-and-paths-that-are-created).
 
 ```bash
 btrfs-backup-ng [OPTIONS] SOURCE DESTINATION
@@ -1223,6 +1247,8 @@ btrfs-backup-ng [OPTIONS] SOURCE DESTINATION
 | Option | Description |
 |--------|-------------|
 | `-n, --num-snapshots N` | Number of snapshots to keep |
+| `-f, --snapshot-folder DIR` | Folder the snapshots are taken into: relative to the source, or absolute (must exist). Default `.snapshots` inside the source |
+| `--accept-full-send` | Start a new chain in `--snapshot-folder` although `<source>/.snapshots` already holds one, accepting one full send to every destination. Needed once at most; see below |
 | `--no-incremental` | Disable incremental transfers |
 | `--ssh-sudo` | Use sudo on SSH remote |
 | `--ssh-username USER` | SSH username |
@@ -1245,6 +1271,8 @@ btrfs-backup-ng /home ssh://backup@server:/backups/home
 # With options
 btrfs-backup-ng --ssh-sudo --num-snapshots 10 /home ssh://user@host:/backup
 ```
+
+Until this release `-f/--snapshot-folder` had no effect on placement: every legacy-mode snapshot went to `<source>/.snapshots`. That is now the default, so a run that never passed `-f` sees no change. A run that did pass `-f`, and whose chain is therefore in `<source>/.snapshots` while the named folder is empty, is refused rather than started as a new chain (which would make the next transfer a full send). The refusal lists the remedies: move the chain into the folder (`mv <source>/.snapshots/<prefix>* <folder>/`, same filesystem), pass `-f <source>/.snapshots` to keep it where it is, or add `--accept-full-send` once.
 
 ---
 

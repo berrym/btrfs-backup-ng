@@ -72,7 +72,9 @@ no-op there. Mutually exclusive with \fB\-\-snapshot\fR.
 .TP
 .BI \-\-temp-dir " " \fIPATH\fR
 Temporary directory for full verification. Must be on a btrfs filesystem.
-Required for full verification of remote backups.
+Required for full verification of remote backups. Created if it does not exist;
+without it, the temporary directory is made inside the backup location, which
+must exist.
 .TP
 .B \-\-no-cleanup
 Do not delete restored snapshots after full verification. Useful for

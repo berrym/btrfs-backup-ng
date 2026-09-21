@@ -5,6 +5,86 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **The remaining ways a backup location could be created are closed, on
+  every layer and every entry point**
+  ([#102](https://github.com/berrym/btrfs-backup-ng/pull/102)). 0.9.7 stopped
+  the endpoints, the transfer engine and the listing from creating a target, a
+  source or an absolute `snapshot_dir`. Five sites were still live, each
+  reproduced on real btrfs before it was fixed:
+
+  - `run` and `snapshot` created `<volume path>/.snapshots` *before* looking at
+    the volume, so a volume whose path was not there (an unmounted data disk, a
+    typo in `path`) had its snapshot tree built on the root filesystem, and from
+    then on the source existed as a plain directory for every later check.
+  - `Endpoint.snapshot()` created an absolute snapshot folder wherever it
+    pointed, on any API call and from legacy mode.
+  - The `.btrfs-backup-ng` tree under a target was created with `parents=True`,
+    which would rebuild a target that vanished between the check and the mkdir.
+  - Legacy mode (`btrfs-backup-ng SOURCE DEST`) built its snapshot tree before
+    looking at the source, and built an absolute `-f/--snapshot-folder`
+    wherever it pointed, exit 0.
+  - Legacy mode reported every refusal as "Process aborted by user or error"
+    and dropped the message that said why.
+
+  The rule is now stated by what a path is: a backup location (a source, a
+  target, an absolute snapshot base, however it was given) must exist and is
+  never created; an output location (the restore destination,
+  `verify --temp-dir`, a written config, completion or man-page file) is
+  created; the program's own state is created; and anything below a location
+  that exists is created one component at a time through one primitive that
+  has no `parents` mode at all, so a base that is missing or vanishes mid-run
+  is refused rather than rebuilt.
+
+- **A snapper backup to a btrfs target failed in 0.9.7** with
+  "Destination `<target>/.snapshots/<n>.incoming` does not exist". The receive
+  slot had only ever existed as a side effect of the creation sites 0.9.7
+  removed. The snapper flow now creates its own slot, below a target that must
+  exist, and the target is checked before the slot lock is taken.
+
+- **Legacy mode's `-f/--snapshot-folder` had no effect on placement.** It
+  computed a directory and created it, but never told the endpoint, so every
+  legacy-mode snapshot went to `<source>/.snapshots` whatever the option said.
+  The option is now honoured.
+
+### Changed
+
+- **Legacy mode's default snapshot folder is `.snapshots` inside the source**
+  -- what has in fact happened on every run, and what the config-driven
+  commands do -- so a run that never passed `-f` sees no change. A run that
+  did pass `-f`, and whose chain is therefore in `<source>/.snapshots` while
+  the named folder is empty, is **refused** rather than started as a new
+  chain, because the next transfer to every destination would be a full send.
+  The refusal lists the three remedies: move the chain into the folder (same
+  filesystem), pass `-f <source>/.snapshots` to keep it where it is, or add
+  the new `--accept-full-send` flag, which is needed at most once.
+- **Legacy mode's absolute `-f/--snapshot-folder` must exist**, like an
+  absolute `snapshot_dir` and like the legacy destination already did in 0.9.7.
+  A relative folder is created under the source.
+- **`Endpoint.snapshot()` no longer creates an absolute `snapshot_folder`**;
+  a relative one is created under the source, which must exist.
+
+### Added
+
+- **The rule is structural, not a list of known sites.** A test walks the
+  package's syntax tree for every way a directory can be created -- `mkdir`,
+  `makedirs`, `mkdtemp`, the privileged helpers, and any string containing
+  `mkdir` (error text included, registered as such) -- and requires each site
+  to be registered with a category its layer allows. The layers that only see
+  backup locations may create only below a verified base; only the command
+  line and the restore and verify engines may create an output location. An
+  unregistered site, a stale entry, a `parents=True` in a below-the-base site,
+  or an unguarded remote `mkdir -p` fails the suite.
+- **The rule is documented** in the README, `docs/CLI-REFERENCE.md`, and the
+  `btrfs-backup-ng(1)` `PATHS` section with pointers from `run`, `snapshot`,
+  `transfer`, `restore`, `verify` and `snapper`.
+- **A snapper acceptance cell in tier3**, local btrfs and `ssh://`, proving the
+  slot is published with a Received UUID, the increment's bytes land, and a
+  missing target is refused without being created.
+
 ## [0.9.7] - 2026-09-19
 
 ### Added

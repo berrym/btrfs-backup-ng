@@ -24,7 +24,7 @@ from __future__ import annotations
 import pytest
 
 from btrfs_backup_ng.__util__ import AbortError
-from btrfs_backup_ng.cli.common import resolve_snapshot_dir
+from btrfs_backup_ng.cli.common import create_snapshot_dir, resolve_snapshot_dir
 
 
 @pytest.fixture
@@ -100,22 +100,105 @@ class TestEveryCallSiteUsesIt:
     branch absent) and pinned behaviourally below."""
 
     @pytest.mark.parametrize(
-        "module",
-        ["run", "snapshot", "transfer", "prune", "list_cmd", "status", "estimate"],
+        "module, helper",
+        [
+            # The two commands that WRITE snapshots create the directory, and
+            # do so through the helper that verifies the source first.
+            ("run", "create_snapshot_dir("),
+            ("snapshot", "create_snapshot_dir("),
+            # The five that only read resolve, and create nothing.
+            ("transfer", "resolve_snapshot_dir("),
+            ("prune", "resolve_snapshot_dir("),
+            ("list_cmd", "resolve_snapshot_dir("),
+            ("status", "resolve_snapshot_dir("),
+            ("estimate", "resolve_snapshot_dir("),
+        ],
     )
-    def test_the_cli_resolves_through_the_helper(self, module):
+    def test_the_cli_resolves_through_the_helper(self, module, helper):
         import importlib
         import inspect
 
         source = inspect.getsource(
             importlib.import_module(f"btrfs_backup_ng.cli.{module}")
         )
-        assert "resolve_snapshot_dir(" in source, (
+        assert helper in source, (
             f"cli/{module}.py must resolve snapshot_dir through the shared helper"
         )
         assert "snapshot_dir.is_absolute()" not in source, (
             f"cli/{module}.py still branches on absoluteness itself"
         )
+        assert "snapshot_dir.mkdir(" not in source, (
+            f"cli/{module}.py creates the snapshot directory itself"
+        )
+
+
+class TestTheSourceIsVerifiedBeforeAnythingIsCreated:
+    """The writer-side helper. The directory used to be created with
+    parents=True BEFORE the source had been looked at, so a volume whose path
+    was not there (an unmounted data disk, a typo in `path`) had its snapshot
+    tree built first, and from then on the source EXISTED as a plain
+    directory -- which is what every later check then saw.
+
+    Reproduced on real btrfs with the CLI: `run` and `snapshot` against a
+    volume path that did not exist both created <path>/.snapshots, and then
+    failed on `btrfs subvolume snapshot` with "Not a Btrfs subvolume"."""
+
+    def test_a_missing_source_is_refused_and_nothing_is_created(self, tmp_path):
+        source = tmp_path / "data" / "home"
+        with pytest.raises(AbortError) as e:
+            create_snapshot_dir(".snapshots", source)
+        assert "Source volume" in str(e.value)
+        assert "Nothing was created" in str(e.value)
+        assert not (tmp_path / "data").exists(), (
+            "the tree was built beside a missing source"
+        )
+
+    def test_a_relative_dir_is_created_under_an_existing_source(self, source):
+        full = create_snapshot_dir(".snapshots", source)
+        assert full == (source / ".snapshots").resolve()
+        assert full.is_dir()
+
+    def test_a_nested_relative_dir_is_created_component_by_component(self, source):
+        full = create_snapshot_dir("snaps/daily", source)
+        assert full.is_dir()
+        assert full.parent == (source / "snaps").resolve()
+
+    def test_an_absolute_base_gets_its_per_source_directory(self, tmp_path, source):
+        base = tmp_path / "bigdisk"
+        base.mkdir()
+        full = create_snapshot_dir(str(base), source)
+        assert full == (base / source.name).resolve()
+        assert full.is_dir()
+
+    def test_a_missing_absolute_base_is_refused_even_with_the_source_present(
+        self, tmp_path, source
+    ):
+        base = tmp_path / "unmounted"
+        with pytest.raises(AbortError, match="snapshot_dir"):
+            create_snapshot_dir(str(base), source)
+        assert not base.exists()
+
+    def test_a_relative_dir_that_climbs_out_of_the_source_must_exist(
+        self, tmp_path, source
+    ):
+        """`../snapshots` names a place outside the one base that was
+        verified; it is treated like an absolute one."""
+        with pytest.raises(AbortError, match="snapshot_dir"):
+            create_snapshot_dir("../elsewhere", source)
+        assert not (tmp_path / "elsewhere").exists()
+        (tmp_path / "elsewhere").mkdir()
+        assert (
+            create_snapshot_dir("../elsewhere", source)
+            == (tmp_path / "elsewhere").resolve()
+        )
+
+    def test_the_writer_returns_what_the_readers_resolve(self, tmp_path, source):
+        base = tmp_path / "bigdisk"
+        base.mkdir()
+        for configured in (".snapshots", "a/b", str(base)):
+            assert create_snapshot_dir(configured, source) == resolve_snapshot_dir(
+                configured, source
+            )
 
 
 class TestEstimateReadsWhatTransferReads:

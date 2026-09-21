@@ -20,7 +20,11 @@ policies. Accessed via subcommands like \fBrun\fR, \fBsnapshot\fR, \fBtransfer\f
 .TP
 .B Legacy mode
 Direct command-line specification of source and destination paths, compatible
-with the original btrfs-backup tool.
+with the original btrfs-backup tool. The source, the destination and an absolute
+\fB\-f\fR folder must exist; see \fBPATHS\fR below. Snapshots are taken into
+\fB.snapshots\fR inside the source, or into the \fB\-f\fR folder; when that folder
+is empty while \fB.snapshots\fR holds the chain from an earlier release, the run is
+refused rather than started as a new chain, unless \fB\-\-accept\-full\-send\fR is given.
 .SH GLOBAL OPTIONS
 .TP
 .BR \-h ", " \-\-help
@@ -126,6 +130,38 @@ ssh_sudo = true
 compress = "zstd"
 .fi
 .RE
+.SH PATHS
+Which paths are created is decided by what a path is, not by where it was
+typed, so the rule has no exceptions.
+.TP
+.B A backup location must exist and is never created.
+A source subvolume, a target on every transport (local, \fBraw://\fR,
+\fBssh://\fR, \fBraw+ssh://\fR) and an absolute snapshot base are statements
+that something is there, whether they come from the configuration file, from
+\fBsnapper backup\fR \fITARGET\fR, or from legacy mode's \fISOURCE\fR,
+\fIDESTINATION\fR and absolute \fB\-f\fR folder. A missing one is refused with
+a message naming the likely cause and the remedy; nothing is created. This is
+deliberate: a target on a removable or network filesystem that was not mounted
+used to have its mount point rebuilt on the root filesystem and the backup
+written there, and an absolute \fBsnapshot_dir\fR that was not mounted had the
+snapshots written to the root filesystem, where they succeed. Mount the
+filesystem, correct the path, or create the directory once by hand, and run
+again.
+.TP
+.B An output location is created.
+Where a command was asked to put something new: the \fBrestore\fR destination,
+\fBverify \-\-temp-dir\fR, and the file written by \fBconfig init \-o\fR,
+\fBcompletions install\fR or \fBmanpages install\fR.
+.TP
+.B The program's own state is created.
+Its state directory, transfer cache, run lock, the parents of \fBlog_file\fR
+and \fBtransaction_log\fR, and ssh control sockets.
+.TP
+.B Below a location that exists, one level at a time, never the location itself.
+The \fB.btrfs-backup-ng\fR tree under a target, a relative \fBsnapshot_dir\fR
+under its volume, the per-volume directory under an absolute
+\fBsnapshot_dir\fR, the \fB.snapshots\fR slots of a snapper backup, and the
+lock directory on a remote target.
 .SH RETENTION POLICIES
 Time-based retention (applied by the
 .BR btrfs-backup-ng-prune (1)

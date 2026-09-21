@@ -285,16 +285,42 @@ class Endpoint:
         base_path = Path(self.config["source"]).resolve()
         snapshot_folder = self.config["snapshot_folder"]
 
-        # Support absolute snapshot_folder paths (external snapshot directories)
+        # An absolute snapshot_folder names another place, typically another
+        # filesystem. It is a backup location, a statement that something is
+        # there, and is not created.
+        # It used to be built with parents=True, which put the snapshots on
+        # whatever filesystem was underneath the mount point, where they
+        # SUCCEED, because a btrfs snapshot only has to share a filesystem
+        # with its source. A relative folder lives under the source, which
+        # must itself exist, and is created one component at a time below it.
         if Path(snapshot_folder).is_absolute():
             snapshot_dir = Path(snapshot_folder).resolve()
+            if not snapshot_dir.is_dir():
+                raise __util__.AbortError(
+                    __util__.missing_backup_location_message(
+                        "Snapshot directory", snapshot_dir
+                    )
+                )
         else:
             snapshot_dir = (base_path / snapshot_folder).resolve()
+            if snapshot_dir == base_path or snapshot_dir.is_relative_to(base_path):
+                __util__.create_below(
+                    base_path,
+                    str(snapshot_dir.relative_to(base_path)),
+                    mode=0o700,
+                    what="Source",
+                )
+            elif not snapshot_dir.is_dir():
+                # "../snapshots" climbs out of the verified source: treated
+                # like an absolute folder, it must be there already.
+                raise __util__.AbortError(
+                    __util__.missing_backup_location_message(
+                        "Snapshot directory", snapshot_dir
+                    )
+                )
 
         self.config["path"] = snapshot_dir
         snap_prefix = self.config["snap_prefix"]
-
-        snapshot_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
         snapshot = __util__.Snapshot(snapshot_dir, snap_prefix, self)
         snapshot_path = snapshot.get_path()
         logger.info(

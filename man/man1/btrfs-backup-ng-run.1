@@ -16,6 +16,10 @@ Transfer snapshots to all configured targets (incrementally when possible)
 Apply retention policies to clean up old snapshots and backups
 .PP
 This is the primary command for automated backups via systemd timers or cron.
+.PP
+Every volume path, every target path and an absolute \fBsnapshot_dir\fR must
+exist before the run; none of them is created, and a missing one is refused
+with the likely cause. See \fBPATHS\fR in \fBbtrfs-backup-ng\fR(1).
 .SH OPTIONS
 .TP
 .B \-\-dry-run

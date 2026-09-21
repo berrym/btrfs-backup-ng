@@ -691,7 +691,7 @@ Each stream file has a companion `.meta` file with JSON metadata for incremental
 
 ### Mount Verification (External Drive Safety)
 
-When backing up to external drives or removable media, there's a common pitfall: if the drive isn't mounted, backups will silently write to the mount point directory on your root filesystem, consuming disk space and not actually backing up your data.
+When backing up to external drives or removable media, there's a common pitfall: the mount point directory exists whether or not the drive is mounted, so with the drive absent a backup lands in that directory on the root filesystem, consuming disk space there and backing nothing up. Two rules cover the two halves of this. btrfs-backup-ng never creates a backup location (see [Which paths must exist, and which are created](#which-paths-must-exist-and-which-are-created)), which catches a mount point that is not there at all. `require_mount` covers the case where the directory is there but nothing is mounted on it.
 
 <!-- retention-scopes -->
 ### Retention per source and per target
@@ -802,6 +802,45 @@ ssh_sudo = true
 ```
 
 **Note:** `require_mount` applies to local targets, including `raw://` ones. It has no effect on `ssh://` or `raw+ssh://` targets -- a local mount table cannot answer for a remote filesystem.
+
+### Which paths must exist, and which are created
+
+The rule is stated by what a path IS, not by where it was typed, so it has no exceptions:
+
+```
+A BACKUP LOCATION must exist. It is never created.
+  A source subvolume, a target (local, raw://, ssh://, raw+ssh://) and an
+  absolute snapshot base are statements that something is there, whether
+  they come from the configuration file, from `snapper backup TARGET`, or
+  from legacy mode's SOURCE, DESTINATION and absolute -f/--snapshot-folder.
+  A missing one is refused with the likely cause and the remedy; nothing is
+  created.
+
+An OUTPUT LOCATION is created.
+  Where a command was asked to put something NEW: the restore DESTINATION
+  and --to, verify --temp-dir, and the file a `config init -o`,
+  `completions install` or `manpages install` writes.
+
+This program's OWN STATE is created.
+  Its state directory, transfer cache, run lock, log_file and
+  transaction_log parents, ssh control sockets.
+
+BELOW a location that exists, one level at a time, never the location itself:
+  <target>/.btrfs-backup-ng/snapshots      the target's own bookkeeping
+  <volume>/<snapshot_dir>                  a RELATIVE snapshot_dir (".snapshots")
+  <snapshot_dir>/<volume name>             under an ABSOLUTE snapshot_dir
+  <target>/.snapshots/<n>                  a snapper backup's slots
+  <target>/.btrfs-backup-ng.locks          locks on a remote target
+```
+
+Why the rule is strict: a target on a removable or network filesystem that is not mounted used to have its mount point rebuilt on the root filesystem and the backup written there -- invisible once the real disk came back, and charged against the wrong filesystem's free space. An absolute `snapshot_dir` was worse: the snapshots *succeeded* on the root filesystem, because a btrfs snapshot only needs to share a filesystem with its source. Refusing also catches a typo, which is the same argument from the other side. When a run is refused for a missing location, the message names the path and the remedy; mount the filesystem, fix the typo, or create the directory once by hand:
+
+```bash
+mkdir -p /mnt/backup/home                    # local
+ssh backup@server 'mkdir -p /backups/home'   # remote
+```
+
+No layer that handles backup locations -- no endpoint, no transport, no engine -- can create one: every directory made under a backup location goes through one primitive that creates only below a base it has verified, one component at a time, with no `parents` mode at all. The test suite scans the source for every way a directory can be created and refuses an unclassified one, so a new creation site cannot slip in unnoticed.
 
 ## Configuration File Locations
 
@@ -1665,6 +1704,8 @@ Restore chain: snap-1 → snap-2 → snap-3 → snap-4
                (2.1 GB)  (156 MB) (89 MB)  (234 MB)
 ```
 
+The destination is an output location -- the place this command was asked to put something new -- so it is created if it does not exist (it must be on a btrfs filesystem). This is deliberate, and it is the opposite of what happens to a backup location, which must exist: see [Which paths must exist, and which are created](#which-paths-must-exist-and-which-are-created).
+
 The restore command:
 1. Analyzes the parent chain required for the target snapshot
 2. Checks which parents already exist locally (can skip those)
@@ -2205,6 +2246,8 @@ btrfs-backup-ng verify ssh://server:/backups/home --level full \
     --temp-dir /mnt/btrfs-test --ssh-sudo --no-fs-checks
 ```
 
+`--temp-dir` is an output location and is created if it does not exist; without it, the temporary directory is made inside the backup location, which must exist.
+
 ### Verify Specific Snapshot
 
 ```bash
@@ -2528,6 +2571,8 @@ Snapper backups preserve the native Snapper directory structure:
     ├── info.xml
     └── snapshot/
 ```
+
+The target itself must exist and is not created; the `.snapshots` tree and each numbered slot are created below it. See [Which paths must exist, and which are created](#which-paths-must-exist-and-which-are-created).
 
 This layout enables:
 - Direct restoration back into Snapper-managed volumes
@@ -2927,6 +2972,19 @@ btrfs-backup-ng /home ssh://backup@server:/backups/home
 
 Legacy mode is auto-detected when the first argument is a path.
 
+Legacy mode follows the same rule as the config-driven commands: the source, the destination and an absolute `-f/--snapshot-folder` are backup locations, must exist, and are not created. A relative folder is created under the source. See [Which paths must exist, and which are created](#which-paths-must-exist-and-which-are-created).
+
+Snapshots are taken into `.snapshots` inside the source by default, or into the folder `-f/--snapshot-folder` names (relative to the source, or absolute). Until this release the option had no effect on placement: every legacy-mode snapshot went to `<source>/.snapshots` whatever `-f` said. If you passed `-f` and your chain is therefore in `<source>/.snapshots`, the run now refuses to start a second chain in the empty folder, because the next transfer to every destination would be a full send. The refusal lists the three ways out:
+
+```bash
+# 1. same filesystem: move the chain into the folder, intact
+mv /home/.snapshots/box-* /mnt/snaps/
+# 2. keep the chain where it is
+btrfs-backup-ng /home /mnt/backup -f /home/.snapshots
+# 3. accept one full send (needed only once; the folder then holds snapshots)
+btrfs-backup-ng /home /mnt/backup -f /mnt/snaps --accept-full-send
+```
+
 ## Systemd Integration
 
 btrfs-backup-ng can install systemd timer and service units for automated backups. There are two installation modes:
@@ -3176,12 +3234,14 @@ path = "ssh://user@remote:/backup"
 ssh_sudo = true
 ```
 
-**Snapshot directory doesn't exist:**
+**Snapshot directory, source or target doesn't exist:**
 ```bash
-# A RELATIVE snapshot_dir (the ".snapshots" default) is created under the
-# source on first use. An ABSOLUTE one is not: it can name another filesystem,
-# and creating it silently would put snapshots on the root filesystem whenever
-# the intended disk is not mounted. Create the base yourself once:
+# A backup location is never created: a volume's path, a target's path (on
+# every transport) and an ABSOLUTE snapshot_dir must exist. Creating them
+# silently put backups and snapshots on the root filesystem whenever the
+# intended disk was not mounted. A RELATIVE snapshot_dir (the ".snapshots"
+# default) is created under the source on first use. Mount the filesystem,
+# fix the typo, or create the directory yourself once:
 mkdir -p /path/to/snapshots
 ```
 

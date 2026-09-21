@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import functools
 import os
+import secrets
 import shutil
 import subprocess
 import time
@@ -150,6 +151,22 @@ def _have_container() -> bool:
     return r.returncode == 0
 
 
+def _have_snapper() -> bool:
+    """snapper is on the RUNNER: the config lives on the source machine, and
+    a btrfs target only needs the `btrfs receive` it already permits."""
+    if shutil.which("snapper") is None:
+        return False
+    r = subprocess.run(
+        ["snapper", "--version"], capture_output=True, timeout=30, check=False
+    )
+    return r.returncode == 0
+
+
+requires_snapper = pytest.mark.skipif(
+    _Deferred(lambda: not _have_snapper()),
+    reason="Tier 3 snapper cells need snapper on the runner",
+)
+
 requires_container = pytest.mark.skipif(
     _Deferred(lambda: not _have_container()),
     reason="Tier 3 sudoers cells need podman or docker",
@@ -205,6 +222,11 @@ class Rig:
     #: snapshot arrived; this is the file that differs between the base and the
     #: increment, and therefore the only thing that can prove the second leg.
     delta: bytes = b""
+    #: Unique per rig. Anything this rig registers OUTSIDE its own loopback
+    #: filesystems -- a snapper config, which lives in /etc/snapper -- carries
+    #: it, so two runs cannot collide and a teardown can only ever name what
+    #: this rig made.
+    suffix: str = ""
 
     @property
     def source_volume(self) -> Path:
@@ -389,6 +411,7 @@ def _rig_up(remote_base: str, raw_remote_base: str) -> Rig:
         remote_base=remote_base,
         raw_remote_base=raw_remote_base,
         payload=payload,
+        suffix=secrets.token_hex(4),
     )
 
 
@@ -522,3 +545,63 @@ def assert_increment_restored(
         f"extra.bin present but stale at: {seen or 'nowhere'}. "
         f"Contents: {_restored_listing(dest)}" + context
     )
+
+
+@dataclass
+class SnapperSource:
+    """A snapper config registered on the runner for a subvolume of the rig."""
+
+    name: str
+    subvol: Path
+
+    def take(self, description: str) -> int:
+        """Take a snapper snapshot and return the number snapper assigned.
+
+        Never assumed: the config is shared by every cell in the module, so
+        the second cell's snapshots are not 1 and 2."""
+        r = sh(
+            ["snapper", "-c", self.name, "create", "-d", description, "--print-number"],
+            check=True,
+        )
+        return int(r.stdout.strip())
+
+    def mutate(self) -> bytes:
+        """A genuine delta in the snapper-managed subvolume; returned so a
+        cell can prove the incremental leg landed, not merely a snapshot."""
+        delta = os.urandom(DELTA_BYTES)
+        (self.subvol / "extra.bin").write_bytes(delta)
+        return delta
+
+
+@pytest.fixture(scope="module")
+def snapper_source(rig, request):
+    """A snapper config on its own subvolume of the rig's source filesystem.
+
+    The config name carries the rig's suffix and a fixed test namespace, so
+    no run can collide with another and the teardown can never name a
+    production config. The teardown is a finalizer registered BEFORE anything
+    is created, so it runs whether the module's cells passed, failed
+    mid-run, or the setup itself broke halfway. Order inside it matters:
+    `snapper delete-config` FIRST, while the subvolume still exists --
+    deleting the subvolume first leaves the config registered in snapperd
+    with a path that is gone, and `delete-config` then refuses.
+    """
+    name = f"bbngt3{rig.suffix}"
+    subvol = rig.src / "snapdata"
+
+    def down():
+        # Never enumerate configs; only the one this fixture named.
+        sh(["snapper", "-c", name, "delete-config"])
+        # The subvolume and what snapper nested in it, deepest first, each by
+        # a path inside the subvolume this fixture created.
+        for snap in sorted((subvol / ".snapshots").glob("*/snapshot"), reverse=True):
+            sh(["btrfs", "subvolume", "delete", str(snap)])
+        for path in (subvol / ".snapshots", subvol):
+            if path.exists():
+                sh(["btrfs", "subvolume", "delete", str(path)])
+
+    request.addfinalizer(down)
+    sh(["btrfs", "subvolume", "create", str(subvol)], check=True)
+    (subvol / "payload.bin").write_bytes(rig.payload)
+    sh(["snapper", "-c", name, "create-config", str(subvol)], check=True)
+    return SnapperSource(name=name, subvol=subvol)

@@ -100,8 +100,16 @@ files is allowed as well."""
     group.add_argument(
         "-f",
         "--snapshot-folder",
-        help="Snapshot folder in source filesystem; either relative to source or absolute. "
-        "Default is '.btrfs-backup-ng/snapshots'.",
+        help="Folder the snapshots are taken into; relative to the source, or "
+        "absolute. It must exist when absolute. Default is '.snapshots' inside "
+        "the source.",
+    )
+    group.add_argument(
+        "--accept-full-send",
+        action="store_true",
+        help="Start a new snapshot chain in --snapshot-folder although the "
+        "source's .snapshots already holds one, accepting that the next "
+        "transfer to every destination is a full send. Needed once at most.",
     )
     group.add_argument(
         "-p",
@@ -404,7 +412,7 @@ def log_initial_settings(options):
     logger.debug("Number of backups to keep: %s", options["num_backups"])
     logger.debug(
         "Snapshot folder: %s",
-        options.get("snapshot_folder", ".btrfs-backup-ng/snapshots"),
+        options.get("snapshot_folder", LEGACY_SNAPSHOT_FOLDER),
     )
     logger.debug(
         "Snapshot prefix: %s", options.get("snapshot_prefix", f"{os.uname()[1]}-")
@@ -470,6 +478,79 @@ def cleanup_snapshots(source_endpoint, destination_endpoints, options):
     return clean
 
 
+#: Where legacy mode takes its snapshots: inside the source, like the
+#: config-driven commands. This is also where every legacy run has in fact put
+#: them: --snapshot-folder computed a directory and set the endpoint's path,
+#: but never passed snapshot_folder, so Endpoint.snapshot() used its own
+#: default and the computed directory was created and then ignored.
+LEGACY_SNAPSHOT_FOLDER = ".snapshots"
+
+
+def _snapshots_for_prefix(folder: Path, prefix: str) -> list[str]:
+    """Names in ``folder`` that look like this run's snapshots; [] if absent."""
+    if not folder.is_dir():
+        return []
+    return sorted(
+        p.name for p in folder.iterdir() if p.is_dir() and p.name.startswith(prefix)
+    )
+
+
+def resolve_snapshot_folder(options, source_abs: Path) -> Path:
+    """The directory legacy mode will snapshot into. Creates nothing.
+
+    Relative to the source, or absolute; ``.snapshots`` inside the source by
+    default.
+    """
+    folder = Path(options.get("snapshot_folder", LEGACY_SNAPSHOT_FOLDER)).expanduser()
+    if folder.is_absolute():
+        return folder.resolve(strict=False)
+    return (source_abs / folder).resolve(strict=False)
+
+
+def refuse_silent_new_chain(options, source_abs: Path, snapshot_dir: Path) -> None:
+    """Refuse to start a second chain when the first one is where it always was.
+
+    Until this release ``--snapshot-folder`` had no effect on placement, so a
+    user who passed it has their chain in ``<source>/.snapshots``. Honouring
+    the option now would begin a NEW chain in the folder they named, and the
+    next transfer to every destination would be a full send -- silently, from
+    a cron job, over whatever link the destination is behind. Refuse, and name
+    the three ways out. ``--accept-full-send`` is the third; it is needed at
+    most once, because the folder then holds snapshots.
+    """
+    default_chain = (source_abs / LEGACY_SNAPSHOT_FOLDER).resolve(strict=False)
+    if snapshot_dir == default_chain:
+        return
+    prefix = options.get("snapshot_prefix", f"{os.uname()[1]}-")
+    existing = _snapshots_for_prefix(default_chain, prefix)
+    if not existing or _snapshots_for_prefix(snapshot_dir, prefix):
+        return
+    if options.get("accept_full_send"):
+        logger.warning(
+            "--accept-full-send: starting a new snapshot chain in %s; %s holds "
+            "%d snapshot(s) for prefix %r that will not be used as parents.",
+            snapshot_dir,
+            default_chain,
+            len(existing),
+            prefix,
+        )
+        return
+    raise __util__.AbortError(
+        f"Snapshot folder {snapshot_dir} holds no snapshots for prefix "
+        f"{prefix!r}, but {default_chain} holds {len(existing)}. Earlier "
+        "releases ignored --snapshot-folder and took every legacy-mode "
+        "snapshot there, so continuing would start a NEW chain in the folder "
+        "you named, and the next transfer to every destination would be a FULL "
+        "send. Nothing was created. Choose one: (1) if both are on the same "
+        f"filesystem, move the chain intact: mkdir -p {snapshot_dir} && "
+        f"mv {default_chain}/{prefix}* {snapshot_dir}/ ; (2) keep the chain "
+        "where it is: pass "
+        f"--snapshot-folder {default_chain} ; (3) accept one full send: add "
+        "--accept-full-send, which is needed only once because the folder then "
+        "holds snapshots."
+    )
+
+
 def prepare_source_endpoint(options):
     """Prepare the source endpoint."""
     logger.debug("Source: %s", options["source"])
@@ -477,17 +558,38 @@ def prepare_source_endpoint(options):
     source_endpoint_kwargs = dict(endpoint_kwargs)
 
     source_abs = Path(options["source"]).expanduser().resolve(strict=False)
-    snapshot_folder = options.get("snapshot_folder", ".btrfs-backup-ng/snapshots")
-    snapshot_root = Path(snapshot_folder).expanduser()
-    if not snapshot_root.is_absolute():
-        snapshot_root = source_abs.parent / snapshot_root
-    snapshot_root = snapshot_root.resolve(strict=False)
+    # The source is looked at BEFORE anything derived from it is created.
+    # The snapshot tree used to be built first, with parents=True, so a
+    # source that was not there (its disk unmounted, or a typo) got a tree
+    # of directories built beside it before the run failed for the missing
+    # source -- and an absolute --snapshot-folder was built wherever it
+    # pointed. A backup location is a statement that something is there;
+    # only what lies BELOW an existing base is created.
+    if not source_abs.is_dir():
+        raise __util__.AbortError(
+            __util__.missing_backup_location_message("Source", source_abs)
+        )
+    snapshot_dir = resolve_snapshot_folder(options, source_abs)
+    refuse_silent_new_chain(options, source_abs, snapshot_dir)
 
-    relative_source = str(source_abs).lstrip(os.sep)
-    snapshot_dir = snapshot_root.joinpath(*relative_source.split(os.sep))
-    snapshot_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if snapshot_dir == source_abs or snapshot_dir.is_relative_to(source_abs):
+        # Under the source, which exists: created one component at a time.
+        __util__.create_below(
+            source_abs,
+            str(snapshot_dir.relative_to(source_abs)),
+            mode=0o700,
+            what="Source",
+        )
+    else:
+        # Absolute, or a relative folder that climbs out of the source: a
+        # place the operator says exists. Nothing is created.
+        __util__.create_below(snapshot_dir, what="Snapshot folder")
 
     source_endpoint_kwargs["path"] = snapshot_dir
+    # Passed through, so the snapshot is TAKEN where the option says. Without
+    # this the endpoint fell back to its own default and the option was a
+    # no-op for placement.
+    source_endpoint_kwargs["snapshot_folder"] = str(snapshot_dir)
 
     try:
         source_endpoint = endpoint.choose_endpoint(
@@ -676,6 +778,14 @@ def legacy_main(argv: list[str] | None = None) -> int:
             return 0
         logger.error("One or more transfers failed")
         return 1
-    except (__util__.AbortError, KeyboardInterrupt):
+    except __util__.AbortError as e:
+        # The diagnosis travels in the exception; a refusal that does not say
+        # why (a source or snapshot folder that is not there, and what to do
+        # about it) only relocates the confusion.
+        if str(e):
+            logger.error("%s", e)
+        logger.error("Process aborted by user or error")
+        return 1
+    except KeyboardInterrupt:
         logger.error("Process aborted by user or error")
         return 1

@@ -136,13 +136,22 @@ class LocalEndpoint(Endpoint):
 
         logger.debug("LocalEndpoint _prepare completed successfully")
 
-        # Create .btrfs-backup-ng directory if needed
-        backup_dir = self.config["path"] / ".btrfs-backup-ng"
+        # Create the .btrfs-backup-ng tree BELOW the destination just verified.
+        # One component at a time, never with parents: a destination that
+        # vanished between the check above and here (the drive unmounted) is
+        # refused rather than rebuilt on the filesystem underneath.
+        backup_dir = Path(self.config["path"]) / ".btrfs-backup-ng"
         try:
-            backup_dir.mkdir(parents=True, exist_ok=True)
-            snapshots_dir = backup_dir / "snapshots"
-            snapshots_dir.mkdir(parents=True, exist_ok=True)
+            __util__.create_below(
+                self.config["path"], ".btrfs-backup-ng", "snapshots", what="Destination"
+            )
             logger.debug("Created backup directories: %s", backup_dir)
         except OSError as e:
+            # create_below raises AbortError itself for a base that is not
+            # there; what reaches here is the mkdir of a component being
+            # refused -- a destination this user cannot write.
             logger.error("Error creating backup infrastructure: %s", e)
-            raise __util__.AbortError
+            raise __util__.AbortError(
+                f"Cannot create {backup_dir} under the destination: {e}. The "
+                "destination exists but is not writable by this user."
+            ) from e
