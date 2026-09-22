@@ -694,6 +694,40 @@ class RawEndpoint(Endpoint):
                 found[name] = match
         return found
 
+    def required_parent_of(self, snapshot: Any) -> Optional[Any]:
+        """Raw override of :meth:`Endpoint.required_parent_of` -- the sidecar's
+        ``parent_name``, which is a FACT about the stored stream, not a policy.
+
+        A raw backup is the ``btrfs send`` stream exactly as it was written. An
+        incremental stream can only ever be received onto its parent; there is
+        no full send to fall back to, because nothing here can regenerate one.
+        So the answer is the stream the sidecar names, looked up in this
+        store's own listing. A full stream needs nothing.
+
+        A sidecar that names a parent this store no longer holds is a broken
+        chain, and this RAISES rather than answering None: None means "needs
+        nothing", and a planner told that would stream an increment the
+        receive cannot apply -- after transferring all of it. Saying so here
+        is what lets the planner refuse before a byte moves.
+        """
+        parent_name = getattr(snapshot, "parent_name", None)
+        if not parent_name:
+            return None
+        try:
+            listed = list(self.list_snapshots())
+        except Exception as e:  # noqa: BLE001 - reported below as unmet
+            logger.debug("required_parent_of: could not list snapshots (%s)", e)
+            listed = []
+        for candidate in listed:
+            if candidate.get_name() == parent_name:
+                return candidate
+        raise __util__.AbortError(
+            f"{snapshot.get_name()} is an incremental stream whose parent "
+            f"{parent_name} is not at this location, so it cannot be received "
+            f"from here: a stored increment applies only onto its parent, and "
+            f"there is no full stream to send instead."
+        )
+
     @contextlib.contextmanager
     def target_lock(self, *, timeout: float | None = None) -> Iterator[None]:
         """Hold an exclusive lock on the target directory for a MUTATING operation.

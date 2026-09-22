@@ -404,6 +404,27 @@ def send_snapshot(
         )
         raise
 
+    except __util__.AbortError as e:
+        # An endpoint's ``send`` may refuse before a byte moves -- a raw store
+        # whose stream fails its sealed sha256, a decompressor that is not
+        # installed, a remote sudo with no password to give. Those are this
+        # transfer's failure, not the run's: re-raised as-is they would escape
+        # the executor's per-snapshot handling, which is where the pins are
+        # released and a partial is cleaned, and abort everything after them.
+        logger.error("Transfer of %s cannot proceed: %s", snapshot_name, e)
+        duration = time.monotonic() - transfer_start
+        log_transaction(
+            action="transfer",
+            status="failed",
+            source=source_path,
+            destination=dest_path,
+            snapshot=snapshot_name,
+            parent=parent_name,
+            duration_seconds=duration,
+            error=str(e),
+        )
+        raise __util__.SnapshotTransferError(str(e)) from e
+
     except (OSError, subprocess.CalledProcessError) as e:
         logger.error("Error during snapshot transfer: %r", e)
         _log_subprocess_error(e, destination_endpoint)
@@ -1734,7 +1755,7 @@ def artifact_verdict(destination_endpoint, snapshot) -> StructureVerdict:
             )
         return destination_endpoint.verify_structure(stored)
 
-    path = _destination_subvolume(destination_endpoint, snapshot.get_path())
+    path = _destination_subvolume(destination_endpoint, received_name_of(snapshot))
     if not getattr(destination_endpoint, "_is_remote", False):
         # Privilege-free, so it is asked first: a plain directory or a missing
         # path after a receive that exited 0 is provably not the copy. Only the
@@ -2311,6 +2332,22 @@ def _receiving_lock(destination_endpoint, destination: str, lock_root: str = "")
                 config.pop("lock_root", None)
 
     return _pinned()
+
+
+def received_name_of(snapshot) -> str:
+    """The name ``btrfs receive`` gives the copy of ``snapshot``.
+
+    A receive names the subvolume it creates after the basename of the
+    subvolume the stream was sent from. For a subvolume that is the basename
+    of its own path (for snapper, always ``snapshot``). A stored raw stream is
+    a FILE whose basename carries the stream suffixes, so the raw snapshot
+    says what its stream will be received as (``received_name``); a snapshot
+    without that attribute is asked its path.
+    """
+    own = getattr(snapshot, "received_name", None)
+    if own:
+        return str(own)
+    return Path(str(snapshot.get_path())).name
 
 
 def _destination_subvolume(destination_endpoint, source_path) -> str:

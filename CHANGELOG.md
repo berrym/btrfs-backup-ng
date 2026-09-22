@@ -7,7 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Every source endpoint answers `required_parent_of`, and the planner's
+  `only=` accepts a selection and a `source_endpoint` to expand it through.
+  The backup run's contract is unchanged: without a source endpoint the
+  selection is planned as given.
+
 ### Fixed
+
+- **An endpoint that refuses to send fails that transfer, not the run.** A raw
+  store whose stream fails its sealed sha256, a decompressor that is not
+  installed, a remote sudo with no password to give: each raised out of the
+  executor, past the per-snapshot handling where pins are released and
+  partials cleaned, and aborted everything after it with the pin still held.
+  It is now one failed entry.
+- The post-receive verdict on a raw SOURCE probed `DESTINATION/<name>.btrfs.zst`
+  -- the stream file's name -- found nothing, and would have called a correct
+  restore invalid and deleted it. A raw snapshot now says what its stream is
+  received as.
 
 - **A refused lock never reported an empty reason again.** Four sites logged
   why and then raised an exception carrying nothing, so a summary that quotes

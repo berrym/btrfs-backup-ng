@@ -241,6 +241,19 @@ class RawSnapshot:
         return self.stream_path
 
     @property
+    def received_name(self) -> str:
+        """What ``btrfs receive`` names the subvolume it creates from this stream.
+
+        A receive names the copy after the basename of the subvolume the stream
+        was sent from, which for a raw backup is the snapshot's name -- NOT the
+        basename of ``get_path()``, which is the stream FILE and carries the
+        compression and encryption suffixes. Anything that predicts where a
+        receive of this snapshot lands (the artifact verdict, a collision check)
+        asks this rather than the path.
+        """
+        return self.name
+
+    @property
     def time_obj(self) -> time.struct_time:
         """Creation time as a ``struct_time``, matching __util__.Snapshot.time_obj.
 
