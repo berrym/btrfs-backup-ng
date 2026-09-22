@@ -1742,6 +1742,21 @@ class Endpoint:
                 st = os.lstat(path)
             except FileNotFoundError:
                 return {}
+            if stat.S_ISDIR(st.st_mode):
+                # The same name is an ssh:// destination's lock DIRECTORY (its
+                # persistent pins and receiving locks; sshutil/lock.py). A
+                # local endpoint over that directory -- a transfer onward from
+                # a mirror -- cannot read those locks yet, and proceeding with
+                # an empty lock set would let a local prune delete what a
+                # remote restore holds. Refuse, and say which store this is.
+                raise ValueError(
+                    f"{path} is a directory: the lock store an ssh:// target "
+                    f"keeps for this location. Its locks are honoured only "
+                    f"through the ssh:// path; reading them from a local "
+                    f"endpoint is not supported yet. Use the ssh:// form of "
+                    f"this location, or move the directory aside if the "
+                    f"location is no longer an ssh:// target."
+                )
             if not stat.S_ISREG(st.st_mode):
                 raise ValueError(
                     f"lock file is not a regular file (mode {st.st_mode:o})"
@@ -1749,8 +1764,11 @@ class Endpoint:
             with open(path, encoding="utf-8") as f:
                 return __util__.read_locks(f.read())
         except (OSError, ValueError) as e:
+            # The exception carries the reason: a bare AbortError left every
+            # report that quoted it ("Transfer to X failed: ") with nothing
+            # after the colon.
             logger.error("Error on reading lock file %s: %s", path, e)
-            raise __util__.AbortError
+            raise __util__.AbortError(f"Cannot read the lock file {path}: {e}") from e
 
     def _write_locks(self, lock_dict: Dict[str, Any]) -> None:
         path = self._get_lock_file_path()
@@ -1765,4 +1783,4 @@ class Endpoint:
             __util__.atomic_write_bytes(path, data, mode=0o600)
         except OSError as e:
             logger.error("Error on writing lock file %s: %s", path, e)
-            raise __util__.AbortError
+            raise __util__.AbortError(f"Cannot write the lock file {path}: {e}") from e

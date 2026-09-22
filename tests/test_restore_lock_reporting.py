@@ -225,7 +225,12 @@ class TestATargetThatDoesPersistLocks:
         assert "NOT a report of zero locks" in out
 
     def test_the_error_does_not_trail_off_after_a_colon(self, tmp_path, capsys):
-        """AbortError stringifies to '', so the message must name the type."""
+        """The refusal carries its reason, and the status prints it.
+
+        This used to assert the exception's TYPE name appeared, because
+        AbortError stringified to '' and naming the type was the only way to
+        avoid "could not be read ()". Every AbortError now carries why, so the
+        status names the file and the cause instead of the class."""
         (tmp_path / LOCK_NAME).write_text("not json {{{")
         with patch.object(
             restore_cli, "_prepare_backup_endpoint", lambda a, s: self._local(tmp_path)
@@ -233,7 +238,8 @@ class TestATargetThatDoesPersistLocks:
             restore_cli._execute_status(_args(tmp_path))
         out = capsys.readouterr().out
         assert "could not be read ()" not in out
-        assert "AbortError" in out
+        assert "Cannot read the lock file" in out
+        assert str(tmp_path / LOCK_NAME) in out
 
     def test_unlock_does_not_overwrite_locks_it_could_not_read(self, tmp_path, capsys):
         """Rewriting an unparseable lock file as {} destroys the very state that
