@@ -25,6 +25,7 @@ of the things being measured.
 from __future__ import annotations
 
 import functools
+import itertools
 import os
 import secrets
 import shutil
@@ -189,9 +190,14 @@ def run_in_container(image: str, script: str, mounts: dict[str, str] | None = No
     return subprocess.run(argv, capture_output=True, text=True, timeout=900)
 
 
-def sh(cmd, timeout=900, check=False):
+def sh(cmd, timeout=900, check=False, env=None):
     r = subprocess.run(
-        cmd, shell=isinstance(cmd, str), capture_output=True, text=True, timeout=timeout
+        cmd,
+        shell=isinstance(cmd, str),
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        env=env,
     )
     if check and r.returncode != 0:
         raise RuntimeError(f"{cmd}\nrc={r.returncode}\n{r.stderr}")
@@ -213,6 +219,14 @@ class Rig:
     root: Path
     src: Path
     dst: Path
+    #: A third btrfs filesystem holding neither the originals nor the backups:
+    #: the recovery media of a disaster-recovery restore. `btrfs receive`
+    #: resolves an incremental stream's parent by uuid across the WHOLE
+    #: filesystem it lands on, so a restore into src or dst would find the
+    #: original (or the backup) and silently succeed where real recovery media
+    #: has nothing to offer. Only a filesystem with nothing on it can prove a
+    #: chain rebuilds from the restored base.
+    rec: Path
     raw: Path
     remote_base: str
     raw_remote_base: str
@@ -232,13 +246,16 @@ class Rig:
     def source_volume(self) -> Path:
         return self.src / "data"
 
-    def cli(self, *args, config: Path | None = None, timeout=900):
+    def cli(self, *args, config: Path | None = None, timeout=900, env=None):
+        """Run the installed CLI. ``env`` replaces the whole environment: an
+        encrypted cell hands the product a throwaway GNUPGHOME or passphrase
+        this way, and the wrong-key cells hand it the wrong one."""
         exe = os.environ.get("BBNG_TEST_CLI") or shutil.which("btrfs-backup-ng")
         assert exe, "btrfs-backup-ng is not on PATH; set BBNG_TEST_CLI"
         argv = [exe]
         if config is not None:
             argv += ["-c", str(config)]
-        return sh([*argv, *args], timeout=timeout)
+        return sh([*argv, *args], timeout=timeout, env=env)
 
     def write_config(
         self,
@@ -363,18 +380,63 @@ def _foreign_home_base() -> str:
     return f"{home}/bbng-tier3-raw"
 
 
+#: The rig's own filesystems, in the order they are torn down (reverse of
+#: creation). Anything else mounted under RIG_ROOT belongs to a cell.
+_RIG_FILESYSTEMS = ("src", "dst", "rec")
+
+
+def loop_fs_up(name: str) -> Path:
+    """A fresh btrfs filesystem on a sparse loopback image, mounted at
+    RIG_ROOT/<name>. The rig's three come from here, and so does the virgin
+    filesystem a disaster-recovery cell needs for itself."""
+    RIG_ROOT.mkdir(parents=True, exist_ok=True)
+    img = RIG_ROOT / f"{name}.img"
+    mnt = RIG_ROOT / name
+    sh(["truncate", "-s", "2G", str(img)], check=True)
+    sh(["mkfs.btrfs", "-q", str(img)], check=True)
+    mnt.mkdir(parents=True, exist_ok=True)
+    sh(["mount", "-o", "loop", str(img), str(mnt)], check=True)
+    return mnt
+
+
+def loop_fs_down(name: str) -> None:
+    """Delete every subvolume on the filesystem, unmount it, remove the image."""
+    mnt = RIG_ROOT / name
+    if mnt.is_dir():
+        # `btrfs subvolume list -o` is FILESYSTEM-wide, not path-scoped -- the trap
+        # endpoint/ssh.py documents, and the one that cost this project a user's
+        # ~/.ssh, ~/.gnupg and /home/.snapshots when an agent ran it against a rig
+        # path. It is safe below ONLY because each rig is its own loopback
+        # filesystem, so filesystem-wide and rig-wide are the same set. Confirm
+        # that before believing it: if the mount is not up (mkfs failed, an
+        # earlier run left the directory behind, BBNG_TEST_RIG points somewhere
+        # unexpected) then this directory belongs to the HOST filesystem and the
+        # listing would enumerate the host's subvolumes instead.
+        if not os.path.ismount(mnt):
+            shutil.rmtree(mnt, ignore_errors=True)
+        else:
+            r = sh(["btrfs", "subvolume", "list", "-o", str(mnt)])
+            for line in reversed(r.stdout.splitlines()):
+                rel = line.split(" path ", 1)[-1]
+                sh(["btrfs", "subvolume", "delete", str(mnt / Path(rel).name)])
+            for d in sorted(mnt.rglob("*"), reverse=True):
+                if d.is_dir():
+                    sh(["btrfs", "subvolume", "delete", str(d)])
+            sh(["umount", str(mnt)])
+            # Only once it is no longer a mount: an rmtree into a filesystem
+            # that refused to unmount would be an rmtree of its contents.
+            if not os.path.ismount(mnt):
+                shutil.rmtree(mnt, ignore_errors=True)
+    (RIG_ROOT / f"{name}.img").unlink(missing_ok=True)
+
+
 def _rig_up(remote_base: str, raw_remote_base: str) -> Rig:
     _rig_down(remote_base, raw_remote_base)
     RIG_ROOT.mkdir(parents=True, exist_ok=True)
     payload = os.urandom(PAYLOAD_BYTES)
 
-    for name in ("src", "dst"):
-        img = RIG_ROOT / f"{name}.img"
-        mnt = RIG_ROOT / name
-        sh(["truncate", "-s", "2G", str(img)], check=True)
-        sh(["mkfs.btrfs", "-q", str(img)], check=True)
-        mnt.mkdir(parents=True, exist_ok=True)
-        sh(["mount", "-o", "loop", str(img), str(mnt)], check=True)
+    for name in _RIG_FILESYSTEMS:
+        loop_fs_up(name)
 
     src, dst = RIG_ROOT / "src", RIG_ROOT / "dst"
     sh(["btrfs", "subvolume", "create", str(src / "data")], check=True)
@@ -407,6 +469,7 @@ def _rig_up(remote_base: str, raw_remote_base: str) -> Rig:
         root=RIG_ROOT,
         src=src,
         dst=dst,
+        rec=RIG_ROOT / "rec",
         raw=raw,
         remote_base=remote_base,
         raw_remote_base=raw_remote_base,
@@ -427,30 +490,14 @@ def _rig_down(remote_base: str, raw_remote_base: str) -> None:
             f'sudo -n btrfs subvolume delete "$d" >/dev/null 2>&1 || true; done; '
             f"rm -rf '{remote_base}'"
         )
-    for name in ("dst", "src"):
-        mnt = RIG_ROOT / name
-        if not mnt.is_dir():
-            continue
-        # `btrfs subvolume list -o` is FILESYSTEM-wide, not path-scoped -- the trap
-        # endpoint/ssh.py documents, and the one that cost this project a user's
-        # ~/.ssh, ~/.gnupg and /home/.snapshots when an agent ran it against a rig
-        # path. It is safe below ONLY because each rig is its own loopback
-        # filesystem, so filesystem-wide and rig-wide are the same set. Confirm
-        # that before believing it: if the mount is not up (mkfs failed, an
-        # earlier run left the directory behind, BBNG_TEST_RIG points somewhere
-        # unexpected) then this directory belongs to the HOST filesystem and the
-        # listing would enumerate the host's subvolumes instead.
-        if not os.path.ismount(mnt):
-            shutil.rmtree(mnt, ignore_errors=True)
-            continue
-        r = sh(["btrfs", "subvolume", "list", "-o", str(mnt)])
-        for line in reversed(r.stdout.splitlines()):
-            rel = line.split(" path ", 1)[-1]
-            sh(["btrfs", "subvolume", "delete", str(mnt / Path(rel).name)])
-        for d in sorted(mnt.rglob("*"), reverse=True):
-            if d.is_dir():
-                sh(["btrfs", "subvolume", "delete", str(d)])
-        sh(["umount", str(mnt)])
+    for name in reversed(_RIG_FILESYSTEMS):
+        loop_fs_down(name)
+    # A cell's own filesystem (a virgin recovery fs) is torn down by the
+    # cell's finalizer; only a run killed outright can leave one mounted,
+    # and the rmtree below must not be what meets it.
+    if RIG_ROOT.is_dir():
+        for img in RIG_ROOT.glob("*.img"):
+            loop_fs_down(img.stem)
     shutil.rmtree(RIG_ROOT, ignore_errors=True)
 
 
@@ -547,12 +594,154 @@ def assert_increment_restored(
     )
 
 
+def subvolumes_under(dest: Path) -> list[Path]:
+    """Every subvolume a restore may have landed under ``dest``, by inode.
+
+    Path-scoped on purpose: `btrfs subvolume list -o` enumerates the containing
+    subvolume, so aimed at a directory on the rig's source filesystem it
+    returns every sibling cell's snapshots and can never say "nothing here".
+    The root inode of a btrfs subvolume is always 256, which is a fact about
+    the filesystem and not about the tool being tested.
+    """
+    if not dest.is_dir():
+        return []
+    return [p for p in _restored_roots(dest) if p.stat().st_ino == 256]
+
+
+def assert_nothing_restored(dest: Path, context: str = "") -> None:
+    """A refused restore must leave no data behind -- not a subvolume, not a
+    payload, not a partial one. A destination that fails closed and still
+    holds a received subvolume would be reported as a failure by the exit
+    code and then found "restored" by whoever looks, which is worse than
+    either alone."""
+    if not dest.exists():
+        return
+    landed = subvolumes_under(dest)
+    assert not landed, (
+        f"the restore was refused but {[str(p) for p in landed]} exist under "
+        f"{dest}: something was received anyway.{context}"
+    )
+    for base in _restored_roots(dest):
+        assert not (base / "payload.bin").exists(), (
+            f"the restore was refused but {base / 'payload.bin'} exists.{context}"
+        )
+
+
+def lifecycle(
+    rig,
+    config,
+    *,
+    location,
+    prefix,
+    extra_args=(),
+    restore_args=(),
+    env=None,
+    snapper=False,
+):
+    """Backup, incremental, verify, prune, restore -- asserting on effects.
+
+    The restore half asserts here rather than at the call site, deliberately.
+    It used to return a dict and leave every check to the caller, and the
+    result was that the restore's return code was discarded outright and
+    ``incremental_rc`` was recorded by this function and asserted by no cell at
+    all -- so a restore that failed, or that delivered the parent and dropped
+    the increment, passed every cell in the matrix. A proof a caller can forget
+    to demand is not a proof.
+
+    ``extra_args`` go to verify AND restore (the ssh options both need);
+    ``restore_args`` go to the restore alone, for options verify does not take
+    such as the transport compression of the restore leg. ``env`` is handed to
+    every CLI call, so an encrypted cell's throwaway keyring or passphrase
+    reaches the product the way an operator's would.
+    """
+    results = {}
+
+    r = rig.cli("run", config=config, env=env)
+    results["backup_rc"] = r.returncode
+    results["backup_out"] = (r.stdout + r.stderr)[-2000:]
+
+    delta = rig.mutate_source()
+    r2 = rig.cli("run", config=config, env=env)
+    results["incremental_rc"] = r2.returncode
+    results["incremental_out"] = (r2.stdout + r2.stderr)[-2000:]
+
+    rv = rig.cli("verify", location, "--prefix", prefix, *extra_args, env=env)
+    results["verify_rc"] = rv.returncode
+    results["verify_out"] = (rv.stdout + rv.stderr)[-2000:]
+
+    before = rig.cli("list", config=config, env=env)
+    results["listed_before_prune"] = (before.stdout + before.stderr)[-1500:]
+    rp = rig.cli("prune", "--yes", config=config, env=env)
+    results["prune_rc"] = rp.returncode
+    results["prune_out"] = (rp.stdout + rp.stderr)[-1500:]
+    after = rig.cli("list", config=config, env=env)
+    results["listed_after_prune"] = (after.stdout + after.stderr)[-1500:]
+
+    # Keyed by the config stem, not the prefix: the rig is module-scoped and
+    # two cells legitimately share an empty prefix, so a prefix-derived name
+    # aimed both of them at the same directory and let the second pass on the
+    # first one's restored artifacts.
+    dest = rig.src / f"restored-{config.stem}"
+    rr = rig.cli(
+        "restore",
+        location,
+        str(dest),
+        "--prefix",
+        prefix,
+        "--yes-i-know-what-i-am-doing",
+        *extra_args,
+        *restore_args,
+        env=env,
+    )
+    results["restore_rc"] = rr.returncode
+    results["restore_out"] = (rr.stdout + rr.stderr)[-2000:]
+    results["restore_dest"] = dest
+    results["delta"] = delta
+
+    assert results["incremental_rc"] == 0, results["incremental_out"]
+    # verify and prune join the in-lifecycle asserts for the same reason the
+    # restore did: verify_rc was asserted by three cells and forgotten by four
+    # -- raw+ssh, the target whose broken restore hid through 0.9.6, among
+    # them -- and prune_rc by one. verify exits 2 on zero matching snapshots
+    # (core/verify.py), so rc 0 proves snapshots were found AND verified.
+    assert results["verify_rc"] == 0, results["verify_out"]
+    assert results["prune_rc"] == 0, results["prune_out"]
+    assert results["restore_rc"] == 0, results["restore_out"]
+    assert_payload_restored(dest, rig.payload)
+    assert_increment_restored(
+        dest,
+        delta,
+        context=(
+            f"\n\n--- listed BEFORE prune ---\n{results['listed_before_prune']}"
+            f"\n--- prune rc={results['prune_rc']} ---\n{results['prune_out']}"
+            f"\n--- listed AFTER prune ---\n{results['listed_after_prune']}"
+        ),
+    )
+    return results
+
+
 @dataclass
 class SnapperSource:
     """A snapper config registered on the runner for a subvolume of the rig."""
 
     name: str
     subvol: Path
+
+    def slots(self) -> list[int]:
+        """The numbered snapshots snapper holds for this config, on disk.
+
+        Read from the filesystem, not from `snapper list`: snapperd caches its
+        view and does not see a slot a restore created out of band until it
+        rescans, and the question here is what a restore LEFT, not what the
+        daemon has noticed.
+        """
+        snaps = self.subvol / ".snapshots"
+        if not snaps.is_dir():
+            return []
+        return sorted(int(p.name) for p in snaps.iterdir() if p.name.isdigit())
+
+    def slot(self, number: int) -> Path:
+        return self.subvol / ".snapshots" / str(number) / "snapshot"
 
     def take(self, description: str) -> int:
         """Take a snapper snapshot and return the number snapper assigned.
@@ -573,35 +762,178 @@ class SnapperSource:
         return delta
 
 
+def snapper_config_down(name: str, subvol: Path) -> None:
+    """Remove one snapper config and the subvolume it managed, by name.
+
+    Never enumerates configs; only the one the caller named. Order matters:
+    `snapper delete-config` FIRST, while the subvolume still exists --
+    deleting the subvolume first leaves the config registered in snapperd
+    with a path that is gone, and `delete-config` then refuses. Then what
+    snapper (or a restore) nested in the subvolume, deepest first, each by a
+    path inside the subvolume the caller created.
+    """
+    sh(["snapper", "-c", name, "delete-config"])
+    for snap in sorted((subvol / ".snapshots").glob("*/snapshot"), reverse=True):
+        sh(["btrfs", "subvolume", "delete", str(snap)])
+    for path in (subvol / ".snapshots", subvol):
+        if path.exists():
+            sh(["btrfs", "subvolume", "delete", str(path)])
+
+
+def snapper_config_up(
+    request, name: str, subvol: Path, payload: bytes | None
+) -> SnapperSource:
+    """Register a snapper config on a fresh subvolume, teardown first.
+
+    The teardown is a finalizer registered BEFORE anything is created, so it
+    runs whether the cells passed, failed mid-run, or the setup itself broke
+    halfway. ``payload`` seeds the subvolume; None leaves it empty, which is
+    what recovery media looks like.
+    """
+    request.addfinalizer(lambda: snapper_config_down(name, subvol))
+    sh(["btrfs", "subvolume", "create", str(subvol)], check=True)
+    if payload is not None:
+        (subvol / "payload.bin").write_bytes(payload)
+    sh(["snapper", "-c", name, "create-config", str(subvol)], check=True)
+    return SnapperSource(name=name, subvol=subvol)
+
+
 @pytest.fixture(scope="module")
 def snapper_source(rig, request):
     """A snapper config on its own subvolume of the rig's source filesystem.
 
     The config name carries the rig's suffix and a fixed test namespace, so
     no run can collide with another and the teardown can never name a
-    production config. The teardown is a finalizer registered BEFORE anything
-    is created, so it runs whether the module's cells passed, failed
-    mid-run, or the setup itself broke halfway. Order inside it matters:
-    `snapper delete-config` FIRST, while the subvolume still exists --
-    deleting the subvolume first leaves the config registered in snapperd
-    with a path that is gone, and `delete-config` then refuses.
+    production config.
     """
-    name = f"bbngt3{rig.suffix}"
-    subvol = rig.src / "snapdata"
+    return snapper_config_up(
+        request, f"bbngt3{rig.suffix}", rig.src / "snapdata", rig.payload
+    )
 
-    def down():
-        # Never enumerate configs; only the one this fixture named.
-        sh(["snapper", "-c", name, "delete-config"])
-        # The subvolume and what snapper nested in it, deepest first, each by
-        # a path inside the subvolume this fixture created.
-        for snap in sorted((subvol / ".snapshots").glob("*/snapshot"), reverse=True):
-            sh(["btrfs", "subvolume", "delete", str(snap)])
-        for path in (subvol / ".snapshots", subvol):
-            if path.exists():
-                sh(["btrfs", "subvolume", "delete", str(path)])
 
-    request.addfinalizer(down)
-    sh(["btrfs", "subvolume", "create", str(subvol)], check=True)
-    (subvol / "payload.bin").write_bytes(rig.payload)
-    sh(["snapper", "-c", name, "create-config", str(subvol)], check=True)
-    return SnapperSource(name=name, subvol=subvol)
+_chain_counter = itertools.count(1)
+
+
+@pytest.fixture
+def snapper_chain(rig, request):
+    """A snapper config for ONE cell, holding exactly the snapshots it takes.
+
+    `snapper backup` syncs every snapshot of a config to the target, so a
+    restore of `--all` from a target fed by the module-scoped source brings
+    back every earlier cell's snapshots too and the chain under test cannot
+    be told apart from the accumulation. A cell that judges a whole chain
+    gets a config of its own: base, delta, nothing else.
+    """
+    n = next(_chain_counter)
+    return snapper_config_up(
+        request, f"bbngt3c{n}{rig.suffix}", rig.src / f"snapdata-{n}", rig.payload
+    )
+
+
+@pytest.fixture(scope="module")
+def snapper_recovery(rig, request):
+    """The config a snapper restore lands in: empty, on the recovery
+    filesystem, sharing nothing with the source or the backups. Module-scoped
+    like the source, so the cells of one module accumulate slots here and
+    each judges only the slots it added."""
+    return snapper_config_up(request, f"bbngt3r{rig.suffix}", rig.rec / "recover", None)
+
+
+@dataclass
+class GpgIdentity:
+    """A throwaway keypair in its own GNUPGHOME, and a stranger's beside it.
+
+    Never the operator's ~/.gnupg: the runner is root under sudo and a key
+    generated there would outlive the run. ``stranger`` holds a different key
+    and none of the secret material, so a restore pointed at it is the
+    wrong-key case exactly as an operator without the key would meet it.
+    """
+
+    home: Path
+    recipient: str
+    stranger: Path
+
+    def env(self, home: Path | None = None) -> dict[str, str]:
+        return {**os.environ, "GNUPGHOME": str(home or self.home)}
+
+
+def _gpg_home_up(home: Path, uid: str) -> None:
+    home.mkdir(mode=0o700, parents=True)
+    sh(
+        [
+            "gpg",
+            "--batch",
+            "--pinentry-mode",
+            "loopback",
+            "--passphrase",
+            "",
+            "--quick-generate-key",
+            uid,
+            "default",
+            "default",
+            "never",
+        ],
+        check=True,
+        env={**os.environ, "GNUPGHOME": str(home)},
+    )
+
+
+def _gpg_home_down(home: Path) -> None:
+    # The agent for this home outlives the run otherwise; matched by homedir,
+    # so the operator's real agent is never touched.
+    sh(["gpgconf", "--homedir", str(home), "--kill", "all"])
+    shutil.rmtree(home, ignore_errors=True)
+
+
+@pytest.fixture(scope="module")
+def gpg_identity(rig, request):
+    if shutil.which("gpg") is None or shutil.which("gpgconf") is None:
+        pytest.skip("Tier 3 gpg cells need gpg and gpgconf on the runner")
+    home = rig.root / "gnupg"
+    stranger = rig.root / "gnupg-stranger"
+    request.addfinalizer(lambda: _gpg_home_down(home))
+    request.addfinalizer(lambda: _gpg_home_down(stranger))
+    uid = f"bbng tier3 {rig.suffix} <t3-{rig.suffix}@example.invalid>"
+    _gpg_home_up(home, uid)
+    _gpg_home_up(stranger, f"stranger {rig.suffix} <no-{rig.suffix}@example.invalid>")
+    return GpgIdentity(
+        home=home, recipient=f"t3-{rig.suffix}@example.invalid", stranger=stranger
+    )
+
+
+def snapper_lifecycle(rig, snap, target, *, extra_args=()):
+    """Base backup, a real delta, an incremental backup -- each rc asserted
+    here, and the increment proven by its bytes at the destination, never
+    by a snapshot merely having arrived.
+
+    This is the cell 0.9.7 did not have. A snapper backup to a btrfs target
+    receives into `.snapshots/<n>.incoming` and publishes it as
+    `.snapshots/<n>`; that slot had only ever existed as a side effect of
+    the `mkdir -p` the endpoints ran on any path a receive was pointed at,
+    and removing those (a backup location is never created) removed the slot
+    with them. The engine then refused the missing slot and every snapper
+    backup to btrfs failed, while every unit test mocked the send.
+    """
+    results = {}
+    base_num = snap.take("base")
+    r1 = rig.cli("snapper", "backup", snap.name, target, *extra_args)
+    results["backup_rc"] = r1.returncode
+    results["backup_out"] = (r1.stdout + r1.stderr)[-2000:]
+    assert results["backup_rc"] == 0, results["backup_out"]
+
+    delta = snap.mutate()
+    delta_num = snap.take("delta")
+    r2 = rig.cli("snapper", "backup", snap.name, target, *extra_args)
+    results["incremental_rc"] = r2.returncode
+    results["incremental_out"] = (r2.stdout + r2.stderr)[-3000:]
+    assert results["incremental_rc"] == 0, results["incremental_out"]
+    # The console renderer wraps long lines, so the log is compared with its
+    # whitespace collapsed.
+    flat = " ".join(results["incremental_out"].split())
+    assert f"incremental from {base_num}" in flat, (
+        "the second backup was not sent as an increment of the first\n"
+        + results["incremental_out"]
+    )
+    results["delta"] = delta
+    results["numbers"] = (base_num, delta_num)
+    return results
