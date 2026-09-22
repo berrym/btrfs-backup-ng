@@ -83,7 +83,8 @@ class TestTheFlagIsNotSilentlyIgnored:
                 with patch.object(restore_cli, "_prepare_local_endpoint", MagicMock()):
 
                     def _restore(*a, **kw):
-                        ran["skip_existing"] = kw.get("skip_existing")
+                        ran["called"] = True
+                        ran["kwargs"] = set(kw)
                         return {
                             "restored": 1,
                             "skipped": 0,
@@ -95,10 +96,11 @@ class TestTheFlagIsNotSilentlyIgnored:
                         rc = restore_cli._execute_main_restore(_args(tmp_path))
 
         assert rc == 0, "the run was refused instead of continuing"
-        assert ran.get("skip_existing") is True, (
-            "existing snapshots must be left alone, since replacing them is not "
-            "supported -- skip_existing=False would attempt exactly that"
-        )
+        assert ran.get("called"), "the restore never ran"
+        # Existing snapshots are left alone structurally: presence is decided
+        # by correspondence in the planner and a same-name stranger refuses
+        # the run, so there is no knob that could ask to receive onto them.
+        assert "skip_existing" not in ran["kwargs"]
 
 
 class TestTheDestructiveMachineryIsGone:

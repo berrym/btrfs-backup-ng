@@ -237,20 +237,25 @@ def test_polymorphism_btrfs_uses_base_raw_overrides():
 
 
 def test_planner_and_restore_both_wired_onto_correspondent_of():
-    """Phase 2 wired the backup planner onto correspondent_of; Phase 3a converges restore's
-    incremental-parent selection onto the SAME primitive (find_parent_by_correspondence).
-    Both now route through the one correspondence authority -- no more bespoke uuid parsing
-    in restore."""
+    """Phase 2 wired the backup planner onto correspondent_of. Restore no
+    longer has a parent chooser of its own at all: it plans through the same
+    ``plan_transfer_sequence``, so presence and parents come from the one
+    correspondence authority in both directions."""
     import btrfs_backup_ng.core.planning as planning
     import btrfs_backup_ng.core.restore as restore
 
     assert "correspondent_of" in inspect.getsource(planning), (
         "the planner is wired onto correspondent_of (P2)"
     )
-    assert "correspondent_of" in inspect.getsource(restore), (
-        "restore is converged onto correspondent_of (P3a)"
+    restore_source = inspect.getsource(restore)
+    assert "plan_transfer_sequence(" in restore_source, (
+        "restore must plan through the engine's planner"
     )
-    # The bespoke restore-side uuid matcher is gone.
-    assert "find_parent_by_uuid" not in inspect.getsource(restore), (
-        "find_parent_by_uuid should be replaced by find_parent_by_correspondence"
-    )
+    for bespoke in (
+        "find_parent_by_uuid",
+        "find_parent_by_correspondence",
+        "_choose_parent",
+    ):
+        assert bespoke not in restore_source, (
+            f"{bespoke} is a second planner in restore"
+        )

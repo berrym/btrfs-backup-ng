@@ -21,7 +21,6 @@ shared base fixes.
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock
 
 import pytest
 
@@ -113,51 +112,72 @@ def test_restore_local_endpoint_uses_backup_prefix(tmp_path):
     assert ep.config["snap_prefix"] == "home-"
 
 
-def test_incremental_parent_is_the_backup_side_snapshot(monkeypatch):
+def test_incremental_parent_is_the_backup_side_snapshot(tmp_path, monkeypatch):
     """``btrfs send -p`` runs where the backup lives (the REMOTE host for ssh://), so the
     parent handed to the send must be the BACKUP snapshot -- whose path is valid there --
-    not a locally-restored copy whose path is meaningless on the remote (that always
-    failed). Mutation guard: removing the backup-side remap in restore_snapshots hands the
-    LOCAL parent to send() and fails this."""
+    not a locally-restored copy whose path is meaningless on the remote. The planner
+    chooses parents from the SOURCE listing by construction; this drives the facade and
+    checks the object identity of what reached the transfer."""
     import time as _time
 
+    import btrfs_backup_ng.core.layout as layout_mod
+    import btrfs_backup_ng.core.operations as ops
     import btrfs_backup_ng.core.restore as restore_mod
-    from btrfs_backup_ng import __util__
+    from btrfs_backup_ng.endpoint.common import Endpoint
+    from btrfs_backup_ng.endpoint.raw_metadata import StructureVerdict
 
-    def _snap(name_time, endpoint, path):
+    def _snap(name_time, endpoint, path, uuid, received_uuid=""):
         s = __util__.Snapshot(
             path, "s-", endpoint, time_obj=_time.strptime(name_time, "%Y%m%d-%H%M%S")
         )
+        s.uuid, s.received_uuid = uuid, received_uuid
         return s
 
-    backup_ep = MagicMock()
-    backup_ep.get_id.return_value = "backup"
-    local_ep = MagicMock()
-    local_ep.get_id.return_value = "local"
+    class _Backup:
+        config = {"path": "/remote/backup", "snap_prefix": "s-"}
+        _is_remote = True
 
-    # Same NAME on both sides, but different locations (remote backup vs local dest).
-    b0 = _snap("20240101-000000", backup_ep, "/remote/backup")
-    b1 = _snap("20240102-000000", backup_ep, "/remote/backup")
-    l0 = _snap("20240101-000000", local_ep, "/local/dest")  # already restored locally
+        def __init__(self, snaps):
+            self.snaps = snaps
 
-    backup_ep.list_snapshots.return_value = [b0, b1]
-    local_ep.list_snapshots.return_value = [l0]
+        def list_snapshots(self, flush_cache=False):
+            return list(self.snaps)
 
-    # Force the name/time fallback parent path (the one that picked a local snapshot).
+        def set_lock(self, *a, **k):
+            pass
+
+        def get_id(self):
+            return "backup"
+
+        def required_parent_of(self, snapshot):
+            return Endpoint.required_parent_of(self, snapshot)  # type: ignore[arg-type]
+
+    backup_ep = _Backup([])
+    b0 = _snap("20240101-000000", backup_ep, "/remote/backup", "B0", received_uuid="O0")
+    b1 = _snap("20240102-000000", backup_ep, "/remote/backup", "B1", received_uuid="O1")
+    backup_ep.snaps = [b0, b1]
+    dest_dir = tmp_path / "dest"
+    dest_dir.mkdir()
+    local_ep = _local(dest_dir)
+    # Already restored locally: the copy of b0, carrying O0 as its received_uuid.
+    l0 = _snap("20240101-000000", local_ep, str(dest_dir), "L0", received_uuid="O0")
+    (dest_dir / l0.get_name()).mkdir()
+    local_ep.list_snapshots = lambda flush_cache=False: [l0]  # type: ignore[method-assign]
+    local_ep.receive = lambda *a, **k: None  # type: ignore[method-assign]
+    monkeypatch.setattr(layout_mod, "_received_subvolume_shape", lambda p: None)
     monkeypatch.setattr(
-        restore_mod, "find_parent_by_correspondence", lambda *a, **k: (None, None)
+        ops, "artifact_verdict", lambda ep, s: StructureVerdict("ok", "verified")
     )
 
     captured = {}
 
-    def fake_restore_snapshot(be, le, snap, parent=None, **k):
-        captured[snap.get_name()] = parent
+    def fake_send(snapshot, destination_endpoint, parent=None, options=None, **k):
+        captured[snapshot.get_name()] = parent
+        (dest_dir / snapshot.get_name()).mkdir(exist_ok=True)
 
-    monkeypatch.setattr(restore_mod, "restore_snapshot", fake_restore_snapshot)
+    monkeypatch.setattr(ops, "send_snapshot", fake_send)
 
-    restore_mod.restore_snapshots(
-        backup_ep, local_ep, snapshot_name=b1.get_name(), skip_existing=True
-    )
+    restore_mod.restore_snapshots(backup_ep, local_ep, snapshot_name=b1.get_name())
 
     parent = captured[b1.get_name()]
     assert parent is b0  # the BACKUP-side object (remote path), not the local copy l0

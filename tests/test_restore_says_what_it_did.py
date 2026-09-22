@@ -8,9 +8,10 @@ result that does not distinguish between different situations.
   matched, when everything was filtered, and when the location was empty. The
   outcome is a satisfied request, not a failure, so the exit code stays 0; but
   which of those happened has to be said.
-* `check_snapshot_collision` returned False -- "no collision" -- when it could
-  not read the destination at all. A caller acting on that receives onto a name
-  that may already exist, which is what the function exists to prevent.
+* the collision check answered "no collision" when it could not read the
+  destination at all. A caller acting on that receives onto a name that may
+  already exist, which is what the check exists to prevent. The check now
+  examines the landing path itself and describes what it cannot read.
 """
 
 from __future__ import annotations
@@ -21,7 +22,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from btrfs_backup_ng.core import restore as core_restore
-from btrfs_backup_ng.core.restore import RestoreError, check_snapshot_collision
+from btrfs_backup_ng.core.restore import RestoreError
 
 
 def _parses(text):
@@ -66,6 +67,24 @@ class _Endpoint:
         return {"home-": len(self._names)}
 
     def correspondent_of(self, snapshot):
+        for snap in self.list_snapshots():
+            if snap.get_name() == snapshot.get_name():
+                return snap
+        return None
+
+    def correspondents_of(self, snapshots):
+        found = {}
+        for snap in snapshots:
+            match = self.correspondent_of(snap)
+            if match is not None:
+                found[snap.get_name()] = match
+        return found
+
+    def required_parent_of(self, snapshot):
+        older = [s for s in self.list_snapshots() if s.time_obj < snapshot.time_obj]
+        return max(older, key=lambda s: s.time_obj) if older else None
+
+    def subvolume_identity(self, path):
         return None
 
     def set_lock(self, *a, **kw):
@@ -110,27 +129,53 @@ class TestItSaysWhyThereIsNothingToDo:
 
 
 class TestACheckThatCannotRunDoesNotAnswer:
-    def test_an_unreadable_destination_raises(self):
-        endpoint = MagicMock()
-        endpoint.list_snapshots.side_effect = OSError("no route to host")
-        with pytest.raises(RestoreError, match="Refusing to assume"):
-            check_snapshot_collision("home-20240101T120000", endpoint)
+    """A same-name entry whose identity cannot be read is a refusal, never
+    "not there". The collision question used to be asked by NAME against a
+    listing, and answered "no collision" when the listing failed. It is now
+    asked of the landing path itself, and an entry that cannot be examined
+    is described as exactly that."""
 
-    def test_a_readable_destination_still_answers_both_ways(self):
-        endpoint = MagicMock()
-        endpoint.list_snapshots.return_value = [_Snap("home-20240101T120000")]
-        assert check_snapshot_collision("home-20240101T120000", endpoint) is True
-        assert check_snapshot_collision("home-20240102T120000", endpoint) is False
+    def test_an_unreadable_identity_refuses_rather_than_assuming_absent(
+        self, tmp_path, monkeypatch
+    ):
+        import btrfs_backup_ng.core.layout as layout_mod
+        from btrfs_backup_ng.core.layout import describe_entry
 
-    def test_the_restore_refuses_before_streaming(self):
+        monkeypatch.setattr(layout_mod, "_received_subvolume_shape", lambda p: None)
+        entry = tmp_path / "home-20240101T120000"
+        entry.mkdir()
+        probe = MagicMock()
+        probe.subvolume_identity.return_value = None
+        what = describe_entry(probe, entry, "S")
+        assert what is not None, "an unexaminable entry was read as absent"
+        assert "could not be read" in what
+
+    def test_a_readable_entry_still_answers_both_ways(self, tmp_path, monkeypatch):
+        import btrfs_backup_ng.core.layout as layout_mod
+        from btrfs_backup_ng.core.layout import describe_entry
+
+        monkeypatch.setattr(layout_mod, "_received_subvolume_shape", lambda p: None)
+        probe = MagicMock()
+        probe.subvolume_identity.return_value = {"uuid": "x", "received_uuid": ""}
+        present = tmp_path / "home-20240101T120000"
+        present.mkdir()
+        assert describe_entry(probe, present, "S") is not None
+        assert describe_entry(probe, tmp_path / "home-20240102T120000", "S") is None
+
+    def test_the_restore_refuses_before_streaming(self, tmp_path, monkeypatch):
         """The point of wiring it: refuse up front, not after the transfer."""
+        import btrfs_backup_ng.core.layout as layout_mod
+        import btrfs_backup_ng.core.operations as ops
+
+        monkeypatch.setattr(layout_mod, "_received_subvolume_shape", lambda p: None)
+        streamed = []
+        monkeypatch.setattr(ops, "send_snapshot", lambda *a, **k: streamed.append(1))
         backup = _Endpoint(["home-20240101T120000"], prefix="home-")
-        # The destination must be readable under the prefix, which is what
-        # restore_snapshots now guarantees before it gets here. With the wrong
-        # prefix the destination cannot see its own snapshot and the collision
-        # check finds nothing -- the same blindness this release is fixing.
-        destination = _Endpoint(["home-20240101T120000"], prefix="home-")
-        with pytest.raises(RestoreError, match="already at the destination"):
-            core_restore.restore_snapshot(
-                backup, destination, _Snap("home-20240101T120000")
+        destination = _Endpoint([], prefix="home-")
+        destination.config["path"] = str(tmp_path)
+        (tmp_path / "home-20240101T120000").mkdir()
+        with pytest.raises(RestoreError, match="not this backup's copy"):
+            core_restore.restore_snapshots(
+                backup, destination, snapshot_name="home-20240101T120000"
             )
+        assert streamed == []

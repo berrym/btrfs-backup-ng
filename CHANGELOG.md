@@ -7,6 +7,58 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **A native restore is a transfer through the engine.** `restore` had its
+  own planner (a chain built by walking timestamps, presence and collision
+  decided by NAME), its own parent chooser, its own verifier (an existence
+  check) and its own lock lifecycle around the shared transfer. It now
+  selects the snapshot and hands the rest to the planner and executor every
+  backup uses, with the roles swapped: presence is correspondence -- the
+  copy's received_uuid against the identity the backup's stream carries, two
+  hops from the original -- so a partial receive, a foreign subvolume and a
+  re-created snapshot are all "absent"; the incremental parent is chosen
+  from what the destination holds; the pins are taken under
+  `restore:<session>` and released when a transfer fails, so a failed restore
+  never leaves a pin on a remote target; every copy gets the artifact
+  verdict; a partial the run made is cleaned under the authorship rule; and
+  `--dry-run` prints the very plan the run executes, line for line. The
+  chain a snapshot depends on comes along by default, as it always has, but
+  from one rule: the source is asked what each snapshot requires
+  (`required_parent_of` -- the time-ordered predecessor for a btrfs
+  location, the sidecar's parent for a raw store), and the selection grows
+  to that chain until it reaches what the destination already holds.
+  `--no-incremental` still brings the chain, as full sends.
+- **A same-name entry at the destination that is not this backup's copy
+  refuses the run.** An interrupted restore leaves a subvolume under the
+  right name with no received_uuid; it listed as "already restored", was
+  skipped, and the run exited 0 having restored nothing -- the signature
+  defect, live in every release with a `restore` command. Anything under a
+  name the restore would receive is examined before a byte moves and, when
+  it is not the copy (no received_uuid; a copy of a different snapshot; an
+  identity that cannot be read; a plain directory), the run refuses, names
+  the path and what it is, and transfers nothing. It is never deleted.
+- **`restore --cleanup` deletes what a run marker names, and only that.**
+  A restore now records each receive in flight in
+  `DESTINATION/.btrfs-backup-ng/restore/<token>.json`, written atomically
+  and removed once the copy is verified. A marker that outlived its process
+  is the authorship record of a restore killed mid-receive, and `--cleanup`
+  removes the subvolume it names when that subvolume has no received_uuid.
+  Nothing else is deleted: a marker whose restore is still running, a marker
+  over a complete received copy (the marker is stale, the copy is not), a
+  marker naming a path outside the destination (including `..`) or a
+  symlink, and every subvolume under no marker -- however empty -- are
+  reported and left; each deletion re-checks its entry first. The
+  `.partial`-suffix and metadata-only heuristics are gone; nothing ever wrote
+  the first, and the second was an operator's own subvolume as often as
+  anything.
+- **A stored raw increment whose parent is not at the store is refused
+  before streaming.** A raw backup is the stream as written, and an
+  incremental stream applies only onto its parent. Restoring such an
+  increment used to stream all of it and fail in the receive; the planner
+  now asks the store, brings the parent first when it is there, and refuses
+  the plan when it is not, leaving nothing at the destination.
+
 ### Added
 
 - **`--compress` on an `ssh://` restore source compresses the wire.** The
