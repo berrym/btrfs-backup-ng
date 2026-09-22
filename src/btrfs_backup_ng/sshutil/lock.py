@@ -962,6 +962,93 @@ def snapshot_lock_name(snapshot: Any) -> str:
     return PurePosixPath(str(snapshot)).name
 
 
+def record_pin(
+    manager: Any,
+    snapshot: Any,
+    lock_id: Any,
+    lock_state: bool,
+    *,
+    parent: bool = False,
+    skip_remote_lock: bool = False,
+    where: str = "destination",
+    noun: str = "snapshot",
+    opt_out: str = "pass --skip-remote-lock",
+) -> None:
+    """Write or drop THIS holder's pin on ``snapshot`` in the target's lock store.
+
+    ``manager`` is a ``RemoteLockManager`` or a zero-argument callable that
+    builds one.
+
+    The one body behind every endpoint's persistent ``set_lock``: ssh://,
+    raw+ssh://, and a local endpoint over a location that carries the
+    directory store. Each endpoint keeps its own in-memory lock set (the
+    transfer and prune logic in this run reads that directly) and then calls
+    this for the durable record. Three copies of this logic had drifted only
+    in their wording; the wording is now a parameter.
+
+    SHARED, not exclusive: the in-memory contract is a SET of lock ids, so any
+    number of restores and transfers may pin one snapshot at once and it stays
+    pinned until the last lets go. Each holder writes and removes only its own
+    file, which is why releasing here cannot drop somebody else's pin -- and
+    why a parent pin is keyed apart from a direct one.
+
+    A pin that could not be written must never read as one that was. Continuing
+    with a warning would leave the operation running unprotected while a prune
+    on this target sees nothing holding the snapshot and is free to delete it
+    mid-read -- the exact failure the pin exists to prevent, with a log line in
+    place of the protection. So it stops, and says what to grant.
+    ``skip_remote_lock`` is the operator overriding that, for a target they can
+    read but not write. It relaxes only the abort: the pin is still consulted
+    everywhere it is read, so nothing starts reporting a target as unlocked
+    without having looked. A release failing is not the same risk: the
+    heartbeat stops, the pin goes stale, and it is swept.
+    """
+    from .. import __util__
+
+    name = f"{SNAPSHOT_LOCK_PREFIX}{snapshot_lock_name(snapshot)}"
+    holder_id = f"p:{lock_id}" if parent else str(lock_id)
+    try:
+        # ``manager`` may be a zero-argument factory (an endpoint's bound
+        # ``_lock_manager``), resolved here so a target whose lock directory
+        # cannot be set up is reported through the same refusal as a pin that
+        # cannot be written, instead of escaping as a bare exception.
+        if callable(manager):
+            manager = manager()
+        if lock_state:
+            if not manager.holds_shared(name, holder_id):
+                manager.acquire_shared_persistent(name, holder_id, str(lock_id))
+        else:
+            manager.release_shared(name, holder_id)
+    except Exception as exc:  # noqa: BLE001 - reported, never silently passed
+        if lock_state and not skip_remote_lock:
+            raise __util__.AbortError(
+                f"Could not lock {snapshot_lock_name(snapshot)} on this "
+                f"{where}: {exc}. Refusing to continue unprotected: another "
+                f"process pruning this {where} would not see the {noun} as in "
+                f"use and could delete it while it is being read. Make the "
+                f"{where} writable by the account running this, allow that "
+                f"account to elevate for it, or {opt_out} to "
+                f"proceed unprotected on purpose."
+            ) from exc
+        if lock_state:
+            logger.warning(
+                "Could not record the lock for %s on this %s (%s), and "
+                "--skip-remote-lock was given, so this continues WITHOUT "
+                "protection: a prune elsewhere will not see it as in use.",
+                snapshot_lock_name(snapshot),
+                where,
+                exc,
+            )
+        else:
+            logger.warning(
+                "Could not clear the lock for %s on this %s (%s). It will "
+                "expire on its own once its heartbeat stops.",
+                snapshot_lock_name(snapshot),
+                where,
+                exc,
+            )
+
+
 def blocked_by_remote_lock(manager: Any, snapshots: list) -> set[str]:
     """Names of ``snapshots`` a live remote lock says must not be deleted.
 

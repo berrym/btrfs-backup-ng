@@ -3113,12 +3113,15 @@ class TestExecuteUnlockDetailed:
 
     @patch("btrfs_backup_ng.cli.restore._prepare_backup_endpoint")
     def test_unlock_lock_read_error(self, mock_prepare, tmp_path, capsys):
-        """Test error when lock file cannot be read."""
+        """Test error when lock file cannot be read.
+
+        A dangling symlink where the lock file belongs: neither a regular
+        file nor the directory store an ssh:// endpoint keeps (a directory is
+        now READ as that store, so it is no longer a read error)."""
         from btrfs_backup_ng.cli.restore import _execute_unlock
 
-        # Create a directory instead of file to cause read error
         lock_path = tmp_path / ".btrfs-backup-ng.locks"
-        lock_path.mkdir()
+        lock_path.symlink_to(tmp_path / "nowhere")
 
         mock_prepare.return_value = _lock_endpoint(tmp_path)
 

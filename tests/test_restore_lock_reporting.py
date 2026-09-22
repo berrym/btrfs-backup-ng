@@ -22,7 +22,9 @@ Three separate ways this command claimed a target was unlocked without knowing:
 
 3. Endpoint._read_locks answered {} for any path that was not a regular file, so
    a directory or a symlink where the lock file belongs also reported zero locks.
-   Retention trusts that answer and prunes on it.
+   Retention trusts that answer and prunes on it. A symlink still raises; a
+   directory is now READ, because it is the store an ssh:// endpoint keeps for
+   the same location, and its pins are the answer.
 """
 
 from __future__ import annotations
@@ -270,10 +272,21 @@ class TestReadingLocksDistinguishesAbsentFromUnreadable:
     def test_absent_is_no_locks(self, tmp_path):
         assert _endpoint(LocalEndpoint, tmp_path)._read_locks() == {}
 
-    def test_a_directory_where_the_lock_file_belongs_raises(self, tmp_path):
+    def test_a_directory_where_the_lock_file_belongs_is_the_shared_store(
+        self, tmp_path
+    ):
+        """A directory under that name is the store an ssh:// endpoint keeps
+        for this location, and a local endpoint reads it as such: empty means
+        no pins (the ssh side would say the same), a holder file is a pin.
+        This used to raise, because the directory could not be read and
+        answering {} would have let a prune delete what a remote restore
+        held; now it is read."""
         (tmp_path / LOCK_NAME).mkdir()
-        with pytest.raises(__util__.AbortError):
-            _endpoint(LocalEndpoint, tmp_path)._read_locks()
+        assert _endpoint(LocalEndpoint, tmp_path)._read_locks() == {}
+        _local_manager(tmp_path).acquire_shared("snap-snap-1", "restore:abc")
+        assert _endpoint(LocalEndpoint, tmp_path)._read_locks() == {
+            "snap-1": {"locks": ["restore:abc"]}
+        }
 
     def test_a_symlink_raises_because_the_writer_refuses_to_follow_one(self, tmp_path):
         """_write_locks goes through atomic_write_bytes, which opens O_NOFOLLOW.

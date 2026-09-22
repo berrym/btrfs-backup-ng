@@ -16,12 +16,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   The case that exposed it: a transfer onward from an `ssh://` mirror. An
   `ssh://` target keeps its persistent locks in a directory of the same name a
   local endpoint uses for its lock file, so a local endpoint over that mirror
-  found a directory and refused with nothing said. It still refuses --
-  proceeding with an empty lock set would let a local prune delete what a
-  remote restore holds -- and now names the store it found and what to do.
-  Honouring that store from a local endpoint is scheduled with the restore
-  work.
-
+  found a directory and refused with nothing said. It no longer refuses: see
+  "One lock store per location" below.
+- **One lock store per location.** An `ssh://` target keeps its persistent
+  locks -- the pins a restore holds, the locks a receive holds -- in a
+  directory named `.btrfs-backup-ng.locks` under the target; a local endpoint
+  keeps a JSON file of the same name. A local endpoint over a location that
+  carries the directory (a transfer onward from an `ssh://` mirror, a prune of
+  it on the host itself, `restore --status` against it) now uses that store:
+  the same scripts the `ssh://` endpoint runs on the remote, run locally. A
+  pin a restore takes over `ssh://` is honoured by a local prune; a pin a
+  local run takes at such a location is visible to an `ssh://` prune; the
+  store is consulted again at delete time; an unanswerable store deletes
+  nothing. A pin in the directory store lives as long as the process that
+  took it, as an `ssh://` endpoint's pins always have (a pin in the lock file
+  survives across runs). A location without the directory keeps its lock
+  file exactly as before; nothing is renamed or migrated, and the store is
+  recognised only under the default lock file name. Renaming either store
+  was rejected because a local prune with an empty lock set would have
+  deleted what a remote restore holds. This covers btrfs endpoints; a local
+  `raw://` endpoint still keeps its locks in memory only.
 ### Added
 
 - **`--btrfs-debug` for every command, and `[global] btrfs_debug`.** Legacy

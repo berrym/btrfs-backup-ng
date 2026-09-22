@@ -2093,63 +2093,18 @@ class SSHRawEndpoint(RawEndpoint):
         query would be gratuitous.
         """
         super().set_lock(snapshot, lock_id, lock_state, parent=parent)
-        from ..sshutil.lock import snapshot_lock_name
+        from ..sshutil.lock import record_pin
 
-        name = f"snap-{snapshot_lock_name(snapshot)}"
-        manager = self._lock_manager()
-        try:
-            # SHARED, not exclusive: the in-memory contract is a SET of lock ids,
-            # so any number of restores and transfers may pin one stream at once
-            # and it stays pinned until the last lets go. Each holder writes and
-            # removes only its own file, which is why releasing here cannot drop
-            # somebody else's pin -- and why a parent pin is keyed apart from a
-            # direct one.
-            holder_id = f"p:{lock_id}" if parent else str(lock_id)
-            if lock_state:
-                if not manager.holds_shared(name, holder_id):
-                    manager.acquire_shared_persistent(name, holder_id, str(lock_id))
-            else:
-                manager.release_shared(name, holder_id)
-        except Exception as exc:  # noqa: BLE001 - see below
-            if lock_state and not self.config.get("skip_remote_lock"):
-                # A lock that could not be written must never read as one that
-                # was. Continuing with a warning leaves the operation running
-                # unprotected while a prune on this target sees nothing holding
-                # the stream and is free to delete it mid-read -- the exact
-                # failure this lock exists to prevent, with a log line in place
-                # of the protection. So it stops, and says what to grant.
-                #
-                # --skip-remote-lock is the operator overriding that, for a
-                # destination they can read but not write. It relaxes only THIS:
-                # the pin is still consulted everywhere it is read, so nothing
-                # starts reporting a target as unlocked without having looked.
-                raise __util__.AbortError(
-                    f"Could not lock {snapshot_lock_name(snapshot)} on this "
-                    f"target: {exc}. Refusing to continue unprotected: another "
-                    f"process pruning this target would not see the stream as in "
-                    f"use and could delete it while it is being read. Make the "
-                    f"target writable by the account running this, allow that "
-                    f"account to elevate for it, or pass --skip-remote-lock to "
-                    f"proceed unprotected on purpose."
-                ) from exc
-            # Either the operator opted out with --skip-remote-lock, or this is
-            # a release. A release failing is not the same risk: the heartbeat
-            # stops, the pin goes stale, and it is swept.
-            if lock_state:
-                logger.warning(
-                    "Could not record the lock for %s on this target (%s), and "
-                    "--skip-remote-lock was given, so this continues WITHOUT "
-                    "protection: a prune elsewhere will not see it as in use.",
-                    snapshot_lock_name(snapshot),
-                    exc,
-                )
-            else:
-                logger.warning(
-                    "Could not clear the lock for %s on this target (%s). It will "
-                    "expire on its own once its heartbeat stops.",
-                    snapshot_lock_name(snapshot),
-                    exc,
-                )
+        record_pin(
+            self._lock_manager,
+            snapshot,
+            lock_id,
+            lock_state,
+            parent=parent,
+            skip_remote_lock=bool(self.config.get("skip_remote_lock")),
+            where="target",
+            noun="stream",
+        )
 
     def _lock_target_path(self) -> str | None:
         """The remote directory locks live in, or None if this target has none.

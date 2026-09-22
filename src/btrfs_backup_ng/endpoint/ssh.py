@@ -1132,63 +1132,21 @@ class SSHEndpoint(Endpoint):
         else:
             target.discard(lock_id)
 
-        from ..sshutil.lock import snapshot_lock_name
+        from ..sshutil.lock import record_pin
 
-        name = f"snap-{snapshot_lock_name(snapshot)}"
-        try:
-            manager = self._lock_manager()
-            # SHARED, not exclusive: the in-memory contract is a SET of lock ids,
-            # so any number of restores and transfers may pin one snapshot at
-            # once and it stays pinned until the last lets go. Each holder writes
-            # and removes only its own file, which is why releasing here cannot
-            # drop somebody else's pin -- and why a parent pin is keyed apart from
-            # a direct one.
-            holder_id = f"p:{lock_id}" if parent else str(lock_id)
-            if lock_state:
-                if not manager.holds_shared(name, holder_id):
-                    manager.acquire_shared_persistent(name, holder_id, str(lock_id))
-            else:
-                manager.release_shared(name, holder_id)
-        except Exception as exc:  # noqa: BLE001 - reported, never silently passed
-            if lock_state and not self.config.get("skip_remote_lock"):
-                # A lock that could not be written must never read as one that
-                # was. Continuing with a warning leaves the operation running
-                # unprotected while a prune on this target sees nothing holding
-                # the snapshot and is free to delete it mid-read -- the exact
-                # failure this lock exists to prevent, with a log line in place
-                # of the protection. So it stops, and says what to grant.
-                #
-                # --skip-remote-lock is the operator overriding that, for a
-                # destination they can read but not write. It relaxes only THIS:
-                # the pin is still consulted everywhere it is read, so nothing
-                # starts reporting a target as unlocked without having looked.
-                raise __util__.AbortError(
-                    f"Could not lock {snapshot_lock_name(snapshot)} on this "
-                    f"destination: {exc}. Refusing to continue unprotected: "
-                    f"another process pruning this target would not see the "
-                    f"snapshot as in use and could delete it while it is being "
-                    f"read. Make the destination writable by the account running "
-                    f"this, allow that account to elevate for it, or pass "
-                    f"--skip-remote-lock to proceed unprotected on purpose."
-                ) from exc
-            # Either the operator opted out with --skip-remote-lock, or this is
-            # a release. A release failing is not the same risk: the heartbeat
-            # stops, the pin goes stale, and it is swept.
-            if lock_state:
-                logger.warning(
-                    "Could not record the lock for %s on this destination (%s), and "
-                    "--skip-remote-lock was given, so this continues WITHOUT "
-                    "protection: a prune elsewhere will not see it as in use.",
-                    snapshot_lock_name(snapshot),
-                    exc,
-                )
-            else:
-                logger.warning(
-                    "Could not clear the lock for %s on this destination (%s). It will "
-                    "expire on its own once its heartbeat stops.",
-                    snapshot_lock_name(snapshot),
-                    exc,
-                )
+        # The manager is built inside record_pin's guard: a target whose lock
+        # directory cannot be set up is reported through the same refusal as a
+        # pin that cannot be written.
+        record_pin(
+            self._lock_manager,
+            snapshot,
+            lock_id,
+            lock_state,
+            parent=parent,
+            skip_remote_lock=bool(self.config.get("skip_remote_lock")),
+            where="destination",
+            noun="snapshot",
+        )
 
     def send(
         self, snapshot: Any, parent: Any = None, clones: Optional[List[Any]] = None
