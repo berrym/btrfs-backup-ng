@@ -23,6 +23,7 @@ def _wrapper(name, uuid):
     s.get_name.return_value = name
     s.uuid = uuid
     s.received_uuid = ""
+    s.stream_uuid = uuid  # what a send of it carries (never received: its own uuid)
     return s
 
 
@@ -356,6 +357,7 @@ def test_sync_snapper_skips_present_via_real_planner(monkeypatch):
         w.get_name.return_value = f"cfg-{s.number}-x"
         w.uuid = f"U{s.number}"
         w.received_uuid = ""
+        w.stream_uuid = w.uuid
         w.time_obj = (2024, 1, s.number, 0, 0, 0, 0, 0, 0)
         return w
 

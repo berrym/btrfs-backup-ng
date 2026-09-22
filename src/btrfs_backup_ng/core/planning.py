@@ -2,8 +2,8 @@
 
 This is the single authority for the backup transfer plan. Presence on the destination and
 incremental-parent validity are decided STRICTLY by ``destination_endpoint.correspondent_of``
--- the btrfs ``received_uuid``/``uuid`` correspondence (or name, for raw targets, where the
-override makes name the native identity), NEVER the on-disk name, which can collide (a
+-- the btrfs ``received_uuid``/``stream_uuid`` correspondence (or name, for raw targets,
+where the override makes name the native identity), NEVER the on-disk name, which can collide (a
 re-created snapshot reuses the name but has a new uuid). There is deliberately no name-based
 fallback for btrfs: identity comes from uuids that enumeration sudo-escalates to read (see
 ``Endpoint._load_subvolume_ids_into``), so a missing uuid is an enrichment problem to fix at
@@ -19,8 +19,8 @@ logger = logging.getLogger(__name__)
 def snapshots_present_on(source_snapshots, destination_endpoint):
     """Return the set of source-snapshot *names* already present on the destination.
 
-    Presence is decided purely by correspondence -- ``received_uuid == uuid`` for btrfs,
-    name for raw -- via the polymorphic ``correspondent_of`` (which never raises; a listing
+    Presence is decided purely by correspondence -- ``received_uuid == stream_uuid`` for
+    btrfs, name for raw -- via the polymorphic ``correspondent_of`` (which never raises; a listing
     failure yields None -> absent). This is the shared presence authority used by both the
     transfer planner and the R3 lock reconcile, so the two can never disagree. A re-created
     snapshot (same name, new uuid) is correctly absent, never a name coincidence.

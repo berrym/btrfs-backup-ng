@@ -553,7 +553,7 @@ def test_the_dst_fold_pair_lands_as_base_and_suffix(tmp_path, monkeypatch):
 
 def test_btrfs_correspondence_never_matches_by_name_even_for_suffixes(tmp_path):
     """The boundary Phase D must not move: a suffixed name changes nothing
-    about correspondence, which stays received_uuid == uuid for btrfs. A
+    about correspondence, which stays received_uuid == stream_uuid for btrfs. A
     same-named destination entry without the uuid is NOT a correspondent; a
     differently-named entry with it IS."""
     from btrfs_backup_ng.endpoint.common import Endpoint

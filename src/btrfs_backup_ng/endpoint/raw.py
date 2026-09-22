@@ -51,6 +51,7 @@ class PendingMetadata(TypedDict):
     stream_path: Path
     part_path: Path
     parent_name: str | None
+    source_uuid: str
     compress: str | None
     encrypt: str | None
     gpg_recipient: str | None
@@ -598,6 +599,7 @@ class RawEndpoint(Endpoint):
             "stream_path": Path(),
             "part_path": Path(),
             "parent_name": None,
+            "source_uuid": "",
             "compress": None,
             "encrypt": None,
             "gpg_recipient": None,
@@ -802,7 +804,11 @@ class RawEndpoint(Endpoint):
         return missing
 
     def receive(
-        self, stdin: Any, snapshot_name: str = "", parent_name: str | None = None
+        self,
+        stdin: Any,
+        snapshot_name: str = "",
+        parent_name: str | None = None,
+        source_uuid: str = "",
     ) -> Any:
         """Write a btrfs send stream to a file.
 
@@ -813,6 +819,9 @@ class RawEndpoint(Endpoint):
             stdin: Input stream (from btrfs send)
             snapshot_name: Name for the snapshot file
             parent_name: Parent snapshot name (for metadata)
+            source_uuid: The source's ``stream_uuid`` -- the identity the stream
+                carries, recorded in the sidecar so the stored stream can be
+                matched by uuid when this store is later a source
 
         Returns:
             Popen object for the pipeline
@@ -857,6 +866,7 @@ class RawEndpoint(Endpoint):
             "stream_path": output_path,
             "part_path": part_path,
             "parent_name": parent_name,
+            "source_uuid": source_uuid,
             "compress": self.compress,
             "encrypt": self.encrypt,
             "gpg_recipient": self.gpg_recipient,
@@ -1265,6 +1275,8 @@ class RawEndpoint(Endpoint):
             name=snapshot.name,
             stream_path=enc_path,
             parent_name=snapshot.parent_name,
+            # The bytes are the same stream, so its identity carries over.
+            source_uuid=snapshot.source_uuid,
             created=datetime.now(timezone.utc),
             size=enc_path.stat().st_size,
             compress=snapshot.compress,  # unchanged: the bytes were already compressed
@@ -1384,6 +1396,7 @@ class RawEndpoint(Endpoint):
             name=pending["name"],
             stream_path=final_path,
             parent_name=pending.get("parent_name"),
+            source_uuid=pending.get("source_uuid") or "",
             created=datetime.now(timezone.utc),
             size=size,
             compress=pending.get("compress"),

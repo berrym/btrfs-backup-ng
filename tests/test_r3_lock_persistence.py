@@ -62,6 +62,7 @@ def _fake_snap(name, locks=None, parent_locks=None):
     s.get_name.return_value = name
     s.uuid = "uuid-" + name  # truthy -> presence is decided by correspondent_of only
     s.received_uuid = ""
+    s.stream_uuid = s.uuid  # never received: a send of it carries its own uuid
     return s
 
 
@@ -240,6 +241,7 @@ def test_reconcile_keeps_lock_for_recreated_snapshot_via_real_correspondence(
 
     recreated = _fake_snap("snap-1", locks=["dest-1"], parent_locks=["dest-1"])
     recreated.uuid = "NEW-UUID"  # re-created: same name, brand-new uuid
+    recreated.stream_uuid = recreated.uuid
     src = MagicMock()
     src.list_snapshots.return_value = [recreated]
 
@@ -279,9 +281,11 @@ def test_reconcile_and_planner_agree_end_to_end(monkeypatch):
     # snap-A truly present (uuid corresponds); snap-B re-created (new uuid vs the stale copy).
     present = _fake_snap("snap-A", locks=["dest-1"])
     present.uuid = "U-PRESENT"
+    present.stream_uuid = present.uuid
     present.time_obj = (2024, 1, 1, 0, 0, 0, 0, 0, 0)
     recreated = _fake_snap("snap-B", locks=["dest-1"])
     recreated.uuid = "NEW"
+    recreated.stream_uuid = recreated.uuid
     recreated.time_obj = (2024, 1, 2, 0, 0, 0, 0, 0, 0)
     src = MagicMock()
     src.list_snapshots.return_value = [present, recreated]

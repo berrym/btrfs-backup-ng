@@ -36,6 +36,7 @@ def _snapshot():
     snap = MagicMock()
     snap.get_path.return_value = "/src/.snapshots/snap"
     snap.get_name.return_value = "snap"
+    snap.stream_uuid = ""
     snap.endpoint.send.return_value = MagicMock(returncode=0)
     return snap
 

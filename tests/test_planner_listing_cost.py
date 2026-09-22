@@ -34,6 +34,8 @@ def _snap(name, uuid="", received=""):
     m.get_name.return_value = name
     m.uuid = uuid
     m.received_uuid = received
+    # The identity a send carries, as the real Snapshot derives it.
+    m.stream_uuid = received or uuid
     return m
 
 

@@ -154,6 +154,9 @@ class TransferManifest:
     bytes_transferred: int = 0
     resume_count: int = 0
     error_message: Optional[str] = None
+    # The source's stream identity (received_uuid or uuid), carried so the
+    # reassembly receive can record it exactly as a direct transfer would.
+    source_uuid: str = ""
 
     def __post_init__(self):
         if not self.created_at:
@@ -226,6 +229,7 @@ class TransferManifest:
             "bytes_transferred": self.bytes_transferred,
             "resume_count": self.resume_count,
             "error_message": self.error_message,
+            "source_uuid": self.source_uuid,
         }
 
     @classmethod
@@ -248,6 +252,7 @@ class TransferManifest:
             bytes_transferred=data.get("bytes_transferred", 0),
             resume_count=data.get("resume_count", 0),
             error_message=data.get("error_message"),
+            source_uuid=data.get("source_uuid") or "",
         )
         manifest.chunks = [ChunkInfo.from_dict(c) for c in data.get("chunks", [])]
         return manifest
@@ -525,6 +530,7 @@ class ChunkedTransferManager:
         parent_path: Optional[str] = None,
         parent_name: Optional[str] = None,
         total_size: Optional[int] = None,
+        source_uuid: str = "",
     ) -> TransferManifest:
         """Create a new chunked transfer.
 
@@ -535,6 +541,8 @@ class ChunkedTransferManager:
             parent_path: Optional parent snapshot path for incremental
             parent_name: Optional parent snapshot name
             total_size: Optional total size if known
+            source_uuid: The source's stream identity, for the sidecar a raw
+                destination writes on reassembly
 
         Returns:
             TransferManifest for the new transfer
@@ -553,6 +561,7 @@ class ChunkedTransferManager:
             total_size=total_size,
             chunk_size=self.config.chunk_size_bytes,
             checksum_algorithm=self.config.checksum_algorithm,
+            source_uuid=source_uuid,
         )
 
         manifest.save(self._get_manifest_path(transfer_id))

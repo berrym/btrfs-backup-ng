@@ -505,14 +505,20 @@ class Endpoint:
         return proc
 
     def receive(
-        self, stdin: Any, snapshot_name: str = "", parent_name: str | None = None
+        self,
+        stdin: Any,
+        snapshot_name: str = "",
+        parent_name: str | None = None,
+        source_uuid: str = "",
     ) -> Any:
         """Call 'btrfs receive', setting the given pipe as its stdin.
 
-        ``snapshot_name`` and ``parent_name`` are accepted for a uniform endpoint
-        interface -- RawEndpoint overrides receive() and uses them to name the
-        output file and record metadata. For a real btrfs receive the subvolume
-        name comes from the stream itself, so they are ignored here.
+        ``snapshot_name``, ``parent_name`` and ``source_uuid`` are accepted for a
+        uniform endpoint interface -- RawEndpoint overrides receive() and uses
+        them to name the output file and record metadata (``source_uuid`` is the
+        source's ``stream_uuid``, the identity the stream carries). For a real
+        btrfs receive the subvolume name and identity come from the stream
+        itself, so they are ignored here.
         """
         # Make sure we use the raw path without local resolution
         path = self.config["path"]
@@ -821,25 +827,32 @@ class Endpoint:
         """Return THIS endpoint's snapshot that is the btrfs-receive copy of ``snapshot``.
 
         Two btrfs subvolumes correspond when one was produced by ``btrfs receive`` of a
-        stream from the other: the received copy's ``received_uuid`` equals the source
-        subvolume's ``uuid``. That is the correspondence btrfs incremental send/receive
-        actually resolves on the destination -- NOT the on-disk name, which can collide
-        (a re-created snapshot reuses the name but gets a new uuid). This is the single
-        authority for "does this endpoint hold the correspondent of that snapshot"; it is
-        used both to detect whether a source snapshot is already on a destination and to
-        find a valid incremental parent.
+        stream from the other: the received copy's ``received_uuid`` equals the uuid the
+        stream carried, which is the source's ``stream_uuid`` -- its own ``uuid`` for a
+        subvolume that was never received, its ``received_uuid`` for one that was.
+        ``btrfs send`` emits received_uuid when set, so a copy of a copy of O carries
+        O's uuid, not the uuid of the copy it was sent from; comparing against ``uuid``
+        matched only the first hop, and a second hop (a transfer onward from a mirror, a
+        restore from a backup) found nothing and degraded to full sends. That is the
+        correspondence btrfs incremental send/receive actually resolves on the
+        destination -- NOT the on-disk name, which can collide (a re-created snapshot
+        reuses the name but gets a new uuid). This is the single authority for "does
+        this endpoint hold the correspondent of that snapshot"; it is used both to
+        detect whether a source snapshot is already on a destination and to find a
+        valid incremental parent.
 
         Returns the corresponding snapshot object, or ``None`` when identity is unknown
-        (empty ``uuid`` -- a best-effort enrichment miss), no correspondent exists, or the
-        listing fails. A ``None`` return is ALWAYS safe for callers: it degrades to a full
+        (empty ``stream_uuid`` -- a best-effort enrichment miss, or an object that
+        carries no stream identity), no correspondent exists, or the listing fails.
+        A ``None`` return is ALWAYS safe for callers: it degrades to a full
         (non-incremental) transfer, never an unapplyable ``send -p`` -- so this method
         never raises.
 
         This base implementation is the btrfs (uuid) semantics used by Local and SSH
         endpoints; raw endpoints override it with name semantics.
         """
-        src_uuid = getattr(snapshot, "uuid", "")
-        if not src_uuid:
+        stream_uuid = getattr(snapshot, "stream_uuid", "")
+        if not stream_uuid:
             return None
         try:
             candidates = self.list_snapshots()
@@ -847,7 +860,7 @@ class Endpoint:
             logger.debug("correspondent_of: could not list snapshots (%s)", e)
             return None
         for candidate in candidates:
-            if getattr(candidate, "received_uuid", "") == src_uuid:
+            if getattr(candidate, "received_uuid", "") == stream_uuid:
                 return candidate
         return None
 
@@ -855,8 +868,8 @@ class Endpoint:
         """``{source_name: correspondent}`` for every snapshot, from ONE listing.
 
         The batch form of :meth:`correspondent_of`, with identical semantics --
-        it is the same ``received_uuid == uuid`` rule, applied to a listing taken
-        once instead of once per snapshot.
+        it is the same ``received_uuid == stream_uuid`` rule, applied to a listing
+        taken once instead of once per snapshot.
 
         This exists because the per-snapshot API forced the caller into O(n)
         listings. The transfer planner asks "is this already on the destination?"
@@ -885,10 +898,10 @@ class Endpoint:
 
         found: Dict[str, Any] = {}
         for snapshot in snapshots:
-            src_uuid = getattr(snapshot, "uuid", "")
-            if not src_uuid:
+            stream_uuid = getattr(snapshot, "stream_uuid", "")
+            if not stream_uuid:
                 continue
-            match = by_received.get(src_uuid)
+            match = by_received.get(stream_uuid)
             if match is not None:
                 found[snapshot.get_name()] = match
         return found
