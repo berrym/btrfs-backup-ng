@@ -88,6 +88,131 @@ def _delete_subvolume(path: Path) -> None:
 
 @pytest.mark.tier2
 @requires_btrfs
+class TestTheVerdictOnRealBtrfs:
+    def test_a_real_receive_through_the_executor_is_ok(self, btrfs_source_and_dest):
+        source, dest = btrfs_source_and_dest
+        original = _original(source, FIRST, "payload")
+        src_ep = _endpoint(source)
+        snapshot = _listed(src_ep, FIRST)
+        assert snapshot.uuid == _subvolume_show(original)["UUID"]
+        dest_ep = _endpoint(dest)
+
+        result = ops._execute_transfers(
+            src_ep, dest_ep, [(snapshot, None)], {"check_space": False}
+        )
+
+        assert result.transferred_count == 1 and result.failed_count == 0
+        verdict = result.verdicts[FIRST]
+        assert verdict.status == "ok", verdict.message
+        copy = _subvolume_show(dest / FIRST)
+        assert copy["Received UUID"] == snapshot.uuid
+        assert (dest / FIRST / "file.txt").read_text() == "payload"
+        assert snapshot.locks == set(), "the pin was released on success"
+
+    def test_a_subvolume_without_received_uuid_is_invalid_and_cleaned(
+        self, btrfs_source_and_dest, monkeypatch
+    ):
+        """The receive exits 0 (simulated) and what it left is a subvolume
+        under the right name with no received_uuid. The real ``btrfs
+        subvolume show`` says so; the transfer fails; the real ``btrfs
+        subvolume delete`` removes it because this run created it."""
+        source, dest = btrfs_source_and_dest
+        _original(source, FIRST, "payload")
+        src_ep = _endpoint(source)
+        snapshot = _listed(src_ep, FIRST)
+        dest_ep = _endpoint(dest)
+
+        def receive_that_leaves_a_bare_subvolume(snap, destination, **kw):
+            subprocess.run(
+                ["btrfs", "subvolume", "create", str(dest / snap.get_name())],
+                check=True,
+                capture_output=True,
+            )
+
+        monkeypatch.setattr(ops, "send_snapshot", receive_that_leaves_a_bare_subvolume)
+        result = ops._execute_transfers(src_ep, dest_ep, [(snapshot, None)], {})
+
+        assert result.failed_count == 1 and result.transferred_count == 0
+        assert result.verdicts[FIRST].status == "invalid"
+        (_, err) = result.failed[0]
+        assert "no received_uuid" in str(err)
+        assert not (dest / FIRST).exists(), "the invalid artifact was not removed"
+        assert snapshot.locks, "a failed backup keeps its pin"
+
+    def test_an_invalid_artifact_that_predates_the_run_is_left_alone(
+        self, btrfs_source_and_dest, monkeypatch
+    ):
+        source, dest = btrfs_source_and_dest
+        _original(source, FIRST, "payload")
+        src_ep = _endpoint(source)
+        snapshot = _listed(src_ep, FIRST)
+        dest_ep = _endpoint(dest)
+        # Somebody else's subvolume, under this name, before the run starts.
+        subprocess.run(
+            ["btrfs", "subvolume", "create", str(dest / FIRST)],
+            check=True,
+            capture_output=True,
+        )
+        (dest / FIRST / "theirs.txt").write_text("not ours")
+        monkeypatch.setattr(ops, "send_snapshot", lambda *a, **k: None)
+
+        result = ops._execute_transfers(src_ep, dest_ep, [(snapshot, None)], {})
+
+        assert result.failed_count == 1
+        assert result.verdicts[FIRST].status == "invalid"
+        assert (dest / FIRST / "theirs.txt").read_text() == "not ours"
+        _delete_subvolume(dest / FIRST)
+
+    def test_an_unreadable_identity_is_unverifiable_and_keeps_the_data(
+        self, btrfs_source_and_dest, monkeypatch
+    ):
+        """A real receive, then the identity read fails (no privilege, an
+        older btrfs-progs). The copy is complete and stays; the transfer
+        counts; the verdict says nothing was confirmed."""
+        source, dest = btrfs_source_and_dest
+        _original(source, FIRST, "payload")
+        src_ep = _endpoint(source)
+        snapshot = _listed(src_ep, FIRST)
+        dest_ep = _endpoint(dest)
+        monkeypatch.setattr(dest_ep, "subvolume_identity", lambda path: None)
+
+        result = ops._execute_transfers(
+            src_ep, dest_ep, [(snapshot, None)], {"check_space": False}
+        )
+
+        assert result.transferred_count == 1 and result.failed_count == 0
+        assert result.verdicts[FIRST].status == "unverifiable"
+        assert _is_subvolume(dest / FIRST)
+        assert (dest / FIRST / "file.txt").read_text() == "payload"
+        assert _subvolume_show(dest / FIRST)["Received UUID"] == snapshot.uuid
+
+    def test_a_second_hop_copy_is_ok_against_the_streams_identity(
+        self, btrfs_three_volumes
+    ):
+        """O -> S through btrfs, S -> R through the executor: R.received_uuid
+        is O's uuid, which is S.stream_uuid, so the verdict is ``ok``. The
+        one-hop comparison (against S.uuid) would have called R invalid and
+        deleted a correct copy."""
+        first, second, third = btrfs_three_volumes
+        original = _original(first, FIRST, "one")
+        subprocess.run(
+            ["sh", "-c", f"btrfs send {original} 2>/dev/null | btrfs receive {second}"],
+            check=True,
+            capture_output=True,
+        )
+        s = _listed(_endpoint(second), FIRST)
+        assert s.stream_uuid == _subvolume_show(original)["UUID"] != s.uuid
+
+        result = ops._execute_transfers(
+            _endpoint(second), _endpoint(third), [(s, None)], {"check_space": False}
+        )
+        assert result.transferred_count == 1
+        assert result.verdicts[FIRST].status == "ok", result.verdicts[FIRST].message
+        assert _is_subvolume(third / FIRST)
+
+
+@pytest.mark.tier2
+@requires_btrfs
 class TestTheSharedLockStoreOnRealBtrfs:
     def test_a_lock_directory_pins_against_a_real_prune(self, btrfs_source_and_dest):
         """Two received copies at a location that carries the directory store;

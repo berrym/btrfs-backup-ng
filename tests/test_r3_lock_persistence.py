@@ -106,9 +106,18 @@ class _FakeDest:
     # takes.
     correspondents_of = Endpoint.correspondents_of
 
+    #: The artifact verdict asks the destination for the received copy's
+    #: identity; a double has none to give, so the verdict is ``unverifiable``
+    #: (kept, counted as transferred), which is the outcome these tests pin.
+    _is_remote = True
+    config = {"path": "/fake-dest"}
+
     def __init__(self, dest_snaps=(), ep_id="fake-dest"):
         self._snaps = list(dest_snaps)
         self._id = ep_id
+
+    def subvolume_identity(self, path):
+        return None
 
     def list_snapshots(self, flush_cache=False):
         return list(self._snaps)

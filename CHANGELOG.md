@@ -36,6 +36,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   was rejected because a local prune with an empty lock set would have
   deleted what a remote restore holds. This covers btrfs endpoints; a local
   `raw://` endpoint still keeps its locks in memory only.
+- **The transfer size estimate is asked of the endpoint that holds the
+  snapshot.** It ran the local measurement whatever the source, so a transfer
+  from an `ssh://` source measured nothing and warned "Could not estimate
+  transfer size for space check" on every run. The `ssh://` endpoint now
+  measures on the remote host with `btrfs filesystem du -s --raw`, whose
+  Total is what a full stream carries; the local endpoint keeps the same
+  measurement it always made. An incremental send is deliberately not sized
+  -- the delta is not knowable in advance -- and says so instead of being
+  reported as a failed estimate. The size parser matched the unit `B` before
+  `KiB`/`MiB`/`GiB` and so returned nothing for any binary unit; it parses
+  them now.
+
 ### Added
 
 - **`--btrfs-debug` for every command, and `[global] btrfs_debug`.** Legacy
@@ -52,6 +64,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ssh; it had ignored the option entirely. Lines are logged on their own
   thread so a slow console cannot slow the transfer, and every transfer waits
   for its queued lines before it returns, so none are lost at exit.
+
+- **Every transfer records a verdict on what the receive left.** After
+  `btrfs receive` exits 0 the engine had nothing more to say: exit 0 was the
+  whole verdict, and a subvolume under the right name that was not the
+  received copy counted as a backup. The executor now records one of three
+  verdicts, in the shape `verify` already uses: `ok`, when the copy's
+  received_uuid is the identity the stream carried (so a copy of a copy is
+  judged against the original, not the middle hop); `invalid`, when the
+  artifact provably is not that copy -- not a subvolume, no received_uuid, or
+  a different one -- in which case the transfer fails and the artifact is
+  removed under the same authorship rule as a partial, on local and on remote
+  btrfs destinations; and `unverifiable`, when the identity could not be read,
+  in which case the data is kept, the transfer counts, and the log says what
+  was not confirmed. A verdict that cannot be computed at all is unverifiable
+  too: the data has landed, and a post-check must never be able to turn that
+  into a failure. Raw destinations are judged by the endpoint's own structural
+  check on the committed stream, which carries the sealed sha256; nothing is
+  re-hashed. The identity is read through one probe that the listing uses as
+  well, so the verdict and the planner cannot disagree about what a subvolume
+  is; that probe consults the subvolume's inode and not the mount-table walk,
+  because a check that can be wrong about the environment must not be able to
+  condemn a copy.
 
 ### Fixed
 

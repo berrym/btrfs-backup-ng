@@ -735,37 +735,68 @@ class Endpoint:
         unaffected. The planner consumes these identities (Phase 2 correspondence)."""
         if not snapshots:
             return
-        sudo_prefix = ["sudo", "-n"] if os.geteuid() != 0 else []
         enriched = 0
         for snap in snapshots:
-            try:
-                result = subprocess.run(
-                    [*sudo_prefix, "btrfs", "subvolume", "show", str(snap.get_path())],
-                    capture_output=True,
-                    text=True,
-                    timeout=30,
-                    check=False,
-                )
-                if result.returncode != 0:
-                    continue
-                ids = __util__.parse_subvolume_show(result.stdout)
-                snap.uuid = ids["uuid"]
-                snap.received_uuid = ids["received_uuid"]
-                if snap.uuid:
-                    enriched += 1
-            except subprocess.TimeoutExpired:
-                logger.debug("subvolume show timed out for %s", snap.get_name())
-            except Exception as e:  # noqa: BLE001 - best-effort, never fatal
-                logger.debug(
-                    "Could not read subvolume uuid for %s (ignoring): %s",
-                    snap.get_name(),
-                    e,
-                )
+            ids = self.subvolume_identity(str(snap.get_path()))
+            if ids is None:
+                continue
+            snap.uuid = ids["uuid"]
+            snap.received_uuid = ids["received_uuid"]
+            if snap.uuid:
+                enriched += 1
         logger.debug(
             "btrfs uuid enrichment: %d/%d snapshot(s) have a uuid",
             enriched,
             len(snapshots),
         )
+
+    def subvolume_identity(self, path: str) -> Optional[Dict[str, str]]:
+        """``{'uuid', 'received_uuid'}`` of the subvolume at exactly ``path``, or
+        None when they could not be read.
+
+        The one identity probe: the listing enrichment above and the post-receive
+        artifact verdict (``core.operations.artifact_verdict``) both read through
+        it, so the two cannot disagree about what a subvolume's identity is or
+        how privilege is applied to read it. ``btrfs subvolume show`` needs
+        CAP_SYS_ADMIN for the uuid fields, so it is escalated the way the rest
+        of this endpoint escalates btrfs: ``sudo -n`` when not root, and only
+        ``-n`` -- a probe must fail fast rather than prompt.
+
+        None is the whole answer for every failure (no passwordless sudo, not a
+        btrfs subvolume, older btrfs-progs, a timeout): the caller decides what
+        "could not read" means for it. The enrichment leaves the uuids empty;
+        the verdict reports ``unverifiable``, never ``invalid``, because a probe
+        that could not run has proven nothing about the artifact.
+
+        This base implementation runs locally; the ssh endpoint overrides it to
+        run on the remote host, under that endpoint's own elevation.
+        """
+        sudo_prefix = ["sudo", "-n"] if os.geteuid() != 0 else []
+        try:
+            result = subprocess.run(
+                [*sudo_prefix, "btrfs", "subvolume", "show", str(path)],
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+        except subprocess.TimeoutExpired:
+            logger.debug("subvolume show timed out for %s", path)
+            return None
+        except Exception as e:  # noqa: BLE001 - best-effort, never fatal
+            logger.debug(
+                "Could not read subvolume identity of %s (ignoring): %s", path, e
+            )
+            return None
+        if result.returncode != 0:
+            logger.debug(
+                "subvolume show failed for %s (rc %d): %s",
+                path,
+                result.returncode,
+                (result.stderr or "").strip(),
+            )
+            return None
+        return __util__.parse_subvolume_show(result.stdout)
 
     def _load_locks_into(self, snapshots: List[Any]) -> None:
         """Populate each snapshot's in-memory lock sets from the persisted lock file.
@@ -949,6 +980,27 @@ class Endpoint:
             "unverifiable",
             "a subvolume, but its received_uuid could not be confirmed "
             "(not a received backup, or btrfs subvolume show needs privilege)",
+        )
+
+    def estimate_transfer_size(
+        self, snapshot: Any, parent: Any = None
+    ) -> Optional[int]:
+        """Bytes a ``btrfs send`` of ``snapshot`` (against ``parent``) is expected to
+        carry, or None when unknown or incremental.
+
+        Asked of the endpoint that HOLDS the snapshot, because that is the only
+        place ``btrfs subvolume show`` can measure it. The transfer engine used
+        to run the estimate on the local machine whatever the source: a remote
+        source's path measured nothing here, and every transfer from an ssh://
+        source warned "Could not estimate transfer size for space check". This
+        base implementation is the local measurement (``core.progress``); the
+        ssh endpoint overrides it to measure on the remote host.
+        """
+        from btrfs_backup_ng.core import progress as progress_utils
+
+        parent_path = str(parent.get_path()) if parent is not None else None
+        return progress_utils.estimate_snapshot_size(
+            str(snapshot.get_path()), parent_path
         )
 
     def test_send_stream(self, snapshot: Any, parent: Any = None) -> None:

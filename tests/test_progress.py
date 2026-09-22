@@ -40,6 +40,14 @@ class TestParseSize:
         assert _parse_size("1024B") == 1024
         assert _parse_size("100B") == 100
 
+    def test_parse_size_with_binary_units(self):
+        """The units ``btrfs subvolume show`` actually prints. Every unit ends
+        in B, and matching B first returned None for all of them."""
+        assert _parse_size("16.00KiB") == 16384
+        assert _parse_size("12.00MiB") == 12 * 1024**2
+        assert _parse_size("1.5GiB") == 1610612736
+        assert _parse_size("2TiB") == 2 * 1024**4
+
     def test_parse_plain_number(self):
         """Test parsing plain bytes number."""
         assert _parse_size("12345") == 12345

@@ -7,6 +7,7 @@ import contextlib
 import logging
 import os
 import shlex
+import stat
 import subprocess
 import time
 from dataclasses import dataclass, field
@@ -15,6 +16,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from .. import __util__
+from ..endpoint.raw_metadata import StructureVerdict
 from ..transaction import log_transaction
 from .transfer import DEFAULT_STALL_TIMEOUT, DEFAULT_TRANSFER_TIMEOUT
 from . import progress as progress_utils
@@ -46,6 +48,11 @@ class TransferResult:
 
     transferred: list = field(default_factory=list)
     failed: list = field(default_factory=list)
+    #: ``{snapshot_name: StructureVerdict}`` -- the artifact verdict recorded for
+    #: every snapshot whose receive exited 0 (``artifact_verdict``). A name in
+    #: ``transferred`` has a verdict of ``ok`` or ``unverifiable``; an
+    #: ``invalid`` verdict puts the snapshot in ``failed``.
+    verdicts: dict = field(default_factory=dict)
 
     @property
     def ok(self) -> bool:
@@ -287,9 +294,7 @@ def send_snapshot(
             logger.debug(
                 "Getting size estimate for: %s (parent: %s)", snapshot_path, parent_path
             )
-            estimated_size = progress_utils.estimate_snapshot_size(
-                snapshot_path, parent_path
-            )
+            estimated_size = _estimate_transfer_size(snapshot, parent)
             if estimated_size:
                 logger.debug(
                     "Estimated transfer size: %d bytes (%.2f MB)",
@@ -893,6 +898,25 @@ def _transfer_chunks_ssh(
             raise
 
 
+def _estimate_transfer_size(snapshot, parent) -> Optional[int]:
+    """The transfer's size estimate, asked of the SOURCE endpoint.
+
+    ``Endpoint.estimate_transfer_size`` measures where the snapshot lives: a
+    local endpoint runs ``btrfs subvolume show`` here, the ssh endpoint runs
+    it on the remote host. Running the local measurement whatever the source
+    was how every transfer from an ssh:// source warned "Could not estimate
+    transfer size for space check" -- the local command was aimed at a remote
+    path. A snapshot object without an endpoint that can measure (a wrapper
+    carrying only a path) falls back to the local measurement it always had.
+    """
+    endpoint = getattr(snapshot, "endpoint", None)
+    measure = getattr(endpoint, "estimate_transfer_size", None)
+    if callable(measure):
+        return measure(snapshot, parent)
+    parent_path = str(parent.get_path()) if parent is not None else None
+    return progress_utils.estimate_snapshot_size(str(snapshot.get_path()), parent_path)
+
+
 def _verify_destination_space(snapshot, destination_endpoint, parent, options) -> None:
     """Verify destination has sufficient space for the transfer.
 
@@ -911,14 +935,20 @@ def _verify_destination_space(snapshot, destination_endpoint, parent, options) -
         # Get space info from destination
         space_info = destination_endpoint.get_space_info()
 
-        # Estimate transfer size
-        snapshot_path = str(snapshot.get_path())
-        parent_path = str(parent.get_path()) if parent else None
-        estimated_size = progress_utils.estimate_snapshot_size(
-            snapshot_path, parent_path
-        )
+        # Estimate transfer size, asked of the endpoint that holds the snapshot
+        estimated_size = _estimate_transfer_size(snapshot, parent)
 
         if estimated_size is None:
+            if parent is not None:
+                # An incremental send is deliberately not sized (the delta is
+                # expensive to measure and usually small), so this is not a
+                # failed estimate and was wrongly warned about on every
+                # incremental transfer.
+                logger.info(
+                    "Incremental transfer: the delta is not estimated, so the "
+                    "space check is skipped"
+                )
+                return
             # Can't estimate size, log warning and proceed
             logger.warning(
                 "Could not estimate transfer size for space check, proceeding anyway"
@@ -1652,11 +1682,172 @@ def _cleanup_partial_raw_stream(destination_endpoint) -> None:
         logger.debug("Partial raw-stream cleanup failed for %s: %s", part_path, e)
 
 
+def artifact_verdict(destination_endpoint, snapshot) -> StructureVerdict:
+    """The verdict on what a receive that exited 0 left at the destination.
+
+    Tri-state, in the shape ``verify`` already uses (``StructureVerdict``), and
+    R1-safe -- a check that could not run never fails a transfer and never
+    deletes anything:
+
+    - ``ok``            a btrfs subvolume whose ``received_uuid`` equals the
+                        identity the stream carried (``snapshot.stream_uuid``):
+                        this IS the received copy of ``snapshot``.
+    - ``invalid``       something that is provably not that copy, after a
+                        receive that exited 0: not a subvolume at all, a
+                        subvolume with no ``received_uuid``, or one carrying a
+                        different identity. The caller fails the transfer and
+                        removes the artifact under the authorship rule.
+    - ``unverifiable``  the identity could not be READ -- no privilege for
+                        ``btrfs subvolume show``, an unreachable host, a source
+                        whose own identity was never enriched. The artifact is
+                        kept and the transfer counts as successful; the verdict
+                        says what was not confirmed.
+
+    A raw destination's integrity record is the sha256 its commit seals into
+    the ``.meta`` sidecar; nothing is re-hashed here. The committed stream is
+    looked up in the listing the commit invalidated and judged by the
+    endpoint's own structural check (an authoritative sidecar is ``ok``, a
+    stream without one is ``unverifiable``), so the answer has the same shape.
+
+    Before this, a local ``btrfs receive`` had no post-check at all: exit 0 was
+    the whole verdict. A receive that exits 0 and leaves a subvolume that is
+    not the received copy is the signature defect (a failed operation read as a
+    clean result) one layer deeper than the exit status.
+    """
+    from ..endpoint.raw import RawEndpoint
+
+    name = snapshot.get_name()
+    if isinstance(destination_endpoint, RawEndpoint):
+        try:
+            stored = next(
+                s for s in destination_endpoint.list_snapshots() if s.get_name() == name
+            )
+        except StopIteration:
+            return StructureVerdict(
+                "unverifiable",
+                f"the committed stream for {name} was not in the listing taken "
+                f"after the commit; nothing was verified",
+            )
+        except Exception as e:  # noqa: BLE001 - could not ask, never a failure
+            return StructureVerdict(
+                "unverifiable", f"the committed stream could not be listed: {e}"
+            )
+        return destination_endpoint.verify_structure(stored)
+
+    path = _destination_subvolume(destination_endpoint, snapshot.get_path())
+    if not getattr(destination_endpoint, "_is_remote", False):
+        # Privilege-free, so it is asked first: a plain directory or a missing
+        # path after a receive that exited 0 is provably not the copy. Only the
+        # inode is consulted -- a subvolume root is always inode 256 -- and not
+        # the mount-table walk ``is_subvolume`` adds, which _prepare treats as
+        # advisory (``fs_checks = "auto"`` continues past it). A probe that
+        # can be wrong about the environment must not condemn a copy.
+        try:
+            shape = _received_subvolume_shape(path)
+        except FileNotFoundError:
+            return StructureVerdict(
+                "invalid", f"nothing is at {path} after a receive that exited 0"
+            )
+        except OSError as e:
+            return StructureVerdict("unverifiable", f"could not stat {path}: {e}")
+        if shape is not None:
+            return StructureVerdict(
+                "invalid", f"{path} is {shape} after a receive that exited 0"
+            )
+    ids = destination_endpoint.subvolume_identity(path)
+    if ids is None:
+        return StructureVerdict(
+            "unverifiable",
+            f"the identity of {path} could not be read (btrfs subvolume show "
+            f"needs privilege, or the host could not be asked)",
+        )
+    received = ids.get("received_uuid", "")
+    if not received:
+        return StructureVerdict(
+            "invalid",
+            f"{path} is a subvolume with no received_uuid: not a received copy "
+            f"(an interrupted receive, or something else, under this name)",
+        )
+    expected = getattr(snapshot, "stream_uuid", "")
+    if not expected:
+        return StructureVerdict(
+            "unverifiable",
+            f"{path} carries received_uuid {received}, but the identity of the "
+            f"source snapshot is unknown (its uuid could not be read), so the "
+            f"correspondence could not be confirmed",
+        )
+    if received != expected:
+        return StructureVerdict(
+            "invalid",
+            f"{path} carries received_uuid {received}, not the identity the "
+            f"stream carried ({expected}): it is not the received copy of {name}",
+        )
+    return StructureVerdict(
+        "ok", f"received_uuid {received} matches the identity the stream carried"
+    )
+
+
+def _received_subvolume_shape(path: str) -> Optional[str]:
+    """None when ``path`` has the shape of a subvolume root (a directory with
+    inode 256), else what it is instead. Raises OSError when it cannot be
+    stat'd -- the caller decides what that means."""
+    st = os.stat(path)
+    if not stat.S_ISDIR(st.st_mode):
+        return "not a directory"
+    if st.st_ino != 256:
+        return f"a plain directory (inode {st.st_ino}), not a btrfs subvolume"
+    return None
+
+
+def _report_artifact_verdict(snapshot, verdict: StructureVerdict) -> None:
+    """Say what the receive left, at the level its status earns."""
+    name = snapshot.get_name()
+    if verdict.status == "ok":
+        logger.info("Received copy of %s verified: %s", name, verdict.message)
+    elif verdict.status == "unverifiable":
+        logger.warning(
+            "Received copy of %s is unverifiable: %s. The transfer counts as "
+            "successful and the data is kept; the copy was not confirmed.",
+            name,
+            verdict.message,
+        )
+    else:
+        logger.error("Received copy of %s is invalid: %s", name, verdict.message)
+
+
+def _cleanup_invalid_remote_subvolume(
+    destination_endpoint, name: str, *, created_by_this_run: bool
+) -> None:
+    """Remove an ``invalid`` artifact from a REMOTE btrfs destination.
+
+    The ssh endpoint cleans its own partials when its transfer fails, and that
+    path is not reached here: the transfer succeeded and the verdict failed it
+    afterwards. Same exact-path cleaner, same authorship rule. A no-op for
+    endpoints without one.
+    """
+    if not getattr(destination_endpoint, "_is_remote", False):
+        return
+    cleaner = getattr(destination_endpoint, "_cleanup_partial_subvolume", None)
+    if cleaner is None:
+        return
+    try:
+        cleaner(
+            str(destination_endpoint.config["path"]),
+            name,
+            created_by_this_run=created_by_this_run,
+        )
+    except Exception as e:  # noqa: BLE001 - never mask the verdict
+        logger.debug("Invalid remote-artifact cleanup failed: %s", e)
+
+
 def _execute_transfers(
     source_endpoint,
     destination_endpoint,
     plan,
     options,
+    *,
+    lock_id: Optional[str] = None,
+    release_on_failure: bool = False,
     **kwargs,
 ) -> TransferResult:
     """Execute a pre-computed transfer plan -- a dumb executor.
@@ -1664,11 +1855,28 @@ def _execute_transfers(
     ``plan`` is a list of ``(snapshot, parent_or_None)`` pairs from
     ``planning.plan_transfer_sequence``; ALL ordering and parent decisions were made there.
     This function only moves bytes and manages the lock lifecycle: it locks the snapshot
-    (and its parent), sends, and on a verified success releases the locks and registers the
-    snapshot at the destination; a failed snapshot is kept locked and recorded in
-    ``result.failed`` (never silently dropped), and any partial artifact is cleaned.
+    (and its parent), sends, records the artifact verdict on what arrived, and on a
+    verified success releases the locks and registers the snapshot at the destination;
+    a failed snapshot is recorded in ``result.failed`` (never silently dropped), and any
+    partial or invalid artifact is cleaned under the authorship rule.
+
+    ``lock_id`` is the identity the pins are taken under on the source; the
+    default is the destination's id, which is what every backup run has always
+    written. A restore through this executor will pass its own
+    (``restore:<session>``) so its pins keep reading back through ``--status``
+    and ``--unlock`` unchanged.
+
+    ``release_on_failure`` decides what a FAILED transfer leaves behind. A
+    backup keeps its pin (the default, today's behaviour): retention must not
+    prune a snapshot a future run still needs to send. A restore must not
+    leave a persistent pin on a remote target after a failure, or that target's
+    prune is blocked until someone runs ``--unlock``; it will pass True. How
+    long a kept pin lives is the source endpoint's store's business: a lock
+    file keeps it across runs; the directory store (ssh://, and a local
+    location that carries one) keeps it for the life of the process that took
+    it, released at exit and stale after its heartbeat stops.
     """
-    destination_id = destination_endpoint.get_id()
+    destination_id = lock_id if lock_id is not None else destination_endpoint.get_id()
     result = TransferResult()
 
     # Names transferred in THIS run, to guard within-run incremental chaining: if a snapshot
@@ -1706,6 +1914,7 @@ def _execute_transfers(
         if parent:
             source_endpoint.set_lock(parent, destination_id, True, parent=True)
 
+        invalid_artifact = False
         try:
             logger.info("Starting transfer of %s", best_snapshot)
             send_snapshot(
@@ -1714,6 +1923,24 @@ def _execute_transfers(
                 parent=parent,
                 options=options or {},
             )
+            # The receive exited 0 and the commit held. What did it leave?
+            # Recorded for every transfer; only ``invalid`` fails one. A check
+            # that cannot even run is ``unverifiable``: the data has landed,
+            # and a post-check must not be able to turn that into a crash.
+            try:
+                verdict = artifact_verdict(destination_endpoint, best_snapshot)
+            except Exception as check_err:  # noqa: BLE001 - R1: never a failure
+                verdict = StructureVerdict(
+                    "unverifiable", f"the verdict could not be computed: {check_err}"
+                )
+            result.verdicts[best_snapshot.get_name()] = verdict
+            _report_artifact_verdict(best_snapshot, verdict)
+            if verdict.is_failure:
+                invalid_artifact = True
+                raise __util__.SnapshotTransferError(
+                    f"the received copy of {best_snapshot.get_name()} is not "
+                    f"valid: {verdict.message}"
+                )
             logger.info("Transfer of %s completed successfully", best_snapshot)
 
             # Release locks
@@ -1733,7 +1960,13 @@ def _execute_transfers(
 
         except __util__.SnapshotTransferError as e:
             logger.error("Snapshot transfer failed for %s: %s", best_snapshot, e)
-            logger.info("Keeping %s locked to prevent deletion.", best_snapshot)
+            if release_on_failure:
+                logger.info("Releasing the pin on %s after the failure.", best_snapshot)
+                source_endpoint.set_lock(best_snapshot, destination_id, False)
+                if parent:
+                    source_endpoint.set_lock(parent, destination_id, False, parent=True)
+            else:
+                logger.info("Keeping %s locked to prevent deletion.", best_snapshot)
             result.failed.append((best_snapshot, e))
             # Remove any partial received subvolume the failed transfer left at the
             # destination so the next run's skip-detection cannot mistake it for a
@@ -1746,6 +1979,15 @@ def _execute_transfers(
                 created_by_this_run=not preexisting,
             )
             _cleanup_partial_raw_stream(destination_endpoint)
+            if invalid_artifact:
+                # A remote btrfs endpoint cleans its own partials only when its
+                # transfer fails; an invalid artifact after a transfer that
+                # succeeded is removed here, under the same authorship rule.
+                _cleanup_invalid_remote_subvolume(
+                    destination_endpoint,
+                    best_snapshot.get_name(),
+                    created_by_this_run=not preexisting,
+                )
 
     # Report honestly: a "complete!" banner must not print when a transfer failed.
     if result.failed:

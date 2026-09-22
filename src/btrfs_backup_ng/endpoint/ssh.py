@@ -2925,11 +2925,26 @@ print(json.dumps(result))
         ``--ssh-sudo`` elevates, so this probe has exactly the privilege that
         ``btrfs subvolume list`` had. A caller that got a listing can run this.
         """
+        return self.subvolume_identity(absolute_path) is not None
+
+    def subvolume_identity(self, path: str) -> Optional[Dict[str, str]]:
+        """``{'uuid', 'received_uuid'}`` of the subvolume at exactly ``path`` ON THE
+        REMOTE, or None when they could not be read.
+
+        The remote form of the base probe: one ``btrfs subvolume show`` over
+        ssh, elevated exactly as every other btrfs command this endpoint runs
+        (``--ssh-sudo`` elevates btrfs and nothing else). None for every
+        failure -- not a subvolume, no privilege, an unreachable host -- and the
+        caller decides what "could not read" means: the listing enrichment
+        leaves the uuids empty, ``_subvolume_exists_at`` answers False, and the
+        post-receive artifact verdict reports ``unverifiable``, never
+        ``invalid``, because a probe that could not run has proven nothing.
+        """
         use_sudo = self.config.get("ssh_sudo", False)
         try:
             if use_sudo:
                 result = self._exec_remote_command_with_retry(
-                    ["btrfs", "subvolume", "show", absolute_path],
+                    ["btrfs", "subvolume", "show", path],
                     max_retries=2,
                     check=False,
                     stdout=subprocess.PIPE,
@@ -2937,15 +2952,89 @@ print(json.dumps(result))
                 )
             else:
                 result = self._exec_remote_command(
-                    ["btrfs", "subvolume", "show", absolute_path],
+                    ["btrfs", "subvolume", "show", path],
                     check=False,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
                 )
-            return bool(result.returncode == 0)
         except Exception as e:
-            logger.debug("subvolume show failed for %s: %s", absolute_path, e)
-            return False
+            logger.debug("subvolume show failed for %s: %s", path, e)
+            return None
+        if result.returncode != 0:
+            stderr = result.stderr or b""
+            if isinstance(stderr, bytes):
+                stderr = stderr.decode("utf-8", errors="replace")
+            logger.debug(
+                "subvolume show failed for %s (rc %d): %s",
+                path,
+                result.returncode,
+                stderr.strip(),
+            )
+            return None
+        out = result.stdout or b""
+        if isinstance(out, bytes):
+            out = out.decode("utf-8", errors="replace")
+        return __util__.parse_subvolume_show(out)
+
+    def estimate_transfer_size(
+        self, snapshot: Any, parent: Any = None
+    ) -> Optional[int]:
+        """Bytes a full ``btrfs send`` of ``snapshot`` is expected to carry,
+        measured ON THE REMOTE where the snapshot lives; None when unknown.
+
+        An incremental send is not estimated (None, an indeterminate progress
+        bar), matching the local measurement: the delta is expensive to size
+        and usually fast to move. A full send is sized by
+        ``btrfs filesystem du -s --raw`` on the snapshot, run remotely under
+        this endpoint's elevation: its Total is the referenced data a full
+        stream carries. (The local measurement also consults ``subvolume
+        show`` for an ``Exclusive`` line first; btrfs-progs prints that field
+        as ``Usage exclusive`` and only with quotas enabled, and exclusive
+        bytes are not what a full send moves, so the branch is not mirrored
+        here.) The engine used to run the local measurement on this remote
+        path, which measured nothing and warned on every transfer from an
+        ssh:// source.
+        """
+        from btrfs_backup_ng.core.progress import _parse_size
+
+        if parent is not None:
+            return None
+        path = self._normalize_path(snapshot.get_path())
+        use_sudo = self.config.get("ssh_sudo", False)
+        cmd = ["btrfs", "filesystem", "du", "-s", "--raw", path]
+        try:
+            if use_sudo:
+                result = self._exec_remote_command_with_retry(
+                    cmd,
+                    max_retries=2,
+                    check=False,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    timeout=120,
+                )
+            else:
+                result = self._exec_remote_command(
+                    cmd,
+                    check=False,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    timeout=120,
+                )
+        except Exception as e:  # noqa: BLE001 - an estimate is advisory
+            logger.debug("Remote filesystem du failed for %s: %s", path, e)
+            return None
+        if result.returncode != 0:
+            return None
+        out = result.stdout or b""
+        text = out.decode("utf-8", errors="replace") if isinstance(out, bytes) else out
+        lines = text.strip().splitlines()
+        if len(lines) >= 2:
+            parts = lines[1].split()
+            if len(parts) >= 3:
+                parsed = _parse_size(parts[0])
+                if parsed:
+                    return parsed
+        return None
 
     def _verify_snapshot_exists(self, dest_path: str, snapshot_name: str) -> bool:
         """Verify a snapshot exists on the remote host at its exact path.
