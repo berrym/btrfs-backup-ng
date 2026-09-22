@@ -37,7 +37,7 @@ def _receiving_endpoint(script: str) -> MagicMock:
     """A destination whose receive() runs ``script`` with the stream on stdin,
     stderr drained into a tail exactly as the real endpoints do."""
 
-    def receive(stdin, snapshot_name="", parent_name=None):
+    def receive(stdin, snapshot_name="", parent_name=None, source_uuid=""):
         p = subprocess.Popen(["sh", "-c", script], stdin=stdin, stderr=subprocess.PIPE)
         T.tail_stderr(p)
         return p

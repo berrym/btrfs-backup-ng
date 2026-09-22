@@ -159,6 +159,24 @@ class Snapshot:
         self.uuid = ""
         self.received_uuid = ""
 
+    @property
+    def stream_uuid(self) -> str:
+        """The uuid a ``btrfs send`` of this subvolume carries: ``received_uuid``
+        when set, else its own ``uuid``.
+
+        ``btrfs send`` emits a subvolume's received_uuid in place of its uuid
+        when it has one, and ``btrfs receive`` records whatever the stream
+        carried as the new copy's received_uuid. Identity therefore propagates
+        along a whole chain of send/receive: a copy of a copy of O still has
+        received_uuid == O.uuid, not the uuid of the copy it was sent from.
+        This is the value every correspondence comparison uses (a candidate
+        corresponds when ``candidate.received_uuid == source.stream_uuid``);
+        comparing against ``uuid`` alone matched only the first hop. Empty
+        when identity could not be read, which callers treat as "unknown",
+        never as a match.
+        """
+        return self.received_uuid or self.uuid
+
     def __eq__(self, other: object) -> bool:
         # Identity is the NAME -- the one fact a comparison shares with the
         # filesystem. Duck-typed via get_name(), mirroring RawSnapshot.__eq__,

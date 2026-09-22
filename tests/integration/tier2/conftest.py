@@ -175,6 +175,19 @@ def btrfs_source_and_dest() -> Generator[tuple[Path, Path], None, None]:
 
 
 @pytest.fixture
+def btrfs_three_volumes() -> Generator[tuple[Path, Path, Path], None, None]:
+    """Three btrfs filesystems for a two-hop send/receive chain: an original on
+    the first, its received copy on the second, a copy of that copy on the third.
+
+    Yields a tuple of (first_mount, second_mount, third_mount).
+    """
+    with LoopbackBtrfs(size_mb=256, label="first") as first:
+        with LoopbackBtrfs(size_mb=256, label="second") as second:
+            with LoopbackBtrfs(size_mb=256, label="third") as third:
+                yield first, second, third
+
+
+@pytest.fixture
 def btrfs_subvolume(btrfs_volume: Path) -> Generator[Path, None, None]:
     """Create a btrfs subvolume within the test volume.
 

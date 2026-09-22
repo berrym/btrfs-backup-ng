@@ -133,6 +133,7 @@ class TestChunkedPartialCleanup:
             snapshot_path="/src/snapshot",
             snapshot_name="snap",
             parent_name=None,
+            source_uuid="",
             chunk_count=1,
             chunks=[SimpleNamespace(sequence=0)],
         )

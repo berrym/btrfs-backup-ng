@@ -155,6 +155,11 @@ class RawSnapshot:
         uuid: Btrfs subvolume UUID
         parent_uuid: Parent subvolume UUID for incremental backups
         parent_name: Parent snapshot name for chain reference
+        source_uuid: The stream identity of the subvolume this stream was sent
+            from -- its ``stream_uuid`` (received_uuid or uuid) at backup time,
+            which is the uuid the stream itself carries and the value a
+            ``btrfs receive`` of it records as received_uuid. Empty for a
+            legacy sidecar, which then corresponds to nothing by identity.
         created: Creation timestamp
         size: Stream file size in bytes
         compress: Compression algorithm used (or None)
@@ -170,6 +175,7 @@ class RawSnapshot:
     uuid: str = ""
     parent_uuid: str | None = None
     parent_name: str | None = None
+    source_uuid: str = ""
     created: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     size: int = 0
     compress: str | None = None
@@ -211,6 +217,19 @@ class RawSnapshot:
     def is_incremental(self) -> bool:
         """Check if this is an incremental backup."""
         return self.parent_uuid is not None or self.parent_name is not None
+
+    @property
+    def stream_uuid(self) -> str:
+        """The uuid this stored stream carries, for correspondence when the raw
+        store is a SOURCE (a restore, or a transfer onward): the sidecar's
+        ``source_uuid``. A stream file has no received_uuid of its own, so as
+        a raw DESTINATION correspondence stays by name; this only says what a
+        ``btrfs receive`` of the stream will record. Empty for a legacy sidecar
+        (nothing corresponds, which degrades to today's name behaviour). The
+        ``uuid`` field is deliberately not consulted: it was documented as the
+        source subvolume's own uuid, which is NOT the stream identity when that
+        subvolume was itself received."""
+        return self.source_uuid
 
     # --- __util__.Snapshot interface -------------------------------------
     def get_name(self) -> str:
@@ -299,6 +318,7 @@ class RawSnapshot:
             "uuid": self.uuid,
             "parent_uuid": self.parent_uuid,
             "parent_name": self.parent_name,
+            "source_uuid": self.source_uuid,
             "created": _to_utc(self.created).isoformat(),
             "size": self.size,
             "pipeline": {
@@ -371,6 +391,9 @@ class RawSnapshot:
             uuid=data.get("uuid", ""),
             parent_uuid=data.get("parent_uuid"),
             parent_name=data.get("parent_name"),
+            # Absent from every sidecar written before this field existed, and
+            # tolerated: an empty source_uuid corresponds to nothing.
+            source_uuid=data.get("source_uuid") or "",
             created=created,
             size=data.get("size", 0),
             compress=pipeline.get("compress"),

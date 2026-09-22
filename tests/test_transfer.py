@@ -621,6 +621,7 @@ class TestReceivePassesSnapshotName:
             send_process.stdout,
             "host-20240115-120000",
             parent_name="host-20240110-120000",
+            source_uuid="",
         )
 
     def test_rich_progress_transfer_passes_snapshot_name(self):
@@ -649,6 +650,7 @@ class TestReceivePassesSnapshotName:
             subprocess.PIPE,
             "host-20240115-120000",
             parent_name="host-20240110-120000",
+            source_uuid="",
         )
 
     def test_chunked_local_passes_snapshot_name(self):
@@ -658,6 +660,7 @@ class TestReceivePassesSnapshotName:
         manifest = MagicMock()
         manifest.snapshot_name = "host-20240115-120000"
         manifest.parent_name = "host-20240110-120000"
+        manifest.source_uuid = ""
         manifest.chunk_count = 1
         manifest.chunks = []
         dest = MagicMock()
@@ -673,6 +676,7 @@ class TestReceivePassesSnapshotName:
             subprocess.PIPE,
             "host-20240115-120000",
             parent_name="host-20240110-120000",
+            source_uuid="",
         )
 
     def test_chunked_ssh_passes_snapshot_name(self):
@@ -682,6 +686,7 @@ class TestReceivePassesSnapshotName:
         manifest = MagicMock()
         manifest.snapshot_name = "host-20240115-120000"
         manifest.parent_name = "host-20240110-120000"
+        manifest.source_uuid = ""
         manifest.pending_chunks = [MagicMock()]
         manifest.completed_chunks = 0
         manifest.chunk_count = 1
@@ -702,4 +707,5 @@ class TestReceivePassesSnapshotName:
             subprocess.PIPE,
             "host-20240115-120000",
             parent_name="host-20240110-120000",
+            source_uuid="",
         )

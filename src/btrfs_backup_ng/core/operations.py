@@ -224,6 +224,10 @@ def send_snapshot(
     dest_path = str(destination_endpoint.config.get("path", ""))
     snapshot_name = str(snapshot)
     parent_name = str(parent) if parent else None
+    # The identity the stream carries (received_uuid or uuid of the source), handed
+    # to the receive like parent_name so a raw destination can record it in the
+    # sidecar; a btrfs receive reads it from the stream itself and ignores this.
+    source_uuid = getattr(snapshot, "stream_uuid", "")
 
     log_transaction(
         action="transfer",
@@ -322,6 +326,7 @@ def send_snapshot(
                 snapshot_name=snapshot_name,
                 estimated_size=estimated_size,
                 parent_name=parent_name,
+                source_uuid=source_uuid,
                 stall_timeout=int(
                     options.get("transfer_stall_timeout", DEFAULT_STALL_TIMEOUT)
                 ),
@@ -471,6 +476,7 @@ def _do_chunked_transfer(
     dest_path = str(destination_endpoint.config.get("path", ""))
     snapshot_name = str(snapshot)
     parent_name = str(parent) if parent else None
+    source_uuid = getattr(snapshot, "stream_uuid", "")
     show_progress = options.get("show_progress", False)
 
     manifest: Optional[TransferManifest] = None
@@ -497,6 +503,7 @@ def _do_chunked_transfer(
                 destination=str(destination_endpoint),
                 parent_path=str(parent.get_path()) if parent else None,
                 parent_name=parent_name,
+                source_uuid=source_uuid,
             )
 
             log_transaction(
@@ -685,10 +692,13 @@ def _transfer_chunks_local(
     # Create a reader to reassemble chunks
     reader = chunked_manager.create_reassembly_reader(manifest)
 
-    # Start btrfs receive (parent_name lets a raw endpoint record the incremental parent in
-    # its .meta sidecar; btrfs ignores it).
+    # Start btrfs receive (parent_name and source_uuid let a raw endpoint record the
+    # incremental parent and the stream identity in its .meta sidecar; btrfs ignores them).
     receive_process = destination_endpoint.receive(
-        subprocess.PIPE, manifest.snapshot_name, parent_name=manifest.parent_name
+        subprocess.PIPE,
+        manifest.snapshot_name,
+        parent_name=manifest.parent_name,
+        source_uuid=manifest.source_uuid,
     )
     if receive_process is None:
         raise __util__.SnapshotTransferError("Receive process failed to start")
@@ -802,10 +812,14 @@ def _transfer_chunks_ssh(
             raise __util__.SnapshotTransferError("SSH chunked receive failed")
     else:
         # Fall back to streaming through regular receive
-        # Start btrfs receive on remote (parent_name lets a raw endpoint record the
-        # incremental parent in its .meta sidecar; btrfs ignores it).
+        # Start btrfs receive on remote (parent_name and source_uuid let a raw endpoint
+        # record the incremental parent and the stream identity in its .meta sidecar;
+        # btrfs ignores them).
         receive_process = destination_endpoint.receive(
-            subprocess.PIPE, manifest.snapshot_name, parent_name=manifest.parent_name
+            subprocess.PIPE,
+            manifest.snapshot_name,
+            parent_name=manifest.parent_name,
+            source_uuid=manifest.source_uuid,
         )
         if receive_process is None:
             raise __util__.SnapshotTransferError("SSH receive process failed to start")
@@ -1048,6 +1062,7 @@ def _do_process_transfer(
     wall_timeout: int = DEFAULT_TRANSFER_TIMEOUT,
     parent_name: str | None = None,
     processes: dict[str, Any] | None = None,
+    source_uuid: str = "",
 ) -> list[int]:
     """Perform transfer using traditional process piping.
 
@@ -1107,6 +1122,7 @@ def _do_process_transfer(
             estimated_size,
             parent_name=parent_name,
             processes=processes,
+            source_uuid=source_uuid,
         )
 
     pipeline_processes = []
@@ -1125,10 +1141,14 @@ def _do_process_transfer(
                 show_progress=effective_show_progress,
             )
 
-        # Start receive process with potentially modified input stream. parent_name lets a
-        # raw endpoint record the incremental parent in its .meta sidecar (btrfs ignores it).
+        # Start receive process with potentially modified input stream. parent_name and
+        # source_uuid let a raw endpoint record the incremental parent and the stream
+        # identity in its .meta sidecar (btrfs ignores them).
         receive_process = destination_endpoint.receive(
-            current_stdout, snapshot_name, parent_name=parent_name
+            current_stdout,
+            snapshot_name,
+            parent_name=parent_name,
+            source_uuid=source_uuid,
         )
         if processes is not None:
             processes["receive"] = receive_process
@@ -1224,6 +1244,7 @@ def _do_rich_progress_transfer(
     estimated_size: int | None,
     parent_name: str | None = None,
     processes: dict[str, Any] | None = None,
+    source_uuid: str = "",
 ) -> list[int]:
     """Perform transfer with Rich progress bar display.
 
@@ -1246,7 +1267,10 @@ def _do_rich_progress_transfer(
     # exactly like the non-rich transfer path.
     try:
         receive_process = destination_endpoint.receive(
-            subprocess.PIPE, snapshot_name, parent_name=parent_name
+            subprocess.PIPE,
+            snapshot_name,
+            parent_name=parent_name,
+            source_uuid=source_uuid,
         )
     except Exception as e:
         logger.error("Failed to start receive process: %s", e)
@@ -1832,6 +1856,10 @@ class _SnapperBtrfsBackup:
     def __init__(self, number: int, received_uuid: str) -> None:
         self.number = number
         self.received_uuid = received_uuid
+        # What a send of THIS copy would carry: its received_uuid (it is a
+        # received subvolume, so that is set). Lets the copy stand as a source
+        # under the same correspondence rule as every other snapshot object.
+        self.stream_uuid = received_uuid
 
     def get_name(self) -> str:
         # Not used for correspondence (received_uuid drives btrfs matching); descriptive only.
@@ -2161,8 +2189,8 @@ def _snapper_publish_slot(destination_endpoint, snapshot_num) -> None:
 
 class _SnapperBtrfsDestView:
     """Presents the received snapper backups on a BTRFS destination to the shared planner so it
-    decides skip + parent by CORRESPONDENCE (``received_uuid == source.uuid``) instead of the
-    brittle snapper-number scan. ``correspondent_of`` is the production
+    decides skip + parent by CORRESPONDENCE (``received_uuid == source.stream_uuid``) instead
+    of the brittle snapper-number scan. ``correspondent_of`` is the production
     ``Endpoint.correspondent_of`` bound verbatim, so this view can never drift from the real
     correspondence logic; only the enumeration (the numbered layout) is view-specific.
     """

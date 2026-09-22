@@ -205,7 +205,7 @@ class TestASuccessfulTransferLogsEveryLine:
             T.tail_stderr(p, log_as="btrfs send")
             return p
 
-        def receive(stdin, snapshot_name="", parent_name=None):
+        def receive(stdin, snapshot_name="", parent_name=None, source_uuid=""):
             p = subprocess.Popen(
                 [
                     "sh",
