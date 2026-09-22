@@ -30,7 +30,10 @@ from typing import Any, Optional, TypedDict
 
 from btrfs_backup_ng import __util__
 from btrfs_backup_ng.__logger__ import logger
-from btrfs_backup_ng.core.transfer import tail_stderr
+from btrfs_backup_ng.core.transfer import (
+    popen_pipeline_pipefail as _popen_pipeline_pipefail,
+    tail_stderr,
+)
 from btrfs_backup_ng.endpoint.common import DeletionResult, Endpoint
 from btrfs_backup_ng.endpoint.raw_metadata import (
     COMPRESSION_CONFIG,
@@ -461,34 +464,6 @@ def _sha256_file(path: Path) -> str | None:
         # wrongly implies a loop rather than "this is a symlink, refused for safety".
         logger.warning("Could not checksum %s: %s", path, _open_failure_reason(e))
         return None
-
-
-def _popen_pipeline_pipefail(shell_cmd: str, **popen_kwargs: Any) -> subprocess.Popen:
-    """Run a multi-stage shell pipeline with ``pipefail``.
-
-    Without ``pipefail`` a shell pipeline's exit status is that of its LAST stage
-    only, so a failure of an upstream stage -- ``btrfs send`` dying, or a
-    compressor/``gpg`` erroring mid-stream -- is masked by the final redirect/ssh
-    exiting 0, and a truncated or empty stream file is reported as a successful
-    backup. ``set -o pipefail`` makes any stage's failure fail the whole pipeline
-    so the returncode the caller checks is honest.
-
-    Uses bash (which supports ``pipefail``); falls back to plain ``sh`` with a
-    warning only when bash is unavailable.
-    """
-    bash_path = shutil.which("bash")
-    if bash_path:
-        return subprocess.Popen(
-            "set -o pipefail; " + shell_cmd,
-            shell=True,
-            executable=bash_path,
-            **popen_kwargs,
-        )
-    logger.warning(
-        "bash not found; running raw pipeline without pipefail (a mid-pipe "
-        "failure may be masked and produce a truncated backup)"
-    )
-    return subprocess.Popen(shell_cmd, shell=True, **popen_kwargs)
 
 
 class RawEndpoint(Endpoint):

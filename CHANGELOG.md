@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`--compress` on an `ssh://` restore source compresses the wire.** The
+  README recommends it for a slow-link restore, and the option was accepted
+  and did nothing: the transfer layer dropped it for a local destination and
+  the ssh endpoint's restore-direction send had no compressor. The remote now
+  runs `btrfs send | <compressor>` and this host decompresses before `btrfs
+  receive`, both from the one configured method, mirroring the backup
+  direction. The remote pipeline exits with the SEND's status, not the
+  compressor's, through a POSIX-only construction run under bash, dash and
+  busybox ash; the local ssh and decompressor run under the one `pipefail`
+  runner the raw pipelines use, so a failure at either end is the failure the
+  executor sees. A missing local decompressor refuses before connecting.
 - Every source endpoint answers `required_parent_of`, and the planner's
   `only=` accepts a selection and a `source_endpoint` to expand it through.
   The backup run's contract is unchanged: without a source endpoint the

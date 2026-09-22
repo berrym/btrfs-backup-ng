@@ -90,6 +90,36 @@ def check_compression_available(method: str) -> bool:
     return shutil.which(check_cmd) is not None
 
 
+def popen_pipeline_pipefail(shell_cmd: str, **popen_kwargs: Any) -> subprocess.Popen:
+    """Run a multi-stage shell pipeline with ``pipefail``.
+
+    Without ``pipefail`` a shell pipeline's exit status is that of its LAST stage
+    only, so a failure of an upstream stage -- ``btrfs send`` dying, or a
+    compressor/``gpg`` erroring mid-stream -- is masked by the final redirect/ssh
+    exiting 0, and a truncated or empty stream file is reported as a successful
+    backup. ``set -o pipefail`` makes any stage's failure fail the whole pipeline
+    so the returncode the caller checks is honest.
+
+    The one pipeline runner for every LOCAL multi-stage pipeline: the raw
+    endpoint's write and read-back pipelines, and the ssh endpoint's
+    decompressing restore read. Uses bash (which supports ``pipefail``); falls
+    back to plain ``sh`` with a warning only when bash is unavailable.
+    """
+    bash_path = shutil.which("bash")
+    if bash_path:
+        return subprocess.Popen(
+            "set -o pipefail; " + shell_cmd,
+            shell=True,
+            executable=bash_path,
+            **popen_kwargs,
+        )
+    logger.warning(
+        "bash not found; running raw pipeline without pipefail (a mid-pipe "
+        "failure may be masked and produce a truncated backup)"
+    )
+    return subprocess.Popen(shell_cmd, shell=True, **popen_kwargs)
+
+
 def check_pv_available() -> bool:
     """Check if pv (pipe viewer) is available for bandwidth limiting."""
     return shutil.which("pv") is not None

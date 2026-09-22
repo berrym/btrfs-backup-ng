@@ -179,6 +179,12 @@ def send_snapshot(
     if options.get("compress", "none") != "none":
         requested = options.get("compress", "none")
         remote_btrfs = getattr(destination_endpoint, "_is_remote", False)
+        source_endpoint = getattr(snapshot, "endpoint", None)
+        remote_btrfs_source = (
+            source_endpoint is not None
+            and getattr(source_endpoint, "_is_remote", False) is True
+            and not isinstance(source_endpoint, RawEndpoint)
+        )
         if isinstance(destination_endpoint, RawEndpoint) or remote_btrfs:
             # Hand the method to the endpoint HERE, in the same breath as taking
             # it away from the transfer layer. Doing it further down let the
@@ -190,13 +196,22 @@ def send_snapshot(
             if remote_btrfs and not isinstance(destination_endpoint, RawEndpoint):
                 destination_endpoint.config["compress"] = requested
             options = {**options, "compress": "none"}
+        elif remote_btrfs_source and source_endpoint is not None:
+            # The restore direction: the snapshot lives on a remote btrfs host
+            # and the destination is local. The wire is the same wire, so the
+            # same option applies -- the SOURCE endpoint compresses its remote
+            # send and decompresses here (SSHEndpoint._compressed_remote_send).
+            # Handed over the same way as above, for the same reason.
+            source_endpoint.config["compress"] = requested
+            options = {**options, "compress": "none"}
         else:
             logger.info(
                 "Not compressing this transfer: compress=%r was requested for a "
-                "LOCAL btrfs destination, where the stream would be compressed "
-                "and immediately decompressed on the same machine for no saving. "
-                "Compression applies to ssh:// (compressed over the wire) and to "
-                "raw:// / raw+ssh:// (compressed at rest).",
+                "LOCAL btrfs destination from a local source, where the stream "
+                "would be compressed and immediately decompressed on the same "
+                "machine for no saving. Compression applies over the wire in "
+                "either direction (an ssh:// destination, or an ssh:// restore "
+                "source) and to raw:// / raw+ssh:// (compressed at rest).",
                 options.get("compress"),
             )
             options = {**options, "compress": "none"}

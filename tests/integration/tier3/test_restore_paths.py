@@ -581,10 +581,14 @@ class TestCompressedAndEncryptedTransports:
     @requires_remote
     def test_zstd_over_ssh(self, rig):
         """ssh:// stores a plain subvolume; zstd here is transport compression
-        on BOTH legs. The restore leg is the one nothing exercised: the remote
-        `btrfs send` is compressed on the far side and undone here before
-        `btrfs receive`, so a decompressor that does not run, or runs the
-        wrong way, feeds receive garbage."""
+        on BOTH legs. The restore leg is the one nothing exercised, and for
+        a long time it was not compressed at all: `--compress` was accepted
+        on an `ssh://` restore source and dropped, so this cell passed on
+        plain bytes while its docstring claimed otherwise. The remote `btrfs
+        send` is now compressed on the far side and undone here before
+        `btrfs receive`; the restore's own log line for that is required
+        below, so a decompressor that does not run fails the cell rather
+        than passing on an uncompressed stream."""
         base = f"{rig.remote_base}/btrfs-zstd"
         remote_sh(f"mkdir -p '{base}'")
         loc = f"ssh://{REMOTE_SPEC}:{base}"
@@ -604,6 +608,11 @@ class TestCompressedAndEncryptedTransports:
         assert res["backup_rc"] == 0, res["backup_out"]
         assert rig.remote_btrfs_subvols(base), "nothing landed remotely"
         assert_payload_restored(res["restore_dest"], rig.payload)
+        flat = " ".join(res["restore_out"].split())
+        assert "Decompressing the restore stream with zstd" in flat, (
+            "the restore leg was not compressed: no decompressor ran here\n"
+            + res["restore_out"]
+        )
 
     @requires_raw_remote
     def test_zstd_raw_over_ssh_to_a_foreign_host(self, rig):
