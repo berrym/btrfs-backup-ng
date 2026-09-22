@@ -316,6 +316,8 @@ def _drive_transfers(monkeypatch, send_side_effect):
     dest = MagicMock()
     dest.get_id.return_value = "dest-id"
     dest.config = {"path": "/dest"}
+    # A double cannot be asked what it received; the verdict is ``unverifiable``.
+    dest.subvolume_identity.return_value = None
     src = MagicMock()
     snap = MagicMock()
     snap.get_name.return_value = "snap-1"

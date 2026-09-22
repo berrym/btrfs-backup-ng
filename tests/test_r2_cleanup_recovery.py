@@ -120,6 +120,12 @@ class TestExecuteTransfersCleansPartialOnFailure:
         dst._is_remote = False
 
         monkeypatch.setattr(ops, "send_snapshot", MagicMock(return_value=None))
+        # A local double has no subvolume at the received path; the verdict on
+        # it would be ``invalid`` (and clean up), which is the other test's
+        # subject, not this one's. The receive here is taken as verified.
+        monkeypatch.setattr(
+            ops, "artifact_verdict", lambda ep, s: ops.StructureVerdict("ok", "")
+        )
         spy = MagicMock()
         monkeypatch.setattr(ops, "_cleanup_partial_local_subvolume", spy)
 

@@ -735,37 +735,68 @@ class Endpoint:
         unaffected. The planner consumes these identities (Phase 2 correspondence)."""
         if not snapshots:
             return
-        sudo_prefix = ["sudo", "-n"] if os.geteuid() != 0 else []
         enriched = 0
         for snap in snapshots:
-            try:
-                result = subprocess.run(
-                    [*sudo_prefix, "btrfs", "subvolume", "show", str(snap.get_path())],
-                    capture_output=True,
-                    text=True,
-                    timeout=30,
-                    check=False,
-                )
-                if result.returncode != 0:
-                    continue
-                ids = __util__.parse_subvolume_show(result.stdout)
-                snap.uuid = ids["uuid"]
-                snap.received_uuid = ids["received_uuid"]
-                if snap.uuid:
-                    enriched += 1
-            except subprocess.TimeoutExpired:
-                logger.debug("subvolume show timed out for %s", snap.get_name())
-            except Exception as e:  # noqa: BLE001 - best-effort, never fatal
-                logger.debug(
-                    "Could not read subvolume uuid for %s (ignoring): %s",
-                    snap.get_name(),
-                    e,
-                )
+            ids = self.subvolume_identity(str(snap.get_path()))
+            if ids is None:
+                continue
+            snap.uuid = ids["uuid"]
+            snap.received_uuid = ids["received_uuid"]
+            if snap.uuid:
+                enriched += 1
         logger.debug(
             "btrfs uuid enrichment: %d/%d snapshot(s) have a uuid",
             enriched,
             len(snapshots),
         )
+
+    def subvolume_identity(self, path: str) -> Optional[Dict[str, str]]:
+        """``{'uuid', 'received_uuid'}`` of the subvolume at exactly ``path``, or
+        None when they could not be read.
+
+        The one identity probe: the listing enrichment above and the post-receive
+        artifact verdict (``core.operations.artifact_verdict``) both read through
+        it, so the two cannot disagree about what a subvolume's identity is or
+        how privilege is applied to read it. ``btrfs subvolume show`` needs
+        CAP_SYS_ADMIN for the uuid fields, so it is escalated the way the rest
+        of this endpoint escalates btrfs: ``sudo -n`` when not root, and only
+        ``-n`` -- a probe must fail fast rather than prompt.
+
+        None is the whole answer for every failure (no passwordless sudo, not a
+        btrfs subvolume, older btrfs-progs, a timeout): the caller decides what
+        "could not read" means for it. The enrichment leaves the uuids empty;
+        the verdict reports ``unverifiable``, never ``invalid``, because a probe
+        that could not run has proven nothing about the artifact.
+
+        This base implementation runs locally; the ssh endpoint overrides it to
+        run on the remote host, under that endpoint's own elevation.
+        """
+        sudo_prefix = ["sudo", "-n"] if os.geteuid() != 0 else []
+        try:
+            result = subprocess.run(
+                [*sudo_prefix, "btrfs", "subvolume", "show", str(path)],
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+        except subprocess.TimeoutExpired:
+            logger.debug("subvolume show timed out for %s", path)
+            return None
+        except Exception as e:  # noqa: BLE001 - best-effort, never fatal
+            logger.debug(
+                "Could not read subvolume identity of %s (ignoring): %s", path, e
+            )
+            return None
+        if result.returncode != 0:
+            logger.debug(
+                "subvolume show failed for %s (rc %d): %s",
+                path,
+                result.returncode,
+                (result.stderr or "").strip(),
+            )
+            return None
+        return __util__.parse_subvolume_show(result.stdout)
 
     def _load_locks_into(self, snapshots: List[Any]) -> None:
         """Populate each snapshot's in-memory lock sets from the persisted lock file.
@@ -951,6 +982,27 @@ class Endpoint:
             "(not a received backup, or btrfs subvolume show needs privilege)",
         )
 
+    def estimate_transfer_size(
+        self, snapshot: Any, parent: Any = None
+    ) -> Optional[int]:
+        """Bytes a ``btrfs send`` of ``snapshot`` (against ``parent``) is expected to
+        carry, or None when unknown or incremental.
+
+        Asked of the endpoint that HOLDS the snapshot, because that is the only
+        place ``btrfs subvolume show`` can measure it. The transfer engine used
+        to run the estimate on the local machine whatever the source: a remote
+        source's path measured nothing here, and every transfer from an ssh://
+        source warned "Could not estimate transfer size for space check". This
+        base implementation is the local measurement (``core.progress``); the
+        ssh endpoint overrides it to measure on the remote host.
+        """
+        from btrfs_backup_ng.core import progress as progress_utils
+
+        parent_path = str(parent.get_path()) if parent is not None else None
+        return progress_utils.estimate_snapshot_size(
+            str(snapshot.get_path()), parent_path
+        )
+
     def test_send_stream(self, snapshot: Any, parent: Any = None) -> None:
         """Verify a ``btrfs send`` stream can be generated for ``snapshot`` -- the STREAM
         verification level for a btrfs subvolume target. Runs ``btrfs send --no-data`` (a
@@ -1013,6 +1065,28 @@ class Endpoint:
             (snapshot.parent_locks if parent else snapshot.locks).add(lock_id)
         else:
             (snapshot.parent_locks if parent else snapshot.locks).discard(lock_id)
+        store = self._lock_store_manager()
+        if store is not None:
+            # This location carries the DIRECTORY store an ssh:// endpoint
+            # keeps: one holder file per pin, no read-modify-write and no
+            # guard file, the same protocol the remote side runs.
+            from ..sshutil.lock import record_pin
+
+            record_pin(
+                store,
+                snapshot,
+                lock_id,
+                lock_state,
+                parent=parent,
+                skip_remote_lock=bool(self.config.get("skip_remote_lock")),
+                where="location",
+                noun="snapshot",
+                opt_out=(
+                    "set skip_remote_lock on the target, or pass "
+                    "--skip-remote-lock where the command takes it,"
+                ),
+            )
+            return
         # Read-modify-write against the AUTHORITATIVE on-disk lock file, serialized by a
         # FileLock so concurrent parallel-target transfers (multiple threads sharing this
         # source endpoint) and concurrent processes cannot lose each other's updates. The
@@ -1091,10 +1165,44 @@ class Endpoint:
             logger.error("Refusing to delete snapshots: %s.", reason)
             result.fail_all(snapshots, reason)
             return result
+        # The directory store is asked again AT DELETE TIME, not only when the
+        # listing was taken: a restore -- in another process, or reaching this
+        # location over ssh:// -- may have pinned a snapshot since. This is the
+        # same guard the ssh endpoint's delete runs on the remote; here the
+        # store is on this machine. An unanswerable query deletes nothing.
+        store_locked: set = set()
+        store = self._lock_store_manager()
+        if store is not None:
+            from ..sshutil.lock import (
+                RemoteLockUnavailable,
+                blocked_by_remote_lock,
+                snapshot_lock_name,
+            )
+
+            try:
+                store_locked = blocked_by_remote_lock(store, list(snapshots))
+            except RemoteLockUnavailable as exc:
+                logger.error(
+                    "Not deleting anything at this location: %s. Nothing was "
+                    "removed; resolve the error above and run this again.",
+                    exc,
+                )
+                result.fail_all(snapshots, f"the lock store is unusable: {exc}")
+                return result
+            if store_locked:
+                logger.info(
+                    "Skipping %d snapshot(s) locked by another process at this "
+                    "location: %s",
+                    len(store_locked),
+                    ", ".join(sorted(store_locked)),
+                )
         for snapshot in snapshots:
             if snapshot.locks or snapshot.parent_locks:
                 logger.info("Skipping locked snapshot: %s", snapshot)
                 result.skip(snapshot, "held by a retention lock")
+                continue
+            if store_locked and snapshot_lock_name(snapshot) in store_locked:
+                result.skip(snapshot, "locked by another process at this location")
                 continue
             # Built by _build_deletion_commands rather than hand-rolled here, so
             # `convert_rw` gets its `btrfs property set -ts ... ro false` ahead of
@@ -1722,8 +1830,93 @@ class Endpoint:
         # restore FROM an ssh:// btrfs backup (which sets a lock on the ssh endpoint).
         return Path(self.config["path"]) / str(self.config["lock_file_name"])
 
+    def _lock_store_manager(self) -> Any:
+        """The DIRECTORY lock store at this location, or None.
+
+        A location has one set of pins however it is reached. An ssh:// endpoint
+        records its persistent locks -- the pins a restore holds, the locks a
+        receive holds (``sshutil/lock.py``) -- in a directory named
+        ``LOCK_DIR_NAME`` under the target; a local endpoint keeps a JSON file
+        of the same name. A local endpoint over an ssh:// mirror (a transfer
+        onward from it, a prune of it on the host itself) therefore met the
+        directory where it expected its file. It refused, deliberately:
+        proceeding with an empty lock set would have let a local prune delete
+        what a remote restore holds, and renaming either store would have left
+        the two blind to each other.
+
+        When the directory is there, this endpoint USES it: the same scripts
+        the ssh endpoint runs on the remote, run here through ``sh``. Reads
+        (``_read_locks``, the delete guard), writes (``set_lock``) and
+        ``restore --unlock`` (``_write_locks``) all go through the one store.
+        A location that carries no directory keeps its lock file exactly as
+        before; nothing is renamed or migrated. The store is recognised only
+        where the lock FILE would have been, i.e. under the default
+        ``lock_file_name``: an endpoint configured with another file name
+        keeps that file, so two stores can never coexist at one location.
+
+        A pin in the directory store lives as long as the process that took
+        it (a holder file with a heartbeat, released at exit, stale after
+        the heartbeat stops), exactly as an ssh:// endpoint's pins do; a pin
+        in the lock file survives across runs.
+        """
+        path = self.config.get("path")
+        if path is None or str(path) == "":
+            return None
+        from ..sshutil.lock import LOCK_DIR_NAME, cached_manager
+
+        if str(self.config.get("lock_file_name")) != LOCK_DIR_NAME:
+            return None
+        try:
+            st = os.lstat(Path(str(path)) / LOCK_DIR_NAME)
+        except OSError:
+            return None
+        if not stat.S_ISDIR(st.st_mode):
+            return None
+        return cached_manager(self, str(path), self._build_local_lock_manager)
+
+    def _build_local_lock_manager(self) -> Any:
+        """A lock manager over this location, running its scripts locally.
+
+        Elevation mirrors the ssh endpoint's: the unprivileged attempt first,
+        ``sudo -n sh -c`` only when the lock directory could not be created or
+        written -- a mirror received under ``--ssh-sudo`` is root-owned, and
+        its lock directory with it.
+        """
+        import socket as _socket
+
+        from ..sshutil.lock import RemoteLockManager
+
+        def run(script: str) -> tuple[int, str, str]:
+            proc = subprocess.run(
+                ["sh", "-c", script], capture_output=True, text=True, check=False
+            )
+            return proc.returncode, proc.stdout, proc.stderr
+
+        def run_elevated(script: str) -> tuple[int, str, str]:
+            import shlex
+
+            return run(f"sudo -n sh -c {shlex.quote(script)}")
+
+        return RemoteLockManager(
+            run,
+            str(self.config["path"]),
+            hostname=_socket.gethostname(),
+            run_elevated=run_elevated,
+        )
+
     def _read_locks(self) -> Dict[str, Any]:
         path = self._get_lock_file_path()
+        store = self._lock_store_manager()
+        if store is not None:
+            from ..sshutil.lock import read_persisted_locks
+
+            try:
+                return read_persisted_locks(store)
+            except Exception as e:  # noqa: BLE001 - the reason travels, see below
+                logger.error("Error on reading the lock store at %s: %s", path, e)
+                raise __util__.AbortError(
+                    f"Cannot read the lock store {path}: {e}"
+                ) from e
         try:
             # ABSENT means genuinely no locks: nothing has ever locked this
             # target. PRESENT BUT NOT A REGULAR FILE does not -- it means the
@@ -1742,21 +1935,6 @@ class Endpoint:
                 st = os.lstat(path)
             except FileNotFoundError:
                 return {}
-            if stat.S_ISDIR(st.st_mode):
-                # The same name is an ssh:// destination's lock DIRECTORY (its
-                # persistent pins and receiving locks; sshutil/lock.py). A
-                # local endpoint over that directory -- a transfer onward from
-                # a mirror -- cannot read those locks yet, and proceeding with
-                # an empty lock set would let a local prune delete what a
-                # remote restore holds. Refuse, and say which store this is.
-                raise ValueError(
-                    f"{path} is a directory: the lock store an ssh:// target "
-                    f"keeps for this location. Its locks are honoured only "
-                    f"through the ssh:// path; reading them from a local "
-                    f"endpoint is not supported yet. Use the ssh:// form of "
-                    f"this location, or move the directory aside if the "
-                    f"location is no longer an ssh:// target."
-                )
             if not stat.S_ISREG(st.st_mode):
                 raise ValueError(
                     f"lock file is not a regular file (mode {st.st_mode:o})"
@@ -1772,6 +1950,18 @@ class Endpoint:
 
     def _write_locks(self, lock_dict: Dict[str, Any]) -> None:
         path = self._get_lock_file_path()
+        store = self._lock_store_manager()
+        if store is not None:
+            from ..sshutil.lock import write_persisted_locks
+
+            try:
+                write_persisted_locks(store, lock_dict)
+            except Exception as e:  # noqa: BLE001 - the reason travels
+                logger.error("Error on writing the lock store at %s: %s", path, e)
+                raise __util__.AbortError(
+                    f"Cannot write the lock store {path}: {e}"
+                ) from e
+            return
         data = __util__.write_locks(lock_dict)
         try:
             logger.debug("Writing lock file: %s", path)

@@ -5,7 +5,7 @@ summary that quotes the exception -- "Transfer to X failed: " -- ended at the
 colon. The first real second-hop transfer from an ssh:// mirror produced
 exactly that: the reason (a lock directory where a lock file was expected)
 was on a log line above, and the verdict line carried nothing. Every
-AbortError now carries its reason, and one of them names what it found.
+AbortError now carries its reason.
 """
 
 from __future__ import annotations
@@ -31,31 +31,58 @@ def test_no_bare_abort_error_anywhere():
     assert offenders == [], offenders
 
 
-class TestTheLockStoreCollision:
+class TestTheLockStoreIsShared:
     """An ssh:// target keeps its locks in a DIRECTORY of the same name a local
-    endpoint uses for its lock FILE. Meeting the directory locally is refused
-    -- proceeding with an empty lock set would let a local prune delete what
-    a remote restore holds -- and the refusal says which store it is."""
+    endpoint uses for its lock FILE. Meeting the directory locally used to be
+    refused, with the store named; now the local endpoint reads and writes
+    that store, so a remote restore's pin is honoured by a local prune. The
+    full protocol is under tests/test_local_lock_directory_store.py; this
+    pins the two facts the refusal used to stand in for."""
 
-    def test_a_lock_directory_is_refused_with_its_name(self, tmp_path):
-        (tmp_path / ".btrfs-backup-ng.locks").mkdir()
-        ep = LocalEndpoint(config={"path": str(tmp_path), "fs_checks": "skip"})
-        with pytest.raises(__util__.AbortError) as e:
-            ep._read_locks()
-        text = str(e.value)
-        assert "ssh://" in text and "directory" in text, text
-        assert str(tmp_path / ".btrfs-backup-ng.locks") in text
-        assert "not supported yet" in text
+    def test_a_local_endpoint_honours_a_remote_restores_pin(self, tmp_path):
+        import subprocess
 
-    def test_the_reason_travels_in_the_exception_not_only_the_log(self, tmp_path):
+        from btrfs_backup_ng.sshutil.lock import RemoteLockManager
+
+        (tmp_path / "home-20260101-120000").mkdir()
+
+        def run(script):
+            proc = subprocess.run(["sh", "-c", script], capture_output=True, text=True)
+            return proc.returncode, proc.stdout, proc.stderr
+
+        RemoteLockManager(run, str(tmp_path), hostname="remote").acquire_shared(
+            "snap-home-20260101-120000", "restore:20260101-abc"
+        )
+        assert (tmp_path / ".btrfs-backup-ng.locks").is_dir()
+
+        ep = LocalEndpoint(
+            config={"path": str(tmp_path), "snap_prefix": "home-", "fs_checks": "skip"}
+        )
+        assert ep._read_locks() == {
+            "home-20260101-120000": {"locks": ["restore:20260101-abc"]}
+        }
+        (snapshot,) = ep.list_snapshots()
+        assert snapshot.locks == {"restore:20260101-abc"}
+        result = ep.delete_snapshots([snapshot])
+        assert result.deleted == [] and result.skipped_count == 1
+
+    def test_a_store_that_cannot_be_read_says_so_in_the_exception(
+        self, tmp_path, monkeypatch
+    ):
         """What a caller reports with str(e) is the full reason."""
         (tmp_path / ".btrfs-backup-ng.locks").mkdir()
         ep = LocalEndpoint(config={"path": str(tmp_path), "fs_checks": "skip"})
+
+        def cannot(manager):
+            raise RuntimeError("sh is unavailable")
+
+        monkeypatch.setattr("btrfs_backup_ng.sshutil.lock.read_persisted_locks", cannot)
         try:
             ep._read_locks()
         except __util__.AbortError as e:
-            assert str(e).strip() != ""
-            assert "Cannot read the lock file" in str(e)
+            assert "Cannot read the lock store" in str(e)
+            assert str(tmp_path / ".btrfs-backup-ng.locks") in str(e)
+            assert "sh is unavailable" in str(e)
         else:
             pytest.fail("no refusal")
 

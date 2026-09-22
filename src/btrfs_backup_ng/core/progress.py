@@ -196,7 +196,11 @@ def _parse_size(size_str: str) -> Optional[int]:
         "TB": 1000**4,
     }
 
-    for suffix, multiplier in multipliers.items():
+    # Longest suffix first: every unit ends in "B", so testing "B" before
+    # "MiB" matched "12.00MiB" as bytes, failed to parse "12.00Mi", and
+    # returned None -- which is what every quota-enabled ``btrfs subvolume
+    # show`` Exclusive line did here, silently, until the du fallback ran.
+    for suffix, multiplier in sorted(multipliers.items(), key=lambda kv: -len(kv[0])):
         if size_str.endswith(suffix):
             try:
                 value = float(size_str[: -len(suffix)].strip())

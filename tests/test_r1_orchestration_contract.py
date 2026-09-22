@@ -48,6 +48,10 @@ def _endpoints(source_snaps, dest_snaps=()):
     dst = MagicMock()
     dst.get_id.return_value = "dest-id"
     dst.list_snapshots.return_value = list(dest_snaps)
+    # A double cannot be asked what it received: the artifact verdict reads
+    # ``unverifiable`` (kept, counted as transferred), which is the outcome
+    # these orchestration tests were written against.
+    dst.subvolume_identity.return_value = None
     # Presence via the correspondence primitive: present iff a same-named dest snap exists.
     _dest_by_name = {s.get_name(): s for s in dest_snaps}
     dst.correspondent_of.side_effect = lambda s: _dest_by_name.get(s.get_name())
