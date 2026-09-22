@@ -600,7 +600,7 @@ def prepare_source_endpoint(options):
         )
     except ValueError as e:
         logger.error("Couldn't parse source specification: %s", e)
-        raise __util__.AbortError
+        raise __util__.AbortError(f"Couldn't parse source specification: {e}") from e
 
     logger.debug("Source endpoint: %s", source_endpoint)
     source_endpoint.prepare()
@@ -652,7 +652,9 @@ def prepare_destination_endpoints(options, source_endpoint):
 
         except ValueError as e:
             logger.error("Couldn't parse destination specification: %s", e)
-            raise __util__.AbortError
+            raise __util__.AbortError(
+                f"Couldn't parse destination specification: {e}"
+            ) from e
         except Exception as e:
             logger.error("Error setting up destination %s: %s", destination, e)
             raise __util__.AbortError(

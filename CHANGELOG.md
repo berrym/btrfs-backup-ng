@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **A refused lock never reported an empty reason again.** Four sites logged
+  why and then raised an exception carrying nothing, so a summary that quotes
+  the exception -- "Transfer to X failed: " -- ended at the colon. Every
+  `AbortError` now carries its reason, and a scan test refuses a bare raise.
+  The case that exposed it: a transfer onward from an `ssh://` mirror. An
+  `ssh://` target keeps its persistent locks in a directory of the same name a
+  local endpoint uses for its lock file, so a local endpoint over that mirror
+  found a directory and refused with nothing said. It still refuses --
+  proceeding with an empty lock set would let a local prune delete what a
+  remote restore holds -- and now names the store it found and what to do.
+  Honouring that store from a local endpoint is scheduled with the restore
+  work.
+
 ### Added
 
 - **`--btrfs-debug` for every command, and `[global] btrfs_debug`.** Legacy
