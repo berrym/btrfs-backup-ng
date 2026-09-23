@@ -26,6 +26,7 @@ from ..core.restore import (
     validate_restore_destination,
 )
 from .common import (
+    apply_config_verbosity,
     btrfs_debug_enabled,
     get_fs_checks_mode,
     get_log_level,
@@ -151,6 +152,7 @@ def _execute_list_volumes(args: argparse.Namespace) -> int:
         logger.error("Failed to load config: %s", e)
         return 1
 
+    apply_config_verbosity(args, config)
     print(f"Configuration: {config_path}")
     print("=" * 60)
     print()
@@ -208,6 +210,7 @@ def _execute_config_restore(args: argparse.Namespace, volume_path: str) -> int:
         logger.error("Failed to load config: %s", e)
         return 1
 
+    apply_config_verbosity(args, config)
     # Find the requested volume
     volume = None
     for vol in config.get_enabled_volumes():

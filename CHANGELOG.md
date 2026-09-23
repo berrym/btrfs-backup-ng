@@ -5,6 +5,23 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **`[global] quiet`, `verbose` and `btrfs_debug` reach the console.** The
+  console is set up from the command line before the configuration is read,
+  so `quiet = true` printed exactly what a config without it did,
+  `verbose = true` showed no debug output, and `btrfs_debug = true` turned
+  on btrfs's `-vv` output but left the console at the level that drops it:
+  without a `log_file` the setting showed nothing. Every command that reads a
+  configuration now applies them as soon as it has loaded it: `btrfs_debug`
+  and `verbose` show debug output, `quiet` shows warnings and errors only. A
+  `-q`, `-v`, `--debug` or `--btrfs-debug` on the command line still wins. Only
+  the console changes; a configured `log_file` keeps its own level. The line
+  naming the configuration file is printed before the file is read, so it
+  follows the command line alone.
+
 ## [0.9.9] - 2026-09-23
 
 Restore now runs through the same planner and executor as a backup. Three

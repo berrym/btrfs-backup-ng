@@ -9,6 +9,7 @@ from .. import __util__, endpoint
 from ..__logger__ import add_file_handler, create_logger
 from ..config import ConfigError, find_config_file, load_config
 from .common import (
+    apply_config_verbosity,
     btrfs_debug_enabled,
     create_snapshot_dir,
     get_log_level,
@@ -55,6 +56,7 @@ def execute_snapshot(args: argparse.Namespace) -> int:
     # went to the console only -- an operator running from cron or systemd
     # with log_file set had a log that silently omitted every config
     # warning, which is the one place they would look afterwards.
+    apply_config_verbosity(args, config)
     for warning in warnings:
         logger.warning("Config: %s", warning)
 

@@ -12,6 +12,7 @@ from ..config import ConfigError, find_config_file, load_config
 from btrfs_backup_ng import __util__
 
 from .common import (
+    apply_config_verbosity,
     btrfs_debug_enabled,
     get_log_level,
     get_timestamp_format,
@@ -53,6 +54,7 @@ def execute_list(args: argparse.Namespace) -> int:
         logger.error("Configuration error: %s", e)
         return 1
 
+    apply_config_verbosity(args, config)
     # Filter volumes if --volume specified
     volume_filter = getattr(args, "volume", None)
     volumes = config.get_enabled_volumes()

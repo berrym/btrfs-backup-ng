@@ -37,6 +37,7 @@ from ..notifications import (
 from ..retention import RetentionError
 from ..transaction import set_transaction_log
 from .common import (
+    apply_config_verbosity,
     assert_target_mounted,
     get_log_level,
     get_timestamp_format,
@@ -177,6 +178,7 @@ def execute_run(args: argparse.Namespace) -> int:
         # went to the console only -- an operator running from cron or systemd
         # with log_file set had a log that silently omitted every config
         # warning, which is the one place they would look afterwards.
+    apply_config_verbosity(args, config)
     for warning in warnings:
         logger.warning("Config: %s", warning)
 
