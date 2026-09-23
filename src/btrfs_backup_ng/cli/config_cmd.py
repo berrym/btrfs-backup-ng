@@ -469,6 +469,240 @@ def _generate_config_from_wizard(config_data: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+# What the wizard ASKS about. Its answers are authoritative even where it
+# writes nothing: a blank log_file means "no log file", declining email means
+# "no email", and an old value must not come back because the answer was to
+# leave it out. Everything else in an existing configuration -- the options
+# the wizard never asks about -- is carried over when it saves over one.
+_WIZARD_GLOBAL_KEYS = frozenset(
+    {
+        "snapshot_dir",
+        "timestamp_format",
+        "incremental",
+        "log_file",
+        "transaction_log",
+        "parallel_volumes",
+        "parallel_targets",
+        # Asked as a whole: carrying a `keep = N` beside the bucket counts the
+        # operator just gave would silently override them.
+        "retention",
+    }
+)
+_WIZARD_NOTIFICATION_KEYS = frozenset({"email", "webhook"})
+_WIZARD_VOLUME_KEYS = frozenset({"path", "snapshot_prefix", "source", "snapper"})
+_WIZARD_TARGET_KEYS = frozenset(
+    {
+        "path",
+        "ssh_sudo",
+        "require_mount",
+        "encrypt",
+        "gpg_recipient",
+        "gpg_keyring",
+        "openssl_cipher",
+    }
+)
+
+
+class CarryOver:
+    """What saving the wizard's configuration over an existing one keeps,
+    replaces with the wizard's answers, and removes."""
+
+    def __init__(self) -> None:
+        self.kept: list[str] = []
+        self.replaced: list[str] = []
+        self.removed: list[str] = []
+
+    @staticmethod
+    def _describe(table: dict) -> str:
+        return ", ".join(f"{k} = {_describe_value(v)}" for k, v in table.items())
+
+
+def _describe_value(value: Any) -> str:
+    if isinstance(value, dict):
+        return "{...}"
+    if isinstance(value, list) and value and isinstance(value[0], dict):
+        return f"[{len(value)} table(s)]"
+    return str(value)
+
+
+def _carry_keys(
+    old: dict, new: dict, asked: frozenset, where: str, report: CarryOver
+) -> None:
+    """Copy into ``new`` every key of ``old`` the wizard does not ask about;
+    record an asked-about key the wizard's answer replaced or removed."""
+    for key, value in old.items():
+        if key in asked:
+            if key not in new:
+                report.replaced.append(f"{where}{key} = {_describe_value(value)}")
+            elif new[key] != value and isinstance(value, dict):
+                gone = {k: v for k, v in value.items() if k not in new[key]}
+                if gone:
+                    report.replaced.append(f"{where}{key}: {CarryOver._describe(gone)}")
+            continue
+        if key not in new:
+            new[key] = value
+            report.kept.append(f"{where}{key} = {_describe_value(value)}")
+
+
+def carry_over_existing(
+    new_content: str, existing_content: str
+) -> tuple[str, CarryOver]:
+    """The wizard's configuration with what it does not ask about carried over
+    from the configuration it is about to replace.
+
+    Volumes are matched by path and targets by path within their volume. A
+    matched one keeps every option the wizard does not ask about; the
+    wizard's answers win for everything it does. A volume or target in the
+    existing file that the new one does not have is reported as removed with
+    its options, since there is nothing to carry them onto. The result is
+    written with ``__util__.dump_toml``; comments in the existing file are
+    not kept.
+    """
+    import tomllib
+
+    old = tomllib.loads(existing_content)
+    new = tomllib.loads(new_content)
+    report = CarryOver()
+
+    old_global = dict(old.get("global", {}))
+    new_global = new.setdefault("global", {})
+    old_notifications = old_global.pop("notifications", None)
+    _carry_keys(old_global, new_global, _WIZARD_GLOBAL_KEYS, "global.", report)
+    if isinstance(old_notifications, dict):
+        new_notifications = new_global.setdefault("notifications", {})
+        _carry_keys(
+            old_notifications,
+            new_notifications,
+            _WIZARD_NOTIFICATION_KEYS,
+            "global.notifications.",
+            report,
+        )
+        if not new_notifications:
+            del new_global["notifications"]
+
+    for key, value in old.items():
+        if key not in ("global", "volumes") and key not in new:
+            new[key] = value
+            report.kept.append(f"{key} = {_describe_value(value)}")
+
+    new_volumes = {v.get("path"): v for v in new.get("volumes", [])}
+    for old_volume in old.get("volumes", []):
+        vpath = old_volume.get("path")
+        volume = new_volumes.get(vpath)
+        if volume is None:
+            count = len(old_volume.get("targets", []))
+            report.removed.append(
+                f"volume {vpath} and its {count} target(s): it is not in the new "
+                f"configuration"
+            )
+            continue
+        old_targets = old_volume.get("targets", [])
+        _carry_keys(
+            {k: v for k, v in old_volume.items() if k != "targets"},
+            volume,
+            _WIZARD_VOLUME_KEYS,
+            f"volume {vpath}: ",
+            report,
+        )
+        new_targets = {t.get("path"): t for t in volume.get("targets", [])}
+        for old_target in old_targets:
+            tpath = old_target.get("path")
+            target = new_targets.get(tpath)
+            if target is None:
+                extra = {k: v for k, v in old_target.items() if k != "path"}
+                report.removed.append(
+                    f"target {tpath} of volume {vpath}: it is not in the new "
+                    f"configuration"
+                    + (f" ({CarryOver._describe(extra)})" if extra else "")
+                )
+                continue
+            _carry_keys(
+                old_target,
+                target,
+                _WIZARD_TARGET_KEYS,
+                f"target {tpath}: ",
+                report,
+            )
+
+    header = (
+        "# btrfs-backup-ng configuration\n"
+        "# Written by the config wizard. Options it does not ask about were kept\n"
+        "# from the configuration this file replaced.\n"
+    )
+    return __util__.dump_toml(new, header=header), report
+
+
+def _show_carry_over(report: CarryOver) -> None:
+    """Say, before anything is written, what the save keeps and what it drops."""
+    if report.kept:
+        console.print()
+        console.print(
+            "[bold]Kept from the existing configuration[/bold] "
+            "(the wizard does not ask about these):"
+        )
+        for line in report.kept:
+            console.print(f"  {line}")
+    if report.replaced:
+        console.print()
+        console.print("[bold]Replaced by your answers:[/bold]")
+        for line in report.replaced:
+            console.print(f"  {line}")
+    if report.removed:
+        console.print()
+        console.print("[bold yellow]Removed:[/bold yellow]")
+        for line in report.removed:
+            console.print(f"  {line}")
+
+
+def _content_for_overwrite(content: str, path: Path) -> str | None:
+    """The configuration to write over ``path``: the wizard's, with what it
+    does not ask about carried over from ``path``, after saying what that
+    keeps and removes. None when the existing file cannot be read as TOML --
+    it is then written as the wizard produced it, and the caller's overwrite
+    prompt is the operator's decision, as before."""
+    try:
+        existing = path.read_text(encoding="utf-8")
+    except OSError as e:
+        console.print(
+            f"[yellow]Could not read {path} to keep its options: {e}[/yellow]"
+        )
+        return None
+    try:
+        merged, report = carry_over_existing(content, existing)
+    except Exception as e:  # noqa: BLE001 - reported; the operator still decides
+        console.print(
+            f"[yellow]{path} is not a configuration this wizard can read ({e}); "
+            f"nothing can be kept from it, and saving replaces it entirely.[/yellow]"
+        )
+        return None
+    reason = _unloadable_reason(merged)
+    if reason is not None:
+        console.print(
+            f"[yellow]Keeping the existing options would produce a configuration "
+            f"that does not load ({reason}); saving writes the wizard's own "
+            f"instead, and replaces them.[/yellow]"
+        )
+        return None
+    _show_carry_over(report)
+    return merged
+
+
+def _confirm_overwrite(content: str, path: Path, question: str) -> str | None:
+    """Ask before the wizard's configuration replaces ``path``; return what
+    to write, or None when the operator declines.
+
+    What is written is the wizard's configuration with the options it does
+    not ask about carried over from ``path`` (``_content_for_overwrite``),
+    and the question is asked only after the operator has been told what the
+    save keeps and what it removes. Every save of a wizard configuration over
+    an existing file goes through here.
+    """
+    content = _content_for_overwrite(content, path) or content
+    if not prompt_bool(question, False):
+        return None
+    return content
+
+
 def _run_interactive_wizard() -> str:
     """Run interactive configuration wizard and return TOML content."""
     display_wizard_header(
@@ -798,9 +1032,13 @@ def _init_config(args: argparse.Namespace) -> int:
     if output:
         if _output_would_clobber(output, force=getattr(args, "force", False)):
             if interactive:
-                if not prompt_bool(f"\nFile {output} exists. Overwrite?", False):
+                confirmed = _confirm_overwrite(
+                    content, Path(output), f"\nFile {output} exists. Overwrite?"
+                )
+                if confirmed is None:
                     console.print("[yellow]Aborted.[/yellow]")
                     return 1
+                content = confirmed
             else:
                 print(
                     f"Error: {output} already exists. "
@@ -860,9 +1098,13 @@ def _init_config(args: argparse.Namespace) -> int:
             save_file.parent.mkdir(parents=True, exist_ok=True)
 
             if save_file.exists():
-                if not prompt_bool(f"File {save_path} exists. Overwrite?", False):
+                confirmed = _confirm_overwrite(
+                    content, save_file, f"File {save_path} exists. Overwrite?"
+                )
+                if confirmed is None:
                     console.print("[yellow]Aborted.[/yellow]")
                     return 1
+                content = confirmed
 
             save_file.write_text(content, encoding="utf-8")
             console.print()
@@ -1266,9 +1508,13 @@ def _save_wizard_config(content: str) -> int:
         save_file.parent.mkdir(parents=True, exist_ok=True)
 
         if save_file.exists():
-            if not prompt_bool(f"File {save_path} exists. Overwrite?", False):
+            confirmed = _confirm_overwrite(
+                content, save_file, f"File {save_path} exists. Overwrite?"
+            )
+            if confirmed is None:
                 console.print("[yellow]Aborted.[/yellow]")
                 return 0
+            content = confirmed
 
         save_file.write_text(content, encoding="utf-8")
         console.print()
@@ -1724,10 +1970,16 @@ def _run_detection_wizard(result) -> int:
                 "summary",
             )
             console.print()
+            # Against what saving over that file would write: the options the
+            # wizard does not ask about are kept, so they are not changes.
+            try:
+                compared, _report = carry_over_existing(new_config, existing_content)
+            except Exception:  # noqa: BLE001 - an unreadable file compares as-is
+                compared = new_config
             if diff_format == "summary":
-                _show_config_diff_summary(existing_content, new_config, config_data)
+                _show_config_diff_summary(existing_content, compared, config_data)
             else:
-                _show_config_diff_text(existing_content, new_config)
+                _show_config_diff_text(existing_content, compared)
             console.print()
 
     # Step 6: Save options
@@ -1773,9 +2025,13 @@ def _run_detection_wizard(result) -> int:
 
         # Check for overwrite
         if save_file.exists():
-            if not prompt_bool(f"Overwrite {save_path}?", False):
+            confirmed = _confirm_overwrite(
+                new_config, save_file, f"Overwrite {save_path}?"
+            )
+            if confirmed is None:
                 console.print("[yellow]Save cancelled.[/yellow]")
                 return 0
+            new_config = confirmed
 
         save_file.write_text(new_config, encoding="utf-8")
         console.print()

@@ -51,6 +51,22 @@ unattended where the remote grants passwordless `btrfs`.
   the console changes; a configured `log_file` keeps its own level. The line
   naming the configuration file is printed before the file is read, so it
   follows the command line alone.
+- **The configuration wizard, saved over an existing configuration, kept
+  only what it asks about.** It builds its configuration from its prompts
+  and writes a target's path, `ssh_sudo`, `require_mount` and (for raw
+  targets) encryption -- so saving over a file dropped every other option.
+  A target's `ssh_host_key_policy = "strict"` became trust on first use,
+  `ssh_key` and `ssh_port` vanished and the next run could not authenticate,
+  an `optional` drive became a required one, and a target's own `retention`
+  and a volume's `source_retention` were lost, behind an "Overwrite?" prompt
+  whose default summary showed only per-volume counts. Volumes and targets are
+  now matched by path and every option the wizard does not ask about is
+  carried over; its answers win for what it does ask, including an option
+  answered by leaving it out. Before the prompt it lists what it kept and
+  what it will remove -- a volume or target the new configuration no longer
+  has, with its options. This applies to every path that saves a wizard
+  configuration over a file, and the "view changes" comparison shows what
+  will actually be written.
 
 ### Changed
 
