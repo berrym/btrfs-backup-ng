@@ -5,12 +5,28 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.9.10] - 2026-09-23
 
-`snapper restore` now does what its documentation and the README's
-disaster-recovery walkthrough say: restoring one snapshot onto media that
-holds nothing lands it, and an `ssh://` source with `--ssh-sudo` runs
-unattended where the remote grants passwordless `btrfs`.
+This release fixes behaviour that did not match what the tool documents.
+`snapper restore` now does what the README's disaster-recovery walkthrough
+says: one snapshot restored onto empty media lands, and an `ssh://` source
+with `--ssh-sudo` runs unattended where the remote grants passwordless
+`btrfs`. `[global] quiet`, `verbose` and `btrfs_debug` now take effect, and
+the configuration wizard no longer drops options it does not ask about when
+it saves over a configuration.
+
+Three changes an upgrade can notice:
+
+- **Retention now prunes snapshots named with a collision counter**
+  (`home-20260923_1`), which earlier releases kept forever. The first `run`
+  after upgrading applies each policy to them, on the source and on every
+  target, and `run` prunes without asking; run `prune --dry-run` first to see
+  what it will remove.
+- **`run` sends a target that is behind only what its prune will keep**, so a
+  catch-up transfers fewer snapshots and ends with the same ones.
+- **`snapper restore` runs one at a time per config**, and a second one is
+  refused with the reason. It leaves a lock file,
+  `.snapshots/.btrfs-backup-ng.restore.lock`, in the config.
 
 ### Fixed
 
