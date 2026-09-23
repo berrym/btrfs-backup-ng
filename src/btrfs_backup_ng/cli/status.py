@@ -11,6 +11,7 @@ from ..transaction import get_transaction_stats, read_transaction_log
 from btrfs_backup_ng import __util__
 
 from .common import (
+    apply_config_verbosity,
     btrfs_debug_enabled,
     get_log_level,
     get_timestamp_format,
@@ -69,6 +70,7 @@ def execute_status(args: argparse.Namespace) -> int:
         logger.error("Configuration error: %s", e)
         return 1
 
+    apply_config_verbosity(args, config)
     volumes = config.get_enabled_volumes()
 
     if not volumes:

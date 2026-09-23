@@ -99,6 +99,30 @@ def set_level(level) -> None:
         handler.setLevel(level)
 
 
+def set_console_level(level) -> None:
+    """Change what the CONSOLE shows, and nothing else.
+
+    A setting that arrives after the logger was created -- ``[global] quiet``,
+    ``verbose`` or ``btrfs_debug`` in a configuration read after the command
+    line -- must reach the console handler, and must not reach the log file:
+    ``quiet`` means "less on the screen", not "less in the record". ``set_level``
+    changes every handler, the file included, so it is not used for this.
+    The loggers themselves stay open to the most verbose level any handler
+    wants, since a logger's level filters a record before any handler sees it.
+    """
+    if isinstance(level, str):
+        level = getattr(logging, level.upper(), logging.INFO)
+    rich_handler.setLevel(level)
+    for handler in logging.getLogger().handlers:
+        if handler is not _file_handler:
+            handler.setLevel(level)
+    floor = level
+    if _file_handler is not None:
+        floor = min(floor, _file_handler.level)
+    logger.setLevel(floor)
+    logging.getLogger().setLevel(level)
+
+
 def create_logger(live_layout, level=None) -> None:
     """Helper function to setup logging depending on visual display options.
 

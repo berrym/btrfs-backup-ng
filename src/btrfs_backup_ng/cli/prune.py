@@ -24,6 +24,7 @@ from ..notifications import (
 )
 from ..retention import RetentionError, apply_retention, parse_duration
 from .common import (
+    apply_config_verbosity,
     btrfs_debug_enabled,
     resolve_snapshot_dir,
     assert_target_mounted,
@@ -461,6 +462,7 @@ def execute_prune(args: argparse.Namespace) -> int:
     # went to the console only -- an operator running from cron or systemd
     # with log_file set had a log that silently omitted every config
     # warning, which is the one place they would look afterwards.
+    apply_config_verbosity(args, config)
     for warning in warnings:
         logger.warning("Config: %s", warning)
 

@@ -17,7 +17,7 @@ from ..core.doctor import (
     DiagnosticSeverity,
     Doctor,
 )
-from .common import get_log_level
+from .common import apply_config_verbosity, get_log_level
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +56,8 @@ def execute_doctor(args: argparse.Namespace) -> int:
                 logger.warning("Config: %s", warning)
         except ConfigError:
             pass  # Doctor will report this
+    if config is not None:
+        apply_config_verbosity(args, config)
 
     # Parse categories to check
     categories = None

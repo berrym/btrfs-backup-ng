@@ -10,6 +10,7 @@ from ..__logger__ import add_file_handler, create_logger
 from ..config import ConfigError, find_config_file, load_config
 from ..core.operations import sync_snapshots
 from .common import (
+    apply_config_verbosity,
     btrfs_debug_enabled,
     resolve_snapshot_dir,
     assert_target_mounted,
@@ -61,6 +62,7 @@ def execute_transfer(args: argparse.Namespace) -> int:
         # went to the console only -- an operator running from cron or systemd
         # with log_file set had a log that silently omitted every config
         # warning, which is the one place they would look afterwards.
+    apply_config_verbosity(args, config)
     for warning in warnings:
         logger.warning("Config: %s", warning)
 

@@ -397,6 +397,47 @@ def btrfs_debug_enabled(args: argparse.Namespace | None, config=None) -> bool:
     return bool(getattr(global_config, "btrfs_debug", False))
 
 
+def config_log_level(args: argparse.Namespace | None, config=None) -> str | None:
+    """The console level the configuration asks for, or None to leave it be.
+
+    The command line decides first: any of ``--debug``, ``--btrfs-debug``,
+    ``-q`` or ``-v`` means the operator chose for this run, and the
+    configuration is not consulted. Otherwise ``[global]`` decides, in the order
+    the flags use: ``btrfs_debug`` (its lines are logged at DEBUG, so it is
+    only visible there), then ``quiet``, then ``verbose``.
+    """
+    if args is not None and any(
+        getattr(args, flag, False)
+        for flag in ("debug", "btrfs_debug", "quiet", "verbose")
+    ):
+        return None
+    global_config = getattr(config, "global_config", None)
+    if global_config is None:
+        return None
+    if getattr(global_config, "btrfs_debug", False):
+        return "DEBUG"
+    if getattr(global_config, "quiet", False):
+        return "WARNING"
+    if getattr(global_config, "verbose", False):
+        return "DEBUG"
+    return None
+
+
+def apply_config_verbosity(args: argparse.Namespace | None, config=None) -> None:
+    """Apply ``[global] quiet`` / ``verbose`` / ``btrfs_debug`` to the console.
+
+    Called by every command right after it loads its configuration. The logger
+    is created from the command line before the configuration exists, so
+    without this the three settings were parsed and never read. Only the
+    console changes; a configured ``log_file`` keeps its own level.
+    """
+    level = config_log_level(args, config)
+    if level is not None:
+        from ..__logger__ import set_console_level
+
+        set_console_level(level)
+
+
 def get_timestamp_format(config=None) -> str:
     """Return the configured snapshot ``timestamp_format`` or the built-in default.
 

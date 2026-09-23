@@ -28,6 +28,7 @@ from ..core.space import (
     format_space_check,
 )
 from .common import (
+    apply_config_verbosity,
     resolve_snapshot_dir,
     get_fs_checks_mode,
     get_log_level,
@@ -98,6 +99,7 @@ def _estimate_from_config(args: argparse.Namespace, volume_path: str) -> int:
         logger.error("Failed to load config: %s", e)
         return 1
 
+    apply_config_verbosity(args, config)
     # Find volume
     volume = None
     for vol in config.get_enabled_volumes():

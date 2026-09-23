@@ -39,6 +39,18 @@ unattended where the remote grants passwordless `btrfs`.
   found. Restarting the daemon does (`systemctl restart snapperd`), as does a
   reboot. The restore's reminder, the README, the snapper guide, the CLI
   reference and the man page now say so.
+- **`[global] quiet`, `verbose` and `btrfs_debug` reach the console.** The
+  console is set up from the command line before the configuration is read,
+  so `quiet = true` printed exactly what a config without it did,
+  `verbose = true` showed no debug output, and `btrfs_debug = true` turned
+  on btrfs's `-vv` output but left the console at the level that drops it:
+  without a `log_file` the setting showed nothing. Every command that reads a
+  configuration now applies them as soon as it has loaded it: `btrfs_debug`
+  and `verbose` show debug output, `quiet` shows warnings and errors only. A
+  `-q`, `-v`, `--debug` or `--btrfs-debug` on the command line still wins. Only
+  the console changes; a configured `log_file` keeps its own level. The line
+  naming the configuration file is printed before the file is read, so it
+  follows the command line alone.
 
 ### Changed
 

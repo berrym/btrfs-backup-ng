@@ -321,8 +321,10 @@ log_file = "/var/log/btrfs-backup-ng.log"           # Optional rotating log file
 transaction_log = "/var/log/btrfs-backup-ng.jsonl"  # Optional JSON transaction log
 parallel_volumes = 2                   # Concurrent volume backups
 parallel_targets = 3                   # Concurrent target transfers
-quiet = false                          # Suppress non-essential output
-verbose = false                        # Enable verbose output
+quiet = false                          # Console shows warnings and errors only
+verbose = false                        # Console shows debug output (same as -v)
+                                       # Both affect the console, never log_file,
+                                       # and a -q, -v or --debug flag overrides them
 btrfs_debug = false                    # Run btrfs send/receive with -vv and log every
                                        # line they print (one per file operation);
                                        # implies debug logging. Also --btrfs-debug
