@@ -30,6 +30,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any, Callable
 
+from . import __util__
 from .config import RetentionConfig
 
 logger = logging.getLogger(__name__)
@@ -227,7 +228,24 @@ def extract_timestamp(
     name = snapshot_name
     if prefix and name.startswith(prefix):
         name = name[len(prefix) :]
+    found = _extract_from(name, preferred_fmt)
+    if found is not None:
+        return found
+    # A trailing ``_N`` -- the collision counter this tool and btrbk append
+    # when a timestamp recurs (a coarse timestamp_format, a scheduler that
+    # fires twice) -- is dated by the timestamp before it, the way every
+    # listing dates it (``__util__.derive_snapshot_time``). Tried only after
+    # the name as written has failed, so a timestamp that itself ends in
+    # ``_<digits>`` keeps the meaning it has today: ``20260904_120000`` is
+    # noon, never midnight with an ordinal of 120000.
+    match = __util__._TRAILING_ORDINAL_RE.search(name)
+    if match:
+        return _extract_from(name[: match.start()], preferred_fmt)
+    return None
 
+
+def _extract_from(name: str, preferred_fmt: str | None) -> datetime | None:
+    """``extract_timestamp``'s parse of one candidate string."""
     # Common timestamp formats (fallbacks).
     formats = [
         "%Y%m%d-%H%M%S",  # 20240115-143022
@@ -414,7 +432,12 @@ def apply_retention(
             )
 
     # Sort valid snapshots newest-first (quarantined entries never participate in ordering).
-    valid_infos.sort(key=lambda s: s.timestamp, reverse=True)
+    # Snapshots sharing a timestamp -- ``X``, ``X_1``, ``X_2`` under a coarse format --
+    # order by their collision counter, so "latest" is the last one created and the
+    # oldest-first bucket walk keeps the first.
+    valid_infos.sort(
+        key=lambda s: (s.timestamp, __util__._name_ordinal(s.name)), reverse=True
+    )
 
     # Rule 1: Always keep the latest VALID snapshot (never a quarantined entry).
     if valid_infos and not valid_infos[0].keep:
