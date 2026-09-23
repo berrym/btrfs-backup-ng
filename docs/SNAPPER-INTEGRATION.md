@@ -102,8 +102,9 @@ btrfs-backup-ng snapper restore /mnt/backup/root root --snapshot 559
 ```
 
 A restored snapshot lands in the config's `.snapshots/{N}/` and integrates with snapper —
-but the snapper **daemon** caches its snapshot list, so run `snapper -c root list` (or
-reboot) after a restore before `snapper diff`/`undochange`/rollback against it (the restore
+but the snapper **daemon** caches its snapshot list, so restart it
+(`sudo systemctl restart snapperd`, or reboot) after a restore before
+`snapper diff`/`undochange`/rollback against it (the restore
 command reminds you). To roll back, prefer snapper's own flow: boot the read-only
 grub-btrfs entry, then `snapper rollback`. For a root-owned `raw+ssh://` backup written with
 `--ssh-sudo`, pass `--ssh-sudo` to `restore` too.
@@ -336,16 +337,16 @@ or `--all`.
 
 A restored snapshot is written **directly** into `.snapshots/{N}/` (not via
 `snapper create`), so the snapper **daemon caches** its snapshot list and will not see the
-new slot until it rescans — `snapper diff`/`undochange`/rollback may report *"Snapshot 'N'
-not found"* immediately after a restore. The command prints a reminder; run `snapper list`
-(or reboot) first:
+new slot until it reloads — `snapper diff`/`undochange`/rollback may report *"Snapshot 'N'
+not found"* immediately after a restore. A `snapper list` does not make it look again;
+restarting the daemon does (or a reboot). The command prints a reminder:
 
 ```bash
 sudo btrfs-backup-ng snapper restore /mnt/backup/root root --snapshot 559
-#   -> "Restored ... Note: run 'snapper -c root list' (or reboot) so snapper's daemon
-#      picks up the restored snapshot(s) before 'snapper diff'/'undochange'/rollback."
+#   -> "Note: restart snapper's daemon ('systemctl restart snapperd', as root) or
+#      reboot so it sees the restored snapshot(s) in config root before ..."
 
-snapper -c root list          # triggers the daemon rescan
+sudo systemctl restart snapperd   # the daemon reloads its snapshot list
 snapper -c root diff 890..0   # now works against the restored slot (890 = new number)
 ```
 

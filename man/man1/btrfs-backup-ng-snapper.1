@@ -223,11 +223,11 @@ is pinned on its location for the duration (released if a transfer fails);
 refused before anything is transferred.
 .PP
 A restored snapshot is written directly into \fI.snapshots/{N}/\fR (not via
-\fBsnapper create\fR), so the Snapper daemon does not see it until it rescans. Run
-\fBsnapper \-c \fICONFIG\fB list\fR (or reboot) after a restore before using
+\fBsnapper create\fR), so the Snapper daemon does not see it until it reloads. Restart
+it (\fBsystemctl restart snapperd\fR, as root) or reboot after a restore before using
 \fBsnapper diff\fR, \fBsnapper undochange\fR, or a rollback against it; the command
 prints a reminder. The on\-disk snapshot is complete and correct \(em only the daemon's
-in\-memory view lags. Restored slots use Snapper's native \fB0755\fR directory mode.
+in\-memory view lags, and \fBsnapper list\fR alone does not make it look again. Restored slots use Snapper's native \fB0755\fR directory mode.
 .PP
 For a \fBraw+ssh://\fR source written with \fB\-\-ssh-sudo\fR (root\-owned remote
 directory), pass \fB\-\-ssh-sudo\fR to \fBrestore\fR as well, or it will report a

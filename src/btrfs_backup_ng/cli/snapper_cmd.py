@@ -823,12 +823,15 @@ def _handle_restore(args: argparse.Namespace) -> int:
 
     # snapperd caches its snapshot list, so a slot created out-of-band (here, not via
     # `snapper create`) is not visible to `snapper diff`/`undochange`/etc. until the
-    # daemon rescans. Nudge the user -- `snapper list` (or a reboot) triggers the rescan.
+    # daemon reloads. Measured: `snapper list` does NOT make it reload (the slot stays
+    # absent across repeated lists); restarting snapperd does, and so does a reboot.
     if restored_count > 0 and not args.dry_run:
         logger.info("")
         logger.info(
-            "Note: run 'snapper -c %s list' (or reboot) so snapper's daemon picks up "
-            "the restored snapshot(s) before 'snapper diff'/'undochange'/rollback.",
+            "Note: restart snapper's daemon ('systemctl restart snapperd', as root) "
+            "or reboot so it sees the restored snapshot(s) in config %s before "
+            "'snapper diff'/'undochange'/rollback; 'snapper list' alone does not "
+            "make it look again.",
             args.config,
         )
 

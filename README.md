@@ -2523,8 +2523,9 @@ only be received onto its parent, and there is no full stream to send instead.
 
 > **After a restore, refresh the daemon.** The slot is written directly to disk (not via
 > `snapper create`), so the snapper **daemon caches** its list and won't see it until it
-> rescans — `snapper diff`/`undochange`/rollback may say *"Snapshot 'N' not found"*. Run
-> `snapper -c <config> list` (or reboot) first (the command prints a reminder). See
+> reloads — `snapper diff`/`undochange`/rollback may say *"Snapshot 'N' not found"*.
+> Restart the daemon first, `sudo systemctl restart snapperd` (or reboot); a
+> `snapper list` does not make it look again (the command prints a reminder). See
 > [Snapper Integration](docs/SNAPPER-INTEGRATION.md#restoration) for the full workflow.
 
 #### Check Backup Status
@@ -2706,9 +2707,9 @@ sudo btrfs-backup-ng snapper restore \
     --snapshot 560 --ssh-sudo
 
 # 5. The restore reports a NEW local number, e.g. "restored as local snapshot 4".
-#    Refresh the snapper daemon so it sees the out-of-band slot, then roll back to
+#    Restart the snapper daemon so it sees the out-of-band slot, then roll back to
 #    that NEW number (not the backup's original 560).
-snapper -c root list           # refresh the daemon cache
+systemctl restart snapperd     # the daemon reloads its snapshot list
 snapper -c root rollback 4     # use the number the restore reported
 ```
 

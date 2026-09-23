@@ -32,6 +32,13 @@ unattended where the remote grants passwordless `btrfs`.
   native restore run never recorded that `sudo -n` would do, and the remote
   `btrfs send` was issued as `sudo -S`. The source is prepared like every
   other endpoint, and the walkthrough's command runs unattended.
+- **After a snapper restore, the tool told you to run `snapper -c <config>
+  list` so snapper's daemon would see the restored snapshots. That does not
+  work:** snapperd keeps its cached list across repeated `snapper list` calls,
+  and `snapper diff`/`undochange`/rollback go on reporting the slot as not
+  found. Restarting the daemon does (`systemctl restart snapperd`), as does a
+  reboot. The restore's reminder, the README, the snapper guide, the CLI
+  reference and the man page now say so.
 
 ### Changed
 

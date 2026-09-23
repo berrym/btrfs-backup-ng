@@ -971,7 +971,7 @@ btrfs-backup-ng snapper restore /mnt/backup/root root --snapshot 559 --date 2024
 
 > **Note — snapper daemon cache.** A restored snapshot is written directly into
 > `.snapshots/{N}/` (not via `snapper create`), so `snapperd` does not see it until it
-> rescans. Run `snapper -c <config> list` (or reboot) after a restore before using
+> reloads. Restart it (`sudo systemctl restart snapperd`, or reboot) after a restore before using
 > `snapper diff`, `snapper undochange`, or a rollback against the restored snapshot; the
 > restore command prints a reminder. The on-disk snapshot is complete and correct — this
 > only affects the daemon's in-memory view. Restored slots use snapper's native `0755`

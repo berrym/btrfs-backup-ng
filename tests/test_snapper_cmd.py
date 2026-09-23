@@ -1745,13 +1745,15 @@ class TestRestoreSnapperdCacheHint:
     def test_hint_printed_after_successful_restore(self, capsys, mock_snapper_configs):
         result, text = self._run(self._args(), mock_snapper_configs, capsys)
         assert result == 0
-        assert "daemon picks up the restored" in text
-        assert "snapper -c root list" in text
+        assert "systemctl restart snapperd" in text
+        assert "in config root" in text
+        # The advice it replaced did not work: a list does not reload snapperd.
+        assert "run 'snapper -c root list'" not in text
 
     def test_no_hint_on_dry_run(self, capsys, mock_snapper_configs):
         result, text = self._run(self._args(dry_run=True), mock_snapper_configs, capsys)
         assert result == 0
-        assert "daemon picks up the restored" not in text
+        assert "systemctl restart snapperd" not in text
 
 
 class TestRestoreNameDateSelection:
