@@ -201,6 +201,27 @@ Show what would be restored without making changes.
 .B \-\-json
 Output in JSON format (with \fB\-\-list\fR).
 .PP
+A restore is a transfer through the same planner and executor a backup uses,
+into Snapper's own layout. The selection is restored exactly as given, never
+expanded to a chain (\fB\-\-all\fR selects everything). Each increment's parent
+is chosen from what the local config already holds, by identity (a slot's
+received_uuid against the identity the backup's stream carries), never by
+Snapper number: a backup whose parent is already restored is received as an
+increment from that copy, one whose parent is not there is received in full.
+Onto empty recovery media, \fB\-\-snapshot \fIN\fR is one full send into slot 1.
+Every selected backup lands in a NEW slot whether or not a copy is already
+there. The copy is received into \fI.snapshots/{N}.incoming/\fR, checked, given
+its renumbered \fIinfo.xml\fR and only then renamed to \fI.snapshots/{N}/\fR, so a
+restore that fails mid\-receive leaves no numbered slot and no temp. The number is
+decided when the copy is published, with a rename that cannot replace an existing
+entry: a snapshot Snapper creates while the restore runs keeps its slot and the copy
+lands under the next free number. One restore runs into a config at a time; a second
+started meanwhile is refused. The backup
+is pinned on its location for the duration (released if a transfer fails);
+\fB\-\-skip-remote-lock\fR for a location that can be read but not written. A
+\fBraw://\fR increment whose parent is neither in the config nor selected is
+refused before anything is transferred.
+.PP
 A restored snapshot is written directly into \fI.snapshots/{N}/\fR (not via
 \fBsnapper create\fR), so the Snapper daemon does not see it until it rescans. Run
 \fBsnapper \-c \fICONFIG\fB list\fR (or reboot) after a restore before using
@@ -383,8 +404,9 @@ Append to existing config:
 .B btrfs-backup-ng snapper generate-config root --append ~/.config/btrfs-backup-ng/config.toml
 .SH INCREMENTAL TRANSFERS
 Both backup and restore operations use incremental btrfs send/receive when
-possible. The commands automatically detect available parent snapshots and
-use the most efficient transfer method:
+possible. The parent is whatever the DESTINATION already holds, decided by
+identity (received_uuid), so a backup finds its parent among the target's
+slots and a restore finds its parent among the local config's:
 .PP
 .RS
 .nf
@@ -426,6 +448,7 @@ The actual btrfs snapshot subvolume
 Snapper must be installed and configured on the source system. The backup
 destination can be any btrfs filesystem - Snapper is not required there.
 .PP
-Restored snapshots are assigned new snapshot numbers by Snapper on the
-destination system. The original metadata (type, description, date) is
-preserved in info.xml.
+Restored snapshots are assigned the next free snapshot numbers of the local
+config. The info.xml is the backup's own with only the number changed, so
+type, description, date, cleanup, userdata and any element Snapper wrote are
+preserved verbatim.

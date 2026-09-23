@@ -235,10 +235,14 @@ Source                          Destination
 
 ### How It Works
 
-1. **Scan destination** for existing backups
-2. **Find highest-numbered** backup that also exists locally
-3. **Use as parent** for `btrfs send -p` incremental transfer
-4. **Verify integrity** after transfer
+1. **Scan the destination** for the slots it already holds and the identity
+   (`received_uuid`) each carries
+2. **Match by identity**, never by snapper number (snapper reuses numbers after
+   a prune): a local snapshot whose copy is already there is skipped, and the
+   newest older snapshot whose copy is there is the parent
+3. **Use it as the parent** for `btrfs send -p`, or send in full when there is none
+4. **Check what arrived** after each transfer: the slot's `received_uuid` must be
+   the identity the stream carried
 
 ### Transfer Progress
 
@@ -366,17 +370,54 @@ sudo btrfs-backup-ng snapper restore \
 
 ### How restoration works
 
-1. **Resolve the requested backup** (by number → newest on a collision, or by exact
-   `--backup-name` / `--date`).
-2. **Determine the next local snapshot number** by scanning the config's `.snapshots/`.
-3. **Receive the stream** into that fresh `.snapshots/{new_num}/` slot (crash-safe:
-   cleaned up on failure), verifying stream integrity first.
-4. **Write `info.xml`** renumbered to the new slot, preserving the original type,
-   description, cleanup, and **all userdata** (and any element snapper wrote, e.g.
-   `<uid>`), so the restored snapshot is a first-class snapper snapshot.
+A snapper restore is a transfer through the same planner and executor a backup
+uses, with the roles swapped: the backup location is the source, the local
+config's `.snapshots/` is the destination.
 
-Restored snapshots get **new** local numbers (the next available) to avoid conflicts; the
-original metadata — including description and userdata — is preserved in `info.xml`.
+1. **Select** (by number → newest on a collision, or by exact `--backup-name` /
+   `--date`). The selection is planned exactly as given; it is never expanded to
+   a chain. `--all` selects everything.
+2. **Read what the config already holds**, by identity: each slot's
+   `received_uuid` against the identity the backup's stream carries. Snapper
+   numbers are never compared, because snapper reuses them.
+3. **Choose each increment's parent from the config.** A backup whose parent is
+   already restored is received as an increment from that copy; one whose parent
+   is not there is received **in full**. Onto empty recovery media,
+   `--snapshot N` is one full send into slot 1.
+4. **Receive into a `.snapshots/{N}.incoming/` temp**, check the copy there (it
+   must be a subvolume whose `received_uuid` is the backup's identity), and
+   publish it under the number that is free **at that moment**: the renumbered
+   `info.xml` is written for that number and the directory is renamed to
+   `.snapshots/{N}/` with a rename that cannot replace an existing entry. The
+   config is live while the restore runs -- snapper's timeline or a manual
+   `snapper create` may take a number meanwhile -- and that snapshot is never
+   touched: the copy lands under the next free number and the report says
+   which. A restore that fails mid-receive leaves no numbered slot and no
+   `.incoming`; a copy that is not the backup's is not published. One restore
+   runs into a config at a time: a second one started while the first runs is
+   refused with the reason and restores nothing; a temp left by a restore that
+   was killed is removed by the next restore into that config.
+5. **Pin the backup on its location** for the duration (`restore:<session>`,
+   released if a transfer fails), so a prune on that target cannot delete what
+   is being read. A location you can read but not write takes
+   `--skip-remote-lock`.
+
+Every selected backup gets a **new** slot, present or not: snapper keeps every
+snapshot, so a restore is never skipped as "already restored" (restoring 559
+twice gives two slots). `info.xml` is snapper's own with only `<num>` changed,
+so type, description, cleanup, **all userdata** and any element snapper wrote
+(`<uid>`) survive verbatim, from one implementation for local, `ssh://` and raw
+sources alike. `--dry-run` prints the plan the run would execute.
+
+A `raw://` / `raw+ssh://` backup is the stream as written. An incremental
+stream can only be received onto its parent, so an increment whose parent is
+neither in the config nor selected is **refused before a byte moves** and no
+slot is created; select the parent too, or restore it first.
+
+With `--ssh-sudo` on an `ssh://` source whose sudoers grants NOPASSWD `btrfs`,
+the restore runs unattended: the source is prepared like a backup target, so
+the passwordless probe runs before the remote `btrfs send`. `--btrfs-debug`
+puts `-vv` on the send and on the receive into the slot and logs every line.
 
 ## Remote Backups
 

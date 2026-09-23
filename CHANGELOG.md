@@ -5,6 +5,83 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+`snapper restore` now does what its documentation and the README's
+disaster-recovery walkthrough say: restoring one snapshot onto media that
+holds nothing lands it, and an `ssh://` source with `--ssh-sudo` runs
+unattended where the remote grants passwordless `btrfs`.
+
+### Fixed
+
+- **`snapper restore --snapshot N` onto media without the parent failed in
+  the receive.** The incremental parent was chosen from the BACKUP side -- the
+  highest-numbered backup below N -- and only the backup was probed for it, so
+  on recovery media the send went out as an increment the receive had nothing
+  to apply to. That is exactly the situation the README's walkthrough
+  describes. The parent is now chosen from what the LOCAL config already
+  holds, by identity (a slot's received_uuid against the identity the backup's
+  stream carries), never by snapper number, which snapper reuses: a backup
+  whose parent is restored is an increment from that copy, one whose parent is
+  not is a full send. `--snapshot N` onto empty media is one full send into
+  slot 1; `--all` rebuilds the chain with each increment received against the
+  slot before it. The selection is never expanded.
+- **`snapper restore ssh://... --ssh-sudo` demanded a sudo password on a
+  remote that grants NOPASSWD `btrfs`.** The remote endpoint was built without
+  being prepared, so the passwordless probe the backup direction and the
+  native restore run never recorded that `sudo -n` would do, and the remote
+  `btrfs send` was issued as `sudo -S`. The source is prepared like every
+  other endpoint, and the walkthrough's command runs unattended.
+
+### Changed
+
+- **A snapper restore is a transfer through the engine, into the snapper
+  layout.** `restore_snapper_snapshot` had its own `btrfs send`/`btrfs
+  receive` pipes, its own progress handling, three separate ways of writing
+  `info.xml` (one per source kind), no pin on the backup, no check of what
+  arrived, and a cleanup that deleted by existence. It is replaced by the
+  planner and executor every backup uses, with the roles swapped, and by a
+  snapper layout that the backup direction now runs as well: `snapper backup`
+  to a btrfs target and `snapper restore` into a local config open, fill,
+  publish and abandon a numbered slot through the same code. What that gives
+  a restore: the backup is pinned on its location for the duration under
+  `restore:<session>` and released if a transfer fails (a location you can
+  read but not write takes `--skip-remote-lock`); the copy is checked in its
+  slot -- a subvolume whose received_uuid is the backup's identity -- before
+  the slot is published, and a copy that is not the backup's is not
+  published; what the send and the receive print reaches the report through
+  the drain every transfer uses, and `--btrfs-debug` puts `-vv` on both; and
+  `--dry-run` prints the plan the run executes. Every selected backup lands
+  in a NEW slot whether or not a copy is already there, as before.
+- **A slot appears complete or not at all, in both directions.** The
+  `info.xml` is written into `.snapshots/<n>.incoming/` before the directory
+  is renamed to `.snapshots/<n>/`; the backup direction used to write it after
+  the rename, leaving a window in which a published slot had no metadata. A
+  restore that fails mid-receive leaves no numbered slot and no `.incoming`.
+- **A snapshot snapper creates during a restore is never touched, and one
+  restore runs into a config at a time.** The config is live while a restore
+  runs and its temp is invisible to snapper, so snapper's timeline or a manual
+  `snapper create` can take the number the restore was heading for. The copy
+  is now published under the number that is free at that moment, with its
+  `info.xml` renumbered to match, through a rename that cannot replace an
+  existing entry (`renameat2` with `RENAME_NOREPLACE`; an empty directory
+  snapper has just made is refused too, where `rename(2)` would take it
+  over); the report names the number the copy landed under. A second
+  `snapper restore` into the same config while one runs is refused with the
+  reason and restores nothing (an exclusive lock on
+  `.snapshots/.btrfs-backup-ng.restore.lock` in the config, which the kernel
+  releases if the restore is killed); the temp a killed restore leaves is
+  removed by the next restore into that config, and only then.
+- **One `info.xml` for every source.** The restored slot's `info.xml` is the
+  backup's own with only `<num>` changed, from local, `ssh://` and raw
+  sources alike, so `<uid>`, every userdata block and any element snapper
+  wrote survive verbatim. The local-source branch used to parse and
+  regenerate it, which dropped what this tool does not model.
+- **A `raw://` increment whose parent is neither in the config nor selected
+  is refused before a byte moves.** A stored increment applies only onto its
+  parent, and there is no full stream to send instead. It used to stream the
+  whole increment and fail in the receive.
+
 ## [0.9.9] - 2026-09-23
 
 Restore now runs through the same planner and executor as a backup. Three
