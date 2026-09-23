@@ -67,6 +67,22 @@ unattended where the remote grants passwordless `btrfs`.
   has, with its options. This applies to every path that saves a wizard
   configuration over a file, and the "view changes" comparison shows what
   will actually be written.
+- **Retention now manages snapshots named with a collision counter, instead
+  of keeping them forever.** A second snapshot in one period under a coarse
+  `timestamp_format` such as `"%Y%m%d"` -- or a scheduler that fires twice, or
+  a pool migrated from btrbk -- is named `home-20260923_1`, `_2`, and so on.
+  Listings, transfers and restores dated those by the timestamp before the
+  counter, and the listing said retention now managed them; but retention
+  parsed names on its own, found no timestamp, and kept every one on the
+  source and on every target, so under a daily format each extra run of the
+  day accumulated without limit. Retention now reads the counter the way the
+  listings do, and only after the name as written fails, so a timestamp that
+  ends in `_<digits>` keeps its meaning. Snapshots that share a timestamp
+  order by the counter, numerically: the day's first is its bucket's
+  representative, and the last one created is the latest, which is always
+  kept. Measured on real btrfs: three runs in a day under `"%Y%m%d"` and
+  `daily = 7` now keep `home-<day>` and `home-<day>_2` and prune `_1` on the
+  source and the target.
 
 ### Changed
 
