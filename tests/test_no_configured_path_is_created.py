@@ -84,6 +84,10 @@ REGISTRY: dict[str, tuple[str, ...]] = {
     # -- below a verified base ------------------------------------------------
     "_legacy_main.py::prepare_source_endpoint": (BELOW, BELOW),
     "cli/common.py::create_snapshot_dir": (BELOW, BELOW),
+    # The restore run marker lives under DESTINATION/.btrfs-backup-ng/, a
+    # tree the local endpoint's prepare() has already created below a
+    # destination that exists; the marker directory is one component under it.
+    "core/layout.py::PlainLayout._write_marker": (BELOW,),
     "core/operations.py::_snapper_prepare_slot": (BELOW,),
     "endpoint/common.py::Endpoint.snapshot": (BELOW,),
     "endpoint/local.py::LocalEndpoint._prepare": (BELOW,),

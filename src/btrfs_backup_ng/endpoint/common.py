@@ -937,6 +937,53 @@ class Endpoint:
                 found[snapshot.get_name()] = match
         return found
 
+    def required_parent_of(self, snapshot: Any) -> Optional[Any]:
+        """The snapshot at THIS endpoint that must be at a destination before
+        ``snapshot`` is sent there, or None when ``snapshot`` needs nothing.
+
+        Asked of a SOURCE by the planner when a selection names one snapshot:
+        the selection is expanded to the chain these answers describe, so a
+        restore of one snapshot brings the history it depends on. Two kinds of
+        answer live behind the one method. For a btrfs subvolume it is POLICY:
+        a full send always works, and the answer here is the time-ordered
+        predecessor in this endpoint's own listing -- the chain the tool has
+        always restored, and what the operator usually wants on recovery
+        media. For a stored raw stream it is a FACT (see the raw override): an
+        incremental stream can only be received onto its parent.
+
+        Ordering is by creation time, then by position in the listing to break
+        a same-second tie, the same total order the planner uses. A snapshot
+        whose name yields no timestamp has no predecessor and is nobody's.
+        Raises ``AbortError`` when a requirement exists and cannot be met from
+        this endpoint (the raw override does); the base never raises.
+        """
+        if getattr(snapshot, "time_obj", None) is None:
+            return None
+        try:
+            listed = list(self.list_snapshots())
+        except Exception as e:  # noqa: BLE001 - no listing, no chain to offer
+            logger.debug("required_parent_of: could not list snapshots (%s)", e)
+            return None
+        position = {s.get_name(): i for i, s in enumerate(listed)}
+
+        def _order(s: Any) -> tuple:
+            return (s.time_obj, position.get(s.get_name(), 0))
+
+        name = snapshot.get_name()
+        me = next((s for s in listed if s.get_name() == name), None)
+        if me is None:
+            return None
+        older = [
+            s
+            for s in listed
+            if getattr(s, "time_obj", None) is not None
+            and s.get_name() != name
+            and _order(s) < _order(me)
+        ]
+        if not older:
+            return None
+        return max(older, key=_order)
+
     def verify_structure(self, snapshot: Any) -> StructureVerdict:
         """Confirm ``snapshot`` is a real, valid backup ARTIFACT (not just a name-shaped
         directory entry) -- the polymorphic structural check behind the ``verify`` metadata

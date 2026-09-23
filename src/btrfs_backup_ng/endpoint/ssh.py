@@ -312,6 +312,29 @@ def _build_receive_command(
     return f"exec sh -c {shlex.quote(script)}"
 
 
+def _compressed_send_script(remote_send: str, compressor: str) -> str:
+    """The remote half of a compressed restore: ``<send> | <compressor>``, exiting
+    with the SEND's status.
+
+    A pipeline exits with its last stage's status, so ``btrfs send`` failing
+    ("cannot find parent subvolume", a path that is not a subvolume) would come
+    back as the compressor's 0 and the local side would learn of it only from
+    an empty stream. The send's status is written to a side descriptor inside
+    the pipeline and becomes the script's exit status; the compressed bytes go
+    to the original stdout through another. Every construct is POSIX -- the
+    remote's ``sh`` is dash or busybox ash as often as bash -- and the send is
+    the first stage, so a ``sudo -S`` in it still reads its password from the
+    ssh session's stdin. Runs under ``sh -c`` so the login shell need not be
+    POSIX itself.
+    """
+    script = (
+        "exec 3>&1; "
+        f"s=$( {{ {{ {remote_send}; echo $? >&4; }} | {compressor} >&3; }} 4>&1 ); "
+        'exit "$s"'
+    )
+    return f"sh -c {shlex.quote(script)}"
+
+
 #: How long a transfer may move NO bytes before it is treated as stuck.
 #:
 #: The default; `transfer_stall_timeout` in [global] overrides it, and 0 disables
@@ -1172,8 +1195,7 @@ class SSHEndpoint(Endpoint):
         # split or injected when ssh runs it through the remote shell.
         remote_cmd = self._build_remote_command(argv)
         remote_str = " ".join(shlex.quote(str(a)) for a in remote_cmd)
-        ssh_cmd = self.ssh_manager.get_ssh_base_cmd(force_tty=False) + [remote_str]
-        logger.debug("Remote btrfs send over ssh: %s", " ".join(ssh_cmd))
+        ssh_base = self.ssh_manager.get_ssh_base_cmd(force_tty=False)
         # When the remote's sudo wants a password, _build_remote_command has just
         # produced `sudo -S btrfs send ...`, which reads that password from ITS
         # stdin. Nothing used to write one: the process was opened with no stdin
@@ -1193,6 +1215,15 @@ class SSHEndpoint(Endpoint):
                 f"BTRFS_BACKUP_SUDO_PASSWORD, or grant the remote user "
                 f"passwordless sudo for /usr/bin/btrfs."
             )
+
+        compress_method = self._stream_compress_method()
+        if compress_method:
+            return self._compressed_remote_send(
+                remote_str, ssh_base, compress_method, password
+            )
+
+        ssh_cmd = ssh_base + [remote_str]
+        logger.debug("Remote btrfs send over ssh: %s", " ".join(ssh_cmd))
 
         # stderr -> a pipe drained as it is written (core.transfer.StderrTail),
         # like the base send. It was DEVNULL, and the reason recorded here was
@@ -1218,6 +1249,83 @@ class SSHEndpoint(Endpoint):
             # The password line, then EOF. ssh forwards our stdin to the remote
             # command; sudo consumes the line and `btrfs send` never reads stdin,
             # so closing immediately is correct and stops the remote waiting.
+            process.stdin.write(f"{password}\n".encode())
+            process.stdin.flush()
+            process.stdin.close()
+        return process
+
+    def _compressed_remote_send(
+        self,
+        remote_send: str,
+        ssh_base: List[str],
+        compress_method: str,
+        password: Optional[str],
+    ) -> subprocess.Popen[Any]:
+        """The restore-direction mirror of the compressed backup transfer.
+
+        Backing up, the local side compresses ``btrfs send`` before the wire and
+        ``_build_receive_command`` puts the decompressor in front of the remote
+        ``btrfs receive``. Restoring, the roles swap: the REMOTE compresses its
+        ``btrfs send`` and THIS host decompresses before its own receive. The
+        method is the one value ``compress`` names, applied on both ends from
+        it, so the two halves cannot disagree. Until this existed ``--compress``
+        on an ``ssh://`` restore was accepted and did nothing: the transfer
+        layer dropped it for a local destination, and this send had no
+        compressor.
+
+        The remote pipeline is ``btrfs send | <compressor>``, and the exit
+        status that comes back is the SEND's, not the compressor's. A
+        pipeline's status is its last stage's, so a ``btrfs send`` that fails
+        -- "cannot find parent subvolume" -- would exit 0 through a compressor
+        that happily compressed nothing; the shell script captures the send's
+        status on a side descriptor and exits with it. POSIX constructs only
+        (``exec``, command substitution, fd duplication), because the remote's
+        ``sh`` is dash or busybox ash as often as bash; run under all three by
+        the tier3 container cells.
+        Locally the ssh and the decompressor run under the one ``pipefail``
+        runner every other multi-stage pipeline here uses, so a failure at
+        either end is the failure the executor sees.
+
+        The sudo password, when the remote needs one, still crosses ssh's
+        stdin: the send is the first stage of the remote pipeline and inherits
+        it, and the compressor reads only the pipe.
+        """
+        from ..core.transfer import (
+            COMPRESSION_PROGRAMS,
+            check_compression_available,
+            popen_pipeline_pipefail,
+        )
+
+        program = COMPRESSION_PROGRAMS[compress_method]
+        if not check_compression_available(compress_method):
+            raise __util__.AbortError(
+                f"--compress {compress_method} needs {program['check']!r} on this "
+                f"host to decompress the restore stream, and it is not installed. "
+                f"Install it, or restore without --compress."
+            )
+        compressor = " ".join(shlex.quote(part) for part in program["compress"])
+        decompressor = " ".join(shlex.quote(part) for part in program["decompress"])
+        remote_str = _compressed_send_script(remote_send, compressor)
+        ssh_part = " ".join(shlex.quote(str(c)) for c in ssh_base + [remote_str])
+        pipeline = f"{ssh_part} | {decompressor}"
+        logger.info(
+            "Decompressing the restore stream with %s here: the remote "
+            "compresses its btrfs send before the wire, and this host undoes "
+            "it before btrfs receive.",
+            compress_method,
+        )
+        logger.debug("Compressed remote btrfs send over ssh: %s", pipeline)
+        process = popen_pipeline_pipefail(
+            pipeline,
+            stdin=subprocess.PIPE if password else subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        tail_stderr(
+            process,
+            log_as="remote btrfs send" if self.config.get("btrfs_debug") else None,
+        )
+        if password and process.stdin:
             process.stdin.write(f"{password}\n".encode())
             process.stdin.flush()
             process.stdin.close()

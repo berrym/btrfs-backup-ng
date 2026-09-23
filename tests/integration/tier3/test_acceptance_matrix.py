@@ -471,6 +471,138 @@ echo "DELIVERED:$(cat /tmp/received.bin 2>/dev/null || echo NOTHING)"
             )
 
 
+class TestCompressedRestoreSendUnderEachShell:
+    """The remote half of a compressed ssh:// restore, run by the shells it meets.
+
+    ``--compress`` on an ssh:// restore source runs ``btrfs send | <compressor>``
+    on the REMOTE and must exit with the send's status, not the compressor's --
+    otherwise a failing send comes back as the compressor's 0 and an empty
+    stream. The construction that does it (fd duplication inside a command
+    substitution) is exactly the kind of shell detail that has differed between
+    bash, dash and busybox ash before, so it is run here under all three, as
+    the command the endpoint emits: ``_build_remote_command`` for the sudo
+    prefix, ``_compressed_send_script`` around it, as a non-root user whose
+    sudoers grants btrfs. ``btrfs`` is a stub that writes a known payload and
+    exits with a chosen status.
+    """
+
+    CASES = [
+        # label, sudoers, passwordless, stub exit, expected exit, payload arrives
+        (
+            "nopasswd",
+            "bbng ALL=(ALL) NOPASSWD: /usr/bin/btrfs",
+            True,
+            0,
+            0,
+            True,
+        ),
+        (
+            "password-on-stdin",
+            "bbng ALL=(ALL) /usr/bin/btrfs",
+            False,
+            0,
+            0,
+            True,
+        ),
+        (
+            "send-fails",
+            "bbng ALL=(ALL) NOPASSWD: /usr/bin/btrfs",
+            True,
+            3,
+            3,
+            False,
+        ),
+    ]
+
+    IMAGES = TestSudoersPolicies.IMAGES
+
+    #: What /bin/sh must resolve to in each image, so a base image that changes
+    #: its shell cannot silently drop the dash or busybox axis.
+    SHELLS = {
+        "fedora:latest": "bash",
+        "debian:stable-slim": "dash",
+        "alpine:latest": "busybox",
+    }
+
+    @requires_container
+    @pytest.mark.parametrize("image", IMAGES)
+    @pytest.mark.parametrize(
+        "label,sudoers,passwordless,stub_rc,expected_rc,arrives", CASES
+    )
+    def test_the_emitted_compressed_send(
+        self,
+        tmp_path,
+        image,
+        label,
+        sudoers,
+        passwordless,
+        stub_rc,
+        expected_rc,
+        arrives,
+    ):
+        from btrfs_backup_ng.core.transfer import COMPRESSION_PROGRAMS
+        from btrfs_backup_ng.endpoint.ssh import SSHEndpoint, _compressed_send_script
+
+        from .conftest import run_in_container
+
+        endpoint = SSHEndpoint.__new__(SSHEndpoint)
+        endpoint.config = {"ssh_sudo": True, "passwordless": passwordless}
+        remote_cmd = endpoint._build_remote_command(["btrfs", "send", "/backup/snap-1"])
+        assert ("-S" in remote_cmd) is (not passwordless)
+        remote_send = " ".join(shlex.quote(a) for a in remote_cmd)
+        compressor = " ".join(COMPRESSION_PROGRAMS["gzip"]["compress"])
+        emitted = _compressed_send_script(remote_send, compressor)
+        command_file = tmp_path / "emitted.txt"
+        command_file.write_text(emitted)
+
+        script = r"""
+set -e
+if command -v dnf >/dev/null 2>&1; then
+    dnf -q -y install sudo shadow-utils util-linux gzip >/dev/null 2>&1
+elif command -v apk >/dev/null 2>&1; then
+    apk add --quiet sudo shadow util-linux gzip >/dev/null 2>&1
+else
+    apt-get -qq update >/dev/null 2>&1
+    apt-get -qq install -y sudo gzip >/dev/null 2>&1
+fi
+useradd -m bbng 2>/dev/null || adduser -D bbng 2>/dev/null
+echo 'bbng:hunter2' | chpasswd
+cat > /usr/bin/btrfs <<STUB
+#!/bin/sh
+printf 'SEND-STREAM-PAYLOAD\n'
+exit $STUB_RC
+STUB
+chmod 755 /usr/bin/btrfs
+printf '%b\n' "$SUDOERS" > /etc/sudoers.d/bbng
+chmod 440 /etc/sudoers.d/bbng
+echo "SHELL:$(readlink -f /bin/sh)"
+CMD=$(cat /emitted.txt)
+set +e
+printf 'hunter2\n' | runuser -u bbng -- sh -c "$CMD" > /tmp/out.gz 2>/tmp/err.txt
+echo "RC:$?"
+echo "GOT:$(gzip -dc < /tmp/out.gz 2>/dev/null)"
+echo "ERR:$(tr '\n' ' ' < /tmp/err.txt)"
+"""
+        result = run_in_container(
+            image,
+            f"SUDOERS={shlex.quote(sudoers)}; STUB_RC={stub_rc}; {script}",
+            mounts={str(command_file): "/emitted.txt"},
+        )
+        detail = (
+            f"{image} / {label}\nemitted: {emitted}\n"
+            f"stdout: {result.stdout[-1500:]}\nstderr: {result.stderr[-1500:]}"
+        )
+        assert "RC:" in result.stdout, f"the container never ran the command\n{detail}"
+        assert (
+            "SHELL:" in result.stdout
+            and self.SHELLS[image]
+            in (result.stdout.split("SHELL:", 1)[1].splitlines()[0])
+        ), detail
+        assert f"RC:{expected_rc}\n" in result.stdout, detail
+        if arrives:
+            assert "GOT:SEND-STREAM-PAYLOAD" in result.stdout, detail
+
+
 # --------------------------------------------------------------------------- #
 # restore honesty -- independent of any one target
 # --------------------------------------------------------------------------- #

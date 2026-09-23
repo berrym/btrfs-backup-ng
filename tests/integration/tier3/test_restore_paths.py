@@ -41,12 +41,14 @@ from __future__ import annotations
 import json
 import os
 import time
+from pathlib import Path
 
 import pytest
 
 from .conftest import (
     RAW_REMOTE_SPEC,
     REMOTE_SPEC,
+    assert_increment_restored,
     assert_nothing_restored,
     assert_payload_restored,
     lifecycle,
@@ -61,6 +63,7 @@ from .conftest import (
     sh,
     snapper_config_up,
     snapper_lifecycle,
+    subvolumes_under,
 )
 
 pytestmark = [pytest.mark.tier3, requires_local]
@@ -444,6 +447,211 @@ class TestSnapperRestore:
 
 
 # --------------------------------------------------------------------------- #
+# native restore onto empty media
+# --------------------------------------------------------------------------- #
+
+
+def _received(path):
+    """UUID / Parent UUID / Received UUID of a subvolume, from btrfs itself."""
+    return _subvolume_show(path)
+
+
+def _native_chain(rig, name, target_line, prefix):
+    """Two backups of the rig's source -- a base and a real increment -- at
+    ``target_line``, each run's rc asserted, and the two snapshot names in
+    order. The increment's bytes are what prove the second leg later."""
+    cfg = rig.write_config(rig.root / f"cfg-{name}.toml", target_line, prefix=prefix)
+    r1 = rig.cli("run", config=cfg)
+    assert r1.returncode == 0, (r1.stdout + r1.stderr)[-2000:]
+    delta = rig.mutate_source()
+    r2 = rig.cli("run", config=cfg)
+    assert r2.returncode == 0, (r2.stdout + r2.stderr)[-2000:]
+    return cfg, delta
+
+
+def _names_under(rig, dest):
+    return sorted(p.name for p in subvolumes_under(dest) if p != dest)
+
+
+def _restore(rig, source, dest, prefix, *args):
+    r = rig.cli(
+        "restore",
+        source,
+        str(dest),
+        "--prefix",
+        prefix,
+        "--yes-i-know-what-i-am-doing",
+        *args,
+    )
+    # The whole output, not a tail: the plan and its "requires X first" line
+    # come BEFORE the transfers and are what several cells assert on.
+    return r.returncode, r.stdout + r.stderr
+
+
+def _unwrapped(out):
+    """The console renderer wraps long lines and a path may break across
+    them; comparing with all whitespace removed reads a path back whole."""
+    return "".join(out.split())
+
+
+class TestNativeRestoreOntoEmptyMedia:
+    """The plain layout on recovery media (the rig's third filesystem), where
+    `btrfs receive` can resolve a parent only from what a restore has put
+    there. Every effect is read from the destination and from `btrfs
+    subvolume show`, never from the exit code alone."""
+
+    def test_the_base_alone_lands_one_then_latest_chains_and_a_rerun_is_satisfied(
+        self, rig
+    ):
+        """`--snapshot <base>` from empty media lands exactly ONE subvolume
+        (the base needs nothing); the default selection then brings the
+        increment received AGAINST that base, by the identity the streams
+        carry; a rerun finds both present by correspondence and sends
+        nothing, exit 0."""
+        prefix = "t3rec-"
+        _cfg, delta = _native_chain(rig, "rec-local", f'path = "{rig.dst}"', prefix)
+        names = sorted(
+            n
+            for n in rig.local_btrfs_subvols(rig.dst)
+            if Path(n).name.startswith(prefix)
+        )
+        base_name, inc_name = (Path(n).name for n in names[-2:])
+        dest = rig.rec / "native-chain"
+
+        rc, out = _restore(rig, str(rig.dst), dest, prefix, "--snapshot", base_name)
+        assert rc == 0, out
+        assert _names_under(rig, dest) == [base_name], out
+        assert_payload_restored(dest, rig.payload)
+        assert not (dest / base_name / "extra.bin").exists(), (
+            "the base carries the increment's bytes: the wrong snapshot landed"
+        )
+
+        rc, out = _restore(rig, str(rig.dst), dest, prefix)
+        assert rc == 0, out
+        assert _names_under(rig, dest) == [base_name, inc_name], out
+        assert_increment_restored(dest, delta)
+        base, inc = _received(dest / base_name), _received(dest / inc_name)
+        assert inc["Parent UUID"] == base["UUID"], (
+            "the increment was not received against the restored base\n" + out
+        )
+        assert (
+            base["Received UUID"] == _received(rig.dst / base_name)["Received UUID"]
+        ), "the restored base does not carry the identity the backup's stream carries"
+        assert f"{inc_name}(incrementalfrom{base_name})" in _unwrapped(out), out
+
+        rc, out = _restore(rig, str(rig.dst), dest, prefix)
+        assert rc == 0, out
+        assert "Already at the destination" in " ".join(out.split()), out
+        assert _names_under(rig, dest) == [base_name, inc_name]
+        assert _received(dest / inc_name)["UUID"] == inc["UUID"], (
+            "the copy was re-created"
+        )
+
+    def test_an_interrupted_restore_is_refused_on_rerun_and_cleanup_removes_it_by_marker(
+        self, rig
+    ):
+        """The shape a receive killed mid-stream leaves (proven on this
+        filesystem type): a SUBVOLUME under the name, holding real files, with
+        no received_uuid. By name it is "already restored"; the rerun must
+        refuse and leave it. `--cleanup` removes it only once a run marker of
+        this tool's names it; unmarked, it is reported and left."""
+        prefix = "t3int-"
+        _native_chain(rig, "rec-int", f'path = "{rig.dst}"', prefix)
+        names = sorted(
+            Path(n).name
+            for n in rig.local_btrfs_subvols(rig.dst)
+            if Path(n).name.startswith(prefix)
+        )
+        base_name, inc_name = names[-2:]
+        dest = rig.rec / "native-interrupted"
+        dest.mkdir()
+        partial = dest / inc_name
+        sh(["btrfs", "subvolume", "create", str(partial)], check=True)
+        (partial / "half.bin").write_bytes(b"x" * 4096)
+        assert _received(partial)["Received UUID"] == "-"
+
+        rc, out = _restore(rig, str(rig.dst), dest, prefix)
+        assert rc != 0, f"a rerun over an interrupted restore exited 0\n{out}"
+        flat = " ".join(out.split())
+        assert str(partial) in _unwrapped(out), out
+        assert "no received_uuid" in flat and "Nothing was transferred" in flat, out
+        assert _names_under(rig, dest) == [inc_name], "something was received anyway"
+        assert (partial / "half.bin").exists(), "the stranger was deleted"
+
+        # Unmarked: reported, left.
+        r = rig.cli("restore", "--cleanup", str(dest), "--dry-run")
+        out = r.stdout + r.stderr
+        assert r.returncode == 0, out
+        assert partial.exists()
+        assert "No interrupted restores found" in out, out
+
+        # Marked by a run that is no longer alive: this is the tool's own
+        # partial, and --cleanup removes it and its marker.
+        from btrfs_backup_ng.core.layout import marker_dir
+
+        dead = sh(["sh", "-c", "echo $$"], check=True).stdout.strip()
+        directory = marker_dir(dest)
+        directory.mkdir(parents=True, exist_ok=True)
+        marker = directory / "t3-001.json"
+        marker.write_text(
+            json.dumps(
+                {
+                    "format": 1,
+                    "session": "t3",
+                    "pid": int(dead),
+                    "snapshot": inc_name,
+                    "path": str(partial),
+                    "started": "2026-01-01T00:00:00+00:00",
+                }
+            )
+        )
+        exe = os.environ.get("BBNG_TEST_CLI") or "btrfs-backup-ng"
+        r = sh(f"printf 'y\\n' | {exe} restore --cleanup {dest}")
+        out = r.stdout + r.stderr
+        assert r.returncode == 0, out
+        assert not partial.exists(), "the interrupted restore was not removed\n" + out
+        assert not marker.exists(), "the marker outlived the deletion it authorised"
+        assert "1 deleted, 0 failed" in out, out
+
+        # And the rerun now lands the chain.
+        rc, out = _restore(rig, str(rig.dst), dest, prefix)
+        assert rc == 0, out
+        assert _names_under(rig, dest) == [base_name, inc_name], out
+
+    def test_a_raw_increment_alone_onto_empty_media_restores_the_chain(self, rig):
+        """A stored raw increment can only be received onto its parent, and the
+        sidecar names it. `--snapshot <increment>` from raw:// onto empty media
+        must bring the base first and land two subvolumes, the increment
+        received against the base -- not fail in the receive after streaming."""
+        prefix = "t3rdr-"
+        target = rig.raw / "native-dr"
+        target.mkdir()
+        loc = f"raw://{target}"
+        _cfg, delta = _native_chain(rig, "rec-raw", f'path = "{loc}"', prefix)
+        streams = sorted(
+            n
+            for n in rig.local_raw_streams(target)
+            if n.startswith(prefix) and not n.endswith(".meta")
+        )
+        assert len(streams) == 2, streams
+        base_name, inc_name = (n.split(".btrfs")[0] for n in streams)
+        dest = rig.rec / "native-raw-chain"
+
+        rc, out = _restore(rig, loc, dest, prefix, "--snapshot", inc_name)
+        assert rc == 0, out
+        assert _names_under(rig, dest) == [base_name, inc_name], out
+        assert_payload_restored(dest, rig.payload)
+        assert_increment_restored(dest, delta)
+        base, inc = _received(dest / base_name), _received(dest / inc_name)
+        assert inc["Parent UUID"] == base["UUID"], (
+            "the raw increment was not received against the restored base\n" + out
+        )
+        assert f"requires{base_name}first" in _unwrapped(out), (
+            "the plan did not say it grew to the required parent\n" + out
+        )
+
+
+# --------------------------------------------------------------------------- #
 # decrypt on restore
 # --------------------------------------------------------------------------- #
 
@@ -581,10 +789,14 @@ class TestCompressedAndEncryptedTransports:
     @requires_remote
     def test_zstd_over_ssh(self, rig):
         """ssh:// stores a plain subvolume; zstd here is transport compression
-        on BOTH legs. The restore leg is the one nothing exercised: the remote
-        `btrfs send` is compressed on the far side and undone here before
-        `btrfs receive`, so a decompressor that does not run, or runs the
-        wrong way, feeds receive garbage."""
+        on BOTH legs. The restore leg is the one nothing exercised, and for
+        a long time it was not compressed at all: `--compress` was accepted
+        on an `ssh://` restore source and dropped, so this cell passed on
+        plain bytes while its docstring claimed otherwise. The remote `btrfs
+        send` is now compressed on the far side and undone here before
+        `btrfs receive`; the restore's own log line for that is required
+        below, so a decompressor that does not run fails the cell rather
+        than passing on an uncompressed stream."""
         base = f"{rig.remote_base}/btrfs-zstd"
         remote_sh(f"mkdir -p '{base}'")
         loc = f"ssh://{REMOTE_SPEC}:{base}"
@@ -604,6 +816,11 @@ class TestCompressedAndEncryptedTransports:
         assert res["backup_rc"] == 0, res["backup_out"]
         assert rig.remote_btrfs_subvols(base), "nothing landed remotely"
         assert_payload_restored(res["restore_dest"], rig.payload)
+        flat = " ".join(res["restore_out"].split())
+        assert "Decompressing the restore stream with zstd" in flat, (
+            "the restore leg was not compressed: no decompressor ran here\n"
+            + res["restore_out"]
+        )
 
     @requires_raw_remote
     def test_zstd_raw_over_ssh_to_a_foreign_host(self, rig):

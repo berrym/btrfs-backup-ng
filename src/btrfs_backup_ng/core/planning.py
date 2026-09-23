@@ -1,19 +1,35 @@
 """Transfer planning: decide what to transfer, in what order, and with which parent.
 
-This is the single authority for the backup transfer plan. Presence on the destination and
-incremental-parent validity are decided STRICTLY by ``destination_endpoint.correspondent_of``
--- the btrfs ``received_uuid``/``stream_uuid`` correspondence (or name, for raw targets,
-where the override makes name the native identity), NEVER the on-disk name, which can collide (a
-re-created snapshot reuses the name but has a new uuid). There is deliberately no name-based
-fallback for btrfs: identity comes from uuids that enumeration sudo-escalates to read (see
-``Endpoint._load_subvolume_ids_into``), so a missing uuid is an enrichment problem to fix at
-the source, not a reason to dilute the planner back into name matching. The executor
+This is the single authority for the transfer plan, in both directions: a backup
+run plans with it, and so does a restore (a transfer with the roles swapped).
+Presence on the destination and incremental-parent validity are decided STRICTLY
+by ``destination_endpoint.correspondent_of`` -- the btrfs
+``received_uuid``/``stream_uuid`` correspondence (or name, for raw targets, where
+the override makes name the native identity), NEVER the on-disk name, which can
+collide (a re-created snapshot reuses the name but has a new uuid). There is
+deliberately no name-based fallback for btrfs: identity comes from uuids that
+enumeration sudo-escalates to read (see ``Endpoint._load_subvolume_ids_into``),
+so a missing uuid is an enrichment problem to fix at the source, not a reason to
+dilute the planner back into name matching. The executor
 (``core.operations._execute_transfers``) only runs the plan this module produces.
 """
 
 import logging
+from typing import Any, Optional
+
+from .. import __util__
 
 logger = logging.getLogger(__name__)
+
+
+class PlanningError(__util__.AbortError):
+    """A plan that cannot be honoured, refused before a byte moves.
+
+    Raised when a selection names a snapshot whose required parent is neither
+    at the destination (by correspondence) nor obtainable from the source. The
+    alternative -- streaming the increment and letting the receive fail on the
+    missing parent -- transfers everything first and leaves a partial behind.
+    """
 
 
 def snapshots_present_on(source_snapshots, destination_endpoint):
@@ -39,6 +55,75 @@ def snapshots_present_on(source_snapshots, destination_endpoint):
     return set(destination_endpoint.correspondents_of(list(source_snapshots)))
 
 
+def _as_selection(only: Any) -> Optional[list]:
+    """``only`` as a list of snapshots: None for "everything", a one-element list
+    for the single snapshot every existing caller passes, the list itself for
+    a selection."""
+    if only is None:
+        return None
+    if isinstance(only, (list, tuple, set, frozenset)):
+        return list(only)
+    return [only]
+
+
+def expand_required_chain(selection, source_snapshots, present, source_endpoint):
+    """The selection plus every snapshot the source says it depends on.
+
+    For each selected snapshot that is not already at the destination, the
+    source is asked ``required_parent_of`` and the answer is added, then asked
+    about in turn, until the chain reaches a snapshot that IS at the
+    destination (by correspondence), needs nothing, or is already selected.
+    The chain is drawn from ``source_snapshots`` -- the source's own listing,
+    matched by name -- so every added member is something the executor can
+    actually send from there.
+
+    Raises ``PlanningError`` when a requirement cannot be met: the source says
+    a snapshot needs a parent it does not hold (a raw store whose sidecar names
+    a stream that is gone), and nothing at the destination corresponds to the
+    snapshot itself. That is refused HERE, before streaming, because the
+    receive would otherwise fail after transferring the whole increment.
+    """
+    by_name = {s.get_name(): s for s in source_snapshots}
+    selected_names = {s.get_name() for s in selection}
+    expanded = list(selection)
+    for snap in list(selection):
+        if snap.get_name() in present:
+            continue
+        current = snap
+        while True:
+            try:
+                required = source_endpoint.required_parent_of(current)
+            except __util__.AbortError as e:
+                raise PlanningError(
+                    f"Refusing to plan {snap.get_name()}: {e} Nothing was transferred."
+                ) from e
+            if required is None:
+                break
+            required_name = required.get_name()
+            if required_name in present or required_name in selected_names:
+                break
+            member = by_name.get(required_name)
+            if member is None:
+                # The source names a requirement it does not itself list.
+                # Nothing here can send it, and following the answer any
+                # further would be walking objects the listing never produced.
+                raise PlanningError(
+                    f"Refusing to plan {snap.get_name()}: it requires "
+                    f"{required_name}, which the source names but does not "
+                    f"list, so it cannot be sent from there. Nothing was "
+                    f"transferred."
+                )
+            expanded.append(member)
+            selected_names.add(required_name)
+            logger.info(
+                "Restoring %s requires %s first; adding it to the plan.",
+                current.get_name(),
+                required_name,
+            )
+            current = member
+    return expanded
+
+
 def plan_transfer_sequence(
     source_snapshots,
     destination_endpoint,
@@ -46,6 +131,7 @@ def plan_transfer_sequence(
     no_incremental=False,
     keep_num_backups=0,
     only=None,
+    source_endpoint=None,
 ):
     """Build the ordered transfer plan ``[(snapshot, parent_or_None)]``.
 
@@ -54,7 +140,16 @@ def plan_transfer_sequence(
         destination_endpoint: The destination; queried via ``correspondent_of``.
         no_incremental: If True, every snapshot is a full send (``parent=None``).
         keep_num_backups: If > 0, only consider the latest N source snapshots.
-        only: If given, plan just this one snapshot (single-snapshot transfer mode).
+        only: If given, plan just this snapshot -- or, given a list, just these
+            (a selection). Anything else at the source is neither transferred
+            nor, unless ``source_endpoint`` says it is required, added.
+        source_endpoint: When given, a selection is expanded to the chain the
+            source says it depends on (``required_parent_of``: the time-ordered
+            predecessor for a btrfs source, the sidecar's parent for a raw
+            store), stopping at whatever the destination already holds. A
+            requirement the source cannot meet is refused with
+            ``PlanningError`` before anything is transferred. Without it the
+            selection is planned exactly as given (the backup run's behaviour).
 
     A snapshot whose correspondent is already present on the destination is skipped. For
     each snapshot to transfer, the parent is the newest source snapshot ordered BEFORE it --
@@ -91,20 +186,33 @@ def plan_transfer_sequence(
         else:
             dated.append(snap)
 
-    if only is not None:
-        if getattr(only, "time_obj", None) is None:
-            # An EXPLICIT single-snapshot request is honoured even without a
-            # timestamp: no ordering is needed for a full send, which always
-            # works. Presence still short-circuits it.
-            if only.get_name() in present:
-                return []
-            logger.info(
-                "Transferring %s as a full send: its name yields no "
-                "timestamp to choose an incremental parent by.",
-                only.get_name(),
+    selection = _as_selection(only)
+    undated_full: list = []
+    if selection is not None:
+        if source_endpoint is not None:
+            selection = expand_required_chain(
+                selection, source_snapshots, present, source_endpoint
             )
-            return [(only, None)]
-        candidates = [only]
+        candidates = []
+        for chosen in selection:
+            if getattr(chosen, "time_obj", None) is None:
+                # An EXPLICIT single-snapshot request is honoured even without a
+                # timestamp: no ordering is needed for a full send, which always
+                # works. Presence still short-circuits it. Sent FIRST, ahead of
+                # the dated members: in practice such a member is an old base
+                # that a chain was built on, and if that guess is ever wrong
+                # btrfs receive fails loudly on the missing parent rather than
+                # applying a delta to the wrong subvolume.
+                if chosen.get_name() in present:
+                    continue
+                logger.info(
+                    "Transferring %s as a full send: its name yields no "
+                    "timestamp to choose an incremental parent by.",
+                    chosen.get_name(),
+                )
+                undated_full.append((chosen, None))
+            else:
+                candidates.append(chosen)
     elif keep_num_backups > 0:
         candidates = dated[-keep_num_backups:]
     else:
@@ -122,10 +230,13 @@ def plan_transfer_sequence(
     def _order_key(s):
         return (s.time_obj, order_pos.get(s.get_name(), 0))
 
-    to_transfer = sorted(
-        (s for s in candidates if s.get_name() not in present),
-        key=_order_key,
-    )
+    seen: set = set()
+    to_transfer = []
+    for s in sorted(candidates, key=_order_key):
+        if s.get_name() in present or s.get_name() in seen:
+            continue
+        seen.add(s.get_name())
+        to_transfer.append(s)
 
     # A parent is valid if its correspondent is present on the destination -- either already
     # (``present``) or projected to be, because it is transferred earlier in THIS run.
@@ -133,7 +244,7 @@ def plan_transfer_sequence(
     # later one sends against it.
     projected_present = set(present)
 
-    plan = []
+    plan = list(undated_full)
     for snap in to_transfer:
         parent = None
         if not no_incremental:

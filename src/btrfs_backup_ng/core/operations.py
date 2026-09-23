@@ -179,6 +179,12 @@ def send_snapshot(
     if options.get("compress", "none") != "none":
         requested = options.get("compress", "none")
         remote_btrfs = getattr(destination_endpoint, "_is_remote", False)
+        source_endpoint = getattr(snapshot, "endpoint", None)
+        remote_btrfs_source = (
+            source_endpoint is not None
+            and getattr(source_endpoint, "_is_remote", False) is True
+            and not isinstance(source_endpoint, RawEndpoint)
+        )
         if isinstance(destination_endpoint, RawEndpoint) or remote_btrfs:
             # Hand the method to the endpoint HERE, in the same breath as taking
             # it away from the transfer layer. Doing it further down let the
@@ -190,13 +196,22 @@ def send_snapshot(
             if remote_btrfs and not isinstance(destination_endpoint, RawEndpoint):
                 destination_endpoint.config["compress"] = requested
             options = {**options, "compress": "none"}
+        elif remote_btrfs_source and source_endpoint is not None:
+            # The restore direction: the snapshot lives on a remote btrfs host
+            # and the destination is local. The wire is the same wire, so the
+            # same option applies -- the SOURCE endpoint compresses its remote
+            # send and decompresses here (SSHEndpoint._compressed_remote_send).
+            # Handed over the same way as above, for the same reason.
+            source_endpoint.config["compress"] = requested
+            options = {**options, "compress": "none"}
         else:
             logger.info(
                 "Not compressing this transfer: compress=%r was requested for a "
-                "LOCAL btrfs destination, where the stream would be compressed "
-                "and immediately decompressed on the same machine for no saving. "
-                "Compression applies to ssh:// (compressed over the wire) and to "
-                "raw:// / raw+ssh:// (compressed at rest).",
+                "LOCAL btrfs destination from a local source, where the stream "
+                "would be compressed and immediately decompressed on the same "
+                "machine for no saving. Compression applies over the wire in "
+                "either direction (an ssh:// destination, or an ssh:// restore "
+                "source) and to raw:// / raw+ssh:// (compressed at rest).",
                 options.get("compress"),
             )
             options = {**options, "compress": "none"}
@@ -403,6 +418,27 @@ def send_snapshot(
             error=str(e),
         )
         raise
+
+    except __util__.AbortError as e:
+        # An endpoint's ``send`` may refuse before a byte moves -- a raw store
+        # whose stream fails its sealed sha256, a decompressor that is not
+        # installed, a remote sudo with no password to give. Those are this
+        # transfer's failure, not the run's: re-raised as-is they would escape
+        # the executor's per-snapshot handling, which is where the pins are
+        # released and a partial is cleaned, and abort everything after them.
+        logger.error("Transfer of %s cannot proceed: %s", snapshot_name, e)
+        duration = time.monotonic() - transfer_start
+        log_transaction(
+            action="transfer",
+            status="failed",
+            source=source_path,
+            destination=dest_path,
+            snapshot=snapshot_name,
+            parent=parent_name,
+            duration_seconds=duration,
+            error=str(e),
+        )
+        raise __util__.SnapshotTransferError(str(e)) from e
 
     except (OSError, subprocess.CalledProcessError) as e:
         logger.error("Error during snapshot transfer: %r", e)
@@ -1734,7 +1770,7 @@ def artifact_verdict(destination_endpoint, snapshot) -> StructureVerdict:
             )
         return destination_endpoint.verify_structure(stored)
 
-    path = _destination_subvolume(destination_endpoint, snapshot.get_path())
+    path = _destination_subvolume(destination_endpoint, received_name_of(snapshot))
     if not getattr(destination_endpoint, "_is_remote", False):
         # Privilege-free, so it is asked first: a plain directory or a missing
         # path after a receive that exited 0 is provably not the copy. Only the
@@ -2311,6 +2347,22 @@ def _receiving_lock(destination_endpoint, destination: str, lock_root: str = "")
                 config.pop("lock_root", None)
 
     return _pinned()
+
+
+def received_name_of(snapshot) -> str:
+    """The name ``btrfs receive`` gives the copy of ``snapshot``.
+
+    A receive names the subvolume it creates after the basename of the
+    subvolume the stream was sent from. For a subvolume that is the basename
+    of its own path (for snapper, always ``snapshot``). A stored raw stream is
+    a FILE whose basename carries the stream suffixes, so the raw snapshot
+    says what its stream will be received as (``received_name``); a snapshot
+    without that attribute is asked its path.
+    """
+    own = getattr(snapshot, "received_name", None)
+    if own:
+        return str(own)
+    return Path(str(snapshot.get_path())).name
 
 
 def _destination_subvolume(destination_endpoint, source_path) -> str:

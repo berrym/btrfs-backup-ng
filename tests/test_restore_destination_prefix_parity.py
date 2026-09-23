@@ -6,8 +6,8 @@ fails to recognize them and the restore chain re-restores an existing parent."
 
 That held while the prefix came from `--prefix`. It stopped holding when the
 prefix is INFERRED: inference updates the backup endpoint and nothing updates
-the destination, so the destination lists as empty, `skip_existing` has nothing
-to skip, and a snapshot already present is re-sent onto its own name --
+the destination, so the destination lists as empty, correspondence finds
+nothing, and a snapshot already present is re-sent onto its own name --
 `creating subvolume ... failed: File exists`.
 
 Shipped as a known issue in 0.9.5 with `--prefix` as the workaround.
@@ -90,6 +90,21 @@ class _Endpoint:
                 return _Snap(name)
         return None
 
+    def correspondents_of(self, snapshots):
+        found = {}
+        for snap in snapshots:
+            match = self.correspondent_of(snap)
+            if match is not None:
+                found[snap.get_name()] = match
+        return found
+
+    def required_parent_of(self, snapshot):
+        older = [s for s in self.list_snapshots() if s.time_obj < snapshot.time_obj]
+        return max(older, key=lambda s: s.time_obj) if older else None
+
+    def subvolume_identity(self, path):
+        return None
+
     def set_lock(self, *a, **kw):
         pass
 
@@ -133,10 +148,9 @@ class TestAnAlreadyRestoredSnapshotIsSkipped:
     ):
         """The observable that matters: it must not be attempted.
 
-        Not ``stats["skipped"]`` -- get_restore_chain STOPS at a snapshot already
-        present locally rather than adding it and filtering it out later, so a
-        correct run reports 0 skipped. Asserting on that counter would have
-        demanded behaviour the fix does not produce.
+        Not ``stats["skipped"]`` -- the planner never plans a present snapshot,
+        and ``skipped`` counts only the TARGETS that were present, so under
+        --all it is 1 here for a reason unrelated to this fix.
         """
         with caplog.at_level("INFO"):
             core_restore.restore_snapshots(
@@ -148,7 +162,7 @@ class TestAnAlreadyRestoredSnapshotIsSkipped:
         attempted = [
             m.group(1)
             for m in (
-                re.search(r"Would restore: (\S+)", r.getMessage())
+                re.search(r"^\s+\[\d+/\d+\] (\S+) \(", r.getMessage())
                 for r in caplog.records
             )
             if m
@@ -210,6 +224,9 @@ class TestTheGuardsAroundTheSync:
             _Snap("home-20240102T120000", 1),
         ]
         backup.correspondent_of.return_value = None
+        # An honest double: a bare MagicMock answers every question with a
+        # mock, and the planner asks the source what each snapshot requires.
+        backup.required_parent_of.return_value = None
         destination = _Endpoint(["home-20240101T120000"], prefix="")
 
         core_restore.restore_snapshots(

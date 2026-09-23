@@ -207,12 +207,17 @@ class TestEstimateExclusion:
 
 
 class TestRestoreGuards:
-    def test_an_undated_restore_target_gets_no_time_based_parent(self):
-        from btrfs_backup_ng.core.restore import _find_older_parent
+    def test_an_undated_restore_target_requires_no_predecessor(self, tmp_path):
+        """A restore's chain comes from ``required_parent_of``: a snapshot with
+        no derivable time has no honest "older", so it needs nothing and a
+        wrong parent can never be sent."""
+        from btrfs_backup_ng.endpoint.local import LocalEndpoint
 
         undated = _undated("home-imported-base")
-        pool = [_dated("home-20240115-000000", "20240115-000000")]
-        assert _find_older_parent(undated, pool) is None
+        dated = _dated("home-20240115-000000", "20240115-000000")
+        ep = LocalEndpoint(config={"path": str(tmp_path), "snap_prefix": "home-"})
+        ep.list_snapshots = lambda flush_cache=False: [dated, undated]  # type: ignore[method-assign]
+        assert ep.required_parent_of(undated) is None
 
     def test_verify_gives_an_undated_snapshot_no_parent(self):
         from btrfs_backup_ng.core.verify import _find_parent_snapshot
@@ -221,16 +226,24 @@ class TestRestoreGuards:
         pool = [_dated("home-20240115-000000", "20240115-000000")]
         assert _find_parent_snapshot(undated, pool) is None
 
-    def test_receive_order_puts_the_undated_base_first(self):
-        from btrfs_backup_ng.core.restore import _receive_order_key
+    def test_a_selected_undated_base_is_planned_first(self, tmp_path):
+        """The planner's order for a restore selection: an undated member
+        first (in practice an old base a chain was built on), then the dated
+        ones oldest-first. If that guess is ever wrong btrfs receive fails
+        loudly on the missing parent rather than applying a delta to the
+        wrong subvolume."""
+        from btrfs_backup_ng.core.planning import plan_transfer_sequence
+        from btrfs_backup_ng.endpoint.local import LocalEndpoint
 
         snaps = [
             _dated("home-20240116-000000", "20240116-000000"),
             _undated("home-imported-base"),
             _dated("home-20240115-000000", "20240115-000000"),
         ]
-        snaps.sort(key=_receive_order_key)
-        assert [s.get_name() for s in snaps] == [
+        dest = LocalEndpoint(config={"path": str(tmp_path), "snap_prefix": "home-"})
+        dest.list_snapshots = lambda flush_cache=False: []  # type: ignore[method-assign]
+        plan = plan_transfer_sequence(snaps, dest, only=list(snaps))
+        assert [s.get_name() for s, _ in plan] == [
             "home-imported-base",
             "home-20240115-000000",
             "home-20240116-000000",

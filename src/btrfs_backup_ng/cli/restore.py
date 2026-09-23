@@ -7,6 +7,8 @@ for disaster recovery, migration, or backup verification.
 import argparse
 import dataclasses
 import logging
+import os
+import subprocess
 import time
 from datetime import datetime
 from pathlib import Path
@@ -389,7 +391,6 @@ def _execute_main_restore(args: argparse.Namespace) -> int:
     dry_run = getattr(args, "dry_run", False)
     snapshot_name = getattr(args, "snapshot", None)
     restore_all = getattr(args, "all", False)
-    skip_existing = True
     no_incremental = getattr(args, "no_incremental", False)
     interactive = getattr(args, "interactive", False)
 
@@ -420,7 +421,6 @@ def _execute_main_restore(args: argparse.Namespace) -> int:
             snapshot_name=snapshot_name,
             before_time=before_time,
             restore_all=restore_all,
-            skip_existing=skip_existing,
             no_incremental=no_incremental,
             options=options,
             dry_run=dry_run,
@@ -1129,10 +1129,19 @@ def _execute_unlock(args: argparse.Namespace, lock_id: str) -> int:
 
 
 def _execute_cleanup(args: argparse.Namespace) -> int:
-    """Clean up partial/incomplete snapshot restores at destination.
+    """Remove what an interrupted restore left at the destination, and only that.
 
-    Scans the destination for partial subvolumes (from interrupted restores)
-    and offers to delete them.
+    A restore writes a run marker under ``DEST/.btrfs-backup-ng/restore/``
+    for each receive while it is in flight and removes it once the copy is
+    verified. A marker that outlives its process is the record of a restore
+    that was killed mid-receive, and the subvolume it names -- when that
+    subvolume has no received_uuid -- is the partial that receive left. That
+    conjunction is the only thing this command deletes. Everything else it
+    finds is reported and left: a marker whose restore is still running, a
+    marker naming a complete received copy (the marker is stale, the copy is
+    not), a subvolume under no marker at all, however empty -- an operator's
+    own ``btrfs subvolume create`` is indistinguishable from an interrupted
+    receive, and this command used to delete it on emptiness alone.
 
     Args:
         args: Command arguments
@@ -1140,6 +1149,9 @@ def _execute_cleanup(args: argparse.Namespace) -> int:
     Returns:
         Exit code (0 for success, non-zero for failure)
     """
+    from ..core.layout import read_markers, still_abandoned
+    from ..endpoint.local import LocalEndpoint
+
     # For cleanup, accept either destination or source as the path
     # (user might use either positional argument)
     destination = getattr(args, "destination", None) or getattr(args, "source", None)
@@ -1154,66 +1166,61 @@ def _execute_cleanup(args: argparse.Namespace) -> int:
         print(f"Error: Destination path does not exist: {dest_path}")
         return 1
 
-    print(f"Scanning for partial restores in {dest_path}")
+    print(f"Scanning for interrupted restores in {dest_path}")
     print("=" * 60)
     print()
 
-    # Look for partial subvolumes. Only markers this tool writes itself count
-    # as evidence; see the classification below for why emptiness does not.
-
-    partial_subvolumes: list[tuple[Path, str]] = []
-    unclear: list[tuple[Path, str]] = []
+    # The one identity probe, through an endpoint over the destination. Not
+    # prepared: this is a read of what is there, and prepare() would create
+    # the bookkeeping tree under a path that may not be a restore destination.
+    probe = LocalEndpoint(
+        config={"path": dest_path, "snap_prefix": "", "fs_checks": "skip"}
+    )
 
     try:
-        for item in dest_path.iterdir():
-            if not item.is_dir():
-                continue
+        marked = read_markers(dest_path, probe)
+    except Exception as e:
+        logger.error("Error reading the run markers under %s: %s", dest_path, e)
+        return 1
 
-            # Check if it's a subvolume
+    abandoned = [m for m in marked if m.state == "abandoned"]
+    stale_only = [m for m in marked if m.state in ("missing", "complete")]
+    left = [m for m in marked if m.state not in ("abandoned", "missing", "complete")]
+    marked_names = {m.name for m in marked}
+
+    # Subvolumes under no marker are reported when they look like debris and
+    # never touched. Emptiness is not evidence.
+    unclear: list[tuple[Path, str]] = []
+    try:
+        for item in dest_path.iterdir():
+            if not item.is_dir() or item.name in marked_names:
+                continue
             if not __util__.is_subvolume(item):
                 continue
-
-            # This command runs long after the restore that left the debris, so
-            # there is no run record to consult and authorship has to be read
-            # off the disk. Exactly two things identify a subvolume as this
-            # tool's unfinished work: the .partial suffix it writes itself, and
-            # a body holding nothing but the .btrfs-backup-ng directory it
-            # creates. Emptiness is NOT evidence -- an operator's own `btrfs
-            # subvolume create` is indistinguishable from an interrupted
-            # receive -- so an unmarked empty subvolume is reported and left
-            # alone. It used to be deleted on emptiness alone.
-            is_partial = False
-            reason = ""
-            unclear_reason = ""
-
             try:
                 contents: list[Path] | None = list(item.iterdir())
             except PermissionError:
                 contents = None
-
-            if item.name.endswith(".partial"):
-                is_partial = True
-                reason = "has .partial suffix"
-            elif (
-                contents is not None
-                and len(contents) == 1
-                and contents[0].name == ".btrfs-backup-ng"
+            if contents is None:
+                unclear.append((item, "cannot be read, so it cannot be identified"))
+            elif not contents or (
+                len(contents) == 1 and contents[0].name == ".btrfs-backup-ng"
             ):
-                is_partial = True
-                reason = "only contains metadata directory"
-            elif contents is None:
-                unclear_reason = "cannot be read, so it cannot be identified"
-            elif not contents:
-                unclear_reason = "empty, but nothing marks it as this tool's"
-
-            if is_partial:
-                partial_subvolumes.append((item, reason))
-            elif unclear_reason:
-                unclear.append((item, unclear_reason))
-
+                unclear.append(
+                    (item, "empty, and no run marker of this tool's names it")
+                )
     except Exception as e:
         logger.error("Error scanning destination: %s", e)
         return 1
+
+    if left:
+        print(
+            f"Leaving {len(left)} marked entr{'y' if len(left) == 1 else 'ies'} alone:\n"
+        )
+        for m in left:
+            print(f"  {m.name}")
+            print(f"      {m.detail} (marker {m.marker.name})")
+        print()
 
     if unclear:
         print(
@@ -1226,14 +1233,24 @@ def _execute_cleanup(args: argparse.Namespace) -> int:
         print("Delete these yourself if you know they are debris.")
         print()
 
-    if not partial_subvolumes:
-        print("No partial restores found.")
+    if stale_only:
+        print(f"Found {len(stale_only)} stale marker(s) with nothing to remove:\n")
+        for m in stale_only:
+            print(f"  {m.name}")
+            print(f"      {m.detail}")
+        print()
+
+    if not abandoned:
+        for m in stale_only:
+            _remove_marker(m.marker)
+        print("No interrupted restores found.")
         return 0
 
-    print(f"Found {len(partial_subvolumes)} incomplete restore(s):\n")
-    for i, (subvol, reason) in enumerate(partial_subvolumes, 1):
-        print(f"  {i}. {subvol.name}")
-        print(f"      Reason: {reason}")
+    print(f"Found {len(abandoned)} interrupted restore(s):\n")
+    for i, m in enumerate(abandoned, 1):
+        print(f"  {i}. {m.name}")
+        print(f"      Reason: {m.detail}")
+        print(f"      Marker: {m.marker.name} (session {m.record.get('session')})")
         print()
 
     # Ask for confirmation
@@ -1242,39 +1259,62 @@ def _execute_cleanup(args: argparse.Namespace) -> int:
         print("Dry run - no changes made.")
         return 0
 
-    print("These subvolumes carry this tool's own partial-restore markers.")
-    confirm = input("Delete all partial subvolumes? [y/N]: ").strip().lower()
+    print("These subvolumes are named by this tool's own run markers and hold no")
+    print("received copy.")
+    confirm = input("Delete them? [y/N]: ").strip().lower()
 
     if confirm not in ("y", "yes"):
         print("Cancelled.")
         return 0
 
-    # Delete partial subvolumes
     deleted = 0
     failed = 0
-
-    for subvol, reason in partial_subvolumes:
+    for m in abandoned:
+        assert m.path is not None
+        if not still_abandoned(m, probe):
+            logger.error(
+                "Not deleting %s: it changed since it was examined and is no "
+                "longer an abandoned, un-received subvolume",
+                m.path,
+            )
+            failed += 1
+            continue
         try:
-            logger.info("Deleting partial subvolume: %s", subvol)
-            # Use btrfs subvolume delete
-            import subprocess
-
+            logger.info("Deleting the interrupted restore at %s", m.path)
             result = subprocess.run(
-                ["btrfs", "subvolume", "delete", str(subvol)],
+                [*_sudo_prefix(), "btrfs", "subvolume", "delete", str(m.path)],
                 capture_output=True,
                 text=True,
             )
             if result.returncode == 0:
-                print(f"  Deleted: {subvol.name}")
+                print(f"  Deleted: {m.name}")
                 deleted += 1
+                _remove_marker(m.marker)
             else:
-                logger.error("Failed to delete %s: %s", subvol, result.stderr)
+                logger.error("Failed to delete %s: %s", m.path, result.stderr.strip())
                 failed += 1
         except Exception as e:
-            logger.error("Failed to delete %s: %s", subvol, e)
+            logger.error("Failed to delete %s: %s", m.path, e)
             failed += 1
+    for m in stale_only:
+        _remove_marker(m.marker)
 
     print()
     print(f"Cleanup complete: {deleted} deleted, {failed} failed")
 
     return 0 if failed == 0 else 1
+
+
+def _sudo_prefix() -> list[str]:
+    """``btrfs subvolume delete`` needs privilege; the same escalation the
+    engine's partial cleanup applies, and none when already root."""
+    return [] if os.geteuid() == 0 else ["sudo", "-n"]
+
+
+def _remove_marker(marker: Path) -> None:
+    try:
+        marker.unlink()
+    except FileNotFoundError:
+        pass
+    except OSError as e:
+        logger.warning("Could not remove the run marker %s: %s", marker, e)
