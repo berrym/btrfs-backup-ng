@@ -57,6 +57,15 @@ Volumes to backup and their targets
 .RE
 .IP
 Requires a terminal (TTY). Press Ctrl+C to cancel at any time.
+.IP
+Saved over an existing configuration, the wizard keeps every option it does
+not ask about: volumes are matched by path and targets by path within their
+volume, and options such as a target's \fBssh_key\fR, \fBssh_host_key_policy\fR
+or \fBoptional\fR are carried into the new file. Answers to the wizard's own
+questions win, including an option answered by leaving it out. Before asking
+whether to overwrite, it lists what it kept and what it will remove (a volume
+or target the new configuration no longer has). Comments in the old file are
+not kept.
 .TP
 .BR \-o ", " \-\-output " " \fIFILE\fR
 Write output to FILE instead of stdout.

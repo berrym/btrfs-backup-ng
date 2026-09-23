@@ -463,6 +463,73 @@ def toml_str(value: str) -> str:
     return '"' + "".join(out) + '"'
 
 
+_TOML_BARE_KEY = re.compile(r"[A-Za-z0-9_-]+")
+
+
+def toml_key(key: str) -> str:
+    """A TOML key: bare when TOML allows it, a quoted basic string otherwise."""
+    return key if _TOML_BARE_KEY.fullmatch(key) else toml_str(key)
+
+
+def toml_value(value: Any) -> str:
+    """One TOML value: a string (through ``toml_str``), a boolean, an integer,
+    a float, or an array of those. Anything else raises ``TypeError`` rather
+    than being written as something the loader would read differently."""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, float):
+        if value != value or value in (float("inf"), float("-inf")):
+            raise TypeError(f"not a finite TOML float: {value!r}")
+        return repr(value)
+    if isinstance(value, str):
+        return toml_str(value)
+    if isinstance(value, list) and not any(isinstance(v, dict) for v in value):
+        return "[" + ", ".join(toml_value(v) for v in value) + "]"
+    raise TypeError(f"cannot write {type(value).__name__} as a TOML value: {value!r}")
+
+
+def dump_toml(data: dict, header: str = "") -> str:
+    """Write a parsed TOML document back out, losslessly for what the loader reads.
+
+    ``tomllib.loads(dump_toml(d)) == d`` for every document made of tables,
+    arrays of tables, strings, booleans, integers, finite floats and arrays of
+    those -- the shapes a configuration here uses. Within each table the
+    key/value pairs come first, then its sub-tables, then its arrays of tables,
+    which is the order TOML requires for them to belong to the table above
+    them. Comments are not part of the parsed data and are not reproduced;
+    ``header`` is written first, verbatim.
+    """
+    lines: list[str] = header.splitlines() if header else []
+
+    def is_table_array(value: Any) -> bool:
+        return (
+            isinstance(value, list)
+            and bool(value)
+            and all(isinstance(v, dict) for v in value)
+        )
+
+    def emit(path: str, table: dict) -> None:
+        for key, value in table.items():
+            if not isinstance(value, dict) and not is_table_array(value):
+                lines.append(f"{toml_key(key)} = {toml_value(value)}")
+        for key, value in table.items():
+            if isinstance(value, dict):
+                name = f"{path}{toml_key(key)}"
+                lines.extend(["", f"[{name}]"])
+                emit(f"{name}.", value)
+        for key, value in table.items():
+            if is_table_array(value):
+                name = f"{path}{toml_key(key)}"
+                for item in value:
+                    lines.extend(["", f"[[{name}]]"])
+                    emit(f"{name}.", item)
+
+    emit("", data)
+    return "\n".join(lines).lstrip("\n") + "\n"
+
+
 def validated_ssh_host(host: str, *, username: str | None = None) -> str:
     """Return ``host`` (or ``user@host``) after checking ssh can be given it.
 

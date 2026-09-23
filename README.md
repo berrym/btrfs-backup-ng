@@ -940,6 +940,18 @@ The wizard automatically suggests appropriate options:
 - Prompts for `require_mount` when targeting `/mnt/` paths (external drive safety)
 - Prompts for `ssh_sudo` when targeting SSH URLs
 
+**Saving over an existing configuration keeps what the wizard does not ask
+about.** Volumes are matched by path and targets by path within their volume;
+every option the wizard has no prompt for -- a target's `ssh_key`, `ssh_port`,
+`ssh_host_key_policy`, `optional`, `compress`, `rate_limit`, its own
+`retention`, a volume's `source_retention`, `[global]` settings such as
+`quiet` or `transfer_timeout` -- is carried into the new file. Your answers
+win for everything the wizard does ask, including an option you answered by
+leaving it out (a blank log file stays blank). Before the "Overwrite?"
+question, the wizard lists what it kept and what it will remove: a volume or
+target the new configuration no longer has, with its options. Comments in the
+old file are not kept.
+
 Press Ctrl+C at any time to cancel.
 
 #### Generate Example Configuration
