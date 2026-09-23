@@ -89,6 +89,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   -- the stream file's name -- found nothing, and would have called a correct
   restore invalid and deleted it. A raw snapshot now says what its stream is
   received as.
+- The README gave `-vv` as the debug level. It is the same as `-v`; the debug
+  level is `--debug`. The restore documentation listed six compression methods
+  where `--compress` accepts nine.
 
 - **A refused lock never reported an empty reason again.** Four sites logged
   why and then raised an exception carrying nothing, so a summary that quotes

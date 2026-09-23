@@ -73,15 +73,21 @@ to the config's [global] timestamp_format, else the built-in).
 .SS Transfer Options
 .TP
 .B \-\-dry-run
-Show what would be restored without making any changes.
+Print the restore plan and stop. It is the same plan a run prints and
+executes, and it refuses what the run would refuse.
 .TP
 .B \-\-no-incremental
-Force full transfers instead of incremental. Use when incremental chain
-is broken.
+Send every snapshot in full (no \fB\-p\fR). The chain a snapshot depends on
+is still brought, as full sends.
 .TP
 .BI \-\-compress " METHOD"
-Compression method for transfers. Valid methods: none, zstd, gzip, lz4,
-pigz, lzop.
+Compress the transfer from an \fBssh://\fR backup location: the remote runs
+\fBbtrfs send\fR through the compressor and this host decompresses before
+\fBbtrfs receive\fR. Any method \fBrun \-\-compress\fR accepts (zstd, gzip,
+lz4, xz, ...). Other sources ignore it: a local source has no wire, and a
+\fBraw://\fR or \fBraw+ssh://\fR stream is sent exactly as it was stored.
+The decompressor must be installed on this host; the restore refuses before
+connecting when it is not.
 .TP
 .BI \-\-rate-limit " RATE"
 Bandwidth limit for transfers. Examples: 10M, 1G, 500K.
@@ -170,7 +176,14 @@ Unlock stuck restore sessions. Use "all" to unlock all restore locks,
 or specify a specific lock ID.
 .TP
 .B \-\-cleanup
-Clean up partial/incomplete snapshot restores at the destination.
+Remove what an interrupted restore left at \fIDESTINATION\fR. Each receive
+is recorded in a run marker under
+\fIDESTINATION\fR/.btrfs-backup-ng/restore/ and the marker is removed once the
+copy is verified. A subvolume is deleted only when a marker whose restore is no
+longer running names it, directly under the destination (never \fB..\fR,
+never through a symlink), and it has no received_uuid. Everything else is
+reported and left, including any subvolume no marker names, however empty.
+Honours \fB\-\-dry-run\fR and asks for confirmation.
 .SH RESTORE STRATEGIES
 .SS Strategy 1: Direct Restore (Default)
 Restore the latest snapshot directly:
@@ -246,9 +259,14 @@ Restore using config (knows backup location):
 Restore from second configured target:
 .B btrfs-backup-ng restore --volume /home --target 1 --to /mnt/restore
 .SH INCREMENTAL CHAINS
-When restoring a snapshot that was created incrementally, all parent snapshots
-in the chain must also be restored. The restore command automatically detects
-and transfers the required chain.
+A restore brings the chain a snapshot depends on: the older snapshots at a
+btrfs backup location, or the parent recorded in the \fB.meta\fR sidecar of a
+\fBraw://\fR store. Whatever is already at the destination is skipped, and
+"already there" is decided by identity (the copy's received_uuid against the
+backup's own), never by name. Each snapshot is sent as an increment from the
+newest one the destination holds, or in full when it holds none. A request that
+is already satisfied succeeds with "Already at the destination, so nothing to
+do".
 .PP
 Example chain:
 .PP
@@ -258,9 +276,23 @@ snap-1 (full) -> snap-2 (incr) -> snap-3 (incr) -> snap-4 (incr)
 .fi
 .RE
 .PP
-To restore snap-4, snapshots 1, 2, 3, and 4 are all transferred.
+To restore snap-4 onto an empty destination, snapshots 1, 2, 3 and 4 are all
+transferred; if snap-2 is already there, only 3 and 4 are.
+.SH WHAT IS ALREADY AT THE DESTINATION
+Before anything is transferred, every name the restore would receive is
+examined. When the destination holds something under that name that is not
+this backup's copy (a partial from an interrupted restore, a subvolume made by
+hand, a copy of a different snapshot, a plain directory), the whole restore
+refuses, names the path and what it is, and transfers nothing. It is never
+deleted. A \fBraw://\fR increment whose parent is no longer in the store is
+refused the same way, since a stored increment applies only onto its parent.
 .SH RECOVERY FROM FAILURES
-If a restore is interrupted:
+A transfer that fails is cleaned up by the restore itself: the partial copy it
+made is removed and its pin on the backup is released. A restore that is killed
+outright (SIGKILL, power loss) leaves a partial subvolume and its run marker,
+and the next restore refuses to receive onto it. A pin a killed restore held
+on an \fBssh://\fR or \fBraw+ssh://\fR target expires on its own a few minutes
+later. To recover at once:
 .PP
 .IP 1. 3
 Check status: \fBbtrfs-backup-ng restore --status SOURCE\fR

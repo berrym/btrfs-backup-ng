@@ -1189,7 +1189,9 @@ destination's directory work as the connecting user (see the next step).
 
 This grant is enough for `compress` on an `ssh://` target. The remote runs
 `<decompressor> | sudo -n btrfs receive ...`, so the decompressor runs as the
-connecting user and only `btrfs` is elevated.
+connecting user and only `btrfs` is elevated. A compressed restore from that
+target is the mirror image, `sudo -n btrfs send ... | <compressor>`, under the
+same grant.
 
 The one exception is a remote whose sudo requires a **password**. There the
 remote command becomes `sudo -S sh -c '<decompressor> | btrfs receive ...'`,
@@ -1694,26 +1696,54 @@ btrfs-backup-ng restore --dry-run ssh://backup@server:/backups/home /mnt/restore
 
 ### How Restore Works
 
-btrfs-backup-ng automatically handles incremental restore chains:
+A restore is a transfer from the backup location to this machine, planned and
+run by the same engine a backup uses. It brings the chain a snapshot depends on:
 
 ```
 Backup has: [snap-1, snap-2, snap-3, snap-4]
                 ↓       ↓       ↓       ↓
             (full)  (incr)  (incr)  (incr)
 
-You request: snap-4
+You request: snap-4, onto an empty destination
 
-Restore chain: snap-1 → snap-2 → snap-3 → snap-4
-               (2.1 GB)  (156 MB) (89 MB)  (234 MB)
+Restore plan:
+  [1/4] snap-1 (full)
+  [2/4] snap-2 (incremental from snap-1)
+  [3/4] snap-3 (incremental from snap-2)
+  [4/4] snap-4 (incremental from snap-3)
 ```
+
+`--dry-run` prints this same plan and stops; the run prints it and executes it.
 
 The destination is an output location -- the place this command was asked to put something new -- so it is created if it does not exist (it must be on a btrfs filesystem). This is deliberate, and it is the opposite of what happens to a backup location, which must exist: see [Which paths must exist, and which are created](#which-paths-must-exist-and-which-are-created).
 
 The restore command:
-1. Analyzes the parent chain required for the target snapshot
-2. Checks which parents already exist locally (can skip those)
-3. Restores snapshots in order (oldest first) to satisfy dependencies
-4. Uses incremental transfers when possible (much faster)
+1. Selects the snapshot you asked for (the latest by default) and asks the backup
+   location what it depends on: the older snapshots for a btrfs location, the
+   parent recorded in the `.meta` sidecar for a `raw://` store
+2. Skips whatever is already at the destination. "Already there" is decided by
+   identity -- the copy's `received_uuid` against the backup's own -- never by
+   name, so a copy is recognised however it was named and a same-name impostor
+   is not
+3. Sends the rest oldest first, each as an increment from the newest one the
+   destination holds, or in full when it holds none
+4. Checks every received copy, and removes a partial copy that a failed
+   transfer of this run left behind
+
+A request that is already satisfied succeeds with "Already at the destination,
+so nothing to do", so a recovery script can be re-run safely.
+
+Two situations are refused before anything is transferred:
+
+- **The destination holds something else under a snapshot's name** -- a partial
+  copy from an interrupted restore, a subvolume made by hand, a copy of a
+  different snapshot, or a plain directory. The restore names the path and what
+  it is, and transfers nothing. It never deletes it: inspect it, remove it (see
+  [Clean Up Partial Restores](#clean-up-partial-restores)), or restore to a
+  different path.
+- **A `raw://` increment whose parent is no longer in the store.** A stored
+  increment can only be received onto its parent, and there is no full stream to
+  send instead.
 
 ### Restore Options
 
@@ -1725,14 +1755,14 @@ The restore command:
 | `-a, --all` | Restore all snapshots (full mirror) |
 | `-i, --interactive` | Interactive snapshot selection |
 | `--dry-run` | Show what would be restored without making changes |
-| `--no-incremental` | Force full transfers (skip incremental) |
+| `--no-incremental` | Send every snapshot in full (no `-p`). The chain a snapshot depends on is still brought |
 | `--overwrite` | **Not supported.** Reports that existing snapshots were left in place and continues; nothing at the destination is deleted. Remove a snapshot yourself to replace it |
 | `--in-place` | **Not implemented.** The command refuses and restores nothing. Restore to a staging directory, verify it, and swap the subvolumes yourself (Strategy 2 below) |
 | `--yes-i-know-what-i-am-doing` | Confirm dangerous operations; it does not unlock `--in-place` |
 | `--prefix PREFIX` | Snapshot prefix filter (include trailing hyphen, e.g., `home-`) |
 | `--ssh-sudo` | Use sudo on remote for btrfs commands |
 | `--ssh-key FILE` | SSH private key file for authentication |
-| `--compress METHOD` | Compression for transfer (none, zstd, gzip, lz4, pigz, lzop) |
+| `--compress METHOD` | Compress the transfer from an `ssh://` backup location: the remote compresses its `btrfs send` and this host decompresses before `btrfs receive`. Any method `run --compress` accepts (zstd, gzip, lz4, xz, ...). Other sources ignore it: a local source has no wire, and a `raw://` or `raw+ssh://` stream is sent exactly as it was stored |
 | `--rate-limit RATE` | Bandwidth limit (e.g., '10M', '1G') |
 | `--no-fs-checks` | Skip btrfs subvolume verification (needed for backup directories) |
 | `--progress` | Show progress bars (default in terminal) |
@@ -1740,7 +1770,7 @@ The restore command:
 | `--status` | Show locks and incomplete restores at backup location. On `ssh://` and `raw+ssh://` this reads locks recorded on the target, so it sees other processes and other machines |
 | `--unlock [ID]` | Unlock stuck restore sessions ('all' or specific session ID) |
 | `--skip-remote-lock` | Proceed even if a lock cannot be recorded on the remote target. Only safe when nothing else can prune this target during the run |
-| `--cleanup` | Clean up partial/incomplete restores at destination |
+| `--cleanup` | Remove what an interrupted restore left at the destination: only a subvolume this tool's own run marker names that holds no received copy. Everything else is reported and left |
 
 **Config-driven restore options:**
 
@@ -2064,20 +2094,32 @@ interrupted run is visible from anywhere that can reach the target. See
 
 #### Clean Up Partial Restores
 
-If a restore failed mid-transfer, partial subvolumes may remain at the destination:
+A transfer that fails is cleaned up by the restore itself. A restore that is
+killed outright (SIGKILL, power loss) cannot clean up after itself, and leaves a
+partial subvolume under the snapshot's name. The next restore refuses to receive
+onto it, and says so. To find and remove it:
 
 ```bash
-# Scan for partial restores (dry-run first)
+# Scan first: lists what would be removed, removes nothing
 btrfs-backup-ng restore --cleanup /mnt/restore --dry-run
 
-# Actually clean up partial subvolumes (requires confirmation)
+# Remove it (asks for confirmation)
 btrfs-backup-ng restore --cleanup /mnt/restore
 ```
 
-The cleanup command detects:
-- Empty subvolumes
-- Subvolumes containing only metadata directories
-- Subvolumes with `.partial` suffix
+Each receive a restore starts is recorded in a run marker under
+`DESTINATION/.btrfs-backup-ng/restore/`, and the marker is removed once the copy
+is verified. `--cleanup` deletes a subvolume only when **both** hold:
+
+- a marker whose restore is no longer running names it, directly under the
+  destination (never `..`, never through a symlink), and
+- the subvolume has no `received_uuid`, so it is not a complete copy.
+
+Everything else is reported and left alone: a marker whose restore is still
+running, a stale marker over a complete copy (only the marker is removed), and
+any subvolume no marker names -- however empty it is, since an empty subvolume
+made by hand looks exactly like an interrupted receive. Remove those yourself if
+you know what they are.
 
 #### Complete Recovery Example
 
@@ -3204,7 +3246,7 @@ ERROR: /mnt/backup/home does not seem to be a btrfs subvolume. Use --no-fs-check
 
 ```bash
 btrfs-backup-ng -v run           # Verbose
-btrfs-backup-ng -vv run          # Debug level
+btrfs-backup-ng --debug run      # Debug level
 ```
 
 ### Common Issues
