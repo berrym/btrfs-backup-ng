@@ -183,7 +183,7 @@ class TestCallerContract:
     The producer escapes exactly once. A caller that re-introduces
     ``shlex.quote`` double-escapes, and btrfs receives the literal quote
     characters -- the mirror image of the bug this change fixed. Before these
-    tests only ``receive_chunked`` was guarded (tests/test_r9_quoting.py), so
+    tests only ``receive_chunked`` was guarded (tests/test_remote_shell_quoting.py), so
     re-adding a quote at the other three sites passed the whole suite.
     """
 

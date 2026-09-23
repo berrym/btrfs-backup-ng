@@ -578,7 +578,7 @@ Expire-Date: 0
             # This fixture used to `return`, so nothing ever stopped them: they
             # outlived the run, kept holding a deleted tmp directory, and
             # accumulated four per run until something swept them by hand.
-            # test_r6_raw_encryption.isolated_gpg already does this correctly.
+            # test_raw_encryption.isolated_gpg already does this correctly.
             # GNUPGHOME in the environment, NOT `gpgconf --homedir`: the flag
             # form exits 0 and leaves the agent running, which is how this leak
             # survived its first fix. Measured, not assumed.

@@ -6,7 +6,7 @@ three operational-state writers migrated to it -- operation state
 the restore-unlock lock write (``restore._execute_unlock``) -- can never leave a torn file
 on a mid-write crash.
 
-The lock-persistence suite (``test_r3_lock_persistence.py``) already mutation-guards the
+The lock-persistence suite (``test_lock_persistence.py``) already mutation-guards the
 primitive's stale-temp cleanup, no-residue, and O_NOFOLLOW-symlink behavior *through* the
 lock path (``_write_locks`` now delegates to the primitive); this file exercises the
 primitive directly plus the new callers.
