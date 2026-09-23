@@ -7,10 +7,14 @@ What is restore-only lives here: choosing which snapshot (by name, by time,
 the latest, all of them), inferring the prefix a location uses, the stats a
 run reports, and the layout the copies land in (``core.layout``).
 
-The snapper restore path further down still has its own send/receive
-pipes and planning; it is the next piece to converge.
+A snapper restore is the same transfer into the snapper layout: the
+backup location's slots or streams are the source, the local config's
+numbered slots the destination, and what is snapper-only lives here too --
+enumerating a snapper layout on a local, ssh:// or raw location, and the
+renumbered ``info.xml`` a restored slot gets.
 """
 
+import dataclasses
 import json
 import logging
 import subprocess
@@ -21,14 +25,15 @@ from typing import Any, Callable
 
 from .. import __util__
 from ..transaction import log_transaction
-from . import progress as progress_utils
+from . import operations as _ops
 from .layout import PlainLayout
 from .operations import (
     _execute_transfers,
     _list_snapper_backups_at_destination,
+    _SnapperBtrfsBackup,
 )
 from .planning import PlanningError, plan_transfer_sequence
-from .target import TargetKind, parse_target
+
 
 logger = logging.getLogger(__name__)
 
@@ -607,10 +612,17 @@ def list_snapper_backups(
                     "number": int(item.name),
                     "snapshot_path": snapshot_path,
                     "info_xml_path": info_xml_path if info_xml_path.exists() else None,
+                    # snapper's own xml, verbatim: a restore renumbers THIS, so
+                    # every element snapper wrote survives, modelled or not.
+                    "info_xml": None,
                 }
 
                 # Parse info.xml if available
                 if info_xml_path.exists():
+                    try:
+                        backup_info["info_xml"] = info_xml_path.read_text()
+                    except OSError as e:
+                        logger.debug("Could not read info.xml for %s: %s", item.name, e)
                     try:
                         metadata = parse_info_xml(info_xml_path)
                         backup_info["metadata"] = metadata
@@ -753,8 +765,8 @@ def _list_remote_snapper_backups(
 
         # The slot only counts if the received subvolume is actually there; a
         # publish that never completed must not present as a restorable backup.
-        # Same probe the restore uses (_remote_dir_exists), so what lists as
-        # restorable is exactly what restore_snapper_snapshot then finds.
+        # What lists here is what a restore is offered: the restore sends the
+        # slots this listing names, and nothing it did not.
         if not _remote_dir_exists(endpoint, snapshot_path):
             logger.debug("Skipping snapper slot %s: no published snapshot", slot)
             continue
@@ -775,6 +787,7 @@ def _list_remote_snapper_backups(
                 "number": int(name),
                 "snapshot_path": snapshot_path,
                 "info_xml_path": info_xml_path if raw_xml is not None else None,
+                "info_xml": raw_xml,
                 "metadata": metadata,
             }
         )
@@ -786,9 +799,9 @@ def _list_remote_snapper_backups(
 def _remote_dir_exists(endpoint: Any, path: str) -> bool:
     """True when ``path`` is a directory on the endpoint's remote host.
 
-    ``test -d`` is the probe BOTH the enumeration and the restore use, so a slot
-    that lists as restorable is the same thing the restore then reads; two
-    different probes could disagree and would eventually be made to.
+    ``test -d`` is the enumeration's probe for a slot's received subvolume, so
+    a slot that lists as restorable is one whose subvolume was there to be
+    seen by the connecting user.
 
     Non-zero means "absent OR not reachable by the connecting user" -- ``test``
     cannot separate those, and callers must not phrase it as if it could.
@@ -825,69 +838,6 @@ def _read_remote_text(endpoint: Any, path: str) -> str | None:
     if isinstance(data, bytes):
         return data.decode(errors="replace")
     return str(data)
-
-
-class _RemoteSubvolume:
-    """The one thing ``SSHEndpoint.send`` needs from a snapshot: ``get_path()``.
-
-    A restore source is a subvolume at a known remote path, not a snapshot this
-    process enumerated, so there is no ``__util__.Snapshot`` to hand over:
-    that class derives its path from ``prefix + timestamp``, and a snapper slot
-    (``.snapshots/{num}/snapshot``) does not follow that naming at all. ``send``
-    calls ``_normalize_path(snapshot.get_path())`` and touches nothing else, so
-    this carries exactly that rather than pretending to be a full snapshot --
-    a fake Snapshot would answer ``get_name()``/``time_obj`` with fiction.
-    """
-
-    __slots__ = ("path",)
-
-    def __init__(self, path: str) -> None:
-        self.path = path
-
-    def get_path(self) -> str:
-        return self.path
-
-    def __repr__(self) -> str:
-        return f"_RemoteSubvolume({self.path!r})"
-
-
-def _resolve_remote_snapper_backup(
-    backup_path: str,
-    backup_number: int,
-    endpoint_options: dict | None = None,
-) -> tuple[Any, str, str | None]:
-    """Resolve one snapper backup at an ``ssh://`` btrfs target, for restore.
-
-    The remote layout is identical to a local btrfs target's --
-    ``{path}/.snapshots/{num}/snapshot`` beside ``info.xml`` -- so this is the
-    remote twin of the local branch's existence check, run over the endpoint
-    because ``Path("ssh://host:/p")`` is a nonexistent LOCAL path (it collapses
-    to ``ssh:/host:/p``, which is what the failure used to name).
-
-    Returns ``(endpoint, remote_snapshot_path, info_xml_text_or_None)``.
-    """
-    from ..endpoint import choose_endpoint
-
-    endpoint = choose_endpoint(
-        backup_path, _restore_endpoint_config(backup_path, endpoint_options)
-    )
-    slot = f"{str(endpoint.config['path']).rstrip('/')}/.snapshots/{backup_number}"
-    snapshot_path = f"{slot}/snapshot"
-
-    if not _remote_dir_exists(endpoint, snapshot_path):
-        raise RestoreError(
-            f"Backup snapshot not readable: {snapshot_path}. The probe failed, "
-            "which means the snapshot is absent OR the connecting user cannot "
-            "reach it -- those are indistinguishable from here, so check both. "
-            "On an ssh:// target --ssh-sudo elevates only btrfs and so does not "
-            "grant access to this path; grant the user access instead, e.g. "
-            "setfacl -m u:<user>:rx on the .snapshots directory."
-        )
-
-    info_xml = _read_remote_text(endpoint, f"{slot}/info.xml")
-    if info_xml is None:
-        logger.debug("No readable info.xml in remote snapper slot %s", slot)
-    return endpoint, snapshot_path, info_xml
 
 
 def _assert_raw_location_exists(endpoint: Any, backup_path: str) -> None:
@@ -961,6 +911,8 @@ def _list_raw_snapper_backups(
                 "number": backup_meta.snapper_number,
                 "snapshot_path": None,
                 "info_xml_path": None,
+                # The sidecar stores snapper's own xml; a restore renumbers it.
+                "info_xml": backup_meta.original_info_xml or None,
                 "metadata": metadata,
                 "raw": True,
                 "backup_name": name,
@@ -974,605 +926,450 @@ def _list_raw_snapper_backups(
     return backups
 
 
-def _resolve_raw_snapper_backup(
-    backup_path: str,
-    backup_number: int,
-    endpoint_options: dict | None = None,
-    backup_name: str | None = None,
-) -> tuple[Any, Any, Any]:
-    """Resolve a raw snapper backup to (endpoint, RawSnapshot, BackupMetadata).
+def _backup_key(backup: dict) -> Any:
+    """What tells two listed backups apart: the unique name a raw store gives
+    each stream, or the slot number on a btrfs location (unique there)."""
+    return backup.get("backup_name") or ("num", backup["number"])
 
-    Two resolution modes:
 
-    * ``backup_name`` given (EXACT) -- resolve that specific sidecar by its unique
-      name. This is what the CLI threads once it has enumerated the exact backup the
-      user selected (``--snapshot`` after collision-dedup, ``--backup-name``,
-      ``--date``), so restore materializes precisely that backup rather than
-      re-guessing by number.
-    * ``backup_name`` None (FALLBACK, bare-number API callers) -- match by
-      ``snapper_number``; on a collision (snapper reuses numbers after a prune, and
-      raw targets accumulate streams), pick the NEWEST by snapper_date and warn.
+def _snapper_label(backup: dict) -> str:
+    """How a backup is named to the operator: its snapper number, and for a
+    raw store the unique name that tells reused numbers apart."""
+    label = f"snapshot {backup['number']}"
+    name = backup.get("backup_name")
+    return f"{label} ({name})" if name else label
 
-    The matched name maps to a RawSnapshot by ``.name`` (the shared cross-type backup
-    identity). One endpoint is built and reused for the lookup and the later ``send()``.
 
-    Raises RestoreError if the requested backup has no sidecar or its stream is missing.
+def _restored_info_xml(backup: dict, new_num: int) -> bytes:
+    """The ``info.xml`` a restored slot gets: snapper's own, renumbered.
+
+    One implementation for every source. A local btrfs location has the file,
+    an ssh:// location was read over the connection, a raw store keeps it in
+    the sidecar; each lister puts the text under ``info_xml``. Only ``<num>``
+    changes, so userdata (every block), ``<uid>`` and any element this project
+    does not model survive verbatim. Regenerating from the parsed fields is
+    the fallback when the text is absent or does not parse, and a slot with
+    no metadata at all gets a minimal record that says where it came from.
+    """
+    from ..snapper.metadata import (
+        SnapperMetadata,
+        generate_info_xml,
+        renumber_info_xml,
+    )
+
+    original = backup.get("info_xml")
+    if original:
+        try:
+            return renumber_info_xml(original, new_num).encode("utf-8")
+        except ValueError as e:
+            logger.warning(
+                "Could not renumber the info.xml of %s (%s); regenerating it "
+                "from its parsed fields",
+                _snapper_label(backup),
+                e,
+            )
+    metadata = backup.get("metadata")
+    if metadata is not None:
+        renumbered = dataclasses.replace(metadata, num=new_num)
+        return generate_info_xml(renumbered).encode("utf-8")
+    from datetime import datetime
+
+    minimal = SnapperMetadata(
+        type="single",
+        num=new_num,
+        date=datetime.now(),
+        description=f"Restored from backup {backup['number']}",
+        cleanup="",
+    )
+    return generate_info_xml(minimal).encode("utf-8")
+
+
+def _snapper_source(
+    backup_path: str, backups: list[dict], endpoint_options: dict | None
+) -> tuple[Any, list[tuple[dict, Any]]]:
+    """The backup location as a transfer SOURCE: its endpoint, prepared, and
+    one sendable snapshot object per listed backup.
+
+    Prepared like the native restore's source: for an ssh:// location that
+    starts the master connection and runs the diagnostics that record whether
+    the remote's sudo is passwordless, which is what lets ``--ssh-sudo`` on a
+    NOPASSWD-btrfs host run unattended (``sudo -n`` instead of a prompt).
+
+    A raw store's snapshots are its own listing (``RawSnapshot``: the stored
+    stream, the identity its sidecar records, the parent it applies onto),
+    matched to the backups by the unique name each carries. A btrfs
+    location's slots are read the way the backup direction reads a target --
+    one shell pass over ``.snapshots/<n>/snapshot`` for each slot's
+    received_uuid -- and each selected backup becomes a ``_SnapperBtrfsBackup``
+    at its path, dated from its info.xml. A slot whose identity could not be
+    read is still restorable: it plans as absent (a full send) and its copy's
+    verdict is unverifiable, and that is said.
     """
     from ..endpoint import choose_endpoint
+    from ..endpoint.raw import RawEndpoint
 
     endpoint = choose_endpoint(
         backup_path, _restore_endpoint_config(backup_path, endpoint_options)
     )
+    endpoint.prepare()
 
-    if backup_name is not None:
-        # EXACT: load this specific sidecar by its unique name (no number guessing).
-        try:
-            match_meta = _load_snapper_sidecar(endpoint, backup_name)
-        except Exception as e:
-            raise RestoreError(
-                f"Snapper backup {backup_name!r} not found at {backup_path}: {e}"
-            ) from e
-        match_name = backup_name
-    else:
-        # FALLBACK: collect ALL sidecars matching this snapper number, then pick the
-        # newest on a collision. Iterating a sorted list keeps the choice deterministic
-        # (the underlying set order is salted -> would otherwise be nondeterministic).
-        matches: list[tuple[str, Any]] = []
-        for name in sorted(_list_snapper_backups_at_destination(endpoint)):
-            try:
-                meta = _load_snapper_sidecar(endpoint, name)
-            except Exception as e:
-                logger.warning(
-                    "Skipping raw snapper backup %r (unreadable sidecar): %s", name, e
+    pairs: list[tuple[dict, Any]] = []
+    if isinstance(endpoint, RawEndpoint):
+        streams = {s.get_name(): s for s in endpoint.list_snapshots()}
+        for backup in backups:
+            name = backup.get("backup_name")
+            stream = streams.get(str(name))
+            if stream is None:
+                raise RestoreError(
+                    f"Raw stream for snapper backup {name!r} not found at "
+                    f"{backup_path} (its .snapper-meta.json sidecar exists but "
+                    f"the btrfs-send stream is missing)"
                 )
-                continue
-            if meta.snapper_number == backup_number:
-                matches.append((name, meta))
+            pairs.append((backup, stream))
+        return endpoint, pairs
 
-        if not matches:
-            raise RestoreError(
-                f"Snapper backup number {backup_number} not found at {backup_path}"
-            )
-
-        if len(matches) > 1:
-            # Deterministic: newest snapper_date wins (name breaks a date tie).
-            matches.sort(key=lambda nm: (nm[1].snapper_date, nm[0]), reverse=True)
-            logger.warning(
-                "Multiple raw snapper backups share number %d at %s: %s. Restoring the "
-                "newest (%s, %s); use --backup-name or --date to restore an older copy.",
-                backup_number,
+    identities = {
+        slot.number: slot.received_uuid
+        for slot in _ops._enumerate_snapper_btrfs_backups(endpoint)
+    }
+    base = str(endpoint.config["path"])
+    for backup in sorted(backups, key=lambda b: int(b["number"])):
+        number = int(backup["number"])
+        metadata = backup.get("metadata")
+        date = getattr(metadata, "date", None)
+        time_obj = date.timetuple() if date is not None else None
+        received_uuid = identities.get(number, "")
+        if not received_uuid:
+            logger.info(
+                "The identity of %s at %s could not be read, so it is restored "
+                "in full and its copy cannot be confirmed against the backup.",
+                _snapper_label(backup),
                 backup_path,
-                ", ".join(f"{n} ({m.snapper_date})" for n, m in matches),
-                matches[0][0],
-                matches[0][1].snapper_date,
             )
-
-        match_name, match_meta = matches[0]
-
-    raw_snapshot = next(
-        (s for s in endpoint.list_snapshots() if s.name == match_name), None
-    )
-    if raw_snapshot is None:
-        raise RestoreError(
-            f"Raw stream for snapper backup {match_name!r} not found at {backup_path} "
-            "(its .snapper-meta.json sidecar exists but the btrfs-send stream is missing)"
+        pairs.append(
+            (
+                backup,
+                _SnapperBtrfsBackup(
+                    number,
+                    received_uuid,
+                    base=base,
+                    endpoint=endpoint,
+                    time_obj=time_obj,
+                ),
+            )
         )
+    return endpoint, pairs
 
-    return endpoint, raw_snapshot, match_meta
+
+def _snapper_mode(snapshot: Any, parent: Any) -> str:
+    """How a planned snapshot is sent, for the plan line and the report line.
+
+    A btrfs slot is sent in full or as an increment from the parent the
+    planner chose among what the destination holds. A stored raw stream is
+    replayed as it was written, so the words say what the stream IS rather
+    than what a send would do.
+    """
+    if getattr(snapshot, "stream_path", None) is not None:
+        parent_name = getattr(snapshot, "parent_name", None)
+        return (
+            f"stored increment of {parent_name}"
+            if parent_name
+            else "stored full stream"
+        )
+    if parent is not None:
+        return f"incremental from {parent.number}"
+    return "full"
 
 
-def restore_snapper_snapshot(
+def _snapper_plan_line(
+    index: int, total: int, backup: dict, snapshot: Any, parent: Any
+) -> str:
+    """One line of the plan, printed identically by the preview and the run."""
+    return f"  [{index}/{total}] {_snapper_label(backup)} ({_snapper_mode(snapshot, parent)})"
+
+
+def restore_snapper_snapshots(
     backup_path: str,
-    backup_number: int,
+    backups: list[dict],
+    selected: list[dict],
     snapper_config_name: str,
-    parent_backup_number: int | None = None,
     options: dict | None = None,
     dry_run: bool = False,
     endpoint_options: dict | None = None,
-    backup_name: str | None = None,
-) -> tuple[int, Path]:
-    """Restore a snapper backup to local snapper format.
+    on_progress: Callable[[int, int, str], None] | None = None,
+) -> dict:
+    """Restore snapper backups into a local snapper config: plan, then execute.
 
-    Restores from:
-        {backup_path}/.snapshots/{backup_number}/snapshot
-    To local snapper:
-        {snapper_snapshots_dir}/{new_number}/snapshot
+    A snapper restore is a transfer through the engine with the roles
+    swapped, into the snapper layout. The backup location is the SOURCE
+    (``_snapper_source``: prepared, its slots or streams as snapshots the
+    engine can send); the local config is the DESTINATION through
+    ``SnapperLayout``, whose view of the config's slots is what the planner
+    reads for correspondence and whose receive endpoint lands each copy in
+    the next free ``.snapshots/<n>`` slot.
 
-    Uses Rich progress bar for transfers.
+    What that gives, and what stays as it was:
 
-    Args:
-        backup_path: Base path of backup (e.g., /backup/home)
-        backup_number: Snapshot number to restore from backup
-        snapper_config_name: Local snapper config to restore to
-        parent_backup_number: Parent snapshot number for incremental restore
-        options: Transfer options
-        dry_run: Show what would be done without doing it
+    - Every selected backup lands in a NEW slot, as snapper keeps every
+      snapshot; nothing is skipped as "already restored". The selection is
+      planned exactly as given -- it is never expanded to a chain.
+    - The incremental parent is chosen from what the CONFIG holds, by
+      correspondence (a slot's received_uuid against the identity the
+      backup's stream carries), never by snapper number: a backup whose
+      parent is on the media is an increment, one whose parent is not is a
+      full send. That is the disaster-recovery case: ``--snapshot N`` onto
+      media holding nothing is one full send into slot 1.
+    - A stored raw increment applies only onto its parent; when the parent
+      is neither in the config nor selected, the plan is refused before a
+      byte moves and no slot is created.
+    - The backup is pinned on its location for the duration under
+      ``restore:<session>``, released when a transfer fails; every copy is
+      judged in its slot before the slot is published; a failed receive
+      leaves no numbered slot and no ``.incoming``.
+    - ``info.xml`` is snapper's own, renumbered, from one implementation.
+    - ``dry_run`` prints the plan the run would execute and stops.
 
-    Returns:
-        Tuple of (new snapshot number, path to restored snapshot)
+    ``backups`` is everything the location lists (the parent candidates);
+    ``selected`` is the subset the operator asked for, already reduced by
+    the command line's collision rule.
 
-    Raises:
-        RestoreError: If restore fails
+    Returns ``{"restored", "failed", "errors", "slots"}`` where ``slots`` is
+    ``[(backup number, slot number)]`` for every copy published, in order.
+
+    Raises ``RestoreError`` before anything moves: an unknown config, a raw
+    stream that is gone, a plan that cannot be honoured.
     """
-    import os
-
+    from ..endpoint.local import LocalEndpoint
     from ..snapper import SnapperScanner
-    from ..snapper.metadata import (
-        SnapperMetadata,
-        generate_info_xml,
-        parse_info_xml,
-        parse_info_xml_string,
-        renumber_info_xml,
-    )
+    from .layout import SnapperLayout
 
-    if options is None:
-        options = {}
+    options = dict(options or {})
+    endpoint_options = dict(endpoint_options or {})
+    session_id = str(uuid.uuid4())[:8]
+    stats: dict[str, Any] = {"restored": 0, "failed": 0, "errors": [], "slots": []}
 
-    show_progress = options.get("show_progress", True)
-
-    # Find the snapper config
     scanner = SnapperScanner()
     local_config = scanner.get_config(snapper_config_name)
     if local_config is None:
         raise RestoreError(f"Local snapper config not found: {snapper_config_name}")
-
-    # Backup paths / source resolution (Seam 1). Three layouts, one per kind of
-    # target:
-    #   raw        -- no .snapshots/{n}/snapshot subvolume at all; the source is a
-    #                 stored btrfs-send stream resolved via the sidecars.
-    #   ssh://     -- the SAME layout as a local btrfs target, on the far side of a
-    #                 connection, so it must be probed over the endpoint.
-    #   local      -- the existing subvolume-path check, unchanged.
-    #
-    # The ssh:// branch is why this dispatch exists: Path("ssh://host:/p") is a
-    # nonexistent LOCAL path (it collapses to "ssh:/host:/p"), so every ssh://
-    # restore failed the .exists() check below and reported that mangled path as
-    # a missing snapshot -- while `snapper restore --list` on the same target
-    # listed the backups perfectly well.
-    #
-    # Classification comes from core.target, the single scheme authority, not from
-    # another local startswith(): call sites each deciding "is this remote?" for
-    # themselves, and disagreeing, is the family this belongs to.
-    scheme = parse_target(backup_path)
-    backup_base = Path(backup_path)
-    is_raw = scheme.is_raw
-    is_ssh = scheme.kind is TargetKind.SSH
-
-    raw_endpoint = None
-    raw_snapshot = None
-    raw_backup_meta = None
-    ssh_endpoint = None
-    remote_snapshot_path: str | None = None
-    remote_info_xml: str | None = None
-    backup_snapshot_path: Path | None = None
-    backup_info_xml: Path | None = None
-
-    if is_raw:
-        raw_endpoint, raw_snapshot, raw_backup_meta = _resolve_raw_snapper_backup(
-            backup_path, backup_number, endpoint_options, backup_name
+    subvolume = Path(local_config.subvolume)
+    if not subvolume.is_dir():
+        raise RestoreError(
+            f"The subvolume of snapper config {snapper_config_name!r}, "
+            f"{subvolume}, is not there. It is most likely on a filesystem that "
+            f"is not mounted; nothing was restored."
         )
-        source_desc = raw_snapshot.name
-    elif is_ssh:
-        (
-            ssh_endpoint,
-            remote_snapshot_path,
-            remote_info_xml,
-        ) = _resolve_remote_snapper_backup(backup_path, backup_number, endpoint_options)
-        source_desc = f"{backup_path} snapshot {backup_number}"
-    else:
-        backup_snapshot_dir = backup_base / ".snapshots" / str(backup_number)
-        backup_snapshot_path = backup_snapshot_dir / "snapshot"
-        backup_info_xml = backup_snapshot_dir / "info.xml"
-        if not backup_snapshot_path.exists():
-            raise RestoreError(f"Backup snapshot not found: {backup_snapshot_path}")
-        source_desc = str(backup_snapshot_path)
-
-    # Get next available snapshot number for restore
-    next_num = scanner.get_next_snapshot_number(local_config)
-
-    # Local destination paths
-    dest_snapshot_dir = local_config.snapshots_dir / str(next_num)
-    dest_snapshot_path = dest_snapshot_dir / "snapshot"
-
-    # Parent path for incremental. Not applicable to raw: the stored stream already
-    # encodes whatever it encodes (full, or incremental against a parent matched by
-    # received_uuid, which the oldest-first restore loop lands just before this one) --
-    # RawEndpoint.send replays it verbatim, there is no btrfs-send `-p` to add here.
-    parent_path = None
-    remote_parent_path: str | None = None
-    if is_ssh and parent_backup_number:
-        # The parent lives on the remote too, so it is probed there. Same
-        # fall-back-to-full rule as the local branch: an absent parent must
-        # degrade the restore, never fail it.
-        assert ssh_endpoint is not None
-        candidate = (
-            f"{str(ssh_endpoint.config['path']).rstrip('/')}"
-            f"/.snapshots/{parent_backup_number}/snapshot"
+    if not Path(local_config.snapshots_dir).is_dir():
+        raise RestoreError(
+            f"Snapper config {snapper_config_name!r} has no {local_config.snapshots_dir}"
+            f" directory; snapper itself cannot use the config without it. Nothing "
+            f"was restored."
         )
-        if _remote_dir_exists(ssh_endpoint, candidate):
-            remote_parent_path = candidate
-        else:
-            logger.warning(
-                "Parent snapshot %d not found on the remote, "
-                "falling back to full restore",
-                parent_backup_number,
+    if not selected:
+        raise RestoreError("Nothing was selected to restore")
+
+    local_endpoint = LocalEndpoint(
+        config={
+            "path": str(subvolume),
+            "snap_prefix": "",
+            "fs_checks": "skip",
+            "btrfs_debug": bool(endpoint_options.get("btrfs_debug", False)),
+        }
+    )
+    layout = SnapperLayout(
+        local_endpoint,
+        next_number=lambda: scanner.get_next_snapshot_number(local_config),
+    )
+
+    # One restore at a time into a config, for the whole run. Two restores
+    # would pick the same next free number and the second would remove the
+    # first's in-flight temp as a crashed run's leftover; refused with words
+    # instead. The kernel drops the lock when the holder dies.
+    try:
+        held = layout.restore_lock(
+            f"Restoring into snapper config {snapper_config_name!r}"
+        )
+        held.__enter__()
+    except RuntimeError as e:
+        raise RestoreError(f"{e}. Nothing was restored.") from e
+    try:
+        return _restore_snapper_snapshots_locked(
+            layout,
+            scanner,
+            local_config,
+            backup_path,
+            backups,
+            selected,
+            snapper_config_name,
+            options,
+            dry_run,
+            endpoint_options,
+            on_progress,
+            session_id,
+            stats,
+        )
+    finally:
+        held.__exit__(None, None, None)
+
+
+def _restore_snapper_snapshots_locked(
+    layout: Any,
+    scanner: Any,
+    local_config: Any,
+    backup_path: str,
+    backups: list[dict],
+    selected: list[dict],
+    snapper_config_name: str,
+    options: dict,
+    dry_run: bool,
+    endpoint_options: dict,
+    on_progress: Callable[[int, int, str], None] | None,
+    session_id: str,
+    stats: dict[str, Any],
+) -> dict:
+    """The body of ``restore_snapper_snapshots``, run with the config's
+    restore lock held: nothing else is restoring into this config, so the
+    temps of restores that died can be swept, and the numbers this run reads
+    are contended only by snapper itself (which ``publish_fresh`` handles)."""
+    from ..endpoint.raw import RawEndpoint
+
+    if not dry_run:
+        layout.sweep_stale_temps()
+
+    source_endpoint, pairs = _snapper_source(backup_path, backups, endpoint_options)
+    backup_of = {snapshot.get_name(): backup for backup, snapshot in pairs}
+    snapshot_of = {_backup_key(backup): snapshot for backup, snapshot in pairs}
+    source_snapshots = [snapshot for _, snapshot in pairs]
+    targets = []
+    for backup in selected:
+        snapshot = snapshot_of.get(_backup_key(backup))
+        if snapshot is None:
+            raise RestoreError(
+                f"{_snapper_label(backup)} is not among the backups listed at "
+                f"{backup_path}"
             )
-    elif not is_raw and parent_backup_number:
-        parent_path = (
-            backup_base / ".snapshots" / str(parent_backup_number) / "snapshot"
-        )
-        if not parent_path.exists():
-            logger.warning(
-                "Parent snapshot %d not found, falling back to full restore",
-                parent_backup_number,
-            )
-            parent_path = None
-    elif is_raw and parent_backup_number:
-        logger.debug(
-            "Raw source: ignoring parent %d (stream is self-contained)",
-            parent_backup_number,
-        )
+        targets.append(snapshot)
 
-    if parent_path or remote_parent_path:
+    # A raw store's answer to "what does this need" is a FACT about the
+    # stored stream and is checked before a byte moves. A btrfs location's
+    # answer is the time-ordered predecessor, a policy the native restore
+    # follows and a snapper restore does not: the selection is what the
+    # operator named, and a full send always works.
+    requirements = source_endpoint if isinstance(source_endpoint, RawEndpoint) else None
+    try:
+        plan = plan_transfer_sequence(
+            source_snapshots,
+            layout.destination_view,
+            only=targets,
+            source_endpoint=requirements,
+            expand_selection=False,
+            skip_present=False,
+        )
+    except PlanningError as e:
+        raise RestoreError(str(e)) from e
+
+    next_free = scanner.get_next_snapshot_number(local_config)
+    logger.info("")
+    logger.info("Restore plan:")
+    logger.info(
+        "  Into snapper config %r (%s); the next free slot is %d, and each "
+        "copy lands under the number that is free when it is published",
+        snapper_config_name,
+        local_config.snapshots_dir,
+        next_free,
+    )
+    for i, (snapshot, parent) in enumerate(plan, 1):
         logger.info(
-            "Restoring snapshot %d -> %d (incremental from %d) ...",
-            backup_number,
-            next_num,
-            parent_backup_number,
+            "%s",
+            _snapper_plan_line(
+                i, len(plan), backup_of[snapshot.get_name()], snapshot, parent
+            ),
         )
-    else:
-        logger.info("Restoring snapshot %d -> %d (full) ...", backup_number, next_num)
+    logger.info("  Total: %d snapshot(s) to restore", len(plan))
+    logger.info("")
 
     if dry_run:
-        logger.info("Dry run - would restore as snapshot %d", next_num)
-        return next_num, Path("/dev/null")
+        logger.info("Dry run - no changes made")
+        return stats
 
-    # Recorded BEFORE anything is created. get_next_snapshot_number is supposed to
-    # hand back a free slot, but the failure path below removes the whole numbered
-    # directory, and "supposed to be free" is the kind of unchecked premise that
-    # turns a failed restore into the loss of a snapshot that was already there --
-    # a stale scan, a concurrent snapper, or a slot made by hand is enough.
-    slot_preexisted = dest_snapshot_dir.exists()
-    snapshot_preexisted = dest_snapshot_path.exists()
-
-    transfer_start = time.monotonic()
-
+    dest_path = str(local_config.snapshots_dir)
+    parents = {s.get_name(): p for s, p in plan}
+    run_start = time.monotonic()
     log_transaction(
         action="snapper_restore",
         status="started",
-        source=source_desc,
-        destination=str(dest_snapshot_path),
-        snapshot=str(backup_number),
-        parent=str(parent_backup_number) if parent_backup_number else None,
+        source=backup_path,
+        destination=dest_path,
+        snapshot=", ".join(str(backup_of[s.get_name()]["number"]) for s, _ in plan),
     )
 
-    # Label for send-side failures: a raw stream's decode pipeline is not `btrfs
-    # send`, and an ssh:// send failed on the OTHER machine -- saying which end
-    # broke is most of the diagnosis.
-    if is_raw:
-        send_label = "raw stream decode"
-    elif is_ssh:
-        send_label = "remote btrfs send"
-    else:
-        send_label = "btrfs send"
+    def _info_xml_for(snapshot: Any, number: int) -> bytes:
+        return _restored_info_xml(backup_of[snapshot.get_name()], number)
 
+    def _published(snapshot: Any, number: int) -> None:
+        # The report line for each slot, as it is published: the number
+        # snapper will show for it, and how it was received.
+        backup = backup_of[snapshot.get_name()]
+        logger.info(
+            "Restored %s as local snapshot %d (%s)",
+            _snapper_label(backup),
+            number,
+            _snapper_mode(snapshot, parents.get(snapshot.get_name())),
+        )
+
+    layout.begin(
+        plan,
+        info_xml_for=_info_xml_for,
+        on_published=_published,
+        on_progress=on_progress,
+    )
     try:
-        # Create destination directory. Direct first, sudo only if that is
-        # refused: a snapper destination under SYNC_ACL is frequently writable by
-        # the backup user, and the documented sudoers (NOPASSWD: /usr/bin/btrfs)
-        # does not cover mkdir at all -- so the unconditional shell-out failed a
-        # restore that needed no privilege whatsoever.
-        __util__.privileged_mkdir(dest_snapshot_dir, allow_prompt=True)
+        result = _execute_transfers(
+            source_endpoint,
+            layout.receive_endpoint,
+            plan,
+            options,
+            lock_id=f"restore:{session_id}",
+            release_on_failure=True,
+        )
+    finally:
+        layout.finish()
 
-        # Build btrfs receive command (shared: the raw stream's embedded subvolume is
-        # named "snapshot" -- the backup source was .snapshots/{n}/snapshot -- so
-        # receive lands dest_snapshot_dir/snapshot exactly like the btrfs path).
-        receive_cmd = ["btrfs", "receive", str(dest_snapshot_dir)]
-        if os.geteuid() != 0:
-            receive_cmd = ["sudo"] + receive_cmd
-        logger.debug("Receive command: %s", " ".join(receive_cmd))
-
-        # Seam 2 (send side) + Seam 3 (progress estimate).
-        estimated_size = None
-        if is_raw:
-            # RawEndpoint.send returns a Popen whose stdout is the verified,
-            # decrypted/decompressed btrfs-send stream -- a drop-in for the send
-            # Popen below. Its integrity check fires INSIDE send() before any bytes
-            # are received, so a corrupt stream aborts before touching the slot. No
-            # size estimate: raw .size is the on-disk (compressed) size, not the
-            # decoded stream size, so a progress total would mislead (spinner only).
-            assert raw_endpoint is not None and raw_snapshot is not None
-            send_process = raw_endpoint.send(raw_snapshot)
-        elif is_ssh:
-            # SSHEndpoint.send runs `btrfs send` ON THE REMOTE and returns a Popen
-            # whose stdout is the stream -- the same shape RawEndpoint.send returns,
-            # so the receive below is untouched by which end the bytes came from.
-            #
-            # No size estimate: the endpoint's _estimate_snapshot_size runs
-            # `btrfs subvolume show` LOCALLY (it exists for the backup direction,
-            # where the source IS local), so aiming it at a remote path measures
-            # nothing and returns None after two failed subprocesses. A missing
-            # total shows a spinner; a wrong total misinforms, and the raw branch
-            # above already set that precedent deliberately.
-            assert ssh_endpoint is not None and remote_snapshot_path is not None
-            send_process = ssh_endpoint.send(
-                _RemoteSubvolume(remote_snapshot_path),
-                parent=(
-                    _RemoteSubvolume(remote_parent_path) if remote_parent_path else None
-                ),
-            )
-        else:
-            send_cmd = ["btrfs", "send"]
-            if parent_path:
-                send_cmd.extend(["-p", str(parent_path)])
-            send_cmd.append(str(backup_snapshot_path))
-            if os.geteuid() != 0:
-                send_cmd = ["sudo"] + send_cmd
-            logger.debug("Send command: %s", " ".join(send_cmd))
-            if show_progress and not parent_path:
-                estimated_size = progress_utils.estimate_snapshot_size(
-                    str(backup_snapshot_path),
-                    str(parent_path) if parent_path else None,
-                )
-            send_process = subprocess.Popen(
-                send_cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-            )
-
-        # Use Rich progress for local transfers
-        use_rich_progress = show_progress and progress_utils.is_interactive()
-
-        if use_rich_progress:
-            receive_process = subprocess.Popen(
-                receive_cmd,
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-            )
-
-            send_rc, receive_rc = progress_utils.run_transfer_with_progress(
-                send_process=send_process,
-                receive_process=receive_process,
-                snapshot_name=f"snapshot {backup_number}",
-                estimated_size=estimated_size,
-            )
-
-            if send_rc != 0:
-                raise RestoreError(f"{send_label} failed with code {send_rc}")
-            if receive_rc != 0:
-                raise RestoreError(f"btrfs receive failed with code {receive_rc}")
-        else:
-            # Simple pipe without progress
-            receive_process = subprocess.Popen(
-                receive_cmd,
-                stdin=send_process.stdout,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-            )
-
-            # One idiom for releasing a handed-over pipe, everywhere. There are
-            # no intermediate stages here, so there is nothing for chain_stages
-            # to chain -- but the handoff itself is the same one, and the same
-            # omission elsewhere left a stage blocked forever.
-            from . import transfer as transfer_utils
-
-            transfer_utils.hand_over(send_process.stdout)
-
-            receive_stdout, receive_stderr = receive_process.communicate()
-            send_process.wait()
-
-            if send_process.returncode != 0:
-                raise RestoreError(
-                    f"{send_label} failed with code {send_process.returncode}"
-                )
-            if receive_process.returncode != 0:
-                raise RestoreError(
-                    f"btrfs receive failed: {receive_stderr.decode().strip()}"
-                )
-
-        # btrfs receive creates "snapshot" subvolume, which is exactly what we want
-        # No rename needed since snapper expects .snapshots/{num}/snapshot
-
-        # Copy or generate info.xml
-        dest_info_xml = dest_snapshot_dir / "info.xml"
-        if is_raw:
-            # Seam 4: build info.xml for the fresh slot. Raw targets have no
-            # .snapshots/{n}/info.xml to copy, so prefer RENUMBERING the sidecar's
-            # stored original_info_xml (snapper's OWN xml) in place -- only <num>
-            # changes; userdata (incl. multi-entry), <uid>, and any element we do not
-            # model are preserved VERBATIM. Fall back to regenerating from the parsed
-            # fields only when no original was stored or it will not parse (older
-            # sidecars that also stored a mis-parsed userdata dict still round-trip
-            # correctly this way, since the original xml is snapper's authoritative copy).
-            assert raw_backup_meta is not None
-            xml_content = None
-            if raw_backup_meta.original_info_xml:
-                try:
-                    xml_content = renumber_info_xml(
-                        raw_backup_meta.original_info_xml, next_num
-                    )
-                except Exception as e:
-                    logger.warning(
-                        "Could not renumber stored info.xml for backup %d (%s); "
-                        "regenerating from sidecar fields",
-                        backup_number,
-                        e,
-                    )
-            if xml_content is None:
-                metadata = raw_backup_meta.to_snapper_metadata()
-                metadata.num = next_num
-                xml_content = generate_info_xml(metadata)
-        elif is_ssh:
-            # Seam 4 over ssh. The remote info.xml was already read during
-            # resolution, so no second connection is opened here. Prefer
-            # RENUMBERING it: only <num> changes, and everything snapper wrote --
-            # multi-entry userdata, <uid>, elements this project does not model --
-            # survives verbatim. Parse-and-regenerate is the fallback because it
-            # can only preserve the fields modelled here, and a synthesized
-            # description is the last resort rather than the first.
-            xml_content = None
-            if remote_info_xml:
-                try:
-                    xml_content = renumber_info_xml(remote_info_xml, next_num)
-                except Exception as e:
-                    logger.warning(
-                        "Could not renumber remote info.xml for backup %d (%s); "
-                        "regenerating from its parsed fields",
-                        backup_number,
-                        e,
-                    )
-                if xml_content is None:
-                    try:
-                        metadata = parse_info_xml_string(remote_info_xml)
-                        metadata.num = next_num
-                        xml_content = generate_info_xml(metadata)
-                    except Exception as e:
-                        logger.warning(
-                            "Could not parse remote info.xml for backup %d: %s",
-                            backup_number,
-                            e,
-                        )
-            if xml_content is None:
-                from datetime import datetime
-
-                metadata = SnapperMetadata(
-                    type="single",
-                    num=next_num,
-                    date=datetime.now(),
-                    description=f"Restored from backup {backup_number}",
-                    cleanup="",
-                )
-                xml_content = generate_info_xml(metadata)
-        elif backup_info_xml is not None and backup_info_xml.exists():
-            # Copy original info.xml but update the number
-            try:
-                metadata = parse_info_xml(backup_info_xml)
-                metadata.num = next_num
-                xml_content = generate_info_xml(metadata)
-            except Exception as e:
-                logger.warning("Could not parse backup info.xml, generating new: %s", e)
-                from datetime import datetime
-
-                metadata = SnapperMetadata(
-                    type="single",
-                    num=next_num,
-                    date=datetime.now(),
-                    description=f"Restored from backup {backup_number}",
-                    cleanup="",
-                )
-                xml_content = generate_info_xml(metadata)
-        else:
-            # Generate new info.xml
-            from datetime import datetime
-
-            metadata = SnapperMetadata(
-                type="single",
-                num=next_num,
-                date=datetime.now(),
-                description=f"Restored from backup {backup_number}",
-                cleanup="",
-            )
-            xml_content = generate_info_xml(metadata)
-
-        # Write info.xml
-        #
-        # Slot dir is 0755 to match what snapper NATIVELY creates for .snapshots/{N}
-        # (verified against snapper 0.13: native slot dirs are 0755, only the parent
-        # .snapshots is 0750). 0750 here would be stricter than snapper and can block
-        # non-root snapper access under ALLOW_USERS/ALLOW_GROUPS/SYNC_ACL; the parent
-        # .snapshots (0750, root+group) still gates who can reach the slot at all.
-        __util__.privileged_write_bytes(dest_info_xml, xml_content, allow_prompt=True)
-        __util__.privileged_chmod(dest_snapshot_dir, 0o755, allow_prompt=True)
-
-        duration = time.monotonic() - transfer_start
-
+    duration = time.monotonic() - run_start
+    slot_of = {snapshot.get_name(): number for snapshot, number in layout.published}
+    for snapshot in result.transferred:
+        backup = backup_of[snapshot.get_name()]
+        parent = parents.get(snapshot.get_name())
+        number = slot_of.get(snapshot.get_name())
+        stats["slots"].append((backup["number"], number))
         log_transaction(
             action="snapper_restore",
             status="completed",
-            source=source_desc,
-            destination=str(dest_snapshot_path),
-            snapshot=str(backup_number),
-            parent=str(parent_backup_number) if parent_backup_number else None,
+            source=backup_path,
+            destination=f"{dest_path}/{number}/snapshot",
+            snapshot=str(backup["number"]),
+            parent=str(backup_of[parent.get_name()]["number"]) if parent else None,
             duration_seconds=duration,
         )
-
-        logger.info(
-            "Restored snapshot %d -> %d successfully (%.1fs)",
-            backup_number,
-            next_num,
-            duration,
-        )
-        return next_num, dest_snapshot_path
-
-    except Exception as e:
-        duration = time.monotonic() - transfer_start
+    for snapshot, error in result.failed:
+        backup = backup_of[snapshot.get_name()]
+        parent = parents.get(snapshot.get_name())
         log_transaction(
             action="snapper_restore",
             status="failed",
-            source=source_desc,
-            destination=str(dest_snapshot_path),
-            snapshot=str(backup_number),
-            parent=str(parent_backup_number) if parent_backup_number else None,
+            source=backup_path,
+            destination=dest_path,
+            snapshot=str(backup["number"]),
+            parent=str(backup_of[parent.get_name()]["number"]) if parent else None,
             duration_seconds=duration,
-            error=str(e),
+            error=str(error),
         )
+        stats["errors"].append(f"{_snapper_label(backup)}: {error}")
 
-        # Clean up partial restore -- only what this run put there. The subvolume
-        # and the numbered directory are judged separately: a restore can fail
-        # after creating the directory but before receiving into it, and it can
-        # also fail into a slot that already held one.
-        if snapshot_preexisted or slot_preexisted:
-            logger.warning(
-                "Not removing %s after the failed restore: it was already present "
-                "before this restore started, so it is not this run's partial. "
-                "Inspect it before deleting anything.",
-                dest_snapshot_path if snapshot_preexisted else dest_snapshot_dir,
-            )
-        try:
-            if dest_snapshot_path.exists() and not snapshot_preexisted:
-                if os.geteuid() != 0:
-                    subprocess.run(
-                        [
-                            "sudo",
-                            "btrfs",
-                            "property",
-                            "set",
-                            "-f",
-                            str(dest_snapshot_path),
-                            "ro",
-                            "false",
-                        ],
-                        capture_output=True,
-                    )
-                    subprocess.run(
-                        [
-                            "sudo",
-                            "btrfs",
-                            "subvolume",
-                            "delete",
-                            str(dest_snapshot_path),
-                        ],
-                        capture_output=True,
-                    )
-                else:
-                    subprocess.run(
-                        [
-                            "btrfs",
-                            "property",
-                            "set",
-                            "-f",
-                            str(dest_snapshot_path),
-                            "ro",
-                            "false",
-                        ],
-                        capture_output=True,
-                    )
-                    __util__.delete_subvolume(dest_snapshot_path)
-            if dest_snapshot_dir.exists() and not slot_preexisted:
-                __util__.privileged_rmtree(dest_snapshot_dir, allow_prompt=True)
-        except Exception as cleanup_e:
-            logger.warning("Cleanup failed: %s", cleanup_e)
-
-        logger.error("Failed to restore snapshot %d: %s", backup_number, e)
-        raise RestoreError(f"Failed to restore snapshot {backup_number}: {e}") from e
+    stats["restored"] = result.transferred_count
+    stats["failed"] = result.failed_count
+    if stats["errors"]:
+        logger.warning("Errors:")
+        for err in stats["errors"]:
+            logger.warning("  %s", err)
+    return stats

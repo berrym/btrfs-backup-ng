@@ -2484,15 +2484,48 @@ sudo btrfs-backup-ng snapper restore /mnt/backup/root root \
 sudo btrfs-backup-ng snapper restore /mnt/backup/root root --snapshot 559 --date 2024-01-01
 ```
 
-The restore command resolves the requested backup, receives it into a fresh
-`.snapshots/{new_num}/` slot, and writes a renumbered `info.xml` preserving the original
-type, description, cleanup, and **all userdata**. The restored snapshot is a first-class
-snapper snapshot (native `0755` slot permissions).
+A snapper restore is a transfer through the same engine a backup uses, into
+snapper's own layout. What it does, in order:
+
+1. Lists the backups at `SOURCE` and takes exactly the ones you selected. The
+   selection is never expanded: `--snapshot 560` restores 560 and nothing else.
+2. Reads the local config's `.snapshots/` for the copies it already holds, by
+   identity (each copy's `received_uuid` against the identity the backup's
+   stream carries), never by number, because snapper reuses numbers.
+3. Chooses each increment's parent from **what the config holds**. A backup
+   whose parent is already restored is sent as an increment from that copy; one
+   whose parent is not there is sent **in full**. Onto empty recovery media,
+   `--snapshot 560` is therefore one full send into slot 1, and `--all` rebuilds
+   the chain with each increment received against the slot before it.
+4. Receives each copy into a `.snapshots/{N}.incoming/` temp, checks that what
+   arrived is the backup's copy, and publishes it under the number that is
+   free **at that moment**: the renumbered `info.xml` is written for that
+   number and the directory is renamed to `.snapshots/{N}/` with a rename that
+   cannot replace anything. A snapshot snapper creates while the restore runs
+   (its timeline, or your own `snapper create`) is never touched; the copy
+   simply lands under the next number. A slot appears complete or not at all:
+   a restore that fails mid-receive leaves no numbered slot and no `.incoming`.
+   One restore runs into a config at a time; a second one started meanwhile is
+   refused and restores nothing.
+5. Pins the backup on its location for the duration (under `restore:<session>`,
+   released when a transfer fails), so a prune on that target cannot delete
+   what is being read. A target you can read but not write takes
+   `--skip-remote-lock`.
+
+Every selected backup lands in a **new** slot, present or not: snapper keeps
+every snapshot, so a restore is never skipped as "already restored". The
+`info.xml` is snapper's own from the backup with only `<num>` changed, so
+type, description, cleanup, **all userdata** and elements this tool does not
+model (`<uid>`) survive verbatim. `--dry-run` prints the plan the run would
+execute. A `raw://` / `raw+ssh://` increment whose parent is neither in the
+config nor selected is refused before a byte moves: a stored increment can
+only be received onto its parent, and there is no full stream to send instead.
 
 > **After a restore, refresh the daemon.** The slot is written directly to disk (not via
 > `snapper create`), so the snapper **daemon caches** its list and won't see it until it
-> rescans — `snapper diff`/`undochange`/rollback may say *"Snapshot 'N' not found"*. Run
-> `snapper -c <config> list` (or reboot) first (the command prints a reminder). See
+> reloads — `snapper diff`/`undochange`/rollback may say *"Snapshot 'N' not found"*.
+> Restart the daemon first, `sudo systemctl restart snapperd` (or reboot); a
+> `snapper list` does not make it look again (the command prints a reminder). See
 > [Snapper Integration](docs/SNAPPER-INTEGRATION.md#restoration) for the full workflow.
 
 #### Check Backup Status
@@ -2663,18 +2696,25 @@ mount /dev/sda2 /mnt/newroot
 # 3. List available backups
 btrfs-backup-ng snapper restore ssh://backup@nas:/backups/root --list
 
-# 4. Restore the snapshot you need (CONFIG comes right after SOURCE)
+# 4. Restore the snapshot you need (CONFIG comes right after SOURCE). The
+#    media holds nothing yet, so this is ONE full send into the first free
+#    slot; the backup's parent is not consulted, because the media does not
+#    have it. With --ssh-sudo on a remote whose sudoers grants NOPASSWD btrfs
+#    this runs unattended.
 sudo btrfs-backup-ng snapper restore \
     ssh://backup@nas:/backups/root \
     root \
-    --snapshot 560
+    --snapshot 560 --ssh-sudo
 
 # 5. The restore reports a NEW local number, e.g. "restored as local snapshot 4".
-#    Refresh the snapper daemon so it sees the out-of-band slot, then roll back to
+#    Restart the snapper daemon so it sees the out-of-band slot, then roll back to
 #    that NEW number (not the backup's original 560).
-snapper -c root list           # refresh the daemon cache
+systemctl restart snapperd     # the daemon reloads its snapshot list
 snapper -c root rollback 4     # use the number the restore reported
 ```
+
+To bring the history back as well, `--all` restores every backup, each
+increment received against the slot restored before it.
 
 ### Snapper Integration vs Native Mode
 

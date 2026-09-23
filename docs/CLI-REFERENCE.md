@@ -937,6 +937,7 @@ btrfs-backup-ng snapper restore SOURCE [CONFIG] [OPTIONS]
 | `--ssh-key FILE` | SSH private key file |
 | `--ssh-auth-sock PATH` | Explicit ssh-agent socket (overrides auto-discovery; useful under `sudo`) |
 | `--ssh-host-key-policy {accept-new,strict}` | Host-key verification policy (default `accept-new`) |
+| `--skip-remote-lock` | Do not pin the backup on its location for the duration of the restore; for a location you can read but not write |
 | `--gpg-keyring PATH` | GPG keyring to decrypt an encrypted raw snapper backup (must match the keyring it was encrypted for) |
 | `--openssl-cipher CIPHER` | OpenSSL cipher fallback for a legacy raw backup whose `.meta` sidecar does not record one (modern sidecars are authoritative) |
 | `--json` | Output in JSON format (for `--list`) |
@@ -970,7 +971,7 @@ btrfs-backup-ng snapper restore /mnt/backup/root root --snapshot 559 --date 2024
 
 > **Note — snapper daemon cache.** A restored snapshot is written directly into
 > `.snapshots/{N}/` (not via `snapper create`), so `snapperd` does not see it until it
-> rescans. Run `snapper -c <config> list` (or reboot) after a restore before using
+> reloads. Restart it (`sudo systemctl restart snapperd`, or reboot) after a restore before using
 > `snapper diff`, `snapper undochange`, or a rollback against the restored snapshot; the
 > restore command prints a reminder. The on-disk snapshot is complete and correct — this
 > only affects the daemon's in-memory view. Restored slots use snapper's native `0755`
