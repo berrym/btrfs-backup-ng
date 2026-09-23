@@ -1534,7 +1534,7 @@ class TestSnapperEndpointRouting:
             patch.object(operations, "send_snapshot", side_effect=fake_send_snapshot),
             patch.object(operations, "_snapper_run_shell", return_value=(0, "")),
             patch.object(operations, "_snapper_publish_slot") as pub,
-            patch.object(operations, "_place_info_xml"),
+            patch.object(operations, "_write_info_xml"),
             patch.object(operations, "_write_snapper_metadata"),
         ):
             operations.send_snapper_snapshot(snap, ep)

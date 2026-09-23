@@ -9,13 +9,17 @@ destination, and a Layout answers those questions. The engine never learns a
 layout's name; it is handed ``destination_view`` to plan against and
 ``receive_endpoint`` to execute against, and both are ordinary endpoints.
 
-Only the plain layout exists here. The snapper layout (one object serving the
-backup and the restore direction) and the in-place layout (#109) build on the
-same four answers.
+Two layouts live here. The plain layout receives into a directory. The
+snapper layout receives into a numbered slot of snapper's own on-disk form,
+and it is ONE object for both directions: a snapper backup to a btrfs target
+and a snapper restore into a local config open, fill, publish and abandon a
+slot through the same code, so the two cannot drift. The in-place layout
+(#109) builds on the same answers.
 """
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import os
@@ -24,6 +28,7 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 
 from .. import __util__
+from . import operations as _ops
 from .operations import _received_subvolume_shape, received_name_of
 
 logger = logging.getLogger(__name__)
@@ -287,6 +292,415 @@ class _MarkedReceiver:
     def add_snapshot(self, snapshot: Any, rewrite: bool = True) -> None:
         self._layout._receive_verified(snapshot)
         self._endpoint.add_snapshot(snapshot, rewrite=rewrite)
+
+
+# --------------------------------------------------------------------------- #
+# the snapper layout: numbered slots, for both directions
+# --------------------------------------------------------------------------- #
+
+
+class _OpenSlot:
+    """The slot a receive is landing in: its number, the endpoint path to put
+    back, and the slot lock held for the receive and the publish."""
+
+    def __init__(self, number: int, saved_path: Any) -> None:
+        self.number = number
+        self.saved_path = saved_path
+        self.locks = contextlib.ExitStack()
+
+
+class SnapperLayout:
+    """Snapper's on-disk form -- ``BASE/.snapshots/<n>/snapshot`` beside
+    ``info.xml`` -- as a receive destination, on a btrfs endpoint whose path
+    is ``BASE``: a backup target, or a snapper config's subvolume.
+
+    The slot lifecycle is the one thing here, and both directions run it:
+
+    - ``open_slot(n)``: the target must exist; the slot lock the destination
+      offers (ssh:// targets have one, a local one none) is taken for slot n;
+      a ``.incoming`` left by a crashed run is removed; ``.snapshots/<n>.incoming``
+      is created below the target; the endpoint is pointed at it, so a
+      ``btrfs receive`` through the endpoint lands ``<n>.incoming/snapshot``.
+    - ``publish(info_xml)``: the endpoint is pointed back at ``BASE``; the
+      slot's ``info.xml`` is written INTO ``.incoming``; the directory is
+      renamed to ``<n>`` (a received subvolume is read-only and cannot be
+      moved, its containing directory can, and the rename keeps
+      received_uuid). A slot appears complete or not at all.
+    - ``abandon()``: the endpoint is pointed back; ``.incoming`` and the
+      subvolume in it are removed; the published slots are never touched.
+
+    A snapper backup (``core.operations.send_snapper_snapshot``) calls those
+    three around the engine's transfer with the source's own number and
+    info.xml. A snapper restore hands the executor ``receive_endpoint`` and
+    ``destination_view`` instead: the receive opens the NEXT FREE slot as it
+    starts, the executor's artifact verdict examines ``<n>.incoming/snapshot``
+    (the endpoint still points at the slot), and ``add_snapshot`` -- the
+    executor's "this copy is verified" step -- publishes it with the backup's
+    info.xml renumbered, through ``publish_fresh``: under the number that is
+    free at that moment and with a rename that cannot replace anything,
+    because the destination is a live snapper config and snapper may have
+    taken the number meanwhile. A receive that never reached that step is
+    abandoned by the next receive or by ``finish()``, so a failed restore
+    leaves no numbered slot and no ``.incoming``. One restore at a time into
+    a config (``restore_lock``), and only under that lock are the temps of
+    restores that died swept (``sweep_stale_temps``).
+    """
+
+    def __init__(
+        self,
+        endpoint: Any,
+        *,
+        next_number: Optional[Callable[[], int]] = None,
+    ) -> None:
+        self.endpoint = endpoint
+        self.base = str(endpoint.config["path"]).rstrip("/")
+        self._next_number = next_number
+        self._open: Optional[_OpenSlot] = None
+        self._receiver = _SlotReceiver(self)
+        self._info_xml_for: Callable[[Any, int], Optional[bytes]] = lambda _s, _n: None
+        self._on_published: Optional[Callable[[Any, int], None]] = None
+        self._on_progress: Optional[Callable[[int, int, str], None]] = None
+        self._plan_size = 0
+        self._started = 0
+        #: ``(snapshot, slot number)`` for every copy published in this run.
+        self.published: list[tuple[Any, int]] = []
+
+    # -- paths -------------------------------------------------------------- #
+
+    @property
+    def snapshots_dir(self) -> str:
+        return f"{self.base}/.snapshots"
+
+    def incoming_dir(self, number: int) -> str:
+        return f"{self.snapshots_dir}/{number}.incoming"
+
+    def slot_dir(self, number: int) -> str:
+        return f"{self.snapshots_dir}/{number}"
+
+    @property
+    def open_number(self) -> Optional[int]:
+        """The slot a receive is landing in right now, or None."""
+        return self._open.number if self._open is not None else None
+
+    # -- the four answers ------------------------------------------------- #
+
+    @property
+    def destination_view(self) -> Any:
+        """What the planner enumerates for correspondence: every published
+        slot's received_uuid, read in one pass (``_snapper_dest_view``)."""
+        return _ops._snapper_dest_view(self.endpoint)
+
+    @property
+    def receive_endpoint(self) -> Any:
+        """What the executor receives through: the endpoint, with a slot
+        opened as each receive starts and published as each copy is verified."""
+        return self._receiver
+
+    # -- the slot lifecycle, shared by both directions ---------------------- #
+
+    def open_slot(self, number: int) -> None:
+        """Make ``.snapshots/<number>.incoming`` the endpoint's receive path.
+
+        The target is checked BEFORE the slot lock is taken: the lock lives
+        under the target, so against a missing target the lock acquisition
+        would fail first and report a lock directory that "could not be
+        created" instead of the actual condition. The check is the engine's
+        own, with the same diagnosis on every transport; nothing is created
+        by it. The receive and the publish are two halves of ONE transaction
+        on the slot, and the lock is named for exactly what the transfer
+        beneath will lock, so that call finds it already held rather than
+        taking a second one.
+        """
+        if self._open is not None:
+            raise RuntimeError(
+                f"slot {self._open.number} is still open; publish or abandon it first"
+            )
+        incoming = self.incoming_dir(number)
+        _ops._ensure_destination_exists(self.endpoint)
+        slot = _OpenSlot(number, self.endpoint.config["path"])
+        try:
+            slot.locks.enter_context(
+                _ops._receiving_lock(self.endpoint, f"{incoming}/snapshot", self.base)
+            )
+            # A leftover temp from a prior crashed run goes first; then the
+            # slot is made, below the target and only there.
+            _ops._cleanup_snapper_backup(self.endpoint, number, False)
+            _ops._snapper_prepare_slot(self.endpoint, number)
+        except BaseException:
+            slot.locks.close()
+            raise
+        self.endpoint.config["path"] = incoming
+        self._open = slot
+        logger.debug("Receiving into snapper slot %s", incoming)
+
+    def publish(self, info_xml: Optional[bytes] = None) -> int:
+        """Publish the open slot as ``.snapshots/<n>`` and return ``n``.
+
+        ``info_xml`` is written into the slot BEFORE the rename, so the
+        published slot carries its metadata from the instant it exists. A
+        publish that fails abandons the slot (the ``.incoming`` temp is
+        removed, a pre-existing published backup is never touched) and
+        raises the executor's transfer error.
+        """
+        slot = self._require_open()
+        self.endpoint.config["path"] = slot.saved_path
+        try:
+            if info_xml is not None:
+                _ops._write_info_xml(
+                    self.endpoint, self.incoming_dir(slot.number), info_xml
+                )
+            _ops._snapper_publish_slot(self.endpoint, slot.number)
+        except BaseException:
+            self.abandon()
+            raise
+        slot.locks.close()
+        self._open = None
+        logger.debug("Published snapper slot %s", self.slot_dir(slot.number))
+        return slot.number
+
+    def publish_fresh(self, info_xml_for: Callable[[int], Optional[bytes]]) -> int:
+        """Publish the open slot under a number that is free AT THIS MOMENT,
+        never replacing anything, and return the number it landed under.
+
+        The restore direction's publish. The destination is a LIVE snapper
+        config: ``<n>.incoming`` is invisible to snapper (not a number), so
+        snapper's timeline, or an operator's ``snapper create``, can take
+        slot n while the receive is in flight -- and the backup direction's
+        publish would move that snapshot aside and delete it, which is right
+        for a recycled number at a backup target and data loss here. So the
+        number is asked for again now, ``info_xml_for(n)`` is written into
+        the temp for THAT number, and the directory is renamed with
+        ``rename_noreplace``: the kernel refuses if anything is at ``n`` --
+        including an empty directory snapper made a moment ago and is about
+        to fill, which ``os.rename`` would silently take over -- and the
+        next free number is tried. A publish that cannot proceed abandons
+        the slot and raises the executor's transfer error.
+        """
+        slot = self._require_open()
+        self.endpoint.config["path"] = slot.saved_path
+        incoming = self.incoming_dir(slot.number)
+        if self._next_number is None:
+            raise RuntimeError("publish_fresh needs next_number")
+        try:
+            for _attempt in range(1000):
+                number = self._next_number()
+                xml = info_xml_for(number)
+                if xml is not None:
+                    _ops._write_info_xml(self.endpoint, incoming, xml)
+                try:
+                    __util__.rename_noreplace(incoming, self.slot_dir(number))
+                except FileExistsError:
+                    logger.debug(
+                        "Slot %d appeared between choosing it and the rename; "
+                        "trying the next free number",
+                        number,
+                    )
+                    continue
+                if number != slot.number:
+                    logger.info(
+                        "Slot %d was taken while the copy was being received "
+                        "(snapper, or another writer); it is left as it is and "
+                        "the copy is published as slot %d.",
+                        slot.number,
+                        number,
+                    )
+                break
+            else:
+                raise __util__.SnapshotTransferError(
+                    f"no free slot under {self.snapshots_dir} after 1000 attempts"
+                )
+        except __util__.SnapshotTransferError:
+            self.abandon()
+            raise
+        except OSError as e:
+            self.abandon()
+            raise __util__.SnapshotTransferError(
+                f"could not publish the received copy into {self.snapshots_dir}: {e}"
+            ) from e
+        except BaseException:
+            self.abandon()
+            raise
+        slot.locks.close()
+        self._open = None
+        logger.debug("Published snapper slot %s", self.slot_dir(number))
+        return number
+
+    def restore_lock(self, subject: str) -> Any:
+        """One restore at a time into this config.
+
+        A local target has no receive lock (``_receiving_lock`` is a no-op),
+        and the next free number counts only numeric entries, so two restores
+        into one config would both pick n and the second's open_slot would
+        remove the first's in-flight ``<n>.incoming`` as "a temp a crashed run
+        left". An exclusive flock on ``.snapshots/.btrfs-backup-ng.restore.lock``
+        (``__util__.exclusive_lock``, timeout 0) is held for the whole
+        restore: a second restore is refused at once with words, and the
+        kernel drops the lock when the holder dies, so a SIGKILLed restore
+        never leaves the config locked. Held, it is also what makes
+        ``sweep_stale_temps`` safe: no live restore can own a temp here.
+        """
+        return __util__.exclusive_lock(
+            Path(self.snapshots_dir) / ".btrfs-backup-ng.restore.lock",
+            timeout=0,
+            subject=subject,
+        )
+
+    def sweep_stale_temps(self) -> list[str]:
+        """Remove every ``<n>.incoming`` under ``.snapshots`` and return their
+        names. Only for a caller holding ``restore_lock``: with it held, every
+        temp here belongs to a restore that is no longer running (SIGKILL,
+        power loss), because a live one would hold the lock. A restore's temp
+        is named for the number it started with, which snapper may since have
+        taken, so the per-number cleanup ``open_slot`` runs would never reach
+        it."""
+        snapshots_dir = Path(self.snapshots_dir)
+        if not snapshots_dir.is_dir():
+            return []
+        stale = sorted(
+            p.name
+            for p in snapshots_dir.iterdir()
+            if p.name.endswith(".incoming") and p.name[: -len(".incoming")].isdigit()
+        )
+        for name in stale:
+            logger.info(
+                "Removing %s/%s, left by a restore that did not finish.",
+                snapshots_dir,
+                name,
+            )
+            _ops._cleanup_snapper_backup(
+                self.endpoint, int(name[: -len(".incoming")]), False
+            )
+        return stale
+
+    def abandon(self) -> None:
+        """Remove the open slot's ``.incoming`` -- and only that -- and point
+        the endpoint back at the target. A no-op when no slot is open."""
+        slot = self._open
+        if slot is None:
+            return
+        self._open = None
+        self.endpoint.config["path"] = slot.saved_path
+        try:
+            logger.info(
+                "Abandoning snapper slot %s: the receive into it did not complete.",
+                self.incoming_dir(slot.number),
+            )
+            _ops._cleanup_snapper_backup(self.endpoint, slot.number, False)
+        finally:
+            slot.locks.close()
+
+    def _require_open(self) -> _OpenSlot:
+        if self._open is None:
+            raise RuntimeError("no snapper slot is open")
+        return self._open
+
+    # -- the restore direction: driven by the executor ---------------------- #
+
+    def begin(
+        self,
+        plan: list,
+        *,
+        info_xml_for: Callable[[Any, int], Optional[bytes]],
+        on_published: Optional[Callable[[Any, int], None]] = None,
+        on_progress: Optional[Callable[[int, int, str], None]] = None,
+    ) -> None:
+        """Before the executor runs: how each planned snapshot's slot gets its
+        info.xml (asked with the snapshot and the slot number it is landing
+        in), and who hears about each publish."""
+        if self._next_number is None:
+            raise RuntimeError(
+                "a restore through the snapper layout needs next_number: the "
+                "receive picks the next free slot as it starts"
+            )
+        self._info_xml_for = info_xml_for
+        self._on_published = on_published
+        self._on_progress = on_progress
+        self._plan_size = len(plan)
+        self._started = 0
+        self.published = []
+
+    def _receive_started(self, snapshot_name: str) -> int:
+        # A slot still open here belongs to a receive that never reached the
+        # verified step: its transfer failed, and the executor has moved on.
+        self.abandon()
+        assert self._next_number is not None
+        number = self._next_number()
+        self.open_slot(number)
+        self._started += 1
+        if self._on_progress is not None:
+            self._on_progress(self._started, self._plan_size, snapshot_name)
+        return number
+
+    def _receive_verified(self, snapshot: Any) -> int:
+        number = self.publish_fresh(lambda n: self._info_xml_for(snapshot, n))
+        self.published.append((snapshot, number))
+        if self._on_published is not None:
+            self._on_published(snapshot, number)
+        return number
+
+    def finish(self) -> None:
+        """After the executor returns, however it returned: a slot still open
+        is a receive that failed, and it is abandoned."""
+        self.abandon()
+
+
+class _SlotReceiver:
+    """The snapper layout's receive endpoint: the btrfs endpoint over the
+    target, with a slot opened as ``btrfs receive`` starts and published when
+    the executor has verified the copy.
+
+    Everything the executor asks -- ``config``, ``commit_receive``,
+    ``subvolume_identity``, ``get_space_info``, ``get_id`` -- is the
+    endpoint's own; ``config["path"]`` is the slot while a receive is in
+    flight, which is what makes the executor's artifact verdict examine
+    ``<n>.incoming/snapshot``. ``list_snapshots`` is empty: the target is a
+    snapper layout, not a directory of prefix-named snapshots, and its
+    contents are read through ``destination_view`` instead. Not a subclass:
+    the endpoint is built by the caller and may be any local btrfs endpoint,
+    real or a test's double.
+    """
+
+    def __init__(self, layout: SnapperLayout) -> None:
+        self._layout = layout
+        self._endpoint = layout.endpoint
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._endpoint, name)
+
+    def __repr__(self) -> str:
+        return f"snapper layout at {self._layout.base}"
+
+    def receive(
+        self,
+        stdin: Any,
+        snapshot_name: str = "",
+        parent_name: str | None = None,
+        source_uuid: str = "",
+    ) -> Any:
+        self._layout._receive_started(snapshot_name)
+        return self._endpoint.receive(
+            stdin, snapshot_name, parent_name=parent_name, source_uuid=source_uuid
+        )
+
+    def add_snapshot(self, snapshot: Any, rewrite: bool = True) -> None:
+        self._layout._receive_verified(snapshot)
+
+    def _receive_destination(self, source_path: Any) -> str:
+        """Where a receive through this endpoint lands: ``<slot>/snapshot``.
+
+        The executor's verdict asks the destination where the copy of a
+        snapshot is, and by default derives it from the source's name. Every
+        snapper backup was sent from ``.snapshots/<n>/snapshot``, so the
+        stream names its subvolume ``snapshot`` whatever the backup is called
+        -- a raw store names its streams ``<config>-<n>-<date>``, and a
+        verdict looking for that under the slot would find nothing and
+        condemn a copy that is right there. The layout knows the answer for
+        every source, so it gives it.
+        """
+        return f"{str(self._endpoint.config['path']).rstrip('/')}/snapshot"
+
+    def list_snapshots(self, flush_cache: bool = False) -> list:
+        return []
 
 
 # --------------------------------------------------------------------------- #

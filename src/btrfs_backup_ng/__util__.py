@@ -850,6 +850,65 @@ def get_mount_info(path: str | Path) -> dict[str, str] | None:
     return best_match
 
 
+#: ``renameat2(2)`` flag: fail with EEXIST instead of replacing the target.
+_RENAME_NOREPLACE = 1
+_AT_FDCWD = -100
+#: ``renameat2`` syscall numbers where libc has no wrapper (musl before 1.2.4).
+_SYS_RENAMEAT2 = {"x86_64": 316, "aarch64": 276, "i686": 353, "i386": 353}
+
+
+def rename_noreplace(src: str | Path, dst: str | Path) -> None:
+    """``rename(2)`` that can never replace anything: atomic, and
+    ``FileExistsError`` when ``dst`` exists, whatever it is.
+
+    ``os.rename``/``os.replace`` replace an EMPTY directory at ``dst`` on
+    Linux, so "check that dst is absent, then rename" has a window in which
+    a directory made by someone else -- snapper creating ``.snapshots/N``
+    and about to fill it -- is silently taken over. ``renameat2`` with
+    ``RENAME_NOREPLACE`` moves the check into the kernel. btrfs, ext4, xfs
+    and tmpfs all support it (kernel 3.15+); a filesystem that does not
+    answers EINVAL, and this raises ``OSError`` with that reason rather than
+    falling back to a rename that could clobber -- the caller decides what
+    "cannot publish without replacing" means, and here it means refusing.
+
+    Linux only, like everything that receives a btrfs stream: glibc has the
+    wrapper since 2.28; without it the raw syscall is used on the
+    architectures listed above, and elsewhere this raises ``OSError`` saying
+    so instead of guessing a syscall number.
+    """
+    import ctypes
+    import platform
+
+    libc = ctypes.CDLL(None, use_errno=True)
+    src_b = os.fsencode(str(src))
+    dst_b = os.fsencode(str(dst))
+    wrapper = getattr(libc, "renameat2", None)
+    if wrapper is not None:
+        rc = wrapper(_AT_FDCWD, src_b, _AT_FDCWD, dst_b, _RENAME_NOREPLACE)
+    else:
+        number = _SYS_RENAMEAT2.get(platform.machine())
+        if number is None:
+            raise OSError(
+                errno.ENOSYS,
+                f"no renameat2 on this platform ({platform.machine()}); a rename "
+                f"that cannot replace an existing entry is not available",
+            )
+        rc = libc.syscall(number, _AT_FDCWD, src_b, _AT_FDCWD, dst_b, _RENAME_NOREPLACE)
+    if rc == 0:
+        return
+    err = ctypes.get_errno()
+    if err == errno.EEXIST:
+        raise FileExistsError(err, os.strerror(err), str(dst))
+    if err in (errno.EINVAL, errno.ENOSYS, errno.EOPNOTSUPP):
+        raise OSError(
+            err,
+            f"the filesystem holding {dst} does not support a rename that cannot "
+            f"replace an existing entry (renameat2 RENAME_NOREPLACE: "
+            f"{os.strerror(err)})",
+        )
+    raise OSError(err, os.strerror(err), str(dst))
+
+
 def atomic_write_bytes(
     path: str | Path, data: bytes | str, *, mode: int = 0o600, fsync: bool = True
 ) -> None:

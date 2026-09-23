@@ -2125,23 +2125,56 @@ def get_snapper_snapshots_for_backup(
 
 
 class _SnapperBtrfsBackup:
-    """A destination-side snapper backup on a btrfs target (``.snapshots/{num}/snapshot``),
-    carrying just enough for correspondence: its ``received_uuid`` (== the source snapshot's
-    uuid it was received from). The number is retained for logging only, NEVER for identity --
-    a recycled snapper number gets a new uuid, so correspondence correctly treats it as absent.
+    """A snapper backup slot on a btrfs location: ``.snapshots/{num}/snapshot``.
+
+    As a DESTINATION-side candidate it carries what correspondence needs: its
+    ``received_uuid`` (the identity the stream that made it carried). As a
+    SOURCE -- a snapper restore reads these slots back -- it is a snapshot the
+    engine can send: ``get_path()`` is the subvolume on the location,
+    ``endpoint`` is the endpoint that holds it (its ``send`` runs ``btrfs
+    send`` there, local or remote), ``stream_uuid`` is what that send carries
+    (its received_uuid, so a restored copy corresponds to the original), and
+    ``time_obj`` is the snapshot's own date from ``info.xml`` for ordering.
+    The number is for the operator and for the path, NEVER for identity: a
+    recycled snapper number gets a new uuid, and correspondence treats it as
+    the different snapshot it is.
     """
 
-    def __init__(self, number: int, received_uuid: str) -> None:
+    def __init__(
+        self,
+        number: int,
+        received_uuid: str,
+        *,
+        base: str = "",
+        endpoint: Any = None,
+        time_obj: Any = None,
+    ) -> None:
         self.number = number
         self.received_uuid = received_uuid
         # What a send of THIS copy would carry: its received_uuid (it is a
         # received subvolume, so that is set). Lets the copy stand as a source
         # under the same correspondence rule as every other snapshot object.
         self.stream_uuid = received_uuid
+        self.uuid = ""
+        self.base = str(base).rstrip("/")
+        self.endpoint = endpoint
+        self.time_obj = time_obj
+        self.prefix = ""
+        self.locks: set = set()
+        self.parent_locks: set = set()
 
     def get_name(self) -> str:
-        # Not used for correspondence (received_uuid drives btrfs matching); descriptive only.
-        return f".snapshots/{self.number}/snapshot"
+        # The engine's key for this snapshot: lock records, the plan's own
+        # bookkeeping, the log. One path component, so nothing that joins it
+        # under a destination path names a real entry there; identity itself
+        # is the received_uuid, never this string.
+        return f"snapshot-{self.number}"
+
+    def get_path(self) -> str:
+        return f"{self.base}/.snapshots/{self.number}/snapshot"
+
+    def __repr__(self) -> str:
+        return f"snapshot {self.number}"
 
 
 _SNAPPER_UNPRIVILEGED_ATTR = "_snapper_unprivileged_shell_ok"
@@ -2294,10 +2327,18 @@ def _enumerate_snapper_btrfs_backups(destination_endpoint) -> list:
     rc, out = _snapper_run_shell(destination_endpoint, script)
     backups: list = []
     if rc == 0:
+        base = str(destination_endpoint.config["path"])
         for line in out.split("\n"):
             parts = line.split()
             if len(parts) == 2 and parts[0].isdigit():
-                backups.append(_SnapperBtrfsBackup(int(parts[0]), parts[1]))
+                backups.append(
+                    _SnapperBtrfsBackup(
+                        int(parts[0]),
+                        parts[1],
+                        base=base,
+                        endpoint=destination_endpoint,
+                    )
+                )
     return backups
 
 
@@ -2519,49 +2560,55 @@ def _snapper_dest_view(destination_endpoint):
     return _SnapperBtrfsDestView(destination_endpoint)
 
 
-def _place_info_xml(snapper_snapshot, destination_endpoint) -> None:
-    """Copy the snapper info.xml into the current destination directory.
-
-    ``destination_endpoint.config["path"]`` is the ``.snapshots/{num}`` directory
-    at call time (btrfs targets only; raw folds info.xml into the metadata sidecar).
-    """
-
+def _snapper_info_xml_bytes(snapper_snapshot) -> Optional[bytes]:
+    """The source snapshot's own ``info.xml``, verbatim, or None when it has
+    none. Not every snapper snapshot has one, and that is not an error."""
     info_xml_src = snapper_snapshot.info_xml_path
     if not info_xml_src.exists():
-        return
+        return None
+    return info_xml_src.read_bytes()
 
-    dest_dir = str(destination_endpoint.config["path"])
+
+def _write_info_xml(destination_endpoint, slot_dir: str, content: bytes) -> None:
+    """Write ``content`` as ``{slot_dir}/info.xml`` on the destination.
+
+    The one writer for a snapper slot's metadata, in both directions: a backup
+    hands it the source snapshot's info.xml verbatim, a restore hands it the
+    backup's info.xml renumbered for the slot it lands in. ``slot_dir`` is the
+    slot being filled -- the ``.incoming`` directory, so the rename that
+    publishes the slot carries its metadata with it and no published slot is
+    ever without.
+
+    Soft-fail by design: the snapshot itself is intact, and info.xml is
+    descriptive metadata. What was lost is said, so a later "listed without a
+    description" or "snapper does not show the restored slot" is traceable to
+    here rather than looking like a second bug.
+    """
     is_remote = getattr(destination_endpoint, "_is_remote", False)
-
     try:
         if is_remote and hasattr(destination_endpoint, "_exec_remote_command"):
             destination_endpoint._exec_remote_command(
-                ["tee", f"{dest_dir}/info.xml"],
-                input=info_xml_src.read_bytes(),
+                ["tee", f"{slot_dir}/info.xml"],
+                input=content,
                 check=True,
                 stdout=subprocess.DEVNULL,
             )
         else:
-            dst = Path(dest_dir) / "info.xml"
             # Try the plain write FIRST, whatever our uid. Assuming "not root =>
             # must sudo" broke every non-root backup under the sudoers policy this
             # project documents (NOPASSWD limited to /usr/bin/btrfs), where the
             # shell-out is refused outright -- measured on a real host, where the
             # destination slot was owned by the running user and a plain copy
-            # would have succeeded. That rule now lives in one place; see
-            # __util__._privileged_fs, which the restore side uses too.
-            __util__.privileged_write_bytes(dst, info_xml_src.read_bytes())
-        logger.debug("Placed info.xml at %s", dest_dir)
+            # would have succeeded. That rule lives in __util__._privileged_fs.
+            __util__.privileged_write_bytes(Path(slot_dir) / "info.xml", content)
+        logger.debug("Placed info.xml at %s", slot_dir)
     except Exception as e:
-        # Soft-fail by design: the backup DATA is already published, and info.xml
-        # is descriptive metadata. Say what was lost, so a later "restore --list
-        # shows no description" is traceable to here rather than looking like a
-        # second bug.
         logger.warning(
-            "Failed to place info.xml at %s: %s. The backup itself is intact; its "
-            "snapper metadata (description, type, userdata) will be missing when "
-            "the backup is listed or restored.",
-            dest_dir,
+            "Failed to place info.xml at %s: %s. The snapshot itself is intact; "
+            "its snapper metadata (description, type, userdata) will be missing "
+            "when the slot is listed, and snapper does not list a slot without "
+            "an info.xml.",
+            slot_dir,
             e,
         )
 
@@ -2673,59 +2720,29 @@ def send_snapper_snapshot(
                 options=raw_options,
             )
         else:
-            # btrfs targets: TRANSACTIONAL receive. Land the stream in a separate
-            # .snapshots/{num}.incoming slot, then atomically publish it as
-            # .snapshots/{num}/snapshot. A mid-flight failure only ever leaves the .incoming
-            # temp (cleaned below) -- it can never touch a pre-existing good backup -- and a
-            # recycled snapper number (occupied slot, new uuid) is replaced without a
-            # data-loss window (see _snapper_publish_slot).
-            snap_root = f"{base_path.rstrip('/')}/.snapshots"
-            incoming = f"{snap_root}/{snapshot_num}.incoming"
-            final_dir = f"{snap_root}/{snapshot_num}"
-            # The receive and the publish are two halves of ONE transaction on
-            # slot {num}: the stream lands in {num}.incoming and is then renamed
-            # into {num}. A second writer aiming at the same slot -- another
-            # machine backing up a snapper config whose numbers overlap -- must
-            # be kept out for BOTH halves, not just the transfer, or it can
-            # publish between this receive and this rename.
-            #
-            # The target is checked BEFORE the slot lock is taken: the lock
-            # lives under the target, so against a missing target the lock
-            # acquisition would fail first and report a lock directory that
-            # "could not be created" instead of the actual condition. This is
-            # the engine's own check, with the same diagnosis on every
-            # transport; nothing is created by it.
-            _ensure_destination_exists(destination_endpoint)
-            # The lock is named for exactly what the transfer beneath will lock,
-            # so that call finds it already held rather than taking a second one.
-            slot_lock = _receiving_lock(
-                destination_endpoint, f"{incoming}/snapshot", base_path
-            )
-            with slot_lock:
-                # Clear any leftover temp from a prior crashed run before receiving.
-                _cleanup_snapper_backup(destination_endpoint, snapshot_num, is_raw)
-                # Then make the slot, below the target and only there.
-                _snapper_prepare_slot(destination_endpoint, snapshot_num)
-                saved_path = destination_endpoint.config["path"]
-                destination_endpoint.config["path"] = incoming
-                try:
-                    send_snapshot(
-                        source_wrapper,
-                        destination_endpoint,
-                        parent=parent_wrapper,
-                        options=options,
-                    )
-                finally:
-                    destination_endpoint.config["path"] = saved_path
-                # Receive succeeded -> atomically publish into the numbered slot.
-                _snapper_publish_slot(destination_endpoint, snapshot_num)
-            # Place info.xml beside the published snapshot.
-            saved_path = destination_endpoint.config["path"]
-            destination_endpoint.config["path"] = final_dir
+            # btrfs targets: a TRANSACTIONAL receive through the snapper layout,
+            # the same object a snapper restore lands in. The stream lands in
+            # .snapshots/{num}.incoming and is published as .snapshots/{num}
+            # by renaming the directory, with its info.xml already inside. A
+            # mid-flight failure only ever leaves the .incoming temp, which the
+            # layout abandons -- it can never touch a pre-existing good backup
+            # -- and a recycled snapper number (occupied slot, new uuid) is
+            # replaced without a data-loss window (see _snapper_publish_slot).
+            from .layout import SnapperLayout
+
+            layout = SnapperLayout(destination_endpoint)
+            layout.open_slot(snapshot_num)
             try:
-                _place_info_xml(snapper_snapshot, destination_endpoint)
-            finally:
-                destination_endpoint.config["path"] = saved_path
+                send_snapshot(
+                    source_wrapper,
+                    destination_endpoint,
+                    parent=parent_wrapper,
+                    options=options,
+                )
+                layout.publish(info_xml=_snapper_info_xml_bytes(snapper_snapshot))
+            except BaseException:
+                layout.abandon()
+                raise
 
         # Metadata sidecar (endpoint-aware; carries original_xml for restore).
         _write_snapper_metadata(
@@ -2758,7 +2775,10 @@ def send_snapper_snapshot(
             duration_seconds=duration,
             error=str(e),
         )
-        _cleanup_snapper_backup(destination_endpoint, snapshot_num, is_raw)
+        if is_raw:
+            # A btrfs slot was abandoned by the layout above; a raw target's
+            # uncommitted ``.part`` is this run's temp to remove.
+            _cleanup_snapper_backup(destination_endpoint, snapshot_num, is_raw)
         logger.error("Failed to transfer snapshot %d: %s", snapshot_num, e)
         raise __util__.SnapshotTransferError(
             f"Failed to transfer snapshot {snapshot_num}: {e}"
