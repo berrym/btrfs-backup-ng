@@ -563,10 +563,10 @@ def list_snapper_backups(
             ...
         ]
     """
-    # R11: raw:// and raw+ssh:// snapper backups are flat btrfs-send streams plus a
+    # raw:// and raw+ssh:// snapper backups are flat btrfs-send streams plus a
     # {name}.snapper-meta.json sidecar -- there is no .snapshots/{num}/info.xml layout
     # to scan. Dispatch those to a sidecar-based enumeration so they can be listed AND
-    # restored (Part 2), instead of silently returning [] as the .snapshots scan did.
+    # restored, instead of silently returning [] as the .snapshots scan did.
     if str(backup_path).startswith(("raw://", "raw+ssh://")):
         return _list_raw_snapper_backups(backup_path, endpoint_options)
 
@@ -928,7 +928,7 @@ def _list_raw_snapper_backups(
     sidecar (reusing the proven ``_list_snapper_backups_at_destination`` name scan,
     local and remote). Returns the same dict shape the btrfs path returns
     (``number``/``metadata``/``snapshot_path``/``info_xml_path``) plus ``raw`` and
-    ``backup_name`` so Part 2 (materialization) can resolve the stream by name.
+    ``backup_name`` so materialization can resolve the stream by name.
     """
     from ..endpoint import choose_endpoint
 

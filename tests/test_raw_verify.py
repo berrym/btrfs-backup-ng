@@ -240,7 +240,7 @@ def test_open_target_construction_error_keeps_prefix(capsys):
 
 
 # --------------------------------------------------------------------------- #
-# verify_stream_checksum primitive (R8a): the ONE classification shared by
+# verify_stream_checksum primitive: the ONE classification shared by
 # `raw verify`, the restore guard, and the general `verify` command.
 # --------------------------------------------------------------------------- #
 def test_primitive_ok_on_intact_stream(tmp_path):

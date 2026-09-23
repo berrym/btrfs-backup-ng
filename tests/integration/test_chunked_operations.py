@@ -535,8 +535,8 @@ class TestChunkedTransferEndToEnd:
 
 
 class TestChunkedTransferSuccessContract:
-    """R1 enforcement: chunked transfers must not report a failed send/receive
-    as a successful (or resumable-complete) backup."""
+    """Transfer-success enforcement: chunked transfers must not report a failed
+    send/receive as a successful (or resumable-complete) backup."""
 
     def test_nonzero_send_exit_raises_and_does_not_transfer(self):
         """A `btrfs send` that fails mid-chunking (nonzero exit) closes stdout

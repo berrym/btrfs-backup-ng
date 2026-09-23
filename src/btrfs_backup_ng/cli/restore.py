@@ -1102,7 +1102,7 @@ def _execute_unlock(args: argparse.Namespace, lock_id: str) -> int:
             new_locks[snap_name] = new_entry
 
     # Write through the endpoint's own writer, which does the atomic replace
-    # (R7: temp -> fsync -> os.replace -> parent fsync, 0600). A torn lock file
+    # (temp -> fsync -> os.replace -> parent fsync, 0600). A torn lock file
     # is misread as "no locks" and lets retention prune a snapshot that is still
     # locked, so this must not be a plain open("w") -- and must not be a second
     # copy of the careful version either.

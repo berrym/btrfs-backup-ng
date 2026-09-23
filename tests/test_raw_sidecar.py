@@ -1,4 +1,4 @@
-"""Auto-written authoritative .meta sidecar (0.8.5 PR3).
+"""Auto-written authoritative .meta sidecar (0.8.5).
 
 Every raw backup writes a v2 sidecar in commit_receive (after the stream is
 durable). The v2 schema is additive over v1 (adds pipeline.openssl_cipher, a
@@ -106,7 +106,7 @@ def test_receive_gates_openssl_cipher_to_openssl_only(tmp_path):
 
 
 def test_sidecar_write_failure_does_not_fail_the_backup(tmp_path):
-    """PR3 headline invariant: the stream is durable BEFORE the sidecar, so a
+    """Headline invariant: the stream is durable BEFORE the sidecar, so a
     sidecar-write error must NOT flip an already-successful backup into a failure
     (it degrades to filename inference). commit_receive must not raise, and the
     committed stream must exist."""

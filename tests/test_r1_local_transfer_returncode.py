@@ -4,9 +4,9 @@ ACTUAL send/receive exit codes, so a failed `btrfs receive` propagates upward.
 If _do_process_transfer returned hardcoded success, send_snapshot's
 `any(rc != 0)` check would never fire on the local path and a failed local
 receive would be reported as a successful backup -- the same false-success class
-R1 fixed for SSH. The previous tests only asserted receive() was called with the
-right args and never checked the returned codes, so that regression was
-invisible.
+the transfer-success contract fixed for SSH. The previous tests only asserted
+receive() was called with the right args and never checked the returned codes,
+so that regression was invisible.
 """
 
 from __future__ import annotations

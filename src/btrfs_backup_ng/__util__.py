@@ -150,7 +150,7 @@ class Snapshot:
         self.newly_visible = False
         self.locks: set = set()
         self.parent_locks: set = set()
-        # btrfs subvolume identity, populated best-effort at enumeration (Phase 0).
+        # btrfs subvolume identity, populated best-effort at enumeration.
         # ``uuid`` is this snapshot's own UUID; ``received_uuid`` is set on a subvolume
         # produced by ``btrfs receive`` and equals the source subvolume's UUID -- the
         # correspondence btrfs incremental send/receive actually uses. Empty when it
@@ -861,7 +861,7 @@ def atomic_write_bytes(
     survives a power loss. A crash at any point leaves either the OLD complete file or
     the NEW complete file -- never a half-written / truncated one. This is the single
     atomic-write primitive shared by lock files, raw ``.meta`` sidecars, operation
-    state, and transfer manifests (R7): a torn state/manifest would break resume and a
+    state, and transfer manifests: a torn state/manifest would break resume and a
     torn lock file would be misread as "no locks" and let retention prune a locked
     snapshot.
 

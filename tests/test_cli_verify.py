@@ -720,12 +720,12 @@ class TestProgressCallback:
 
 
 class TestGeneralVerifyAgainstRawTarget:
-    """R8a: the GENERAL ``verify`` command (not ``raw verify``) must consult the sealed
-    sha256 on raw:// targets. Before R8a a bare ``verify raw://X`` ran the metadata level
-    and reported 'All verifications passed' for a CORRUPT stream -- a false all-clear.
-    These drive the real ``execute()`` with a real RawEndpoint (choose_endpoint builds
-    it), mocking nothing about the checksum path -- closing the exact coverage gap the
-    R8 audit flagged (no test drove general verify against any raw target)."""
+    """The GENERAL ``verify`` command (not ``raw verify``) must consult the sealed sha256 on
+    raw:// targets. Before that check a bare ``verify raw://X`` ran the metadata level and
+    reported 'All verifications passed' for a CORRUPT stream -- a false all-clear. These
+    drive the real ``execute()`` with a real RawEndpoint (choose_endpoint builds it),
+    mocking nothing about the checksum path -- closing the exact coverage gap the
+    verification audit flagged (no test drove general verify against any raw target)."""
 
     @staticmethod
     def _build_raw(path, name):
@@ -929,8 +929,8 @@ class TestGeneralVerifyAgainstRawTarget:
         assert "path" not in captured  # a raw scheme must not get a resolved local path
 
 
-class TestR8eHonestOutput:
-    """R8e: unverifiable is visually distinct (not green PASS), the summary is honest about
+class TestVerifyVerdictOutput:
+    """Unverifiable is visually distinct (not green PASS), the summary is honest about
     'checked N of M' with a --all hint, and the JSON carries a top-level tri-state verdict."""
 
     def test_unverifiable_is_distinct_from_pass(self, capsys):
@@ -1012,8 +1012,8 @@ class TestR8eHonestOutput:
         assert data["errors"] == ["No snapshots found"]
 
 
-class TestR8eReviewFixes:
-    """Guards for the R8e adversarial-review fixes."""
+class TestVerifyVerdictReviewFixes:
+    """Guards for the tri-state verdict adversarial-review fixes."""
 
     def test_all_hint_suppressed_when_snapshot_named(self, capsys):
         """--snapshot is mutually exclusive with --all, so the 'pass --all' hint must NOT

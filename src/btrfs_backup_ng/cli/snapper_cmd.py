@@ -715,7 +715,7 @@ def _handle_restore(args: argparse.Namespace) -> int:
     # Build the selection.
     #   --backup-name : EXACT identity, restored as-is (no dedup).
     #   --snapshot    : by number; on a reused-number collision, restore the NEWEST
-    #                   and warn (Option A) -- --backup-name/--date reach an older one.
+    #                   and warn -- --backup-name/--date reach an older one.
     #   --all         : everything (after any --date filter).
     to_restore: list[dict] = []
     seen: set = set()
@@ -759,7 +759,7 @@ def _handle_restore(args: argparse.Namespace) -> int:
                 )
                 return 1
             if len(matches) > 1:
-                # Reused number: newest wins (Option A), warn with an actionable path.
+                # Reused number: newest wins, warn with an actionable path.
                 matches.sort(key=_backup_recency_key, reverse=True)
                 chosen = matches[0]
                 logger.warning(

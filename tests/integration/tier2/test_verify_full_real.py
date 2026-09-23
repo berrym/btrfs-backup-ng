@@ -1,19 +1,20 @@
-"""Tier 2: verify_full does a REAL incremental-backup restore and passes (R8d).
+"""Tier 2: verify_full does a REAL incremental-backup restore and passes.
 
 The unit tests mock _test_restore (test theater). These do a genuine send/receive of a
 base+incremental chain into a backup location, then run verify_full on the LATEST
-(incremental) snapshot and assert it PASSES. Before R8d, verify_full sent `-p parent` into
+(incremental) snapshot and assert it PASSES. verify_full used to send `-p parent` into
 the temp -> `btrfs receive` failed with "cannot find parent subvolume" -> a perfectly good
-backup was reported FAIL (the F5 false-negative). R8d does a FULL send of the target, which
-needs no parent present.
+backup was reported FAIL (a false negative). verify_full now does a FULL send of the
+target, which needs no parent present.
 
-EMPIRICAL NOTE (verified on real btrfs, matching the R10b lesson): F5 only manifests when
-the temp dir is on a DIFFERENT filesystem than the backup -- `btrfs receive` searches the
-WHOLE destination fs for the parent's received_uuid, so an incremental into a temp on the
-SAME fs as the backup finds the parent and (mis-)succeeds. It ALWAYS manifests for remote
+EMPIRICAL NOTE (verified on real btrfs, matching the raw incremental-parent lesson): the
+false negative only manifests when the temp dir is on a DIFFERENT filesystem than the
+backup -- `btrfs receive` searches the WHOLE destination fs for the parent's
+received_uuid, so an incremental into a temp on the SAME fs as the backup finds the
+parent and (mis-)succeeds. It ALWAYS manifests for remote
 backups (temp is local, backup is remote = different fs). So these tests deliberately put
 the backup on the SOURCE loop fs and temp on the DEST loop fs (a separate filesystem), so
-the old `-p` behavior genuinely fails and Option B (full send) genuinely fixes it.
+the old `-p` behavior genuinely fails and the full send genuinely fixes it.
 """
 
 import subprocess
@@ -71,7 +72,7 @@ class TestVerifyFullRealBtrfs:
         """The latest (incremental) backup verifies via a FULL send -> PASS, with temp on a
         SEPARATE fs from the backup. Mutation guard: re-introducing `-p parent` makes the
         incremental receive fail ('cannot find parent subvolume' on the temp fs) -> this
-        asserts PASS, so the F5 regression is caught."""
+        asserts PASS, so the incremental false-negative regression is caught."""
         source, dest = btrfs_source_and_dest
         backup, latest = self._build_backup(source)
         temp = dest / "verify-temp"  # DEST fs -- a DIFFERENT filesystem than the backup

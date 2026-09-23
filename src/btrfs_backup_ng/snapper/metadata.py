@@ -362,8 +362,8 @@ def save_backup_metadata(path: Path | str, metadata: BackupMetadata) -> None:
     path = Path(path)
     data = asdict(metadata)
     # Write atomically (temp -> fsync -> os.replace) so a crash mid-write can never leave a
-    # torn .snapper-meta.json that load_backup_metadata would reject -- fulfilling the R7
-    # deferral for this sidecar, now that R11 reads it back on restore. R11/R7.
+    # torn .snapper-meta.json that load_backup_metadata would reject -- which matters
+    # now that a restore from a raw target reads this sidecar back.
     __util__.atomic_write_bytes(path, json.dumps(data, indent=2), mode=0o600)
 
 

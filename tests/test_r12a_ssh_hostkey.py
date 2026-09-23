@@ -1,13 +1,13 @@
-"""R12a -- SSH host-key hardening.
+"""SSH host-key hardening.
 
-- P1: the Paramiko password-sudo transport now loads the operator's known_hosts BEFORE
+- The Paramiko password-sudo transport now loads the operator's known_hosts BEFORE
   connecting, so a changed key is refused (BadHostKeyException) and a genuinely new host is
   trust-on-first-use pinned -- accept-new parity. The old code loaded nothing, so
   AutoAddPolicy blindly accepted ANY key (including a changed one) -- a fail-open MITM on the
   path that carries the SSH + sudo passwords.
-- P3: operator-supplied ssh_opts are applied on the primary subprocess transport, and FIRST
+- Operator-supplied ssh_opts are applied on the primary subprocess transport, and FIRST
   (ssh uses the first value -> operator hardening wins). They were silently dropped.
-- P4: UserKnownHostsFile points at the OPERATOR's known_hosts (even under sudo), so accept-new
+- UserKnownHostsFile points at the OPERATOR's known_hosts (even under sudo), so accept-new
   verifies/pins against the operator's curated trust, not root's empty store.
 
 The changed-key -> refused behaviour itself is OpenSSH's guarantee once the store is loaded,
@@ -38,7 +38,7 @@ def _isolated_home(tmp_path, monkeypatch):
     monkeypatch.delenv("SUDO_USER", raising=False)
 
 
-# ------------------------------------ operator known_hosts resolution (P4 foundation)
+# ---------------------- operator known_hosts resolution (UserKnownHostsFile foundation)
 
 
 def test_operator_ssh_dir_non_sudo_uses_home(tmp_path):
@@ -123,7 +123,7 @@ def test_ensure_known_hosts_fchowns_only_the_fresh_file_under_sudo(
     assert fchowns == [(pw.pw_uid, pw.pw_gid)]
 
 
-# ------------------------------------ P4: UserKnownHostsFile on the primary transport
+# ------------------------------------ UserKnownHostsFile on the primary transport
 
 
 def _mgr(**kw):
@@ -148,7 +148,7 @@ def test_ssh_base_cmd_leaves_known_hosts_alone_non_sudo(tmp_path):
     assert not any(c.startswith("UserKnownHostsFile=") for c in cmd)
 
 
-# ------------------------------------ P3: operator ssh_opts applied, and FIRST (they win)
+# ------------------------------------ operator ssh_opts applied, and FIRST (they win)
 
 
 def test_ssh_base_cmd_applies_operator_ssh_opts_first():
@@ -162,7 +162,7 @@ def test_ssh_base_cmd_applies_operator_ssh_opts_first():
     )
 
 
-# ------------------------------------ P1: Paramiko loads the operator known_hosts (no fail-open)
+# ------------------------------------ Paramiko loads the operator known_hosts (no fail-open)
 
 
-# ------------------------------------ P1: the BadHostKeyException handler refuses loudly
+# ------------------------------------ the BadHostKeyException handler refuses loudly

@@ -230,11 +230,11 @@ def test_native_backup_stays_complete(tmp_path):
 # --------------------------------------------------------------------------- #
 def test_backfill_symlinked_meta_tmp_cannot_truncate_outside_file(tmp_path):
     """A pre-planted <name>.meta.tmp symlink must NOT let the sidecar write redirect to
-    an arbitrary file. The shared atomic writer (R7 ``atomic_write_bytes``) unlinks the
+    an arbitrary file. The shared atomic writer (``atomic_write_bytes``) unlinks the
     stale/planted temp and re-creates it with O_EXCL|O_NOFOLLOW, so the outside file is
     never followed or truncated -- the attacker's symlink at our OWN temp path is simply
     reclaimed (exactly as a stale temp from a crash would be) and the legitimate sidecar
-    is still written to <name>.meta, never to the symlink target. This matches the R3
+    is still written to <name>.meta, never to the symlink target. This matches the
     lock-writer's symlink contract (test_write_locks_does_not_clobber_through_symlinked_temp:
     victim safe AND the file is still written)."""
     outside = tmp_path / "outside.secret"

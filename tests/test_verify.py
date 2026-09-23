@@ -215,7 +215,7 @@ class TestVerifyMetadata:
         assert report.total == 3
         assert report.passed == 3
         assert report.failed == 0
-        # R8e: metadata sets the unified status; all-ok structure -> verdict pass.
+        # Metadata sets the unified status; all-ok structure -> verdict pass.
         assert all(r.details["status"] == "ok" for r in report.results)
         assert report.verdict == "pass" and report.available == 3
 
@@ -517,7 +517,7 @@ class TestVerifyStream:
 
 
 class TestVerifyReportVerdictAndCounts:
-    """R8e: the report's tri-state verdict + honest counts (verified/failed/unverifiable,
+    """The report's tri-state verdict + honest counts (verified/failed/unverifiable,
     checked-of-available) are the single source of truth for the display and JSON."""
 
     def _report(self, statuses, errors=None, available=None):
@@ -561,7 +561,7 @@ class TestVerifyReportVerdictAndCounts:
 
 
 class TestVerifyStreamSelection:
-    """R8e: latest-only default vs --all, and report.available reflects the whole set."""
+    """Latest-only default vs --all, and report.available reflects the whole set."""
 
     def _endpoint(self, n):
         snaps = make_snapshots(
@@ -865,7 +865,7 @@ class TestVerifyFull:
 
 
 class TestVerifyFullEnvironment:
-    """R8d false-negative-safety: verify_full must NEVER report a good backup as FAILED
+    """False-negative safety: verify_full must NEVER report a good backup as FAILED
     just because the environment could not run the restore test. Missing privilege, a
     space shortfall, ENOSPC, or a permission error are UNVERIFIABLE / run-level errors,
     not per-snapshot failures. A GENUINE restore failure is still a FAIL."""
@@ -1004,8 +1004,8 @@ class TestVerifyFullEnvironment:
 
 
 class TestVerifyFullHelpers:
-    """Unit coverage for the R8d preflight/cleanup helpers, mutation-guarded without root
-    (the real paths are exercised on real btrfs in tier2)."""
+    """Unit coverage for the verify_full preflight/cleanup helpers, mutation-guarded
+    without root (the real paths are exercised on real btrfs in tier2)."""
 
     def test_estimate_temp_shortfall_none_when_cannot_estimate(self):
         """Size unmeasurable (e.g. a remote source) -> None (proceed, catch ENOSPC)."""
@@ -1090,7 +1090,7 @@ class TestVerifyFullHelpers:
 
 
 class TestEndpointTestSendStream:
-    """R8c: the polymorphic endpoint.test_send_stream replaces the deleted module-level
+    """The polymorphic endpoint.test_send_stream replaces the deleted module-level
     _test_send_stream (and its dead ssh_client branch). Local runs `btrfs send --no-data`
     locally; SSH runs it ON THE REMOTE via _exec_remote_command -- the exact bug the dead
     branch caused was ssh:// stream verify running btrfs send LOCALLY against a remote
@@ -1332,7 +1332,7 @@ class TestVerifyReportDuration:
 
 
 # =============================================================================
-# verify_raw_checksums (R8a): raw-target checksum verification branches
+# verify_raw_checksums: raw-target checksum verification branches
 # =============================================================================
 from btrfs_backup_ng.core.verify import verify_raw_checksums  # noqa: E402
 from btrfs_backup_ng.endpoint.raw_metadata import ChecksumVerdict  # noqa: E402
@@ -1405,7 +1405,7 @@ def test_raw_checksums_error_status_fails_with_message():
     assert r.passed is False
     assert "could not be read" in r.message
     assert report.failed == 1
-    # R8e: the checksum taxonomy maps onto the unified status (error/corrupt -> failed).
+    # The checksum taxonomy maps onto the unified status (error/corrupt -> failed).
     assert r.details["status"] == "failed"
 
 
@@ -1417,7 +1417,7 @@ def test_raw_checksums_unverifiable_is_not_a_failure():
     assert r.passed is True
     assert "Unverifiable" in r.message
     assert report.failed == 0
-    # R8e: unverifiable maps to the unified 'unverifiable' status (not 'ok'), so the report
+    # Unverifiable maps to the unified 'unverifiable' status (not 'ok'), so the report
     # verdict is 'unverifiable', never a clean pass.
     assert r.details["status"] == "unverifiable"
     assert report.verdict == "unverifiable"
@@ -1444,7 +1444,7 @@ def test_raw_checksums_list_failure_is_reported_not_raised():
 
 
 # =============================================================================
-# verify_metadata STRUCTURAL validation (R8b): real filesystem objects, no mocks.
+# verify_metadata STRUCTURAL validation: real filesystem objects, no mocks.
 # These exercise the actual endpoint.verify_structure + authoritative parent check
 # against real directories / real raw streams -- the audit's whole point was that the
 # old mock tests hid a byte-blind, tautological metadata level.
@@ -1466,14 +1466,15 @@ def _build_raw_backup(path, name):
 
 
 class TestVerifyMetadataStructural:
-    """R8b: metadata level validates real structure (F1) and authoritative parent
-    continuity (F2), against real filesystem objects."""
+    """The metadata level validates real structure and authoritative parent
+    continuity, against real filesystem objects."""
 
     def test_local_plain_directory_fails_as_invalid(self, tmp_path):
-        """F1 end-to-end: a real LocalEndpoint over a directory holding plain (non-
-        subvolume) directories named like snapshots -> every entry FAILS as 'invalid'.
-        Before R8b these passed with a green 'All verifications passed'. Mutation guard:
-        revert verify_structure to hardcode exists=True and this reports all passed."""
+        """Structure check end-to-end: a real LocalEndpoint over a directory holding
+        plain (non-subvolume) directories named like snapshots -> every entry FAILS as
+        'invalid'. Before structural validation these passed with a green 'All
+        verifications passed'. Mutation guard: revert verify_structure to hardcode
+        exists=True and this reports all passed."""
         backup = tmp_path / "backup"
         backup.mkdir()
         (backup / "home-20260101-120000").mkdir()  # interrupted-receive leftover
@@ -1594,10 +1595,11 @@ class TestVerifyMetadataStructural:
         assert "no .meta sidecar" in r.message
 
     def test_raw_missing_incremental_parent_fails(self, tmp_path):
-        """F2 end-to-end: a raw snapshot whose sidecar records a parent_name that is NOT
-        present at the target -> FAIL 'missing incremental parent' (an unrestorable chain
-        break). This branch was UNREACHABLE before R8b (the tautology); the test proves it
-        now fires. Mutation guard: dropping the parent-continuity check makes this pass."""
+        """Parent-continuity check end-to-end: a raw snapshot whose sidecar records a
+        parent_name that is NOT present at the target -> FAIL 'missing incremental
+        parent' (an unrestorable chain break). This branch was UNREACHABLE before
+        structural validation (the tautology); the test proves it now fires. Mutation
+        guard: dropping the parent-continuity check makes this pass."""
         import json
 
         _build_raw_backup(tmp_path, "child.20260102T120000")

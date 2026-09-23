@@ -38,8 +38,8 @@ def snapshots_present_on(source_snapshots, destination_endpoint):
     Presence is decided purely by correspondence -- ``received_uuid == stream_uuid`` for
     btrfs, name for raw -- via the polymorphic ``correspondent_of`` (which never raises; a listing
     failure yields None -> absent). This is the shared presence authority used by both the
-    transfer planner and the R3 lock reconcile, so the two can never disagree. A re-created
-    snapshot (same name, new uuid) is correctly absent, never a name coincidence.
+    transfer planner and the persistent-lock reconcile, so the two can never disagree. A
+    re-created snapshot (same name, new uuid) is correctly absent, never a name coincidence.
     """
     # ONE listing for all of them. Asking per snapshot meant a remote
     # `btrfs subvolume list` per source snapshot on an ssh:// destination --
@@ -165,7 +165,7 @@ def plan_transfer_sequence(
     transfer (not only snapshots already on the destination at plan time). This keeps a fresh
     multi-snapshot run (e.g. an initial snapper-history backup) a tight incremental chain
     instead of all-full sends. If an earlier transfer fails at execution, its dependent
-    incremental fails too and is surfaced (R1) -- never silently mis-applied.
+    incremental fails too and is surfaced -- never silently mis-applied.
     """
     present = snapshots_present_on(source_snapshots, destination_endpoint)
 

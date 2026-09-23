@@ -347,7 +347,7 @@ def apply_retention(
     # ``min="1M"`` is one calendar month, aligned with the monthly/yearly bucket keys. ``min`` is
     # a corrupt-retention selector when invalid: fail LOUD and CLOSED (raise -> the caller prunes
     # nothing) rather than silently choosing a shorter, more-permissive window that DELETES more
-    # (R1/R3 "never delete on ambiguous input"). Config load validates ``min`` too (defence-in-depth).
+    # (never delete on ambiguous input). Config load validates ``min`` too (defence-in-depth).
     try:
         min_cutoff = subtract_duration(now, config.min)
     except ValueError as e:
@@ -362,7 +362,7 @@ def apply_retention(
     # still participates in retention). QUARANTINED = unparseable OR implausibly future-dated:
     # ALWAYS kept and COMPLETELY excluded from the retention math, so such an entry can never
     # (a) consume the "keep latest" slot from the real newest snapshot, nor (b) occupy a
-    # time-bucket slot. This is the R10a data-loss fix: only real, orderable snapshots decide
+    # time-bucket slot. This closes a data-loss hole: only real, orderable snapshots decide
     # what gets deleted.
     valid_infos: list[SnapshotInfo] = []
     quarantined_infos: list[SnapshotInfo] = []

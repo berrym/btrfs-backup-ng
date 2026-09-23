@@ -778,7 +778,7 @@ class TestMigrateSystemd:
 
 
 class TestPromptTargetEncryption:
-    """0.9.2 Phase 2B-ii: the wizard's raw-target encryption prompt."""
+    """The wizard's raw-target encryption prompt."""
 
     def test_non_raw_targets_are_not_prompted(self):
         """Encryption is raw-only; ssh:// and local targets must skip it entirely
@@ -862,7 +862,7 @@ class TestPromptTargetEncryption:
 
 
 class TestGenerateConfigEncryption:
-    """0.9.2 Phase 2B-ii: wizard-emitted encrypted raw configs serialize & LOAD."""
+    """Wizard-emitted encrypted raw configs serialize & LOAD."""
 
     @staticmethod
     def _config_with_target(target):
@@ -995,7 +995,7 @@ class TestGenerateConfigEncryption:
 
 
 class TestGenerateConfigEscaping:
-    """R9 follow-up: EVERY string field in _generate_config_from_wizard is emitted
+    """Quoting follow-up: EVERY string field in _generate_config_from_wizard is emitted
     through _toml_str, so a backslash / double-quote / control char round-trips
     losslessly instead of producing an unparseable or silently-corrupted config."""
 

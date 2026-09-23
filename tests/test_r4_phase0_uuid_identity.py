@@ -1,10 +1,11 @@
-"""R4 Phase 0: snapshots carry their btrfs uuid / received_uuid (identity foundation).
+"""Snapshots carry their btrfs uuid / received_uuid (identity foundation).
 
-Phase 0 is strictly NON-behavioral: it only ENRICHES snapshot objects with the btrfs
-``uuid`` and ``received_uuid`` at enumeration -- local endpoints via ``btrfs subvolume
-show`` per snapshot (mount-safe, unambiguous), ssh endpoints from each ``subvolume list
--o -u -R`` line. Identity (`__eq__` / `__lt__` / `find_parent`) is unchanged and nothing
-consults the new fields yet -- that is Phase 2. ``subvolume show`` is sudo-escalated
+The enrichment is strictly NON-behavioral: it only ENRICHES snapshot objects with the
+btrfs ``uuid`` and ``received_uuid`` at enumeration -- local endpoints via ``btrfs
+subvolume show`` per snapshot (mount-safe, unambiguous), ssh endpoints from each
+``subvolume list -o -u -R`` line. Identity (`__eq__` / `__lt__` / `find_parent`) is
+unchanged; the new fields are consulted only by the correspondence-based planner.
+``subvolume show`` is sudo-escalated
 (``sudo -n`` when not root) so a non-root+passwordless-sudo run populates uuids like the
 transfer path; population stays best-effort: any failure (no sudo, non-btrfs, older
 btrfs-progs) leaves the uuids empty and enumeration working.
@@ -264,13 +265,13 @@ def test_enrichment_graceful_when_subprocess_raises(tmp_path, monkeypatch):
 
 
 # --------------------------------------------------------------------------- #
-# Non-behavioral guard: identity is STILL name/time in Phase 0
+# Non-behavioral guard: snapshot identity is STILL name/time
 # --------------------------------------------------------------------------- #
 def test_identity_unchanged_despite_differing_uuids(tmp_path):
     """Two snapshots with the same name/time but DIFFERENT uuids must still compare equal
-    in Phase 0 (identity is name/time; uuids are carried, not consulted). Mutation guard:
-    if __eq__ were switched to uuid-based, this fails -- proving Phase 0 didn't change
-    identity."""
+    (identity is name/time; uuids are carried, not consulted). Mutation guard:
+    if __eq__ were switched to uuid-based, this fails -- proving the uuid enrichment
+    didn't change identity."""
     ep = _local(tmp_path)
     t = time.strptime("20240101-000000", "%Y%m%d-%H%M%S")
     a = __util__.Snapshot(tmp_path, "home-", ep, time_obj=t)

@@ -1093,8 +1093,8 @@ class RawEndpoint(Endpoint):
                 self.write_sidecar(self._sidecar_snapshot(final_path, size, checksum))
             except Exception as e:
                 # The backup data is already durable; a sidecar error must NEVER flip
-                # an already-successful transfer into a reported failure (PR1
-                # contract). A missing sidecar just degrades to filename inference.
+                # an already-successful transfer into a reported failure.
+                # A missing sidecar just degrades to filename inference.
                 logger.warning("Failed to write sidecar for %s: %s", final_path, e)
         self._cached_snapshots = None  # re-discover to include the new sidecar
         logger.debug("Committed raw stream + sidecar: %s", final_path)
@@ -1236,7 +1236,8 @@ class RawEndpoint(Endpoint):
             )
         part = Path(str(enc_path) + PARTIAL_SUFFIX)
         # A compress-less endpoint yields an ENCRYPT-ONLY argv (the plaintext bytes
-        # are already whatever they are), reusing the PR4-hardened crypto command.
+        # are already whatever they are), reusing the endpoint's hardened crypto
+        # command.
         enc_ep = RawEndpoint(
             config={
                 "path": str(Path(self.config["path"])),
@@ -1735,7 +1736,7 @@ class RawEndpoint(Endpoint):
         writes a LOCAL lock file at ``config['path']`` -- both wrong for a raw
         target (restore does not set a source, and the path is remote for
         raw+ssh, so the base write would raise and abort the restore). Raw lock
-        PERSISTENCE across runs is a separate change (audit root R3); until then
+        PERSISTENCE across runs is a separate change; until then
         this mutates only the in-memory lock set so the restore/transfer
         lock-guard logic works without touching disk.
         """
@@ -2021,7 +2022,7 @@ class SSHRawEndpoint(RawEndpoint):
         self._file_ops_direct: bool | None = None
         # Host-key policy: "accept-new" (default; unifies raw+ssh with the btrfs transport --
         # previously it set no StrictHostKeyChecking and inherited the ambient ssh default)
-        # or "strict" (refuse an unknown host). R12b.
+        # or "strict" (refuse an unknown host).
         self.ssh_host_key_policy = config.get("ssh_host_key_policy", "accept-new")
         # An explicit ssh-agent socket (e.g. `--ssh-auth-sock`), useful under sudo where
         # SSH_AUTH_SOCK is not inherited. None -> rely on ssh's own agent discovery.
@@ -2663,10 +2664,10 @@ class SSHRawEndpoint(RawEndpoint):
         # or backfill that looks in between sees a stream with no sidecar and
         # mislabels it (backfill stamps it `unknown`/inferred, overwriting the
         # authoritative record this commit is about to write). The local path has
-        # taken the lock over exactly this window since R7; the remote path never
-        # did, though its window is WIDER -- a network round trip, not a rename --
-        # and its peers can be on other machines, where a flock would not have
-        # helped anyway. This section is now metadata-only and sub-second.
+        # taken the lock over exactly this window since the atomic-write change; the
+        # remote path never did, though its window is WIDER -- a network round trip,
+        # not a rename -- and its peers can be on other machines, where a flock would
+        # not have helped anyway. This section is now metadata-only and sub-second.
         with self.target_lock():
             result = self._exec_remote_command(["sh", "-c", mv_script], check=False)
             if result.returncode != 0:
@@ -2754,7 +2755,7 @@ class SSHRawEndpoint(RawEndpoint):
         # Best-effort: the stream is already durable, so a sidecar error must not
         # fail the backup (mirrors the local commit path) -- write_sidecar is
         # inside the try so it cannot flip an already-successful transfer into a
-        # reported failure (the PR1/R1 contract).
+        # reported failure.
         try:
             self.write_sidecar(self._sidecar_snapshot(final_path, size, checksum))
         except Exception as e:
@@ -2949,7 +2950,7 @@ class SSHRawEndpoint(RawEndpoint):
         # into place. The old predictable ``<meta>.tmp`` let a local user ON THE REMOTE plant
         # a symlink at that guessable path so ``cat >`` followed it and truncated an arbitrary
         # file the remote (sudo) user can write -- an unguessable mktemp name closes that by
-        # design (R12d/P6). A ``trap`` removes the temp on any failure; the name avoids
+        # design. A ``trap`` removes the temp on any failure; the name avoids
         # ``.btrfs``/``.meta`` so a leaked temp is never mis-enumerated as a stream/sidecar.
         script = (
             f"set -e; d=$(dirname -- {meta_q}); "

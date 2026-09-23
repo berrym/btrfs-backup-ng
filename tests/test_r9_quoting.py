@@ -1,4 +1,4 @@
-"""R9 defensive shell-quoting sweep: paths/names interpolated into a REMOTE shell
+"""Defensive shell-quoting sweep: paths/names interpolated into a REMOTE shell
 context must be shlex.quote'd so a space / single-quote / shell metacharacter can
 neither break the command nor inject into the remote shell.
 

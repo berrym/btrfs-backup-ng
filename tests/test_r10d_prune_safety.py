@@ -1,4 +1,4 @@
-"""R10d: prune confirmation gate + degenerate-policy guardrail.
+"""Prune confirmation gate + degenerate-policy guardrail.
 
 Prune now runs a plan-then-execute flow: it computes the whole deletion plan, then (for a real
 run) asks for a single confirmation on an interactive TTY unless --yes, and REFUSES a degenerate
@@ -177,7 +177,7 @@ def test_dry_run_never_deletes(tmp_path, monkeypatch):
 
 
 def test_resolved_policy_log_includes_yearly(tmp_path, monkeypatch, caplog):
-    """R10d/critic#10: the resolved-policy log line includes yearly (was omitted)."""
+    """The resolved-policy log line includes yearly (was omitted)."""
     import logging
 
     with caplog.at_level(logging.INFO):

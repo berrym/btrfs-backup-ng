@@ -1,10 +1,10 @@
-"""R4 Phase 1: the polymorphic ``endpoint.correspondent_of(snapshot)`` primitive.
+"""The polymorphic ``endpoint.correspondent_of(snapshot)`` primitive.
 
 Correspondence is the single authority for "does THIS endpoint hold the subvolume that
 corresponds to that snapshot". For btrfs it is ``received_uuid == snapshot.uuid`` (what
 incremental send/receive actually resolves on the destination); for raw it is name (a
-self-contained stream, no received_uuid). Phase 1 is strictly NON-behavioral: the method
-exists and is proven, but nothing in the planner or restore calls it yet (P2/P3 do).
+self-contained stream, no received_uuid). Adding it was strictly NON-behavioral: the
+method exists and is proven on its own; the planner and restore were wired onto it later.
 """
 
 from __future__ import annotations
@@ -61,10 +61,10 @@ def test_correspondent_matches_by_received_uuid_not_name(tmp_path, monkeypatch):
 
 
 def test_recreated_snapshot_same_name_new_uuid_is_not_present(tmp_path, monkeypatch):
-    """THE R4 WIN: a re-created source snapshot reuses the name but has a NEW uuid, so it
-    does NOT correspond to the destination's old copy -- returns None (correctly "not
-    present"), instead of the name-collision a name match would wrongly report. Mutation
-    guard: a name-based correspondent returns the stale copy and fails this."""
+    """THE UUID-IDENTITY WIN: a re-created source snapshot reuses the name but has a NEW
+    uuid, so it does NOT correspond to the destination's old copy -- returns None (correctly
+    "not present"), instead of the name-collision a name match would wrongly report.
+    Mutation guard: a name-based correspondent returns the stale copy and fails this."""
     dest = _local(tmp_path)
     old_copy = _snap(
         dest, tmp_path, "20240101-000000", uuid="Dx", received_uuid="OLD-UUID"
@@ -237,7 +237,7 @@ def test_polymorphism_btrfs_uses_base_raw_overrides():
 
 
 def test_planner_and_restore_both_wired_onto_correspondent_of():
-    """Phase 2 wired the backup planner onto correspondent_of. Restore no
+    """The backup planner is wired onto correspondent_of. Restore no
     longer has a parent chooser of its own at all: it plans through the same
     ``plan_transfer_sequence``, so presence and parents come from the one
     correspondence authority in both directions."""
@@ -245,7 +245,7 @@ def test_planner_and_restore_both_wired_onto_correspondent_of():
     import btrfs_backup_ng.core.restore as restore
 
     assert "correspondent_of" in inspect.getsource(planning), (
-        "the planner is wired onto correspondent_of (P2)"
+        "the planner must decide presence through correspondent_of"
     )
     restore_source = inspect.getsource(restore)
     assert "plan_transfer_sequence(" in restore_source, (

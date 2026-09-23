@@ -1,4 +1,4 @@
-"""Atomic raw stream write (0.8.5 PR1).
+"""Atomic raw stream write (0.8.5).
 
 A raw receive writes to a ``.part`` file and is published to its final name only
 by ``commit_receive()``, which the transfer engine calls after confirming the
@@ -193,7 +193,8 @@ def test_ssh_commit_holds_the_target_lock_across_rename_and_sidecar():
     """A concurrent prune or backfill must not observe the published stream in the
     window before its authoritative sidecar exists -- it would stamp the backup
     `unknown`/inferred over the record this commit is about to write. The local
-    commit path has held the lock over exactly this window since R7."""
+    commit path has held the lock over exactly this window since the atomic-write
+    change."""
     ep = _ssh_commit_endpoint()
     ep._exec_remote_command = MagicMock(
         return_value=MagicMock(returncode=0, stderr=b"", stdout=b"1")

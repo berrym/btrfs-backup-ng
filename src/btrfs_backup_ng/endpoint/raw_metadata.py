@@ -364,7 +364,7 @@ class RawSnapshot:
 
     def save_metadata(self) -> None:
         """Write the sidecar atomically at mode 0600 via the shared atomic-write
-        primitive (temp -> fsync -> os.replace -> dir fsync; R7), so a crash never
+        primitive (temp -> fsync -> os.replace -> dir fsync), so a crash never
         leaves a partial/half-written .meta and the metadata dossier is not
         world-readable.
 

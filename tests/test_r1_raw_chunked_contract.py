@@ -1,4 +1,4 @@
-"""Enforcement tests for the R1 transfer-success contract: raw + chunked paths.
+"""Enforcement tests for the transfer-success contract: raw + chunked paths.
 
 Companion to test_r1_transfer_success_contract.py (the SSH point-of-truth layer).
 These cover the non-SSH-direct transfer paths (commits A2a/A2b): the raw stream

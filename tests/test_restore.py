@@ -2385,7 +2385,7 @@ class TestRestoreSnapperSnapshot:
 
 
 def _make_backup_meta(number, *, desc="timeline", snap_type="single", userdata=None):
-    """Build a BackupMetadata for a raw snapper sidecar (R11 tests).
+    """Build a BackupMetadata for a raw snapper sidecar (raw snapper restore tests).
 
     original_info_xml is a valid snapper info.xml (real <key>/<value> userdata
     format) so restore's primary path (parse the stored xml) is exercised.
@@ -2432,7 +2432,7 @@ class _FakeRemoteEndpoint:
 
 
 class TestListRawSnapperBackups:
-    """R11 Part 1: enumerate raw:// / raw+ssh:// snapper backups via sidecars."""
+    """Enumerate raw:// / raw+ssh:// snapper backups via sidecars."""
 
     def test_backup_metadata_from_dict_round_trips(self):
         """BackupMetadata.from_dict reverses asdict() with no drift."""
@@ -2547,7 +2547,7 @@ class TestListRawSnapperBackups:
 
 
 class TestResolveRawSnapperBackup:
-    """R11 Part 2: snapper number -> backup_name -> RawSnapshot resolution."""
+    """Snapper number -> backup_name -> RawSnapshot resolution."""
 
     def _write_sidecars(self, tmp_path, numbers):
         for n in numbers:
@@ -2608,7 +2608,7 @@ class TestResolveRawSnapperBackup:
 
 
 class TestRestoreRawSnapperSnapshot:
-    """R11 Part 2: materialize a raw snapper stream into a fresh snapper slot."""
+    """Materialize a raw snapper stream into a fresh snapper slot."""
 
     def _setup(self, tmp_path, *, send_rc=0):
         from btrfs_backup_ng.snapper import SnapperConfig
@@ -2747,7 +2747,7 @@ class TestRestoreRawSnapperSnapshot:
 
 
 class TestRawRestoreUserdataFidelity:
-    """R11: restore sources info.xml from original_info_xml so userdata survives."""
+    """Restore sources info.xml from original_info_xml so userdata survives."""
 
     def _setup(self, tmp_path):
         from btrfs_backup_ng.snapper import SnapperConfig
@@ -2896,7 +2896,7 @@ def _write_named_sidecar(tmp_path, name, number, date, *, desc="d"):
 
 
 class TestRawSnapperResolutionFixes:
-    """R11 #1 (duplicate snapper_number determinism) and #2 (ssh option threading)."""
+    """Duplicate snapper_number determinism and ssh option threading."""
 
     def _fake_local_ep(self, tmp_path, stream_names):
         streams = []
@@ -2983,7 +2983,7 @@ class TestRawSnapperResolutionFixes:
 
 
 class TestRemoteSnapperEnumerationErrors:
-    """R11 #3: remote enumeration surfaces unreachable/denied, not a silent empty."""
+    """Remote enumeration surfaces unreachable/denied, not a silent empty."""
 
     def _remote_ep(self, path, rc, stdout=b"", stderr=b""):
         class _Ep:
@@ -3046,7 +3046,7 @@ class TestRemoteSnapperEnumerationErrors:
 
 
 class TestRawSnapperExactNameResolution:
-    """R11b: _resolve_raw_snapper_backup resolves the EXACT backup by name."""
+    """_resolve_raw_snapper_backup resolves the EXACT backup by name."""
 
     def _fake_local_ep(self, tmp_path, stream_names):
         streams = []
@@ -3097,7 +3097,7 @@ class TestRawSnapperExactNameResolution:
                 )
 
     def test_bare_number_still_picks_newest_and_warns(self, tmp_path, caplog):
-        """Fallback (no backup_name) keeps the R11 newest+warn behavior."""
+        """Fallback (no backup_name) keeps the newest+warn behavior."""
         from btrfs_backup_ng.core.restore import _resolve_raw_snapper_backup
 
         fake = self._two_colliding(tmp_path)

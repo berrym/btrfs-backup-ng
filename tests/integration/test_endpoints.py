@@ -541,7 +541,7 @@ class TestEndpointCommandExecution:
         )
 
         cmd = [("btrfs", False), ("subvolume", False), ("list", False)]
-        # os.geteuid() is mocked here; the R12c per-euid lock dir verifies ownership against
+        # os.geteuid() is mocked here; the per-euid lock dir verifies ownership against
         # that mocked euid, which mismatches the real-uid-owned dir on a CI runner. The lock
         # is not under test (FileLock is mocked), so stub the path computation.
         with patch(
@@ -575,7 +575,7 @@ class TestEndpointCommandExecution:
         )
 
         cmd = [("btrfs", False), ("subvolume", False), ("list", False)]
-        # This test mocks os.geteuid()->0 to exercise the root/no-sudo path; the R12c
+        # This test mocks os.geteuid()->0 to exercise the root/no-sudo path; the
         # per-euid lock dir verifies ownership against that (mocked) euid, which would
         # mismatch the real-uid-owned dir. The lock is not under test here (FileLock is
         # already mocked), so stub the path computation.

@@ -1,7 +1,7 @@
-"""Shared sidecar writer (0.8.5 PR5).
+"""Shared sidecar writer (0.8.5).
 
 Every ``.meta`` sidecar -- written by the transfer engine on commit, or by a raw
-maintenance command (0.8.5 PR6) with any provenance -- goes through one path:
+maintenance command (the ``raw`` family) with any provenance -- goes through one path:
 ``RawSnapshot.serialize()`` for the wire bytes and ``endpoint.write_sidecar()`` for
 the atomic write (local direct, raw+ssh on the remote). These tests pin that
 contract so the local and remote writers cannot drift and the engine keeps routing
@@ -79,7 +79,7 @@ def test_local_and_remote_sidecar_bytes_are_identical(tmp_path):
 
 def test_ssh_write_sidecar_builds_atomic_script_at_meta_path():
     """The remote write is atomic and targets exactly ``<stream>.meta``, via an
-    UNPREDICTABLE mktemp temp (R12d/P6) -- NOT the old predictable ``<meta>.tmp`` a
+    UNPREDICTABLE mktemp temp -- NOT the old predictable ``<meta>.tmp`` a
     remote user could pre-symlink. Mutation guard: revert to ``cat > <meta>.tmp`` and the
     'no predictable temp' assertion fails."""
     ep = SSHRawEndpoint(config={"path": "/backup", "hostname": "nas"})
@@ -157,11 +157,11 @@ def test_remote_meta_path_equals_stream_plus_meta(stream):
 
 
 def test_custom_provenance_round_trips_through_write_sidecar(tmp_path):
-    """The PR5 -> PR6 enabler: a maintenance command writes a sidecar with a
-    non-native provenance (e.g. 'remediation') by handing write_sidecar a snapshot
-    that carries it. Prove the origin survives to the on-disk bytes AND the bytes
-    the ssh writer feeds the remote. If anything hardcoded 'native-write' on the
-    write path, PR6 would silently break -- this fails."""
+    """What the ``raw`` maintenance commands rely on: a maintenance command writes a
+    sidecar with a non-native provenance (e.g. 'remediation') by handing write_sidecar a
+    snapshot that carries it. Prove the origin survives to the on-disk bytes AND the
+    bytes the ssh writer feeds the remote. If anything hardcoded 'native-write' on the
+    write path, the ``raw`` commands would silently break -- this fails."""
     import json
 
     snap = _snapshot(tmp_path / "snap.btrfs")

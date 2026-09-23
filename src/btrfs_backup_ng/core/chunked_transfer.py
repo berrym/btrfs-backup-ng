@@ -260,7 +260,7 @@ class TransferManifest:
     def save(self, path: Path) -> None:
         """Save manifest to file.
 
-        Crash-atomic + best-effort (R7): written via the shared atomic-write primitive
+        Crash-atomic + best-effort: written via the shared atomic-write primitive
         (temp -> fsync -> os.replace), so a crash mid-write can never leave a torn
         manifest that ``load()`` would reject -- which would force a full retransmit of
         an already-partial (potentially GB-scale) chunked transfer. On an I/O failure the

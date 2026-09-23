@@ -1,5 +1,5 @@
 """Enforcement: the CLI dispatch paths must thread raw-target encryption into the
-destination endpoint and fail closed -- the exact seam the R6 plaintext bug lived
+destination endpoint and fail closed -- the exact seam the silent-plaintext bug lived
 in. These drive the REAL cli functions (not a mocked choose_endpoint), let
 choose_endpoint build a REAL RawEndpoint, and mock only the btrfs snapshot/transfer
 work, so a dropped thread/assert is actually caught.

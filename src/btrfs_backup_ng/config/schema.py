@@ -213,7 +213,7 @@ class TargetConfig:
     ssh_password_auth: bool = True
     skip_remote_lock: bool = False
     # Host-key verification policy: "accept-new" (default; trust-on-first-use, reject a
-    # changed key) or "strict" (known_hosts-only, reject an unknown host). R12b.
+    # changed key) or "strict" (known_hosts-only, reject an unknown host).
     ssh_host_key_policy: str = "accept-new"
     compress: str = "none"
     rate_limit: Optional[str] = None
@@ -276,7 +276,7 @@ class RawTargetConfig:
     ssh_auth_sock: Optional[str] = None
     # Host-key policy. NOTE: raw targets are represented by TargetConfig at load time
     # (the loader does not instantiate RawTargetConfig), so the LIVE knob is
-    # TargetConfig.ssh_host_key_policy; kept here for schema parity. R12b.
+    # TargetConfig.ssh_host_key_policy; kept here for schema parity.
     ssh_host_key_policy: str = "accept-new"
 
     def __post_init__(self):

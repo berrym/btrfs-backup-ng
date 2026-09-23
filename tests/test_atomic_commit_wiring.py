@@ -1,4 +1,4 @@
-"""Engine wiring for atomic raw commit (0.8.5 PR1).
+"""Engine wiring for atomic raw commit (0.8.5).
 
 These lock the contract that the transfer engine actually CALLS commit_receive()
 on the raw success path and treats a commit failure as a transfer FAILURE.
@@ -115,7 +115,7 @@ class _StderrProc:
 
 
 def test_log_process_errors_returns_captured_stderr():
-    """R8d enrichment: _log_process_errors RETURNS the (send_err, recv_err) it read, so a
+    """_log_process_errors RETURNS the (send_err, recv_err) it read, so a
     caller can surface the real btrfs reason in the raised error rather than losing it to
     the log. Mutation guard: reverting it to return None makes the tuple-unpack fail, and
     the caller could no longer classify ENOSPC vs corruption."""

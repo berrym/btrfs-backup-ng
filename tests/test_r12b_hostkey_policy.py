@@ -1,4 +1,4 @@
-"""R12b -- configurable ssh_host_key_policy (accept-new | strict) across all transports.
+"""Configurable ssh_host_key_policy (accept-new | strict) across all transports.
 
 Covers: config validation (fail-closed on invalid), and that each of the three transports
 (subprocess master, ssh:// endpoint, raw+ssh) emits the correct policy for each
@@ -129,9 +129,9 @@ def test_raw_default_is_accept_new():
 
 def test_every_handler_threading_ssh_sudo_also_threads_host_key_policy():
     """Silent-degrade guard: any CLI handler that threads a target's ssh_sudo into endpoint
-    config MUST also thread ssh_host_key_policy -- else a config'd `strict` is silently
-    ignored on that command (the R12b review found exactly this gap on `run`). Scans the
-    cli/ handlers; if one reads target.ssh_sudo it must also read target.ssh_host_key_policy."""
+    config MUST also thread ssh_host_key_policy -- else a config'd `strict` is silently ignored
+    on that command (the host-key policy review found exactly this gap on `run`). Scans the cli/
+    handlers; if one reads target.ssh_sudo it must also read target.ssh_host_key_policy."""
     import pathlib
 
     cli_dir = pathlib.Path("src/btrfs_backup_ng/cli")
@@ -152,7 +152,7 @@ def test_every_handler_threading_ssh_sudo_also_threads_host_key_policy():
     )
 
 
-# ------------------------------------ R12d: snapper subcommands get the flag (R12b deferral)
+# -------------------- snapper subcommands get the flag (deferred from the policy change)
 
 
 @pytest.mark.parametrize(

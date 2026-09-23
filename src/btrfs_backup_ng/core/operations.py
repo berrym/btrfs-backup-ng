@@ -1500,9 +1500,9 @@ def sync_snapshots(
     # depend on cache-population order.
     source_snapshots = source_endpoint.list_snapshots(flush_cache=True)
 
-    # Reconcile this destination's locks against reality (R3), using the SAME presence
-    # authority as the planner (correspondence: uuid for btrfs, name for raw) so the two
-    # can never disagree. A lock pins a source snapshot so retention cannot prune it while
+    # Reconcile this destination's persistent locks against reality, using the SAME presence
+    # authority as the planner (correspondence: uuid for btrfs, name for raw) so the two can
+    # never disagree. A lock pins a source snapshot so retention cannot prune it while
     # a transfer to this destination still needs it. Clear the lock only for snapshots
     # CONFIRMED present on the destination; KEEP it for one not yet there (a prior transfer
     # failed/pending). Presence-based, not time-based -- a long outage never prunes a
@@ -1722,7 +1722,7 @@ def artifact_verdict(destination_endpoint, snapshot) -> StructureVerdict:
     """The verdict on what a receive that exited 0 left at the destination.
 
     Tri-state, in the shape ``verify`` already uses (``StructureVerdict``), and
-    R1-safe -- a check that could not run never fails a transfer and never
+    fail-safe -- a check that could not run never fails a transfer and never
     deletes anything:
 
     - ``ok``            a btrfs subvolume whose ``received_uuid`` equals the
@@ -1919,7 +1919,7 @@ def _execute_transfers(
     # parents off an earlier in-run transfer that FAILED, the parent is not on the destination,
     # so a ``send -p`` against it cannot apply. btrfs receive self-detects this (nonzero rc ->
     # SnapshotTransferError), but a raw target would just write bytes and commit a valid-looking
-    # but UNRESTORABLE stream -- a false success (R1 violation). Short-circuit such a child on
+    # but UNRESTORABLE stream -- a false success. Short-circuit such a child on
     # ALL endpoint types instead.
     planned_names = {s.get_name() for s, _ in plan}
     transferred_names: set = set()
@@ -1965,7 +1965,7 @@ def _execute_transfers(
             # and a post-check must not be able to turn that into a crash.
             try:
                 verdict = artifact_verdict(destination_endpoint, best_snapshot)
-            except Exception as check_err:  # noqa: BLE001 - R1: never a failure
+            except Exception as check_err:  # noqa: BLE001 - never a failure
                 verdict = StructureVerdict(
                     "unverifiable", f"the verdict could not be computed: {check_err}"
                 )
@@ -2826,7 +2826,7 @@ def _create_snapper_snapshot_wrapper(snapper_snapshot, destination_endpoint=None
     wrapper.get_path = get_path_override
 
     # Enrich the wrapper's btrfs uuid / received_uuid (sudo-escalated `subvolume show` via the
-    # source endpoint, same as P2 enumeration) so the correspondence-based planner can
+    # source endpoint, as list_snapshots does) so the correspondence-based planner can
     # identify this snapshot on the destination by received_uuid -- NOT by the snapper number,
     # which snapper reuses after a prune. get_path() is overridden to the snapper subvolume,
     # so _load_subvolume_ids_into inspects the right path. Best-effort (empty on failure).

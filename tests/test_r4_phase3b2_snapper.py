@@ -1,10 +1,11 @@
-"""R4 Phase 3b-2: snapper backup identity converged onto correspondence.
+"""Snapper backup identity converged onto correspondence.
 
 Snapper no longer decides skip/parent by the snapper NUMBER (which snapper recycles after a
 prune). Instead each snapper snapshot is wrapped as a uuid-enriched Snapshot and routed
 through the shared planner, whose destination view resolves correspondence: received_uuid for
 btrfs (via the ``.snapshots/{num}/snapshot`` numbered-layout enumeration), name for raw. A
-recycled number gets a NEW uuid, so it is correctly "absent" and re-sent -- the R4 win.
+recycled number gets a NEW uuid, so it is correctly "absent" and re-sent -- the
+uuid-identity win.
 """
 
 from __future__ import annotations
@@ -48,10 +49,11 @@ def test_btrfs_dest_view_corresponds_by_received_uuid(monkeypatch):
 
 
 def test_btrfs_dest_view_recycled_number_new_uuid_is_absent(monkeypatch):
-    """THE R4 WIN for snapper: snapper reused number 7 for a NEW snapshot (new uuid); the
-    destination still holds the OLD number-7 backup (its old received_uuid). Correspondence
-    correctly reports the new snapshot ABSENT -> it is re-sent, instead of being skipped by a
-    number coincidence. Mutation guard: number-based identity skips it."""
+    """THE UUID-IDENTITY WIN for snapper: snapper reused number 7 for a NEW snapshot (new
+    uuid); the destination still holds the OLD number-7 backup (its old received_uuid).
+    Correspondence correctly reports the new snapshot ABSENT -> it is re-sent, instead of
+    being skipped by a number coincidence. Mutation guard: number-based identity skips
+    it."""
     monkeypatch.setattr(
         ops,
         "_enumerate_snapper_btrfs_backups",
@@ -287,7 +289,7 @@ def test_publish_replaces_occupied_slot_end_to_end(tmp_path, monkeypatch):
 
 
 # --------------------------------------------------------------------------- #
-# sync_snapper_snapshots: within-run failed-parent short-circuit (R1 safety)
+# sync_snapper_snapshots: within-run failed-parent short-circuit (transfer-success safety)
 # --------------------------------------------------------------------------- #
 def test_sync_snapper_failed_in_run_parent_short_circuits_dependents(monkeypatch):
     """A snapper child whose in-run parent's transfer FAILED is short-circuited (recorded

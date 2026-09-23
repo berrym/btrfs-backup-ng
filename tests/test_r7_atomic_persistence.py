@@ -1,4 +1,4 @@
-"""R7 -- atomic state & manifest persistence.
+"""Atomic state & manifest persistence.
 
 Proves the shared ``__util__.atomic_write_bytes`` primitive is crash-atomic and that the
 three operational-state writers migrated to it -- operation state
@@ -6,10 +6,10 @@ three operational-state writers migrated to it -- operation state
 the restore-unlock lock write (``restore._execute_unlock``) -- can never leave a torn file
 on a mid-write crash.
 
-The R3 lock suite (``test_r3_lock_persistence.py``) already mutation-guards the primitive's
-stale-temp cleanup, no-residue, and O_NOFOLLOW-symlink behavior *through* the lock path
-(``_write_locks`` now delegates to the primitive); this file exercises the primitive
-directly plus the new callers.
+The lock-persistence suite (``test_r3_lock_persistence.py``) already mutation-guards the
+primitive's stale-temp cleanup, no-residue, and O_NOFOLLOW-symlink behavior *through* the
+lock path (``_write_locks`` now delegates to the primitive); this file exercises the
+primitive directly plus the new callers.
 
 Keystone mutation guard: patch ``os.replace`` to raise mid-save. A caller that still did a
 plain ``open(path, "w") + json.dump`` would truncate the previous good file and leave a

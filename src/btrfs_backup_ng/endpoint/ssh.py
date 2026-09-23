@@ -1140,7 +1140,7 @@ class SSHEndpoint(Endpoint):
         calling super().
 
         It used to stop there, holding the pin in memory only, with "persisting
-        ssh locks across runs is a separate change (audit root R3)" written where
+        ssh locks across runs is a separate change" written where
         this sentence now is. That is the change. An in-memory pin is invisible
         to a prune running in another process or on another machine, which was
         therefore free to delete the very snapshot a restore was reading.
@@ -2274,7 +2274,7 @@ print(json.dumps(result))
         # re-split (or injected) remotely. Quoting mirrors raw.py's _exec_remote_command
         # and is a no-op for clean tokens. All callers pass literal argv (command +
         # flags + values), never bare shell operators, so this cannot break intended
-        # remote-shell syntax. (R9)
+        # remote-shell syntax.
         ssh_cmd = ssh_base_cmd + ["--"] + [shlex.quote(str(c)) for c in remote_cmd]
         logger.debug("Complete SSH command: %s", ssh_cmd)
 
@@ -2627,7 +2627,7 @@ print(json.dumps(result))
                 pass
 
         # Standard method - works with cached credentials. -u -R add the subvolume UUID
-        # and received_uuid columns so snapshots are self-describing (Phase 0); older
+        # and received_uuid columns so snapshots are self-describing; older
         # btrfs-progs simply omit the columns and the parser tolerates that.
         cmd = ["btrfs", "subvolume", "list", "-o", "-u", "-R", path]
         try:
@@ -4669,7 +4669,7 @@ print(json.dumps(result))
 
         # Build the receive command. _build_receive_command escapes the
         # destination itself and quotes the whole remote script as one argument,
-        # so a path with a space or shell metacharacter is safe here. (R9)
+        # so a path with a space or shell metacharacter is safe here.
         receive_cmd = _build_receive_command(
             dest_path=dest_path,
             use_sudo=use_sudo,

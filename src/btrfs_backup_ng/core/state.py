@@ -296,13 +296,13 @@ class OperationRecord:
     def save(self, path: Path) -> None:
         """Save operation record to file.
 
-        Crash-atomic + best-effort (R7): written via the shared atomic-write primitive
+        Crash-atomic + best-effort: written via the shared atomic-write primitive
         (temp -> fsync -> os.replace), so a crash mid-write can never leave a torn JSON
         file that ``load()`` would choke on and thereby kill resume -- a reader always
         sees the old complete record or the new one. On an I/O failure the previous
         complete record is left intact and we log + continue: the state file is a resume
         optimization, never the backup itself, so a save failure must not fail a good
-        operation (the R1/R2 false-negative-safety principle)."""
+        operation."""
         self.updated_at = datetime.now().isoformat()
         path.parent.mkdir(parents=True, exist_ok=True)
         payload = json.dumps(self.to_dict(), indent=2)
@@ -498,7 +498,7 @@ class OperationManager:
             # save() is best-effort (swallows OSError), so verify the archive copy is
             # actually written AND loadable before removing the source record. An
             # unconditional unlink here would destroy a completed operation's record if
-            # the archive write had failed (ENOSPC, archive-dir I/O error) -- the R1
+            # the archive write had failed (ENOSPC, archive-dir I/O error) -- the
             # principle: never delete a good record on an inconclusive write.
             try:
                 archived_ok = (

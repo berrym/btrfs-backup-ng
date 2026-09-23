@@ -526,7 +526,7 @@ class TestShellConfigTypes:
 
 
 class TestSnapperRestoreCompletionFlags:
-    """R11b: new snapper-restore flags stay in lockstep across all shell completions."""
+    """New snapper-restore flags stay in lockstep across all shell completions."""
 
     def _completions_dir(self):
         return Path(__file__).resolve().parent.parent / "completions"
@@ -546,7 +546,7 @@ class TestSnapperRestoreCompletionFlags:
 
 
 class TestDecryptCompletionFlags:
-    """0.9.2 Phase 2A: --gpg-keyring/--openssl-cipher stay in lockstep across all
+    """The --gpg-keyring/--openssl-cipher flags stay in lockstep across all
     shells for restore and snapper restore (the paths that DECODE). verify must
     NOT offer them -- it checksums ciphertext and never decrypts."""
 

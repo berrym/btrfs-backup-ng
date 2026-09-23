@@ -1,4 +1,4 @@
-"""R10b: raw incremental-parent protection.
+"""Raw incremental-parent protection.
 
 A raw backup is a ``btrfs send`` stream file; an incremental child stream cannot be applied
 without its parent stream. Time-based retention must therefore never delete a stream that a KEPT

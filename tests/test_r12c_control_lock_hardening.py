@@ -1,10 +1,10 @@
-"""R12c -- control-socket dir + command-lock path hardening.
+"""Control-socket dir + command-lock path hardening.
 
-P2: the ControlMaster socket dir is now an UNPREDICTABLE, 0700, euid-owned mkdtemp dir
+The ControlMaster socket dir is now an UNPREDICTABLE, 0700, euid-owned mkdtemp dir
 (prefer $XDG_RUNTIME_DIR base), removed on cleanup -- the old predictable
 /tmp/ssh-controlmasters-<user> + mkdir(exist_ok=True) was a socket-hijack vector.
 
-P5: the per-user btrfs-command lock lives in a euid-owned dir when possible, and FAILS
+The per-user btrfs-command lock lives in a euid-owned dir when possible, and FAILS
 CLOSED (never follows) a symlink planted at the /tmp fallback path.
 """
 
@@ -26,7 +26,7 @@ def _isolated_home(tmp_path, monkeypatch):
     monkeypatch.delenv("SUDO_USER", raising=False)
 
 
-# ------------------------------------ P2: control-socket dir
+# ------------------------------------ control-socket dir
 
 
 def _mgr():
@@ -85,7 +85,7 @@ def test_control_dir_base_requires_euid_ownership(tmp_path, monkeypatch):
     assert _control_dir_base() is None  # not euid-owned -> refused
 
 
-# ------------------------------------ P5: command-lock path
+# ------------------------------------ command-lock path
 
 
 def test_command_lock_path_prefers_owned_xdg(tmp_path, monkeypatch):
@@ -105,9 +105,9 @@ def test_command_lock_path_falls_back_to_secure_tmp_dir(tmp_path, monkeypatch):
 
 
 def test_command_lock_path_refuses_symlinked_dir_fail_closed(tmp_path, monkeypatch):
-    """THE P5 guard: if the per-euid lock DIR is a symlink (or foreign-owned), refuse --
-    never place the lock through an attacker path. Mutation guard: drop the lstat S_ISDIR/
-    ownership check and this raises nothing."""
+    """THE command-lock guard: if the per-euid lock DIR is a symlink (or foreign-owned),
+    refuse -- never place the lock through an attacker path. Mutation guard: drop the
+    lstat S_ISDIR/ownership check and this raises nothing."""
     monkeypatch.delenv("XDG_RUNTIME_DIR", raising=False)
     monkeypatch.setattr(common_mod.tempfile, "gettempdir", lambda: str(tmp_path))
     victim = tmp_path / "victim_dir"
@@ -117,7 +117,7 @@ def test_command_lock_path_refuses_symlinked_dir_fail_closed(tmp_path, monkeypat
         _command_lock_path()
 
 
-# ------------------------------------ P2: deterministic cleanup on stop_master
+# ------------------------------------ deterministic cleanup on stop_master
 
 
 def test_stop_master_removes_owned_control_dir(monkeypatch):

@@ -293,7 +293,7 @@ class TestBtrbkRawImportRoundTrip:
     TOML. String-only assertions stayed green while the config loader silently
     dropped `encrypt`, so a migrated GPG backup became plaintext. These tests
     load the migrated TOML and assert the semantic outcome, and would have caught
-    that (R6) plaintext-downgrade bug.
+    that plaintext-downgrade bug.
     """
 
     def _migrate_and_load(self, tmp_path, config_content):

@@ -1,4 +1,4 @@
-"""Enforcement tests for the R1 transfer-success contract: orchestration (commit B).
+"""Enforcement tests for the transfer-success contract: the orchestration layer.
 
 The orchestration layer must never swallow a per-snapshot transfer failure. A
 sync with any failed transfer raises SnapshotTransferError carrying a
@@ -88,7 +88,7 @@ class TestExecuteTransfersResult:
         """Within-run chaining safety: if an in-run parent transfer FAILS, its dependent
         incrementals must NOT be attempted or committed -- a raw target would otherwise write
         a valid-looking but UNRESTORABLE stream (a false success). They are recorded as
-        failures (R1). Mutation guard: removing the short-circuit lets the dependents transfer
+        failures. Mutation guard: removing the short-circuit lets the dependents transfer
         against a missing parent."""
         s1 = _fake_snap("s1")
         s2 = _fake_snap("s2")
@@ -113,11 +113,10 @@ class TestExecuteTransfersResult:
         assert attempted == [s1]
 
     def test_parent_lock_lifecycle(self, monkeypatch):
-        """The executor locks the incremental PARENT (parent=True) before the send and
-        releases it after a verified success -- the R3 lock lifecycle that keeps retention
-        from pruning a parent a pending transfer still needs. Only covered end-to-end
-        elsewhere; this pins it directly. Mutation guard: dropping either parent set_lock
-        call fails this."""
+        """The executor locks the incremental PARENT (parent=True) before the send and releases
+        it after a verified success -- the persistent-lock lifecycle that keeps retention from
+        pruning a parent a pending transfer still needs. Only covered end-to-end elsewhere; this
+        pins it directly. Mutation guard: dropping either parent set_lock call fails this."""
         parent = _fake_snap("p")
         child = _fake_snap("c")
         src, dst = _endpoints([parent, child])

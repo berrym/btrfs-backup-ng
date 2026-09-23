@@ -1,6 +1,6 @@
-"""Enforcement tests for the R1 transfer-success contract.
+"""Enforcement tests for the transfer-success contract.
 
-The contract (see the R1 design): a snapshot transfer succeeds *iff* every process
+The contract: a snapshot transfer succeeds *iff* every process
 in the pipeline exited 0 AND a post-completion check confirms a well-formed
 received subvolume. Existence is checked only AFTER the processes exit 0, never
 during the transfer and never as a substitute for the exit code.
@@ -8,7 +8,7 @@ during the transfer and never as a substitute for the exit code.
 These tests are mutation-verified: reverting any one fix (re-adding the ``test -d``
 fallback, downgrading a nonzero receive to a warning, restoring the mid-flight
 existence short-circuit, or dropping ``pipefail``) makes the corresponding test
-fail. They guard the SSH point-of-truth layer (commit A1).
+fail. They guard the SSH point-of-truth layer.
 """
 
 from __future__ import annotations

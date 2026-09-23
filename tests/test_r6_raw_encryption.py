@@ -1,4 +1,4 @@
-"""Enforcement tests for R6 (0.8.5) — raw-target encryption must not silently
+"""Enforcement tests (0.8.5): raw-target encryption must not silently
 degrade to plaintext.
 
 A documented `encrypt = "gpg"` on a raw target was dropped by the config loader,

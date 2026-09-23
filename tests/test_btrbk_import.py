@@ -515,7 +515,7 @@ volume /mnt/pool
 
 
 class TestBtrbkRetentionFidelity:
-    """0.9.2 Phase 2B-i: btrbk retention must translate without silent policy loss."""
+    """btrbk retention must translate without silent policy loss."""
 
     @staticmethod
     def _toml(config: str):
@@ -642,7 +642,7 @@ class TestBtrbkRetentionFidelity:
         assert v.retention is not None
         assert v.retention.min == "2w"
         assert v.retention.daily == 7
-        # Phase 2A interaction: the generated config trips no unknown-key warnings.
+        # The generated config trips no unknown-key warnings.
         assert not [w for w in load_warns if "Unknown config key" in w]
 
     def test_special_min_token_produces_loadable_config(self, tmp_path):
@@ -660,7 +660,7 @@ class TestBtrbkRetentionFidelity:
 
 
 class TestBtrbkRetentionWarningQuality:
-    """0.9.2 Phase 2B-i review fixes: retention warnings must be accurate & distinct."""
+    """Review fixes: retention warnings must be accurate & distinct."""
 
     @staticmethod
     def _toml(config: str):

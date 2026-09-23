@@ -697,7 +697,7 @@ def _backup_volume(
     # (non-zero exit) rather than being silently skipped.
     #
     # Fate-sharing, both ways: only targets whose transfer SUCCEEDED are pruned,
-    # and the source is pruned only if EVERY target succeeded. R3 lock reconcile
+    # and the source is pruned only if EVERY target succeeded. The lock reconcile
     # protects a snapshot whose transfer failed part-way, but a target that never
     # got as far as a transfer -- refused by require_mount, or failing to prepare
     # for any other reason -- takes no lock at all, so the snapshots it still owes

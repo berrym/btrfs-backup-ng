@@ -1,9 +1,10 @@
-"""Enforcement tests for R2 — no cleanup / poisoned re-runs.
+"""Enforcement tests for cleanup and recovery after a failed run (no poisoned re-runs).
 
 A failed/killed transfer must not leave a partial artifact that the next run's
 skip-detection mistakes for a completed backup. Cleanup is scoped to the EXACT
 artifact path and runs only on the failure path, so a good backup is never
-deleted (the R1 false-negative guard, extended to the local/standard path).
+deleted (the false-negative guard -- never delete a good backup on an inconclusive
+check -- extended to the local/standard path).
 """
 
 from __future__ import annotations

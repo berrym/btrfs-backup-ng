@@ -198,7 +198,7 @@ class TestGetBucketKey:
         assert bucket is not None
 
     def test_weekly_bucket_is_iso_week_no_year_boundary_split(self):
-        """R10c: all seven days of an ISO week share ONE weekly key, even across a year boundary
+        """All seven days of an ISO week share ONE weekly key, even across a year boundary
         (2021-12-27 Mon .. 2022-01-02 Sun == ISO 2021-W52). Mutation guard: calendar %Y+%W splits
         this week into '2021-W52' and '2022-W00'."""
         keys = {
@@ -208,7 +208,7 @@ class TestGetBucketKey:
         assert keys == {"2021-W52"}
 
     def test_weekly_bucket_jan1_maps_to_prior_iso_year(self):
-        """R10c: 2023-01-01 (a Sunday) belongs to ISO week 2022-W52, not '2023-W00'. Mutation
+        """2023-01-01 (a Sunday) belongs to ISO week 2022-W52, not '2023-W00'. Mutation
         guard: %Y+%W yields '2023-W00'."""
         assert get_bucket_key(datetime(2023, 1, 1), "weekly") == "2022-W52"
 
@@ -270,7 +270,7 @@ class TestApplyRetention:
         assert len(to_keep) >= 1
 
     def test_invalid_min_raises_and_deletes_nothing(self):
-        """R10a: an invalid min fails LOUD and CLOSED -- apply_retention raises RetentionError
+        """An invalid min fails LOUD and CLOSED -- apply_retention raises RetentionError
         (so the caller prunes nothing) instead of silently defaulting to 1d and deleting.
         Mutation guard: the old silent-1d fallback returns a non-empty to_delete."""
         now = datetime(2024, 1, 15, 12, 0, 0)
@@ -284,7 +284,7 @@ class TestApplyRetention:
             apply_retention(snapshots, retention, now=now)
 
     def test_unparseable_does_not_steal_latest(self):
-        """R10a CRITICAL: an unparseable-named entry must NOT consume the 'keep latest' slot --
+        """CRITICAL: an unparseable-named entry must NOT consume the 'keep latest' slot --
         the real newest snapshot is still kept, the junk is quarantined (kept). Mutation guard:
         the old code assigns the unparseable timestamp=now, making IT 'latest' and DELETING the
         real newest."""
@@ -301,7 +301,7 @@ class TestApplyRetention:
         assert "garbage-name-xyz" not in to_delete
 
     def test_future_dated_does_not_steal_latest(self):
-        """R10a HIGH: a future-dated snapshot (beyond the skew tolerance) is quarantined (kept)
+        """HIGH: a future-dated snapshot (beyond the skew tolerance) is quarantined (kept)
         and never consumes 'latest'; the real newest valid snapshot survives. Mutation guard:
         without the future partition it sorts first, steals latest, and the real newest is
         deleted."""
@@ -319,7 +319,7 @@ class TestApplyRetention:
         assert real_new not in to_delete
 
     def test_skew_within_tolerance_is_valid_and_can_be_latest(self):
-        """R10a: a snapshot a couple minutes in the future (benign NTP jitter, within
+        """A snapshot a couple minutes in the future (benign NTP jitter, within
         CLOCK_SKEW_TOLERANCE) is treated as VALID (clamped to now), so it is the 'latest' and
         retention still functions -- it is NOT quarantined. Mutation guard: dropping the
         tolerance (quarantining every t>now) makes the OLDER snapshot 'latest', so nothing is
@@ -504,7 +504,7 @@ class TestFormatRetentionSummary:
 
 
 class TestSubtractDuration:
-    """R10c: calendar-aware min cutoff for month/year units (stdlib, no dep)."""
+    """Calendar-aware min cutoff for month/year units (stdlib, no dep)."""
 
     def test_fixed_units_unchanged(self):
         """s/m/h/d/w stay fixed timedeltas (identical to the old behavior). Mutation guard:

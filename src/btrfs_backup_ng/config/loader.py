@@ -286,7 +286,7 @@ def _parse_target(data: dict[str, Any]) -> TargetConfig:
 
     # Host-key policy is a SECURITY selector: fail CLOSED on an unrecognized value rather
     # than silently falling back to a default (a typo'd "strict" must not degrade to
-    # accept-new). Only the two safe modes are accepted -- there is no "off"/"no". R12b.
+    # accept-new). Only the two safe modes are accepted -- there is no "off"/"no".
     ssh_host_key_policy = _validate_host_key_policy(
         data.get("ssh_host_key_policy", "accept-new"), path
     )

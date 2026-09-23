@@ -1,4 +1,4 @@
-"""Tier 2 tests for R8b metadata structural validation with real btrfs.
+"""Tier 2 tests for metadata structural validation with real btrfs.
 
 The unit tests (tests/test_verify.py::TestVerifyMetadataStructural) cover the cases
 reachable without root -- a plain directory is 'invalid', raw sidecar/parent logic. These

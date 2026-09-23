@@ -1697,7 +1697,7 @@ class TestSnapperEndpointRouting:
 
 
 class TestRestoreSnapperdCacheHint:
-    """R11: restore prints a snapperd-rescan hint (a)+(c) decision."""
+    """Restore prints a snapperd-rescan hint (a)+(c) decision."""
 
     def _args(self, dry_run=False):
         return argparse.Namespace(
@@ -1749,7 +1749,7 @@ class TestRestoreSnapperdCacheHint:
 
 
 class TestRestoreNameDateSelection:
-    """R11b: --backup-name / --date selection + collision dedup + name threading."""
+    """--backup-name / --date selection + collision dedup + name threading."""
 
     def _mk_backups(self):
         from datetime import datetime
@@ -1938,7 +1938,7 @@ class TestRestoreNameDateSelection:
 
 
 class TestBackupSelectionHelpers:
-    """R11b: the date-match and recency-key helpers."""
+    """The date-match and recency-key helpers."""
 
     def _b(self, name, date):
         from datetime import datetime

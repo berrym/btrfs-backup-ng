@@ -1,4 +1,4 @@
-"""Enforcement tests for the R1 transfer-success contract: legacy CLI (commit C).
+"""Enforcement tests for the transfer-success contract: the legacy CLI layer.
 
 The legacy path (`run_task` / `legacy_main`, reachable via the dispatcher) caught
 per-destination transfer failures, logged them, and returned success -- so a

@@ -1,8 +1,7 @@
-"""OpenSSL cipher/passphrase restore+send contract (0.8.5 PR4).
+"""OpenSSL cipher/passphrase restore+send contract (0.8.5).
 
 The raw endpoint records the openssl cipher used for a backup in its ``.meta``
-sidecar (PR3). These tests pin the contract that PR4 establishes around that
-value:
+sidecar. These tests pin the contract established around that value:
 
   * restore decrypts with the cipher RECORDED in the sidecar, not this
     endpoint's configured default (else a non-default-cipher backup decrypts to
@@ -307,7 +306,7 @@ def test_send_pipeline_quotes_argv_ssh(monkeypatch):
 # clean SnapshotTransferError, not a bare ValueError that skips the audit log
 # --------------------------------------------------------------------------- #
 def test_rich_progress_receive_build_error_becomes_transfer_error():
-    """PR4 makes receive() fail loud at build time (e.g. openssl with no
+    """receive() fails loud at build time (e.g. openssl with no
     passphrase). The rich-progress transfer path must convert that to a
     SnapshotTransferError like the standard path. Dropping the try/except around
     the rich-progress receive() -> the raw ValueError propagates -> this test

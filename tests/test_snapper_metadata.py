@@ -499,7 +499,7 @@ class TestSaveLoadBackupMetadata:
 
 
 class TestUserdataKeyValueFormat:
-    """R11: snapper stores userdata as <key>/<value> pairs; parse+generate round-trip."""
+    """Snapper stores userdata as <key>/<value> pairs; parse+generate round-trip."""
 
     # Snapper's real 0.13.0 format: ONE <userdata> block per entry (siblings).
     SNAPPER_MULTI = (
@@ -598,7 +598,7 @@ class TestUserdataKeyValueFormat:
 
 
 class TestRenumberInfoXml:
-    """R11 #4: renumber preserves snapper's xml verbatim (incl. unmodeled <uid>)."""
+    """Renumber preserves snapper's xml verbatim (incl. unmodeled <uid>)."""
 
     SNAP_WITH_UID = (
         "<?xml version='1.0'?>\n<snapshot>\n"
@@ -619,7 +619,7 @@ class TestRenumberInfoXml:
         assert "<num>99</num>" in out
         assert "<num>6052</num>" not in out
         # everything else verbatim
-        assert "<uid>1000</uid>" in out  # the unmodeled element R11 must NOT drop
+        assert "<uid>1000</uid>" in out  # unmodeled, must NOT be dropped
         assert "<key>reason</key>" in out and "<value>manual</value>" in out
         assert "<key>ticket</key>" in out and "<value>OP-1</value>" in out
         assert "Fedora restore point" in out
@@ -651,7 +651,7 @@ class TestRenumberInfoXml:
 
 
 class TestUserdataEscaping:
-    """R11 #5: userdata keys/values with XML special chars round-trip safely."""
+    """Userdata keys/values with XML special chars round-trip safely."""
 
     def test_special_chars_round_trip(self):
         meta = SnapperMetadata(
@@ -670,7 +670,7 @@ class TestUserdataEscaping:
 
 
 class TestSaveBackupMetadataAtomic:
-    """R11 #6 / pt1: sidecar is written atomically at 0600."""
+    """The sidecar is written atomically at 0600."""
 
     def test_saved_file_is_0600_and_no_temp_left(self, tmp_path):
         import os
@@ -688,7 +688,7 @@ class TestSaveBackupMetadataAtomic:
         )
         path = tmp_path / "root-1.snapper-meta.json"
         save_backup_metadata(path, meta)
-        # tightened mode from pt1 -- a revert to open('w') would yield 0644
+        # the tightened 0600 mode -- a revert to open('w') would yield 0644
         assert oct(os.stat(path).st_mode & 0o777) == oct(0o600)
         # atomic write leaves no stray temp sibling in the dir
         assert [p.name for p in tmp_path.iterdir()] == ["root-1.snapper-meta.json"]

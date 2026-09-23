@@ -38,7 +38,7 @@ def operator_ssh_dir() -> Path:
     Under ``sudo`` (SUDO_USER set, euid 0) this resolves to the sudo user's ``~/.ssh``,
     NOT root's -- so host-key trust (``known_hosts``) matches the keys the operator
     curated interactively, instead of pinning into root's (usually empty) store where the
-    operator can neither see nor manage it (R12/P4)."""
+    operator can neither see nor manage it."""
     sudo_user = os.environ.get("SUDO_USER")
     if sudo_user and os.geteuid() == 0:
         return Path(pwd.getpwnam(sudo_user).pw_dir) / ".ssh"
@@ -135,7 +135,7 @@ class SSHMasterManager:
         self.identity_file = identity_file
         self.allow_password_auth = allow_password_auth
         # "accept-new" (TOFU: trust first contact, reject a changed key) or "strict"
-        # (known_hosts-only; an unknown host is refused). R12b.
+        # (known_hosts-only; an unknown host is refused).
         self.host_key_policy = host_key_policy
         # Explicit ssh-agent socket override (config `ssh_auth_sock` / CLI / the
         # BTRFS_BACKUP_SSH_AUTH_SOCK env var). Takes precedence over auto-discovery so a
@@ -160,7 +160,7 @@ class SSHMasterManager:
         self.ssh_config_dir = operator_ssh_dir()
         # The operator's known_hosts, ensured to exist and be operator-owned. Passed as
         # UserKnownHostsFile so accept-new/strict verify against the operator's curated
-        # trust even under sudo (was silently using root's store) -- R12/P4.
+        # trust even under sudo (was silently using root's store).
         self.known_hosts_path = ensure_operator_known_hosts()
 
         if control_dir:
@@ -174,7 +174,7 @@ class SSHMasterManager:
             # control socket -- which carries root's authenticated ssh to the backup host
             # (socket hijack -> command execution as root@remote). An unguessable name that
             # only euid owns closes it by design; the socket name already embeds pid+tid, so
-            # nothing relied on a stable path. R12c/P2.
+            # nothing relied on a stable path.
             self.control_dir = Path(
                 tempfile.mkdtemp(prefix="bbng-cm-", dir=_control_dir_base())
             )
@@ -228,8 +228,8 @@ class SSHMasterManager:
 
         # Operator-supplied ssh_opts come FIRST so they WIN: ssh uses the first obtained
         # value for each option, so an operator who hardens e.g. StrictHostKeyChecking=yes
-        # via config `ssh_opts` overrides the default below (was silently DROPPED here --
-        # R12/P3; it is still honored in raw+ssh, so this restores parity).
+        # via config `ssh_opts` overrides the default below (was silently DROPPED here;
+        # it is still honored in raw+ssh, so this restores parity).
         opts = list(self.ssh_opts)
 
         # SSH options for better reliability
@@ -243,7 +243,7 @@ class SSHMasterManager:
             "ConnectTimeout=30",
             "ConnectionAttempts=3",
             # strict => an unknown host is refused (known_hosts-only); accept-new => TOFU
-            # (trust first contact, reject a changed key). R12b.
+            # (trust first contact, reject a changed key).
             "StrictHostKeyChecking="
             + ("yes" if self.host_key_policy == "strict" else "accept-new"),
             "PasswordAuthentication=yes",
@@ -254,7 +254,7 @@ class SSHMasterManager:
         # Under sudo, ssh runs as root and would otherwise pin/verify against ROOT's
         # known_hosts, ignoring the operator's curated trust (and defeating any TOFU the
         # operator did as themselves). Bind it to the operator's file so accept-new lands
-        # where the operator can see and manage it -- R12/P4. Non-sudo ssh already uses the
+        # where the operator can see and manage it. Non-sudo ssh already uses the
         # operator's ~/.ssh/known_hosts and respects their ssh_config, so it is left alone.
         if self.running_as_sudo:
             opts.append(f"UserKnownHostsFile={self.known_hosts_path}")
@@ -742,7 +742,7 @@ class SSHMasterManager:
             try:
                 subprocess.run(cmd, check=True, capture_output=True)
                 self._master_started = False
-                self._cleanup_control_dir()  # deterministic teardown (R12c/P2)
+                self._cleanup_control_dir()  # deterministic teardown
                 return True
             except Exception as e:
                 logger.error(f"Failed to stop SSH master: {e}")
@@ -782,7 +782,7 @@ class SSHMasterManager:
         self._cleanup_control_dir()
 
     def _cleanup_control_dir(self) -> None:
-        """Remove the unpredictable per-manager control dir we created (R12c/P2), so it does
+        """Remove the unpredictable per-manager control dir we created, so it does
         not linger in $XDG_RUNTIME_DIR / /tmp. Idempotent + best-effort; an explicit
         control_dir override (``_own_control_dir`` False) is never removed."""
         if getattr(self, "_own_control_dir", False):

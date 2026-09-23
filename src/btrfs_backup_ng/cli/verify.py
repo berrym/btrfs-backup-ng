@@ -45,7 +45,7 @@ def execute(args: argparse.Namespace) -> int:
         ),
     }
 
-    # Host-key policy override (R12b): threaded for any remote; harmless (ignored) for local.
+    # Host-key policy override: threaded for any remote; harmless (ignored) for local.
     if getattr(args, "ssh_host_key_policy", None):
         endpoint_kwargs["ssh_host_key_policy"] = args.ssh_host_key_policy
     if getattr(args, "skip_remote_lock", None):

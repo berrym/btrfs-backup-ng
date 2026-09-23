@@ -163,7 +163,7 @@ class TestLoadConfig:
         assert logs_volume.retention.weekly == 8
 
     def test_load_invalid_retention_min(self, tmp_config_dir):
-        """R10a: an invalid retention 'min' duration fails LOUD at config load (ConfigError),
+        """An invalid retention 'min' duration fails LOUD at config load (ConfigError),
         so a corrupt policy can never reach the destructive prune path. Mutation guard: without
         load-time validation the bad value loads and only silently defaults/fails at prune time."""
         bad_config = tmp_config_dir / "bad_min.toml"

@@ -241,7 +241,7 @@ class TestARawDestinationKeepsItsOwnVerdict:
     def test_a_stream_missing_from_the_listing_is_unverifiable_not_invalid(
         self, tmp_path
     ):
-        """R1: a listing miss is not proof the commit lied; nothing is failed
+        """A listing miss is not proof the commit lied; nothing is failed
         or deleted on it."""
         ep = self._raw(tmp_path)
         ep.list_snapshots = lambda flush_cache=False: []
@@ -327,7 +327,7 @@ class TestTheExecutorActsOnTheVerdict:
     def test_unverifiable_keeps_the_artifact_and_counts_as_transferred(
         self, rig, monkeypatch, caplog
     ):
-        """R1: a check that could not run is not a failure. The data stays, the
+        """A check that could not run is not a failure. The data stays, the
         pin is released, the transfer counts, and the report says what was
         not confirmed."""
         assert not rig["reply"].exists()
@@ -347,7 +347,7 @@ class TestTheExecutorActsOnTheVerdict:
 
     def test_a_verdict_that_cannot_be_computed_is_unverifiable(self, rig, monkeypatch):
         """The data has landed; a post-check that blows up must not turn that
-        into a crash or a failure. R1: unverifiable, kept, counted."""
+        into a crash or a failure: unverifiable, kept, counted."""
 
         def explode(ep, snapshot):
             raise RuntimeError("probe machinery broke")

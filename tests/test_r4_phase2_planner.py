@@ -1,4 +1,4 @@
-"""R4 Phase 2: the single UUID-first TransferPlanner.
+"""The single UUID-first TransferPlanner.
 
 ``plan_transfer_sequence`` is the sole authority for what to transfer, in what order, and
 with which parent -- decided via ``correspondent_of`` (uuid for btrfs, name for raw), so a
@@ -110,11 +110,11 @@ def test_full_send_when_no_older_corresponding_parent(tmp_path):
 
 
 def test_recreated_snapshot_same_name_new_uuid_full_send(tmp_path):
-    """THE R4 WIN (presence): a re-created source snapshot (same name, new uuid) is NOT
-    present -- its uuid does not correspond to the dest's stale same-named copy -- so it is
-    planned (not silently skipped). With no older snapshot it is a clean FULL send. Mutation
-    guard: name-based presence would skip it. (The parent clause is guarded separately, in
-    test_recreated_snapshot_parents_on_older_corresponding_not_stale_copy.)"""
+    """THE UUID-IDENTITY WIN (presence): a re-created source snapshot (same name, new uuid)
+    is NOT present -- its uuid does not correspond to the dest's stale same-named copy -- so
+    it is planned (not silently skipped). With no older snapshot it is a clean FULL send.
+    Mutation guard: name-based presence would skip it. (The parent clause is guarded
+    separately, in test_recreated_snapshot_parents_on_older_corresponding_not_stale_copy.)"""
     recreated = _snap("20240101-000000", uuid="NEW-UUID")
     stale_copy = _snap("20240101-000000", uuid="Dx", received_uuid="OLD-UUID")
     dest = _dest(tmp_path, [stale_copy])
@@ -194,12 +194,13 @@ def test_no_incremental_forces_full_sends(tmp_path):
 
 
 def test_empty_uuid_source_is_not_present_and_planned_full(tmp_path):
-    """NO name fallback (R4 purity): a source snapshot whose uuid is unknown cannot be
-    verified present -- correspondent_of returns None for an empty uuid -- so it is planned
-    as a FULL send, never skipped by a name coincidence with a same-named dest copy. An empty
-    uuid is an enrichment problem to fix at the source (sudo-escalated `subvolume show`), not
-    a reason to dilute the planner into name matching. (Single snapshot, so within-run
-    chaining is not in play.) Mutation guard: a name-based presence fallback re-skips it."""
+    """NO name fallback (identity is by uuid, never by name): a source snapshot whose uuid
+    is unknown cannot be verified present -- correspondent_of returns None for an empty uuid
+    -- so it is planned as a FULL send, never skipped by a name coincidence with a
+    same-named dest copy. An empty uuid is an enrichment problem to fix at the source
+    (sudo-escalated `subvolume show`), not a reason to dilute the planner into name
+    matching. (Single snapshot, so within-run chaining is not in play.) Mutation guard: a
+    name-based presence fallback re-skips it."""
     s = _snap("20240101-000000", uuid="")  # unknown identity
     # The dest lists a SAME-NAMED snapshot: a name fallback would (wrongly) skip s.
     dest = _dest(

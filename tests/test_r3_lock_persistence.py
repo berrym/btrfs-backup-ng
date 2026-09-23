@@ -1,4 +1,4 @@
-"""R3: retention locks must persist across runs (source-side lock persistence).
+"""Retention locks must persist across runs (source-side lock persistence).
 
 A transfer locks the source snapshot it needs (and its incremental parent) by the
 destination's id, so retention cannot prune a snapshot a failed or pending transfer still
@@ -7,7 +7,7 @@ ever read them back onto ``snapshot.locks``. So on the *next* run every snapshot
 unlocked and ``delete_old_snapshots`` / ``delete_snapshots`` -- whose lock-skipping guards
 were correct but inert -- could delete a snapshot the next incremental send required.
 
-R3 has three parts, each pinned below:
+Persistence has three parts, each pinned below:
 
 1. Read-back: ``Endpoint.list_snapshots`` loads persisted locks onto the snapshots it
    returns (``_load_locks_into``), so the retention guards actually see the locks.
@@ -165,7 +165,7 @@ def test_list_snapshots_loads_persisted_locks(tmp_path):
 
 
 def test_lock_persists_across_endpoint_instances(tmp_path):
-    """The R3 core: a lock set in one run is visible in the next (a fresh endpoint =
+    """The core property: a lock set in one run is visible in the next (a fresh endpoint =
     a new process). Mutation guard: no read-back -> the second instance sees it
     unlocked."""
     ep1 = _local(tmp_path)
@@ -319,8 +319,8 @@ def test_reconcile_and_planner_agree_end_to_end(monkeypatch):
 # 3. End-to-end: a persisted lock survives retention across runs
 # --------------------------------------------------------------------------- #
 def test_persisted_lock_survives_retention_across_runs(tmp_path, monkeypatch):
-    """The whole point of R3: lock the oldest snapshot in run 1; in run 2 a fresh
-    endpoint must NOT prune it even though keep-count would otherwise. Mutation guard:
+    """The whole point of lock persistence: lock the oldest snapshot in run 1; in run 2 a
+    fresh endpoint must NOT prune it even though keep-count would otherwise. Mutation guard:
     removing the read-back makes the locked snapshot look unlocked -> it gets deleted ->
     this fails."""
     names = [

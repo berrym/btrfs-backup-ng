@@ -1,4 +1,4 @@
-"""RawSnapshot satisfies the __util__.Snapshot interface (0.8.5 PR2).
+"""RawSnapshot satisfies the __util__.Snapshot interface (0.8.5).
 
 Before this, raw backups AttributeError'd in restore/verify/prune: those paths
 call get_name()/get_path()/time_obj/find_parent and compare/sort snapshots, none

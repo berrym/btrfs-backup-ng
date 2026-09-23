@@ -34,7 +34,7 @@ def _secure_lock_dir(base: Path, euid: int) -> Optional[Path]:
     or None if it cannot be secured (a pre-planted symlink or foreign-owned dir at that
     predictable name). Placing the lock INSIDE a private 0700 dir means no untrusted symlink
     can be planted at the lock path itself -- this closes the check-then-open TOCTOU that a
-    bare /tmp lock has (the filelock library opens O_TRUNC without O_NOFOLLOW). R12c/P5."""
+    bare /tmp lock has (the filelock library opens O_TRUNC without O_NOFOLLOW)."""
     d = base / f"btrfs-backup-ng-{euid}"
     try:
         d.mkdir(mode=0o700, exist_ok=True)
@@ -52,8 +52,8 @@ def _secure_lock_dir(base: Path, euid: int) -> Optional[Path]:
 
 def _command_lock_path() -> Path:
     """Stable per-euid path for the btrfs-command serialization lock, placed INSIDE a
-    euid-owned 0700 directory so it is immune to a symlink race in world-writable /tmp
-    (R12c/P5). Prefer ``$XDG_RUNTIME_DIR`` (euid-owned); else a verified
+    euid-owned 0700 directory so it is immune to a symlink race in world-writable /tmp.
+    Prefer ``$XDG_RUNTIME_DIR`` (euid-owned); else a verified
     ``/tmp/btrfs-backup-ng-<euid>``. Fails CLOSED if neither can be secured -- never follows
     an attacker-controlled path to truncate a victim file."""
     euid = os.geteuid()
@@ -698,12 +698,12 @@ class Endpoint:
                 )
                 snapshot.newly_visible = not parsed_as_written
                 snapshots.append(snapshot)
-        # R3: load persisted retention locks back onto the snapshots. set_lock writes them
+        # Load persisted retention locks back onto the snapshots. set_lock writes them
         # to the lock file, but nothing read them back, so a snapshot kept locked after a
         # failed transfer looked unlocked on the next run and retention could prune a
         # snapshot a failed/pending transfer still needs.
         self._load_locks_into(snapshots)
-        # Phase 0: best-effort btrfs identity so snapshots are self-describing (uuid +
+        # Best-effort btrfs identity so snapshots are self-describing (uuid +
         # received_uuid). Never fatal -- a non-root/non-btrfs enumeration keeps working
         # with empty uuids.
         self._load_subvolume_ids_into(snapshots)
@@ -732,7 +732,7 @@ class Endpoint:
         non-interactive: with no passwordless sudo it fails fast rather than prompting.
         Purely additive and best-effort: any failure (no sudo, not btrfs, older
         btrfs-progs, command error) leaves that snapshot's uuids empty and enumeration
-        unaffected. The planner consumes these identities (Phase 2 correspondence)."""
+        unaffected. The correspondence-based planner consumes these identities."""
         if not snapshots:
             return
         enriched = 0
@@ -1318,7 +1318,7 @@ class Endpoint:
         time-based policy engine is ``retention.apply_retention`` (min + hourly/daily/weekly/
         monthly/yearly buckets), driven by the ``prune`` command -- prefer it for any new code.
         Chain/lock safety is preserved either way: this routes deletions through
-        ``delete_snapshots`` (R10b incremental-parent guard) and skips R3-locked snapshots.
+        ``delete_snapshots`` (incremental-parent guard) and skips locked snapshots.
         """
         snapshots = self.list_snapshots()
         if getattr(self, "_locks_read_failed", False):
@@ -2012,7 +2012,7 @@ class Endpoint:
         data = __util__.write_locks(lock_dict)
         try:
             logger.debug("Writing lock file: %s", path)
-            # Atomic replace via the shared primitive (R7): a crash mid-write can never
+            # Atomic replace via the shared primitive: a crash mid-write can never
             # leave a half-written / corrupt lock file (which would then be misread as
             # "no locks" and let retention prune a locked snapshot). The primitive does
             # the temp -> fsync -> os.replace -> parent-dir fsync dance with

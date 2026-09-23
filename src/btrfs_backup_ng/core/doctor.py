@@ -1421,7 +1421,7 @@ class Doctor:
                         del locks[snapshot_name]
                     else:
                         locks[snapshot_name]["locks"] = snapshot_locks
-                    # Atomic replace via the shared primitive (R7): a plain write_text
+                    # Atomic replace via the shared primitive: a plain write_text
                     # here could leave a torn lock file on a crash, which read_locks then
                     # misreads as "no locks" -> retention prunes a still-locked snapshot.
                     __util__.atomic_write_bytes(
