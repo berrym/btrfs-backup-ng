@@ -53,6 +53,7 @@ from .prune import (
     execute_retention_deletes,
     is_degenerate_policy,
     plan_endpoint_retention,
+    plan_retention_of,
 )
 
 logger = logging.getLogger(__name__)
@@ -642,6 +643,7 @@ def _backup_volume(
                     space_options,
                     config.global_config.transfer_timeout,
                     newest_only,
+                    _catch_up_selector(volume, config, target_config, dest_endpoint),
                 ): (dest_endpoint, target_config)
                 for dest_endpoint, target_config in destination_endpoints
             }
@@ -677,6 +679,7 @@ def _backup_volume(
                     space_options,
                     config.global_config.transfer_timeout,
                     newest_only,
+                    _catch_up_selector(volume, config, target_config, dest_endpoint),
                 )
                 if outcome is not None:
                     stats["completed"] += 1
@@ -1056,6 +1059,78 @@ def _prune_snapper_after_transfer(
     return ok
 
 
+def _catch_up_selector(
+    volume: VolumeConfig,
+    config: Config,
+    target_config: TargetConfig,
+    destination_endpoint: Any,
+):
+    """What ``run`` sends a target that is behind: what its prune will keep.
+
+    ``run`` prunes each target straight after transferring to it, with the
+    target's own policy. A target that has been away is missing a backlog, and
+    sending all of it means sending snapshots that are neither the newest nor
+    the oldest of their time bucket only for the prune to delete them. So the
+    same retention decision the prune makes (``plan_retention_of``, with the
+    prefix and timestamp format it uses) is asked first, of the target's
+    snapshots plus the ones it is missing, and only the missing ones it keeps
+    are sent; each is then sent against the newest earlier snapshot the target
+    holds. For a btrfs target that leaves exactly what the prune would have
+    left. For a raw target it can leave fewer: a stored increment's parent is
+    protected by the prune, and a parent that was never sent needs no
+    protection.
+
+    Returns a ``select`` for ``sync_snapshots``, or None to send everything:
+    under a policy the prune refuses to apply (it would delete nothing, so
+    nothing may be left out), and whenever the decision cannot be made -- the
+    target cannot be listed, names collide, the policy is invalid -- because
+    leaving out a snapshot the prune would have kept loses history.
+    """
+    retention = config.get_target_retention(volume, target_config)
+    if is_degenerate_policy(retention):
+        return None
+    prefix = volume.snapshot_prefix
+    ts_format = get_timestamp_format(config)
+
+    def select(source_snapshots: list, present_names: set):
+        missing = [s for s in source_snapshots if s.get_name() not in present_names]
+        if len(missing) < 2:
+            return None
+        try:
+            held = list(destination_endpoint.list_snapshots())
+        except Exception as e:  # noqa: BLE001 - cannot decide, so send everything
+            logger.debug(
+                "Catch-up: could not list %s (%s); sending all", target_config.path, e
+            )
+            return None
+        combined = held + missing
+        names = [s.get_name() for s in combined]
+        if len(names) != len(set(names)):
+            return None
+        try:
+            to_keep, _ = plan_retention_of(combined, retention, prefix, ts_format)
+        except Exception as e:  # noqa: BLE001 - cannot decide, so send everything
+            logger.debug(
+                "Catch-up: retention not decidable for %s (%s)", target_config.path, e
+            )
+            return None
+        kept = {id(s) for s in to_keep}
+        chosen = [s for s in missing if id(s) in kept]
+        left_out = [s.get_name() for s in missing if id(s) not in kept]
+        if left_out:
+            logger.info(
+                "Not sending %d of %d missing snapshot(s) to %s: the target's "
+                "retention would delete them straight after the transfer (%s).",
+                len(left_out),
+                len(missing),
+                target_config.path,
+                ", ".join(left_out),
+            )
+        return chosen
+
+    return select
+
+
 def _transfer_to_target(
     source_endpoint,
     destination_endpoint,
@@ -1068,6 +1143,7 @@ def _transfer_to_target(
     space_options: dict[str, Any] | None = None,
     transfer_timeout: int = DEFAULT_TRANSFER_TIMEOUT,
     newest_only: bool = False,
+    select=None,
 ) -> TransferResult | None:
     """Transfer to a single target, catching up whatever it is missing.
 
@@ -1114,6 +1190,8 @@ def _transfer_to_target(
             # with itself. Issue #104; newest-only is kept behind a flag.
             snapshot=snapshot if newest_only else None,
             options=transfer_options,
+            # What the target's own prune would keep (see _catch_up_selector).
+            select=None if newest_only else select,
         )
     except __util__.AbortError as e:
         # sync_snapshots attaches the outcome to the exception precisely so a

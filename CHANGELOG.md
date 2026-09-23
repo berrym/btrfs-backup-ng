@@ -70,6 +70,22 @@ unattended where the remote grants passwordless `btrfs`.
 
 ### Changed
 
+- **`run` no longer sends a target what the target's own prune deletes
+  straight after** ([#104](https://github.com/berrym/btrfs-backup-ng/issues/104)).
+  `run` sends everything a target is missing and then prunes it with the
+  target's policy, so a target that had been away was sent its whole backlog --
+  including snapshots that are neither the newest nor the oldest of their time
+  bucket -- only for the prune to delete them. `run` now asks the prune's own
+  retention decision first, over the target's snapshots plus the ones it is
+  missing, and sends only what it keeps, each against the newest earlier
+  snapshot the target holds. Measured on real btrfs with a 30-snapshot backlog
+  and `daily = 3` on the target: 0.9.9 sent 31 and pruned 27; now 4 are sent,
+  and the target holds the same four either way. On a raw target the result can
+  hold fewer streams than before, since a snapshot that was never sent needs no
+  protection as a stored increment's parent. Nothing is left out when the
+  target's policy is one the prune refuses to apply, when the target cannot be
+  listed, or when a name collides; `transfer` (which does not prune) and
+  `run --newest-only` are unchanged.
 - **A snapper restore is a transfer through the engine, into the snapper
   layout.** `restore_snapper_snapshot` had its own `btrfs send`/`btrfs
   receive` pipes, its own progress handling, three separate ways of writing

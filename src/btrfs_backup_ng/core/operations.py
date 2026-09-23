@@ -1468,6 +1468,7 @@ def sync_snapshots(
     no_incremental=False,
     snapshot=None,
     options=None,
+    select=None,
     **kwargs,
 ) -> TransferResult:
     """Synchronize snapshots from source to destination.
@@ -1479,6 +1480,11 @@ def sync_snapshots(
         no_incremental: If True, never use incremental transfers
         snapshot: Specific snapshot to transfer (None = use planning)
         options: Additional options dict
+        select: Optional ``(source_snapshots, present_names) -> list | None``.
+            With no ``snapshot``, the list it returns is planned as the
+            selection; None plans everything the destination is missing.
+            ``run`` passes one that leaves out what the target's own
+            retention would delete straight after the transfer.
         **kwargs: Additional keyword arguments
 
     Returns:
@@ -1523,12 +1529,15 @@ def sync_snapshots(
     # Plan: the single authority decides what to transfer, in what order, and with which
     # (correspondence-verified) parent -- so a `send -p` is only emitted for a parent the
     # destination actually holds.
+    only = snapshot
+    if only is None and select is not None:
+        only = select(source_snapshots, present_names)
     plan = plan_transfer_sequence(
         source_snapshots,
         destination_endpoint,
         no_incremental=no_incremental,
         keep_num_backups=keep_num_backups,
-        only=snapshot,
+        only=only,
     )
 
     if not plan:

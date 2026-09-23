@@ -75,16 +75,31 @@ def plan_endpoint_retention(
     snapshots = endpoint_obj.list_snapshots()
     if not snapshots:
         return [], []
-    to_keep, to_delete = apply_retention(
+    to_keep, to_delete = plan_retention_of(
+        snapshots, retention, prefix, timestamp_format
+    )
+    # Never prune a snapshot a kept one still needs as an incremental parent (no-op for btrfs;
+    # protects raw stream chains from becoming unrestorable).
+    return endpoint_obj.protect_incremental_parents(to_keep, to_delete)
+
+
+def plan_retention_of(
+    snapshots: list, retention: Any, prefix: str, timestamp_format: str | None
+) -> tuple[list, list]:
+    """The time-based policy applied to ``snapshots``: ``(to_keep, to_delete)``.
+
+    The one place the retention decision for a set of prefix-named snapshots is
+    made: ``plan_endpoint_retention`` asks it about an endpoint's listing, and
+    ``run`` asks it, before sending, about a target's listing plus what it is
+    about to send -- so what ``run`` leaves out of a catch-up is exactly what
+    its own prune would delete."""
+    return apply_retention(
         snapshots,
         retention,
         get_name=lambda s: s.get_name(),
         prefix=prefix,
         timestamp_format=timestamp_format,
     )
-    # Never prune a snapshot a kept one still needs as an incremental parent (no-op for btrfs;
-    # protects raw stream chains from becoming unrestorable).
-    return endpoint_obj.protect_incremental_parents(to_keep, to_delete)
 
 
 def snapper_backup_timestamp(backup: dict) -> Any:

@@ -11,7 +11,11 @@ in sequence for each configured volume:
 .IP 1. 3
 Create a new snapshot of the source volume
 .IP 2. 3
-Transfer snapshots to all configured targets (incrementally when possible)
+Transfer snapshots to all configured targets (incrementally when possible).
+A target that has missed runs is sent what it is missing, except what its own
+retention would delete in step 3: that decision is made before sending, by the
+same retention rules, so the target ends up with what it would have held had
+everything been sent and pruned.
 .IP 3. 3
 Apply retention policies to clean up old snapshots and backups
 .PP
