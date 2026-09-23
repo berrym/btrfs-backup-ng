@@ -402,3 +402,154 @@ class TestARefusingSendIsThisTransfersFailure:
         assert result.failed_count == 1 and result.transferred_count == 0
         assert "CORRUPT" in str(result.failed[0][1])
         source.set_lock.assert_any_call(snapshot, "restore:t", False)
+
+
+# --------------------------------------------------------------------------- #
+# the snapper layout's questions: plan what is present, check without expanding
+# --------------------------------------------------------------------------- #
+class TestASelectionMayBePlannedWithoutSkippingWhatIsPresent:
+    """``skip_present=False``: the snapper layout lands every restore in a
+    fresh slot, as snapper keeps every snapshot, so a present copy is planned
+    again -- and what is present still serves as the incremental parent."""
+
+    def test_a_present_snapshot_is_planned_again(self, tmp_path):
+        s1 = _snap("20240101-000000", uuid="U1")
+        copy = _snap("20240101-000000", uuid="D1", received_uuid="U1")
+        dest = _local(tmp_path / "dst", [copy])
+        assert plan_transfer_sequence([s1], dest, only=s1) == []
+        assert plan_transfer_sequence([s1], dest, only=s1, skip_present=False) == [
+            (s1, None)
+        ]
+
+    def test_a_present_parent_still_serves_the_increment(self, tmp_path):
+        s1 = _snap("20240101-000000", uuid="U1")
+        s2 = _snap("20240102-000000", uuid="U2")
+        copy = _snap("20240101-000000", uuid="D1", received_uuid="U1")
+        dest = _local(tmp_path / "dst", [copy])
+        plan = plan_transfer_sequence([s1, s2], dest, only=[s1, s2], skip_present=False)
+        assert plan == [(s1, None), (s2, s1)]
+
+    def test_an_undated_present_selection_is_planned_in_full(self, tmp_path):
+        undated = _snap("20240101-000000", uuid="U1", name="home-odd")
+        undated.time_obj = None
+        copy = _snap("20240101-000000", uuid="D1", received_uuid="U1")
+        dest = _local(tmp_path / "dst", [copy])
+        assert plan_transfer_sequence([undated], dest, only=undated) == []
+        assert plan_transfer_sequence(
+            [undated], dest, only=undated, skip_present=False
+        ) == [(undated, None)]
+
+
+class TestASelectionMayBeCheckedWithoutBeingExpanded:
+    """``expand_selection=False``: the source is asked what each selected
+    snapshot requires, and a requirement that is neither at the destination
+    nor selected is a refusal -- nothing is added to the plan. A snapper
+    restore plans this way: the operator named the snapshots to bring."""
+
+    def _store(self, tmp_path):
+        base = _raw("home-20240101-000000", "20240101-000000", source_uuid="A")
+        inc = _raw(
+            "home-20240102-000000",
+            "20240102-000000",
+            parent_name=base.name,
+            source_uuid="B",
+        )
+        return base, inc, _raw_store(tmp_path / "raw", [base, inc])
+
+    def test_an_increment_whose_parent_is_neither_present_nor_selected_is_refused(
+        self, tmp_path
+    ):
+        base, inc, store = self._store(tmp_path)
+        dest = _local(tmp_path / "dst", [])
+        with pytest.raises(PlanningError, match=base.name) as info:
+            plan_transfer_sequence(
+                [base, inc],
+                dest,
+                only=inc,
+                source_endpoint=store,
+                expand_selection=False,
+            )
+        assert "neither at the destination nor selected" in str(info.value)
+        assert "Nothing was transferred" in str(info.value)
+
+    def test_the_selection_is_not_expanded(self, tmp_path):
+        """Mutation guard: falling through to the expanding form plans the base."""
+        base, inc, store = self._store(tmp_path)
+        dest = _local(tmp_path / "dst", [])
+        plan = plan_transfer_sequence(
+            [base, inc],
+            dest,
+            only=[base, inc],
+            source_endpoint=store,
+            expand_selection=False,
+        )
+        assert [s.get_name() for s, _ in plan] == [base.name, inc.name]
+        expanding = plan_transfer_sequence(
+            [base, inc], dest, only=inc, source_endpoint=store
+        )
+        assert [s.get_name() for s, _ in expanding] == [base.name, inc.name]
+
+    def test_a_selected_parent_satisfies_the_requirement(self, tmp_path):
+        base, inc, store = self._store(tmp_path)
+        dest = _local(tmp_path / "dst", [])
+        plan = plan_transfer_sequence(
+            [base, inc],
+            dest,
+            only=[inc, base],
+            source_endpoint=store,
+            expand_selection=False,
+        )
+        assert [s.get_name() for s, _ in plan] == [base.name, inc.name]
+
+    def test_a_present_parent_satisfies_the_requirement(self, tmp_path):
+        base, inc, store = self._store(tmp_path)
+        copy = _snap("20240101-000000", uuid="D1", received_uuid="A")
+        dest = _local(tmp_path / "dst", [copy])
+        plan = plan_transfer_sequence(
+            [base, inc], dest, only=inc, source_endpoint=store, expand_selection=False
+        )
+        assert [s.get_name() for s, _ in plan] == [inc.name]
+
+    def test_a_present_selection_that_will_be_skipped_needs_nothing(self, tmp_path):
+        base, inc, store = self._store(tmp_path)
+        copy = _snap("20240102-000000", uuid="D2", received_uuid="B")
+        dest = _local(tmp_path / "dst", [copy])
+        assert (
+            plan_transfer_sequence(
+                [base, inc],
+                dest,
+                only=inc,
+                source_endpoint=store,
+                expand_selection=False,
+            )
+            == []
+        )
+
+    def test_a_present_selection_planned_again_still_needs_its_parent(self, tmp_path):
+        """With skip_present=False the increment IS streamed, so its parent must
+        be there for the receive to apply it."""
+        base, inc, store = self._store(tmp_path)
+        copy = _snap("20240102-000000", uuid="D2", received_uuid="B")
+        dest = _local(tmp_path / "dst", [copy])
+        with pytest.raises(PlanningError, match=base.name):
+            plan_transfer_sequence(
+                [base, inc],
+                dest,
+                only=inc,
+                source_endpoint=store,
+                expand_selection=False,
+                skip_present=False,
+            )
+
+    def test_a_parent_the_store_no_longer_holds_is_refused_the_same_way(self, tmp_path):
+        inc = _raw(
+            "home-20240102-000000",
+            "20240102-000000",
+            parent_name="home-20240101-000000",
+        )
+        store = _raw_store(tmp_path / "raw", [inc])
+        dest = _local(tmp_path / "dst", [])
+        with pytest.raises(PlanningError, match="home-20240101-000000"):
+            plan_transfer_sequence(
+                [inc], dest, only=inc, source_endpoint=store, expand_selection=False
+            )

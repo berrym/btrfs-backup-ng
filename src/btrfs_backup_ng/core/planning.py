@@ -124,6 +124,44 @@ def expand_required_chain(selection, source_snapshots, present, source_endpoint)
     return expanded
 
 
+def require_parents_present(selection, present, source_endpoint, *, skip_present):
+    """Refuse a selection whose requirements are not met, adding nothing.
+
+    The check-only sibling of :func:`expand_required_chain`, for a caller
+    that plans exactly what was selected: each selected snapshot's required
+    parent (``required_parent_of``) must already be at the destination by
+    correspondence or be selected itself. A snapshot that is present and
+    will be skipped needs nothing. A requirement the source names but cannot
+    meet raises the same way the expanding form does.
+
+    Raises ``PlanningError``: a stored raw increment whose parent is neither
+    at the destination nor selected would otherwise stream all of itself and
+    fail in the receive.
+    """
+    selected_names = {s.get_name() for s in selection}
+    for snap in selection:
+        name = snap.get_name()
+        if skip_present and name in present:
+            continue
+        try:
+            required = source_endpoint.required_parent_of(snap)
+        except __util__.AbortError as e:
+            raise PlanningError(
+                f"Refusing to plan {name}: {e} Nothing was transferred."
+            ) from e
+        if required is None:
+            continue
+        required_name = required.get_name()
+        if required_name in present or required_name in selected_names:
+            continue
+        raise PlanningError(
+            f"Refusing to plan {name}: it requires {required_name}, which is "
+            f"neither at the destination nor selected, and a stored increment "
+            f"applies only onto its parent. Restore {required_name} first, or "
+            f"select both. Nothing was transferred."
+        )
+
+
 def plan_transfer_sequence(
     source_snapshots,
     destination_endpoint,
@@ -132,6 +170,8 @@ def plan_transfer_sequence(
     keep_num_backups=0,
     only=None,
     source_endpoint=None,
+    expand_selection=True,
+    skip_present=True,
 ):
     """Build the ordered transfer plan ``[(snapshot, parent_or_None)]``.
 
@@ -150,6 +190,18 @@ def plan_transfer_sequence(
             requirement the source cannot meet is refused with
             ``PlanningError`` before anything is transferred. Without it the
             selection is planned exactly as given (the backup run's behaviour).
+        expand_selection: With ``source_endpoint``, False plans the selection
+            exactly as given and only CHECKS it: a selected snapshot whose
+            required parent is neither at the destination nor selected is
+            refused (``require_parents_present``). A snapper restore plans
+            this way -- the operator named the snapshots to bring, and a
+            stored raw increment without its parent is refused rather than
+            streamed.
+        skip_present: False plans a selected snapshot even when its copy is
+            already at the destination. The snapper layout lands every
+            restore in a fresh numbered slot, as snapper keeps every
+            snapshot, and what is present still serves as the incremental
+            parent. The default skips what is present.
 
     A snapshot whose correspondent is already present on the destination is skipped. For
     each snapshot to transfer, the parent is the newest source snapshot ordered BEFORE it --
@@ -190,9 +242,14 @@ def plan_transfer_sequence(
     undated_full: list = []
     if selection is not None:
         if source_endpoint is not None:
-            selection = expand_required_chain(
-                selection, source_snapshots, present, source_endpoint
-            )
+            if expand_selection:
+                selection = expand_required_chain(
+                    selection, source_snapshots, present, source_endpoint
+                )
+            else:
+                require_parents_present(
+                    selection, present, source_endpoint, skip_present=skip_present
+                )
         candidates = []
         for chosen in selection:
             if getattr(chosen, "time_obj", None) is None:
@@ -203,7 +260,7 @@ def plan_transfer_sequence(
                 # that a chain was built on, and if that guess is ever wrong
                 # btrfs receive fails loudly on the missing parent rather than
                 # applying a delta to the wrong subvolume.
-                if chosen.get_name() in present:
+                if skip_present and chosen.get_name() in present:
                     continue
                 logger.info(
                     "Transferring %s as a full send: its name yields no "
@@ -233,7 +290,7 @@ def plan_transfer_sequence(
     seen: set = set()
     to_transfer = []
     for s in sorted(candidates, key=_order_key):
-        if s.get_name() in present or s.get_name() in seen:
+        if (skip_present and s.get_name() in present) or s.get_name() in seen:
             continue
         seen.add(s.get_name())
         to_transfer.append(s)
