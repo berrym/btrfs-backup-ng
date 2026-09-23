@@ -5,7 +5,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.9.9] - 2026-09-23
+
+Restore now runs through the same planner and executor as a backup. Three
+things a restore script can notice: a same-name entry at the destination that
+is not this backup's copy now refuses the run (it used to be skipped and
+reported as restored); `restore --cleanup` deletes only what this tool's run
+marker names; and `--compress` on an `ssh://` restore now compresses the
+transfer instead of being ignored. Chain restore stays the default.
 
 ### Changed
 
@@ -58,6 +65,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   increment used to stream all of it and fail in the receive; the planner
   now asks the store, brings the parent first when it is there, and refuses
   the plan when it is not, leaving nothing at the destination.
+- **A transfer onward from a mirror is incremental.** `btrfs send` of a
+  received subvolume carries the original's uuid rather than its own, so a copy
+  of a copy records the original as its received_uuid. Presence was compared
+  against the middle copy's own uuid, which matched only the first hop: a
+  transfer onward from an `ssh://` mirror re-sent every snapshot in full and
+  then failed on the names already at the destination. Presence is now
+  compared against the identity a stream actually carries, so the second hop
+  is an ordinary incremental and a rerun reports the target up to date. Raw
+  backups record that identity in a new sidecar field, `source_uuid`; a
+  sidecar written before this release lacks it and is matched by name, as
+  before.
+- **`restore --in-place` refuses instead of pretending.** The flag was
+  accepted and ignored: the ordinary restore ran, landed the snapshot as a
+  nested subvolume at `DESTINATION/<name>`, replaced nothing, and exited 0 --
+  while the README documented `--in-place` as a disaster-recovery strategy
+  with copy-paste commands, and the config-driven `--volume` path never read
+  the flag at all. The command now refuses ahead of every mode, before any
+  endpoint is prepared (exit 2), and names the procedure that works today:
+  restore into a staging directory, verify, swap the subvolumes by hand
+  (README Strategy 2, whose commands now include making the received
+  snapshot writable). In-place restore that verifies the staged copy against
+  the backup's identity before swapping is scheduled; the running root will
+  only ever be replaceable from a rescue system, because btrfs-backup-ng does
+  not touch the bootloader.
 
 ### Added
 
@@ -72,6 +103,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   busybox ash; the local ssh and decompressor run under the one `pipefail`
   runner the raw pipelines use, so a failure at either end is the failure the
   executor sees. A missing local decompressor refuses before connecting.
+- **`--btrfs-debug` for every command, and `[global] btrfs_debug`.** Legacy
+  mode has had `--btrfs-debug` since the original tool; it put `-vv` on
+  `btrfs send` and `btrfs receive`, whose output then went to DEVNULL, so the
+  option did nothing anyone could see. The config-driven commands did not have
+  it at all: nine of them hard-coded it off. The stderr drain now logs each
+  line as it arrives, prefixed with the process that printed it (`btrfs
+  receive: At subvol ...`), the option implies `--debug` because that is the
+  level the lines are logged at, one helper answers every command, and a
+  non-boolean value in the configuration is refused at load. The `ssh://`
+  direct path, which builds its own local send and remote receive, carries
+  `-vv` on both and drains the remote receive's lines as they come back over
+  ssh; it had ignored the option entirely. Lines are logged on their own
+  thread so a slow console cannot slow the transfer, and every transfer waits
+  for its queued lines before it returns, so none are lost at exit.
+- **Every transfer records a verdict on what the receive left.** After
+  `btrfs receive` exits 0 the engine had nothing more to say: exit 0 was the
+  whole verdict, and a subvolume under the right name that was not the
+  received copy counted as a backup. The executor now records one of three
+  verdicts, in the shape `verify` already uses: `ok`, when the copy's
+  received_uuid is the identity the stream carried (so a copy of a copy is
+  judged against the original, not the middle hop); `invalid`, when the
+  artifact provably is not that copy -- not a subvolume, no received_uuid, or
+  a different one -- in which case the transfer fails and the artifact is
+  removed under the same authorship rule as a partial, on local and on remote
+  btrfs destinations; and `unverifiable`, when the identity could not be read,
+  in which case the data is kept, the transfer counts, and the log says what
+  was not confirmed. A verdict that cannot be computed at all is unverifiable
+  too: the data has landed, and a post-check must never be able to turn that
+  into a failure. Raw destinations are judged by the endpoint's own structural
+  check on the committed stream, which carries the sealed sha256; nothing is
+  re-hashed. The identity is read through one probe that the listing uses as
+  well, so the verdict and the planner cannot disagree about what a subvolume
+  is; that probe consults the subvolume's inode and not the mount-table walk,
+  because a check that can be wrong about the environment must not be able to
+  condemn a copy.
 - Every source endpoint answers `required_parent_of`, and the planner's
   `only=` accepts a selection and a `source_endpoint` to expand it through.
   The backup run's contract is unchanged: without a source endpoint the
@@ -79,6 +145,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A failed send or receive now reports what btrfs said, not only how it
+  exited.** The local `btrfs send` and `btrfs receive` -- and by inheritance
+  the `ssh://` receive, and the remote send -- sent stderr to DEVNULL, so a
+  restore from a corrupt stream reported "btrfs send/receive failed with
+  return codes: [-13, 1]" and nothing else, while "ERROR: crc32 mismatch in
+  command" had been printed and discarded. Every send and receive an endpoint
+  starts now has its stderr drained on a thread as it is written, with the
+  last 64 KiB kept for the report and the pipe closed at EOF. The drain is
+  what makes a pipe safe: `--btrfs-debug` puts `-vv` on both commands, one
+  line per file operation, and a pipe read only after exit would fill, stop
+  the child, and read as a stall (verified: 30,000 files under `-vv`, local
+  and over ssh, complete without one). The transfer engine also hands the
+  receive it starts back to the failure report, which had been given None.
+  Raw transfers no longer leave a stderr pipe open until garbage collection.
 - **An endpoint that refuses to send fails that transfer, not the run.** A raw
   store whose stream fails its sealed sha256, a decompressor that is not
   installed, a remote sudo with no password to give: each raised out of the
@@ -89,10 +169,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   -- the stream file's name -- found nothing, and would have called a correct
   restore invalid and deleted it. A raw snapshot now says what its stream is
   received as.
-- The README gave `-vv` as the debug level. It is the same as `-v`; the debug
-  level is `--debug`. The restore documentation listed six compression methods
-  where `--compress` accepts nine.
-
 - **A refused lock never reported an empty reason again.** Four sites logged
   why and then raised an exception carrying nothing, so a summary that quotes
   the exception -- "Transfer to X failed: " -- ended at the colon. Every
@@ -131,84 +207,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reported as a failed estimate. The size parser matched the unit `B` before
   `KiB`/`MiB`/`GiB` and so returned nothing for any binary unit; it parses
   them now.
-
-### Added
-
-- **`--btrfs-debug` for every command, and `[global] btrfs_debug`.** Legacy
-  mode has had `--btrfs-debug` since the original tool; it put `-vv` on
-  `btrfs send` and `btrfs receive`, whose output then went to DEVNULL, so the
-  option did nothing anyone could see. The config-driven commands did not have
-  it at all: nine of them hard-coded it off. The stderr drain now logs each
-  line as it arrives, prefixed with the process that printed it (`btrfs
-  receive: At subvol ...`), the option implies `--debug` because that is the
-  level the lines are logged at, one helper answers every command, and a
-  non-boolean value in the configuration is refused at load. The `ssh://`
-  direct path, which builds its own local send and remote receive, carries
-  `-vv` on both and drains the remote receive's lines as they come back over
-  ssh; it had ignored the option entirely. Lines are logged on their own
-  thread so a slow console cannot slow the transfer, and every transfer waits
-  for its queued lines before it returns, so none are lost at exit.
-
-- **Every transfer records a verdict on what the receive left.** After
-  `btrfs receive` exits 0 the engine had nothing more to say: exit 0 was the
-  whole verdict, and a subvolume under the right name that was not the
-  received copy counted as a backup. The executor now records one of three
-  verdicts, in the shape `verify` already uses: `ok`, when the copy's
-  received_uuid is the identity the stream carried (so a copy of a copy is
-  judged against the original, not the middle hop); `invalid`, when the
-  artifact provably is not that copy -- not a subvolume, no received_uuid, or
-  a different one -- in which case the transfer fails and the artifact is
-  removed under the same authorship rule as a partial, on local and on remote
-  btrfs destinations; and `unverifiable`, when the identity could not be read,
-  in which case the data is kept, the transfer counts, and the log says what
-  was not confirmed. A verdict that cannot be computed at all is unverifiable
-  too: the data has landed, and a post-check must never be able to turn that
-  into a failure. Raw destinations are judged by the endpoint's own structural
-  check on the committed stream, which carries the sealed sha256; nothing is
-  re-hashed. The identity is read through one probe that the listing uses as
-  well, so the verdict and the planner cannot disagree about what a subvolume
-  is; that probe consults the subvolume's inode and not the mount-table walk,
-  because a check that can be wrong about the environment must not be able to
-  condemn a copy.
-
-### Fixed
-
-- **A failed send or receive now reports what btrfs said, not only how it
-  exited.** The local `btrfs send` and `btrfs receive` -- and by inheritance
-  the `ssh://` receive, and the remote send -- sent stderr to DEVNULL, so a
-  restore from a corrupt stream reported "btrfs send/receive failed with
-  return codes: [-13, 1]" and nothing else, while "ERROR: crc32 mismatch in
-  command" had been printed and discarded. Every send and receive an endpoint
-  starts now has its stderr drained on a thread as it is written, with the
-  last 64 KiB kept for the report and the pipe closed at EOF. The drain is
-  what makes a pipe safe: `--btrfs-debug` puts `-vv` on both commands, one
-  line per file operation, and a pipe read only after exit would fill, stop
-  the child, and read as a stall (verified: 30,000 files under `-vv`, local
-  and over ssh, complete without one). The transfer engine also hands the
-  receive it starts back to the failure report, which had been given None.
-  Raw transfers no longer leave a stderr pipe open until garbage collection.
-
 - **The `restore` man page said `--overwrite` overwrites.** The option was
   withdrawn in 0.9.6 and the CLI help has said so since; the man page kept the
   original sentence. It now matches the CLI, and a test pins the help text,
   the man page and the README's options table to each other for every option
   whose truth is "does not do what its name says".
-
-### Changed
-
-- **`restore --in-place` refuses instead of pretending.** The flag was
-  accepted and ignored: the ordinary restore ran, landed the snapshot as a
-  nested subvolume at `DESTINATION/<name>`, replaced nothing, and exited 0 --
-  while the README documented `--in-place` as a disaster-recovery strategy
-  with copy-paste commands, and the config-driven `--volume` path never read
-  the flag at all. The command now refuses ahead of every mode, before any
-  endpoint is prepared (exit 2), and names the procedure that works today:
-  restore into a staging directory, verify, swap the subvolumes by hand
-  (README Strategy 2, whose commands now include making the received
-  snapshot writable). In-place restore that verifies the staged copy against
-  the backup's identity before swapping is scheduled; the running root will
-  only ever be replaceable from a rescue system, because btrfs-backup-ng does
-  not touch the bootloader.
+- The README gave `-vv` as the debug level. It is the same as `-v`; the debug
+  level is `--debug`. The restore documentation listed six compression methods
+  where `--compress` accepts nine.
 
 ## [0.9.8] - 2026-09-21
 
