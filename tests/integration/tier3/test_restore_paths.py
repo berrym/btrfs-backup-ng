@@ -28,12 +28,12 @@ the original or the backup and succeeds for a reason a real recovery would
 not have. A cell that needs media with NOTHING on it -- the single-increment
 disaster-recovery case -- brings up a filesystem of its own.
 
-The snapper parent-selection cells are xfail(strict=True): `snapper restore
---snapshot N` picks the incremental parent from the backup side and probes
-only the backup for it, so on recovery media without the parent the receive
-fails. The README's walkthrough is exactly that situation. The cells describe
-the behaviour the fix must produce; strict xfail means the fix cannot land
-without them turning green, and cannot quietly regress after.
+Three snapper cells were strict xfails until the snapper restore became a
+transfer through the engine: `--snapshot N` onto media without the parent
+used to pick the parent from the BACKUP side and fail in the receive, and an
+`ssh://` restore with `--ssh-sudo` used to demand a password on a remote that
+grants NOPASSWD btrfs because its endpoint was never prepared. They are
+ordinary cells now, and the README's walkthrough is exactly what they run.
 """
 
 from __future__ import annotations
@@ -79,10 +79,12 @@ def _snapper_restore(rig, source, recovery, *args, env=None):
 
     The recovery config is shared by the cells of a module, so the slots a
     call created are the difference in the on-disk numbering, never "slot 1".
+    The whole output, not a tail: the selection's collision warning and the
+    plan come BEFORE the transfers, and cells assert on them.
     """
     before = set(recovery.slots())
     r = rig.cli("snapper", "restore", source, recovery.name, *args, env=env)
-    out = (r.stdout + r.stderr)[-3000:]
+    out = r.stdout + r.stderr
     new = sorted(set(recovery.slots()) - before)
     return r.returncode, out, new
 
@@ -179,24 +181,9 @@ def _virgin_recovery(rig, request, tag):
     return snapper_config_up(request, f"bbngt3{tag}{rig.suffix}", mnt / "recover", None)
 
 
-_PARENT_SELECTION = (
-    "snapper restore selects the incremental parent from the backup side and "
-    "never checks the destination (cli/snapper_cmd.py, core/restore.py): with "
-    "the parent absent from the recovery media the receive fails instead of "
-    "degrading to a full restore, which is the README walkthrough's situation"
-)
-
-_SSH_SUDO_PROMPT = (
-    "snapper restore over ssh:// with --ssh-sudo demands a sudo password even "
-    "where the remote grants NOPASSWD btrfs: the endpoint is built without "
-    "prepare(), so the passwordless probe the native restore runs never "
-    "records passwordless_sudo_available and _build_remote_command emits "
-    "`sudo -S btrfs send` (core/restore.py _resolve_remote_snapper_backup, "
-    "endpoint/ssh.py)"
-)
-
-#: The documented override for that: sudo -n unconditionally. The ssh cells
-#: that must get PAST the prompt to prove something else set it, and say so.
+#: The documented override that forces `sudo -n` on the remote without the
+#: probe. One ssh cell runs the walkthrough as documented (no override), so
+#: the probe itself is proven; the others set it, and say so.
 _PASSWORDLESS_ONLY = {**os.environ, "BTRFS_BACKUP_PASSWORDLESS_ONLY": "1"}
 
 
@@ -230,7 +217,6 @@ class TestSnapperRestore:
         _assert_slot(snapper_recovery, new[0], rig.payload, res["delta"])
 
     @requires_remote
-    @pytest.mark.xfail(strict=True, reason=_SSH_SUDO_PROMPT)
     def test_from_ssh_as_documented(self, rig, snapper_chain, snapper_recovery):
         """The walkthrough's command against the walkthrough's sudoers policy,
         with nothing added: `snapper restore ssh://... CONFIG --all --ssh-sudo`
@@ -374,17 +360,15 @@ class TestSnapperRestore:
             "a reused number was restored without saying which copy\n" + out
         )
 
-    @pytest.mark.xfail(strict=True, reason=_PARENT_SELECTION)
     def test_one_increment_onto_empty_media_from_local_btrfs(
         self, rig, snapper_chain, request
     ):
         """The walkthrough: media with nothing on it, restore ONE snapshot.
 
-        The parent exists at the backup, so the backup-side probe is
-        satisfied and the send goes out incremental; the receive has nothing
-        to apply it to. What is asked for here is the fall-back the local
-        branch already promises for an ABSENT parent: a full restore, exit 0,
-        the bytes in slot 1.
+        The parent exists at the backup and NOT on the media, so the only
+        parent worth choosing is none: a full restore, exit 0, the bytes in
+        slot 1. Choosing the parent from the backup side sent an increment
+        the receive had nothing to apply to.
         """
         target = rig.dst / "snapper-dr"
         target.mkdir()
@@ -400,10 +384,9 @@ class TestSnapperRestore:
         _assert_slot(virgin, 1, rig.payload, res["delta"])
 
     @requires_remote
-    @pytest.mark.xfail(strict=True, reason=_PARENT_SELECTION)
     def test_one_increment_onto_empty_media_from_ssh(self, rig, snapper_chain, request):
-        """BTRFS_BACKUP_PASSWORDLESS_ONLY is set so this cell gets past the
-        sudo prompt pinned above and fails on parent selection, not on that."""
+        """The same over ssh://, with the documented `sudo -n` override set
+        so the cell judges parent selection alone."""
         base = f"{rig.remote_base}/snapper-dr"
         remote_sh(f"mkdir -p '{base}'")
         loc = f"ssh://{REMOTE_SPEC}:{base}"

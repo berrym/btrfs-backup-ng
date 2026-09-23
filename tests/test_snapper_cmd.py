@@ -1696,6 +1696,13 @@ class TestSnapperEndpointRouting:
         assert cfg.get("ssh_identity_file") == "/home/u/.ssh/id"
 
 
+def _stats(restored, slots, dry_run=False):
+    """What ``restore_snapper_snapshots`` reports for ``restored`` published slots."""
+    if dry_run:
+        return {"restored": 0, "failed": 0, "errors": [], "slots": []}
+    return {"restored": restored, "failed": 0, "errors": [], "slots": slots}
+
+
 class TestRestoreSnapperdCacheHint:
     """Restore prints a snapperd-rescan hint (a)+(c) decision."""
 
@@ -1714,7 +1721,6 @@ class TestRestoreSnapperdCacheHint:
         )
 
     def _run(self, args, mock_snapper_configs, capsys):
-        from pathlib import Path
 
         from btrfs_backup_ng.cli.snapper_cmd import _handle_restore
 
@@ -1722,14 +1728,14 @@ class TestRestoreSnapperdCacheHint:
             patch("btrfs_backup_ng.cli.snapper_cmd.SnapperScanner") as scanner_cls,
             patch("btrfs_backup_ng.core.restore.list_snapper_backups") as mock_list,
             patch(
-                "btrfs_backup_ng.core.restore.restore_snapper_snapshot"
+                "btrfs_backup_ng.core.restore.restore_snapper_snapshots"
             ) as mock_restore,
         ):
             scanner = MagicMock()
             scanner.get_config.return_value = mock_snapper_configs[0]
             scanner_cls.return_value = scanner
             mock_list.return_value = [{"number": 559, "metadata": MagicMock()}]
-            mock_restore.return_value = (1, Path("/x/.snapshots/1/snapshot"))
+            mock_restore.return_value = _stats(1, [(559, 1)], dry_run=args.dry_run)
             result = _handle_restore(args)
         captured = capsys.readouterr()
         # Rich wraps log lines; normalize whitespace before substring checks.
@@ -1795,7 +1801,6 @@ class TestRestoreNameDateSelection:
         return argparse.Namespace(**base)
 
     def _run(self, args, mock_snapper_configs):
-        from pathlib import Path
 
         from btrfs_backup_ng.cli.snapper_cmd import _handle_restore
 
@@ -1806,19 +1811,26 @@ class TestRestoreNameDateSelection:
                 return_value=self._mk_backups(),
             ),
             patch(
-                "btrfs_backup_ng.core.restore.restore_snapper_snapshot"
+                "btrfs_backup_ng.core.restore.restore_snapper_snapshots"
             ) as mock_restore,
         ):
             scanner = MagicMock()
             scanner.get_config.return_value = mock_snapper_configs[0]
             scanner_cls.return_value = scanner
-            mock_restore.return_value = (1, Path("/x/snapshot"))
+            mock_restore.side_effect = lambda **kw: _stats(
+                len(kw["selected"]),
+                [(b["number"], i) for i, b in enumerate(kw["selected"], 1)],
+            )
             result = _handle_restore(args)
         return result, mock_restore
 
     @staticmethod
     def _restored_names(mock_restore):
-        return [c.kwargs.get("backup_name") for c in mock_restore.call_args_list]
+        """The exact backups the command line handed the one restore call."""
+        if not mock_restore.call_args_list:
+            return []
+        (call,) = mock_restore.call_args_list
+        return [b.get("backup_name") for b in call.kwargs["selected"]]
 
     def test_backup_name_restores_exact_older(self, mock_snapper_configs):
         result, mr = self._run(

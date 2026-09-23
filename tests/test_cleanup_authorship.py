@@ -23,6 +23,7 @@ this run wrote and a backup that was already there are the same observation.
 
 from __future__ import annotations
 
+import subprocess
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -353,54 +354,68 @@ class TestVerifyDeletesOnlyWhatItRestored:
         )
 
 
-class TestSnapperRestoreDeletesOnlyWhatItCreated:
-    """``restore_snapper_snapshot`` removes the destination subvolume and the whole
-    numbered slot directory on ANY exception, on existence alone. The slot comes
-    from ``get_next_snapshot_number`` and is supposed to be free -- but a stale
-    scan, a concurrent snapper, or a slot made by hand is enough to make it not,
-    and a failure before anything was written then deletes a snapshot that was
-    already there.
+class TestASnapperRestoreDeletesOnlyWhatItCreated:
+    """A snapper restore receives into ``.snapshots/<n>.incoming`` and publishes
+    by renaming the directory; what it may remove after a failure is that
+    ``.incoming`` and nothing else. The numbered slots -- snapper's own, an
+    earlier restore's, one made by hand -- are never a candidate, however the
+    receive died and whatever number it had been given.
+
+    The previous implementation recorded whether ``.snapshots/<n>`` existed
+    before it created it and gated its deletions on that record; the slot
+    lifecycle the layout shares with the backup direction makes the question
+    moot, because a published slot is never the thing being cleaned.
     """
 
     @staticmethod
-    def _source():
-        import inspect
+    def _real_shell(ep, script):
+        r = subprocess.run(["sh", "-c", script], capture_output=True, text=True)
+        return r.returncode, r.stdout
 
-        from btrfs_backup_ng.core import restore as rs
+    def _layout(self, tmp_path, monkeypatch):
+        from btrfs_backup_ng.core import operations as ops
+        from btrfs_backup_ng.core.layout import SnapperLayout
+        from btrfs_backup_ng.endpoint.local import LocalEndpoint
 
-        return inspect.getsource(rs.restore_snapper_snapshot)
-
-    def test_existence_is_recorded_before_the_slot_is_created(self):
-        source = self._source()
-        record = source.index("slot_preexisted = dest_snapshot_dir.exists()")
-        mkdir = source.index("privileged_mkdir(dest_snapshot_dir")
-        assert record < mkdir, (
-            "the slot's prior existence is recorded after it is created, which "
-            "always answers 'it was already there'"
+        monkeypatch.setattr(ops, "_snapper_run_shell", self._real_shell)
+        base = tmp_path / "config"
+        base.mkdir()
+        ep = LocalEndpoint(
+            config={"path": str(base), "snap_prefix": "", "fs_checks": "skip"}
         )
+        return base, SnapperLayout(ep)
 
-    def test_the_subvolume_deletion_is_gated_on_the_record(self):
-        assert (
-            "if dest_snapshot_path.exists() and not snapshot_preexisted:"
-            in self._source()
-        )
+    def test_a_failed_receive_removes_its_incoming_and_no_published_slot(
+        self, tmp_path, monkeypatch
+    ):
+        base, layout = self._layout(tmp_path, monkeypatch)
+        for n in (1, 2):
+            slot = base / ".snapshots" / str(n) / "snapshot"
+            slot.mkdir(parents=True)
+            (slot / "marker").write_text(f"slot {n}")
+        layout.open_slot(3)
+        (base / ".snapshots" / "3.incoming" / "snapshot").mkdir()
+        layout.abandon()
+        assert not (base / ".snapshots" / "3.incoming").exists()
+        assert not (base / ".snapshots" / "3").exists()
+        for n in (1, 2):
+            assert (
+                base / ".snapshots" / str(n) / "snapshot" / "marker"
+            ).read_text() == (f"slot {n}")
 
-    def test_the_slot_removal_is_gated_on_the_record(self):
-        assert (
-            "if dest_snapshot_dir.exists() and not slot_preexisted:" in self._source()
-        )
-
-    def test_the_two_are_judged_separately(self):
-        """A restore can fail after creating the directory but before receiving
-        into it, and can also fail into a slot that already held a snapshot. One
-        flag for both would either leak the directory or delete the snapshot."""
-        source = self._source()
-        # Each must be derived from its OWN path. Counting the assignments is not
-        # enough: `snapshot_preexisted = slot_preexisted` assigns exactly once and
-        # collapses the two, so a failure after the directory was created but
-        # before the receive would refuse to remove the directory it made.
-        assert "slot_preexisted = dest_snapshot_dir.exists()" in source
-        assert "snapshot_preexisted = dest_snapshot_path.exists()" in source
+    def test_a_slot_that_already_held_a_snapshot_is_not_the_receive_target(
+        self, tmp_path, monkeypatch
+    ):
+        """Even given a number that is taken, the receive lands in the temp
+        and a failure removes the temp: the occupant is never touched."""
+        base, layout = self._layout(tmp_path, monkeypatch)
+        occupant = base / ".snapshots" / "3" / "snapshot"
+        occupant.mkdir(parents=True)
+        (occupant / "marker").write_text("theirs")
+        layout.open_slot(3)
+        assert str(layout.endpoint.config["path"]).endswith("3.incoming")
+        layout.abandon()
+        assert (occupant / "marker").read_text() == "theirs"
 
 
 class TestNoCleanupCanBeReachedWithoutDecidingAuthorship:

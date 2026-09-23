@@ -13,7 +13,7 @@ from typing import Any, cast
 from ..__logger__ import create_logger
 from ..snapper import SnapperScanner
 from ..snapper.scanner import SnapperNotFoundError
-from .common import get_log_level, resolve_timestamp_format
+from .common import btrfs_debug_enabled, get_log_level, resolve_timestamp_format
 
 logger = logging.getLogger(__name__)
 
@@ -541,7 +541,7 @@ def _handle_restore(args: argparse.Namespace) -> int:
     """Handle 'snapper restore' command."""
     from ..core.restore import (
         list_snapper_backups,
-        restore_snapper_snapshot,
+        restore_snapper_snapshots,
     )
 
     # Set up Rich logging
@@ -557,6 +557,14 @@ def _handle_restore(args: argparse.Namespace) -> int:
     endpoint_options: dict[str, Any] = {}
     if getattr(args, "ssh_sudo", False):
         endpoint_options["ssh_sudo"] = True
+    # The restore pins the backup on its location for the duration; a location
+    # the operator can read but not write says so with --skip-remote-lock.
+    if getattr(args, "skip_remote_lock", None):
+        endpoint_options["skip_remote_lock"] = True
+    # -vv on the remote or local `btrfs send` and on the `btrfs receive` into
+    # the slot, with every line they print logged.
+    if btrfs_debug_enabled(args):
+        endpoint_options["btrfs_debug"] = True
     if getattr(args, "ssh_key", None):
         endpoint_options["ssh_identity_file"] = args.ssh_key
         endpoint_options["ssh_key"] = args.ssh_key
@@ -786,55 +794,26 @@ def _handle_restore(args: argparse.Namespace) -> int:
         "show_progress": True,
     }
 
-    # Track restored snapshots for incremental
-    restored_count = 0
-    failed_count = 0
-    backup_numbers = {b["number"] for b in backups}
+    # One transfer through the engine for the whole selection: the planner
+    # chooses each increment's parent from what the LOCAL config already
+    # holds, by identity, and the executor lands every copy in the next free
+    # slot. What was selected is restored exactly as selected.
+    try:
+        stats = restore_snapper_snapshots(
+            backup_path=source_path,
+            backups=backups,
+            selected=to_restore,
+            snapper_config_name=args.config,
+            options=options,
+            dry_run=args.dry_run,
+            endpoint_options=endpoint_options,
+        )
+    except Exception as e:
+        logger.error("Failed to restore: %s", e)
+        return 1
 
-    for i, backup in enumerate(to_restore, 1):
-        backup_num = backup["number"]
-
-        # Find parent for incremental restore
-        # Look for the highest numbered backup that:
-        # 1. Is lower than current backup number
-        # 2. Exists in the backup set
-        parent_num = None
-        for candidate in sorted(backup_numbers, reverse=True):
-            if candidate < backup_num:
-                parent_num = candidate
-                break
-
-        # Check if parent was already restored in this session or exists locally
-        # For now, use the backup-side parent for incremental send
-        # The restore function will use -p with the parent backup path
-
-        try:
-            logger.info(
-                "[%d/%d] Restoring snapshot %d ...", i, len(to_restore), backup_num
-            )
-
-            new_num, snapshot_path = restore_snapper_snapshot(
-                backup_path=source_path,
-                backup_number=backup_num,
-                snapper_config_name=args.config,
-                parent_backup_number=parent_num,
-                options=options,
-                dry_run=args.dry_run,
-                endpoint_options=endpoint_options,
-                # Restore the EXACT enumerated backup (raw carries a unique name);
-                # None for btrfs -> number-based path. Fixes the collision double-restore.
-                backup_name=backup.get("backup_name"),
-            )
-
-            if not args.dry_run:
-                logger.info(
-                    "Snapshot %d restored as local snapshot %d", backup_num, new_num
-                )
-            restored_count += 1
-
-        except Exception as e:
-            logger.error("Failed to restore snapshot %d: %s", backup_num, e)
-            failed_count += 1
+    restored_count = stats["restored"]
+    failed_count = stats["failed"]
 
     # Summary
     logger.info("")

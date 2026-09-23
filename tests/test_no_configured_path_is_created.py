@@ -103,7 +103,6 @@ REGISTRY: dict[str, tuple[str, ...]] = {
     "cli/restore.py::_prepare_local_endpoint": (OUTPUT,),
     "cli/snapper_cmd.py::_handle_generate_config": (OUTPUT,),
     "core/restore.py::validate_restore_destination": (OUTPUT,),
-    "core/restore.py::restore_snapper_snapshot": (OUTPUT,),
     # verify: --temp-dir is an output location; without it a temp is made
     # INSIDE the verified backup location (mkdtemp creates no parents).
     "core/verify.py::verify_full": (OUTPUT, BELOW),
