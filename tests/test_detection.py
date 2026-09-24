@@ -1640,15 +1640,8 @@ snapshot_prefix = "home"
 path = "/"
 snapshot_prefix = "root"
 """
-        config_data = {
-            "volumes": [
-                {"path": "/home", "snapshot_prefix": "home", "targets": []},
-                {"path": "/", "snapshot_prefix": "root", "targets": [{"path": "/mnt"}]},
-            ],
-            "retention": {},
-        }
 
-        _show_config_diff_summary(existing, new, config_data)
+        _show_config_diff_summary(existing, new)
 
         captured = capsys.readouterr()
         assert "+ Add volume: /" in captured.out
@@ -1678,14 +1671,8 @@ snapshot_dir = ".snapshots"
 path = "/home"
 snapshot_prefix = "home"
 """
-        config_data = {
-            "volumes": [
-                {"path": "/home", "snapshot_prefix": "home", "targets": []},
-            ],
-            "retention": {},
-        }
 
-        _show_config_diff_summary(existing, new, config_data)
+        _show_config_diff_summary(existing, new)
 
         captured = capsys.readouterr()
         assert "- Remove volume: /opt" in captured.out
@@ -1713,18 +1700,8 @@ snapshot_dir = ".snapshots"
 path = "/home"
 snapshot_prefix = "home-new"
 """
-        config_data = {
-            "volumes": [
-                {
-                    "path": "/home",
-                    "snapshot_prefix": "home-new",
-                    "targets": [{"path": "/mnt/a"}, {"path": "/mnt/b"}],
-                },
-            ],
-            "retention": {},
-        }
 
-        _show_config_diff_summary(existing, new, config_data)
+        _show_config_diff_summary(existing, new)
 
         captured = capsys.readouterr()
         assert "~ Modify volume: /home" in captured.out
@@ -1750,12 +1727,8 @@ snapshot_dir = ".snapshots"
 daily = 14
 weekly = 4
 """
-        config_data = {
-            "volumes": [],
-            "retention": {"daily": 14, "weekly": 4},
-        }
 
-        _show_config_diff_summary(existing, new, config_data)
+        _show_config_diff_summary(existing, new)
 
         captured = capsys.readouterr()
         assert "~ Modify retention:" in captured.out
@@ -1776,13 +1749,8 @@ snapshot_dir = ".snapshots"
 [global.notifications.email]
 enabled = true
 """
-        config_data = {
-            "volumes": [],
-            "retention": {},
-            "email": {"enabled": True},
-        }
 
-        _show_config_diff_summary(existing, new, config_data)
+        _show_config_diff_summary(existing, new)
 
         captured = capsys.readouterr()
         assert "+ Add email notifications" in captured.out
@@ -1803,13 +1771,8 @@ snapshot_dir = ".snapshots"
 enabled = true
 url = "https://example.com/hook"
 """
-        config_data = {
-            "volumes": [],
-            "retention": {},
-            "webhook": {"enabled": True, "url": "https://example.com/hook"},
-        }
 
-        _show_config_diff_summary(existing, new, config_data)
+        _show_config_diff_summary(existing, new)
 
         captured = capsys.readouterr()
         assert "+ Add webhook notifications" in captured.out
@@ -1820,9 +1783,8 @@ url = "https://example.com/hook"
 
         existing = "this is not valid toml {{{"
         new = "[global]\nsnapshot_dir = '.snapshots'"
-        config_data = {"volumes": [], "retention": {}}
 
-        _show_config_diff_summary(existing, new, config_data)
+        _show_config_diff_summary(existing, new)
 
         captured = capsys.readouterr()
         assert "Could not parse existing config" in captured.out

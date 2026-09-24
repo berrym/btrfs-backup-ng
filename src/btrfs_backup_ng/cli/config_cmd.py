@@ -428,8 +428,10 @@ def _generate_config_from_wizard(config_data: dict[str, Any]) -> str:
                     f"path = {_toml_str(target['path'])}",
                 ]
             )
-            if target.get("ssh_sudo"):
-                lines.append("ssh_sudo = true")
+            # Written whenever it was answered, `false` included, so a changed
+            # answer reads as a change and not as a removed key.
+            if "ssh_sudo" in target:
+                lines.append(f"ssh_sudo = {str(bool(target['ssh_sudo'])).lower()}")
             # require_mount is bool OR a mount point path. Emitting `true` for
             # any truthy value silently rewrote a configured mount point as a
             # boolean on every round-trip through this writer, turning the
@@ -469,11 +471,16 @@ def _generate_config_from_wizard(config_data: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-# What the wizard ASKS about. Its answers are authoritative even where it
-# writes nothing: a blank log_file means "no log file", declining email means
-# "no email", and an old value must not come back because the answer was to
-# leave it out. Everything else in an existing configuration -- the options
-# the wizard never asks about -- is carried over when it saves over one.
+# What the wizards CAN ask about. A wizard records, as it prompts, which of
+# these it actually asked (``Asked``); an answer is authoritative even where
+# it writes nothing -- a blank log_file means "no log file", declining email
+# means "no email", and an old value must not come back because the answer
+# was to leave it out. Everything a wizard did NOT ask about in a given run
+# -- because it never asks (ssh_port), or because the operator declined the
+# section that would have asked (the detection wizard's global settings), or
+# because the question did not apply to that target (ssh_sudo on raw+ssh://,
+# the mount check outside /mnt) -- is carried over from the existing
+# configuration when the wizard saves over one.
 _WIZARD_GLOBAL_KEYS = frozenset(
     {
         "snapshot_dir",
@@ -489,7 +496,29 @@ _WIZARD_GLOBAL_KEYS = frozenset(
     }
 )
 _WIZARD_NOTIFICATION_KEYS = frozenset({"email", "webhook"})
-_WIZARD_VOLUME_KEYS = frozenset({"path", "snapshot_prefix", "source", "snapper"})
+_WIZARD_EMAIL_KEYS = frozenset(
+    {
+        "enabled",
+        "smtp_host",
+        "smtp_port",
+        "smtp_tls",
+        "smtp_user",
+        "smtp_password",
+        "from_addr",
+        "to_addrs",
+        "on_success",
+        "on_failure",
+    }
+)
+_WIZARD_WEBHOOK_KEYS = frozenset(
+    {"enabled", "url", "method", "on_success", "on_failure"}
+)
+# ``snapper.config_name``: the snapper question decides the source and names
+# the config; the rest of the [volumes.snapper] table (include_types,
+# exclude_cleanup, min_age) is never asked and is carried over.
+_WIZARD_VOLUME_KEYS = frozenset(
+    {"path", "snapshot_prefix", "source", "snapper.config_name"}
+)
 _WIZARD_TARGET_KEYS = frozenset(
     {
         "path",
@@ -501,6 +530,85 @@ _WIZARD_TARGET_KEYS = frozenset(
         "openssl_cipher",
     }
 )
+_ENCRYPTION_KEYS = frozenset(
+    {"encrypt", "gpg_recipient", "gpg_keyring", "openssl_cipher"}
+)
+
+
+class Asked:
+    """Which keys a wizard actually prompted for, per scope.
+
+    Filled in by the wizard as it asks. Global keys and notification blocks
+    are recorded by name; volumes and targets by their position in the
+    configuration the wizard builds, which is the order it writes them in,
+    so two volumes with the same path stay distinct. ``carry_over_existing``
+    reads it: an asked key takes the wizard's answer, an unasked key keeps
+    the existing configuration's value.
+    """
+
+    def __init__(self) -> None:
+        self.global_keys: set[str] = set()
+        #: block name -> the sub-keys asked; a block that was asked as a
+        #: yes/no gate and declined is present with an empty set.
+        self.notifications: dict[str, set[str]] = {}
+        self.volumes: dict[int, set[str]] = {}
+        self.targets: dict[tuple[int, int], set[str]] = {}
+
+    def global_key(self, *keys: str) -> None:
+        unknown = set(keys) - _WIZARD_GLOBAL_KEYS
+        assert not unknown, f"not a wizard global key: {unknown}"
+        self.global_keys.update(keys)
+
+    def notification(self, block: str, *keys: str) -> None:
+        assert block in _WIZARD_NOTIFICATION_KEYS, block
+        universe = _WIZARD_EMAIL_KEYS if block == "email" else _WIZARD_WEBHOOK_KEYS
+        unknown = set(keys) - universe
+        assert not unknown, f"not a wizard {block} key: {unknown}"
+        self.notifications.setdefault(block, set()).update(keys)
+
+    def volume(self, index: int, *keys: str) -> None:
+        unknown = set(keys) - _WIZARD_VOLUME_KEYS
+        assert not unknown, f"not a wizard volume key: {unknown}"
+        self.volumes.setdefault(index, set()).update(keys)
+
+    def target(self, volume_index: int, index: int, *keys: str) -> None:
+        unknown = set(keys) - _WIZARD_TARGET_KEYS
+        assert not unknown, f"not a wizard target key: {unknown}"
+        self.targets.setdefault((volume_index, index), set()).update(keys)
+
+    @classmethod
+    def everything_in(cls, content: str) -> "Asked":
+        """Every key ``content`` sets counts as asked: what a conversion or a
+        configuration built outside the wizards is authoritative for. Keys it
+        does not set are carried over."""
+        import tomllib
+
+        asked = cls()
+        data = tomllib.loads(content)
+        global_data = data.get("global", {})
+        asked.global_keys.update(k for k in global_data if k != "notifications")
+        for block, table in global_data.get("notifications", {}).items():
+            if isinstance(table, dict):
+                asked.notifications[block] = set(table)
+        for vi, volume in enumerate(data.get("volumes", [])):
+            asked.volumes[vi] = {k for k in volume if k != "targets"}
+            for ti, target in enumerate(volume.get("targets", [])):
+                asked.targets[(vi, ti)] = set(target)
+        return asked
+
+
+class WizardConfig:
+    """What a wizard produced: the configuration text and what it asked."""
+
+    def __init__(self, content: str, asked: Asked) -> None:
+        self.content = content
+        self.asked = asked
+
+
+def _wizard_parts(wizard: "WizardConfig | str") -> tuple[str, Asked | None]:
+    if isinstance(wizard, WizardConfig):
+        return wizard.content, wizard.asked
+    return wizard, None
 
 
 class CarryOver:
@@ -526,40 +634,101 @@ def _describe_value(value: Any) -> str:
 
 
 def _carry_keys(
-    old: dict, new: dict, asked: frozenset, where: str, report: CarryOver
+    old: dict, new: dict, asked: set[str], where: str, report: CarryOver
 ) -> None:
-    """Copy into ``new`` every key of ``old`` the wizard does not ask about;
-    record an asked-about key the wizard's answer replaced or removed."""
+    """Carry into ``new`` every key of ``old`` the wizard did not ask about,
+    over whatever default the wizard wrote for it; for an asked key, record
+    what the wizard's answer replaced or removed.
+
+    A dotted entry in ``asked`` (``snapper.config_name``) means the table was
+    asked about only for those sub-keys: the rest of the table is carried
+    over inside it, and a table the new configuration no longer has is
+    reported as removed like any asked key.
+    """
     for key, value in old.items():
+        sub_asked = {k.split(".", 1)[1] for k in asked if k.startswith(key + ".")}
+        if sub_asked and key not in asked:
+            if key in new and isinstance(value, dict) and isinstance(new[key], dict):
+                _carry_keys(value, new[key], sub_asked, f"{where}{key}.", report)
+            else:
+                report.replaced.append(
+                    f"{where}{key} = {_describe_value(value)} (removed)"
+                )
+            continue
         if key in asked:
             if key not in new:
-                report.replaced.append(f"{where}{key} = {_describe_value(value)}")
-            elif new[key] != value and isinstance(value, dict):
-                gone = {k: v for k, v in value.items() if k not in new[key]}
-                if gone:
-                    report.replaced.append(f"{where}{key}: {CarryOver._describe(gone)}")
+                report.replaced.append(
+                    f"{where}{key} = {_describe_value(value)} (removed)"
+                )
+            elif new[key] != value:
+                if isinstance(value, dict) and isinstance(new[key], dict):
+                    gone = {k: v for k, v in value.items() if k not in new[key]}
+                    changed = {
+                        k: (v, new[key][k])
+                        for k, v in value.items()
+                        if k in new[key] and new[key][k] != v
+                    }
+                    if gone:
+                        report.replaced.append(
+                            f"{where}{key}: {CarryOver._describe(gone)} (removed)"
+                        )
+                    for k, (was, now) in changed.items():
+                        report.replaced.append(
+                            f"{where}{key}.{k}: {_describe_value(was)} -> "
+                            f"{_describe_value(now)}"
+                        )
+                else:
+                    report.replaced.append(
+                        f"{where}{key}: {_describe_value(value)} -> "
+                        f"{_describe_value(new[key])}"
+                    )
             continue
-        if key not in new:
+        if key not in new or new[key] != value:
             new[key] = value
             report.kept.append(f"{where}{key} = {_describe_value(value)}")
 
 
+def _match_by_path(old_items: list, new_items: list) -> list[tuple[dict, dict | None]]:
+    """Pair each old table with the new table of the same ``path``, in order
+    of occurrence, so two volumes (or targets) sharing a path -- the shape the
+    shipped example configuration has -- stay two. Returns ``(old, new or
+    None)`` per old table."""
+    seen: dict[Any, int] = {}
+    positions: dict[tuple[Any, int], dict] = {}
+    for item in new_items:
+        path = item.get("path")
+        positions[(path, seen.get(path, 0))] = item
+        seen[path] = seen.get(path, 0) + 1
+    pairs = []
+    seen.clear()
+    for item in old_items:
+        path = item.get("path")
+        pairs.append((item, positions.get((path, seen.get(path, 0)))))
+        seen[path] = seen.get(path, 0) + 1
+    return pairs
+
+
 def carry_over_existing(
-    new_content: str, existing_content: str
+    new_content: str, existing_content: str, asked: Asked | None = None
 ) -> tuple[str, CarryOver]:
-    """The wizard's configuration with what it does not ask about carried over
+    """The wizard's configuration with what it did not ask about carried over
     from the configuration it is about to replace.
 
-    Volumes are matched by path and targets by path within their volume. A
-    matched one keeps every option the wizard does not ask about; the
-    wizard's answers win for everything it does. A volume or target in the
-    existing file that the new one does not have is reported as removed with
-    its options, since there is nothing to carry them onto. The result is
-    written with ``__util__.dump_toml``; comments in the existing file are
-    not kept.
+    ``asked`` is what the wizard actually prompted for in this run; without
+    it, every key the new configuration sets counts as asked. Volumes are
+    matched by path and targets by path within their volume, in order of
+    occurrence. A matched one keeps every option the wizard did not ask
+    about -- over a default the wizard may have written for it -- and the
+    wizard's answers win for everything it did ask; a changed answer is
+    reported with both values. A volume or target in the existing file that
+    the new one does not have is reported as removed with its options, since
+    there is nothing to carry them onto. The result is written with
+    ``__util__.dump_toml``; comments in the existing file are not kept.
     """
     import tomllib
 
+    if asked is None:
+        asked = Asked.everything_in(new_content)
     old = tomllib.loads(existing_content)
     new = tomllib.loads(new_content)
     report = CarryOver()
@@ -567,16 +736,32 @@ def carry_over_existing(
     old_global = dict(old.get("global", {}))
     new_global = new.setdefault("global", {})
     old_notifications = old_global.pop("notifications", None)
-    _carry_keys(old_global, new_global, _WIZARD_GLOBAL_KEYS, "global.", report)
+    _carry_keys(old_global, new_global, asked.global_keys, "global.", report)
     if isinstance(old_notifications, dict):
         new_notifications = new_global.setdefault("notifications", {})
-        _carry_keys(
-            old_notifications,
-            new_notifications,
-            _WIZARD_NOTIFICATION_KEYS,
-            "global.notifications.",
-            report,
-        )
+        for block, old_table in old_notifications.items():
+            where = f"global.notifications.{block}"
+            if block not in asked.notifications:
+                # Never asked in this run: the whole block stays as it was.
+                if new_notifications.get(block) != old_table:
+                    new_notifications[block] = old_table
+                    report.kept.append(f"{where} = {_describe_value(old_table)}")
+                continue
+            new_table = new_notifications.get(block)
+            if not isinstance(new_table, dict):
+                report.replaced.append(
+                    f"{where} = {_describe_value(old_table)} (removed)"
+                )
+                new_notifications.pop(block, None)
+                continue
+            if isinstance(old_table, dict):
+                _carry_keys(
+                    old_table,
+                    new_table,
+                    asked.notifications[block],
+                    where + ".",
+                    report,
+                )
         if not new_notifications:
             del new_global["notifications"]
 
@@ -585,10 +770,10 @@ def carry_over_existing(
             new[key] = value
             report.kept.append(f"{key} = {_describe_value(value)}")
 
-    new_volumes = {v.get("path"): v for v in new.get("volumes", [])}
-    for old_volume in old.get("volumes", []):
+    new_volumes = new.get("volumes", [])
+    volume_index = {id(v): i for i, v in enumerate(new_volumes)}
+    for old_volume, volume in _match_by_path(old.get("volumes", []), new_volumes):
         vpath = old_volume.get("path")
-        volume = new_volumes.get(vpath)
         if volume is None:
             count = len(old_volume.get("targets", []))
             report.removed.append(
@@ -596,18 +781,20 @@ def carry_over_existing(
                 f"configuration"
             )
             continue
-        old_targets = old_volume.get("targets", [])
+        vi = volume_index[id(volume)]
         _carry_keys(
             {k: v for k, v in old_volume.items() if k != "targets"},
             volume,
-            _WIZARD_VOLUME_KEYS,
+            asked.volumes.get(vi, set()),
             f"volume {vpath}: ",
             report,
         )
-        new_targets = {t.get("path"): t for t in volume.get("targets", [])}
-        for old_target in old_targets:
+        new_targets = volume.get("targets", [])
+        target_index = {id(t): i for i, t in enumerate(new_targets)}
+        for old_target, target in _match_by_path(
+            old_volume.get("targets", []), new_targets
+        ):
             tpath = old_target.get("path")
-            target = new_targets.get(tpath)
             if target is None:
                 extra = {k: v for k, v in old_target.items() if k != "path"}
                 report.removed.append(
@@ -619,14 +806,14 @@ def carry_over_existing(
             _carry_keys(
                 old_target,
                 target,
-                _WIZARD_TARGET_KEYS,
+                asked.targets.get((vi, target_index[id(target)]), set()),
                 f"target {tpath}: ",
                 report,
             )
 
     header = (
         "# btrfs-backup-ng configuration\n"
-        "# Written by the config wizard. Options it does not ask about were kept\n"
+        "# Written by the config wizard. Options it did not ask about were kept\n"
         "# from the configuration this file replaced.\n"
     )
     return __util__.dump_toml(new, header=header), report
@@ -654,12 +841,13 @@ def _show_carry_over(report: CarryOver) -> None:
             console.print(f"  {line}")
 
 
-def _content_for_overwrite(content: str, path: Path) -> str | None:
+def _content_for_overwrite(wizard: "WizardConfig | str", path: Path) -> str | None:
     """The configuration to write over ``path``: the wizard's, with what it
-    does not ask about carried over from ``path``, after saying what that
+    did not ask about carried over from ``path``, after saying what that
     keeps and removes. None when the existing file cannot be read as TOML --
     it is then written as the wizard produced it, and the caller's overwrite
     prompt is the operator's decision, as before."""
+    content, asked = _wizard_parts(wizard)
     try:
         existing = path.read_text(encoding="utf-8")
     except OSError as e:
@@ -668,7 +856,7 @@ def _content_for_overwrite(content: str, path: Path) -> str | None:
         )
         return None
     try:
-        merged, report = carry_over_existing(content, existing)
+        merged, report = carry_over_existing(content, existing, asked)
     except Exception as e:  # noqa: BLE001 - reported; the operator still decides
         console.print(
             f"[yellow]{path} is not a configuration this wizard can read ({e}); "
@@ -687,24 +875,106 @@ def _content_for_overwrite(content: str, path: Path) -> str | None:
     return merged
 
 
-def _confirm_overwrite(content: str, path: Path, question: str) -> str | None:
+def _confirm_overwrite(
+    wizard: "WizardConfig | str", path: Path, question: str, *, force: bool = False
+) -> str | None:
     """Ask before the wizard's configuration replaces ``path``; return what
     to write, or None when the operator declines.
 
-    What is written is the wizard's configuration with the options it does
+    What is written is the wizard's configuration with the options it did
     not ask about carried over from ``path`` (``_content_for_overwrite``),
     and the question is asked only after the operator has been told what the
-    save keeps and what it removes. Every save of a wizard configuration over
-    an existing file goes through here.
+    save keeps and what it removes. ``force`` skips the question and nothing
+    else: what is written is the same. Every save of a wizard configuration
+    over an existing file goes through here.
     """
-    content = _content_for_overwrite(content, path) or content
-    if not prompt_bool(question, False):
+    content, _asked = _wizard_parts(wizard)
+    content = _content_for_overwrite(wizard, path) or content
+    if not force and not prompt_bool(question, False):
         return None
     return content
 
 
-def _run_interactive_wizard() -> str:
-    """Run interactive configuration wizard and return TOML content."""
+def _ask_email(config_data: dict[str, Any], asked: Asked, indent: str = "") -> None:
+    """The email notification questions, shared by both wizards. The yes/no
+    gate is itself an answer about the block: declining means no email."""
+    asked.notification("email")
+    if not prompt_bool(f"{indent}Configure email notifications?", False):
+        return
+    asked.notification("email", *_WIZARD_EMAIL_KEYS)
+    email: dict[str, Any] = {"enabled": True}
+    email["smtp_host"] = prompt(f"{indent}SMTP host", "smtp.example.com")
+    email["smtp_port"] = prompt_int(f"{indent}SMTP port", 587, 1, 65535)
+    email["smtp_tls"] = prompt_choice(
+        f"{indent}SMTP security", ["starttls", "ssl", "none"], "starttls"
+    )
+    email["smtp_user"] = prompt(f"{indent}SMTP username (leave empty if none)", "")
+    if email["smtp_user"]:
+        email["smtp_password"] = prompt(f"{indent}SMTP password", "")
+    email["from_addr"] = prompt(f"{indent}From address", "")
+    to_addrs_str = prompt(f"{indent}To addresses (comma-separated)", "")
+    if to_addrs_str:
+        email["to_addrs"] = [a.strip() for a in to_addrs_str.split(",") if a.strip()]
+    email["on_success"] = prompt_bool(f"{indent}Notify on success?", False)
+    email["on_failure"] = prompt_bool(f"{indent}Notify on failure?", True)
+    config_data["email"] = email
+
+
+def _ask_retention(config_data: dict[str, Any], asked: Asked, indent: str = "") -> None:
+    """The retention questions, shared by both wizards; asked as a whole."""
+    asked.global_key("retention")
+    retention: dict[str, str | int] = config_data.setdefault("retention", {})
+    retention["min"] = prompt(f"{indent}Minimum retention period", "1d")
+    retention["hourly"] = prompt_int(f"{indent}Hourly snapshots to keep", 24, 0, 1000)
+    retention["daily"] = prompt_int(f"{indent}Daily snapshots to keep", 7, 0, 1000)
+    retention["weekly"] = prompt_int(f"{indent}Weekly snapshots to keep", 4, 0, 1000)
+    retention["monthly"] = prompt_int(f"{indent}Monthly snapshots to keep", 12, 0, 1000)
+    retention["yearly"] = prompt_int(f"{indent}Yearly snapshots to keep", 0, 0, 1000)
+
+
+def _ask_target(
+    volume: dict[str, Any], asked: Asked, volume_index: int, question: str
+) -> bool:
+    """One target's questions, shared by both wizards. Returns False when the
+    operator entered no path (finished with this volume, or must add one).
+
+    Each question is recorded only when it is asked: ``ssh_sudo`` for an
+    ``ssh://`` target, the mount check for a target under /mnt or on a USB
+    path, encryption for a raw target. A target the questions did not apply
+    to keeps whatever the existing configuration says about them.
+    """
+    target_path = prompt(question, "")
+    if not target_path:
+        if not volume["targets"]:
+            console.print(
+                "  [yellow]At least one target is required per volume.[/yellow]"
+            )
+        return False
+    index = len(volume["targets"])
+    target: dict[str, Any] = {"path": target_path}
+    asked.target(volume_index, index, "path")
+
+    if target_path.startswith("ssh://"):
+        target["ssh_sudo"] = prompt_bool("  Use sudo on remote host?", False)
+        asked.target(volume_index, index, "ssh_sudo")
+    elif target_path.startswith("/mnt/") or "usb" in target_path.lower():
+        asked.target(volume_index, index, "require_mount")
+        if prompt_bool("  Require mount check (for external drives)?", True):
+            target["require_mount"] = _derive_require_mount(target_path)
+
+    # Encryption is offered only for raw:// / raw+ssh:// targets.
+    if target_path.startswith(("raw://", "raw+ssh://")):
+        asked.target(volume_index, index, *_ENCRYPTION_KEYS)
+        target.update(_prompt_target_encryption(target_path))
+
+    volume["targets"].append(target)
+    console.print(f"  [green]Added target:[/green] {target_path}")
+    return True
+
+
+def _run_interactive_wizard() -> WizardConfig:
+    """Run interactive configuration wizard; return the configuration and
+    what was asked."""
     display_wizard_header(
         "btrfs-backup-ng Configuration Wizard",
         "This wizard will help you create a configuration file.\n"
@@ -712,6 +982,7 @@ def _run_interactive_wizard() -> str:
     )
 
     config_data: dict[str, Any] = {}
+    asked = Asked()
 
     # Global settings
     display_section_header("Global Settings")
@@ -729,6 +1000,9 @@ def _run_interactive_wizard() -> str:
     config_data["transaction_log"] = prompt(
         "Transaction log path (leave empty to disable)", ""
     )
+    asked.global_key(
+        "snapshot_dir", "timestamp_format", "incremental", "log_file", "transaction_log"
+    )
 
     # Parallelism
     console.print()
@@ -739,47 +1013,24 @@ def _run_interactive_wizard() -> str:
     config_data["parallel_targets"] = prompt_int(
         "Max parallel targets per volume", 3, 1, 16
     )
+    asked.global_key("parallel_volumes", "parallel_targets")
 
     # Retention policy
     console.print()
     display_section_header("Retention Policy")
     console.print()
     console.print("Configure how long to keep snapshots. Set to 0 to disable.")
-
-    retention: dict[str, str | int] = {}
-    retention["min"] = prompt("Minimum retention period", "1d")
-    retention["hourly"] = prompt_int("Hourly snapshots to keep", 24, 0, 1000)
-    retention["daily"] = prompt_int("Daily snapshots to keep", 7, 0, 1000)
-    retention["weekly"] = prompt_int("Weekly snapshots to keep", 4, 0, 1000)
-    retention["monthly"] = prompt_int("Monthly snapshots to keep", 12, 0, 1000)
-    retention["yearly"] = prompt_int("Yearly snapshots to keep", 0, 0, 1000)
-    config_data["retention"] = retention
+    _ask_retention(config_data, asked)
 
     # Notifications
     console.print()
     display_section_header("Notifications")
 
-    if prompt_bool("Configure email notifications?", False):
-        email: dict[str, Any] = {"enabled": True}
-        email["smtp_host"] = prompt("SMTP host", "smtp.example.com")
-        email["smtp_port"] = prompt_int("SMTP port", 587, 1, 65535)
-        email["smtp_tls"] = prompt_choice(
-            "SMTP security", ["starttls", "ssl", "none"], "starttls"
-        )
-        email["smtp_user"] = prompt("SMTP username (leave empty if none)", "")
-        if email["smtp_user"]:
-            email["smtp_password"] = prompt("SMTP password", "")
-        email["from_addr"] = prompt("From address", "")
-        to_addrs_str = prompt("To addresses (comma-separated)", "")
-        if to_addrs_str:
-            email["to_addrs"] = [
-                a.strip() for a in to_addrs_str.split(",") if a.strip()
-            ]
-        email["on_success"] = prompt_bool("Notify on success?", False)
-        email["on_failure"] = prompt_bool("Notify on failure?", True)
-        config_data["email"] = email
+    _ask_email(config_data, asked)
 
+    asked.notification("webhook")
     if prompt_bool("Configure webhook notifications?", False):
+        asked.notification("webhook", *_WIZARD_WEBHOOK_KEYS)
         webhook: dict[str, Any] = {"enabled": True}
         webhook["url"] = prompt("Webhook URL", "")
         webhook["method"] = prompt_choice("HTTP method", ["POST", "GET", "PUT"], "POST")
@@ -814,6 +1065,8 @@ def _run_interactive_wizard() -> str:
             "snapshot_prefix": snapshot_prefix,
             "targets": [],
         }
+        volume_index = len(volumes)
+        asked.volume(volume_index, "path", "snapshot_prefix")
 
         # Targets for this volume
         console.print()
@@ -821,28 +1074,15 @@ def _run_interactive_wizard() -> str:
 
         add_target = True
         while add_target:
-            target_path = prompt("  Target path (local or ssh://user@host:/path)", "")
-            if not target_path:
+            if not _ask_target(
+                volume,
+                asked,
+                volume_index,
+                "  Target path (local or ssh://user@host:/path)",
+            ):
                 if not volume["targets"]:
-                    console.print(
-                        "  [yellow]At least one target is required per volume.[/yellow]"
-                    )
                     continue
                 break
-
-            target: dict[str, Any] = {"path": target_path}
-
-            if target_path.startswith("ssh://"):
-                target["ssh_sudo"] = prompt_bool("  Use sudo on remote host?", False)
-            elif target_path.startswith("/mnt/") or "usb" in target_path.lower():
-                if prompt_bool("  Require mount check (for external drives)?", True):
-                    target["require_mount"] = _derive_require_mount(target_path)
-
-            # Encryption is offered only for raw:// / raw+ssh:// targets.
-            target.update(_prompt_target_encryption(target_path))
-
-            volume["targets"].append(target)
-            console.print(f"  [green]Added target:[/green] {target_path}")
             add_target = prompt_bool("  Add another target?", False)
 
         volumes.append(volume)
@@ -855,7 +1095,7 @@ def _run_interactive_wizard() -> str:
     console.print()
     display_section_header("Configuration Complete")
 
-    return _generate_config_from_wizard(config_data)
+    return WizardConfig(_generate_config_from_wizard(config_data), asked)
 
 
 def execute_config(args: argparse.Namespace) -> int:
@@ -1022,30 +1262,37 @@ def _init_config(args: argparse.Namespace) -> int:
             return 1
 
         try:
-            content = _run_interactive_wizard()
+            wizard: WizardConfig | str = _run_interactive_wizard()
         except KeyboardInterrupt:
             print("\nConfiguration cancelled.")
             return 1
     else:
-        content = generate_example_config()
+        wizard = generate_example_config()
+    content, _asked = _wizard_parts(wizard)
 
     if output:
-        if _output_would_clobber(output, force=getattr(args, "force", False)):
-            if interactive:
-                confirmed = _confirm_overwrite(
-                    content, Path(output), f"\nFile {output} exists. Overwrite?"
-                )
-                if confirmed is None:
-                    console.print("[yellow]Aborted.[/yellow]")
-                    return 1
-                content = confirmed
-            else:
-                print(
-                    f"Error: {output} already exists. "
-                    "Re-run with --force to replace it.",
-                    file=sys.stderr,
-                )
+        force = getattr(args, "force", False)
+        if interactive and os.path.exists(output):
+            # The carry-over of what the wizard did not ask about happens
+            # whenever it saves over an existing file; --force only skips the
+            # question. Bypassing the carry-over with it replaced every option
+            # the wizard never asks about with the wizard's defaults.
+            confirmed = _confirm_overwrite(
+                wizard,
+                Path(output),
+                f"\nFile {output} exists. Overwrite?",
+                force=force,
+            )
+            if confirmed is None:
+                console.print("[yellow]Aborted.[/yellow]")
                 return 1
+            content = confirmed
+        elif _output_would_clobber(output, force=force):
+            print(
+                f"Error: {output} already exists. Re-run with --force to replace it.",
+                file=sys.stderr,
+            )
+            return 1
 
         try:
             # Create parent directory if needed
@@ -1099,7 +1346,7 @@ def _init_config(args: argparse.Namespace) -> int:
 
             if save_file.exists():
                 confirmed = _confirm_overwrite(
-                    content, save_file, f"File {save_path} exists. Overwrite?"
+                    wizard, save_file, f"File {save_path} exists. Overwrite?"
                 )
                 if confirmed is None:
                     console.print("[yellow]Aborted.[/yellow]")
@@ -1459,15 +1706,17 @@ def _display_detection_results(result) -> None:
     print()
 
 
-def _save_wizard_config(content: str) -> int:
+def _save_wizard_config(wizard: "WizardConfig | str") -> int:
     """Save wizard-generated configuration to file.
 
     Args:
-        content: TOML configuration content
+        wizard: the configuration and what the wizard asked; plain content is
+            a configuration authoritative for every key it sets
 
     Returns:
         Exit code
     """
+    content, _asked = _wizard_parts(wizard)
     default_path = str(get_default_config_path())
 
     # Show config preview
@@ -1509,7 +1758,7 @@ def _save_wizard_config(content: str) -> int:
 
         if save_file.exists():
             confirmed = _confirm_overwrite(
-                content, save_file, f"File {save_path} exists. Overwrite?"
+                wizard, save_file, f"File {save_path} exists. Overwrite?"
             )
             if confirmed is None:
                 console.print("[yellow]Aborted.[/yellow]")
@@ -1680,8 +1929,7 @@ def _run_detection_wizard(result) -> int:
             console.print()
             console.print("[dim]Switching to manual configuration...[/dim]")
             console.print()
-            content = _run_interactive_wizard()
-            return _save_wizard_config(content)
+            return _save_wizard_config(_run_interactive_wizard())
         # else: "detect" - continue with auto-detection below
 
     # Try to detect snapper configurations
@@ -1806,6 +2054,7 @@ def _run_detection_wizard(result) -> int:
     console.print()
 
     # Step 2: Configure each volume
+    asked = Asked()
     config_data: dict[str, Any] = {
         "snapshot_dir": ".snapshots",
         "timestamp_format": "%Y%m%d-%H%M%S",
@@ -1838,12 +2087,15 @@ def _run_detection_wizard(result) -> int:
             "path": sv.display_path,
             "targets": [],
         }
+        volume_index = len(config_data["volumes"])
+        asked.volume(volume_index, "path")
 
         # Configure based on whether this is a snapper volume
         if snapper_cfg:
             # Snapper-sourced volume
             console.print("  This volume is managed by snapper.")
             use_snapper = prompt_bool("  Use snapper as snapshot source?", True)
+            asked.volume(volume_index, "source", "snapper.config_name")
 
             if use_snapper:
                 volume["source"] = "snapper"
@@ -1860,82 +2112,47 @@ def _run_detection_wizard(result) -> int:
                 volume["snapshot_prefix"] = prompt_snapshot_prefix(
                     suggestion.suggested_prefix
                 )
+                asked.volume(volume_index, "snapshot_prefix")
         else:
             # Native volume
             volume["snapshot_prefix"] = prompt_snapshot_prefix(
                 suggestion.suggested_prefix
             )
+            asked.volume(volume_index, "snapshot_prefix")
 
         # Add targets
         console.print()
         console.print("  [bold]Add backup target(s) for this volume:[/bold]")
         add_target = True
         while add_target:
-            target_path = prompt(
-                "  Target path (local path or ssh://user@host:/path)", ""
-            )
-            if not target_path:
+            if not _ask_target(
+                volume,
+                asked,
+                volume_index,
+                "  Target path (local path or ssh://user@host:/path)",
+            ):
                 if not volume["targets"]:
-                    console.print(
-                        "  [yellow]At least one target is required per volume.[/yellow]"
-                    )
                     continue
                 break
-
-            target: dict[str, Any] = {"path": target_path}
-
-            if target_path.startswith("ssh://"):
-                target["ssh_sudo"] = prompt_bool("  Use sudo on remote host?", False)
-            elif target_path.startswith("/mnt/") or "usb" in target_path.lower():
-                if prompt_bool("  Require mount check (for external drives)?", True):
-                    target["require_mount"] = _derive_require_mount(target_path)
-
-            # Encryption is offered only for raw:// / raw+ssh:// targets.
-            target.update(_prompt_target_encryption(target_path))
-
-            volume["targets"].append(target)
-            console.print(f"  [green]Added target:[/green] {target_path}")
             add_target = prompt_bool("  Add another target?", False)
 
         config_data["volumes"].append(volume)
         console.print()
 
-    # Step 3: Global settings (optional)
+    # Step 3: Global settings (optional). Declined, nothing here was asked:
+    # the defaults in config_data are placeholders for a new file, and an
+    # existing file keeps its own values for every one of them.
     display_section_header("Global Settings")
 
     if prompt_bool("Configure global settings (retention, notifications)?", False):
         # Retention
         console.print()
         console.print("  [bold]Retention Policy:[/bold]")
-        retention = config_data["retention"]
-        retention["min"] = prompt("  Minimum retention period", "1d")
-        retention["hourly"] = prompt_int("  Hourly snapshots to keep", 24, 0, 1000)
-        retention["daily"] = prompt_int("  Daily snapshots to keep", 7, 0, 1000)
-        retention["weekly"] = prompt_int("  Weekly snapshots to keep", 4, 0, 1000)
-        retention["monthly"] = prompt_int("  Monthly snapshots to keep", 12, 0, 1000)
-        retention["yearly"] = prompt_int("  Yearly snapshots to keep", 0, 0, 1000)
+        _ask_retention(config_data, asked, indent="  ")
 
         # Email notifications
         console.print()
-        if prompt_bool("  Configure email notifications?", False):
-            email: dict[str, Any] = {"enabled": True}
-            email["smtp_host"] = prompt("  SMTP host", "smtp.example.com")
-            email["smtp_port"] = prompt_int("  SMTP port", 587, 1, 65535)
-            email["smtp_tls"] = prompt_choice(
-                "  SMTP security", ["starttls", "ssl", "none"], "starttls"
-            )
-            email["smtp_user"] = prompt("  SMTP username (leave empty if none)", "")
-            if email["smtp_user"]:
-                email["smtp_password"] = prompt("  SMTP password", "")
-            email["from_addr"] = prompt("  From address", "")
-            to_addrs_str = prompt("  To addresses (comma-separated)", "")
-            if to_addrs_str:
-                email["to_addrs"] = [
-                    a.strip() for a in to_addrs_str.split(",") if a.strip()
-                ]
-            email["on_success"] = prompt_bool("  Notify on success?", False)
-            email["on_failure"] = prompt_bool("  Notify on failure?", True)
-            config_data["email"] = email
+        _ask_email(config_data, asked, indent="  ")
     else:
         console.print(
             "  [dim]Using default settings (can be changed later in config file).[/dim]"
@@ -1945,6 +2162,7 @@ def _run_detection_wizard(result) -> int:
 
     # Step 4: Generate config
     new_config = _generate_config_from_wizard(config_data)
+    wizard = WizardConfig(new_config, asked)
 
     # Step 5: Check for existing config and show diff if needed
     existing_config_path = find_config_file(None)
@@ -1973,11 +2191,13 @@ def _run_detection_wizard(result) -> int:
             # Against what saving over that file would write: the options the
             # wizard does not ask about are kept, so they are not changes.
             try:
-                compared, _report = carry_over_existing(new_config, existing_content)
+                compared, _report = carry_over_existing(
+                    new_config, existing_content, asked
+                )
             except Exception:  # noqa: BLE001 - an unreadable file compares as-is
                 compared = new_config
             if diff_format == "summary":
-                _show_config_diff_summary(existing_content, compared, config_data)
+                _show_config_diff_summary(existing_content, compared)
             else:
                 _show_config_diff_text(existing_content, compared)
             console.print()
@@ -2025,9 +2245,7 @@ def _run_detection_wizard(result) -> int:
 
         # Check for overwrite
         if save_file.exists():
-            confirmed = _confirm_overwrite(
-                new_config, save_file, f"Overwrite {save_path}?"
-            )
+            confirmed = _confirm_overwrite(wizard, save_file, f"Overwrite {save_path}?")
             if confirmed is None:
                 console.print("[yellow]Save cancelled.[/yellow]")
                 return 0
@@ -2053,51 +2271,51 @@ def _run_detection_wizard(result) -> int:
     return 0
 
 
-def _show_config_diff_summary(
-    existing: str, new: str, config_data: dict[str, Any]
-) -> None:
-    """Show a human-friendly summary of config changes.
+def _show_config_diff_summary(existing: str, new: str) -> None:
+    """Show a human-friendly summary of the changes saving ``new`` over
+    ``existing`` makes.
 
-    Args:
-        existing: Existing config content
-        new: New config content
-        config_data: Parsed config data from wizard
+    Both are configuration text; ``new`` is what would actually be written
+    (the wizard's answers with the existing file's other options carried
+    over), so an option the carry-over keeps is not shown as a change.
     """
+    import tomllib
+
     print("  Changes:")
     print()
 
-    # Parse existing config to compare
     try:
-        import tomllib
-
         existing_parsed = tomllib.loads(existing)
     except Exception:
         print("  (Could not parse existing config for comparison)")
         print("  New configuration will replace existing.")
         return
+    try:
+        new_parsed = tomllib.loads(new)
+    except Exception:
+        print("  (Could not parse the new configuration for comparison)")
+        return
 
-    # Compare volumes
-    existing_volumes = {v.get("path"): v for v in existing_parsed.get("volumes", [])}
-    new_volumes = {v["path"]: v for v in config_data.get("volumes", [])}
+    def by_path(volumes: list) -> dict:
+        return {v.get("path"): v for v in volumes}
 
-    # Added volumes
-    for path in new_volumes:
+    existing_volumes = by_path(existing_parsed.get("volumes", []))
+    new_volumes = by_path(new_parsed.get("volumes", []))
+
+    for path, volume in new_volumes.items():
         if path not in existing_volumes:
-            prefix = new_volumes[path].get("snapshot_prefix", "")
-            targets = len(new_volumes[path].get("targets", []))
+            prefix = volume.get("snapshot_prefix", "")
+            targets = len(volume.get("targets", []))
             print(f"  + Add volume: {path}")
             print(f"      prefix: {prefix}, targets: {targets}")
 
-    # Removed volumes
     for path in existing_volumes:
         if path not in new_volumes:
             print(f"  - Remove volume: {path}")
 
-    # Modified volumes
-    for path in new_volumes:
+    for path, new_v in new_volumes.items():
         if path in existing_volumes:
             old = existing_volumes[path]
-            new_v = new_volumes[path]
             changes = []
 
             if old.get("snapshot_prefix") != new_v.get("snapshot_prefix"):
@@ -2116,9 +2334,8 @@ def _show_config_diff_summary(
                 for change in changes:
                     print(f"      {change}")
 
-    # Compare retention
     old_retention = existing_parsed.get("global", {}).get("retention", {})
-    new_retention = config_data.get("retention", {})
+    new_retention = new_parsed.get("global", {}).get("retention", {})
 
     retention_changes = []
     for key in ["min", "hourly", "daily", "weekly", "monthly", "yearly"]:
@@ -2132,16 +2349,13 @@ def _show_config_diff_summary(
         for change in retention_changes:
             print(f"      {change}")
 
-    # Check for notification changes
-    if config_data.get("email") and not existing_parsed.get("global", {}).get(
-        "notifications", {}
-    ).get("email"):
-        print("  + Add email notifications")
-
-    if config_data.get("webhook") and not existing_parsed.get("global", {}).get(
-        "notifications", {}
-    ).get("webhook"):
-        print("  + Add webhook notifications")
+    old_notifications = existing_parsed.get("global", {}).get("notifications", {})
+    new_notifications = new_parsed.get("global", {}).get("notifications", {})
+    for block in ("email", "webhook"):
+        if new_notifications.get(block) and not old_notifications.get(block):
+            print(f"  + Add {block} notifications")
+        elif old_notifications.get(block) and not new_notifications.get(block):
+            print(f"  - Remove {block} notifications")
 
 
 def _show_config_diff_text(existing: str, new: str) -> None:

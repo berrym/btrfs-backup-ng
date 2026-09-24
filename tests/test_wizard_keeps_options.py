@@ -28,6 +28,7 @@ from btrfs_backup_ng.cli.config_cmd import (
     _WIZARD_GLOBAL_KEYS,
     _WIZARD_TARGET_KEYS,
     _WIZARD_VOLUME_KEYS,
+    Asked,
     _generate_config_from_wizard,
     carry_over_existing,
 )
@@ -124,6 +125,19 @@ def _wizard(**overrides) -> str:
     return _generate_config_from_wizard(data)
 
 
+def _init_asked() -> Asked:
+    """What ``config init -i`` asks for /home and its one ssh target: every
+    global key, both notification gates, the volume's path and prefix, the
+    target's path and (an ssh:// target) ssh_sudo."""
+    asked = Asked()
+    asked.global_key(*_WIZARD_GLOBAL_KEYS)
+    asked.notification("email")
+    asked.notification("webhook")
+    asked.volume(0, "path", "snapshot_prefix")
+    asked.target(0, 0, "path", "ssh_sudo")
+    return asked
+
+
 def _load(tmp_path, name, text):
     path = tmp_path / name
     path.write_text(text)
@@ -199,7 +213,9 @@ class TestWhatIsKept:
 class TestTheWizardsAnswersWin:
     def test_a_blank_log_file_is_not_brought_back(self, tmp_path):
         existing = _existing(tmp_path, global_extra='log_file = "/var/log/old.log"\n')
-        merged, report = carry_over_existing(_wizard(log_file=""), existing)
+        merged, report = carry_over_existing(
+            _wizard(log_file=""), existing, _init_asked()
+        )
         assert "log_file" not in tomllib.loads(merged)["global"]
         assert any("global.log_file" in line for line in report.replaced)
 
@@ -217,7 +233,7 @@ class TestTheWizardsAnswersWin:
         existing = _existing(tmp_path).replace(
             "\n[global.retention]", more + "\n[global.retention]", 1
         )
-        merged, report = carry_over_existing(_wizard(), existing)
+        merged, report = carry_over_existing(_wizard(), existing, _init_asked())
         assert "notifications" not in tomllib.loads(merged)["global"]
         assert any("notifications.email" in line for line in report.replaced)
 
@@ -343,5 +359,5 @@ def test_the_asked_sets_name_real_schema_fields():
     volume_fields = {f.name for f in dataclasses.fields(VolumeConfig)}
     target_fields = {f.name for f in dataclasses.fields(TargetConfig)}
     assert _WIZARD_GLOBAL_KEYS <= global_fields
-    assert _WIZARD_VOLUME_KEYS <= volume_fields | {"source"}
+    assert {k.split(".")[0] for k in _WIZARD_VOLUME_KEYS} <= volume_fields | {"source"}
     assert _WIZARD_TARGET_KEYS <= target_fields

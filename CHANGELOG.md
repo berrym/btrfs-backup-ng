@@ -83,6 +83,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   confirmation prompt shows them the same way. The source is snapper's own
   timeline and is not pruned, as before. This is a behaviour change for a
   `prune` run on a snapper volume: it now deletes what `run` would.
+- **The configuration wizards replaced options they had not asked about.**
+  The carry-over that saves a wizard's answers over an existing file worked
+  from one fixed list of "asked" keys per wizard, while the wizards ask
+  conditionally. Declining "Configure global settings?" in `config detect
+  --wizard` replaced `snapshot_dir`, `timestamp_format`, `incremental`, the
+  parallel counts, the retention policy, `log_file` and the notifications
+  with defaults; a `raw+ssh://` target lost its `ssh_sudo` (the sudo
+  question is asked only for `ssh://`) and a target outside `/mnt` its
+  `require_mount`; a snapper volume re-entered through `config init -i`
+  became native and lost `[volumes.snapper]`; webhook headers and timeouts
+  were dropped; two volumes sharing a path collapsed into one; `--force`
+  skipped the carry-over along with the question; a changed answer was not
+  reported; and the diff summary compared the wizard's raw answers instead
+  of what would be written. Each wizard now records, as it prompts, which
+  keys it asked -- per volume and per target, with the snapper question
+  covering only the config name -- and everything else in the existing file
+  is kept, over any default the wizard wrote for it. Volumes and targets
+  are matched by path in order of occurrence; a changed answer is reported
+  with both values; `--force` skips only the question; the diff summary
+  reads the configuration that would be saved.
 - **Retention and `list` disagreed about a snapshot's date.** Retention kept
   a parser of its own -- a list of guessed formats and an unanchored search
   for digits -- so under `timestamp_format = "%Y%m%d"` the snapshot
