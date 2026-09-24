@@ -166,10 +166,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   missing** and then pruned most of it. The native pipeline already sends
   only what the target's prune keeps; the snapper pipeline now asks the
   same decision its prune makes, over the target's backups plus the
-  snapshots it is missing, and sends only those the prune would keep. The
-  target ends up holding exactly what it would have held had everything
-  been sent and pruned. `snapper backup`, which does not prune, still sends
-  everything.
+  snapshots it is missing, and sends only those the prune would keep. A
+  btrfs destination ends up holding exactly what it would have held had
+  everything been sent and pruned; a raw destination can hold fewer
+  streams, since its prune keeps a stored increment's parent and a parent
+  that was never sent needs no keeping. `snapper backup`, which does not
+  prune, still sends everything.
 - **`[global] quiet` could silence the endpoints for the rest of the
   process.** The shared logger the endpoints write through was built
   outside the logging manager, whose job it is to clear every logger's

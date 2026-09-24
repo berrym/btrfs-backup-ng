@@ -14,8 +14,10 @@ Create a new snapshot of the source volume
 Transfer snapshots to all configured targets (incrementally when possible).
 A target that has missed runs is sent what it is missing, except what its own
 retention would delete in step 3: that decision is made before sending, by the
-same retention rules, so the target ends up with what it would have held had
-everything been sent and pruned.
+same retention rules. A btrfs target ends up holding exactly what it would have
+held had everything been sent and pruned. A raw target can end up holding
+fewer streams: its prune keeps a stored increment's parent, and a parent that
+was never sent needs no keeping.
 .IP 3. 3
 Apply retention policies to clean up old snapshots and backups
 .PP
