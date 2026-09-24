@@ -13,8 +13,46 @@ from pathlib import Path
 from rich.console import Console
 from rich.logging import RichHandler
 
+#: The levels ``BTRFS_BACKUP_LOG_LEVEL`` may name.
+ENVIRONMENT_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR")
+
+
+def environment_log_level() -> str | None:
+    """The console level ``BTRFS_BACKUP_LOG_LEVEL`` asks for, or None.
+
+    The lowest-precedence source: a command-line flag (``--debug``, ``-q``,
+    ``-v``) wins over it, and a configuration's ``[global] quiet``, ``verbose``
+    or ``btrfs_debug`` wins over it too, so it decides only where neither said
+    anything. Documented for years and, until this, read once at import and
+    then overwritten by every command's ``create_logger``. A value that is
+    not one of ``ENVIRONMENT_LEVELS`` is ignored, and said so once.
+    """
+    raw = os.environ.get("BTRFS_BACKUP_LOG_LEVEL")
+    if raw is None or raw.strip() == "":
+        return None
+    name = raw.strip().upper()
+    if name in ENVIRONMENT_LEVELS:
+        return name
+    _warn_about_environment_level(raw)
+    return None
+
+
+_environment_level_warned: set[str] = set()
+
+
+def _warn_about_environment_level(raw: str) -> None:
+    if raw in _environment_level_warned:
+        return
+    _environment_level_warned.add(raw)
+    logging.getLogger(__name__).warning(
+        "BTRFS_BACKUP_LOG_LEVEL=%r is not one of %s; it is ignored",
+        raw,
+        ", ".join(ENVIRONMENT_LEVELS),
+    )
+
+
 # Get initial log level from environment or default to INFO
-_initial_level_name = os.environ.get("BTRFS_BACKUP_LOG_LEVEL", "INFO").upper()
+_initial_level_name = environment_log_level() or "INFO"
 _initial_level = getattr(logging, _initial_level_name, logging.INFO)
 
 # Initialize basic console and handler

@@ -285,7 +285,15 @@ def add_verbosity_args(parser: argparse.ArgumentParser) -> None:
 
 
 def get_log_level(args: argparse.Namespace) -> str:
-    """Determine log level from parsed arguments.
+    """Determine the console log level from the command line.
+
+    The command line decides first; without a flag the environment's
+    ``BTRFS_BACKUP_LOG_LEVEL`` decides; without that, INFO. The
+    configuration's ``quiet`` / ``verbose`` / ``btrfs_debug`` are applied
+    afterwards by ``apply_config_verbosity``, once the configuration is
+    read, and they win over the environment but not over a flag
+    (``config_log_level``). So: flags, then configuration, then environment,
+    then the default.
 
     Args:
         args: Parsed command line arguments
@@ -302,8 +310,9 @@ def get_log_level(args: argparse.Namespace) -> str:
         return "WARNING"
     elif getattr(args, "verbose", False):
         return "DEBUG"
-    else:
-        return "INFO"
+    from ..__logger__ import environment_log_level
+
+    return environment_log_level() or "INFO"
 
 
 def add_fs_checks_args(parser: argparse.ArgumentParser) -> None:

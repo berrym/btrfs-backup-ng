@@ -1435,7 +1435,7 @@ metadata write likewise avoid predictable, symlink-plantable paths.
 | `BTRFS_BACKUP_SUDO_PASSWORD` | Sudo password for remote hosts (avoids interactive prompt) |
 | `BTRFS_BACKUP_SSH_PASSWORD` | Enable SSH password authentication |
 | `BTRFS_BACKUP_PASSWORDLESS_ONLY` | Only use passwordless sudo (fail if password required) |
-| `BTRFS_BACKUP_LOG_LEVEL` | Override log level (DEBUG, INFO, WARNING, ERROR) |
+| `BTRFS_BACKUP_LOG_LEVEL` | Console log level when nothing else says (DEBUG, INFO, WARNING, ERROR). The lowest-precedence source: `--debug`/`--btrfs-debug`/`-q`/`-v` win over it, and `[global] quiet`/`verbose`/`btrfs_debug` in the configuration win over it too. Any other value is ignored, with a warning. |
 | `SSH_AUTH_SOCK` | SSH agent socket (preserve with `sudo -E`) |
 
 ---

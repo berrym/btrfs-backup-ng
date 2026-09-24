@@ -41,16 +41,20 @@ def _config(tmp_path, *global_lines: str) -> str:
     return str(path)
 
 
-def _run(capsys, *argv: str) -> str:
+def _run(capsys, *argv: str, env_level: str | None = None) -> str:
     """The console output of one real command, run as the operator runs it.
 
     A separate process, because the setting under test is process state (the
     console's level) and a command run in-process twice shares it -- and
     shares caches that change which lines are logged at all. Whitespace is
     collapsed: the console renderer wraps long lines at the terminal width.
+    ``env_level`` is what ``BTRFS_BACKUP_LOG_LEVEL`` says in that process;
+    None unsets it.
     """
     env = {**os.environ, "COLUMNS": "200"}
     env.pop("BTRFS_BACKUP_LOG_LEVEL", None)
+    if env_level is not None:
+        env["BTRFS_BACKUP_LOG_LEVEL"] = env_level
     result = subprocess.run(
         [sys.executable, "-m", "btrfs_backup_ng", *argv],
         capture_output=True,
@@ -96,6 +100,60 @@ class TestTheCommandLineWins:
         out = _run(capsys, "-q", "-c", _config(tmp_path, "verbose = true"), "list")
         assert DEBUG_AFTER_LOAD not in out
         assert INFO_AFTER_LOAD not in out
+
+
+class TestTheEnvironmentIsTheLowestSource:
+    """``BTRFS_BACKUP_LOG_LEVEL`` was documented and dead: read once at
+    import, then overwritten by every command's logger setup. It now decides
+    the console level where neither a flag nor the configuration does, and
+    loses to both."""
+
+    def test_the_environment_alone_sets_the_level(self, tmp_path, capsys):
+        out = _run(capsys, "-c", _config(tmp_path), "list", env_level="DEBUG")
+        assert DEBUG_AFTER_LOAD in out
+        out = _run(capsys, "-c", _config(tmp_path), "list", env_level="WARNING")
+        assert INFO_AFTER_LOAD not in out
+
+    def test_the_configuration_wins_over_the_environment(self, tmp_path, capsys):
+        out = _run(
+            capsys,
+            "-c",
+            _config(tmp_path, "verbose = true"),
+            "list",
+            env_level="WARNING",
+        )
+        assert DEBUG_AFTER_LOAD in out
+        out = _run(
+            capsys, "-c", _config(tmp_path, "quiet = true"), "list", env_level="DEBUG"
+        )
+        assert INFO_AFTER_LOAD not in out
+
+    def test_a_flag_wins_over_the_environment(self, tmp_path, capsys):
+        out = _run(capsys, "-v", "-c", _config(tmp_path), "list", env_level="WARNING")
+        assert DEBUG_AFTER_LOAD in out
+        out = _run(capsys, "-q", "-c", _config(tmp_path), "list", env_level="DEBUG")
+        assert INFO_AFTER_LOAD not in out
+
+    def test_a_value_that_is_not_a_level_is_ignored_and_said(self, tmp_path, capsys):
+        out = _run(capsys, "-c", _config(tmp_path), "list", env_level="loud")
+        assert INFO_AFTER_LOAD in out
+        assert "BTRFS_BACKUP_LOG_LEVEL='loud' is not one of" in out
+
+    def test_get_log_level_reads_the_environment_last(self, monkeypatch):
+        from btrfs_backup_ng import __logger__
+        from btrfs_backup_ng.cli.common import get_log_level
+
+        monkeypatch.setenv("BTRFS_BACKUP_LOG_LEVEL", "warning")
+        assert get_log_level(types.SimpleNamespace()) == "WARNING"
+        assert get_log_level(types.SimpleNamespace(verbose=True)) == "DEBUG"
+        assert get_log_level(types.SimpleNamespace(quiet=True)) == "WARNING"
+        monkeypatch.setenv("BTRFS_BACKUP_LOG_LEVEL", "DEBUG")
+        assert get_log_level(types.SimpleNamespace(quiet=True)) == "WARNING"
+        monkeypatch.setenv("BTRFS_BACKUP_LOG_LEVEL", " ")
+        assert __logger__.environment_log_level() is None
+        assert get_log_level(types.SimpleNamespace()) == "INFO"
+        monkeypatch.delenv("BTRFS_BACKUP_LOG_LEVEL")
+        assert get_log_level(types.SimpleNamespace()) == "INFO"
 
 
 class TestTheLogFileKeepsItsOwnLevel:

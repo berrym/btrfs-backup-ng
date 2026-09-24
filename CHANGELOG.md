@@ -146,6 +146,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   pinned slot and deletes nothing when the store cannot be read. The
   documentation's "a prune cannot delete what is being read" is now true
   wherever a backup lives.
+- **`BTRFS_BACKUP_LOG_LEVEL` did nothing.** Documented for years, read once
+  at import and overwritten by every command's logger setup. It now sets
+  the console level where neither a command-line flag nor the
+  configuration's `quiet`/`verbose`/`btrfs_debug` says anything, and loses
+  to both; a value that is not `DEBUG`, `INFO`, `WARNING` or `ERROR` is
+  ignored with a warning.
 - **Retention and `list` disagreed about a snapshot's date.** Retention kept
   a parser of its own -- a list of guessed formats and an unanchored search
   for digits -- so under `timestamp_format = "%Y%m%d"` the snapshot
