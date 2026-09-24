@@ -51,6 +51,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   every other process an endpoint starts; a structural test over the
   endpoint modules refuses any new `Popen(stderr=PIPE)` without a drain,
   and a flood test per endpoint class proves the drain.
+- **`restore --status` reported "Available snapshots: 0" for a location
+  holding snapper backups.** Snapper backups are numbered slots, not
+  prefix-named snapshots, so the prefix listing was empty however many
+  backups the location held. The status now lists the snapper backups the
+  way `snapper restore --list` does, with the pins a snapper restore holds
+  on each, and says when the layout is there but could not be enumerated
+  rather than printing zero.
 - **Retention and `list` disagreed about a snapshot's date.** Retention kept
   a parser of its own -- a list of guessed formats and an unanchored search
   for digits -- so under `timestamp_format = "%Y%m%d"` the snapshot

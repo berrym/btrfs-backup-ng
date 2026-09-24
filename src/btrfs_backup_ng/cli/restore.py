@@ -1015,6 +1015,7 @@ def _execute_status(args: argparse.Namespace) -> int:
 
     # List snapshots for reference, under the prefix this location actually
     # uses -- reporting 0 for a location holding backups reads as data loss.
+    snapshots: list[Any] = []
     try:
         snapshots, inferred = _list_for_display(backup_endpoint)
         if inferred:
@@ -1024,7 +1025,112 @@ def _execute_status(args: argparse.Namespace) -> int:
     except Exception as e:
         logger.warning("Could not list snapshots: %s", e)
 
+    # A snapper backup location holds numbered slots (.snapshots/<n>/snapshot)
+    # or sidecar-named streams, not prefix-named snapshots, so the listing
+    # above is 0 for it however many backups it holds -- the same "0 for a
+    # location holding backups" this command is not allowed to print. Those
+    # backups are enumerated the way `snapper restore --list` enumerates them
+    # and reported with the pins a running snapper restore holds on them.
+    _print_snapper_backups(source, backup_endpoint, args, locks, snapshots)
+
     return 0
+
+
+def _snapper_endpoint_options(args: argparse.Namespace) -> dict[str, Any]:
+    """The restore command's connection options in the shape the snapper
+    enumeration (``list_snapper_backups``) takes: the same options
+    ``snapper restore`` threads, so a location written with ``--ssh-sudo`` is
+    read back with it and the enumeration is of what is there."""
+    options: dict[str, Any] = {}
+    if getattr(args, "ssh_sudo", False):
+        options["ssh_sudo"] = True
+    if getattr(args, "skip_remote_lock", None):
+        options["skip_remote_lock"] = True
+    if btrfs_debug_enabled(args):
+        options["btrfs_debug"] = True
+    if getattr(args, "ssh_key", None):
+        options["ssh_identity_file"] = args.ssh_key
+        options["ssh_key"] = args.ssh_key
+    if getattr(args, "ssh_auth_sock", None):
+        options["ssh_auth_sock"] = args.ssh_auth_sock
+    if getattr(args, "ssh_host_key_policy", None):
+        options["ssh_host_key_policy"] = args.ssh_host_key_policy
+    if getattr(args, "gpg_keyring", None):
+        options["gpg_keyring"] = args.gpg_keyring
+    if getattr(args, "openssl_cipher", None):
+        options["openssl_cipher"] = args.openssl_cipher
+    return options
+
+
+def _snapper_pin_key(backup: dict) -> str:
+    """The name under which a snapper restore pins this backup on its location:
+    the engine's key for a numbered slot is ``snapshot-<n>``, for a raw stream
+    its own file name (``core.operations._SnapperBtrfsBackup.get_name``,
+    ``RawSnapshot``)."""
+    name = backup.get("backup_name")
+    if name:
+        return str(name)
+    return f"snapshot-{backup.get('number')}"
+
+
+def _print_snapper_backups(
+    source: str,
+    backup_endpoint: Any,
+    args: argparse.Namespace,
+    locks: dict[str, Any],
+    prefix_snapshots: list[Any],
+) -> None:
+    """Report the snapper backups at ``source`` and the pins held on them.
+
+    Prints nothing for a location with no snapper layout. A layout that is
+    there but cannot be enumerated is reported as exactly that, never as
+    zero backups.
+    """
+    from ..core.restore import list_snapper_backups, snapper_layout_present
+
+    if not snapper_layout_present(backup_endpoint):
+        return
+    try:
+        backups = list_snapper_backups(source, _snapper_endpoint_options(args))
+    except Exception as e:
+        print()
+        print(f"Snapper backups: the layout at {source} could not be enumerated ({e}).")
+        print("This is NOT a report of zero backups; resolve the error before")
+        print("treating this location as empty.")
+        return
+
+    print()
+    print(f"Snapper backups: {len(backups)}")
+    if not prefix_snapshots:
+        print("(This location holds snapper backups, numbered by snapshot, rather")
+        print(" than prefix-named snapshots; list and restore them with")
+        print(" `btrfs-backup-ng snapper restore --list <source>`.)")
+    if not backups:
+        return
+    print()
+    pinned_total = 0
+    for backup in backups:
+        metadata = backup.get("metadata")
+        date = getattr(metadata, "date", None)
+        when = date.strftime("%Y-%m-%d %H:%M:%S") if date else "date unknown"
+        kind = getattr(metadata, "type", None) or "?"
+        description = getattr(metadata, "description", None) or ""
+        lock_info = locks.get(_snapper_pin_key(backup), {}) if locks else {}
+        pins = list(lock_info.get("locks", [])) + list(
+            lock_info.get("parent_locks", [])
+        )
+        line = f"  {backup.get('number'):>6}  {kind:<6}  {when:<19}  {description[:30]}"
+        if pins:
+            pinned_total += 1
+            line += "  pinned: " + ", ".join(pins)
+        print(line.rstrip())
+    if pinned_total:
+        print()
+        print(
+            f"{pinned_total} snapper backup(s) are pinned by a restore in progress "
+            f"(or one that did not finish); retention does not delete a pinned "
+            f"backup. Unlock a finished session with restore --unlock."
+        )
 
 
 def _execute_unlock(args: argparse.Namespace, lock_id: str) -> int:

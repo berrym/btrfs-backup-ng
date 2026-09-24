@@ -169,7 +169,13 @@ List volumes and their backup targets from the configuration file.
 .SS Recovery Options
 .TP
 .B \-\-status
-Show status of locks and incomplete restores at the backup location.
+Show status of locks and incomplete restores at the backup location. A
+location holding snapper backups (numbered
+.B .snapshots/<n>
+slots, or raw streams with
+.B .snapper-meta.json
+sidecars) lists those backups as well, each with the pins a snapper restore
+holds on it.
 .TP
 .BI \-\-unlock " " [\fILOCK_ID\fR]
 Unlock stuck restore sessions. Use "all" to unlock all restore locks,

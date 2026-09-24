@@ -1785,7 +1785,7 @@ Two situations are refused before anything is transferred:
 | `--no-fs-checks` | Skip btrfs subvolume verification (needed for backup directories) |
 | `--progress` | Show progress bars (default in terminal) |
 | `--no-progress` | Disable progress bars |
-| `--status` | Show locks and incomplete restores at backup location. On `ssh://` and `raw+ssh://` this reads locks recorded on the target, so it sees other processes and other machines |
+| `--status` | Show locks and incomplete restores at backup location. On `ssh://` and `raw+ssh://` this reads locks recorded on the target, so it sees other processes and other machines. A location holding snapper backups (numbered `.snapshots/<n>` slots, or raw streams with `.snapper-meta.json` sidecars) lists those backups too, each with the pins a snapper restore holds on it |
 | `--unlock [ID]` | Unlock stuck restore sessions ('all' or specific session ID) |
 | `--skip-remote-lock` | Proceed even if a lock cannot be recorded on the remote target. Only safe when nothing else can prune this target during the run |
 | `--cleanup` | Remove what an interrupted restore left at the destination: only a subvolume this tool's own run marker names that holds no received copy. Everything else is reported and left |
