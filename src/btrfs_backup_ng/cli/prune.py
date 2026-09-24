@@ -152,12 +152,60 @@ def plan_snapper_retention(
     backups = list_snapper_backups(backup_path, endpoint_options)
     if not backups:
         return [], []
+    return plan_snapper_retention_of(backups, retention, now=now)
+
+
+def _snapper_item_name(item: Any) -> str:
+    """How a snapper item is named to the retention engine: a destination
+    backup (a dict from ``list_snapper_backups``) by its slot, a source
+    snapshot not yet transferred (a ``SnapperSnapshot``) by its number."""
+    if isinstance(item, dict):
+        return f"slot {item.get('number')}"
+    return f"source snapshot {getattr(item, 'number', '?')}"
+
+
+def _snapper_item_timestamp(item: Any) -> Any:
+    """A destination backup's date from its info.xml; a source snapshot's
+    from snapper. None when unknown, which the engine quarantines and keeps."""
+    if isinstance(item, dict):
+        return snapper_backup_timestamp(item)
+    date = getattr(item, "date", None)
+    return date if isinstance(date, datetime) else None
+
+
+def _snapper_item_order(item: Any) -> int:
+    """A snapper item's creation order: its snapper number, which snapper
+    hands out in creation order. Two backups or snapshots taken within one
+    second share a date, and this is what orders them."""
+    number = (
+        item.get("number") if isinstance(item, dict) else getattr(item, "number", 0)
+    )
+    try:
+        return int(str(number))
+    except (TypeError, ValueError):
+        return 0
+
+
+def plan_snapper_retention_of(
+    items: list, retention: Any, now: Any = None
+) -> tuple[list, list]:
+    """The snapper retention decision over ``items``: ``(keep, delete)``.
+
+    ``items`` are destination backups (``list_snapper_backups`` dicts), or
+    those plus source snapshots the destination does not hold yet. The one
+    place the decision is made: ``plan_snapper_retention`` asks it about a
+    destination's enumeration, and ``run`` asks it, before sending, about the
+    destination's backups plus the snapshots it is missing -- so what ``run``
+    leaves out of a snapper catch-up is exactly what its own prune would
+    delete a moment later.
+    """
     return apply_retention(
-        backups,
+        items,
         retention,
-        get_name=lambda b: f"slot {b.get('number')}",
+        get_name=_snapper_item_name,
         now=now,
-        get_timestamp=snapper_backup_timestamp,
+        get_timestamp=_snapper_item_timestamp,
+        get_order=_snapper_item_order,
     )
 
 

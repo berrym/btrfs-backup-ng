@@ -54,6 +54,7 @@ from .prune import (
     is_degenerate_policy,
     plan_endpoint_retention,
     plan_retention_of,
+    plan_snapper_retention_of,
 )
 
 logger = logging.getLogger(__name__)
@@ -957,6 +958,13 @@ def _backup_snapper_volume(
                 destination_endpoint,
                 snapper_config=snapper_config,
                 options=options,
+                select=_snapper_catch_up_selector(
+                    volume,
+                    config,
+                    target,
+                    snapper_endpoint_config,
+                    destination_endpoint,
+                ),
             )
 
             stats["completed"] += transferred
@@ -1127,6 +1135,88 @@ def _catch_up_selector(
             logger.info(
                 "Not sending %d of %d missing snapshot(s) to %s: the target's "
                 "retention would delete them straight after the transfer (%s).",
+                len(left_out),
+                len(missing),
+                target_config.path,
+                ", ".join(left_out),
+            )
+        return chosen
+
+    return select
+
+
+def _snapper_catch_up_selector(
+    volume: VolumeConfig,
+    config: Config,
+    target_config: TargetConfig,
+    endpoint_config: dict[str, Any],
+    destination_endpoint: Any = None,
+):
+    """What ``run`` sends a snapper target that is behind: what its prune keeps.
+
+    The snapper twin of ``_catch_up_selector``. ``run`` prunes each snapper
+    destination straight after transferring to it, with the target's own
+    policy, over the backups' info.xml dates (``_prune_snapper_after_transfer``
+    -> ``plan_snapper_retention``). A destination that has been away is
+    missing a backlog of snapper snapshots, and sending all of it means
+    sending snapshots that are neither the newest nor the oldest of their
+    time bucket only for the prune to delete them. So the same decision the
+    prune makes (``plan_snapper_retention_of``) is asked first, of the
+    destination's backups plus the snapshots it is missing, and only the
+    missing ones it keeps are sent; the planner then chains each against the
+    newest earlier snapshot the destination holds or receives in this run.
+    The destination ends up holding exactly what it would have held had
+    everything been sent and pruned.
+
+    Returns a ``select`` for ``sync_snapper_snapshots``, or None to send
+    everything: under a policy the prune refuses (degenerate -- it would
+    delete nothing, so nothing may be left out), and whenever the decision
+    cannot be made -- the destination cannot be enumerated, the policy is
+    invalid -- because leaving out a snapshot the prune would have kept loses
+    history.
+    """
+    retention = config.get_target_retention(volume, target_config)
+    if is_degenerate_policy(retention):
+        return None
+
+    def select(missing: list):
+        from ..core.restore import list_snapper_backups, snapper_layout_present
+
+        if len(missing) < 2:
+            return None
+        try:
+            # A destination that exists but has no .snapshots yet holds no
+            # backups: the first backup to it is a catch-up like any other.
+            # The enumeration refuses to call an absent layout "empty" (it is
+            # a restore-side reader), so it is asked only when there is one.
+            if destination_endpoint is not None and not snapper_layout_present(
+                destination_endpoint
+            ):
+                held: list = []
+            else:
+                held = list_snapper_backups(target_config.path, endpoint_config)
+        except Exception as e:  # noqa: BLE001 - cannot decide, so send everything
+            logger.debug(
+                "Catch-up: could not enumerate snapper backups at %s (%s); sending all",
+                target_config.path,
+                e,
+            )
+            return None
+        try:
+            to_keep, _ = plan_snapper_retention_of(held + list(missing), retention)
+        except Exception as e:  # noqa: BLE001 - cannot decide, so send everything
+            logger.debug(
+                "Catch-up: retention not decidable for %s (%s)", target_config.path, e
+            )
+            return None
+        kept = {id(s) for s in to_keep}
+        chosen = [s for s in missing if id(s) in kept]
+        left_out = [str(s.number) for s in missing if id(s) not in kept]
+        if left_out:
+            logger.info(
+                "Not sending %d of %d missing snapper snapshot(s) to %s: the "
+                "target's retention would delete them straight after the "
+                "transfer (%s).",
                 len(left_out),
                 len(missing),
                 target_config.path,

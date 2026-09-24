@@ -28,6 +28,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   undated -- kept, never deleted -- as the README has always said. Names
   that parse under neither the configured nor the default format, which
   only the old guessed formats dated, are now kept rather than pruned.
+- **A snapper `run` sent a target that was behind everything it was
+  missing** and then pruned most of it. The native pipeline already sends
+  only what the target's prune keeps; the snapper pipeline now asks the
+  same decision its prune makes, over the target's backups plus the
+  snapshots it is missing, and sends only those the prune would keep. The
+  target ends up holding exactly what it would have held had everything
+  been sent and pruned. `snapper backup`, which does not prune, still sends
+  everything.
 - **`[global] quiet` could silence the endpoints for the rest of the
   process.** The shared logger the endpoints write through was built
   outside the logging manager, whose job it is to clear every logger's
@@ -77,6 +85,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **The chunked `ssh://` receive kept a stdout pipe it never read** and
   left its stderr pipe open until garbage collection; the pipe nobody reads
   is gone and the stderr is drained like every other receive's.
+- **Two snapper snapshots taken within one second could have the newer one
+  deleted.** snapper dates have one-second resolution and no collision
+  counter, so snapshots taken in quick succession share a timestamp, and
+  retention broke the tie by input order read newest-first: the lowest
+  number of a tie became "latest" and the highest its bucket's oldest member
+  or nothing. Measured on real btrfs with four snapshots taken in two
+  seconds under `daily = 1`: the plan kept 2 and 3 and deleted 1 and 4, the
+  newest snapshot among them -- from the prune and from `run`'s catch-up
+  alike. A snapper number is its creation order and now breaks the tie in
+  every snapper retention path.
 
 ## [0.9.10] - 2026-09-23
 

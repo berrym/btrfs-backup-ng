@@ -872,3 +872,61 @@ class TestSnapperSource:
         assert remote_sh(f"test -e '{never}'").returncode != 0, (
             "the missing remote target was built"
         )
+
+    def test_run_sends_a_behind_target_only_what_its_prune_keeps(
+        self, rig, snapper_chain
+    ):
+        """Four same-day snapper snapshots and a target that has none of them:
+        `run` under a daily-only policy sends the day's first and the newest,
+        says which two it left out, and the target ends up holding exactly
+        what `snapper backup` of everything followed by the prune leaves.
+        Before this the snapper pipeline sent all four and pruned two a
+        moment later.
+        """
+        snap = snapper_chain
+        numbers = [snap.take(f"catch-up {i}") for i in range(4)]
+        policy = (
+            'min = "0s"\nhourly = 0\ndaily = 1\nweekly = 0\nmonthly = 0\nyearly = 0'
+        )
+
+        def slots(target: Path) -> list[int]:
+            snapshots = target / ".snapshots"
+            if not snapshots.is_dir():
+                return []
+            return sorted(
+                int(p.name) for p in snapshots.iterdir() if p.name.isdecimal()
+            )
+
+        selective = rig.dst / "snapper-catch-up-run"
+        selective.mkdir()
+        cfg = rig.write_config(
+            rig.root / "cfg-snapper-catch-up.toml",
+            f'path = "{selective}"',
+            source="snapper",
+            snapper_config=snap.name,
+            retention=policy,
+            prefix="t3sc-",
+        )
+        r = rig.cli("run", config=cfg)
+        out = r.stdout + r.stderr
+        assert r.returncode == 0, out[-3000:]
+        flat = " ".join(out.split())
+        assert "Not sending 2 of 4 missing snapper snapshot(s)" in flat, out[-3000:]
+        assert slots(selective) == [numbers[0], numbers[-1]], out[-3000:]
+
+        everything = rig.dst / "snapper-catch-up-all"
+        everything.mkdir()
+        r2 = rig.cli("snapper", "backup", snap.name, str(everything), "--min-age", "0s")
+        assert r2.returncode == 0, (r2.stdout + r2.stderr)[-3000:]
+        assert slots(everything) == numbers
+        cfg2 = rig.write_config(
+            rig.root / "cfg-snapper-catch-up-all.toml",
+            f'path = "{everything}"',
+            source="snapper",
+            snapper_config=snap.name,
+            retention=policy,
+            prefix="t3sca-",
+        )
+        r3 = rig.cli("run", config=cfg2)  # nothing new to send; the prune runs
+        assert r3.returncode == 0, (r3.stdout + r3.stderr)[-3000:]
+        assert slots(everything) == slots(selective) == [numbers[0], numbers[-1]]

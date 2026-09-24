@@ -796,6 +796,34 @@ def _list_remote_snapper_backups(
     return backups
 
 
+def snapper_layout_present(endpoint: Any) -> bool:
+    """Whether the endpoint's location is laid out as snapper backups: a
+    ``.snapshots`` directory on a btrfs location (local or ssh://), or
+    ``.snapper-meta.json`` sidecars on a raw one.
+
+    Read-only. Answers the question the enumeration deliberately does not --
+    ``list_snapper_backups`` raises for an absent layout, because a restore
+    must never mistake a mistyped path for an empty one -- so a caller that
+    needs "is there anything here at all" (the status command, the backup
+    direction's first transfer to a fresh target) asks this first. A probe
+    that cannot be made says no; the enumeration that follows a yes raises
+    its own error when it cannot look.
+    """
+    from ..endpoint.raw import RawEndpoint
+    from .operations import _list_snapper_backups_at_destination
+
+    base = str(endpoint.config["path"]).rstrip("/")
+    try:
+        if isinstance(endpoint, RawEndpoint):
+            return bool(_list_snapper_backups_at_destination(endpoint))
+        if getattr(endpoint, "_is_remote", False):
+            return _remote_dir_exists(endpoint, f"{base}/.snapshots")
+        return Path(base, ".snapshots").is_dir()
+    except Exception as e:  # noqa: BLE001 - a failed probe is "not snapper", said
+        logger.debug("Could not probe %s for a snapper layout: %s", base, e)
+        return False
+
+
 def _remote_dir_exists(endpoint: Any, path: str) -> bool:
     """True when ``path`` is a directory on the endpoint's remote host.
 

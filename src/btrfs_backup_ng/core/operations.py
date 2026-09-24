@@ -2950,6 +2950,7 @@ def sync_snapper_snapshots(
     destination_endpoint,
     snapper_config=None,
     options: dict | None = None,
+    select=None,
 ) -> int:
     """Synchronize snapper snapshots to a destination.
 
@@ -2967,6 +2968,11 @@ def sync_snapper_snapshots(
         destination_endpoint: Destination Endpoint (its config["path"] is the backup base)
         snapper_config: Optional SnapperSourceConfig with filtering options
         options: Additional transfer options
+        select: Optional ``(missing) -> list | None``: given the eligible
+            snapper snapshots the destination does not hold, the subset to
+            plan; None plans all of them. ``run`` passes one that leaves out
+            what the destination's own retention would delete straight after
+            the transfer (``cli.run._snapper_catch_up_selector``).
 
     Returns:
         Number of snapshots transferred (on full success).
@@ -3012,7 +3018,7 @@ def sync_snapper_snapshots(
     # incrementals. Each snapper snapshot is wrapped as a uuid-enriched Snapshot; the planner
     # also projects in-run transfers, so a fresh full history is a tight incremental chain
     # (P3b-1), not all-full sends.
-    from .planning import plan_transfer_sequence
+    from .planning import plan_transfer_sequence, snapshots_present_on
 
     wrappers = [
         _create_snapper_snapshot_wrapper(s, destination_endpoint)
@@ -3022,7 +3028,25 @@ def sync_snapper_snapshots(
         w.get_name(): s for w, s in zip(wrappers, snapper_snapshots)
     }
     dest_view = _snapper_dest_view(destination_endpoint)
-    plan = plan_transfer_sequence(wrappers, dest_view)
+    only = None
+    if select is not None:
+        # The same presence authority the planner uses (correspondence), so
+        # "missing" here is what the planner would send.
+        present = snapshots_present_on(wrappers, dest_view)
+        missing = [
+            snapper_by_wrapper_name[w.get_name()]
+            for w in wrappers
+            if w.get_name() not in present
+        ]
+        chosen = select(missing)
+        if chosen is not None:
+            chosen_ids = {id(s) for s in chosen}
+            only = [
+                w
+                for w in wrappers
+                if id(snapper_by_wrapper_name[w.get_name()]) in chosen_ids
+            ]
+    plan = plan_transfer_sequence(wrappers, dest_view, only=only)
 
     if not plan:
         logger.info("All snapper snapshots already backed up")
