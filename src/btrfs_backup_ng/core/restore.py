@@ -603,7 +603,7 @@ def list_snapper_backups(
         )
 
     for item in snapshots_dir.iterdir():
-        if item.is_dir() and item.name.isdigit():
+        if item.is_dir() and item.name.isdecimal():
             snapshot_path = item / "snapshot"
             info_xml_path = item / "info.xml"
 
@@ -756,7 +756,7 @@ def _list_remote_snapper_backups(
         if not slot:
             continue
         name = slot.rsplit("/", 1)[-1]
-        if not name.isdigit():
+        if not name.isdecimal():
             # .incoming / .stale are this run's transactional temps, never backups.
             continue
 

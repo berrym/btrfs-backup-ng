@@ -446,7 +446,7 @@ class SnapperScanner:
         max_num = 0
         try:
             for item in config.snapshots_dir.iterdir():
-                if item.is_dir() and item.name.isdigit():
+                if item.is_dir() and item.name.isdecimal():
                     num = int(item.name)
                     if num > max_num:
                         max_num = num

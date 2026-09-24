@@ -2578,7 +2578,7 @@ def _snapper_info_xml_bytes(snapper_snapshot) -> Optional[bytes]:
     return info_xml_src.read_bytes()
 
 
-def _write_info_xml(destination_endpoint, slot_dir: str, content: bytes) -> None:
+def _write_info_xml(destination_endpoint, slot_dir: str, content: bytes) -> bool:
     """Write ``content`` as ``{slot_dir}/info.xml`` on the destination.
 
     The one writer for a snapper slot's metadata, in both directions: a backup
@@ -2588,10 +2588,11 @@ def _write_info_xml(destination_endpoint, slot_dir: str, content: bytes) -> None
     publishes the slot carries its metadata with it and no published slot is
     ever without.
 
-    Soft-fail by design: the snapshot itself is intact, and info.xml is
-    descriptive metadata. What was lost is said, so a later "listed without a
-    description" or "snapper does not show the restored slot" is traceable to
-    here rather than looking like a second bug.
+    Returns whether the file was written. A failure is logged here, with what
+    it means, and reported to the caller: the layout does not publish a slot
+    without its info.xml, because snapper does not list such a slot and a
+    restore that ended with one reported success for a copy snapper could
+    not see.
     """
     is_remote = getattr(destination_endpoint, "_is_remote", False)
     try:
@@ -2611,6 +2612,7 @@ def _write_info_xml(destination_endpoint, slot_dir: str, content: bytes) -> None
             # would have succeeded. That rule lives in __util__._privileged_fs.
             __util__.privileged_write_bytes(Path(slot_dir) / "info.xml", content)
         logger.debug("Placed info.xml at %s", slot_dir)
+        return True
     except Exception as e:
         logger.warning(
             "Failed to place info.xml at %s: %s. The snapshot itself is intact; "
@@ -2620,6 +2622,7 @@ def _write_info_xml(destination_endpoint, slot_dir: str, content: bytes) -> None
             slot_dir,
             e,
         )
+        return False
 
 
 def _cleanup_snapper_backup(destination_endpoint, snapshot_num, is_raw) -> None:

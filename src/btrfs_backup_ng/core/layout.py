@@ -445,9 +445,12 @@ class SnapperLayout:
         slot = self._require_open()
         self.endpoint.config["path"] = slot.saved_path
         try:
-            if info_xml is not None:
-                _ops._write_info_xml(
-                    self.endpoint, self.incoming_dir(slot.number), info_xml
+            if info_xml is not None and not _ops._write_info_xml(
+                self.endpoint, self.incoming_dir(slot.number), info_xml
+            ):
+                raise __util__.SnapshotTransferError(
+                    f"could not write info.xml into {self.incoming_dir(slot.number)}; "
+                    f"the slot was not published (a slot is complete or not at all)"
                 )
             _ops._snapper_publish_slot(self.endpoint, slot.number)
         except BaseException:
@@ -485,8 +488,13 @@ class SnapperLayout:
             for _attempt in range(1000):
                 number = self._next_number()
                 xml = info_xml_for(number)
-                if xml is not None:
-                    _ops._write_info_xml(self.endpoint, incoming, xml)
+                if xml is not None and not _ops._write_info_xml(
+                    self.endpoint, incoming, xml
+                ):
+                    raise __util__.SnapshotTransferError(
+                        f"could not write info.xml into {incoming}; the copy was "
+                        f"not published (a slot is complete or not at all)"
+                    )
                 try:
                     __util__.rename_noreplace(incoming, self.slot_dir(number))
                 except FileExistsError:
@@ -559,7 +567,7 @@ class SnapperLayout:
         stale = sorted(
             p.name
             for p in snapshots_dir.iterdir()
-            if p.name.endswith(".incoming") and p.name[: -len(".incoming")].isdigit()
+            if p.name.endswith(".incoming") and p.name[: -len(".incoming")].isdecimal()
         )
         for name in stale:
             logger.info(

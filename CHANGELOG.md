@@ -125,6 +125,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   so `-v verify` shows debug output and its warnings are formatted. `run`
   printed one INFO line after reading a `quiet` configuration (the one
   announcing the log file); it applies the setting before that line.
+- **A snapper slot could be published without its `info.xml`.** The write
+  of the slot's metadata was soft-fail, so a publish went ahead without it
+  and a restore reported success for a slot snapper does not list. In both
+  directions a slot whose `info.xml` cannot be written is now abandoned and
+  the transfer fails, as the documentation has said all along.
 - **Two configuration keys the loader read were reported as unknown.**
   `skip_remote_lock` on a target and `timeout` under
   `[global.notifications.email]` produced "Unknown config key ... (ignored)"
@@ -144,6 +149,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   newest snapshot among them -- from the prune and from `run`'s catch-up
   alike. A snapper number is its creation order and now breaks the tie in
   every snapper retention path.
+- Slot numbers under `.snapshots` are recognised as decimal digits only; a
+  name `str.isdigit` accepted but `int` refused (a superscript digit) made
+  the enumeration and the stale-temp sweep raise instead of skipping it.
 
 ## [0.9.10] - 2026-09-23
 
