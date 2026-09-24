@@ -42,6 +42,7 @@ import pytest
 import btrfs_backup_ng.core.operations as ops
 import btrfs_backup_ng.core.restore as core_restore
 from btrfs_backup_ng import __util__
+from btrfs_backup_ng.core.layout import SnapperLayout
 from btrfs_backup_ng.core.restore import (
     RestoreError,
     _restored_info_xml,
@@ -533,6 +534,20 @@ class TestOneRestoreAtATimeIntoAConfig:
         (rig.local / ".snapshots" / "7.incoming").mkdir(parents=True)
         rig.restore(6, dry_run=True)
         assert _incomings(rig.local) == ["7.incoming"]
+
+    def test_a_dry_run_creates_nothing(self, rig):
+        """No lock file in the config, no bookkeeping tree under the source:
+        a dry run only reads. Before this it took the config's writer lock
+        (creating its file) and prepared the source as a destination."""
+        before_local = sorted(p.name for p in (rig.local / ".snapshots").iterdir())
+        before_backup = sorted(p.name for p in rig.backup.iterdir())
+        rig.restore(6, dry_run=True)
+        assert (
+            sorted(p.name for p in (rig.local / ".snapshots").iterdir()) == before_local
+        )
+        assert sorted(p.name for p in rig.backup.iterdir()) == before_backup
+        assert not (rig.local / ".snapshots" / SnapperLayout.WRITER_LOCK_NAME).exists()
+        assert not (rig.backup / ".btrfs-backup-ng").exists()
 
     def test_a_config_without_snapshots_dir_is_refused(self, rig):
         import shutil

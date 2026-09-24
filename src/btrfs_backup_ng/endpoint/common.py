@@ -197,6 +197,10 @@ class Endpoint:
             "lock_file_name", ".btrfs-backup-ng.locks"
         )
         self.config["snapshot_folder"] = config.get("snapshot_folder", ".snapshots")
+        # Whether prepare() may create this tool's bookkeeping tree below the
+        # path. A transfer destination needs it; a location a restore only
+        # reads -- possibly a read-only medium -- must not be written to.
+        self.config["create_tree"] = bool(config.get("create_tree", True))
         # Snapshot timestamp format (from [global] timestamp_format). None means the
         # built-in default is used when naming/parsing snapshots for this endpoint.
         self.config["timestamp_format"] = config.get("timestamp_format")
@@ -1142,21 +1146,24 @@ class Endpoint:
         # miss. We only touch THIS snapshot's entry; every other snapshot's locks come
         # straight from disk, so a concurrent writer's locks survive.
         guard = str(self._get_lock_file_path()) + ".guard"
-        with FileLock(guard):
-            # _read_locks raises on a corrupt file: abort loudly rather than overwrite
-            # (which would silently discard locks we could not read).
-            lock_dict = self._read_locks()
-            name = snapshot.get_name()
-            entry: Dict[str, Any] = {}
-            if snapshot.locks:
-                entry["locks"] = list(snapshot.locks)
-            if snapshot.parent_locks:
-                entry["parent_locks"] = list(snapshot.parent_locks)
-            if entry:
-                lock_dict[name] = entry
-            else:
-                lock_dict.pop(name, None)
-            self._write_locks(lock_dict)
+        try:
+            with FileLock(guard):
+                # _read_locks raises on a corrupt file: abort loudly rather than overwrite
+                # (which would silently discard locks we could not read).
+                lock_dict = self._read_locks()
+                name = snapshot.get_name()
+                entry: Dict[str, Any] = {}
+                if snapshot.locks:
+                    entry["locks"] = list(snapshot.locks)
+                if snapshot.parent_locks:
+                    entry["parent_locks"] = list(snapshot.parent_locks)
+                if entry:
+                    lock_dict[name] = entry
+                else:
+                    lock_dict.pop(name, None)
+                self._write_locks(lock_dict)
+        except (OSError, __util__.AbortError) as exc:
+            self._lock_file_not_written(snapshot, lock_state, exc)
         logger.debug(
             "Lock state for %s and lock_id %s changed to %s (parent = %s)",
             snapshot,
@@ -1164,6 +1171,55 @@ class Endpoint:
             lock_state,
             parent,
         )
+
+    def _lock_file_not_written(self, snapshot: Any, lock_state: bool, exc: Any) -> None:
+        """What a lock FILE that could not be written means, decided the way
+        ``sshutil.lock.record_pin`` decides it for the directory store.
+
+        A pin that could not be recorded must never read as one that was, so
+        taking one fails the operation -- unless the operator said
+        ``--skip-remote-lock`` (which covers this store too: the option is
+        about proceeding without a recorded pin, wherever the pin would live),
+        or the location is mounted read-only. Read-only is the
+        disaster-recovery medium: nothing can delete a backup there while it
+        is mounted so, so the pin protects against nothing and is not needed;
+        that is said at INFO and the restore goes on. A release that fails is
+        a warning: the in-memory set is already updated, and the file keeps a
+        pin the next writer will drop.
+        """
+        from ..sshutil.lock import local_path_is_read_only, read_only_notice, reason_of
+
+        name = snapshot.get_name()
+        if not lock_state:
+            logger.warning(
+                "Could not clear the lock for %s in the lock file at %s (%s).",
+                name,
+                self._get_lock_file_path(),
+                exc,
+            )
+            return
+        # The same rule every pin writer applies (``sshutil.lock``): the
+        # location's filesystem is mounted read-only, per the kernel.
+        if local_path_is_read_only(self.config["path"]):
+            read_only_notice(name, "location", str(self.config["path"]))
+            return
+        if self.config.get("skip_remote_lock"):
+            logger.warning(
+                "Could not record the lock for %s in the lock file at %s (%s), and "
+                "--skip-remote-lock was given, so this continues WITHOUT "
+                "protection: a prune of this location will not see it as in use.",
+                name,
+                self._get_lock_file_path(),
+                exc,
+            )
+            return
+        raise __util__.AbortError(
+            f"Could not lock {name} on this location: {reason_of(exc)}. Refusing to continue "
+            f"unprotected: another process pruning this location would not see "
+            f"the snapshot as in use and could delete it while it is being read. "
+            f"Make the location writable by the account running this, or pass "
+            f"--skip-remote-lock to proceed unprotected on purpose."
+        ) from exc
 
     def add_snapshot(self, snapshot: Any, rewrite: bool = True) -> None:
         """Add a snapshot to the cache, once.

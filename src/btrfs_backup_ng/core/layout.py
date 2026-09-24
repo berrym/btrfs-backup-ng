@@ -484,9 +484,24 @@ class SnapperLayout:
         incoming = self.incoming_dir(slot.number)
         if self._next_number is None:
             raise RuntimeError("publish_fresh needs next_number")
+        tried: set[int] = set()
         try:
             for _attempt in range(1000):
                 number = self._next_number()
+                if number in tried:
+                    # The free-number rule stands still: something at
+                    # ``.snapshots/<number>`` is not a slot directory (a
+                    # regular file, a symlink) and is not counted, yet the
+                    # rename cannot take its place. Say so instead of asking
+                    # the same question a thousand times.
+                    raise __util__.SnapshotTransferError(
+                        f"{self.slot_dir(number)} exists and is not a snapshot "
+                        f"slot (a file or a link named like one); the copy cannot "
+                        f"be published under {number} and no other number is "
+                        f"offered. Move that entry out of {self.snapshots_dir} and "
+                        f"run the restore again."
+                    )
+                tried.add(number)
                 xml = info_xml_for(number)
                 if xml is not None and not _ops._write_info_xml(
                     self.endpoint, incoming, xml
@@ -533,24 +548,45 @@ class SnapperLayout:
         logger.debug("Published snapper slot %s", self.slot_dir(number))
         return number
 
-    def restore_lock(self, subject: str) -> Any:
-        """One restore at a time into this config.
+    #: The one lock file below a ``.snapshots`` tree this tool writes into,
+    #: whichever direction is writing. The name predates the backup direction
+    #: taking it and is kept so a restore from an earlier release and a run
+    #: from this one still exclude each other.
+    WRITER_LOCK_NAME = ".btrfs-backup-ng.restore.lock"
+
+    def writer_lock(self, subject: str) -> Any:
+        """One writer at a time below this ``.snapshots`` tree: a restore
+        into a config, or a snapper backup into a local target.
 
         A local target has no receive lock (``_receiving_lock`` is a no-op),
-        and the next free number counts only numeric entries, so two restores
-        into one config would both pick n and the second's open_slot would
-        remove the first's in-flight ``<n>.incoming`` as "a temp a crashed run
-        left". An exclusive flock on ``.snapshots/.btrfs-backup-ng.restore.lock``
-        (``__util__.exclusive_lock``, timeout 0) is held for the whole
-        restore: a second restore is refused at once with words, and the
-        kernel drops the lock when the holder dies, so a SIGKILLed restore
-        never leaves the config locked. Held, it is also what makes
-        ``sweep_stale_temps`` safe: no live restore can own a temp here.
+        and the next free number counts only numeric entries, so two writers
+        would both pick n and the second's open_slot would remove the first's
+        in-flight ``<n>.incoming`` as "a temp a crashed run left". An
+        exclusive flock on ``.snapshots/WRITER_LOCK_NAME``
+        (``__util__.exclusive_lock``, timeout 0) is held for the whole run: a
+        second writer is refused at once with words, and the kernel drops the
+        lock when the holder dies, so a SIGKILLed run never leaves the tree
+        locked. Held by a restore, it is also what makes ``sweep_stale_temps``
+        safe: no live restore can own a temp here.
+
+        The target must exist (it is never created); ``.snapshots`` below an
+        existing target is made when missing, as the first slot would make it.
         """
+        # ``.snapshots`` below a target that must already be there: the one
+        # primitive for creating under a backup location, whose own words
+        # refuse a missing target the way every other missing destination is.
+        try:
+            snapshots_dir = __util__.create_below(
+                self.base, ".snapshots", what="Snapper backup target"
+            )
+        except __util__.AbortError as e:
+            raise RuntimeError(str(e)) from e
+        except OSError as e:
+            raise RuntimeError(
+                f"{subject}: cannot create {self.snapshots_dir} ({e})"
+            ) from e
         return __util__.exclusive_lock(
-            Path(self.snapshots_dir) / ".btrfs-backup-ng.restore.lock",
-            timeout=0,
-            subject=subject,
+            snapshots_dir / self.WRITER_LOCK_NAME, timeout=0, subject=subject
         )
 
     def sweep_stale_temps(self) -> list[str]:
@@ -692,6 +728,21 @@ class _SlotReceiver:
 
     def add_snapshot(self, snapshot: Any, rewrite: bool = True) -> None:
         self._layout._receive_verified(snapshot)
+
+    def _artifact_preexists(self, name: str) -> bool:
+        """Whether the copy of ``name`` was already at its destination before
+        the receive: never, here. Each receive lands in a slot opened for it
+        (``.snapshots/<n>.incoming``, fresh), so whatever is in the slot
+        afterwards is this run's."""
+        return False
+
+    def _cleanup_partial_local(self, name: str, *, created_by_this_run: bool) -> None:
+        """Remove what a failed receive left: the open slot's ``.incoming``,
+        and only that (``abandon``). The engine's generic cleanup builds
+        ``<endpoint path>/<name>`` and deletes it; with the endpoint pointed
+        back at the config's subvolume after a failed publish, that path
+        would be a directory of the operator's beside ``.snapshots``."""
+        self._layout.abandon()
 
     def _receive_destination(self, source_path: Any) -> str:
         """Where a receive through this endpoint lands: ``<slot>/snapshot``.

@@ -176,9 +176,9 @@ class TestBackupThenRestoreThroughTheLayout:
         _data, snapshots, _delta = _snapper_source(first)
         _backup(snapshots, _target(second / "backup"))
         base = second / "backup" / ".snapshots"
-        assert sorted(p.name for p in base.iterdir()) == ["1", "2"], (
-            "a temp slot outlived its publish"
-        )
+        # The writer lock file lives beside the slots and is not a slot.
+        entries = sorted(p.name for p in base.iterdir() if not p.name.startswith("."))
+        assert entries == ["1", "2"], "a temp slot outlived its publish"
         for number in (1, 2):
             copy = _show(base / str(number) / "snapshot")
             assert (
@@ -465,3 +465,69 @@ class TestTheConfigIsLiveWhileTheRestoreRuns:
         assert outcome["first"]["restored"] == 1, outcome["first"]
         assert _slots(config) == [1] and _temps(config) == []
         assert (config.snapshots_dir / "1" / "snapshot" / "payload.bin").exists()
+
+
+@pytest.mark.tier2
+@requires_btrfs
+class TestTheEdgesHoldOnRealBtrfs:
+    """The snapper edges pinned by unit tests, run against real subvolumes:
+    one writer at a time into a target, a pinned slot that no prune deletes,
+    a raw pin another process can see, and a read-only medium as a source."""
+
+    def test_a_second_backup_into_a_busy_target_is_refused_and_disturbs_nothing(
+        self, btrfs_three_volumes
+    ):
+        from btrfs_backup_ng import __util__
+        from btrfs_backup_ng.core.layout import SnapperLayout
+
+        first, second, _third = btrfs_three_volumes
+        _data, snapshots, _delta = _snapper_source(first)
+        target = _target(second / "backup")
+        ops.send_snapper_snapshot(snapshots[0], target)
+        holder = SnapperLayout(_target(second / "backup"))
+        with holder.writer_lock("a backup already running"):
+            with pytest.raises(
+                __util__.SnapshotTransferError, match="another operation holds the lock"
+            ):
+                ops.send_snapper_snapshot(
+                    snapshots[1], target, parent_snapper_snapshot=snapshots[0]
+                )
+        snapshots_dir = second / "backup" / ".snapshots"
+        published = sorted(
+            p.name for p in snapshots_dir.iterdir() if not p.name.startswith(".")
+        )
+        assert published == ["1"], published
+        assert (snapshots_dir / SnapperLayout.WRITER_LOCK_NAME).is_file()
+        # Released: the same send goes through afterwards.
+        ops.send_snapper_snapshot(
+            snapshots[1], target, parent_snapper_snapshot=snapshots[0]
+        )
+        assert (second / "backup" / ".snapshots" / "2" / "snapshot").is_dir()
+
+    def test_a_read_only_medium_restores_without_writing_to_it(
+        self, btrfs_three_volumes, monkeypatch
+    ):
+        first, second, third = btrfs_three_volumes
+        _data, snapshots, delta = _snapper_source(first)
+        backup = second / "backup"
+        _backup(snapshots, _target(backup))
+        config = _config(third, monkeypatch)
+        subprocess.run(
+            ["mount", "-o", "remount,ro", str(second)], check=True, capture_output=True
+        )
+        try:
+            before = sorted(p.name for p in backup.iterdir())
+            stats = _restore(str(backup), config, 2)
+            assert stats["restored"] == 1, stats
+            assert _slots(config) == [1]
+            landed = config.snapshots_dir / "1" / "snapshot" / "extra.bin"
+            assert landed.read_bytes() == delta
+            assert sorted(p.name for p in backup.iterdir()) == before, (
+                "the restore wrote to the read-only medium"
+            )
+        finally:
+            subprocess.run(
+                ["mount", "-o", "remount,rw", str(second)],
+                check=True,
+                capture_output=True,
+            )

@@ -322,7 +322,7 @@ def test_sync_snapper_failed_in_run_parent_short_circuits_dependents(monkeypatch
 
     attempted = []
 
-    def fake_send(snap, dest, parent_snapper_snapshot=None, options=None):
+    def fake_send(snap, dest, parent_snapper_snapshot=None, options=None, **kw):
         attempted.append(snap.number)
         if snap.number == 1:
             raise __util__.SnapshotTransferError("boom")
@@ -378,8 +378,8 @@ def test_sync_snapper_skips_present_via_real_planner(monkeypatch):
     monkeypatch.setattr(
         ops,
         "send_snapper_snapshot",
-        lambda snap, dest, parent_snapper_snapshot=None, options=None: sent.append(
-            snap.number
+        lambda snap, dest, parent_snapper_snapshot=None, options=None, **kw: (
+            sent.append(snap.number)
         ),
     )
 

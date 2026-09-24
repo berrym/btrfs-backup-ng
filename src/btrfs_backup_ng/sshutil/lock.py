@@ -283,6 +283,91 @@ class Holder:
         )
 
 
+#: Exit statuses of ``read_only_probe_script``: the location's filesystem is
+#: mounted read-only / is writable / the mount table could not be read.
+READ_ONLY, WRITABLE, UNKNOWN_MOUNT = 10, 11, 12
+
+
+def read_only_probe_script(path: str) -> str:
+    """Shell answering, by EXIT STATUS, whether ``path`` lies on a filesystem
+    mounted read-only: ``READ_ONLY``, ``WRITABLE`` or ``UNKNOWN_MOUNT`` (3 when
+    ``path`` is not a directory). Read-only means BOTH that a directory cannot
+    be created there and that the mount table says so; either alone is not
+    enough (a firmlinked path reads as its read-only parent in the table, a
+    permission refusal is not a read-only mount).
+
+    The one rule every pin writer decides read-only by, wherever the location
+    is. A location mounted read-only cannot have anything deleted from it, so
+    a pin there protects against nothing and is not needed; a location that
+    merely refuses the write (no permission) is a different thing, and the
+    pin is required. The two are told apart from the mount table -- the
+    ``ro`` option token in ``/proc/self/mounts`` on Linux, the ``read-only``
+    token in ``mount(8)``'s option list elsewhere -- never from a tool's
+    message, which is localised. Anything the script cannot classify is
+    ``UNKNOWN_MOUNT``, which the caller treats as NOT read-only, so an
+    unclassifiable location still gets the refusal and its opt-out.
+    ``BBNG_MOUNT_TABLE`` names another mount table file (the tests use it).
+    """
+    q = shlex.quote(path)
+    # The matching runs in awk, present on every host this reaches (GNU,
+    # BSD, busybox): one program over "MNT OPTS" lines picks the longest mount
+    # point that is the real path or an ancestor of it. No shell ``case`` and
+    # no unbalanced parenthesis anywhere inside a command substitution --
+    # bash 3.2, macOS's /bin/sh, cannot parse those.
+    pick = (
+        r"""awk -v real="$real" '{ m = $1; gsub(/\\040/, " ", m); """
+        r"""if (m == "/" || m == real || index(real, m "/") == 1) """
+        r"""{ if (length(m) >= length(b)) { b = m; o = $2 } } } """
+        r"""END { printf "%s", o }'"""
+    )
+    # mount(8) prints "dev on MNT (opt, opt, ...)" (macOS, the BSDs) or
+    # "dev on MNT type T (opt,opt)" (Linux): reduce each line to "MNT OPTS".
+    convert = (
+        r"""awk '{ s = $0; i = index(s, " on "); if (i == 0) next; s = substr(s, i + 4); """
+        r"""j = index(s, " ("); if (j == 0) next; o = substr(s, j + 2); s = substr(s, 1, j - 1); """
+        r"""k = index(s, " type "); if (k > 0) s = substr(s, 1, k - 1); """
+        r"""o = substr(o, 1, length(o) - 1); gsub(/ /, "", o); print s, o }'"""
+    )
+    return (
+        f'p={q}; [ -d "$p" ] || exit 3; '
+        'real=$(cd "$p" 2>/dev/null && pwd -P) || exit 3; '
+        # A write that succeeds settles it: not read-only, whatever the table
+        # says (macOS reaches a writable data volume through firmlinks from
+        # its sealed, read-only root, so the table alone would call /tmp
+        # read-only). Only a write that FAILS is classified by the table.
+        'probe="$real/.btrfs-backup-ng.probe.$$"; '
+        f'if mkdir "$probe" 2>/dev/null; then rmdir "$probe" 2>/dev/null; exit {WRITABLE}; fi; '
+        "table=${BBNG_MOUNT_TABLE:-/proc/self/mounts}; "
+        'if [ -r "$table" ]; then '
+        # /proc/self/mounts: "dev MNT fstype OPTS freq passno"
+        "bestopts=$(awk '{ print $2, $4 }' \"$table\" | " + pick + "); "
+        f"else bestopts=$(mount 2>/dev/null | {convert} | {pick}) || exit {UNKNOWN_MOUNT}; fi; "
+        f'[ -n "$bestopts" ] || exit {UNKNOWN_MOUNT}; '
+        """if printf '%s' ",$bestopts," | grep -qF -e ',ro,' -e ',read-only,'; """
+        f"then exit {READ_ONLY}; fi; exit {WRITABLE}"
+    )
+
+
+def local_path_is_read_only(path: str | os.PathLike) -> bool:
+    """The same rule for a path on THIS machine, asked of the kernel directly:
+    ``statvfs`` reports the read-only mount flag."""
+    try:
+        return bool(os.statvfs(path).f_flag & os.ST_RDONLY)
+    except OSError:
+        return False
+
+
+def read_only_notice(name: str, where: str, location: str) -> None:
+    """What every pin writer says when it skips a pin on a read-only location."""
+    logger.info(
+        "%s is mounted read-only, so %s is not pinned on this %s: nothing can "
+        "delete from a read-only location while it is being read.",
+        location,
+        name,
+        where,
+    )
+
+
 def _remote_mtime_expr(path: str) -> str:
     """Shell yielding ``path``'s mtime, or nothing if it does not exist.
 
@@ -351,6 +436,21 @@ class RemoteLockManager:
 
     def _lock_dir(self, name: str) -> str:
         return f"{self._root}/{encode_name(name)}.lock"
+
+    @property
+    def location(self) -> str:
+        return self._target
+
+    def location_is_read_only(self) -> bool:
+        """Whether this manager's location lies on a read-only filesystem, by
+        ``read_only_probe_script`` run where the location is. Only the
+        READ_ONLY exit status says yes; a probe that fails to run says no."""
+        try:
+            rc, _out, _err = self._run(read_only_probe_script(self._target))
+        except Exception as exc:  # noqa: BLE001 - an unanswered probe is "not read-only"
+            logger.debug("Read-only probe of %s did not run: %s", self._target, exc)
+            return False
+        return rc == READ_ONLY
 
     def _acquire_script(self, name: str, payload: str, token: str) -> str:
         """One round trip: try, judge staleness, break if dead, try again.
@@ -1020,10 +1120,17 @@ def record_pin(
         else:
             manager.release_shared(name, holder_id)
     except Exception as exc:  # noqa: BLE001 - reported, never silently passed
+        if lock_state and _read_only(manager):
+            read_only_notice(
+                snapshot_lock_name(snapshot),
+                where,
+                getattr(manager, "location", where),
+            )
+            return
         if lock_state and not skip_remote_lock:
             raise __util__.AbortError(
                 f"Could not lock {snapshot_lock_name(snapshot)} on this "
-                f"{where}: {exc}. Refusing to continue unprotected: another "
+                f"{where}: {reason_of(exc)}. Refusing to continue unprotected: another "
                 f"process pruning this {where} would not see the {noun} as in "
                 f"use and could delete it while it is being read. Make the "
                 f"{where} writable by the account running this, allow that "
@@ -1047,6 +1154,17 @@ def record_pin(
                 where,
                 exc,
             )
+
+
+def _read_only(manager: Any) -> bool:
+    probe = getattr(manager, "location_is_read_only", None)
+    return callable(probe) and bool(probe())
+
+
+def reason_of(exc: BaseException) -> str:
+    """An exception's message as a clause: without its own final period, so
+    a sentence built around it does not end in two."""
+    return str(exc).rstrip(". ")
 
 
 def blocked_by_remote_lock(manager: Any, snapshots: list) -> set[str]:

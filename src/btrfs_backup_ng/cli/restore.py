@@ -710,6 +710,9 @@ def _prepare_backup_endpoint(args: argparse.Namespace, source: str):
     # Create endpoint - for restore, backup location needs to be set as "path"
     # (not "source") because list_snapshots() uses config["path"]
     # The source=False means the path will be stored in config["path"]
+    # A restore reads the backup location; the bookkeeping tree a destination
+    # gets is not created there (a read-only medium must serve as a source).
+    endpoint_kwargs["create_tree"] = False
     backup_ep = endpoint.choose_endpoint(
         source,
         endpoint_kwargs,

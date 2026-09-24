@@ -338,11 +338,11 @@ class TestOneRestoreAtATime:
         (base / ".snapshots").mkdir(parents=True)
         first = SnapperLayout(_endpoint(base))
         second = SnapperLayout(_endpoint(base))
-        with first.restore_lock("Restoring into snapper config 'c'"):
+        with first.writer_lock("Restoring into snapper config 'c'"):
             with pytest.raises(RuntimeError, match="another operation holds the lock"):
-                with second.restore_lock("Restoring into snapper config 'c'"):
+                with second.writer_lock("Restoring into snapper config 'c'"):
                     pass
-        with second.restore_lock("Restoring into snapper config 'c'"):
+        with second.writer_lock("Restoring into snapper config 'c'"):
             pass
 
     def test_sweep_removes_only_incoming_temps(self, tmp_path, real_shell):

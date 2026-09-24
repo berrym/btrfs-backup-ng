@@ -1579,6 +1579,15 @@ def destination_artifact_exists(destination_endpoint, name: str) -> bool:
     backup that was not ours and the safe answer under uncertainty is to leave it
     alone.
     """
+    # A destination that lands each receive in a slot of its own (the snapper
+    # layout's receiver) answers for itself: its endpoint path moves between
+    # this probe and the cleanup, so a path derived here would name a
+    # different place later.
+    # Looked up on the TYPE: a test double built from MagicMock answers every
+    # attribute with a callable, and would otherwise be asked a question it
+    # never meant to answer.
+    if callable(getattr(type(destination_endpoint), "_artifact_preexists", None)):
+        return bool(destination_endpoint._artifact_preexists(name))
     try:
         base = str(destination_endpoint.config["path"]).rstrip("/")
         expected = f"{base}/{name}"
@@ -1630,6 +1639,18 @@ def _cleanup_partial_local_subvolume(
 
     from ..endpoint.raw import RawEndpoint
 
+    # A receiver that owns the place it received into removes exactly that
+    # place and nothing else. The snapper layout's receiver points the
+    # endpoint at ``.snapshots/<n>.incoming`` for a receive and back at the
+    # config's subvolume afterwards, so a path built here from the endpoint's
+    # current path and the snapshot's name (``<subvolume>/<name>``) could name
+    # a directory of the operator's, outside ``.snapshots``, and this function
+    # would have deleted it.
+    if callable(getattr(type(destination_endpoint), "_cleanup_partial_local", None)):
+        destination_endpoint._cleanup_partial_local(
+            name, created_by_this_run=created_by_this_run
+        )
+        return
     if getattr(destination_endpoint, "_is_remote", False):
         return
     if isinstance(destination_endpoint, RawEndpoint):
@@ -2033,6 +2054,30 @@ def _execute_transfers(
                     best_snapshot.get_name(),
                     created_by_this_run=not preexisting,
                 )
+        except BaseException:
+            # Anything else that ends the transfer -- Ctrl-C, a signal turned
+            # into SystemExit, an error no handler above names -- propagates,
+            # but not with the pins still on the source. A restore's pin on a
+            # backup location outlives the process otherwise, and blocks that
+            # location's prune until someone runs --unlock.
+            if release_on_failure:
+                logger.info(
+                    "Releasing the pin on %s: the transfer did not finish.",
+                    best_snapshot,
+                )
+                try:
+                    source_endpoint.set_lock(best_snapshot, destination_id, False)
+                    if parent:
+                        source_endpoint.set_lock(
+                            parent, destination_id, False, parent=True
+                        )
+                except Exception as release_error:  # noqa: BLE001 - the cause wins
+                    logger.warning(
+                        "Could not release the pin on %s: %s",
+                        best_snapshot,
+                        release_error,
+                    )
+            raise
 
     # Report honestly: a "complete!" banner must not print when a transfer failed.
     if result.failed:
@@ -2653,11 +2698,36 @@ def _cleanup_snapper_backup(destination_endpoint, snapshot_num, is_raw) -> None:
     _snapper_run_shell(destination_endpoint, script)
 
 
+def _local_snapper_writer_lock(destination_endpoint, subject: str):
+    """The snapper layout's writer lock for a LOCAL btrfs destination, or a
+    no-op for a raw or remote one.
+
+    A remote target has the per-slot receive lock its lock store gives it; a
+    local one had nothing, so two ``snapper backup`` runs into one target
+    both opened slot n and the second removed the first's in-flight
+    ``.incoming`` as a crashed run's leftover. The lock is the one a restore
+    into a config holds (``SnapperLayout.writer_lock``): one writer at a time
+    below a ``.snapshots`` tree, whichever direction it writes in.
+    """
+    import contextlib
+
+    from ..endpoint.raw import RawEndpoint
+
+    if isinstance(destination_endpoint, RawEndpoint) or getattr(
+        destination_endpoint, "_is_remote", False
+    ):
+        return contextlib.nullcontext()
+    from .layout import SnapperLayout
+
+    return SnapperLayout(destination_endpoint).writer_lock(subject)
+
+
 def send_snapper_snapshot(
     snapper_snapshot,
     destination_endpoint,
     parent_snapper_snapshot=None,
     options: dict | None = None,
+    writer_lock_held: bool = False,
 ) -> None:
     """Send a snapper snapshot to a destination endpoint.
 
@@ -2672,9 +2742,13 @@ def send_snapper_snapshot(
         destination_endpoint: Destination Endpoint (its config["path"] is the base)
         parent_snapper_snapshot: Optional parent for incremental transfer
         options: Transfer options (compress, show_progress, rate_limit)
+        writer_lock_held: The caller already holds the destination's writer
+            lock for a longer span (``sync_snapper_snapshots`` holds it for
+            the whole sync); otherwise it is taken here around the slot.
 
     Raises:
-        SnapshotTransferError: If transfer fails
+        SnapshotTransferError: If transfer fails, or another process is
+            writing snapper backups into this destination.
     """
     from ..endpoint.raw import RawEndpoint
 
@@ -2684,6 +2758,26 @@ def send_snapper_snapshot(
     snapshot_num = snapper_snapshot.number
     is_raw = isinstance(destination_endpoint, RawEndpoint)
     base_path = str(destination_endpoint.config["path"])
+    if not writer_lock_held:
+        try:
+            held = _local_snapper_writer_lock(
+                destination_endpoint, f"Snapper backup into {base_path}"
+            )
+            held.__enter__()
+        except RuntimeError as e:
+            raise __util__.SnapshotTransferError(
+                f"{e}. Nothing was sent to {base_path}."
+            ) from e
+        try:
+            return send_snapper_snapshot(
+                snapper_snapshot,
+                destination_endpoint,
+                parent_snapper_snapshot=parent_snapper_snapshot,
+                options=options,
+                writer_lock_held=True,
+            )
+        finally:
+            held.__exit__(None, None, None)
 
     # Presence/skip is decided by the caller via correspondence (received_uuid for btrfs, name
     # for raw) -- NOT the snapper number, which is reused after a prune. So there is no
@@ -3015,6 +3109,33 @@ def sync_snapper_snapshots(
 
     logger.info("Found %d snapper snapshot(s) to consider", len(snapper_snapshots))
 
+    # One writer into a local target for the whole sync: what the destination
+    # holds is read once below, and every slot this run opens is decided from
+    # that reading. A second sync started meanwhile is refused with the reason.
+    base_path = str(destination_endpoint.config["path"])
+    try:
+        held = _local_snapper_writer_lock(
+            destination_endpoint, f"Snapper backup into {base_path}"
+        )
+        held.__enter__()
+    except RuntimeError as e:
+        raise __util__.SnapshotTransferError(
+            f"{e}. Nothing was sent to {base_path}."
+        ) from e
+    try:
+        return _sync_snapper_snapshots_locked(
+            destination_endpoint, snapper_snapshots, options, select
+        )
+    finally:
+        held.__exit__(None, None, None)
+
+
+def _sync_snapper_snapshots_locked(
+    destination_endpoint, snapper_snapshots: list, options: dict, select
+) -> int:
+    """The body of ``sync_snapper_snapshots``, with the destination's writer
+    lock held for a local target."""
+
     # Decide skip + parent by CORRESPONDENCE via the shared planner (received_uuid for btrfs,
     # name for raw) instead of the brittle snapper-number scan: a recycled snapper number gets
     # a new uuid, so it is correctly "absent" and re-sent; and snapper->raw now gets
@@ -3088,6 +3209,7 @@ def sync_snapper_snapshots(
                 destination_endpoint,
                 parent_snapper_snapshot=parent,
                 options=options,
+                writer_lock_held=True,
             )
             result.transferred.append(snap)
             transferred_names.add(w.get_name())

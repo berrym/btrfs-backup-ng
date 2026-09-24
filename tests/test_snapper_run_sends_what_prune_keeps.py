@@ -234,8 +234,8 @@ class TestSyncHonoursTheSelection:
         monkeypatch.setattr(
             ops,
             "send_snapper_snapshot",
-            lambda snap, dest, parent_snapper_snapshot=None, options=None: sent.append(
-                snap.number
+            lambda snap, dest, parent_snapper_snapshot=None, options=None, **kw: (
+                sent.append(snap.number)
             ),
         )
         count = ops.sync_snapper_snapshots(

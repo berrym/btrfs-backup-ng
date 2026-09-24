@@ -103,6 +103,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   are matched by path in order of occurrence; a changed answer is reported
   with both values; `--force` skips only the question; the diff summary
   reads the configuration that would be saved.
+- **Snapper backup and restore: seven edges.** After one snapshot's receive
+  failed and a later one's publish failed, the engine's cleanup of the
+  partial derived a path from the endpoint's current path and the copy's
+  name -- by then the config's subvolume, so `<subvolume>/snapshot-<n>`,
+  outside `.snapshots` -- and would have deleted a directory of the
+  operator's under that name; the snapper layout's receiver now removes
+  exactly the slot it opened and nothing else. A pin that could not be
+  written to a location's lock FILE aborted the restore, so a backup medium
+  mounted read-only could not be a snapper restore source and
+  `--skip-remote-lock` did not cover that store: the flag covers it, and a
+  read-only location proceeds without the pin and says so. That is one rule
+  for every pin writer -- the lock file of a local btrfs location and the
+  lock directory of `raw://`, `ssh://` and `raw+ssh://` alike: a location
+  whose filesystem is mounted read-only cannot have anything deleted from
+  it, so the pin protects against nothing and is not taken. Read-only is
+  decided from the kernel's mount table together with a failed write
+  attempt, by exit status, never from a tool's message; a location that
+  merely refuses the write keeps the refusal and its opt-out. A restore's
+  source got this tool's bookkeeping tree
+  (`.btrfs-backup-ng/`) created under it -- on a dry run too -- and it no
+  longer does. Two `snapper backup` runs into one local target both opened
+  slot n and the second removed the first's in-flight `.incoming`; the
+  backup direction now holds the same writer lock a restore holds
+  (`.snapshots/.btrfs-backup-ng.restore.lock`), for the whole sync, and a
+  second writer is refused with the reason. A regular file named like a
+  slot in `.snapshots` made the restore's publish ask for the same number a
+  thousand times; the number is now occupied by any entry named like a
+  slot, and a number that stands still is refused with the entry named.
+  `--dry-run` took the config's writer lock and created its file; it now
+  creates nothing. A pin stayed on the backup when the send died of
+  anything but the transfer error the executor expected (Ctrl-C included);
+  it is released for every kind of failure.
 - **Retention and `list` disagreed about a snapshot's date.** Retention kept
   a parser of its own -- a list of guessed formats and an unanchored search
   for digits -- so under `timestamp_format = "%Y%m%d"` the snapshot

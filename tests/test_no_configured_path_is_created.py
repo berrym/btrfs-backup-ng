@@ -88,11 +88,18 @@ REGISTRY: dict[str, tuple[str, ...]] = {
     # tree the local endpoint's prepare() has already created below a
     # destination that exists; the marker directory is one component under it.
     "core/layout.py::PlainLayout._write_marker": (BELOW,),
+    # The writer lock lives in .snapshots below a target that must already
+    # exist; .snapshots itself is made when missing, as the first slot would.
+    "core/layout.py::SnapperLayout.writer_lock": (BELOW,),
     "core/operations.py::_snapper_prepare_slot": (BELOW,),
     "endpoint/common.py::Endpoint.snapshot": (BELOW,),
     "endpoint/local.py::LocalEndpoint._prepare": (BELOW,),
     "sshutil/lock.py::RemoteLockManager._acquire_script": (BELOW,),
     "sshutil/lock.py::RemoteLockManager.acquire_shared": (BELOW,),
+    # The read-only probe makes one directory directly below a location that
+    # `[ -d ]` has just confirmed, and removes it at once; a location that is
+    # not there exits before it.
+    "sshutil/lock.py::read_only_probe_script": (BELOW,),
     # -- an output location ----------------------------------------------------
     "cli/config_cmd.py::_init_config": (OUTPUT, OUTPUT),
     "cli/config_cmd.py::_save_wizard_config": (OUTPUT,),
