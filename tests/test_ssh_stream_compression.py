@@ -680,6 +680,26 @@ class TestTheCompressedRemoteCommandIsSupervised:
         return found
 
     @staticmethod
+    def _signals_as_sshd_leaves_them() -> None:
+        """Runs in the child between fork and exec: HUP, INT and TERM back to
+        their default dispositions.
+
+        A signal that is IGNORED when a non-interactive shell starts cannot be
+        trapped by it (POSIX; bash and dash both silently keep ignoring it), so
+        the shell under test only shows what it does on the remote if it starts
+        the way sshd starts a session command -- every signal at its default.
+        The test process does not always have that: under ``nohup``, or any
+        harness that ignores SIGHUP, the ignore is inherited through fork and
+        exec, the emitted ``trap ... HUP`` installs nothing, and the shell
+        survives the SIGHUP this test sends. That is how this test failed in
+        some full-suite runs and never on its own: the runs that failed were
+        started under ``nohup``. Resetting here makes the test independent of
+        how pytest itself was started.
+        """
+        for signum in (signal.SIGHUP, signal.SIGINT, signal.SIGTERM):
+            signal.signal(signum, signal.SIG_DFL)
+
+    @staticmethod
     def _picture_of(sid: int) -> str:
         """The processes of session ``sid`` with their signal masks."""
         ps = subprocess.run(
@@ -702,9 +722,59 @@ class TestTheCompressedRemoteCommandIsSupervised:
             except OSError:
                 masks = "(gone)"
             lines.append(f"{line.strip()}  {masks}")
+        try:
+            own = open("/proc/self/status").read().splitlines()
+            lines.append(
+                "this test process: "
+                + " ".join(
+                    entry.replace("\t", "=")
+                    for entry in own
+                    if entry.startswith(("SigIgn", "SigBlk", "SigCgt"))
+                )
+            )
+        except OSError:
+            pass
         return "\n".join(lines) or "(no processes left in the session)"
 
-    @pytest.mark.parametrize("sig", [signal.SIGHUP, signal.SIGTERM])
+    def test_an_ignored_signal_at_entry_would_defeat_the_trap(self, tmp_path):
+        """The reason the shell must start with default dispositions: started
+        with SIGHUP ignored -- as under nohup -- the very same command keeps
+        running through a SIGHUP, because the shell cannot trap a signal it
+        inherited as ignored. This pins the mechanism the reset above defends
+        against, so the defence cannot be removed as unexplained."""
+        env = self._shims(tmp_path)
+        cmd = _build_receive_command(
+            "/backups", use_sudo=True, decompress="zstd"
+        ).replace("btrfs receive", "btrfs-slow receive")
+
+        def ignore_hup() -> None:
+            signal.signal(signal.SIGHUP, signal.SIG_IGN)
+
+        proc = subprocess.Popen(
+            ["/bin/sh", "-c", cmd],
+            start_new_session=True,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            env=env,
+            preexec_fn=ignore_hup,
+        )
+        try:
+            time.sleep(0.8)
+            os.kill(proc.pid, signal.SIGHUP)
+            time.sleep(1.0)
+            assert proc.poll() is None, (
+                "a shell started with SIGHUP ignored trapped it anyway; the "
+                "reset in the tests above is then no longer load-bearing"
+            )
+        finally:
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            proc.wait()
+
+    @pytest.mark.parametrize(
+        "sig", [signal.SIGHUP, signal.SIGTERM], ids=lambda s: signal.Signals(s).name
+    )
     @pytest.mark.parametrize("password_on_stdin", [False, True])
     def test_a_signal_mid_transfer_kills_the_whole_pipeline(
         self, tmp_path, sig, password_on_stdin
@@ -724,6 +794,7 @@ class TestTheCompressedRemoteCommandIsSupervised:
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             env=env,
+            preexec_fn=self._signals_as_sshd_leaves_them,
         )
         picture = ""
         try:
@@ -736,9 +807,8 @@ class TestTheCompressedRemoteCommandIsSupervised:
             if rc is None:
                 # What the shell and its children were doing when they should
                 # have been dead: state, and the signals each one ignores,
-                # blocks or catches. This test has failed only inside the full
-                # suite and never in a subset or on its own, so the failure has
-                # to explain itself when it happens.
+                # blocks or catches, plus this process's own -- an inherited
+                # ignore is the first thing to look for.
                 picture = self._picture_of(proc.pid)
         finally:
             if proc.poll() is None:
