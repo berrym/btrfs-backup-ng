@@ -349,13 +349,41 @@ def delete_snapper_backups(
 
     base = str(endpoint_obj.config["path"]).rstrip("/")
     remote = scheme.kind is TargetKind.SSH
+    # A snapper restore pins the backup it reads on its location, under the
+    # slot's name (``snapshot-<n>``), in the location's lock store. This
+    # deletion is not the endpoint's guarded one -- it removes slot
+    # directories, not prefix-named snapshots -- so it asks the store itself,
+    # at delete time, and skips what is pinned. A store that cannot be read
+    # deletes nothing: "no pins" is the one answer that must not be invented.
+    try:
+        pinned = {
+            name
+            for name, entry in endpoint_obj._read_locks().items()
+            if entry.get("locks") or entry.get("parent_locks")
+        }
+    except Exception as e:  # noqa: BLE001 - fail closed, with the reason
+        errors.append(
+            f"Not deleting any snapper backup at {backup_path}: the lock store "
+            f"could not be read ({e}), so it is not known whether a restore is "
+            f"reading one of them"
+        )
+        return 0, errors
     for backup in backups:
-        slot_dir = f"{base}/.snapshots/{backup.get('number')}"
+        number = backup.get("number")
+        slot_name = f"snapshot-{number}"
+        if slot_name in pinned:
+            logger.info(
+                "  Kept slot %s at %s: pinned by a restore in progress",
+                number,
+                backup_path,
+            )
+            continue
+        slot_dir = f"{base}/.snapshots/{number}"
         try:
             _delete_snapper_slot_btrfs(endpoint_obj, slot_dir, remote)
             deleted += 1
         except Exception as e:  # noqa: BLE001 - record and continue
-            errors.append(f"Delete slot {backup.get('number')}: {e}")
+            errors.append(f"Delete slot {number}: {e}")
     return deleted, errors
 
 

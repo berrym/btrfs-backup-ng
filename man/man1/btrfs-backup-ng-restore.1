@@ -59,8 +59,10 @@ Filesystem verification mode: 'auto' (warn and continue), 'strict' (error
 on failure), 'skip' (no checks). Default: auto.
 .TP
 .B \-\-skip-remote-lock
-Proceed even if a lock cannot be recorded on the remote target. Only safe
-when nothing else can prune this target during the run.
+Proceed even if a pin cannot be recorded on the location, wherever its lock
+store lives (a remote target's lock directory, or a local location's lock
+file). Only safe when nothing else can prune this location during the run. A
+medium mounted read-only needs no pin and none is asked for.
 .TP
 .B \-\-skip-verify
 Skip the pre-restore integrity check for raw backups (restore even if the

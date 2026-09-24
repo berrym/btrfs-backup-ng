@@ -32,6 +32,7 @@ import errno
 import itertools
 import logging
 import os
+import shutil
 import subprocess
 from pathlib import Path
 from types import SimpleNamespace
@@ -39,12 +40,15 @@ from types import SimpleNamespace
 import pytest
 
 from btrfs_backup_ng import __util__
+from btrfs_backup_ng.cli import prune as prune_cli
 from btrfs_backup_ng.core import operations as ops
 from btrfs_backup_ng.core.layout import SnapperLayout
 from btrfs_backup_ng.core.restore import _restore_endpoint_config
 from btrfs_backup_ng.endpoint.local import LocalEndpoint
 from btrfs_backup_ng.endpoint.raw import RawEndpoint
+from btrfs_backup_ng.endpoint.raw_metadata import RawSnapshot
 from btrfs_backup_ng.snapper import SnapperScanner
+from btrfs_backup_ng.sshutil import lock
 
 
 def _real_shell(ep, script):
@@ -248,6 +252,187 @@ class TestAReadOnlySourceNeedsNoLockFile:
         assert (location / ".btrfs-backup-ng" / "snapshots").is_dir()
 
 
+class TestEveryPinWriterDecidesReadOnlyTheSameWay:
+    """Making raw:// pins durable made a raw restore from a read-only medium
+    refuse ("Could not lock ... pass --skip-remote-lock") where 8bbb2af
+    restored: the read-only rule lived only in the lock FILE store, and
+    ``record_pin`` -- ssh://, raw+ssh:// and now raw:// -- had none. One
+    rule now, in the lock module: a location whose filesystem is mounted
+    read-only cannot have anything deleted from it, so the pin is not needed;
+    said at INFO, and the restore goes on. Decided by exit status from the
+    kernel's mount table plus a failed write attempt, never by a tool's
+    message."""
+
+    @staticmethod
+    def _probe(path, env=None, shell="sh"):
+        return subprocess.run(
+            [shell, "-c", lock.read_only_probe_script(str(path))],
+            env={**os.environ, **(env or {})},
+            capture_output=True,
+        ).returncode
+
+    @pytest.fixture
+    def ro_table(self, tmp_path):
+        """A mount table that calls the pytest temp directory's mount read-only."""
+        table = tmp_path.parent / "mounts"
+        real = os.path.realpath(str(tmp_path))
+        table.write_text(
+            f"/dev/x / btrfs rw,relatime 0 0\n/dev/y {real} ext4 ro,noatime 0 0\n"
+        )
+        return str(table)
+
+    @pytest.fixture
+    def unwritable(self, tmp_path, monkeypatch):
+        """A store this account cannot write and cannot elevate for: the
+        disaster-recovery medium's shape. The elevated fallback is removed
+        from the lock manager because this machine's passwordless sudo would
+        otherwise write into the 0555 directory as root."""
+        if os.geteuid() == 0:
+            pytest.skip("root can write anywhere but a read-only mount")
+        real_build = RawEndpoint._build_lock_manager
+
+        def unelevated(self):
+            manager = real_build(self)
+            manager._run_elevated = None
+            return manager
+
+        monkeypatch.setattr(RawEndpoint, "_build_lock_manager", unelevated)
+        d = tmp_path / "store"
+        d.mkdir()
+        d.chmod(0o555)
+        yield d
+        d.chmod(0o755)
+
+    def test_the_probe_reads_the_mount_table_by_exit_status(
+        self, tmp_path, ro_table, unwritable
+    ):
+        assert self._probe(tmp_path) == lock.WRITABLE
+        assert self._probe(tmp_path / "missing") == 3
+        # Unwritable and the table says ro: read-only.
+        assert self._probe(unwritable, {"BBNG_MOUNT_TABLE": ro_table}) == lock.READ_ONLY
+        # Unwritable but the real table says rw: a permission problem, not ro.
+        assert self._probe(unwritable) == lock.WRITABLE
+        # Writable settles it whatever a table claims.
+        assert self._probe(tmp_path, {"BBNG_MOUNT_TABLE": ro_table}) == lock.WRITABLE
+        # No table and no mount(8) on PATH: unknown, which the caller treats
+        # as not read-only.
+        bin_dir = tmp_path / "bin"
+        bin_dir.mkdir()
+        for tool in ("sh", "awk", "grep", "mkdir", "rmdir"):
+            (bin_dir / tool).symlink_to(shutil.which(tool))
+        assert (
+            self._probe(
+                unwritable,
+                {"BBNG_MOUNT_TABLE": "/nonexistent", "PATH": str(bin_dir)},
+            )
+            == lock.UNKNOWN_MOUNT
+        )
+
+    def test_the_probe_has_no_newline_and_no_case_pattern(self):
+        """One line, so it survives every transport; no ``case`` inside a
+        command substitution, which bash 3.2 (macOS /bin/sh) cannot parse."""
+        script = lock.read_only_probe_script("/x")
+        assert "\n" not in script
+        assert "case " not in script
+
+    def _manager(self, rc):
+        class Manager:
+            location = "/medium"
+
+            def holds_shared(self, name, holder):
+                return False
+
+            def acquire_shared_persistent(self, *a):
+                raise lock.RemoteLockUnavailable(
+                    "the lock directory could not be created."
+                )
+
+            def release_shared(self, *a):
+                raise lock.RemoteLockUnavailable("gone")
+
+            def location_is_read_only(self):
+                return rc
+
+        return Manager()
+
+    def test_record_pin_skips_the_pin_on_a_read_only_location(self, shared_log):
+        with shared_log.at_level(logging.INFO):
+            lock.record_pin(self._manager(True), _snap("home-1"), "restore:s1", True)
+        assert "/medium is mounted read-only" in shared_log.text
+        assert "not pinned" in shared_log.text
+
+    def test_record_pin_still_refuses_elsewhere_without_a_doubled_period(self):
+        with pytest.raises(__util__.AbortError) as info:
+            lock.record_pin(self._manager(False), _snap("home-1"), "restore:s1", True)
+        message = str(info.value)
+        assert "could not be created. Refusing" in message
+        assert ".." not in message
+
+    def test_reason_of_drops_a_final_period_only(self):
+        assert lock.reason_of(RuntimeError("busy.")) == "busy"
+        assert lock.reason_of(RuntimeError("a. b")) == "a. b"
+        assert lock.reason_of(RuntimeError("x")) == "x"
+
+    def test_a_raw_store_on_a_read_only_medium_is_pinned_without_error(
+        self, unwritable, ro_table, monkeypatch, shared_log
+    ):
+        """The measured regression: a raw:// location whose lock store cannot
+        be created and whose filesystem is read-only. The restore's pin is
+        skipped with a notice and the transfer goes on."""
+        monkeypatch.setenv("BBNG_MOUNT_TABLE", ro_table)
+        ep = RawEndpoint(config={"path": str(unwritable), "snap_prefix": ""})
+        snap = _snap("home-1")
+        with shared_log.at_level(logging.INFO):
+            ep.set_lock(snap, "restore:s1", True)
+        assert "restore:s1" in snap.locks
+        assert "mounted read-only" in shared_log.text
+        assert not (unwritable / ".btrfs-backup-ng.locks").exists()
+
+    def test_a_raw_store_that_merely_refuses_the_write_still_aborts(
+        self, unwritable, monkeypatch
+    ):
+        monkeypatch.delenv("BBNG_MOUNT_TABLE", raising=False)
+        ep = RawEndpoint(config={"path": str(unwritable), "snap_prefix": ""})
+        with pytest.raises(__util__.AbortError, match="skip-remote-lock") as info:
+            ep.set_lock(_snap("home-1"), "restore:s1", True)
+        assert ".." not in str(info.value)
+
+    @pytest.mark.parametrize(
+        "rc,expected",
+        [
+            (lock.READ_ONLY, True),
+            (lock.WRITABLE, False),
+            (lock.UNKNOWN_MOUNT, False),
+            (3, False),
+            (127, False),
+        ],
+    )
+    def test_the_manager_says_read_only_on_that_exit_status_alone(self, rc, expected):
+        """Only the READ_ONLY status is a yes: an unknown mount table, a
+        missing directory or a probe that could not run all mean "not
+        read-only", so the refusal and its opt-out still apply there."""
+        manager = lock.RemoteLockManager(lambda script: (rc, "", ""), "/medium")
+        assert manager.location_is_read_only() is expected
+
+    def test_a_probe_that_does_not_run_is_not_read_only(self):
+        def broken(script):
+            raise OSError("no shell")
+
+        manager = lock.RemoteLockManager(broken, "/medium")
+        assert manager.location_is_read_only() is False
+
+    def test_the_local_rule_asks_the_kernel(self, tmp_path, monkeypatch):
+        assert lock.local_path_is_read_only(tmp_path) is False
+        real = os.statvfs
+        monkeypatch.setattr(
+            lock.os,
+            "statvfs",
+            lambda p: SimpleNamespace(f_flag=real(p).f_flag | os.ST_RDONLY),
+        )
+        assert lock.local_path_is_read_only(tmp_path) is True
+        assert lock.local_path_is_read_only(tmp_path / "missing") is False
+
+
 # --------------------------------------------------------------------------- #
 # c. one writer at a time, in both directions
 # --------------------------------------------------------------------------- #
@@ -447,3 +632,88 @@ class TestAPinNeverOutlivesTheTransfer:
     def test_a_backup_keeps_its_pin_as_before(self, monkeypatch):
         calls = self._run(monkeypatch, False, KeyboardInterrupt())
         assert calls == [("home-1", True)]
+
+
+# --------------------------------------------------------------------------- #
+# g. pins protect on every location
+# --------------------------------------------------------------------------- #
+class TestPinsProtectEverywhere:
+    def _stream(self, location: Path, name: str) -> RawSnapshot:
+        stream = location / f"{name}.btrfs"
+        stream.write_bytes(b"x")
+        (location / f"{name}.btrfs.meta").write_text("{}")
+        snap = RawSnapshot(name=name, stream_path=stream)
+        return snap
+
+    def test_a_raw_pin_is_seen_by_another_process(self, tmp_path):
+        location = tmp_path / "raw"
+        location.mkdir()
+        reader = RawEndpoint(config={"path": str(location), "snap_prefix": ""})
+        pruner = RawEndpoint(config={"path": str(location), "snap_prefix": ""})
+        stream = self._stream(location, "home-1")
+        reader.set_lock(stream, "restore:s1", True)
+        assert (location / ".btrfs-backup-ng.locks").is_dir()
+        # The pruner lists the location afresh: its own objects, empty
+        # in-memory lock sets -- what a prune in another process sees.
+        theirs = RawSnapshot(name="home-1", stream_path=stream.stream_path)
+        result = pruner._delete_snapshots_locked([theirs])
+        assert result.deleted_count == 0
+        assert [reason for _s, reason in result.skipped] == [
+            "locked by another process at this location"
+        ]
+        assert stream.stream_path.exists()
+        reader.set_lock(stream, "restore:s1", False)
+        result = pruner._delete_snapshots_locked([theirs])
+        assert result.deleted_count == 1
+        assert not stream.stream_path.exists()
+
+    def test_a_raw_pin_is_reported_by_the_lock_readers(self, tmp_path):
+        location = tmp_path / "raw"
+        location.mkdir()
+        ep = RawEndpoint(config={"path": str(location), "snap_prefix": ""})
+        ep.set_lock(self._stream(location, "home-1"), "restore:s1", True)
+        assert ep._read_locks() == {"home-1": {"locks": ["restore:s1"]}}
+        assert RawEndpoint.persists_locks is True
+
+    def _slot_deleter(self, monkeypatch, locks):
+        deleted: list[str] = []
+        monkeypatch.setattr(
+            prune_cli,
+            "_delete_snapper_slot_btrfs",
+            lambda ep, slot_dir, remote: deleted.append(slot_dir),
+        )
+
+        class Endpoint:
+            config = {"path": "/backups"}
+
+            def _read_locks(self):
+                if isinstance(locks, Exception):
+                    raise locks
+                return locks
+
+        monkeypatch.setattr(
+            prune_cli, "choose_endpoint", lambda p, c: Endpoint(), raising=False
+        )
+        monkeypatch.setattr(
+            "btrfs_backup_ng.endpoint.choose_endpoint", lambda p, c: Endpoint()
+        )
+        return deleted
+
+    def test_a_pinned_snapper_slot_is_not_deleted(self, monkeypatch, caplog):
+        deleted = self._slot_deleter(
+            monkeypatch, {"snapshot-3": {"locks": ["restore:s1"]}}
+        )
+        backups = [{"number": 3}, {"number": 4}]
+        with caplog.at_level(logging.INFO):
+            count, errors = prune_cli.delete_snapper_backups("/backups", backups, {})
+        assert (count, errors) == (1, [])
+        assert deleted == ["/backups/.snapshots/4"]
+        assert "pinned by a restore in progress" in caplog.text
+
+    def test_an_unreadable_lock_store_deletes_no_slot(self, monkeypatch):
+        deleted = self._slot_deleter(monkeypatch, __util__.AbortError("corrupt"))
+        count, errors = prune_cli.delete_snapper_backups(
+            "/backups", [{"number": 3}], {}
+        )
+        assert (count, deleted) == (0, [])
+        assert errors and "lock store could not be read" in errors[0]

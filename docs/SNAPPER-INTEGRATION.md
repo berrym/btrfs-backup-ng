@@ -399,9 +399,12 @@ config's `.snapshots/` is the destination.
    refused with the reason and restores nothing; a temp left by a restore that
    was killed is removed by the next restore into that config.
 5. **Pin the backup on its location** for the duration (`restore:<session>`,
-   released if a transfer fails), so a prune on that target cannot delete what
-   is being read. A location you can read but not write takes
-   `--skip-remote-lock`.
+   released if a transfer fails or the run is interrupted), so a prune on that
+   location cannot delete what is being read: the pin is recorded on the
+   location for every location type (local, `ssh://`, `raw://`, `raw+ssh://`),
+   and the deletion of a snapper slot or a raw stream asks for it first. A
+   location you can read but not write takes `--skip-remote-lock`; a medium
+   mounted read-only needs nothing, since nothing can delete from it.
 
 Every selected backup gets a **new** slot, present or not: snapper keeps every
 snapshot, so a restore is never skipped as "already restored" (restoring 559

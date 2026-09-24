@@ -135,6 +135,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   creates nothing. A pin stayed on the backup when the send died of
   anything but the transfer error the executor expected (Ctrl-C included);
   it is released for every kind of failure.
+- **Pins now protect on every location type.** A pin on a `raw://` stream
+  lived only in the process that took it, so a prune in another process
+  could delete the stream a restore was reading; it is now recorded in the
+  location's lock store, the same directory store `ssh://` and `raw+ssh://`
+  use, `--status` and `--unlock` read it, and the raw deletion asks for it
+  at delete time. The deletion of a snapper slot (`run`'s prune and
+  `prune`, local and `ssh://`) never consulted the lock store at all, so a
+  slot pinned by a restore could be deleted from under it; it now skips a
+  pinned slot and deletes nothing when the store cannot be read. The
+  documentation's "a prune cannot delete what is being read" is now true
+  wherever a backup lives.
 - **Retention and `list` disagreed about a snapshot's date.** Retention kept
   a parser of its own -- a list of guessed formats and an unanchored search
   for digits -- so under `timestamp_format = "%Y%m%d"` the snapshot

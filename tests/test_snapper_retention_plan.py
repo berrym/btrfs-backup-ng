@@ -317,7 +317,9 @@ class TestTheDeletePrimitive:
     `sudo rm` is refused because rm is not btrfs."""
 
     def _endpoint(self, path="/backups"):
-        return SimpleNamespace(config={"path": path})
+        # A location whose lock store holds no pins: the deletion asks it
+        # before removing any slot.
+        return SimpleNamespace(config={"path": path}, _read_locks=lambda: {})
 
     def test_the_subvolume_is_deleted_before_the_slot_directory(self):
         """If the subvolume delete fails there is still data in the slot;

@@ -1718,10 +1718,10 @@ class RawEndpoint(Endpoint):
         logger.debug("Found %d raw snapshots in %s", len(snapshots), path)
         return list(snapshots)
 
-    #: Declared beside the override that makes it true, so the two cannot drift.
-    #: Local raw keeps its in-memory lock set; SSHRawEndpoint overrides this to
-    #: True because it now writes a real lock on the remote target.
-    persists_locks: bool = False
+    #: Declared beside the override that makes it true, so the two cannot drift:
+    #: a pin on a raw stream is recorded in the location's lock store, the
+    #: same directory store an ssh:// or raw+ssh:// target keeps.
+    persists_locks: bool = True
 
     def set_lock(
         self,
@@ -1730,21 +1730,85 @@ class RawEndpoint(Endpoint):
         lock_state: bool,
         parent: bool = False,
     ) -> None:
-        """Update the in-memory retention lock on a raw snapshot.
+        """Pin or unpin a raw stream AT THE LOCATION, not just in this process.
 
-        Overrides the base Endpoint.set_lock, which requires a ``source`` and
-        writes a LOCAL lock file at ``config['path']`` -- both wrong for a raw
-        target (restore does not set a source, and the path is remote for
-        raw+ssh, so the base write would raise and abort the restore). Raw lock
-        PERSISTENCE across runs is a separate change; until then
-        this mutates only the in-memory lock set so the restore/transfer
-        lock-guard logic works without touching disk.
+        The in-memory set is maintained for the transfer and prune logic of
+        this run; the durable record is a holder file in the location's lock
+        store (``sshutil.lock.record_pin``), which a prune in another process
+        consults before deleting. Until this, a raw:// pin lived only in the
+        process that took it: a restore reading a stream and a prune of the
+        same location in another process did not see each other, and the
+        prune was free to delete the stream being read -- while the
+        documentation said the pin prevented exactly that.
+
+        Overrides the base ``Endpoint.set_lock``, which requires a ``source``
+        and writes a JSON lock file; a raw location has no source, and the
+        directory store is what every other persistent pin uses.
         """
         target = snapshot.parent_locks if parent else snapshot.locks
         if lock_state:
             target.add(lock_id)
         else:
             target.discard(lock_id)
+        from ..sshutil.lock import record_pin
+
+        record_pin(
+            self._lock_manager,
+            snapshot,
+            lock_id,
+            lock_state,
+            parent=parent,
+            skip_remote_lock=bool(self.config.get("skip_remote_lock")),
+            where="location",
+            noun="stream",
+        )
+
+    def _lock_target_path(self) -> str | None:
+        """The directory pins live in, or None if this location has none.
+
+        The one resolution shared by the writer (``set_lock``) and the reader
+        (the delete guard). ``lock_root`` wins where it is set: the snapper
+        flow points the endpoint at a slot for the duration of a receive, and
+        a lock root that followed it would write the lock inside the slot.
+        """
+        path = self.config.get("lock_root") or self.config.get("path")
+        if path in (None, ""):
+            return None
+        return str(path)
+
+    def _lock_manager(self) -> Any:
+        """The lock manager for this location, one per resolved path."""
+        from ..sshutil.lock import cached_manager
+
+        return cached_manager(
+            self, self._lock_target_path() or "", self._build_lock_manager
+        )
+
+    def _build_lock_manager(self) -> Any:
+        """A lock manager over this local location, running its scripts here.
+
+        The same manager the local btrfs endpoint builds over a location that
+        carries the directory store, and the raw+ssh subclass builds over its
+        remote: one protocol, one store layout, wherever the location is.
+        """
+        from ..sshutil.lock import RemoteLockManager
+
+        path = self._lock_target_path()
+        if path is None:
+            raise ValueError("raw location has no path; cannot lock")
+
+        def run(script: str) -> tuple[int, str, str]:
+            proc = subprocess.run(
+                ["sh", "-c", script], capture_output=True, text=True, check=False
+            )
+            return proc.returncode, proc.stdout, proc.stderr
+
+        def run_elevated(script: str) -> tuple[int, str, str]:
+            return run(f"sudo -n sh -c {shlex.quote(script)}")
+
+        return RemoteLockManager(
+            run, path, hostname=socket.gethostname(), run_elevated=run_elevated
+        )
 
     def protect_incremental_parents(
         self, to_keep: list, to_delete: list
@@ -1852,8 +1916,27 @@ class RawEndpoint(Endpoint):
     def _delete_snapshots_locked(
         self, snapshots: list[RawSnapshot], delete_session: set[str] | None = None
     ) -> DeletionResult:
+        from ..sshutil.lock import (
+            RemoteLockUnavailable,
+            blocked_by_remote_lock,
+            snapshot_lock_name,
+        )
+
         result = DeletionResult()
         protected = self._chain_referenced_parents(snapshots, delete_session)
+        # The location's lock store is asked at delete time: a restore in
+        # another process may have pinned a stream since this listing was
+        # taken, and its pin lives there, not in this process's memory. An
+        # unanswerable question deletes nothing.
+        try:
+            store_locked = blocked_by_remote_lock(self._lock_manager(), snapshots)
+        except RemoteLockUnavailable as exc:
+            logger.error(
+                "Not deleting anything at this location: %s. Nothing was removed.",
+                exc,
+            )
+            result.fail_all(snapshots, f"the lock store is unusable: {exc}")
+            return result
         for snapshot in snapshots:
             # A retention lock is what a restore holds while it reads a stream.
             # The base Endpoint.delete_snapshots checks it; this override
@@ -1863,6 +1946,14 @@ class RawEndpoint(Endpoint):
             if snapshot.locks or snapshot.parent_locks:
                 logger.info("Skipping locked raw stream: %s", snapshot.get_name())
                 result.skip(snapshot, "held by a retention lock")
+                continue
+            if snapshot_lock_name(snapshot) in store_locked:
+                logger.info(
+                    "Skipping raw stream %s: pinned by another process at this "
+                    "location",
+                    snapshot.get_name(),
+                )
+                result.skip(snapshot, "locked by another process at this location")
                 continue
             if snapshot.get_name() in protected:
                 logger.error(
@@ -2116,38 +2207,11 @@ class SSHRawEndpoint(RawEndpoint):
             noun="stream",
         )
 
-    def _lock_target_path(self) -> str | None:
-        """The remote directory locks live in, or None if this target has none.
-
-        The one resolution shared by the writer (``set_lock``) and the reader
-        (the delete guard). They must agree: if this returns None the writer
-        cannot record a lock, so the reader finding nothing is a proven-empty
-        answer rather than a check that silently did not run.
-        """
-        # ``lock_root`` wins where it is set, because ``path`` is not always the
-        # target. The snapper flow points the endpoint at
-        # ``.snapshots/<n>.incoming`` for the duration of a receive, and a lock
-        # root that followed it would write the lock INSIDE the slot being
-        # published -- then get renamed into place along with it.
-        path = self.config.get("lock_root") or self.config.get("path")
-        if path in (None, ""):
-            return None
-        return str(path)
-
-    def _lock_manager(self) -> Any:
-        """The lock manager for this target, one per resolved path.
-
-        See ``sshutil.lock.cached_manager`` for why it is shared rather than
-        rebuilt per call, and why the cache is keyed by path.
-        """
-        from ..sshutil.lock import cached_manager
-
-        return cached_manager(
-            self, self._lock_target_path() or "", self._build_lock_manager
-        )
-
     def _build_lock_manager(self) -> Any:
-        """A lock manager bound to this target, elevating as this target does.
+        """A lock manager bound to this REMOTE target, elevating as this
+        target does. ``_lock_target_path`` and ``_lock_manager`` are the
+        raw endpoint's: the same resolution and the same cache, over the
+        remote instead of a local directory.
 
         Built per call rather than cached: the endpoint's config (path, sudo)
         can be rewritten between operations, and a manager holding a stale path

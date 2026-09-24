@@ -1785,9 +1785,9 @@ Two situations are refused before anything is transferred:
 | `--no-fs-checks` | Skip btrfs subvolume verification (needed for backup directories) |
 | `--progress` | Show progress bars (default in terminal) |
 | `--no-progress` | Disable progress bars |
-| `--status` | Show locks and incomplete restores at backup location. On `ssh://` and `raw+ssh://` this reads locks recorded on the target, so it sees other processes and other machines. A location holding snapper backups (numbered `.snapshots/<n>` slots, or raw streams with `.snapper-meta.json` sidecars) lists those backups too, each with the pins a snapper restore holds on it |
+| `--status` | Show locks and incomplete restores at backup location. Every location type records its pins on the location itself -- local, `ssh://`, `raw://` and `raw+ssh://` -- so this sees other processes and other machines. A location holding snapper backups (numbered `.snapshots/<n>` slots, or raw streams with `.snapper-meta.json` sidecars) lists those backups too, each with the pins a snapper restore holds on it |
 | `--unlock [ID]` | Unlock stuck restore sessions ('all' or specific session ID) |
-| `--skip-remote-lock` | Proceed even if a lock cannot be recorded on the remote target. Only safe when nothing else can prune this target during the run |
+| `--skip-remote-lock` | Proceed even if a pin cannot be recorded on the location, wherever its lock store lives (a remote target's lock directory or a local location's lock file). Only safe when nothing else can prune this location during the run. Not needed for a medium mounted read-only: nothing can delete from it, so the restore goes on without the pin and says so |
 | `--cleanup` | Remove what an interrupted restore left at the destination: only a subvolume this tool's own run marker names that holds no received copy. Everything else is reported and left |
 
 **Config-driven restore options:**
@@ -2526,9 +2526,13 @@ snapper's own layout. What it does, in order:
    One restore runs into a config at a time; a second one started meanwhile is
    refused and restores nothing.
 5. Pins the backup on its location for the duration (under `restore:<session>`,
-   released when a transfer fails), so a prune on that target cannot delete
-   what is being read. A target you can read but not write takes
-   `--skip-remote-lock`.
+   released when a transfer fails or the run is interrupted), so a prune on
+   that location -- `run`'s or `prune`'s, in any process, on any machine --
+   cannot delete what is being read: the pin is recorded on the location for
+   every location type, and every deletion of a snapper slot or a raw stream
+   asks for it first. A target you can read but not write takes
+   `--skip-remote-lock`; a medium mounted read-only needs nothing, since
+   nothing can delete from it.
 
 Every selected backup lands in a **new** slot, present or not: snapper keeps
 every snapshot, so a restore is never skipped as "already restored". The

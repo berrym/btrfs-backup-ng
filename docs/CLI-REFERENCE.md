@@ -937,7 +937,7 @@ btrfs-backup-ng snapper restore SOURCE [CONFIG] [OPTIONS]
 | `--ssh-key FILE` | SSH private key file |
 | `--ssh-auth-sock PATH` | Explicit ssh-agent socket (overrides auto-discovery; useful under `sudo`) |
 | `--ssh-host-key-policy {accept-new,strict}` | Host-key verification policy (default `accept-new`) |
-| `--skip-remote-lock` | Do not pin the backup on its location for the duration of the restore; for a location you can read but not write |
+| `--skip-remote-lock` | Proceed when the pin on the backup cannot be recorded on its location (a remote lock directory or a local lock file); for a location you can read but not write. A medium mounted read-only needs it not: no pin is asked for there |
 | `--gpg-keyring PATH` | GPG keyring to decrypt an encrypted raw snapper backup (must match the keyring it was encrypted for) |
 | `--openssl-cipher CIPHER` | OpenSSL cipher fallback for a legacy raw backup whose `.meta` sidecar does not record one (modern sidecars are authoritative) |
 | `--json` | Output in JSON format (for `--list`) |

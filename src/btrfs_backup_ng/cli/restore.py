@@ -944,12 +944,10 @@ def _execute_status(args: argparse.Namespace) -> int:
     if not backup_endpoint.persists_locks:
         print("This target does not persist locks.")
         print()
-        print("Locks on a local raw:// target are held in memory for the duration of")
-        print("a single run, so nothing is written here. An interrupted run leaves")
-        print("nothing behind to inspect or unlock.")
-        print()
-        print("ssh:// and raw+ssh:// targets DO persist locks, on the target itself,")
-        print("and report them here.")
+        print("Its pins are held in memory for the duration of a single run, so")
+        print("nothing is written here and an interrupted run leaves nothing behind")
+        print("to inspect or unlock. Local, ssh://, raw:// and raw+ssh:// locations")
+        print("all persist their pins on the location itself and report them here.")
         return 0
 
     # Read through the endpoint rather than rebuilding the path here. The
@@ -1165,8 +1163,8 @@ def _execute_unlock(args: argparse.Namespace, lock_id: str) -> int:
     if not backup_endpoint.persists_locks:
         print("This target does not persist locks, so there is nothing to unlock.")
         print()
-        print("Locks on a local raw:// target are held in memory for the duration of")
-        print("a single run, so an interrupted run leaves nothing behind to clear.")
+        print("Its pins are held in memory for the duration of a single run, so an")
+        print("interrupted run leaves nothing behind to clear.")
         return 0
 
     # Same endpoint API as --status, for the same reason.
