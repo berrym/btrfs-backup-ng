@@ -39,6 +39,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   so `-v verify` shows debug output and its warnings are formatted. `run`
   printed one INFO line after reading a `quiet` configuration (the one
   announcing the log file); it applies the setting before that line.
+- **Two configuration keys the loader read were reported as unknown.**
+  `skip_remote_lock` on a target and `timeout` under
+  `[global.notifications.email]` produced "Unknown config key ... (ignored)"
+  although the first was honoured and the second was in the schema; the
+  warning was untrue for one and the value was never read for the other.
+  Both are known and read.
 - **The chunked `ssh://` receive kept a stdout pipe it never read** and
   left its stderr pipe open until garbage collection; the pipe nobody reads
   is gone and the stderr is drained like every other receive's.
