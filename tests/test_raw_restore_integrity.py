@@ -45,6 +45,7 @@ def test_intact_stream_passes_verification_and_restores(tmp_path):
     ep, snap = _sealed(tmp_path, corrupt=False)
     proc = ep.send(snap)  # verify passes -> restore proceeds
     proc.stdout.read()
+    proc.stdout.close()
     proc.wait()
     assert proc.returncode == 0
 
@@ -56,6 +57,7 @@ def test_legacy_stream_without_checksum_skips_verify(tmp_path):
     assert snap.checksum_value is None
     proc = ep.send(snap)  # must not raise
     proc.stdout.read()
+    proc.stdout.close()
     proc.wait()
 
 
@@ -66,6 +68,7 @@ def test_verify_does_not_block_when_checksum_unreadable(tmp_path, monkeypatch):
     monkeypatch.setattr(ep, "compute_stream_checksum", lambda _s: None)
     proc = ep.send(snap)  # must not raise despite unreadable checksum
     proc.stdout.read()
+    proc.stdout.close()
     proc.wait()
 
 
@@ -76,6 +79,7 @@ def test_skip_verify_allows_corrupt_restore_for_last_copy_recovery(tmp_path):
     ep.config["verify_before_restore"] = False  # as _prepare_backup_endpoint sets it
     proc = ep.send(snap)  # must NOT raise despite the corruption
     proc.stdout.read()
+    proc.stdout.close()
     proc.wait()
 
 

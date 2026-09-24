@@ -163,16 +163,16 @@ def require_parents_present(selection, present, source_endpoint, *, skip_present
 
 
 def plan_transfer_sequence(
-    source_snapshots,
-    destination_endpoint,
+    source_snapshots: list,
+    destination_endpoint: Any,
     *,
-    no_incremental=False,
-    keep_num_backups=0,
-    only=None,
-    source_endpoint=None,
-    expand_selection=True,
-    skip_present=True,
-):
+    no_incremental: bool = False,
+    keep_num_backups: int = 0,
+    only: Any = None,
+    source_endpoint: Any = None,
+    expand_selection: bool = True,
+    skip_present: bool = True,
+) -> list[tuple[Any, Any]]:
     """Build the ordered transfer plan ``[(snapshot, parent_or_None)]``.
 
     Args:

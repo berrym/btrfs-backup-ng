@@ -42,7 +42,7 @@ class TestRawPipelinePipefail:
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
         )
-        proc.wait()
+        proc.communicate()
         assert proc.returncode != 0
 
     def test_successful_pipeline_returns_zero_and_writes(self, tmp_path):
@@ -53,7 +53,7 @@ class TestRawPipelinePipefail:
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
         )
-        proc.wait()
+        proc.communicate()
         assert proc.returncode == 0
         assert out.read_bytes() == b"hello"
 

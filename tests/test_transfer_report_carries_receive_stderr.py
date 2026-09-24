@@ -87,6 +87,7 @@ class TestTheReportSaysWhy:
             stderr=subprocess.PIPE,
         )
         T.tail_stderr(recv)
+        send.stdout.close()
         send.wait(timeout=10)
         recv.wait(timeout=10)
         send_err, recv_err = ops._log_process_errors(send, recv)

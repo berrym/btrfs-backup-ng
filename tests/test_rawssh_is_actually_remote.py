@@ -156,7 +156,12 @@ class TestTheIntegrityCheckIsNotPaidTwice:
             ),
         ):
             endpoint.preflight_send(snapshot)  # as core/restore.py does
-            endpoint.send(snapshot)  # which preflights again
+            proc = endpoint.send(snapshot)  # which preflights again
+        # The send is a real pipeline towards a host that does not exist;
+        # it is ended here rather than left running past the test.
+        proc.kill()
+        proc.stdout.close()
+        proc.wait(timeout=30)
 
         assert hashed == [str(stream)], (
             f"the stream was hashed {len(hashed)} times for one restore"

@@ -2605,6 +2605,13 @@ class SSHRawEndpoint(RawEndpoint):
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.PIPE,
             )
+            # Drained as it is written and kept as a tail (core.transfer.StderrTail),
+            # like every other pipeline an endpoint starts. This one was started
+            # with a pipe nobody read: ssh's own diagnostics and anything the
+            # remote shell printed accumulated in a 64 KiB kernel buffer, and a
+            # remote that said more than that blocked on stderr for ever, which
+            # the stall detector then reported as a transfer that stopped moving.
+            tail_stderr(proc)
             return proc
 
         # Local processing then SSH. Quote every argv element (a gpg
@@ -2625,6 +2632,7 @@ class SSHRawEndpoint(RawEndpoint):
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
         )
+        tail_stderr(proc)
         return proc
 
     def commit_receive(self) -> None:

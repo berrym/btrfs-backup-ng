@@ -303,6 +303,44 @@ class TestForeignRawTarget:
         assert_payload_restored(res["restore_dest"], rig.payload)
 
     @requires_raw_remote
+    def test_a_receive_whose_ssh_floods_stderr_still_finishes(self, rig):
+        """The raw+ssh receive pipeline's last stage is ssh, and its stderr
+        was a pipe nobody read: an ssh that said more than the 64 KiB pipe
+        holds blocked, and the stall detector killed a healthy transfer.
+        Here the ssh the product finds on PATH writes 1 MiB to stderr before
+        handing over to the real one, through the real CLI to the real
+        foreign host; the stream still lands and restores."""
+        import os
+        import shutil
+
+        from .conftest import RAW_REMOTE_SPEC, raw_remote_sh
+
+        real_ssh = shutil.which("ssh")
+        assert real_ssh, "no ssh on the runner"
+        wrapper_dir = rig.root / "ssh-flood-bin"
+        wrapper_dir.mkdir(exist_ok=True)
+        wrapper = wrapper_dir / "ssh"
+        wrapper.write_text(
+            "#!/bin/sh\n"
+            "head -c 1048576 /dev/zero | tr '\\0' v >&2\n"
+            f'exec {shlex.quote(real_ssh)} "$@"\n'
+        )
+        wrapper.chmod(0o755)
+        dest = f"{rig.raw_remote_base}/raw-flood"
+        raw_remote_sh(f"mkdir -p '{dest}'")
+        loc = f"raw+ssh://{RAW_REMOTE_SPEC}:{dest}"
+        cfg = rig.write_config(
+            rig.root / "cfg-foreign-flood.toml", f'path = "{loc}"', prefix="t3fld-"
+        )
+        env = {**os.environ, "PATH": f"{wrapper_dir}:{os.environ['PATH']}"}
+        r = rig.cli("run", config=cfg, env=env, timeout=300)
+        out = r.stdout + r.stderr
+        assert r.returncode == 0, out[-3000:]
+        assert "stall" not in out.lower(), out[-3000:]
+        streams = rig.foreign_raw_streams(dest)
+        assert streams, "nothing landed on the foreign target"
+
+    @requires_raw_remote
     def test_the_published_stream_is_not_world_readable(self, rig):
         """The stream is the most sensitive file this tool writes. A remote
         `cat >` left it at the target's umask, typically 0644, while the .meta

@@ -4684,15 +4684,28 @@ print(json.dumps(result))
 
         # Start the receive process
         try:
+            # stdout is not read anywhere on this path; a pipe nobody reads is
+            # a second place the receive could block, and a file descriptor
+            # that was left open until garbage collection.
             receive_process = subprocess.Popen(
                 ssh_cmd,
                 stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
+                stdout=subprocess.DEVNULL,
                 stderr=subprocess.PIPE,
             )
         except Exception as e:
             logger.error("Failed to start SSH receive process: %s", e)
             return False
+        # The remote receive's stderr comes back over ssh. It is drained as it
+        # arrives (core.transfer.StderrTail) and read through stderr_text below;
+        # it used to be read only after the process had exited, so a receive
+        # that said more than the 64 KiB pipe holds -- -vv under btrfs_debug is
+        # a line per file operation -- blocked on stderr while this side waited
+        # for it to take the next chunk.
+        tail_stderr(
+            receive_process,
+            log_as="remote btrfs receive" if self.config.get("btrfs_debug") else None,
+        )
 
         # If sudo with password is needed, send it first
         if use_sudo and not passwordless:
@@ -4713,11 +4726,7 @@ print(json.dumps(result))
 
                 # Check if process is still alive
                 if receive_process.poll() is not None:
-                    stderr = ""
-                    if receive_process.stderr:
-                        stderr = receive_process.stderr.read().decode(
-                            "utf-8", errors="replace"
-                        )
+                    stderr = stderr_text(receive_process)
                     logger.error(
                         "SSH receive process died at chunk %d: %s",
                         chunks_sent,
@@ -4780,11 +4789,7 @@ print(json.dumps(result))
                 return False
 
             if return_code != 0:
-                stderr = ""
-                if receive_process.stderr:
-                    stderr = receive_process.stderr.read().decode(
-                        "utf-8", errors="replace"
-                    )
+                stderr = stderr_text(receive_process)
                 logger.error(
                     "SSH btrfs receive failed with code %d: %s",
                     return_code,

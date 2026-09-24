@@ -5,6 +5,23 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **A `raw+ssh://` receive could stall on its own stderr.** The pipeline
+  that writes the stream over ssh was started with a stderr pipe nobody
+  read, so an ssh that said more than the 64 KiB pipe holds blocked, and
+  the stall detector reported a transfer that stopped moving. The chunked
+  `ssh://` receive read its stderr only after the process had exited, the
+  same fault one step later. Both are now drained as they are written, like
+  every other process an endpoint starts; a structural test over the
+  endpoint modules refuses any new `Popen(stderr=PIPE)` without a drain,
+  and a flood test per endpoint class proves the drain.
+- **The chunked `ssh://` receive kept a stdout pipe it never read** and
+  left its stderr pipe open until garbage collection; the pipe nobody reads
+  is gone and the stderr is drained like every other receive's.
+
 ## [0.9.10] - 2026-09-23
 
 This release fixes behaviour that did not match what the tool documents.
