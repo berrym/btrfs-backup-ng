@@ -34,7 +34,7 @@ from ..notifications import (
 from ..notifications import (
     NotificationConfig as NotifConfig,
 )
-from ..retention import RetentionError
+from ..retention import RetentionError, extract_timestamp
 from ..transaction import set_transaction_log
 from .common import (
     apply_config_verbosity,
@@ -1129,8 +1129,39 @@ def _catch_up_selector(
             )
             return None
         kept = {id(s) for s in to_keep}
-        chosen = [s for s in missing if id(s) in kept]
-        left_out = [s.get_name() for s in missing if id(s) not in kept]
+        get_id = getattr(destination_endpoint, "get_id", None)
+        destination_id = get_id() if callable(get_id) else None
+
+        def pinned_for_this_target(snap) -> bool:
+            # A lock this destination holds on the source snapshot is a
+            # transfer that did not finish. Only a completed transfer releases
+            # it (and a prune then deletes the copy as before); left out here
+            # it would never be released, and the source would keep the
+            # snapshot for ever with "Skipping locked snapshot" every run.
+            if destination_id is None:
+                return False
+            return destination_id in getattr(snap, "locks", ()) or (
+                destination_id in getattr(snap, "parent_locks", ())
+            )
+
+        def dated(snap) -> bool:
+            # The planner sends nothing it cannot order by time unless asked
+            # for it by name. A selection IS such an ask, so an undated
+            # subvolume in the snapshot directory -- kept by retention as
+            # unparseable -- must not be turned into a full send by being
+            # selected here. The plan without a selection leaves it out.
+            # Dated by the listing's rule, the one the retention above used.
+            return extract_timestamp(snap.get_name(), prefix, ts_format) is not None
+
+        chosen = [
+            s
+            for s in missing
+            if (id(s) in kept or pinned_for_this_target(s)) and dated(s)
+        ]
+        chosen_ids = {id(s) for s in chosen}
+        left_out = [
+            s.get_name() for s in missing if id(s) not in chosen_ids and dated(s)
+        ]
         if left_out:
             logger.info(
                 "Not sending %d of %d missing snapshot(s) to %s: the target's "

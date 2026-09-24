@@ -62,6 +62,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   of the hour as "latest" and deleted the ones created after it. The
   counter now comes only from a name that parsed with a trailing `_N`
   removed, in retention and in the listing's own order.
+- **`run`'s catch-up could strand a lock and send an undated subvolume.** A
+  missing snapshot this destination still held a transfer lock on (a send
+  that did not finish) was left out of the catch-up, so nothing ever
+  released the lock and the source kept the snapshot for ever; it is now
+  always sent. A subvolume in the snapshot directory whose name yields no
+  timestamp was kept by retention as unparseable, so the selection carried
+  it, and a selection is an explicit request to the planner: it was sent
+  as a full send, first, to every target, which the plan without a
+  selection never does. It is left out of the selection.
 - **The log file's completeness depended on the console level.** The
   file handler is meant to record at DEBUG whatever the screen shows, but
   the shared endpoint logger kept the console's level, so under `-q` every
