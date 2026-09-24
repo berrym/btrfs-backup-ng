@@ -8,13 +8,15 @@ one ``btrbk -n -S run`` per variant -- and holds this tool's engine, fed the
 imported policy at the same clock, to the same agreement the unit tests
 assert against the table:
 
+- EVERY variant keeps at least what btrbk keeps: a snapshot btrbk keeps and
+  this tool deletes is a defect in the importer or the engine, whatever the
+  clock;
 - the variants whose meaning coincides keep EXACTLY what btrbk keeps;
-- a variant this tool refuses to prune under (btrbk: keep only the newest)
-  is kept as MORE than btrbk, never less;
-- the two measured divergences -- btrbk's calendar-granular ``Nd`` minimum
-  and its N+1 period counts -- are allowed to keep LESS than btrbk here, and
-  the set of variants that does so must be exactly those two. Anything else
-  keeping less than btrbk is a defect in the importer or the engine.
+- the others keep MORE, by design: a policy this tool refuses to prune under
+  (btrbk: keep only the newest) gets the default schedule, and btrbk's
+  inclusive numbers are written one higher (``2d`` -> ``3d``, ``2d`` ->
+  ``daily = 3``), which contains btrbk's window from any position in the
+  day, week or month.
 
 Needs root, btrfs and btrbk on the runner; skips otherwise and says so.
 """
@@ -41,31 +43,16 @@ requires_btrbk = pytest.mark.skipif(
 
 pytestmark = [pytest.mark.tier2, requires_btrfs, requires_btrbk]
 
-#: Where the importer is known to keep less than btrbk, awaiting a ruling on
-#: the mapping (two strict xfails in the unit tests pin the mechanism): every
-#: ``N<unit>`` minimum -- btrbk's is calendar-granular and inclusive, this
-#: tool's is an exact duration -- and every bucket count -- btrbk keeps N+1
-#: periods. Whether a given variant actually keeps less depends on where the
-#: run's clock falls in its day, week and month, so these MAY keep less.
-KNOWN_TO_KEEP_LESS = {
-    ("snapshot_preserve_min 2d",),
-    ("snapshot_preserve_min 2d", "snapshot_preserve 3d 2w"),
-    ("snapshot_preserve_min 3m",),
-    ("target_preserve_min no", "target_preserve 2d"),
-    ("target_preserve_min 2d",),
-    ("target_preserve_min 1w",),
-}
-#: Where this tool refuses btrbk's policy (keep only the newest) and writes
-#: the default schedule instead: more is kept, and that is asserted.
-KEPT_AS_MORE = {
-    ("snapshot_preserve_min latest",),
-    ("snapshot_preserve no", "snapshot_preserve_min latest"),
-    ("target_preserve_min no",),
-    ("target_preserve_min no", "target_preserve no"),
-    ("target_preserve_min latest", "target_preserve no"),
-    # A minimum of a day or less with no schedule: refused here, so the default
-    # schedule is written instead.
-    ("target_preserve_min 0d",),
+#: The variants whose imported meaning is btrbk's at every clock: nothing
+#: set, and a schedule under the default ``all`` minimum -- keep everything.
+#: These keep EXACTLY what btrbk keeps. Every other variant contains a number
+#: the import writes one higher, a policy it refuses and widens, or a
+#: same-day snapshot that is future-dated before 10:00 and quarantined here,
+#: and keeps MORE at some clocks -- never less.
+EXACT = {
+    (),
+    ("snapshot_preserve 2d",),
+    ("target_preserve 2d",),
 }
 
 
@@ -131,7 +118,20 @@ def _btrbk_kept(conf: Path, present: set[str]) -> tuple[set[str], set[str]]:
         for line in text.splitlines()
         if line.startswith("+++ ") and "data." in line
     }
-    return (present | created) - deleted, created
+    # The dry run creates a snapshot it does not send, so the newest snapshot
+    # the two sides already share stays the incremental parent of that
+    # transfer and btrbk preserves it for that reason alone ("preserve forced:
+    # latest common target"), outside its retention policy. A real run sends
+    # first and the sent snapshot becomes the parent; this tool prunes after
+    # sending, so its "latest" is that one. The schedule table names the
+    # reason per snapshot; a snapshot kept only as the pending transfer's
+    # parent is not a retention decision to hold this tool to.
+    chain_parent = {
+        line.split("data.", 1)[1].split()[0]
+        for line in text.splitlines()
+        if "preserve forced: latest common" in line and "data." in line
+    }
+    return (present | created) - deleted - chain_parent, created
 
 
 def _ours_kept(
@@ -176,26 +176,21 @@ def _compare(variants, tmp_path, source, target, present, target_side):
 
 
 def _judge(results, present):
-    keeps_less = []
+    """Every variant keeps at least what btrbk keeps; the EXACT ones keep
+    exactly that. Returns the variants that kept more, with what."""
+    keeps_less = {
+        lines: theirs - ours
+        for lines, (theirs, ours) in results.items()
+        if theirs - ours
+    }
+    assert not keeps_less, f"kept by btrbk and deleted here: {keeps_less}"
+    more = {}
     for lines, (theirs, ours) in results.items():
-        if lines in KEPT_AS_MORE:
-            assert ours >= theirs, (lines, theirs - ours)
-        elif lines in KNOWN_TO_KEEP_LESS:
-            if not ours >= theirs:
-                keeps_less.append(lines)
-        else:
-            assert ours == theirs, (
-                lines,
-                "btrbk only:",
-                theirs - ours,
-                "ours only:",
-                ours - theirs,
-            )
-    # Every variant that kept less than btrbk is one of the two known
-    # divergences; a new one is a defect, a vanished one means the pinned
-    # unit tests are stale.
-    assert set(keeps_less) <= KNOWN_TO_KEEP_LESS
-    return keeps_less
+        if lines in EXACT:
+            assert ours == theirs, (lines, "ours only:", ours - theirs)
+        elif ours != theirs:
+            more[lines] = sorted(ours - theirs)
+    return more
 
 
 class TestTheImportedPolicyAgainstBtrbk:
@@ -206,8 +201,8 @@ class TestTheImportedPolicyAgainstBtrbk:
         results = _compare(
             list(truth.SOURCE_KEEPS), tmp_path, source, target, present, False
         )
-        less = _judge(results, present)
-        print("source variants keeping less than btrbk (known):", less)
+        more = _judge(results, present)
+        print("source variants keeping more than btrbk:", more)
 
     def test_target_side(self, btrfs_source_and_dest, tmp_path):
         source, target = btrfs_source_and_dest
@@ -223,8 +218,8 @@ class TestTheImportedPolicyAgainstBtrbk:
         results = _compare(
             list(truth.TARGET_KEEPS), tmp_path, source, target, present, True
         )
-        less = _judge(results, present)
-        print("target variants keeping less than btrbk (known):", less)
+        more = _judge(results, present)
+        print("target variants keeping more than btrbk:", more)
 
 
 def test_the_shift_keeps_the_time_of_day():

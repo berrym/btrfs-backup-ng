@@ -586,10 +586,20 @@ def parse_btrbk_config(content: str) -> BtrbkConfig:
 
 
 def parse_btrbk_retention(value: str) -> dict[str, int]:
-    """Parse btrbk retention format into counts.
+    """Parse a btrbk preserve matrix into this tool's bucket counts.
 
-    btrbk format: "[<hourly>h] [<daily>d] [<weekly>w] [<monthly>m] [<yearly>y]"
-    Example: "14d 4w 6m" means 14 daily, 4 weekly, 6 monthly
+    btrbk format: "[<hourly>h] [<daily>d] [<weekly>w] [<monthly>m] [<yearly>y]".
+
+    btrbk's count is INCLUSIVE: ``14d`` keeps the first snapshot of each of
+    days 0..14 -- fifteen days -- because its scheduler preserves a period
+    while ``delta_days <= 14`` (``schedule()`` in btrbk 0.32.7); the same holds
+    for hours, weeks, months and years. This tool's ``daily = N`` keeps N day
+    buckets. So every count is written one higher than btrbk's number, which
+    keeps at least what btrbk keeps: "14d 4w 6m" becomes daily 15, weekly 5,
+    monthly 7. ``*`` keeps every period (999). btrbk reads the count as a
+    string and tests it for truth: ``0`` disables the period and stays 0;
+    ``00`` is true, enables the period with a bound of 0 and keeps the current
+    period, so it becomes 1.
 
     Args:
         value: btrbk retention string
@@ -619,7 +629,7 @@ def parse_btrbk_retention(value: str) -> dict[str, int]:
     pattern = re.compile(r"(\d+|\*)([hdwmy])")
     for match in pattern.finditer(value):
         count_str, unit = match.groups()
-        count = 999 if count_str == "*" else int(count_str)
+        count = _inclusive_count(count_str)
 
         if unit == "h":
             result["hourly"] = count
@@ -635,16 +645,34 @@ def parse_btrbk_retention(value: str) -> dict[str, int]:
     return result
 
 
+def _inclusive_count(count_str: str) -> int:
+    """One btrbk period count as this tool's bucket count: see
+    ``parse_btrbk_retention``."""
+    if count_str == "*":
+        return 999
+    if count_str == "0":
+        return 0
+    return int(count_str) + 1
+
+
 def _translate_preserve_min(value: str) -> tuple[str, list[str]]:
     """Translate a btrbk ``*_preserve_min`` value into a btrfs-backup-ng retention
     ``min`` duration.
 
-    Two btrbk-vs-btrfs-backup-ng mismatches make a straight passthrough wrong:
+    Three btrbk-vs-btrfs-backup-ng mismatches make a straight passthrough wrong:
 
     * **Unit clash on ``m``.** btrbk retention uses ``m`` for MONTHS, but
       btrfs-backup-ng's duration parser uses ``m`` for minutes and ``M`` for months.
       A btrbk ``3m`` (3 months) passed through verbatim would silently become 3
       *minutes*. We remap ``m`` -> ``M``.
+    * **btrbk's minimum is calendar-granular and inclusive.** ``2d`` keeps a
+      snapshot while ``delta_days <= 2``, where the delta counts whole days
+      from the start of the snapshot's day; at 19:19 on the 23rd that keeps a
+      snapshot from 03:00 on the 21st. ``min = "2d"`` here is exactly 48 hours
+      and would delete it. Written one unit higher (``3d``, 72 hours) the
+      window always contains btrbk's: the start of the Nth period back lies
+      within N+1 whole units of any moment inside the current one. The same
+      holds for hours, weeks, months and years.
     * **Special tokens.** btrbk ``no``/``all``/``latest`` are not durations. ``no``
       is no age floor (``0s``); ``latest`` keeps only the latest beyond the
       schedule, which this project always keeps anyway (``0s``); ``all`` keeps
@@ -667,7 +695,7 @@ def _translate_preserve_min(value: str) -> tuple[str, list[str]]:
         count, unit = m.groups()
         # btrbk m=months -> btrfs-backup-ng M=months (h/d/w/y are identical).
         bbng_unit = "M" if unit == "m" else unit
-        return f"{count}{bbng_unit}", warnings
+        return f"{int(count) + 1}{bbng_unit}", warnings
     warnings.append(
         f"btrbk retention minimum {value.strip()!r} was not understood; "
         f'using min = "all" (keep every snapshot) until you set it -- review the '
@@ -766,10 +794,53 @@ def _retention_block(
     retention. Returns ``(toml_lines, warnings)``.
     """
     min_str, counts, warnings = _btrbk_policy(preserve, preserve_min, scope)
-    lines = [f"[{header}.retention]", "min = " + toml_str(min_str)]
+    directive = "target" if header.endswith("targets") else "snapshot"
+    origin = ", ".join(
+        f"{directive}_{name} {value.strip()}"
+        for name, value in (("preserve", preserve), ("preserve_min", preserve_min))
+        if value is not None
+    )
+    lines = [f"[{header}.retention]"]
+    if origin:
+        lines.append(f"# btrbk: {origin}")
+        if _raises_a_number(preserve, preserve_min):
+            lines.append(INCLUSIVE_NOTE_COMMENT)
+    lines.append("min = " + toml_str(min_str))
     for key in ("hourly", "daily", "weekly", "monthly", "yearly"):
         lines.append(f"{key} = {counts[key]}")
     return lines, warnings
+
+
+#: The comment written above a retention block whose numbers were raised by
+#: one, and (as ``INCLUSIVE_NOTE``) said once per import.
+INCLUSIVE_NOTE_COMMENT = (
+    "# counts and minimum are one higher than btrbk's: its N keeps periods "
+    "0..N and its minimum is inclusive"
+)
+INCLUSIVE_NOTE = (
+    "Retention counts and minimums are written one higher than btrbk's "
+    'numbers (14d -> daily = 15, snapshot_preserve_min 2d -> min = "3d"): '
+    "btrbk's count N keeps the first snapshot of each of periods 0..N, and its "
+    "minimum N keeps the whole Nth calendar unit back, so the imported policy "
+    "keeps at least what btrbk keeps. Weekly, monthly and yearly buckets start "
+    "on ISO Monday and on the first of the month and year here, where btrbk "
+    "starts them on preserve_day_of_week; the first snapshot of a week can "
+    "therefore differ."
+)
+
+
+def _raises_a_number(preserve: str | None, preserve_min: str | None) -> bool:
+    """Whether this pair contains a btrbk number the import writes one higher:
+    a period count other than ``*`` and ``0``, or an ``N<unit>`` minimum."""
+    if preserve is not None and any(
+        count not in ("*", "0")
+        for count, _unit in re.findall(r"(\*|\d+)([hdwmy])", preserve.lower())
+    ):
+        return True
+    return bool(
+        preserve_min is not None
+        and re.fullmatch(r"\s*\d+\s*[hdwmy]\s*", preserve_min.lower())
+    )
 
 
 def _is_disabled(value: object) -> bool:
@@ -1285,6 +1356,9 @@ def convert_to_toml(btrbk_config: BtrbkConfig) -> tuple[str, list[str]]:
                 warnings.extend(target_warnings)
 
                 lines.append("")
+
+    if INCLUSIVE_NOTE_COMMENT in lines:
+        warnings.append(INCLUSIVE_NOTE)
 
     # Options btrbk understands that this project has no equivalent for. They
     # were in the lexer's keyword set -- so they never looked unknown -- stored,

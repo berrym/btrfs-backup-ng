@@ -192,39 +192,51 @@ volume /mnt/pool
 
 
 class TestParseBtrbkRetention:
-    """Tests for retention parsing."""
+    """Tests for retention parsing.
+
+    btrbk's count N keeps periods 0..N, so every count is written one higher.
+    """
 
     def test_parse_days(self):
         """Test parsing day retention."""
         result = parse_btrbk_retention("7d")
-        assert result.get("daily") == 7
+        assert result.get("daily") == 8
 
     def test_parse_weeks(self):
         """Test parsing week retention."""
         result = parse_btrbk_retention("4w")
-        assert result.get("weekly") == 4
+        assert result.get("weekly") == 5
 
     def test_parse_months(self):
         """Test parsing month retention."""
         result = parse_btrbk_retention("6m")
-        assert result.get("monthly") == 6
+        assert result.get("monthly") == 7
 
     def test_parse_combined(self):
         """Test parsing combined retention."""
         result = parse_btrbk_retention("14d 4w 6m")
-        assert result.get("daily") == 14
-        assert result.get("weekly") == 4
-        assert result.get("monthly") == 6
+        assert result.get("daily") == 15
+        assert result.get("weekly") == 5
+        assert result.get("monthly") == 7
 
     def test_parse_hours(self):
         """Test parsing hour retention."""
         result = parse_btrbk_retention("24h")
-        assert result.get("hourly") == 24
+        assert result.get("hourly") == 25
 
     def test_parse_years(self):
         """Test parsing year retention."""
         result = parse_btrbk_retention("5y")
-        assert result.get("yearly") == 5
+        assert result.get("yearly") == 6
+
+    def test_a_zero_count_disables_the_period(self):
+        """btrbk tests the count string for truth: "0" is false."""
+        assert parse_btrbk_retention("0d").get("daily") == 0
+
+    def test_a_double_zero_count_keeps_the_current_period(self):
+        """ "00" is true in btrbk: the period is enabled with a bound of 0 and
+        keeps the first snapshot of the current period."""
+        assert parse_btrbk_retention("00d").get("daily") == 1
 
     def test_parse_all(self):
         """Test parsing 'all' value."""
@@ -395,9 +407,9 @@ volume /mnt/pool
 
         toml_output, warnings = import_btrbk_config(config_path)
 
-        assert "daily = 14" in toml_output
-        assert "weekly = 4" in toml_output
-        assert "monthly = 6" in toml_output
+        assert "daily = 15" in toml_output
+        assert "weekly = 5" in toml_output
+        assert "monthly = 7" in toml_output
 
     def test_import_nonexistent_file(self, tmp_path):
         """Test importing nonexistent file."""
@@ -526,18 +538,19 @@ class TestBtrbkRetentionFidelity:
     # --- _translate_preserve_min --------------------------------------------
 
     def test_min_months_unit_remapped(self):
-        """btrbk 'm' = MONTHS must become btrfs-backup-ng 'M', not minutes ('m')."""
+        """btrbk 'm' = MONTHS must become btrfs-backup-ng 'M', not minutes ('m');
+        the number is one higher because btrbk's minimum is inclusive."""
         from btrfs_backup_ng.btrbk_import import _translate_preserve_min
 
-        assert _translate_preserve_min("3m") == ("3M", [])
+        assert _translate_preserve_min("3m") == ("4M", [])
 
-    def test_min_hours_days_weeks_years_passthrough(self):
+    def test_min_hours_days_weeks_years_keep_their_unit(self):
         from btrfs_backup_ng.btrbk_import import _translate_preserve_min
 
-        assert _translate_preserve_min("48h")[0] == "48h"
-        assert _translate_preserve_min("2d")[0] == "2d"
-        assert _translate_preserve_min("4w")[0] == "4w"
-        assert _translate_preserve_min("1y")[0] == "1y"
+        assert _translate_preserve_min("48h")[0] == "49h"
+        assert _translate_preserve_min("2d")[0] == "3d"
+        assert _translate_preserve_min("4w")[0] == "5w"
+        assert _translate_preserve_min("1y")[0] == "2y"
 
     def test_min_no_maps_to_zero_age(self):
         from btrfs_backup_ng.btrbk_import import _translate_preserve_min
@@ -551,7 +564,7 @@ class TestBtrbkRetentionFidelity:
         toml, _ = self._toml(
             "snapshot_preserve 5y\n\nvolume /mnt/p\n  subvolume s\n    target /mnt/b\n"
         )
-        assert "yearly = 5" in toml
+        assert "yearly = 6" in toml
 
     def test_yearly_default_emitted_when_absent(self):
         toml, _ = self._toml("volume /mnt/p\n  subvolume s\n    target /mnt/b\n")
@@ -565,8 +578,8 @@ class TestBtrbkRetentionFidelity:
             "  subvolume home\n    snapshot_preserve 7d 2w\n    target /mnt/b\n"
         )
         assert "[volumes.retention]" in toml
-        assert "daily = 7" in toml
-        assert "weekly = 2" in toml
+        assert "daily = 8" in toml
+        assert "weekly = 3" in toml
 
     def test_no_override_omits_volumes_retention(self):
         toml, _ = self._toml(
@@ -611,13 +624,13 @@ class TestBtrbkRetentionFidelity:
         cfg, load_warns = load_config(p)
 
         gr = cfg.global_config.retention
-        assert gr.min == "3M"  # months, not minutes
-        assert gr.yearly == 2  # not dropped
-        assert gr.daily == 14
+        assert gr.min == "4M"  # months, not minutes; one higher than btrbk's 3m
+        assert gr.yearly == 3  # not dropped
+        assert gr.daily == 15
         v = cfg.volumes[0]
         assert v.retention is not None
-        assert v.retention.min == "2w"
-        assert v.retention.daily == 7
+        assert v.retention.min == "3w"
+        assert v.retention.daily == 8
         # The generated config trips no unknown-key warnings.
         assert not [w for w in load_warns if "Unknown config key" in w]
 

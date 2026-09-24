@@ -39,9 +39,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   backup, as btrbk does. The one shape this tool cannot prune under -- no
   schedule and a minimum of a day or less, which in btrbk keeps only the
   newest snapshot -- gets the default schedule with a warning that it keeps
-  more. An unterminated quote no longer swallows the rest of the file. The
-  migration guide describes the new mapping, and two remaining differences
-  (btrbk's calendar-granular minimum and its N+1 period counts).
+  more. An unterminated quote no longer swallows the rest of the file.
+  btrbk's numbers are inclusive -- `snapshot_preserve 14d` keeps the first
+  snapshot of each of days 0..14, fifteen days, and `snapshot_preserve_min
+  2d` keeps a snapshot for the whole of the second calendar day back -- so
+  every count and every `N<unit>` minimum is written one higher (`daily =
+  15`, `min = "3d"`), which keeps at least what btrbk keeps; `0` still
+  disables a period and `00`, true to btrbk, keeps the current one. Each
+  generated retention block names the btrbk lines it came from and the
+  one-higher rule, and the import says the rule once. Measured against
+  btrbk 0.32.7 live, at every hour of the day and day of the week in four
+  zones: the minimum and the hourly and daily counts never delete a
+  snapshot btrbk keeps. The migration guide describes the mapping and the
+  one remaining difference: btrbk starts weeks on `preserve_day_of_week`
+  and months and years on the first such weekday, this tool on ISO Monday
+  and the first of the month, so the first snapshot of a week can differ.
 - **A `raw+ssh://` receive could stall on its own stderr.** The pipeline
   that writes the stream over ssh was started with a stderr pipe nobody
   read, so an ssh that said more than the 64 KiB pipe holds blocked, and
