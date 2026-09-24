@@ -18,6 +18,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   every other process an endpoint starts; a structural test over the
   endpoint modules refuses any new `Popen(stderr=PIPE)` without a drain,
   and a flood test per endpoint class proves the drain.
+- **`[global] quiet` could silence the endpoints for the rest of the
+  process.** The shared logger the endpoints write through was built
+  outside the logging manager, whose job it is to clear every logger's
+  level cache when a level changes; after `quiet` raised it to WARNING and
+  one INFO line was refused, lowering it again (a log file at DEBUG added
+  afterwards, `verbose`) changed the level and nothing else. The logger is
+  now registered with the manager.
+- **The log file's completeness depended on the console level.** The
+  file handler is meant to record at DEBUG whatever the screen shows, but
+  the shared endpoint logger kept the console's level, so under `-q` every
+  endpoint INFO line was missing from `log_file` and under the default
+  level every endpoint DEBUG line. Adding the file handler now opens that
+  logger to the file's level, and removing it puts the level back.
+- **Commands that read the configuration for a `timestamp_format` or a
+  target's options ignored its `quiet` / `verbose`:** `restore` on a
+  location (`--list`, `--status`, a plain restore), `verify`, `estimate` on
+  paths, `snapper list`, `snapper backup` and `snapper status`. They apply
+  it now; `verify` also sets up the console logger every other command has,
+  so `-v verify` shows debug output and its warnings are formatted. `run`
+  printed one INFO line after reading a `quiet` configuration (the one
+  announcing the log file); it applies the setting before that line.
 - **The chunked `ssh://` receive kept a stdout pipe it never read** and
   left its stderr pipe open until garbage collection; the pipe nobody reads
   is gone and the stderr is drained like every other receive's.

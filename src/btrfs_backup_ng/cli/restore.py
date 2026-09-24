@@ -27,6 +27,7 @@ from ..core.restore import (
 )
 from .common import (
     apply_config_verbosity,
+    apply_configured_verbosity,
     btrfs_debug_enabled,
     get_fs_checks_mode,
     get_log_level,
@@ -50,6 +51,10 @@ def execute_restore(args: argparse.Namespace) -> int:
     """
     log_level = get_log_level(args)
     create_logger(False, level=log_level)
+    # The location modes read the configuration for a target's options and a
+    # timestamp_format; its quiet/verbose applies to them too. The --volume
+    # modes load it again below and apply again, which is idempotent.
+    apply_configured_verbosity(args)
 
     # --in-place is NOT implemented, and the command refuses rather than
     # proceed as if it were. Accepting the flag and running the ordinary

@@ -105,6 +105,29 @@ class TestTheLogFileKeepsItsOwnLevel:
         _run(capsys, "-c", cfg, "prune", "--dry-run")
         text = log.read_text()
         assert "[INFO]" in text, text
+        # An INFO line the ENDPOINTS log after the console went quiet: the
+        # shared endpoint logger is a separate tree, and a package-logger line
+        # alone cannot tell whether it was thinned.
+        assert INFO_AFTER_LOAD in text, text
+
+    def test_the_quiet_flag_does_not_thin_the_log_file_either(self, tmp_path, capsys):
+        """-q is "less on the screen" too. The file's completeness used to
+        depend on the console level the command line set, because only a
+        config setting recomputed the shared logger's floor."""
+        log = tmp_path / "flag.log"
+        cfg = _config(tmp_path, f'log_file = "{log}"')
+        _run(capsys, "-q", "-c", cfg, "prune", "--dry-run")
+        text = log.read_text()
+        assert INFO_AFTER_LOAD in text, text
+        assert DEBUG_AFTER_LOAD in text, text
+
+    def test_run_prints_no_info_after_the_load_under_quiet(self, tmp_path, capsys):
+        """The line announcing the log file came after the configuration was
+        read and still ignored quiet."""
+        log = tmp_path / "quiet-run.log"
+        cfg = _config(tmp_path, "quiet = true", f'log_file = "{log}"')
+        out = _run(capsys, "-c", cfg, "run", "--dry-run")
+        assert "File logging enabled" not in out, out
 
     def test_the_file_receives_what_the_console_drops(self, tmp_path):
         log = tmp_path / "direct.log"
@@ -165,8 +188,13 @@ COMMANDS = [
     ("snapshot", "--dry-run"),
     ("transfer", "--dry-run"),
     ("estimate", "--volume", "{src}"),
+    ("estimate", "{src}", "{dst}"),
     ("restore", "--list-volumes"),
     ("restore", "--volume", "{src}", "--to", "{restore_to}", "--dry-run"),
+    # The location modes read the configuration for a timestamp_format and a
+    # target's options; they apply its verbosity too.
+    ("restore", "--list", "{dst}"),
+    ("verify", "{dst}"),
 ]
 
 
@@ -182,7 +210,11 @@ class TestEveryCommandAppliesIt:
 
         cfg = _config(tmp_path, f"{setting} = true")
         argv = [
-            part.format(src=tmp_path / "src", restore_to=tmp_path / "restored")
+            part.format(
+                src=tmp_path / "src",
+                dst=tmp_path / "dst",
+                restore_to=tmp_path / "restored",
+            )
             for part in command
         ]
         try:

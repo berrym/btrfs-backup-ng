@@ -16,7 +16,14 @@ from ..core.verify import (
     verify_raw_checksums,
     verify_stream,
 )
-from .common import btrfs_debug_enabled, get_fs_checks_mode, resolve_timestamp_format
+from ..__logger__ import create_logger
+from .common import (
+    apply_configured_verbosity,
+    btrfs_debug_enabled,
+    get_fs_checks_mode,
+    get_log_level,
+    resolve_timestamp_format,
+)
 
 logger = logging.getLogger(__name__)
 console = Console()
@@ -31,6 +38,14 @@ def execute(args: argparse.Namespace) -> int:
     Returns:
         Exit code (0 = success, 1 = failures found, 2 = error)
     """
+    # The same console logger every other command sets up: without it -v and
+    # --debug showed nothing here, and the module's warnings came out through
+    # logging's last-resort handler, unformatted. Not in --json mode: stdout is
+    # the machine-readable report there, and the console logger writes to it.
+    if not getattr(args, "json", False):
+        create_logger(False, level=get_log_level(args))
+        apply_configured_verbosity(args)
+
     # Build endpoint kwargs. Thread timestamp_format so custom-named snapshots
     # are parsed (otherwise verify silently skips them and can report success).
     endpoint_kwargs = {

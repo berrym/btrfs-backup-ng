@@ -438,6 +438,33 @@ def apply_config_verbosity(args: argparse.Namespace | None, config=None) -> None
         set_console_level(level)
 
 
+def apply_configured_verbosity(args: argparse.Namespace | None) -> None:
+    """Apply ``[global] quiet`` / ``verbose`` / ``btrfs_debug`` for a command
+    that reads the configuration without keeping it.
+
+    The direct-mode commands -- ``restore`` on a location, ``verify``,
+    ``estimate`` on paths, ``snapper list/backup/status`` -- read the
+    configuration for a ``timestamp_format`` or a target's ssh options and
+    let it go, so ``apply_config_verbosity`` had no object to be given and
+    those commands were the exception to "every command that reads a
+    configuration applies them". This finds and loads the configuration the
+    same way they do (the operator's ``-c``, else the default locations) and
+    applies it; a configuration that is missing or does not load changes
+    nothing here, as those commands already tolerate that.
+    """
+    from ..config import ConfigError, find_config_file, load_config
+
+    try:
+        path = find_config_file(getattr(args, "config", None))
+        if path is None:
+            return
+        config, _warnings = load_config(path)
+    except (ConfigError, OSError) as e:
+        logger.debug("Configured verbosity not applied: %s", e)
+        return
+    apply_config_verbosity(args, config)
+
+
 def get_timestamp_format(config=None) -> str:
     """Return the configured snapshot ``timestamp_format`` or the built-in default.
 

@@ -29,6 +29,7 @@ from ..core.space import (
 )
 from .common import (
     apply_config_verbosity,
+    apply_configured_verbosity,
     resolve_snapshot_dir,
     get_fs_checks_mode,
     get_log_level,
@@ -212,6 +213,9 @@ def _estimate_direct(args: argparse.Namespace, source: str, destination: str) ->
 
     # Prepare source endpoint
     fs_checks_mode = get_fs_checks_mode(args)
+    # The configuration this mode reads for its timestamp_format also says how
+    # loud the console is.
+    apply_configured_verbosity(args)
     # Thread timestamp_format so custom-named snapshots are counted, not skipped
     # (which would undercount and hide an existing incremental parent).
     ts_fmt = resolve_timestamp_format(

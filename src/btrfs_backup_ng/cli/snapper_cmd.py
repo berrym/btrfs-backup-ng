@@ -13,7 +13,12 @@ from typing import Any, cast
 from ..__logger__ import create_logger
 from ..snapper import SnapperScanner
 from ..snapper.scanner import SnapperNotFoundError
-from .common import btrfs_debug_enabled, get_log_level, resolve_timestamp_format
+from .common import (
+    apply_configured_verbosity,
+    btrfs_debug_enabled,
+    get_log_level,
+    resolve_timestamp_format,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -95,6 +100,7 @@ def _handle_detect(args: argparse.Namespace) -> int:
 
 def _handle_list(args: argparse.Namespace) -> int:
     """Handle 'snapper list' command."""
+    apply_configured_verbosity(args)
     try:
         scanner = SnapperScanner()
     except SnapperNotFoundError as e:
@@ -203,6 +209,7 @@ def _handle_backup(args: argparse.Namespace) -> int:
     # Set up Rich logging like other commands
     log_level = get_log_level(args)
     create_logger(False, level=log_level)
+    apply_configured_verbosity(args)
 
     try:
         scanner = SnapperScanner()
@@ -385,6 +392,7 @@ def _handle_status(args: argparse.Namespace) -> int:
     from ..core.operations import _list_snapper_backups_at_destination
     from ..endpoint import choose_endpoint
 
+    apply_configured_verbosity(args)
     try:
         scanner = SnapperScanner()
     except SnapperNotFoundError as e:

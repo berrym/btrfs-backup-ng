@@ -10,7 +10,7 @@ These options can be used with any command:
 -h, --help          Show help message and exit
 -V, --version       Show version and exit
 -c, --config FILE   Path to configuration file
--v, --verbose       Increase output verbosity (can be repeated: -vv)
+-v, --verbose       Show debug output on the console
 -q, --quiet         Suppress non-essential output
 --debug             Enable debug output
 --btrfs-debug       Run btrfs send and receive with -vv and log every line they

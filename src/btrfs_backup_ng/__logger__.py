@@ -20,8 +20,18 @@ _initial_level = getattr(logging, _initial_level_name, logging.INFO)
 # Initialize basic console and handler
 cons = Console()
 rich_handler = RichHandler(console=cons, show_path=False)
-# Create a logger - level will be set by set_level() or environment variable
-logger = logging.Logger("btrfs-backup-ng", _initial_level)
+# The shared logger every endpoint module logs through. Registered with the
+# logging manager (getLogger) rather than constructed bare: a Logger built
+# directly is unknown to the manager, and the manager is what clears every
+# logger's isEnabledFor cache when a level changes. A bare one kept the answer
+# it had cached under one level after the level moved -- `quiet` in a config
+# set it to WARNING, the first INFO record cached "disabled", and every INFO
+# line from the endpoints stayed dropped after the level was lowered again
+# (a log file added later, a test resetting the level). propagate stays off,
+# as create_logger sets it, so its records reach only its own handlers.
+logger = logging.getLogger("btrfs-backup-ng")
+logger.setLevel(_initial_level)
+logger.propagate = False
 
 # File handler (set by add_file_handler)
 _file_handler: logging.Handler | None = None
@@ -29,9 +39,8 @@ _file_handler: logging.Handler | None = None
 # The package-root logger, i.e. the parent of every logging.getLogger(__name__)
 # inside btrfs_backup_ng.
 #
-# `logger` above is a standalone logging.Logger instance named with HYPHENS. It
-# is not obtained via getLogger, so it is not registered in the logging manager
-# and nothing can be its child -- while 36 modules across cli/ and core/ use
+# `logger` above is named with HYPHENS and does not propagate, so nothing is
+# its child and nothing above it sees its records -- while 36 modules across cli/ and core/ use
 # logging.getLogger(__name__), which lives under "btrfs_backup_ng" with
 # UNDERSCORES. The two are unrelated trees, so a file handler attached only to
 # `logger` never saw a single line from run, transfer, restore, operations or
@@ -49,6 +58,9 @@ _PACKAGE_LOGGER_NAME = "btrfs_backup_ng"
 # leaving it raised changes console verbosity for the rest of the process,
 # which is a side effect of file logging that nothing asked for.
 _package_level_before: int | None = None
+#: The shared endpoint logger's level before add_file_handler lowered it, for
+#: the same reason and the same restoration.
+_shared_level_before: int | None = None
 
 
 class RichLogger:
@@ -181,7 +193,7 @@ def add_file_handler(
         max_bytes: Maximum size of each log file before rotation (default: 10 MB)
         backup_count: Number of backup files to keep (default: 5)
     """
-    global _file_handler, _package_level_before
+    global _file_handler, _package_level_before, _shared_level_before
 
     # Remove existing file handler if present
     if _file_handler is not None:
@@ -234,13 +246,24 @@ def add_file_handler(
         if _package_level_before is None:
             _package_level_before = package_logger.level
         package_logger.setLevel(file_level)
+    # The shared endpoint logger gets the same treatment. Left at the console's
+    # level, what the FILE received from the endpoints depended on how the
+    # console had been set up: under `-q` every endpoint INFO line was missing
+    # from the record, and under the default level every endpoint DEBUG line,
+    # while set_console_level's floor happened to open it only when a config
+    # setting ran. The console handler keeps its own level, so the screen shows
+    # no more than before.
+    if logger.level == logging.NOTSET or logger.level > file_level:
+        if _shared_level_before is None:
+            _shared_level_before = logger.level
+        logger.setLevel(file_level)
 
     logger.debug("File logging enabled: %s", log_path)
 
 
 def remove_file_handler() -> None:
     """Remove the file handler if present."""
-    global _file_handler, _package_level_before
+    global _file_handler, _package_level_before, _shared_level_before
 
     if _file_handler is not None:
         logger.removeHandler(_file_handler)
@@ -254,3 +277,6 @@ def remove_file_handler() -> None:
         if _package_level_before is not None:
             logging.getLogger(_PACKAGE_LOGGER_NAME).setLevel(_package_level_before)
             _package_level_before = None
+        if _shared_level_before is not None:
+            logger.setLevel(_shared_level_before)
+            _shared_level_before = None

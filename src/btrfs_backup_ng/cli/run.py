@@ -170,6 +170,10 @@ def execute_run(args: argparse.Namespace) -> int:
         logger.error("Configuration error: %s", e)
         return 1
 
+    # The configuration's quiet/verbose applies from here on -- before the
+    # line announcing the log file, which used to be the one INFO line printed
+    # under `quiet = true` after the configuration had been read.
+    apply_config_verbosity(args, config)
     # Enable file logging if configured
     if config.global_config.log_file:
         add_file_handler(config.global_config.log_file)
@@ -179,6 +183,8 @@ def execute_run(args: argparse.Namespace) -> int:
         # went to the console only -- an operator running from cron or systemd
         # with log_file set had a log that silently omitted every config
         # warning, which is the one place they would look afterwards.
+    # Applied again with the file handler in place, so the shared logger's
+    # floor accounts for the file's level (the call is idempotent).
     apply_config_verbosity(args, config)
     for warning in warnings:
         logger.warning("Config: %s", warning)
