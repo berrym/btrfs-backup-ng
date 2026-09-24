@@ -138,6 +138,17 @@ def _subtract_months(dt: datetime, months: int) -> datetime:
     return dt.replace(year=year, month=month, day=min(dt.day, last_day))
 
 
+#: ``min = "all"``: keep every snapshot, whatever its age -- btrbk's
+#: ``*_preserve_min all``, and its default. Nothing in the scope is ever
+#: deleted by retention; the bucket counts cannot select anything to delete.
+MIN_KEEP_ALL = "all"
+
+
+def keeps_everything(min_value: Any) -> bool:
+    """Whether a retention ``min`` is ``"all"``: keep every snapshot."""
+    return str(min_value).strip().lower() == MIN_KEEP_ALL
+
+
 def subtract_duration(now: datetime, duration_str: str) -> datetime:
     """Return ``now`` minus a duration string, CALENDAR-aware for month/year units.
 
@@ -149,6 +160,10 @@ def subtract_duration(now: datetime, duration_str: str) -> datetime:
     ambiguous input). ``parse_duration`` keeps its plain-timedelta contract for other callers.
     """
     s = duration_str.strip()
+    if keeps_everything(s):
+        # The earliest representable moment: every snapshot is younger than it,
+        # so every snapshot is "within min" and kept.
+        return datetime.min
     match = DURATION_PATTERN.match(s)
     if not match:
         raise ValueError(f"Invalid duration format: {duration_str}")

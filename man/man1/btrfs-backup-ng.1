@@ -194,7 +194,12 @@ before this age. Month and year units are calendar\(hyaware:
 .B 1M
 is one calendar month (not a flat 30 days) and
 .B 1y
-is one calendar year. An invalid value fails loudly and prunes nothing.
+is one calendar year. The value
+.B all
+keeps every snapshot in the scope for ever, whatever the bucket counts say
+(btrbk's
+.BR snapshot_preserve_min " all,"
+its default). An invalid value fails loudly and prunes nothing.
 .TP
 .B hourly
 Number of hourly snapshots to keep (one per clock hour).

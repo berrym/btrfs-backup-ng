@@ -22,7 +22,12 @@ from ..notifications import (
 from ..notifications import (
     NotificationConfig as NotifConfig,
 )
-from ..retention import RetentionError, apply_retention, parse_duration
+from ..retention import (
+    RetentionError,
+    apply_retention,
+    keeps_everything,
+    parse_duration,
+)
 from .common import (
     apply_config_verbosity,
     btrfs_debug_enabled,
@@ -47,6 +52,9 @@ def is_degenerate_policy(retention: Any) -> bool:
     # even with every bucket at zero -- refusing it would block exactly the
     # configuration the count form exists for.
     if getattr(retention, "keep", 0) > 0:
+        return False
+    # min = "all" keeps every snapshot: the opposite of degenerate.
+    if keeps_everything(retention.min):
         return False
     if any(
         c > 0

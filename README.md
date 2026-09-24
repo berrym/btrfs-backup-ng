@@ -576,6 +576,10 @@ month (aligned with the monthly bucket boundary), not a flat 30 days, and `1y` i
 Weekly buckets use **ISO-8601 week numbering**, so a week that straddles a year boundary is counted
 once rather than split in two.
 
+**`min = "all"`** keeps every snapshot in that scope for ever: retention deletes nothing there,
+whatever the bucket counts or `keep` say. It is what btrbk means by `snapshot_preserve_min all`
+(btrbk's default), and what `config import` writes for a btrbk configuration that sets no minimum.
+
 An invalid `min` value (e.g. a typo) now **fails loudly** and prunes nothing for that volume, rather
 than silently falling back to a shorter window and deleting more than intended.
 
@@ -724,7 +728,7 @@ keep = 30
 
 `keep = N` keeps at least the N most recent snapshots and ignores the time buckets (`hourly`, `daily`, `weekly`, `monthly`, `yearly`) for that scope. It suits a drive that is only connected occasionally, where pruning by elapsed time behaves oddly. Setting `keep` alongside those buckets is reported as a warning, naming which keys are ignored.
 
-`min` is not a bucket and still applies — it is a floor ("keep everything for at least this long"), and a floor composes with a count without ambiguity, since both can only ever keep more. So `keep = 5` with `min = "1d"` keeps five snapshots *and* everything from the last day. Write `min = "0s"` if you want the count alone.
+`min` is not a bucket and still applies — it is a floor ("keep everything for at least this long"), and a floor composes with a count without ambiguity, since both can only ever keep more. So `keep = 5` with `min = "1d"` keeps five snapshots *and* everything from the last day. Write `min = "0s"` if you want the count alone, and `min = "all"` for a scope that keeps every snapshot and prunes nothing.
 
 Two things hold regardless of policy: a snapshot whose timestamp cannot be parsed is never deleted, and a snapshot still locked for a pending transfer is never deleted. Together with `min`, that is why `keep = N` means "at least N" rather than "exactly N".
 

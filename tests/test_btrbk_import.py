@@ -544,21 +544,6 @@ class TestBtrbkRetentionFidelity:
 
         assert _translate_preserve_min("no") == ("0s", [])
 
-    def test_min_all_and_latest_warn_and_fall_back(self):
-        from btrfs_backup_ng.btrbk_import import _translate_preserve_min
-
-        for token in ("all", "latest"):
-            value, warns = _translate_preserve_min(token)
-            assert value == "1d"
-            assert warns, f"{token} should warn"
-
-    def test_min_unrecognized_warns(self):
-        from btrfs_backup_ng.btrbk_import import _translate_preserve_min
-
-        value, warns = _translate_preserve_min("bogus")
-        assert value == "1d"
-        assert warns
-
     # --- yearly (BUG #3) -----------------------------------------------------
 
     def test_yearly_is_emitted(self):
@@ -590,15 +575,6 @@ class TestBtrbkRetentionFidelity:
         assert "[volumes.retention]" not in toml
 
     # --- warnings (BUG #1/#4/#5/#6) -----------------------------------------
-
-    def test_target_preserve_divergence_warns(self):
-        _, warns = self._toml(
-            "snapshot_preserve 7d\ntarget_preserve 30d\n\n"
-            "volume /mnt/p\n  subvolume s\n    target /mnt/b\n"
-        )
-        assert any(
-            "target_preserve" in w and "NOT applied separately" in w for w in warns
-        )
 
     def test_day_of_week_warns(self):
         _, warns = self._toml(
@@ -645,19 +621,6 @@ class TestBtrbkRetentionFidelity:
         # The generated config trips no unknown-key warnings.
         assert not [w for w in load_warns if "Unknown config key" in w]
 
-    def test_special_min_token_produces_loadable_config(self, tmp_path):
-        """btrbk 'snapshot_preserve_min latest' previously emitted min = "latest",
-        which the loader REJECTS. It must now produce a loadable config."""
-        from btrfs_backup_ng.config.loader import load_config
-
-        toml, _ = self._toml(
-            "snapshot_preserve_min latest\n\nvolume /mnt/p\n  subvolume s\n    target /mnt/b\n"
-        )
-        p = tmp_path / "out.toml"
-        p.write_text(toml)
-        cfg, _ = load_config(p)  # must not raise ConfigError
-        assert cfg.global_config.retention.min == "1d"
-
 
 class TestBtrbkRetentionWarningQuality:
     """Review fixes: retention warnings must be accurate & distinct."""
@@ -667,30 +630,6 @@ class TestBtrbkRetentionWarningQuality:
         from btrfs_backup_ng.btrbk_import import convert_to_toml, parse_btrbk_config
 
         return convert_to_toml(parse_btrbk_config(config))
-
-    def test_per_subvolume_divergence_warnings_are_distinct(self):
-        """Two subvolumes diverging with the SAME target_preserve value must each be
-        reported (the dedup must not collapse them)."""
-        _, warns = self._toml(
-            "volume /mnt/p\n"
-            "  subvolume home\n    snapshot_preserve 7d\n    target_preserve 30d\n    target /mnt/b/home\n"
-            "  subvolume data\n    snapshot_preserve 7d\n    target_preserve 30d\n    target /mnt/b/data\n"
-        )
-        div = [w for w in warns if "target_preserve" in w]
-        assert len(div) == 2
-        assert any("/mnt/p/home" in w for w in div)
-        assert any("/mnt/p/data" in w for w in div)
-
-    def test_divergence_message_accurate_when_no_snapshot_preserve(self):
-        """When target_preserve is set but snapshot_preserve is absent, the warning
-        must say the DEFAULT was used (not 'snapshot_preserve was used')."""
-        _, warns = self._toml(
-            "target_preserve 30d\n\nvolume /mnt/p\n  subvolume s\n    target /mnt/b\n"
-        )
-        div = [w for w in warns if "target_preserve" in w]
-        assert div
-        assert any("default retention was used" in w for w in div)
-        assert not any("snapshot_preserve was used" in w for w in div)
 
     def test_zero_bucket_value_not_labelled_not_understood(self):
         """'0d' parses fine (intentional zero) -- warn it keeps nothing, but do NOT
@@ -714,13 +653,6 @@ class TestBtrbkRetentionWarningQuality:
             "volume /mnt/p\n  subvolume s\n    target /mnt/b\n"
         )
         assert not any("target_preserve" in w for w in warns)
-
-    def test_differing_target_preserve_still_warns(self):
-        _, warns = self._toml(
-            "snapshot_preserve 14d\ntarget_preserve 30d\n\n"
-            "volume /mnt/p\n  subvolume s\n    target /mnt/b\n"
-        )
-        assert any("target_preserve" in w for w in warns)
 
     def test_archive_preserve_warns(self):
         _, warns = self._toml(

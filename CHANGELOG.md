@@ -7,8 +7,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`min = "all"` in a retention block** keeps every snapshot in that scope
+  for ever: retention deletes nothing there, whatever the bucket counts or
+  `keep` say. It is btrbk's `snapshot_preserve_min all`, and btrbk's
+  default. Accepted at every scope (`[global.retention]`,
+  `[volumes.retention]`, `[volumes.source_retention]`,
+  `[volumes.targets.retention]`), inherited like any other key, and not
+  a degenerate policy.
+
 ### Fixed
 
+- **`config import` kept less than btrbk did.** Three faults in one command,
+  each silent, each first noticed by a prune that deleted history btrbk was
+  keeping. The lexer discarded any character it had no class for, so
+  `snapshot_preserve 14d 8w *m` was read as `14d 8w m` and the `*m` (keep
+  every monthly snapshot) became no monthly snapshots; a leading `~` in a
+  path vanished the same way. A missing `snapshot_preserve_min` was written
+  as `min = "1d"` and a missing `snapshot_preserve` as this tool's default
+  buckets, while btrbk's defaults are no schedule and a minimum of `all`: a
+  btrbk configuration that says nothing about retention keeps everything.
+  And `target_preserve` / `target_preserve_min` were dropped with a warning
+  that this tool "uses one retention per volume", which has not been true
+  since retention became per target. Now a directive's value is the rest of
+  its line, verbatim, as btrbk reads it; an absent or `all` minimum is
+  `min = "all"`; `latest` and `no` are `0s`; a minimum the importer does not
+  understand is `all` with a warning; each target's `target_preserve*`,
+  resolved at the narrowest scope that sets it, becomes that target's own
+  `[volumes.targets.retention]`, and a target that sets neither keeps every
+  backup, as btrbk does. The one shape this tool cannot prune under -- no
+  schedule and a minimum of a day or less, which in btrbk keeps only the
+  newest snapshot -- gets the default schedule with a warning that it keeps
+  more. An unterminated quote no longer swallows the rest of the file. The
+  migration guide describes the new mapping, and two remaining differences
+  (btrbk's calendar-granular minimum and its N+1 period counts).
 - **A `raw+ssh://` receive could stall on its own stderr.** The pipeline
   that writes the stream over ssh was started with a stderr pipe nobody
   read, so an ssh that said more than the 64 KiB pipe holds blocked, and

@@ -34,7 +34,11 @@ this version \(em
 .B 1M
 is one calendar month (aligned with the monthly bucket), not a flat 30 days.
 Weekly buckets use ISO\(hy8601 week numbering, so a week that straddles a year
-boundary is counted once. An invalid
+boundary is counted once. A
+.B min
+of
+.B all
+keeps every snapshot in that scope and prunes nothing there. An invalid
 .B min
 value now fails loudly (the volume is skipped) rather than silently defaulting.
 .SH SAFETY
