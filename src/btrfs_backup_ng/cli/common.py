@@ -575,6 +575,30 @@ def thread_ssh_target_config(kwargs: dict, target) -> None:
         kwargs["ssh_auth_sock"] = ssh_auth_sock
 
 
+def snapper_destination_options(
+    config, target, compress_override: str | None = None
+) -> dict[str, Any]:
+    """The endpoint options for a snapper volume's destination ``target``.
+
+    One builder for every command that opens a snapper destination -- ``run``
+    to transfer and prune, ``prune`` to prune -- so they open the same endpoint
+    with the same connection, encryption and compression settings and see the
+    same backups. A snapper destination has no snapshot prefix (its backups are
+    numbered slots), and the transfer stall timeout is a global setting that
+    the per-target helpers do not thread.
+    """
+    options: dict[str, Any] = {
+        "path": target.path,
+        "snap_prefix": "",
+        "timestamp_format": get_timestamp_format(config),
+        "transfer_stall_timeout": config.global_config.transfer_stall_timeout,
+    }
+    thread_ssh_target_config(options, target)
+    thread_raw_encryption(options, target)
+    thread_raw_compression(options, target, compress_override)
+    return options
+
+
 def thread_raw_compression(kwargs: dict, target, override: str | None = None) -> None:
     """Thread the EFFECTIVE compression into an endpoint config dict.
 

@@ -70,6 +70,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   way `snapper restore --list` does, with the pins a snapper restore holds
   on each, and says when the layout is there but could not be enumerated
   rather than printing zero.
+- **`prune` did not prune snapper destinations.** A snapper destination
+  holds numbered slots, not prefix-named snapshots, so `prune` listed it
+  through the native endpoint, found nothing, reported "Keeping 0, deleting
+  0" and deleted nothing -- while `run` pruned the same destination after
+  transferring. `prune` now makes the same decision `run` makes
+  (`plan_snapper_retention`, each target under its own policy, the
+  destination opened with the same connection, encryption and compression
+  options) and carries out the same deletion (`delete_snapper_backups`),
+  local, `ssh://`, `raw://` and `raw+ssh://` alike. `--dry-run` lists the
+  slots it would delete, with their dates, and deletes nothing; the
+  confirmation prompt shows them the same way. The source is snapper's own
+  timeline and is not pruned, as before. This is a behaviour change for a
+  `prune` run on a snapper volume: it now deletes what `run` would.
 - **Retention and `list` disagreed about a snapshot's date.** Retention kept
   a parser of its own -- a list of guessed formats and an unanchored search
   for digits -- so under `timestamp_format = "%Y%m%d"` the snapshot

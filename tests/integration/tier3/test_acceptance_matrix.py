@@ -930,3 +930,73 @@ class TestSnapperSource:
         r3 = rig.cli("run", config=cfg2)  # nothing new to send; the prune runs
         assert r3.returncode == 0, (r3.stdout + r3.stderr)[-3000:]
         assert slots(everything) == slots(selective) == [numbers[0], numbers[-1]]
+
+    def test_prune_deletes_from_a_snapper_destination_what_run_would(
+        self, rig, snapper_chain
+    ):
+        """`prune` on a snapper volume prunes its destination exactly as `run`
+        does after a transfer: four same-day snapper backups under a daily-only
+        policy, `prune --dry-run` names the two slots it would delete and
+        deletes nothing, `prune --yes` deletes them, and the destination ends
+        up holding what `run`'s own prune leaves on a twin destination. Before
+        this, `prune` listed a snapper destination through the native endpoint,
+        found no prefix-named snapshot and reported "Keeping 0, deleting 0".
+        """
+        snap = snapper_chain
+        numbers = [snap.take(f"prune {i}") for i in range(4)]
+        policy = (
+            'min = "0s"\nhourly = 0\ndaily = 1\nweekly = 0\nmonthly = 0\nyearly = 0'
+        )
+
+        def slots(target: Path) -> list[int]:
+            snapshots = target / ".snapshots"
+            if not snapshots.is_dir():
+                return []
+            return sorted(
+                int(p.name) for p in snapshots.iterdir() if p.name.isdecimal()
+            )
+
+        pruned = rig.dst / "snapper-prune-cmd"
+        pruned.mkdir()
+        r = rig.cli("snapper", "backup", snap.name, str(pruned), "--min-age", "0s")
+        assert r.returncode == 0, (r.stdout + r.stderr)[-3000:]
+        assert slots(pruned) == numbers
+        cfg = rig.write_config(
+            rig.root / "cfg-snapper-prune-cmd.toml",
+            f'path = "{pruned}"',
+            source="snapper",
+            snapper_config=snap.name,
+            retention=policy,
+            prefix="t3sp-",
+        )
+        dry = rig.cli("prune", "--dry-run", config=cfg)
+        out = dry.stdout + dry.stderr
+        assert dry.returncode == 0, out[-3000:]
+        flat = " ".join(out.split())
+        for n in numbers[1:-1]:
+            assert f"Would delete (target {pruned}): slot {n} (" in flat, out[-3000:]
+        assert f"slot {numbers[0]} (" not in flat.split("Would delete")[0]
+        assert slots(pruned) == numbers, "a dry run deleted a slot"
+
+        real = rig.cli("prune", "--yes", config=cfg)
+        out = real.stdout + real.stderr
+        assert real.returncode == 0, out[-3000:]
+        assert slots(pruned) == [numbers[0], numbers[-1]], out[-3000:]
+        for n in numbers[1:-1]:
+            assert not (pruned / ".snapshots" / str(n)).exists()
+
+        by_run = rig.dst / "snapper-prune-run"
+        by_run.mkdir()
+        r2 = rig.cli("snapper", "backup", snap.name, str(by_run), "--min-age", "0s")
+        assert r2.returncode == 0, (r2.stdout + r2.stderr)[-3000:]
+        cfg2 = rig.write_config(
+            rig.root / "cfg-snapper-prune-run.toml",
+            f'path = "{by_run}"',
+            source="snapper",
+            snapper_config=snap.name,
+            retention=policy,
+            prefix="t3spr-",
+        )
+        r3 = rig.cli("run", config=cfg2)
+        assert r3.returncode == 0, (r3.stdout + r3.stderr)[-3000:]
+        assert slots(by_run) == slots(pruned) == [numbers[0], numbers[-1]]

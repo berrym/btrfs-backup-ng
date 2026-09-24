@@ -42,6 +42,7 @@ from .common import (
     get_log_level,
     get_timestamp_format,
     should_show_progress,
+    snapper_destination_options,
     space_options_from_args,
     thread_raw_compression,
     thread_raw_encryption,
@@ -926,22 +927,12 @@ def _backup_snapper_volume(
                 **(space_options or {}),
             }
 
-            # Route the destination through the endpoint layer (local/ssh/raw),
-            # threading the target's SSH options so ssh:// / raw+ssh:// honor them.
-            snapper_endpoint_config: dict[str, Any] = {
-                "path": target.path,
-                "snap_prefix": "",
-                "timestamp_format": get_timestamp_format(config),
-            }
-            # A global setting, so it is threaded here rather than by the
-            # per-target helper. Without this the key loads, validates and does
-            # nothing -- the shape of defect this project keeps finding.
-            snapper_endpoint_config["transfer_stall_timeout"] = (
-                config.global_config.transfer_stall_timeout
+            # Route the destination through the endpoint layer (local/ssh/raw)
+            # with the options every command opens a snapper destination with,
+            # so `prune` later sees exactly the backups this run wrote.
+            snapper_endpoint_config = snapper_destination_options(
+                config, target, compress_override
             )
-            thread_ssh_target_config(snapper_endpoint_config, target)
-            thread_raw_encryption(snapper_endpoint_config, target)
-            thread_raw_compression(snapper_endpoint_config, target, compress_override)
             destination_endpoint = endpoint.choose_endpoint(
                 target.path, snapper_endpoint_config
             )
