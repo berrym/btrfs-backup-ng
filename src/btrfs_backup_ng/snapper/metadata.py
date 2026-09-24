@@ -7,7 +7,7 @@ that accompany each snapshot.
 import json
 import xml.etree.ElementTree as ET
 from dataclasses import asdict, dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
@@ -23,6 +23,33 @@ __all__ = [
 
 # Snapper's date format in info.xml
 SNAPPER_DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
+
+
+def _utc_text_to_local(text: str) -> datetime:
+    """A snapper ``<date>`` as the naive LOCAL datetime this tool works in.
+
+    snapper writes info.xml dates in UTC and prints them in local time:
+    measured, a snapshot ``snapper list`` shows at 20:00:09 EDT carries
+    ``<date>2026-09-24 00:00:09</date>``. Every other date here -- a
+    snapshot's name, ``snapper --jsonout list``, ``datetime.now()`` in the
+    retention engine -- is naive local time. Read as local, the UTC text put
+    every backup's date off by the zone's offset: west of UTC a backup made in
+    the last few hours was "dated in the future" and quarantined, east of UTC
+    it looked older than it was and fell out of its minimum window early, and
+    a destination's backups (dated from info.xml) never agreed with the
+    source's snapshots (dated by ``snapper list``) about the same snapshot.
+    The conversion happens once, here, at the boundary with snapper's file.
+    """
+    parsed = datetime.strptime(text, SNAPPER_DATE_FORMAT)
+    return parsed.replace(tzinfo=timezone.utc).astimezone().replace(tzinfo=None)
+
+
+def _local_to_utc_text(when: datetime) -> str:
+    """The inverse of ``_utc_text_to_local``: what snapper expects to find in
+    ``<date>``. A naive datetime is local time; an aware one is converted."""
+    if when.tzinfo is None:
+        when = when.astimezone()
+    return when.astimezone(timezone.utc).strftime(SNAPPER_DATE_FORMAT)
 
 
 @dataclass
@@ -133,7 +160,7 @@ def _snapper_metadata_from_root(root: ET.Element) -> SnapperMetadata:
         raise ValueError(f"Invalid snapshot number: {num_elem.text}") from e
 
     try:
-        date = datetime.strptime(date_elem.text, SNAPPER_DATE_FORMAT)
+        date = _utc_text_to_local(date_elem.text)
     except ValueError as e:
         raise ValueError(f"Invalid date format: {date_elem.text}") from e
 
@@ -226,7 +253,7 @@ def generate_info_xml(metadata: SnapperMetadata) -> str:
 
     lines.append(f"  <type>{metadata.type}</type>")
     lines.append(f"  <num>{metadata.num}</num>")
-    lines.append(f"  <date>{metadata.date.strftime(SNAPPER_DATE_FORMAT)}</date>")
+    lines.append(f"  <date>{_local_to_utc_text(metadata.date)}</date>")
 
     if metadata.description:
         # Escape XML special characters
@@ -318,11 +345,26 @@ class BackupMetadata:
         )
 
     def to_snapper_metadata(self) -> SnapperMetadata:
-        """Convert back to SnapperMetadata."""
+        """Convert back to SnapperMetadata.
+
+        The date comes from snapper's own xml when the sidecar holds it: that
+        text is UTC and is read the way every info.xml is read
+        (``_utc_text_to_local``). Sidecars written before that conversion
+        existed stored ``snapper_date`` as the UTC text mistaken for local, so
+        the string is only trusted when there is no xml to read.
+        """
+        date: Optional[datetime] = None
+        if self.original_info_xml:
+            try:
+                date = parse_info_xml_string(self.original_info_xml).date
+            except ValueError:
+                date = None
+        if date is None:
+            date = datetime.strptime(self.snapper_date, SNAPPER_DATE_FORMAT)
         return SnapperMetadata(
             type=self.snapper_type,
             num=self.snapper_number,
-            date=datetime.strptime(self.snapper_date, SNAPPER_DATE_FORMAT),
+            date=date,
             description=self.snapper_description,
             cleanup=self.snapper_cleanup,
             pre_num=self.snapper_pre_num,

@@ -25,6 +25,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   one INFO line was refused, lowering it again (a log file at DEBUG added
   afterwards, `verbose`) changed the level and nothing else. The logger is
   now registered with the manager.
+- **Snapper dates were read as local time; snapper writes them in UTC.**
+  Every `info.xml` `<date>` is UTC (a snapshot `snapper list` shows at
+  20:00 EDT is dated 00:00 the next day in its file), and it was parsed as
+  local time. West of UTC a fresh snapper backup was "dated in the future"
+  and kept out of retention for hours; east of UTC it looked older than it
+  was and left its minimum window early; and a destination's backups (dated
+  from `info.xml`) never agreed with the source's snapshots (dated by
+  `snapper list`) about when the same snapshot was taken. The date is now
+  converted at the file boundary in both directions; a raw sidecar's
+  stored `info.xml` is the authority for its date, so sidecars written
+  before this read correctly too.
 - **The log file's completeness depended on the console level.** The
   file handler is meant to record at DEBUG whatever the screen shows, but
   the shared endpoint logger kept the console's level, so under `-q` every
