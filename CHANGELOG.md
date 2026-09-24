@@ -18,6 +18,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   every other process an endpoint starts; a structural test over the
   endpoint modules refuses any new `Popen(stderr=PIPE)` without a drain,
   and a flood test per endpoint class proves the drain.
+- **Retention and `list` disagreed about a snapshot's date.** Retention kept
+  a parser of its own -- a list of guessed formats and an unanchored search
+  for digits -- so under `timestamp_format = "%Y%m%d"` the snapshot
+  `20260921_1000000` was the 21st to the listing and 10:00:00 to retention,
+  and a name the listing showed as "unknown" could be bucketed and deleted
+  by a date only retention believed in. Retention now reads every name
+  with the listing's one rule, and a name the listing leaves undated stays
+  undated -- kept, never deleted -- as the README has always said. Names
+  that parse under neither the configured nor the default format, which
+  only the old guessed formats dated, are now kept rather than pruned.
 - **`[global] quiet` could silence the endpoints for the rest of the
   process.** The shared logger the endpoints write through was built
   outside the logging manager, whose job it is to clear every logger's
@@ -36,6 +46,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   converted at the file boundary in both directions; a raw sidecar's
   stored `info.xml` is the authority for its date, so sidecars written
   before this read correctly too.
+- **A collision counter was read off any name ending in digits.** The `_N`
+  that orders two snapshots sharing a timestamp was taken from the end of
+  the whole name, so under a `timestamp_format` ending in `_%H` or
+  `_%H%M%S`, or a prefix ending in `_`, the bare name carried a huge
+  "counter" and sorted newest on a tie: retention kept the first snapshot
+  of the hour as "latest" and deleted the ones created after it. The
+  counter now comes only from a name that parsed with a trailing `_N`
+  removed, in retention and in the listing's own order.
 - **The log file's completeness depended on the console level.** The
   file handler is meant to record at DEBUG whatever the screen shows, but
   the shared endpoint logger kept the console's level, so under `-q` every

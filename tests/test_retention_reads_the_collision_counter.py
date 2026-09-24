@@ -32,12 +32,30 @@ class TestDating:
         ) == datetime(2026, 9, 23)
 
     def test_a_timestamp_ending_in_digits_keeps_its_meaning(self):
-        # As written first: this is noon, never midnight with ordinal 120000.
-        assert extract_timestamp("home-20260904_120000", "home-", "%Y%m%d") == datetime(
-            2026, 9, 4, 12, 0, 0
-        )
-        assert extract_timestamp("home-2024-01-15_143022", "home-") == datetime(
+        # As written first: under a format that has the underscore this is
+        # noon, never midnight with ordinal 120000 -- to retention exactly as
+        # to the listing.
+        assert extract_timestamp(
+            "home-20260904_120000", "home-", "%Y%m%d_%H%M%S"
+        ) == datetime(2026, 9, 4, 12, 0, 0)
+        assert extract_timestamp("home-20240115-143022", "home-") == datetime(
             2024, 1, 15, 14, 30, 22
+        )
+
+    def test_retention_reads_a_digit_suffix_as_the_listing_does(self):
+        """Under ``%Y%m%d`` the name ``20260904_120000`` does not parse as
+        written, so both the listing and retention read it as the 4th with a
+        collision counter. Retention used to search the name for eight digits,
+        a separator and six more, and called this noon while ``list`` showed
+        midnight -- two dates for one snapshot."""
+        from btrfs_backup_ng import __util__
+
+        time_obj, _ = __util__.derive_snapshot_time("20260904_120000", "%Y%m%d")
+        assert time_obj is not None
+        listing_says = datetime(*time_obj[:6])
+        assert listing_says == datetime(2026, 9, 4)
+        assert (
+            extract_timestamp("home-20260904_120000", "home-", "%Y%m%d") == listing_says
         )
 
     def test_the_default_format_with_a_counter(self):

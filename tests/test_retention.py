@@ -4,6 +4,7 @@ from datetime import datetime, timedelta
 
 import pytest
 
+from btrfs_backup_ng import __util__
 from btrfs_backup_ng.config.schema import RetentionConfig
 from btrfs_backup_ng.retention import (
     CLOCK_SKEW_TOLERANCE,
@@ -100,36 +101,24 @@ class TestParseDuration:
 
 
 class TestExtractTimestamp:
-    """Tests for extract_timestamp function."""
+    """extract_timestamp reads a name the way the listing does
+    (``__util__.derive_snapshot_time``): the prefix stripped, then the
+    configured format, then the default format, then either with one trailing
+    collision counter removed. Nothing else -- no guessing at other formats and
+    no searching for digits inside the name -- so retention and ``list`` can
+    never disagree about a snapshot's date."""
 
-    def test_extract_standard_format(self):
-        """Test extracting timestamp from standard format."""
-        # Format: YYYYMMDD-HHMMSS
-        result = extract_timestamp("home-20240115-143022")
-        assert result is not None
-        assert result.year == 2024
-        assert result.month == 1
-        assert result.day == 15
-        assert result.hour == 14
-        assert result.minute == 30
-        assert result.second == 22
-
-    def test_extract_with_prefix(self):
-        """Test extracting timestamp with various prefixes."""
-        result = extract_timestamp("myprefix-20240115-143022")
-        assert result is not None
-        assert result.year == 2024
+    def test_extract_default_format(self):
+        result = extract_timestamp("home-20240115-143022", prefix="home-")
+        assert result == datetime(2024, 1, 15, 14, 30, 22)
 
     def test_extract_no_timestamp(self):
-        """Test extracting from name without timestamp."""
-        result = extract_timestamp("snapshot-without-date")
-        assert result is None
+        assert extract_timestamp("snapshot-without-date", prefix="snapshot-") is None
 
     def test_preferred_format_parses_custom_names(self):
         """A custom timestamp_format not in the built-in list is honored when
         passed as preferred_fmt, so retention buckets it instead of keeping it
         forever."""
-        # Custom format with a 'T' separator and no seconds -> not in the fallbacks.
         name = "home-2024-01-15T1430"
         assert extract_timestamp(name, prefix="home-") is None
         result = extract_timestamp(name, prefix="home-", preferred_fmt="%Y-%m-%dT%H%M")
@@ -143,33 +132,38 @@ class TestExtractTimestamp:
         )
 
     def test_extract_invalid_timestamp(self):
-        """Test extracting invalid timestamp."""
-        result = extract_timestamp("home-99999999-999999")
-        assert result is None
+        assert extract_timestamp("home-99999999-999999", prefix="home-") is None
 
-    def test_extract_with_explicit_prefix(self):
-        """Test extracting with explicit prefix parameter."""
-        result = extract_timestamp("home-20240115-143022", prefix="home-")
-        assert result is not None
-        assert result.year == 2024
+    def test_a_collision_counter_is_dated_by_the_timestamp_before_it(self):
+        assert extract_timestamp("home-20240115-143022_2", prefix="home-") == datetime(
+            2024, 1, 15, 14, 30, 22
+        )
 
-    def test_extract_underscore_format(self):
-        """Test extracting timestamp with underscore format."""
-        result = extract_timestamp("snap-20240115_143022")
-        assert result is not None
-        assert result.year == 2024
+    def test_the_prefix_is_not_guessed(self):
+        """Every listing strips the configured prefix and parses the rest, so a
+        name handed over with its prefix still on it is not a timestamp. The
+        parser this replaced searched the whole name for eight digits, a
+        separator and six more, and so dated names no listing dates."""
+        assert extract_timestamp("home-20240115-143022") is None
+        assert extract_timestamp("myprefix-20240115-143022") is None
 
-    def test_extract_iso_format(self):
-        """Test extracting ISO format timestamp."""
-        result = extract_timestamp("2024-01-15T14:30:22")
-        assert result is not None
-        assert result.year == 2024
-
-    def test_extract_compact_format(self):
-        """Test extracting compact format timestamp."""
-        result = extract_timestamp("backup-20240115143022")
-        assert result is not None
-        assert result.year == 2024
+    @pytest.mark.parametrize(
+        "name",
+        [
+            "snap-20240115_143022",  # %Y%m%d_%H%M%S was a private fallback
+            "backup-20240115143022",  # %Y%m%d%H%M%S was a private fallback
+            "2024-01-15T14:30:22",  # %Y-%m-%dT%H:%M:%S was a private fallback
+            "snap-2024-01-15_143022",  # %Y-%m-%d_%H%M%S was a private fallback
+        ],
+    )
+    def test_other_formats_are_not_guessed(self, name):
+        """A name that parses under neither the configured nor the default
+        format is undated to the listing, and therefore to retention: kept,
+        never deleted by a date the listing does not show. Under the
+        configured format such a name parses, in both places."""
+        prefix = name.split("-")[0] + "-" if name[0].isalpha() else ""
+        assert extract_timestamp(name, prefix=prefix) is None
+        assert __util__.derive_snapshot_time(name[len(prefix) :], None) == (None, False)
 
 
 class TestGetBucketKey:
@@ -244,7 +238,9 @@ class TestApplyRetention:
         retention = RetentionConfig(min="0m", hourly=0, daily=1, weekly=0, monthly=0)
 
         snapshots = ["home-20240115-100000", "invalid-snapshot-name"]
-        to_keep, to_delete = apply_retention(snapshots, retention, now=now)
+        to_keep, to_delete = apply_retention(
+            snapshots, retention, now=now, prefix="home-"
+        )
 
         # Invalid name should be kept
         assert "invalid-snapshot-name" in to_keep
@@ -265,6 +261,7 @@ class TestApplyRetention:
             retention,
             now=now,
             get_name=lambda s: s["name"],
+            prefix="home-",
         )
 
         assert len(to_keep) >= 1
@@ -281,7 +278,7 @@ class TestApplyRetention:
         snapshots = self._make_snapshot_names(timestamps)
 
         with pytest.raises(RetentionError):
-            apply_retention(snapshots, retention, now=now)
+            apply_retention(snapshots, retention, now=now, prefix="home-")
 
     def test_unparseable_does_not_steal_latest(self):
         """CRITICAL: an unparseable-named entry must NOT consume the 'keep latest' slot --
@@ -293,7 +290,10 @@ class TestApplyRetention:
         real_new = "home-20240115-100000"  # 2h before now -> newest real
         real_old = "home-20240110-100000"
         to_keep, to_delete = apply_retention(
-            ["garbage-name-xyz", real_new, real_old], retention, now=now
+            ["garbage-name-xyz", real_new, real_old],
+            retention,
+            now=now,
+            prefix="home-",
         )
         assert real_new in to_keep  # the real newest keeps its 'latest' guarantee
         assert real_new not in to_delete
@@ -330,7 +330,9 @@ class TestApplyRetention:
         skew = "home-20240115-120200"  # +2min, within tolerance
         older = "home-20240115-100000"
         retention = RetentionConfig(min="0s", hourly=0, daily=0, weekly=0, monthly=0)
-        to_keep, to_delete = apply_retention([skew, older], retention, now=now)
+        to_keep, to_delete = apply_retention(
+            [skew, older], retention, now=now, prefix="home-"
+        )
         assert skew in to_keep  # kept as the latest valid (clamped to now)
         assert older in to_delete  # retention still runs: older is pruned
 
@@ -360,7 +362,9 @@ class TestApplyRetention:
         timestamps = [now - timedelta(hours=i) for i in range(12)]
         snapshots = self._make_snapshot_names(timestamps)
 
-        to_keep, to_delete = apply_retention(snapshots, retention, now=now)
+        to_keep, to_delete = apply_retention(
+            snapshots, retention, now=now, prefix="home-"
+        )
 
         # All should be kept (within 1 day)
         assert len(to_keep) == 12
@@ -379,7 +383,9 @@ class TestApplyRetention:
             timestamps.append(dt.replace(hour=14))
 
         snapshots = self._make_snapshot_names(timestamps)
-        to_keep, to_delete = apply_retention(snapshots, retention, now=now)
+        to_keep, to_delete = apply_retention(
+            snapshots, retention, now=now, prefix="home-"
+        )
 
         # Should keep 1 per day for 3 days, plus latest is always kept
         # Implementation may keep slightly more due to bucket boundaries
@@ -399,7 +405,9 @@ class TestApplyRetention:
             timestamps.append(dt.replace(minute=45))
 
         snapshots = self._make_snapshot_names(timestamps)
-        to_keep, to_delete = apply_retention(snapshots, retention, now=now)
+        to_keep, to_delete = apply_retention(
+            snapshots, retention, now=now, prefix="home-"
+        )
 
         # Should keep 1 per hour for 6 hours, plus latest is always kept
         # Implementation keeps one per bucket, may vary by exact algorithm
@@ -423,7 +431,9 @@ class TestApplyRetention:
         timestamps = [now - timedelta(days=i) for i in range(5)]
         snapshots = self._make_snapshot_names(timestamps)
 
-        to_keep, to_delete = apply_retention(snapshots, retention, now=now)
+        to_keep, to_delete = apply_retention(
+            snapshots, retention, now=now, prefix="home-"
+        )
 
         # Latest should still be kept
         assert len(to_keep) >= 1
@@ -448,7 +458,9 @@ class TestApplyRetention:
                 timestamps.append(dt.replace(hour=hour, minute=0, second=0))
 
         snapshots = self._make_snapshot_names(timestamps)
-        to_keep, to_delete = apply_retention(snapshots, retention, now=now)
+        to_keep, to_delete = apply_retention(
+            snapshots, retention, now=now, prefix="home-"
+        )
 
         # Should keep: 6 hourly + some daily (non-overlapping)
         # Exact count depends on overlap between hourly and daily
