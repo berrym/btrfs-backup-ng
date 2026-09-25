@@ -168,6 +168,13 @@ threshold. A live holder refreshes six times inside one threshold, so nothing
 that far behind can still be alive — and deleting somebody's live pin is far
 worse than leaving a small file lying around.
 
+A holder whose age cannot be read -- no readable mtime, or no readable clock on
+the target -- counts as HELD. It is listed, it blocks deletion, it is never
+swept, and a warning says so. Counting it as dead, as an mtime read as 0 once
+did, made the guard report a live pin as absent and let `restore --unlock`
+sweep it. A lock directory that exists but cannot be listed is reported as an
+error, never as a target with no pins.
+
 An interrupted run does not wait for any of that:
 
 * **Ctrl-C** is Python's own `KeyboardInterrupt`; no signal handler is

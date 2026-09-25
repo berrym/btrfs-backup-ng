@@ -1044,9 +1044,14 @@ class TestTheAgeIsAlwaysAnInteger:
             monkeypatch,
             'printf "  File: %s\\n  ID: 4c7c Type: tmpfs\\n" "$2"; exit 0',
         )
-        # Whatever stat prints, the listing completes: never a crash or a
-        # script error.
-        manager.live_locks()
+        # A holder whose time cannot be read is HELD: listed as live, never
+        # swept, never a crash or a script error. Aging it from zero (as this
+        # scan once did) made the guard report a live pin as absent, and
+        # `restore --unlock` swept it.
+        live = manager.live_locks()
+        assert "snap-a" in live
+        assert manager.sweep_dead_holders() == 0
+        assert blocked_by_remote_lock(manager, ["a"]) == {"a"}
 
     def test_a_date_without_epoch_seconds_is_never_arithmetic(
         self, tmp_path, monkeypatch
@@ -1088,11 +1093,19 @@ class TestTheAgeIsAlwaysAnInteger:
         os.utime(lock_dir, (old, old))
         assert "target" not in manager.live_locks()
 
-    def test_is_locked_answers_live_and_stale_correctly(self, tmp_path):
-        """A live lock is reported with its holder and a stale one is not --
-        without a script error, under every shell present."""
+    def test_is_locked_answers_live_stale_and_unreadable_correctly(
+        self, tmp_path, monkeypatch
+    ):
+        """A live lock is reported with its holder, a stale one is not, and one
+        whose age cannot be read is reported HELD -- without a script error,
+        under every shell present."""
         from .lockshell import available_shells
 
+        self._shim(
+            tmp_path,
+            monkeypatch,
+            'case "$*" in *unreadable*) exit 1;; esac',
+        )
         for shell in available_shells():
             errors: list[str] = []
 
@@ -1110,7 +1123,63 @@ class TestTheAgeIsAlwaysAnInteger:
             stale = self._held_lock(manager, "stale")
             old = time.time() - 10_000
             os.utime(stale / "heartbeat", (old, old))
+            self._held_lock(manager, "unreadable")
 
             assert (manager.is_locked("live") or {}).get("operation") == "prune", shell
             assert manager.is_locked("stale") is None, shell
-            assert errors == ["", ""], (shell, errors)
+            assert manager.is_locked("unreadable") is not None, shell
+            assert manager.is_locked("absent") is None, shell
+            assert errors == ["", "", "", ""], (shell, errors)
+
+    def test_is_locked_never_answers_not_locked_when_it_could_not_ask(self, tmp_path):
+        """It returned None -- "not locked" -- whenever its script failed."""
+
+        def unreachable(_script):
+            return 255, "", "ssh: connect to host target: No route to host"
+
+        manager = RemoteLockManager(unreachable, str(tmp_path), hostname="h")
+        with pytest.raises(RemoteLockUnavailable, match="No route to host"):
+            manager.is_locked("target")
+
+    def test_a_target_clock_that_cannot_be_read_holds_every_pin(
+        self, tmp_path, monkeypatch
+    ):
+        """With no readable ``date``, no age can be judged: every holder is
+        held, none is swept, and the guard blocks the deletion."""
+        manager = _manager(tmp_path, stale_after=1)
+        manager.acquire_shared("snap-a", "restore:1")
+        holder = next(tmp_path.rglob("holders/*"))
+        old = time.time() - 10_000
+        os.utime(holder, (old, old))
+        self._fake_date(tmp_path, monkeypatch)
+        assert "snap-a" in manager.live_locks()
+        assert manager.sweep_dead_holders() == 0
+        assert holder.exists()
+        assert blocked_by_remote_lock(manager, ["a"]) == {"a"}
+
+    def test_unlock_all_does_not_sweep_a_pin_whose_age_cannot_be_read(
+        self, tmp_path, monkeypatch
+    ):
+        """``restore --unlock`` reconciles the pins it was asked about and then
+        sweeps abandoned ones; a pin it cannot age is not abandoned."""
+        manager = _manager(tmp_path, stale_after=1)
+        manager.acquire_shared("snap-a", "restore:1")
+        holder = next(tmp_path.rglob("holders/*"))
+        self._shim(tmp_path, monkeypatch, 'case "$*" in *holders*) exit 1;; esac')
+        write_persisted_locks(manager, {"a": {"locks": ["restore:1"]}})
+        assert holder.exists()
+
+    def test_a_lock_root_that_cannot_be_listed_is_not_an_empty_one(self, tmp_path):
+        if os.geteuid() == 0:
+            pytest.skip("root lists any directory")
+        manager = _manager(tmp_path)
+        manager.acquire_shared("snap-a", "restore:1")
+        root = tmp_path / LOCK_DIR_NAME
+        root.chmod(0o300)
+        try:
+            with pytest.raises(RemoteLockUnavailable, match="cannot be listed"):
+                manager.live_locks()
+            with pytest.raises(RemoteLockUnavailable):
+                blocked_by_remote_lock(manager, ["a"])
+        finally:
+            root.chmod(0o755)

@@ -189,6 +189,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   error.** Stopping the connection removed its control directory, and the
   restart pointed ssh at a socket in the missing directory, which ssh
   reports as a failed login. The restart now makes a new directory.
+- **A pin whose age could not be read counted as abandoned.** Its mtime was
+  read as 0, so a prune's guard reported a live pin as absent and `restore
+  --unlock` swept it. A pin or lock whose age cannot be read, or on a target
+  whose clock cannot be read, now counts as held: it blocks the deletion, it
+  is never swept, and a warning says so. A lock directory that exists but
+  cannot be listed is an error, not a target with no pins.
 - **`BTRFS_BACKUP_LOG_LEVEL` did nothing.** Documented for years, read once
   at import and overwritten by every command's logger setup. It now sets
   the console level where neither a command-line flag nor the

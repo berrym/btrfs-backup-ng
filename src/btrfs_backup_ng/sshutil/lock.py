@@ -392,6 +392,15 @@ def csh_safe_text(value: str) -> str:
     return value.replace("!", "\\u0021")
 
 
+def _verdict(out: str) -> str:
+    """The first line a lock script printed: its verdict. What follows it is
+    detail (a holder's record), which must never be mistaken for one."""
+    for line in out.splitlines():
+        if line.strip():
+            return line.strip()
+    return ""
+
+
 def _age_call(path: str, fallback: Optional[str] = None) -> str:
     """The shell call yielding the age of ``path`` (see ``MTIME_FUNCTIONS``);
     ``fallback`` is aged instead when ``path`` has no readable mtime."""
@@ -708,32 +717,51 @@ class RemoteLockManager:
         _unregister_for_cleanup(self, name)
 
     def is_locked(self, name: str) -> Optional[dict]:
-        """The holder's details if a LIVE lock exists, else None.
+        """The holder's details if a live lock exists, else None.
 
-        A lock whose heartbeat has gone stale reports as not held: it is a
-        leftover, and treating it as live would block every future operation on
-        the target until someone cleaned up by hand.
+        Raises ``RemoteLockUnavailable`` when the question could not be
+        answered: "not locked" is an answer, and a failed check must never
+        read as one. A lock whose age cannot be read is reported as held (its
+        details, or an empty dict). A lock whose heartbeat has gone stale
+        reports as not held: it is a leftover, and treating it as live would
+        block every future operation on the target until someone cleaned up by
+        hand.
         """
+        lock = shlex.quote(self._lock_dir(name))
         info = shlex.quote(f"{self._lock_dir(name)}/info.json")
-        age = _age_call(f"{self._lock_dir(name)}/heartbeat")
-        # A lock whose heartbeat cannot be read reports as not live, as an
-        # unreadable heartbeat always has here: this is the informational
-        # answer, and the acquire script judges contention for itself.
+        age = _age_call(f"{self._lock_dir(name)}/heartbeat", self._lock_dir(name))
         script = (
-            MTIME_FUNCTIONS + f"if [ -d {shlex.quote(self._lock_dir(name))} ]; then "
-            f'  AGE={age}; if [ -n "$AGE" ] && [ "$AGE" -le {self._stale_after} ]; then '
-            f"    cat {info} 2>/dev/null; fi; "
-            f"fi"
+            MTIME_FUNCTIONS + f"if [ -d {lock} ]; then "
+            f'AGE={age}; printf "AGE %s\\n" "${{AGE:-?}}"; cat {info} 2>/dev/null; '
+            f"elif [ -e {lock} ]; then echo UNKNOWN; else echo ABSENT; fi"
         )
-        _rc, out, _err = self._run(script)
+        rc, out, err = self._run(script)
+        verdict = _verdict(out)
+        if rc != 0 or not (verdict == "ABSENT" or verdict.startswith("AGE ")):
+            raise RemoteLockUnavailable(
+                f"could not read the lock {name!r} on the target: "
+                f"{err.strip() or out.strip() or f'exit {rc}'}"
+            )
+        if verdict == "ABSENT":
+            return None
+        age = verdict[len("AGE ") :].strip()
+        if age.isdigit() and int(age) > self._stale_after:
+            return None
+        if not age.isdigit():
+            logger.warning(
+                "The age of the lock %r on the target could not be read, so it "
+                "is treated as held.",
+                name,
+            )
         for line in out.splitlines():
             line = line.strip()
             if line.startswith("{"):
                 try:
-                    return json.loads(line)
+                    info = json.loads(line)
                 except ValueError:
                     return {}
-        return None
+                return info if isinstance(info, dict) else {}
+        return {}
 
     def live_locks(self) -> dict[str, list[Holder]]:
         """Every lock on this target with a live holder, mapped to its holders.
@@ -777,26 +805,41 @@ class RemoteLockManager:
         root = shlex.quote(self._root)
         holders_dir = HOLDERS_DIR_NAME
         script = (
-            MTIME_FUNCTIONS + f'printf "NOW %s\\n" "$(date +%s)"; '
+            MTIME_FUNCTIONS + 'printf "NOW %s\\n" "$(bbng_now)"; '
+            # A lock root that exists but cannot be listed is not an empty one:
+            # the glob below would simply not expand, and "no pins" would be
+            # reported for a target this account cannot see into.
+            f"if [ -d {root} ] && {{ [ ! -r {root} ] || [ ! -x {root} ]; }}; then "
+            "echo UNLISTABLE; exit 0; fi; "
             f"for d in {root}/*.lock; do "
             f'  [ -d "$d" ] || continue; '
             f'  n=$(basename "$d" .lock); '
             f'  if [ -d "$d/{holders_dir}" ]; then '
+            f'    if [ ! -r "$d/{holders_dir}" ] || [ ! -x "$d/{holders_dir}" ]; then '
+            f'      printf "U %s\\n" "$n"; continue; fi; '
             f'    for h in "$d"/{holders_dir}/*; do '
             f'      [ -f "$h" ] || continue; '
-            f'      m=$(bbng_mtime "$h"); m=${{m:-0}}; '
-            f'      printf "H %s %s %s " "$n" "$m" "$(basename "$h")"; '
+            f'      m=$(bbng_mtime "$h"); '
+            f'      printf "H %s %s %s " "$n" "${{m:-?}}" "$(basename "$h")"; '
             f'      cat "$h" 2>/dev/null; printf "\\n"; '
             f"    done; "
             f"  else "
             f'    m=$(bbng_mtime "$d/heartbeat"); [ -n "$m" ] || m=$(bbng_mtime "$d"); '
-            f"    m=${{m:-0}}; "
-            f'    printf "X %s %s - "  "$n" "$m"; '
+            f'    printf "X %s %s - " "$n" "${{m:-?}}"; '
             f'    cat "$d/info.json" 2>/dev/null; printf "\\n"; '
             f"  fi; "
             f"done 2>/dev/null; exit 0"
         )
         rc, out, err = self._run(script)
+        if rc == 0 and "UNLISTABLE" in out.splitlines():
+            if self._run_elevated is not None:
+                rc, out, err = self._run_elevated(script)
+            if rc == 0 and "UNLISTABLE" in out.splitlines():
+                raise RemoteLockUnavailable(
+                    f"the lock directory {self._root!r} on the target exists but "
+                    f"cannot be listed by the account running this, so whether "
+                    f"anything is pinned there is not known"
+                )
         if rc != 0:
             # The script ends in `exit 0`, so a non-zero status means the shell
             # never ran it -- the host is unreachable, or the lock directory is
@@ -809,27 +852,42 @@ class RemoteLockManager:
             )
 
         now: Optional[int] = None
+        clock_read = False
         live: dict[str, list[Holder]] = {}
         dead: list[tuple[str, str]] = []
+        unjudged: list[str] = []
         for line in out.splitlines():
-            if line.startswith("NOW "):
-                try:
-                    now = int(line[4:].strip())
-                except ValueError:
-                    now = None
+            if line.startswith("NOW"):
+                clock_read = True
+                value = line[3:].strip()
+                now = int(value) if value.isdigit() else None
                 continue
-            if not line or line[0] not in ("H", "X") or now is None:
+            if line.startswith("U "):
+                # A holders directory that cannot be listed: something may
+                # hold this lock and nothing here can say what. Held.
+                dir_name = line[2:].strip()
+                live.setdefault(decode_name_for_display(dir_name), []).append(
+                    Holder(dir_name, "", {})
+                )
+                unjudged.append(decode_name_for_display(dir_name))
+                continue
+            if not line or line[0] not in ("H", "X"):
                 continue
             parts = line.split(" ", 4)
             if len(parts) < 4:
                 continue
             kind, dir_name, mtime_raw, file_name = parts[:4]
             raw = parts[4] if len(parts) > 4 else ""
-            try:
-                age = now - int(mtime_raw)
-            except ValueError:
-                continue
-            if age > self._stale_after:
+            # A holder whose age cannot be read -- no readable mtime, or no
+            # readable clock on the target -- is HELD. Counting it as dead
+            # (which an mtime read as 0 used to do) made the guard report a
+            # live pin as absent, and `restore --unlock` swept it.
+            age = (
+                now - int(mtime_raw)
+                if now is not None and mtime_raw.isdigit()
+                else None
+            )
+            if age is not None and age > self._stale_after:
                 if kind == "H" and age > self._stale_after * DEAD_HOLDER_MULTIPLE:
                     dead.append((dir_name, file_name))
                 continue
@@ -847,6 +905,24 @@ class RemoteLockManager:
             # checks for both, so such a lock still blocks.
             key = str(info.get("name") or decode_name_for_display(dir_name))
             live.setdefault(key, []).append(Holder(dir_name, file_name, info))
+            if age is None:
+                unjudged.append(key)
+        if not clock_read:
+            # Every run of the script prints the NOW line first; output without
+            # it is not a listing, and an empty result would read as "nothing
+            # is locked".
+            raise RemoteLockUnavailable(
+                f"could not list locks on the target: unexpected output "
+                f"{(out.strip() or err.strip() or 'none')[:200]!r}"
+            )
+        if unjudged:
+            logger.warning(
+                "The age of %d lock record(s) on the target could not be read%s, "
+                "so they are treated as held: %s",
+                len(unjudged),
+                "" if now is not None else " (the target's clock could not be read)",
+                ", ".join(sorted(set(unjudged))),
+            )
         return live, dead
 
     def sweep_dead_holders(self) -> int:
