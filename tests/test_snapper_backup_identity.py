@@ -10,6 +10,8 @@ uuid-identity win.
 
 from __future__ import annotations
 
+import os
+import subprocess
 from unittest.mock import MagicMock
 
 import pytest
@@ -125,7 +127,7 @@ def test_enumerate_parses_privileged_shell_output(monkeypatch):
     monkeypatch.setattr(
         ops,
         "_snapper_run_shell",
-        lambda ep, script: (0, "1 U-ONE\n2 U-TWO\n\nbad\n3\n"),
+        lambda ep, script: (0, "1 U-ONE\n2 U-TWO\n\nbad\n3\nEND\n"),
     )
     backups = ops._enumerate_snapper_btrfs_backups(MagicMock(config={"path": "/b"}))
     assert [(b.number, b.received_uuid) for b in backups] == [
@@ -134,11 +136,120 @@ def test_enumerate_parses_privileged_shell_output(monkeypatch):
     ]
 
 
-def test_enumerate_degrades_to_empty_on_shell_failure(monkeypatch):
-    """A non-zero shell return (ssh blip / permission / timeout) degrades to [] -- never raises;
-    the sources then re-send (safe). Mutation guard: returning partial/raising fails this."""
-    monkeypatch.setattr(ops, "_snapper_run_shell", lambda ep, script: (1, "1 U1\n"))
-    assert ops._enumerate_snapper_btrfs_backups(MagicMock(config={"path": "/b"})) == []
+@pytest.mark.parametrize(
+    "reply",
+    [
+        (1, "1 U1\n"),  # the shell failed part-way
+        (1, ""),  # never ran: ssh down, sudo refused
+        (0, "1 U1\n"),  # ran, but never reached the end
+        (1, "0: Event not found.\n"),  # a csh login shell rejected the command
+    ],
+)
+def test_a_failed_listing_is_never_no_backups(monkeypatch, reply):
+    """An empty answer makes every source look unsent: a backup re-sends them all in full
+    and a restore finds nothing. A listing that did not complete raises instead."""
+    monkeypatch.setattr(ops, "_snapper_run_shell", lambda ep, script: reply)
+    with pytest.raises(__util__.SnapshotTransferError, match="no backups"):
+        ops._enumerate_snapper_btrfs_backups(MagicMock(config={"path": "/b"}))
+
+
+class TestTheEnumerationScriptItself:
+    """The real script, run by a real shell against a directory laid out like a
+    destination, with a ``btrfs`` on PATH that answers like the real one."""
+
+    @pytest.fixture
+    def destination(self, tmp_path, monkeypatch):
+        shims = tmp_path / "shims"
+        shims.mkdir()
+        (shims / "btrfs").write_text(
+            "#!/bin/sh\n"
+            "# btrfs subvolume show <slot>/snapshot: the uuid is kept in a file\n"
+            'f="$3/uuid"; [ -f "$f" ] || exit 1\n'
+            'printf "\\tName: \\tsnapshot\\n\\tReceived UUID: \\t%s\\n" "$(cat "$f")"\n'
+        )
+        (shims / "btrfs").chmod(0o755)
+        monkeypatch.setenv("PATH", f"{shims}:{os.environ['PATH']}")
+        dest = tmp_path / "dest"
+        dest.mkdir()
+
+        def run(ep, script):
+            proc = subprocess.run(["sh", "-c", script], capture_output=True, text=True)
+            return proc.returncode, proc.stdout
+
+        monkeypatch.setattr(ops, "_snapper_run_shell", run)
+        endpoint = MagicMock(config={"path": str(dest)}, _is_remote=True)
+        return dest, endpoint
+
+    @staticmethod
+    def _slot(dest, number, uuid):
+        snapshot = dest / ".snapshots" / str(number) / "snapshot"
+        snapshot.mkdir(parents=True)
+        if uuid is not None:
+            (snapshot / "uuid").write_text(uuid)
+
+    def test_a_destination_without_snapper_backups_has_none(self, destination):
+        dest, endpoint = destination
+        assert ops._enumerate_snapper_btrfs_backups(endpoint) == []
+        (dest / ".snapshots").mkdir()
+        assert ops._enumerate_snapper_btrfs_backups(endpoint) == []
+
+    def test_a_last_slot_that_was_never_received_does_not_hide_the_others(
+        self, destination
+    ):
+        """The script's status used to be its last loop iteration's: a final slot
+        with no Received UUID made the whole listing read as failed, and so as
+        empty."""
+        dest, endpoint = destination
+        self._slot(dest, 1, "U-ONE")
+        self._slot(dest, 2, "-")
+        found = ops._enumerate_snapper_btrfs_backups(endpoint)
+        assert [(b.number, b.received_uuid) for b in found] == [(1, "U-ONE")]
+
+    def test_one_unreadable_slot_is_left_out_and_the_rest_listed(self, destination):
+        dest, endpoint = destination
+        self._slot(dest, 1, "U-ONE")
+        self._slot(dest, 2, None)
+        found = ops._enumerate_snapper_btrfs_backups(endpoint)
+        assert [b.number for b in found] == [1]
+
+    def test_no_readable_slot_at_all_is_a_failure(self, destination):
+        dest, endpoint = destination
+        self._slot(dest, 1, None)
+        self._slot(dest, 2, None)
+        with pytest.raises(__util__.SnapshotTransferError, match="every slot"):
+            ops._enumerate_snapper_btrfs_backups(endpoint)
+
+    def test_a_directory_that_cannot_be_entered_is_a_failure(self, destination):
+        if os.geteuid() == 0:
+            pytest.skip("root enters any directory")
+        dest, endpoint = destination
+        self._slot(dest, 1, "U-ONE")
+        (dest / ".snapshots").chmod(0)
+        try:
+            with pytest.raises(
+                __util__.SnapshotTransferError, match="cannot be entered"
+            ):
+                ops._enumerate_snapper_btrfs_backups(endpoint)
+        finally:
+            (dest / ".snapshots").chmod(0o755)
+
+    def test_the_script_is_safe_for_a_csh_login_shell(self, destination):
+        from btrfs_backup_ng.sshutil.lock import csh_unsafe
+
+        _dest, endpoint = destination
+        captured = []
+        real = ops._snapper_run_shell
+
+        def capture(ep, script):
+            captured.append(script)
+            return real(ep, script)
+
+        ops._snapper_run_shell = capture
+        try:
+            ops._enumerate_snapper_btrfs_backups(endpoint)
+        finally:
+            ops._snapper_run_shell = real
+        assert captured and csh_unsafe(captured[0]) == []
 
 
 def test_run_shell_remote_passes_script_as_single_raw_arg():

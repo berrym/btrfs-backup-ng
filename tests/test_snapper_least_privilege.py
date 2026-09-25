@@ -140,7 +140,7 @@ class TestGeneratedScriptsElevateOnlyBtrfs:
 
         def fake_run(endpoint, script):
             captured["script"] = script
-            return 0, ""
+            return 0, "END\n"
 
         original = ops._snapper_run_shell
         ops._snapper_run_shell = fake_run

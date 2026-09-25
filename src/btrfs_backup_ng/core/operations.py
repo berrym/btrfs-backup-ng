@@ -2394,36 +2394,86 @@ def _enumerate_snapper_btrfs_backups(destination_endpoint) -> list:
     """Received snapper backups on a BTRFS destination, each carrying its ``received_uuid``,
     read from ``.snapshots/{num}/snapshot`` (local or over ssh). A SINGLE privileged shell
     pass emits ``<num> <received_uuid>`` for every numeric slot holding a ``snapshot``
-    subvolume with a real Received UUID -- one sudo call (not O(N) subprocesses) that degrades
-    to fewer/no backups on any failure (a missing match simply re-sends its source, which is
-    safe). NEVER raises: an ssh/permission/timeout failure returns what was parsed so far.
+    subvolume with a real Received UUID -- one sudo call, not O(N) subprocesses.
+
+    A listing that could not be made RAISES ``SnapshotTransferError``; it never reads as
+    "no backups". An empty answer here makes every source look unsent: a backup would
+    re-send them all as full streams into new slots, and a restore would find nothing to
+    restore. The script therefore ends by printing ``END``, and output without it -- the
+    shell never ran, sudo was refused, the account's login shell rejected the command --
+    is a failure, as is a ``.snapshots`` directory that exists but cannot be entered. A
+    missing ``.snapshots`` is a destination with no backups yet.
+
+    One slot whose subvolume cannot be read is left out with a warning (its source is
+    re-sent, which is safe); when no slot at all can be read, that is the listing
+    failing, and it raises.
     """
     snap_dir = f"{str(destination_endpoint.config['path']).rstrip('/')}/.snapshots"
+    quoted = shlex.quote(snap_dir)
     script = (
-        f"cd {shlex.quote(snap_dir)} 2>/dev/null || exit 0; "
+        # No negated bracket (`*[!0-9]*`): the command line is parsed by the
+        # account's login shell first, and csh/tcsh read `!0` as a history
+        # reference -- the whole command failed before sh ran. Digits are
+        # checked one character at a time instead.
+        'bbng_digits() { bbng_t=$1; [ -n "$bbng_t" ] || return 1; '
+        'while [ -n "$bbng_t" ]; do case $bbng_t in [0123456789]*) bbng_t=${bbng_t#?};; '
+        "*) return 1;; esac; done; return 0; }; "
+        f"if [ -e {quoted} ]; then cd {quoted} 2>/dev/null || {{ echo NOENTER; exit 0; }}; "
+        "else echo END; exit 0; fi; "
         "for n in */; do n=${n%/}; "
-        'case "$n" in ""|*[!0-9]*) continue ;; esac; '
+        'bbng_digits "$n" || continue; '
         '[ -e "$n/snapshot" ] || continue; '
-        f'ru=$({_snapper_btrfs(destination_endpoint)} subvolume show "$n/snapshot" 2>/dev/null '
-        '| sed -n "s/.*Received UUID:[[:space:]]*//p" | head -1); '
-        '[ -n "$ru" ] && [ "$ru" != "-" ] && printf "%s %s\\n" "$n" "$ru"; '
-        "done"
+        f'if show=$({_snapper_btrfs(destination_endpoint)} subvolume show "$n/snapshot" 2>/dev/null); then '
+        'ru=$(printf "%s\\n" "$show" | sed -n "s/.*Received UUID:[[:space:]]*//p" | head -1); '
+        'if [ -n "$ru" ] && [ "$ru" != "-" ]; then printf "%s %s\\n" "$n" "$ru"; fi; '
+        'else printf "? %s\\n" "$n"; fi; '
+        "done; echo END"
     )
     rc, out = _snapper_run_shell(destination_endpoint, script)
+    lines = out.split("\n")
+    host = destination_endpoint.config.get("hostname")
+    where = f"{snap_dir} on {host}" if host else snap_dir
+    if "NOENTER" in lines:
+        raise __util__.SnapshotTransferError(
+            f"Could not read the snapper backups in {where}: the directory exists but "
+            f"cannot be entered by the account running this. Refusing to treat that as "
+            f"'no backups', which would re-send every snapshot in full."
+        )
+    if rc != 0 or "END" not in lines:
+        raise __util__.SnapshotTransferError(
+            f"Could not list the snapper backups in {where} (exit {rc}). Refusing to "
+            f"treat a failed listing as 'no backups', which would re-send every "
+            f"snapshot in full. Run with --debug for the underlying error."
+        )
     backups: list = []
-    if rc == 0:
-        base = str(destination_endpoint.config["path"])
-        for line in out.split("\n"):
-            parts = line.split()
-            if len(parts) == 2 and parts[0].isdigit():
-                backups.append(
-                    _SnapperBtrfsBackup(
-                        int(parts[0]),
-                        parts[1],
-                        base=base,
-                        endpoint=destination_endpoint,
-                    )
+    unreadable: list[str] = []
+    base = str(destination_endpoint.config["path"])
+    for line in lines:
+        parts = line.split()
+        if len(parts) == 2 and parts[0] == "?" and parts[1].isdigit():
+            unreadable.append(parts[1])
+        elif len(parts) == 2 and parts[0].isdigit():
+            backups.append(
+                _SnapperBtrfsBackup(
+                    int(parts[0]),
+                    parts[1],
+                    base=base,
+                    endpoint=destination_endpoint,
                 )
+            )
+    if unreadable and not backups:
+        raise __util__.SnapshotTransferError(
+            f"Could not read any snapper backup in {where}: `btrfs subvolume show` "
+            f"failed for every slot ({', '.join(unreadable)}). Refusing to treat that "
+            f"as 'no backups', which would re-send every snapshot in full."
+        )
+    if unreadable:
+        logger.warning(
+            "Could not read the snapper backup(s) in slot(s) %s of %s; their sources "
+            "will be sent again rather than matched.",
+            ", ".join(unreadable),
+            where,
+        )
     return backups
 
 

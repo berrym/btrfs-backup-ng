@@ -189,6 +189,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   error.** Stopping the connection removed its control directory, and the
   restart pointed ssh at a socket in the missing directory, which ssh
   reports as a failed login. The restart now makes a new directory.
+- **A snapper listing that failed read as "no backups".** Any failure --
+  ssh, a refused sudo, the login shell above -- and even a last slot that
+  was never received returned an empty list, so a backup re-sent every
+  snapshot in full into new slots and a restore found nothing. A listing
+  that did not complete is now an error naming the location; one slot that
+  cannot be read is left out with a warning.
 - **Breaking a dead lock could give two winners.** The break renamed aside
   whatever lock directory sat at the path when it ran, so a contender that
   judged a dead lock and was descheduled could break and take the lock a
