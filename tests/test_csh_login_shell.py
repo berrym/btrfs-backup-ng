@@ -15,6 +15,7 @@ read as "no backups".
 from __future__ import annotations
 
 import ast
+import os
 import shlex
 import shutil
 import subprocess
@@ -161,6 +162,11 @@ def test_the_whole_protocol_works_under_a_csh_login_shell(tmp_path, login):
     what enforces this everywhere; this shows they are checking the right
     thing."""
     if shutil.which(login) is None:
+        if os.environ.get("BBNG_REQUIRE_LOGIN_SHELLS"):
+            pytest.fail(
+                f"{login} is not installed, and BBNG_REQUIRE_LOGIN_SHELLS says this "
+                f"run must prove the protocol under it rather than skip"
+            )
         pytest.skip(f"{login} is not installed here")
     run, _seen = _recording(tmp_path, [login, "-f", "-c"])
     assert _exercise(run, tmp_path) == EXPECTED
