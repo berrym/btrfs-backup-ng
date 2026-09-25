@@ -73,7 +73,10 @@ from typing import Any, Callable, Iterator, Optional
 
 logger = logging.getLogger(__name__)
 
-#: Exit-cleanup stages, drained in this order.
+#: Exit-cleanup stages, drained in this order: what a failed operation
+#: half-made (after its writers have stopped, before the lock guarding it goes),
+#: then locks and pins, then connections.
+STAGE_PARTIALS = 0
 STAGE_LOCKS = 1
 STAGE_CONNECTIONS = 2
 
@@ -360,6 +363,44 @@ def run_cleanups(select: Optional[Callable[[Any], bool]] = None) -> None:
             continue
         except Exception as exc:  # noqa: BLE001 - cleanup must not raise on exit
             logger.debug("Exit cleanup %r failed: %s", key, exc)
+        unregister(key)
+
+
+@contextmanager
+def undo_on_failure(
+    undo: Callable[[], None],
+    *,
+    unless: "tuple[type[BaseException], ...]" = (),
+) -> Iterator[None]:
+    """Run ``undo`` if the block does not complete.
+
+    For removing what a failed operation half-made -- the partial subvolume an
+    interrupted receive leaves. ``undo`` runs when an exception leaves the block
+    (Ctrl-C included, except the types in ``unless``, which the caller handles
+    itself), and, while the block runs, it is registered with the exit drain, so
+    SIGTERM or SIGHUP run it too. It is dropped once the block completes.
+
+    Where it is opened is the safety argument: OUTSIDE the process scope of the
+    work, so the writers have been stopped before ``undo`` runs, and INSIDE the
+    lock that guards the thing, so nobody else can have made it anew by then.
+    A ``KeyboardInterrupt`` during ``undo`` leaves it registered for the exit
+    drain to finish.
+    """
+    key = ("undo", object())
+    register(key, undo, STAGE_PARTIALS)
+    try:
+        yield
+    except BaseException as exc:
+        if not isinstance(exc, unless):
+            try:
+                undo()
+            except KeyboardInterrupt:
+                raise
+            except Exception as undo_exc:  # noqa: BLE001 - the original failure wins
+                logger.debug("Undo after a failure did not complete: %s", undo_exc)
+        unregister(key)
+        raise
+    else:
         unregister(key)
 
 

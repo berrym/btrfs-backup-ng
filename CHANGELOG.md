@@ -203,6 +203,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   snapshot in full into new slots and a restore found nothing. A listing
   that did not complete is now an error naming the location; one slot that
   cannot be read is left out with a warning.
+- **An interrupted receive left a partial subvolume that stopped every later
+  run.** Only a transfer error removed the partial a failed receive left at
+  the snapshot's name. Ctrl-C, SIGTERM, SIGHUP and unexpected errors left it,
+  and each later run then refused to remove something that was there before
+  it started, so that snapshot failed on every run -- and the incremental
+  chain behind it stopped -- until someone deleted it by hand. A receive that
+  does not complete now removes the partial it created, on every
+  destination type, after its writers have stopped; an ssh:// receive does
+  so before it releases the receive lock on that path. What was at the path
+  before the run is still never touched, and partials left by earlier runs
+  are not swept.
 - **Breaking a dead lock could give two winners.** The break renamed aside
   whatever lock directory sat at the path when it ran, so a contender that
   judged a dead lock and was descheduled could break and take the lock a

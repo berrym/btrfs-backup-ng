@@ -4,6 +4,7 @@ Extracted from __main__.py for modularity and reuse.
 """
 
 import contextlib
+import functools
 import logging
 import os
 import shlex
@@ -1715,6 +1716,22 @@ def _cleanup_partial_local_subvolume(
         logger.debug("Partial local-subvolume cleanup failed: %s", cleanup_e)
 
 
+def _cleanup_this_runs_partial(
+    destination_endpoint, name: str, *, created_by_this_run: bool
+) -> None:
+    """What a failed transfer left at a local or raw destination, removed.
+
+    The one undo for a transfer that did not complete, whether it failed or was
+    interrupted: the partial local subvolume at ``name`` if this run created it,
+    and the raw ``.part`` this run wrote. A no-op for an ssh:// destination,
+    which undoes its own receive inside its receive lock.
+    """
+    _cleanup_partial_local_subvolume(
+        destination_endpoint, name, created_by_this_run=created_by_this_run
+    )
+    _cleanup_partial_raw_stream(destination_endpoint)
+
+
 def _cleanup_partial_remote_subvolume(
     destination_endpoint, manifest, *, created_by_this_run: bool
 ) -> None:
@@ -2014,12 +2031,28 @@ def _execute_transfers(
         invalid_artifact = False
         try:
             logger.info("Starting transfer of %s", best_snapshot)
-            send_snapshot(
-                best_snapshot,
-                destination_endpoint,
-                parent=parent,
-                options=options or {},
-            )
+            # A transfer that ends any way but a transfer error (handled
+            # below) -- Ctrl-C, SIGTERM or SIGHUP, an unexpected exception --
+            # also removes the partial it left at a local or raw destination.
+            # Left there, a local partial sits at the snapshot's own name and
+            # every later run refuses to remove what was there before it
+            # started. An ssh:// destination does this inside its receive
+            # lock (SSHEndpoint.receiving_lock).
+            with lifecycle.undo_on_failure(
+                functools.partial(
+                    _cleanup_this_runs_partial,
+                    destination_endpoint,
+                    best_snapshot.get_name(),
+                    created_by_this_run=not preexisting,
+                ),
+                unless=(__util__.SnapshotTransferError,),
+            ):
+                send_snapshot(
+                    best_snapshot,
+                    destination_endpoint,
+                    parent=parent,
+                    options=options or {},
+                )
             # The receive exited 0 and the commit held. What did it leave?
             # Recorded for every transfer; only ``invalid`` fails one. A check
             # that cannot even run is ``unverifiable``: the data has landed,
@@ -2070,12 +2103,11 @@ def _execute_transfers(
             # completed backup. Local btrfs and raw (whose distinct-per-run stream
             # file would otherwise be re-listed as a phantom backup) are cleaned
             # here; SSH btrfs endpoints clean their own partials during transfer.
-            _cleanup_partial_local_subvolume(
+            _cleanup_this_runs_partial(
                 destination_endpoint,
                 best_snapshot.get_name(),
                 created_by_this_run=not preexisting,
             )
-            _cleanup_partial_raw_stream(destination_endpoint)
             if invalid_artifact:
                 # A remote btrfs endpoint cleans its own partials only when its
                 # transfer fails; an invalid artifact after a transfer that

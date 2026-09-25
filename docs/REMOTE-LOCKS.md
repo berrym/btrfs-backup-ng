@@ -227,18 +227,25 @@ An interrupted run does not wait for any of that:
 * **Ctrl-C** is Python's own `KeyboardInterrupt`; no signal handler is
   involved. Every transfer's child processes run inside a scope nested within
   the locks and pins it holds, so as the interrupt unwinds, the scope stops
-  those processes and waits for them first, and only then does each
-  operation release its own locks. Whatever the unwind did not release, the
+  those processes and waits for them first; then the partial subvolume the
+  interrupted receive created is removed; and only then does each operation
+  release its own locks. Whatever the unwind did not release, the
   exit releases. A transfer running on a worker thread is not interrupted by
   it, and keeps its locks until it finishes: a lock is never released while a
   stream is still being written under it.
 * **SIGTERM and SIGHUP** (systemd stopping a run, a closed terminal) stop the
-  run's child processes, then release its locks and pins, then close its ssh
+  run's child processes, then remove the partial subvolumes its unfinished
+  receives created, then release its locks and pins, then close its ssh
   connections, and the process then dies of the signal. A second signal during
   that does not cut it short.
 * **A signal that was set to be ignored stays ignored.** A run started under
   `nohup` keeps its locks, pins and connections through a hangup, and lets
   them go when it finishes.
+
+A partial is removed only if this run created it: whatever was at the path
+before the run started is left alone, as on every failure path. An ssh://
+receive removes its partial while it still holds the receive lock on that
+path, so no other transfer can have started creating it in the meantime.
 
 Before 0.9.11 a SIGINT handler released every pin at once, before the
 interrupted operation had unwound -- and while any other thread's transfer was

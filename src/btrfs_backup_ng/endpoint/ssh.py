@@ -1102,13 +1102,27 @@ class SSHEndpoint(Endpoint):
                 f"anyway."
             ) from exc
 
+        # Recorded while the lock is held and before anything is received: what
+        # is at the path now is not this run's work, and must survive this
+        # run's failure.
+        dest_dir, _, received = str(destination).rstrip("/").rpartition("/")
+        preexisted = self.artifact_exists(dest_dir or "/", received)
+
+        def remove_partial() -> None:
+            self._cleanup_partial_subvolume(
+                dest_dir or "/", received, created_by_this_run=not preexisted
+            )
+
         manager._start_heartbeat(name)
         try:
-            # The receive's processes run INSIDE the lock: if the block fails
-            # or is interrupted, they are stopped and waited for before the
-            # lock is released, never after (see btrfs_backup_ng.lifecycle).
-            with lifecycle.process_scope():
-                yield
+            # The order an interrupted or failed receive is unwound in (see
+            # btrfs_backup_ng.lifecycle): the receive's processes are stopped
+            # and waited for; then the partial subvolume THIS run created at
+            # the path is removed; only then is the lock released, so no other
+            # transfer can have started creating that path in between.
+            with lifecycle.undo_on_failure(remove_partial):
+                with lifecycle.process_scope():
+                    yield
         finally:
             manager.release(name)
 
