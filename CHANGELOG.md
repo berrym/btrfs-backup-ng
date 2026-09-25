@@ -5,7 +5,37 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.9.11] - 2026-09-25
+
+This release is about what happens when a run is interrupted or has
+company. A run stopped by Ctrl-C, SIGTERM or SIGHUP now stops its own
+processes, removes the partial subvolume it was receiving, and only then
+lets go of its locks and pins; breaking a dead lock has one winner; and a
+lock or pin whose state cannot be read counts as held, never as absent.
+It also fixes `config import` keeping less than btrbk did, retention
+reading snapshot dates differently from `list`, and remote commands for
+accounts whose login shell is csh or tcsh.
+
+Five changes an upgrade can notice:
+
+- **`prune` now prunes snapper destinations.** It used to report "deleting
+  0" for them while `run` pruned the same destination; it now deletes what
+  `run` would. Run `prune --dry-run` on a snapper volume first to see what
+  it will remove.
+- **Retention can keep or delete different snapshots than before** where
+  it read dates wrongly: names only its old guessed formats could date
+  (now kept), `timestamp_format`s ending in `_%H` or `_%H%M%S` and prefixes
+  ending in `_` (the newest of a tie is now kept), snapper dates (now read as UTC) and snapper
+  snapshots taken within one second. `prune --dry-run` shows the effect.
+- **Ctrl-C no longer releases every pin at once.** Pins and locks are let
+  go after the work under them has stopped, and a transfer on another
+  thread keeps its locks until it finishes (see Changed).
+- **The lock format on a target changed.** While a 0.9.10 client and a
+  0.9.11 client share one target, locking still excludes, but the older
+  client keeps its own weaknesses until it is upgraded; see
+  "Older versions on the same target" in docs/REMOTE-LOCKS.md.
+- **A snapper backup whose destination cannot be listed now fails** and
+  says why, instead of sending every snapshot again in full.
 
 ### Added
 
