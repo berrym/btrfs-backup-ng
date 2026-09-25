@@ -4,7 +4,7 @@ requires-python = ">=3.11"
 
 [[package]]
 name = "btrfs-backup-ng"
-version = "0.9.10"
+version = "0.9.11"
 source = { editable = "." }
 dependencies = [
     { name = "filelock" },
