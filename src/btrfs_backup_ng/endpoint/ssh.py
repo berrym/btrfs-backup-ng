@@ -137,8 +137,11 @@ def _guarded_pipeline(pipeline: str) -> str:
     it wins. Verified delivering the full payload on all three shells above,
     with a failing `btrfs receive` still exiting non-zero through the group.
     """
+    # `$! ;`, never `$!;`: the command line is parsed by the account's login
+    # shell first, and csh/tcsh read a `!` followed by anything but a blank,
+    # `=` or `(` as a history reference, even inside single quotes.
     return (
-        f"exec 3<&0; {{ {pipeline}; }} <&3 & pid=$!; "
+        f"exec 3<&0; {{ {pipeline}; }} <&3 & pid=$! ; "
         f'trap "trap - HUP INT TERM; kill 0" HUP INT TERM; '
         f'wait "$pid"'
     )

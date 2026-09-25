@@ -14,6 +14,7 @@ read as "no backups".
 
 from __future__ import annotations
 
+import ast
 import shlex
 import shutil
 import subprocess
@@ -21,12 +22,71 @@ from pathlib import Path
 
 import pytest
 
+import btrfs_backup_ng
 from btrfs_backup_ng.sshutil.lock import (
     RemoteLockBusy,
     RemoteLockManager,
     csh_unsafe,
     read_only_probe_script,
 )
+
+SRC = Path(btrfs_backup_ng.__file__).parent
+
+#: String literals that contain a csh-unsafe ``!`` and are never sent to a
+#: shell: console markup and messages. (file relative to the package, text).
+NOT_SHELL = {
+    ("cli/wizard_utils.py", "  [yellow]![/yellow] "),
+    ("cli/config_cmd.py", "[green]Systemd migration complete![/green]"),
+    ("cli/config_cmd.py", "  [yellow]![/yellow] "),
+    (
+        "cli/dispatcher.py",
+        "TIP: btrfs-backup-ng now supports TOML configuration files!",
+    ),
+    ("core/operations.py", " complete!"),
+    ("sshutil/lock.py", "!"),  # the csh check itself
+}
+
+#: Files whose strings starting with these are HTML/markup, never a command.
+NOT_SHELL_PREFIXES = {("notifications.py", "\n        <!DOCTYPE html>")}
+
+
+def _unsafe_literals() -> list[tuple[str, int, str]]:
+    found = []
+    for path in sorted(SRC.rglob("*.py")):
+        rel = path.relative_to(SRC).as_posix()
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        docstrings = {
+            id(body[0].value)
+            for body in (
+                getattr(n, "body", None)
+                for n in ast.walk(tree)
+                if isinstance(
+                    n, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)
+                )
+            )
+            if body
+            and isinstance(body[0], ast.Expr)
+            and isinstance(body[0].value, ast.Constant)
+        }
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Constant) and isinstance(node.value, str):
+                text = node.value
+                if id(node) in docstrings or (rel, text) in NOT_SHELL:
+                    continue
+                if any(rel == f and text.startswith(p) for f, p in NOT_SHELL_PREFIXES):
+                    continue
+                if any(
+                    c == "!" and text[i + 1 : i + 2] not in (" ", "\t", "\n", "=", "(")
+                    for i, c in enumerate(text)
+                ):
+                    found.append((rel, node.lineno, text[:60]))
+    return found
+
+
+def test_no_string_in_the_program_carries_a_history_expanding_bang():
+    """Checked over every string literal, not only the scripts known today:
+    the next remote command is written by someone who has never heard of csh."""
+    assert _unsafe_literals() == []
 
 
 def test_the_check_itself_sees_the_pattern_that_broke():

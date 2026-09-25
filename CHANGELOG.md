@@ -189,6 +189,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   error.** Stopping the connection removed its control directory, and the
   restart pointed ssh at a socket in the missing directory, which ssh
   reports as a failed login. The restart now makes a new directory.
+- **Remote commands failed for an account whose login shell is csh or
+  tcsh.** A remote command is parsed by the account's login shell first, and
+  csh reads a `!` followed by a character as a history reference even inside
+  quotes. A digits check written `*[!0-9]*` made every lock script fail
+  there, and made the listing of snapper backups on a btrfs target return
+  nothing -- read as "no backups", so every snapshot would be sent again in
+  full. No command contains such a `!` now; a test checks every string in
+  the program.
 - **A snapper listing that failed read as "no backups".** Any failure --
   ssh, a refused sudo, the login shell above -- and even a last slot that
   was never received returned an empty list, so a backup re-sent every

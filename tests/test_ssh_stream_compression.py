@@ -854,7 +854,7 @@ class TestTheCompressedRemoteCommandIsSupervised:
     def test_the_pipeline_is_backgrounded_and_waited_on(self):
         """A foreground pipeline defers the trap until it is far too late."""
         cmd = _build_receive_command("/backups", use_sudo=True, decompress="zstd")
-        assert "& pid=$!" in cmd
+        assert "& pid=$! ;" in cmd
         assert 'wait "$pid"' in cmd
 
     def test_the_uncompressed_form_still_uses_exec(self):

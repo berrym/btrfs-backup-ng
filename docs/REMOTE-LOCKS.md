@@ -241,6 +241,15 @@ interrupted operation had unwound -- and while any other thread's transfer was
 still writing. The stale window remains the backstop for what nothing can catch:
 SIGKILL, a power cut, a severed network.
 
+### The account's login shell
+
+Every lock script reaches the target as one `sh -c '<script>'` on a command line
+the account's LOGIN shell parses first. csh and tcsh treat a `!` followed by
+anything but a blank, `=` or `(` as a history reference, even inside single
+quotes, and fail the whole command before `sh` runs. No script this program
+sends contains one; a digits check once written as `*[!0-9]*` made every lock
+script fail for such an account.
+
 ### Receiving
 
 A transfer holds the right to create one destination subvolume, named
