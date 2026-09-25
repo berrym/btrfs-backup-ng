@@ -857,3 +857,215 @@ class TestReleaseIsNotRecursive:
 
         manager.release("target")
         assert stray.exists(), "release deleted a file it did not create"
+
+
+class TestTheAgeIsAlwaysAnInteger:
+    """Under contention the acquire script died with an arithmetic syntax
+    error, about once in sixteen full runs of the one-winner test above.
+
+    The heartbeat's mtime was read as ``stat -c %Y FILE || stat -f %m FILE``:
+    GNU first, BSD as a fallback. On GNU, ``stat -f`` is "file system status",
+    so when the heartbeat was missing at the first call (the holder had won
+    the ``mkdir`` and not yet ``touch``ed it) and present at the second, the
+    fallback printed a multi-line status block, and ``$(( now - block ))``
+    was the arithmetic error -- the contender then failed with "could not
+    operate the lock directory" instead of the BUSY it should have said.
+
+    Every lock script now reads times through one function: the ``stat``
+    flavour is decided once, from ``/``, and whatever it prints is checked to
+    be digits before any arithmetic. A lock whose age cannot be read is BUSY;
+    one that vanished meanwhile is taken. The interleaving is forced here
+    with a ``stat`` on PATH that fails exactly once for the heartbeat.
+    """
+
+    def _held_lock(self, manager: RemoteLockManager, name: str) -> Path:
+        lock_dir = Path(manager._lock_dir(name))
+        lock_dir.mkdir(parents=True)
+        (lock_dir / "info.json").write_text(
+            '{"name": "%s", "lock_id": "%s"}' % (name, name)
+        )
+        (lock_dir / "heartbeat").touch()
+        return lock_dir
+
+    def _shim(self, tmp_path, monkeypatch, body: str) -> Path:
+        """A ``stat`` ahead of the real one on PATH, running ``body`` first."""
+        real = subprocess.run(
+            ["sh", "-c", "command -v stat"], capture_output=True, text=True
+        ).stdout.strip()
+        shims = tmp_path / "shims"
+        shims.mkdir()
+        (shims / "stat").write_text(f'#!/bin/sh\n{body}\nexec {real} "$@"\n')
+        (shims / "stat").chmod(0o755)
+        monkeypatch.setenv("PATH", f"{shims}:{os.environ['PATH']}")
+        return shims
+
+    def test_a_heartbeat_that_appears_between_two_stats_reads_as_busy(
+        self, tmp_path, monkeypatch
+    ):
+        sandbox = tmp_path / "target"
+        sandbox.mkdir()
+        manager = _manager(sandbox)
+        self._held_lock(manager, "target")
+        marker = tmp_path / "failed-once"
+        # The first mtime read of the heartbeat fails, as it did while the
+        # holder had not yet written it; every later call is the real stat.
+        self._shim(
+            tmp_path,
+            monkeypatch,
+            f'case "$*" in *heartbeat*) if [ ! -e "{marker}" ]; then '
+            f'touch "{marker}"; exit 1; fi;; esac',
+        )
+        rc, out, err = manager._run(manager._acquire_script("target", "{}", "tok"))
+        assert rc == 0, err
+        assert "arithmetic" not in err and "syntax error" not in err, err
+        assert "BUSY" in out and "ACQUIRED" not in out, out
+        assert marker.exists(), "the shim never intercepted the heartbeat read"
+        with pytest.raises(RemoteLockBusy):
+            manager.acquire_once("target", "op")
+
+    def test_a_stat_that_prints_a_status_block_is_never_arithmetic(
+        self, tmp_path, monkeypatch
+    ):
+        """Whatever ``stat`` prints, only digits reach ``$(( ))``; a lock whose
+        age cannot be read is BUSY, never a script error."""
+        sandbox = tmp_path / "target"
+        sandbox.mkdir()
+        manager = _manager(sandbox)
+        self._held_lock(manager, "target")
+        self._shim(
+            tmp_path,
+            monkeypatch,
+            'printf "  File: %s\\n  ID: 4c7c Namelen: 255 Type: tmpfs\\n" "$2"; exit 0',
+        )
+        rc, out, err = manager._run(manager._acquire_script("target", "{}", "tok"))
+        assert rc == 0, err
+        # Nothing on stderr at all, not the absence of one shell's wording: the
+        # arithmetic in bbng_age runs in a command substitution, so an error
+        # there leaves the verdict BUSY and shows only here -- and dash, the
+        # `sh` of Debian and Ubuntu, words it "Illegal number", which neither
+        # "arithmetic" nor "syntax error" matches.
+        assert err == "", err
+        assert "BUSY" in out, out
+
+    def test_a_lock_that_vanished_between_the_mkdir_and_the_stat_is_taken(
+        self, tmp_path, monkeypatch
+    ):
+        sandbox = tmp_path / "target"
+        sandbox.mkdir()
+        manager = _manager(sandbox)
+        lock_dir = self._held_lock(manager, "target")
+        # The holder releases while the contender is reading the age.
+        self._shim(
+            tmp_path,
+            monkeypatch,
+            f'case "$*" in *heartbeat*) rm -f "{lock_dir}/heartbeat" "{lock_dir}/info.json"; '
+            f'rmdir "{lock_dir}"; exit 1;; esac',
+        )
+        rc, out, err = manager._run(manager._acquire_script("target", "{}", "tok"))
+        assert rc == 0, err
+        assert "arithmetic" not in err, err
+        assert "ACQUIRED" in out and "STALE" not in out, out
+        assert (lock_dir / "heartbeat").exists()
+
+    def test_every_lock_script_parses_and_reads_time_through_one_function(
+        self, tmp_path
+    ):
+        manager = _manager(tmp_path)
+        scripts = {
+            "acquire": manager._acquire_script("target", "{}", "tok"),
+            "is_locked": None,
+        }
+        acquire = scripts["acquire"]
+        assert acquire.count("bbng_mtime()") == 1
+        assert "stat -f %m " not in acquire.replace("bbng_st='-f %m'", "")
+        assert "|| echo 0" not in acquire
+        # A `)` pattern inside a command substitution does not parse under
+        # bash 3.2 (macOS /bin/sh); the case statements live in function
+        # bodies defined at top level.
+        for script in (acquire,):
+            check = subprocess.run(
+                ["sh", "-n", "-c", script], capture_output=True, text=True
+            )
+            assert check.returncode == 0, check.stderr
+            assert "\n" not in script
+
+    def test_the_holder_scan_does_arithmetic_only_on_integers(
+        self, tmp_path, monkeypatch
+    ):
+        manager = _manager(tmp_path, stale_after=1)
+        manager.acquire_shared("snap-a", "restore:1")
+        self._shim(
+            tmp_path,
+            monkeypatch,
+            'printf "  File: %s\\n  ID: 4c7c Type: tmpfs\\n" "$2"; exit 0',
+        )
+        # Whatever stat prints, the listing completes: never a crash or a
+        # script error.
+        manager.live_locks()
+
+    def test_a_date_without_epoch_seconds_is_never_arithmetic(
+        self, tmp_path, monkeypatch
+    ):
+        """The current time is checked to be digits too. A ``date`` without
+        ``%s`` prints the format back; that must not reach ``$(( ))``, and a
+        lock that cannot be aged is never broken -- even one whose heartbeat
+        is long dead stays BUSY."""
+        sandbox = tmp_path / "target"
+        sandbox.mkdir()
+        manager = _manager(sandbox, stale_after=1)
+        lock_dir = self._held_lock(manager, "target")
+        old = time.time() - 10_000
+        os.utime(lock_dir / "heartbeat", (old, old))
+        self._fake_date(tmp_path, monkeypatch)
+        rc, out, err = manager._run(manager._acquire_script("target", "{}", "tok"))
+        assert rc == 0, err
+        assert err == "", err
+        assert "BUSY" in out and "ACQUIRED" not in out, out
+
+    @staticmethod
+    def _fake_date(tmp_path, monkeypatch) -> None:
+        shims = tmp_path / "date-shim"
+        shims.mkdir()
+        (shims / "date").write_text("#!/bin/sh\necho '%s'\n")
+        (shims / "date").chmod(0o755)
+        monkeypatch.setenv("PATH", f"{shims}:{os.environ['PATH']}")
+
+    def test_a_lock_taken_microseconds_ago_is_listed_as_live(self, tmp_path):
+        """The listing ages a lock whose record is not written yet from its
+        directory, as acquisition does. Aged from zero, a lock inside the
+        window between the ``mkdir`` that took it and the write that records
+        it would drop out of the listing a prune consults."""
+        manager = _manager(tmp_path)
+        lock_dir = Path(manager._lock_dir("target"))
+        lock_dir.mkdir(parents=True)
+        assert "target" in manager.live_locks()
+        old = time.time() - 10_000
+        os.utime(lock_dir, (old, old))
+        assert "target" not in manager.live_locks()
+
+    def test_is_locked_answers_live_and_stale_correctly(self, tmp_path):
+        """A live lock is reported with its holder and a stale one is not --
+        without a script error, under every shell present."""
+        from .lockshell import available_shells
+
+        for shell in available_shells():
+            errors: list[str] = []
+
+            def run(script, _sh=shell, _errors=errors):
+                proc = subprocess.run(
+                    [_sh, "-c", script], capture_output=True, text=True
+                )
+                _errors.append(proc.stderr)
+                return proc.returncode, proc.stdout, proc.stderr
+
+            sandbox = tmp_path / shell
+            sandbox.mkdir()
+            manager = RemoteLockManager(run, str(sandbox), hostname="testhost")
+            _manager(sandbox).acquire_once("live", "prune")
+            stale = self._held_lock(manager, "stale")
+            old = time.time() - 10_000
+            os.utime(stale / "heartbeat", (old, old))
+
+            assert (manager.is_locked("live") or {}).get("operation") == "prune", shell
+            assert manager.is_locked("stale") is None, shell
+            assert errors == ["", ""], (shell, errors)

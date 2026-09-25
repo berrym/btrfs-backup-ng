@@ -146,6 +146,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   pinned slot and deletes nothing when the store cannot be read. The
   documentation's "a prune cannot delete what is being read" is now true
   wherever a backup lives.
+- **A contended lock could fail with a shell arithmetic error instead of
+  "busy".** The lock scripts read a heartbeat's mtime as `stat -c %Y FILE ||
+  stat -f %m FILE`, GNU first and BSD as a fallback. On GNU `stat -f` means
+  "file system status", so when the heartbeat was missing at the first call
+  (the holder had won the `mkdir` and not yet written it) and present at the
+  second, the fallback printed a multi-line status block and the age
+  arithmetic died on it; the contender reported "could not operate the lock
+  directory" for a lock that was simply held. Every lock script now reads
+  times through one function: the `stat` flavour is decided once, from `/`,
+  and whatever `stat` prints is checked to be digits before any arithmetic.
+  A lock whose age cannot be read is busy; one that vanished between the
+  `mkdir` and the check is taken; neither is a script error. The scripts
+  parse under bash 3.2, dash and busybox, and survive an account whose login
+  shell is csh or tcsh.
 - **`BTRFS_BACKUP_LOG_LEVEL` did nothing.** Documented for years, read once
   at import and overwritten by every command's logger setup. It now sets
   the console level where neither a command-line flag nor the

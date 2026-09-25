@@ -368,35 +368,82 @@ def read_only_notice(name: str, where: str, location: str) -> None:
     )
 
 
-def _remote_mtime_expr(path: str) -> str:
-    """Shell yielding ``path``'s mtime, or nothing if it does not exist.
+#: Shell defining the functions every lock script reads times with.
+#:
+#: ``bbng_digits VALUE`` succeeds only for a non-empty string of ASCII digits.
+#: It walks the value one character at a time rather than matching a negated
+#: bracket such as ``*[!0-9]*``: these scripts reach a remote target as
+#: ``sh -c '<script>'`` on a command line the account's LOGIN shell parses
+#: first, and csh and tcsh read a ``!`` followed by anything but a blank, ``=``
+#: or ``(`` as a history reference even inside single quotes. The whole command
+#: then failed with "Event not found." before ``sh`` ever ran. No remote script
+#: may contain such a ``!`` (see ``csh_unsafe``).
+#:
+#: ``bbng_mtime FILE`` prints the file's mtime as a bare integer, or nothing.
+#: Which ``stat`` this host has is decided ONCE, from a path that always
+#: exists: GNU takes ``-c %Y``, BSD (macOS) ``-f %m``. The two must not be
+#: chained as fallbacks per file: on GNU, ``stat -f`` means "file system
+#: status", so ``stat -f %m FILE`` prints a multi-line block whenever FILE
+#: exists -- and a heartbeat that appeared between the failed ``-c`` call and
+#: the ``-f`` one handed that block to ``$(( ))``, which died with an
+#: arithmetic syntax error under contention. Whatever ``stat`` prints is then
+#: checked to be digits before it is printed at all.
+#:
+#: ``bbng_now`` prints the target's clock as a bare integer, or nothing.
+#:
+#: ``bbng_age FILE [FALLBACK]`` prints the age in seconds of FILE by the
+#: target's own clock, of FALLBACK when FILE has no readable mtime, or nothing
+#: when neither can be read or the clock cannot. Callers treat nothing as
+#: "cannot judge", never as an age of zero or of forever.
+MTIME_FUNCTIONS = (
+    "if stat -c %Y / >/dev/null 2>&1; then bbng_st='-c %Y'; else bbng_st='-f %m'; fi; "
+    'bbng_digits() { bbng_t=$1; [ -n "$bbng_t" ] || return 1; '
+    'while [ -n "$bbng_t" ]; do case $bbng_t in [0123456789]*) bbng_t=${bbng_t#?};; '
+    "*) return 1;; esac; done; return 0; }; "
+    'bbng_mtime() { bbng_m=$(stat $bbng_st "$1" 2>/dev/null) || bbng_m=; '
+    'bbng_digits "$bbng_m" || bbng_m=; '
+    'printf "%s" "$bbng_m"; }; '
+    "bbng_now() { bbng_c=$(date +%s 2>/dev/null) || bbng_c=; "
+    'bbng_digits "$bbng_c" || bbng_c=; printf "%s" "$bbng_c"; }; '
+    'bbng_age() { bbng_a=$(bbng_mtime "$1"); '
+    'if [ -z "$bbng_a" ] && [ -n "$2" ]; then bbng_a=$(bbng_mtime "$2"); fi; '
+    "bbng_n=$(bbng_now); "
+    'if [ -n "$bbng_a" ] && [ -n "$bbng_n" ]; then echo $(( bbng_n - bbng_a )); fi; }; '
+)
 
-    GNU ``stat -c %Y`` with a BSD ``stat -f %m`` fallback, matching how the rest
-    of the codebase probes remote files -- targets are not all Linux.
+
+def csh_unsafe(script: str) -> list[str]:
+    """The fragments of ``script`` a csh or tcsh login shell would misread.
+
+    Every remote command is parsed by the account's login shell before ``sh``
+    sees it. csh and tcsh begin a history substitution at any ``!`` that is not
+    followed by a blank, ``=`` or ``(`` -- inside single quotes too -- and
+    reject a quoted string that spans a line. Either fails the whole command
+    before it runs. Empty means the script is safe to send.
     """
-    q = shlex.quote(path)
-    return f"stat -c %Y {q} 2>/dev/null || stat -f %m {q} 2>/dev/null"
+    bad = [
+        script[i : i + 2]
+        for i, c in enumerate(script)
+        if c == "!" and script[i + 1 : i + 2] not in (" ", "\t", "=", "(")
+    ]
+    if "\n" in script:
+        bad.append("\\n")
+    return bad
 
 
-def _remote_age_expr(path: str, fallback: Optional[str] = None) -> str:
-    """Shell computing the age in seconds of ``path``, on the remote.
+def csh_safe_text(value: str) -> str:
+    """``value`` (JSON) with every ``!`` written as the JSON escape ``\\u0021``,
+    so a payload carrying a user-chosen name survives a csh login shell."""
+    return value.replace("!", "\\u0021")
 
-    ``fallback`` is a second path to age from when the first does not exist yet.
-    It closes a real race in acquisition: between the ``mkdir`` that wins a lock
-    and the ``touch`` that writes its first heartbeat there is a window in which
-    the heartbeat is absent. Ageing a missing file from epoch zero makes that
-    brand-new lock look infinitely old, and a contender arriving inside the
-    window breaks it and takes a lock somebody else already holds -- two winners.
-    Observed as an intermittent failure of the one-winner test, then reproduced
-    exactly by creating the directory without its heartbeat.
 
-    The lock directory itself is the fallback: ``mkdir`` creates it atomically,
-    so its mtime is a sound lower bound on the holder's age.
-    """
-    primary = _remote_mtime_expr(path)
+def _age_call(path: str, fallback: Optional[str] = None) -> str:
+    """The shell call yielding the age of ``path`` (see ``MTIME_FUNCTIONS``);
+    ``fallback`` is aged instead when ``path`` has no readable mtime."""
+    call = f"bbng_age {shlex.quote(path)}"
     if fallback is not None:
-        primary = f"{primary} || {_remote_mtime_expr(fallback)}"
-    return f"$(( $(date +%s) - $({primary} || echo 0) ))"
+        call += f" {shlex.quote(fallback)}"
+    return f"$({call})"
 
 
 class RemoteLockManager:
@@ -465,10 +512,9 @@ class RemoteLockManager:
         info = shlex.quote(f"{self._lock_dir(name)}/info.json")
         target = shlex.quote(self._target)
         stale_dir = shlex.quote(f"{self._lock_dir(name)}.stale.{token}")
-        age = _remote_age_expr(
-            f"{self._lock_dir(name)}/heartbeat", self._lock_dir(name)
-        )
+        age = _age_call(f"{self._lock_dir(name)}/heartbeat", self._lock_dir(name))
         return (
+            MTIME_FUNCTIONS +
             # A lock directory that cannot be created is NOT contention. Reported
             # as BUSY -- which is what a bare mkdir failure looks like -- it sends
             # an operator hunting for a competing process that does not exist.
@@ -481,15 +527,24 @@ class RemoteLockManager:
             f"if [ -d {target} ]; then mkdir -p {root} 2>/dev/null; fi; "
             f"if [ ! -d {root} ] || [ ! -w {root} ]; then echo NOLOCKDIR; exit 0; fi; "
             f"if mkdir {lock} 2>/dev/null; then "
-            f"  printf '%s' {shlex.quote(payload)} > {info}; touch {hb}; echo ACQUIRED; "
+            f"  printf '%s' {shlex.quote(csh_safe_text(payload))} > {info}; touch {hb}; echo ACQUIRED; "
             f"else "
             f"  AGE={age}; "
-            f'  if [ "$AGE" -gt {self._stale_after} ]; then '
+            # No readable age: the holder released between the failed mkdir and
+            # the stat (the directory is gone -- take it now), or the lock is
+            # there and cannot be read (BUSY: a lock that cannot be judged is
+            # never broken). Neither is a script error.
+            f'  if [ -z "$AGE" ]; then '
+            f"    if [ -d {lock} ]; then echo BUSY; "
+            f"    elif mkdir {lock} 2>/dev/null; then "
+            f"      printf '%s' {shlex.quote(csh_safe_text(payload))} > {info}; touch {hb}; echo ACQUIRED; "
+            f"    else echo BUSY; fi; "
+            f'  elif [ "$AGE" -gt {self._stale_after} ]; then '
             f"    if mv {lock} {stale_dir} 2>/dev/null; then "
             f"      rm -f {stale_dir}/info.json {stale_dir}/heartbeat 2>/dev/null; "
             f"      rmdir {stale_dir} 2>/dev/null; "
             f"      if mkdir {lock} 2>/dev/null; then "
-            f"        printf '%s' {shlex.quote(payload)} > {info}; touch {hb}; "
+            f"        printf '%s' {shlex.quote(csh_safe_text(payload))} > {info}; touch {hb}; "
             f"        echo ACQUIRED_STALE; "
             f"      else echo BUSY; fi; "
             f"    else echo BUSY; fi; "
@@ -556,7 +611,7 @@ class RemoteLockManager:
             # competing process that does not exist.
             f"if [ ! -d {root} ] || [ ! -d {holders} ] || [ ! -w {holders} ]; then "
             f"  echo NOLOCKDIR; exit 0; fi; "
-            f"printf '%s' {shlex.quote(payload)} > {holder} 2>/dev/null "
+            f"printf '%s' {shlex.quote(csh_safe_text(payload))} > {holder} 2>/dev/null "
             f"&& echo ACQUIRED || echo FAILED"
         )
         rc, out, err = self._run(script)
@@ -695,10 +750,13 @@ class RemoteLockManager:
         the target until someone cleaned up by hand.
         """
         info = shlex.quote(f"{self._lock_dir(name)}/info.json")
-        age = _remote_age_expr(f"{self._lock_dir(name)}/heartbeat")
+        age = _age_call(f"{self._lock_dir(name)}/heartbeat")
+        # A lock whose heartbeat cannot be read reports as not live, as an
+        # unreadable heartbeat always has here: this is the informational
+        # answer, and the acquire script judges contention for itself.
         script = (
-            f"if [ -d {shlex.quote(self._lock_dir(name))} ]; then "
-            f'  AGE={age}; if [ "$AGE" -le {self._stale_after} ]; then '
+            MTIME_FUNCTIONS + f"if [ -d {shlex.quote(self._lock_dir(name))} ]; then "
+            f'  AGE={age}; if [ -n "$AGE" ] && [ "$AGE" -le {self._stale_after} ]; then '
             f"    cat {info} 2>/dev/null; fi; "
             f"fi"
         )
@@ -754,23 +812,20 @@ class RemoteLockManager:
         root = shlex.quote(self._root)
         holders_dir = HOLDERS_DIR_NAME
         script = (
-            f'printf "NOW %s\\n" "$(date +%s)"; '
+            MTIME_FUNCTIONS + f'printf "NOW %s\\n" "$(date +%s)"; '
             f"for d in {root}/*.lock; do "
             f'  [ -d "$d" ] || continue; '
             f'  n=$(basename "$d" .lock); '
             f'  if [ -d "$d/{holders_dir}" ]; then '
             f'    for h in "$d"/{holders_dir}/*; do '
             f'      [ -f "$h" ] || continue; '
-            f'      m=$(stat -c %Y "$h" 2>/dev/null '
-            f'|| stat -f %m "$h" 2>/dev/null || echo 0); '
+            f'      m=$(bbng_mtime "$h"); m=${{m:-0}}; '
             f'      printf "H %s %s %s " "$n" "$m" "$(basename "$h")"; '
             f'      cat "$h" 2>/dev/null; printf "\\n"; '
             f"    done; "
             f"  else "
-            f'    m=$(stat -c %Y "$d/heartbeat" 2>/dev/null '
-            f'|| stat -f %m "$d/heartbeat" 2>/dev/null '
-            f'|| stat -c %Y "$d" 2>/dev/null '
-            f'|| stat -f %m "$d" 2>/dev/null || echo 0); '
+            f'    m=$(bbng_mtime "$d/heartbeat"); [ -n "$m" ] || m=$(bbng_mtime "$d"); '
+            f"    m=${{m:-0}}; "
             f'    printf "X %s %s - "  "$n" "$m"; '
             f'    cat "$d/info.json" 2>/dev/null; printf "\\n"; '
             f"  fi; "
