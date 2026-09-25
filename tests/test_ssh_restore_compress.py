@@ -142,23 +142,14 @@ class TestTheRemoteCompressesAndThisHostDecompresses:
             ep.send(_snap("/backup/snap-1"))
         assert "pipeline" not in pipeline and "argv" not in pipeline
 
-    def test_it_says_so_on_the_log(self, pipeline, caplog):
+    def test_it_says_so_on_the_log(self, pipeline, shared_log):
         """The tier3 zstd-over-ssh cell requires this line in the restore's
         output; it is what tells a compressed restore leg from a plain one."""
         ep = _ep(compress="zstd")
-        # The endpoint logger is the package's own Logger instance, not one
-        # registered with the manager, so caplog's handler is attached to it.
-        ssh_mod.logger.addHandler(caplog.handler)
-        previous = ssh_mod.logger.level
-        ssh_mod.logger.setLevel(logging.INFO)
-        try:
-            ep.send(_snap("/backup/snap-1"))
-        finally:
-            ssh_mod.logger.setLevel(previous)
-            ssh_mod.logger.removeHandler(caplog.handler)
+        ep.send(_snap("/backup/snap-1"))
         assert any(
-            "Decompressing the restore stream with zstd" in r.getMessage()
-            for r in caplog.records
+            "Decompressing the restore stream with zstd" in m
+            for m in shared_log.messages(logging.INFO)
         )
 
 

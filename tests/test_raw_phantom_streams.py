@@ -20,6 +20,7 @@ there is no file for it to find.
 from __future__ import annotations
 
 import json
+import logging
 
 import pytest
 
@@ -51,15 +52,17 @@ class TestAPhantomIsNotListed:
             f"{[(s.name, s.size) for s in found]}"
         )
 
-    def test_it_is_reported_rather_than_dropped_quietly(self, tmp_path, capsys):
+    def test_it_is_reported_rather_than_dropped_quietly(self, tmp_path, shared_log):
         """A sidecar without its stream means a backup is GONE. Silence there is
         how an operator discovers it during a restore instead of before one."""
         _sidecar(tmp_path, "home.20240102-120000", stream=False)
 
         discover_raw_snapshots(tmp_path)
 
-        err = capsys.readouterr().err
-        assert "missing" in err and "that backup is gone" in err, err
+        warnings = shared_log.messages(logging.WARNING)
+        assert any("missing" in m and "that backup is gone" in m for m in warnings), (
+            warnings
+        )
 
     def test_real_backups_beside_it_are_unaffected(self, tmp_path):
         _sidecar(tmp_path, "home.20240101-120000")

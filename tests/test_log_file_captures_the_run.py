@@ -1,10 +1,10 @@
 """`log_file` must record what the run actually did.
 
-The shared logger is `logging.Logger("btrfs-backup-ng")` -- a standalone instance
-named with HYPHENS, constructed directly rather than via getLogger, so it is not
-registered in the logging manager and nothing can be its child. Meanwhile 36
-modules across cli/ and core/ use `logging.getLogger(__name__)`, which lives
-under `btrfs_backup_ng` with UNDERSCORES.
+The shared logger is `logging.getLogger("btrfs-backup-ng")` -- named with
+HYPHENS and set not to propagate, so nothing is its child and nothing above it
+sees its records. Meanwhile 36 modules across cli/ and core/ use
+`logging.getLogger(__name__)`, which lives under `btrfs_backup_ng` with
+UNDERSCORES.
 
 Those are unrelated trees. A file handler attached only to the shared logger
 therefore never saw a single line from run, transfer, restore or operations --

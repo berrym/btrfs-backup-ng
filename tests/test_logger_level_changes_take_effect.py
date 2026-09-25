@@ -27,15 +27,6 @@ def _restore_logging():
     __logger__.create_logger(False, level="INFO")
 
 
-class _Capture(logging.Handler):
-    def __init__(self):
-        super().__init__(level=logging.DEBUG)
-        self.records: list[logging.LogRecord] = []
-
-    def emit(self, record):
-        self.records.append(record)
-
-
 def test_the_shared_logger_is_known_to_the_manager():
     assert logging.getLogger(__logger__.logger.name) is __logger__.logger
 
@@ -48,20 +39,15 @@ def test_lowering_the_level_after_an_info_was_refused_enables_info_again():
     assert lg.isEnabledFor(logging.INFO)
 
 
-def test_quiet_then_a_lower_console_level_delivers_info_records():
+def test_quiet_then_a_lower_console_level_delivers_info_records(shared_log):
     """Through the real setters: what a config's ``quiet`` does, then what a
     later ``verbose`` (or a reset) does."""
     lg = __logger__.logger
-    capture = _Capture()
-    lg.addHandler(capture)
-    try:
-        __logger__.set_console_level(logging.WARNING)
-        lg.info("dropped, as quiet asks")
-        __logger__.set_console_level(logging.INFO)
-        lg.info("delivered")
-        assert [r.getMessage() for r in capture.records] == ["delivered"]
-    finally:
-        lg.removeHandler(capture)
+    __logger__.set_console_level(logging.WARNING)
+    lg.info("dropped, as quiet asks")
+    __logger__.set_console_level(logging.INFO)
+    lg.info("delivered")
+    assert shared_log.messages() == ["delivered"]
 
 
 def test_quiet_does_not_thin_a_debug_log_file_for_the_endpoints(tmp_path):

@@ -3,6 +3,7 @@
 import functools
 import logging
 import subprocess
+from collections.abc import Iterator
 
 import pytest
 
@@ -94,6 +95,58 @@ def reset_logging():
             logger_module.logger.handlers.clear()
     except ImportError:
         pass
+
+
+class SharedLogCapture(logging.Handler):
+    """Every record the shared logger handled while this was attached to it."""
+
+    def __init__(self) -> None:
+        super().__init__(level=logging.NOTSET)
+        self.records: list[logging.LogRecord] = []
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self.records.append(record)
+
+    def messages(self, level: int = logging.NOTSET) -> list[str]:
+        """The message of each record logged at ``level`` or above."""
+        return [r.getMessage() for r in self.records if r.levelno >= level]
+
+
+@pytest.fixture
+def shared_log() -> Iterator[SharedLogCapture]:
+    """Capture what the shared logger handles during the test.
+
+    The endpoints, the dispatcher and a few other modules log through
+    ``btrfs_backup_ng.__logger__.logger``, which does not propagate. Neither
+    of pytest's own captures sees its records on every pytest version:
+
+    - ``capsys`` sees them only through ``logging.lastResort``, which writes
+      WARNING and above to stderr and runs only when the logger has no
+      handler at all. From 9.1 on, pytest attaches its handlers to every
+      registered logger that does not propagate, so lastResort never runs and
+      stderr is empty.
+    - ``caplog`` sees them only from pytest 9.1 on. Before that its handler
+      is on the root logger alone, which these records never reach.
+
+    A handler the test attaches itself sees them on every version. The logger
+    is opened to DEBUG for the test, since an earlier test may have left it
+    at any level; a test that depends on the level a message was logged at
+    reads ``messages(level)``. ``create_logger`` clears the logger's
+    handlers, so a test that calls it must patch it out.
+    """
+    from btrfs_backup_ng.__logger__ import logger as shared
+
+    capture = SharedLogCapture()
+    level = shared.level
+    shared.addHandler(capture)
+    shared.setLevel(logging.DEBUG)
+    try:
+        yield capture
+    finally:
+        # Only this handler is removed: from 9.1 on, pytest adds and removes
+        # its own on the logger at each test phase.
+        shared.removeHandler(capture)
+        shared.setLevel(level)
 
 
 @pytest.fixture(autouse=True)

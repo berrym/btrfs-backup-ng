@@ -61,22 +61,6 @@ def real_shell(monkeypatch):
     monkeypatch.setattr(ops, "_snapper_run_shell", _real_shell)
 
 
-@pytest.fixture
-def shared_log(caplog):
-    """The endpoints log through the shared logger, which does not propagate
-    to the root; attach caplog's handler to it for the test."""
-    from btrfs_backup_ng.__logger__ import logger as shared
-
-    shared.addHandler(caplog.handler)
-    level = shared.level
-    shared.setLevel(logging.DEBUG)
-    try:
-        yield caplog
-    finally:
-        shared.removeHandler(caplog.handler)
-        shared.setLevel(level)
-
-
 def _endpoint(base: Path) -> LocalEndpoint:
     base.mkdir(parents=True, exist_ok=True)
     return LocalEndpoint(
@@ -198,16 +182,16 @@ class TestAReadOnlySourceNeedsNoLockFile:
         monkeypatch.setattr(lock.os, "statvfs", statvfs)
 
     def test_a_pin_on_a_read_only_location_is_not_an_error(
-        self, tmp_path, monkeypatch, shared_log
+        self, tmp_path, monkeypatch, caplog
     ):
         ep = self._location(tmp_path)
         self._refuse_writes(monkeypatch)
         self._mounted_read_only(monkeypatch)
         snap = _snap("home-1")
-        with shared_log.at_level(logging.INFO):
+        with caplog.at_level(logging.INFO):
             ep.set_lock(snap, "restore:s1", True)
         assert "restore:s1" in snap.locks
-        assert "mounted read-only" in shared_log.text
+        assert "mounted read-only" in caplog.text
 
     def test_any_other_failure_to_pin_still_refuses(self, tmp_path, monkeypatch):
         ep = self._location(tmp_path)
@@ -222,18 +206,18 @@ class TestAReadOnlySourceNeedsNoLockFile:
         ep = self._location(tmp_path)
         ep.config["skip_remote_lock"] = True
         self._refuse_writes(monkeypatch)
-        with shared_log.at_level(logging.WARNING):
-            ep.set_lock(_snap("home-1"), "restore:s1", True)
-        assert "WITHOUT protection" in shared_log.text
+        ep.set_lock(_snap("home-1"), "restore:s1", True)
+        warnings = shared_log.messages(logging.WARNING)
+        assert any("WITHOUT protection" in m for m in warnings), warnings
 
     def test_a_release_that_cannot_be_written_is_a_warning(
         self, tmp_path, monkeypatch, shared_log
     ):
         ep = self._location(tmp_path)
         self._refuse_writes(monkeypatch)
-        with shared_log.at_level(logging.WARNING):
-            ep.set_lock(_snap("home-1"), "restore:s1", False)
-        assert "Could not clear the lock" in shared_log.text
+        ep.set_lock(_snap("home-1"), "restore:s1", False)
+        warnings = shared_log.messages(logging.WARNING)
+        assert any("Could not clear the lock" in m for m in warnings), warnings
 
     def test_a_source_that_is_only_read_gets_no_bookkeeping_tree(self, tmp_path):
         """The restore-side endpoint configuration says the location is only
@@ -355,11 +339,11 @@ class TestEveryPinWriterDecidesReadOnlyTheSameWay:
 
         return Manager()
 
-    def test_record_pin_skips_the_pin_on_a_read_only_location(self, shared_log):
-        with shared_log.at_level(logging.INFO):
+    def test_record_pin_skips_the_pin_on_a_read_only_location(self, caplog):
+        with caplog.at_level(logging.INFO):
             lock.record_pin(self._manager(True), _snap("home-1"), "restore:s1", True)
-        assert "/medium is mounted read-only" in shared_log.text
-        assert "not pinned" in shared_log.text
+        assert "/medium is mounted read-only" in caplog.text
+        assert "not pinned" in caplog.text
 
     def test_record_pin_still_refuses_elsewhere_without_a_doubled_period(self):
         with pytest.raises(__util__.AbortError) as info:
@@ -374,7 +358,7 @@ class TestEveryPinWriterDecidesReadOnlyTheSameWay:
         assert lock.reason_of(RuntimeError("x")) == "x"
 
     def test_a_raw_store_on_a_read_only_medium_is_pinned_without_error(
-        self, unwritable, ro_table, monkeypatch, shared_log
+        self, unwritable, ro_table, monkeypatch, caplog
     ):
         """The measured regression: a raw:// location whose lock store cannot
         be created and whose filesystem is read-only. The restore's pin is
@@ -382,10 +366,10 @@ class TestEveryPinWriterDecidesReadOnlyTheSameWay:
         monkeypatch.setenv("BBNG_MOUNT_TABLE", ro_table)
         ep = RawEndpoint(config={"path": str(unwritable), "snap_prefix": ""})
         snap = _snap("home-1")
-        with shared_log.at_level(logging.INFO):
+        with caplog.at_level(logging.INFO):
             ep.set_lock(snap, "restore:s1", True)
         assert "restore:s1" in snap.locks
-        assert "mounted read-only" in shared_log.text
+        assert "mounted read-only" in caplog.text
         assert not (unwritable / ".btrfs-backup-ng.locks").exists()
 
     def test_a_raw_store_that_merely_refuses_the_write_still_aborts(

@@ -9,6 +9,7 @@ non-zero, not crash. These guard the break-campaign findings grouped under T7.
 from __future__ import annotations
 
 import argparse
+import logging
 import subprocess
 import time
 from pathlib import Path
@@ -31,7 +32,18 @@ def _run(command="raw"):
     return disp.run_subcommand(argparse.Namespace(version=False, command=command))
 
 
-def test_uncaught_exception_renders_clean_line_not_traceback(monkeypatch, capsys):
+def _logged_tracebacks(shared_log):
+    """Records that would put a traceback on the console: exception info on
+    anything at INFO or above. The stderr checks see only what is printed; a
+    record logged through the shared logger reaches the console through that
+    logger's own handler. The dispatcher keeps an unexpected error's traceback
+    at DEBUG, for ``--debug``, and that record is not one of these."""
+    return [r for r in shared_log.records if r.exc_info and r.levelno >= logging.INFO]
+
+
+def test_uncaught_exception_renders_clean_line_not_traceback(
+    monkeypatch, capsys, shared_log
+):
     """A handler raising an arbitrary error (e.g. a ValueError from a bad sidecar
     cipher, which send_snapshot's except historically did not catch) must reach the
     user as one plain line + a --debug hint + exit 1, never a Python traceback.
@@ -45,9 +57,12 @@ def test_uncaught_exception_renders_clean_line_not_traceback(monkeypatch, capsys
     assert "Error: bad cipher in sidecar" in err
     assert "--debug" in err
     assert "Traceback" not in err
+    assert not _logged_tracebacks(shared_log)
 
 
-def test_abort_error_renders_its_message_without_debug_hint(monkeypatch, capsys):
+def test_abort_error_renders_its_message_without_debug_hint(
+    monkeypatch, capsys, shared_log
+):
     """An AbortError is a deliberate, already-plain-language stop; show its message as
     the reason, and do NOT append the --debug traceback hint (there is nothing to
     debug -- the message is the answer)."""
@@ -62,15 +77,18 @@ def test_abort_error_renders_its_message_without_debug_hint(monkeypatch, capsys)
     assert "Error: zstd is not installed; install it" in err
     assert "--debug" not in err
     assert "Traceback" not in err
+    assert not _logged_tracebacks(shared_log)
+    assert not [m for m in shared_log.messages(logging.INFO) if "--debug" in m]
 
 
-def test_keyboard_interrupt_is_clean_130(monkeypatch, capsys):
+def test_keyboard_interrupt_is_clean_130(monkeypatch, capsys, shared_log):
     monkeypatch.setattr(disp, "cmd_raw", MagicMock(side_effect=KeyboardInterrupt()))
     rc = _run("raw")
     err = capsys.readouterr().err
     assert rc == 130
     assert "Interrupted" in err
     assert "Traceback" not in err
+    assert not _logged_tracebacks(shared_log)
 
 
 # --- exec_subprocess: a command failure carries a real reason ----------------

@@ -602,8 +602,8 @@ class TestElevationIsProvenNotGuessed:
         """An internal marker in an operator-facing log is noise that gets
         pasted into bug reports.
 
-        Asserts on what reaches the logger rather than on caplog: this project
-        configures logging itself, so caplog captures nothing here.
+        This path raises rather than logs, so the error's text is what is
+        checked.
         """
         with pytest.raises(RuntimeError) as excinfo:
             raw_mod._check_remote_listing(

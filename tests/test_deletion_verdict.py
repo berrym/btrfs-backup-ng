@@ -22,6 +22,7 @@ exit code has to say so.
 
 from __future__ import annotations
 
+import logging
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -203,14 +204,11 @@ class TestTheRawEndpoint:
         assert result.deleted_count == 1 and result.ok
         assert not snap.stream_path.exists()
 
-    def test_an_already_absent_stream_is_a_skip_and_is_logged(self, tmp_path, capsys):
+    def test_an_already_absent_stream_is_a_skip_and_is_logged(
+        self, tmp_path, shared_log
+    ):
         """Previously silent: a batch whose every stream was already gone produced
-        no log line at all and was reported as a completed prune of that many.
-
-        Read off stderr rather than caplog: this project's logger does not
-        propagate to the root, so caplog.text is empty here whether the message
-        is emitted or not -- a check that cannot fail.
-        """
+        no log line at all and was reported as a completed prune of that many."""
         ep = RawEndpoint(config={"path": str(tmp_path)})
         snap = _raw_snap(tmp_path)
         assert not snap.stream_path.exists()
@@ -219,7 +217,8 @@ class TestTheRawEndpoint:
 
         assert result.deleted_count == 0
         assert result.skipped_count == 1
-        assert "already absent" in capsys.readouterr().err
+        warnings = shared_log.messages(logging.WARNING)
+        assert any("already absent" in m for m in warnings), warnings
 
     def test_a_chain_referenced_parent_is_a_skip(self, tmp_path):
         ep = RawEndpoint(config={"path": str(tmp_path)})

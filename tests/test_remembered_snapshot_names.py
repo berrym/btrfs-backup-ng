@@ -10,6 +10,7 @@ listing returns is the string the filesystem holds.
 
 from __future__ import annotations
 
+import logging
 import subprocess
 import time
 from pathlib import Path
@@ -172,39 +173,6 @@ ORDINAL = "home.2026-09-08_020306_1"  # dated via one stripped _N
 WEIRD = "home.imported-base"  # a subvolume with no derivable timestamp
 
 
-@pytest.fixture()
-def endpoint_log():
-    """Capture records from the endpoint modules' shared logger.
-
-    That logger (``btrfs_backup_ng.__logger__.logger``) is a standalone
-    ``logging.Logger`` outside the manager tree: it does not propagate to
-    root, so ``caplog`` sees nothing from it whether a message is emitted or
-    not -- an assertion built on caplog here cannot fail. A handler attached
-    directly to it can.
-    """
-    import logging
-
-    from btrfs_backup_ng.__logger__ import logger as pkg_logger
-
-    class _Capture(logging.Handler):
-        def __init__(self):
-            super().__init__(level=logging.DEBUG)
-            self.records = []
-
-        def emit(self, record):
-            self.records.append(record)
-
-    handler = _Capture()
-    previous_level = pkg_logger.level
-    pkg_logger.addHandler(handler)
-    pkg_logger.setLevel(logging.INFO)
-    try:
-        yield handler
-    finally:
-        pkg_logger.removeHandler(handler)
-        pkg_logger.setLevel(previous_level)
-
-
 def _mixed_pool(tmp_path, monkeypatch):
     """A directory holding every kind of entry, with subvolume-ness injected
     (tmpdirs cannot hold real subvolumes; the inode probe is the ENVIRONMENT,
@@ -287,16 +255,14 @@ def test_a_timestamp_less_snapshot_sorts_last(tmp_path, monkeypatch):
     assert names[-1] == WEIRD
 
 
-def test_newly_visible_snapshots_are_announced(tmp_path, monkeypatch, endpoint_log):
+def test_newly_visible_snapshots_are_announced(tmp_path, monkeypatch, shared_log):
     """Reported, never silent: the first run that can see a foreign pool says
     so at INFO, naming the snapshots, BEFORE any deletion surface does.
     Mutation guard: removing the announcement leaves this log empty."""
     ep = _mixed_pool(tmp_path, monkeypatch)
     ep.list_snapshots()
     announcement = [
-        r.getMessage()
-        for r in endpoint_log.records
-        if "not visible to earlier" in r.getMessage()
+        m for m in shared_log.messages(logging.INFO) if "not visible to earlier" in m
     ]
     assert len(announcement) == 1
     assert ORDINAL in announcement[0]
@@ -304,7 +270,7 @@ def test_newly_visible_snapshots_are_announced(tmp_path, monkeypatch, endpoint_l
     assert CANONICAL not in announcement[0]
 
 
-def test_an_all_canonical_pool_is_not_announced(tmp_path, monkeypatch, endpoint_log):
+def test_an_all_canonical_pool_is_not_announced(tmp_path, monkeypatch, shared_log):
     """The announcement is for pools that CHANGED meaning under this release;
     an ordinary pool stays quiet. Fixture self-check: the same capture is
     proven able to see announcements by the positive test above -- this
@@ -312,9 +278,7 @@ def test_an_all_canonical_pool_is_not_announced(tmp_path, monkeypatch, endpoint_
     (tmp_path / CANONICAL).mkdir()
     ep = _endpoint(tmp_path)
     ep.list_snapshots()
-    assert not [
-        r for r in endpoint_log.records if "not visible to earlier" in r.getMessage()
-    ]
+    assert not [m for m in shared_log.messages() if "not visible to earlier" in m]
 
 
 def test_a_lock_on_a_timestamp_less_snapshot_survives_relisting(tmp_path, monkeypatch):
@@ -361,7 +325,7 @@ def test_the_ssh_listing_separates_the_same_way():
 
 
 def test_count_based_retention_neither_counts_nor_deletes_the_undated(
-    tmp_path, monkeypatch, endpoint_log
+    tmp_path, monkeypatch, shared_log
 ):
     """delete_old_snapshots keeps "the newest N". A timestamp-less snapshot
     sorts LAST, so without the partition it would occupy a keep slot and push
@@ -397,8 +361,8 @@ def test_count_based_retention_neither_counts_nor_deletes_the_undated(
 
     assert deleted_batches == [["home.2026-09-06_020306"]]
     assert any(
-        "no derivable timestamp" in r.getMessage() and WEIRD in r.getMessage()
-        for r in endpoint_log.records
+        "no derivable timestamp" in m and WEIRD in m
+        for m in shared_log.messages(logging.INFO)
     )
 
 

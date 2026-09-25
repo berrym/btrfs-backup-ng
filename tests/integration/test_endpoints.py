@@ -3,6 +3,7 @@
 Tests the complete flow of endpoint operations with mocked subprocess calls.
 """
 
+import logging
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -643,7 +644,7 @@ class TestEndpointErrorHandling:
                 with pytest.raises(AbortError, match="not a btrfs subvolume"):
                     endpoint.prepare()
 
-    def test_prepare_auto_mode_warns_but_continues(self, tmp_path, capsys):
+    def test_prepare_auto_mode_warns_but_continues(self, tmp_path, shared_log):
         """Test prepare in auto mode warns but doesn't error on fs check failure."""
         source = tmp_path / "source"
         dest = tmp_path / "dest"
@@ -664,15 +665,14 @@ class TestEndpointErrorHandling:
                     # Should NOT raise, just warn
                     endpoint.prepare()
 
-                    # Check that a warning was logged to stderr
-                    captured = capsys.readouterr()
-                    assert "btrfs subvolume" in captured.err
-                    assert "auto mode" in captured.err
+                    # Check that a warning was logged
+                    warnings = shared_log.messages(logging.WARNING)
+                    assert any(
+                        "btrfs subvolume" in m and "auto mode" in m for m in warnings
+                    ), warnings
 
-    def test_prepare_skip_mode_no_checks(self, tmp_path, caplog):
+    def test_prepare_skip_mode_no_checks(self, tmp_path, shared_log):
         """Test prepare in skip mode doesn't perform fs checks."""
-        import logging
-
         source = tmp_path / "source"
         dest = tmp_path / "dest"
         source.mkdir()
@@ -692,13 +692,12 @@ class TestEndpointErrorHandling:
                         }
                     )
 
-                    with caplog.at_level(logging.WARNING):
-                        endpoint.prepare()
+                    endpoint.prepare()
 
                     # is_subvolume should not have been called (checks skipped)
                     mock_is_subvol.assert_not_called()
 
-                    # No warnings about subvolume should be logged
-                    assert not any(
-                        "subvolume" in record.message for record in caplog.records
-                    )
+                    # No warnings about subvolume should be logged; the auto
+                    # mode test above shows the same capture sees that warning
+                    warnings = shared_log.messages(logging.WARNING)
+                    assert not any("subvolume" in m for m in warnings), warnings

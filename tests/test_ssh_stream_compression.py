@@ -487,8 +487,11 @@ class TestChunkedSaysItDoesNotCompress:
     is a real limitation -- but it must be stated, not silently applied."""
 
     def test_it_warns_rather_than_quietly_sending_uncompressed(self):
-        """The project logger does not propagate to caplog, so it is patched
-        directly -- the same way the other logging assertions here work."""
+        """The shared logger's ``warning`` method is patched and its calls
+        recorded, so this checks that a warning was requested through that
+        method. It does not see the same record logged any other way, such as
+        ``log(logging.WARNING, ...)``; the ``shared_log`` fixture reads the
+        records themselves."""
         from btrfs_backup_ng.endpoint import ssh as ssh_mod
 
         ep = SSHEndpoint.__new__(SSHEndpoint)
