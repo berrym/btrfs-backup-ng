@@ -217,6 +217,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   deleted that process's lock when it woke. It now removes only its own
   record, leaves the successor's lock alone and says so, and its heartbeat
   can no longer recreate its record inside the successor's lock.
+- **A lock that could not be created was reported as held by another
+  process.** A `mkdir` that failed for a reason other than contention (a full
+  or read-only filesystem, a quota) read as "Already being received by
+  another process"; it is now reported as the lock not being creatable, with
+  the reason.
 - **A pin whose age could not be read counted as abandoned.** Its mtime was
   read as 0, so a prune's guard reported a live pin as absent and `restore
   --unlock` swept it. A pin or lock whose age cannot be read, or on a target

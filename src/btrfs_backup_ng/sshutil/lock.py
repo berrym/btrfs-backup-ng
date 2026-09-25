@@ -570,6 +570,14 @@ class RemoteLockManager:
             f"if [ -d {target} ]; then mkdir -p {root} 2>/dev/null; fi; "
             f"if [ ! -d {root} ] || [ ! -w {root} ]; then echo NOLOCKDIR; exit 0; fi; "
             f"if mkdir {lock} 2>/dev/null; then bbng_take ACQUIRED; exit 0; fi; "
+            # The mkdir failed with no lock there: the holder released in
+            # between (take it now), or the directory cannot be made at all
+            # (a full or read-only filesystem, a quota) -- which is not
+            # contention and is reported with the reason.
+            f"if [ ! -d {lock} ]; then "
+            f"  if bbng_e=$(mkdir {lock} 2>&1); then bbng_take ACQUIRED; exit 0; fi; "
+            f'  if [ ! -d {lock} ]; then printf "NOLOCK %s" "$bbng_e" | tr -d "\\n"; echo; exit 0; fi; '
+            "fi; "
             "bbng_judge; "
             # No readable age: a lock that cannot be judged is never broken.
             f'if [ -z "$AGE" ]; then '
@@ -732,6 +740,12 @@ class RemoteLockManager:
                 f"created or written to. Locks live beside the backups they "
                 f"protect, so this path must be writable by the account running "
                 f"the backup, or that account must be able to elevate for it."
+            )
+        if verdict.startswith("NOLOCK"):
+            reason = verdict[len("NOLOCK") :].strip() or "no reason given"
+            raise RemoteLockUnavailable(
+                f"the lock {self._lock_dir(name)!r} could not be created on the "
+                f"target ({reason}). This is not another process holding it."
             )
         if verdict not in ("ACQUIRED", "ACQUIRED_STALE", "BUSY"):
             raise RemoteLockUnavailable(

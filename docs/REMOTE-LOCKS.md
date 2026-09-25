@@ -125,6 +125,10 @@ This is deliberately a single script rather than a sequence of calls: split
 across round trips, another contender can slip between the staleness check and
 the break. The evaluation cannot be moved to the client for the same reason.
 
+A `mkdir` that fails with no lock there to contend with -- a full or read-only
+filesystem, a quota -- is reported as the lock not being creatable, with the
+reason, never as another process holding it.
+
 ### Breaking a dead lock has one winner
 
 An earlier version broke a dead lock by renaming its directory aside. The

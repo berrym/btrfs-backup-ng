@@ -782,6 +782,33 @@ class TestBreakingADeadLockHasOneWinner:
         assert sorted(p.name for p in lock_dir.glob("owner.*")) == ["owner.other"]
 
 
+class TestAFailedMkdirIsNotContention:
+    def test_a_lock_that_cannot_be_created_says_why(self, tmp_path, monkeypatch):
+        """``mkdir`` failing for a reason other than another holder -- a full or
+        read-only filesystem, a quota -- used to read as BUSY, which callers
+        show as "Already being received by another process"."""
+        manager = _manager(tmp_path)
+        real = subprocess.run(
+            ["sh", "-c", "command -v mkdir"], capture_output=True, text=True
+        ).stdout.strip()
+        shims = tmp_path / "shims"
+        shims.mkdir()
+        (shims / "mkdir").write_text(
+            "#!/bin/sh\n"
+            'case "$*" in *.lock) echo "mkdir: cannot create directory: '
+            'No space left on device" >&2; exit 1;; esac\n'
+            f'exec {real} "$@"\n'
+        )
+        (shims / "mkdir").chmod(0o755)
+        monkeypatch.setenv("PATH", f"{shims}:{os.environ['PATH']}")
+        with pytest.raises(
+            RemoteLockUnavailable, match="No space left on device"
+        ) as caught:
+            manager.acquire_once("target", "receive")
+        assert "not another process" in str(caught.value)
+        assert not isinstance(caught.value, RemoteLockBusy)
+
+
 class TestReleaseTouchesOnlyItsOwnLock:
     def _break_under(self, tmp_path):
         """A holder stalled past the threshold, whose lock another took."""
