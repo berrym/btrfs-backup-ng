@@ -55,7 +55,16 @@ def _command_lock_path() -> Path:
     euid-owned 0700 directory so it is immune to a symlink race in world-writable /tmp.
     Prefer ``$XDG_RUNTIME_DIR`` (euid-owned); else a verified
     ``/tmp/btrfs-backup-ng-<euid>``. Fails CLOSED if neither can be secured -- never follows
-    an attacker-controlled path to truncate a victim file."""
+    an attacker-controlled path to truncate a victim file.
+
+    The directory and its ``command.lock`` are left in place when a run ends, on purpose.
+    The lock is an ``flock`` on that file, and ``flock`` excludes by inode, not by name: a
+    process that removed the file at exit while another was blocked on it would let the
+    blocked one lock the removed inode while a newcomer created and locked a fresh file at
+    the same path -- two holders of what both believe is the one lock. Removing it safely
+    would need every locker to re-check, after acquiring, that the path still names the
+    inode it holds. A small empty file in a per-user runtime directory costs nothing; a lock
+    that stops excluding costs the serialisation it exists for."""
     euid = os.geteuid()
     xdg = os.environ.get("XDG_RUNTIME_DIR")
     if xdg and os.path.isdir(xdg) and not os.path.islink(xdg):

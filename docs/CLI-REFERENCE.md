@@ -1422,6 +1422,11 @@ SSH ControlMaster sockets are created in an unpredictable, private (0700) direct
 multiplexed connection to your backup host. The internal command lock and the raw+ssh remote
 metadata write likewise avoid predictable, symlink-plantable paths.
 
+The command lock (`btrfs-backup-ng-<uid>/command.lock` under `$XDG_RUNTIME_DIR` or the temp
+directory) is left in place after a run, deliberately. It is an `flock`, which excludes by
+inode: removing the file while another process waits on it would let that process and a
+newcomer each hold a lock on a different file at the same path, and both would proceed.
+
 > **Upgrade note:** `raw+ssh://` targets now set an explicit `accept-new` policy (previously they
 > inherited the ambient SSH default, which under batch mode accidentally refused unknown hosts).
 > If you relied on that refuse-unknown behavior, set `ssh_host_key_policy = "strict"`.
