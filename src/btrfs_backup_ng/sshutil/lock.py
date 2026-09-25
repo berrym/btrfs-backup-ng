@@ -42,12 +42,10 @@ nothing but the lock it created.
 
 from __future__ import annotations
 
-import atexit
 import hashlib
 import json
 import logging
 import os
-import signal
 import shlex
 import threading
 import uuid
@@ -98,82 +96,39 @@ DEAD_HOLDER_MULTIPLE = 2
 #
 # A lock outlives the process that took it -- that is the whole point -- so an
 # interrupted run must not leave its pins sitting on the target until the stale
-# window expires. Ctrl-C on a restore should free the snapshot immediately, not
-# in three minutes.
+# window expires.
 #
-# Registered holders are released on normal exit (atexit) and on SIGINT/SIGTERM.
-# The stale window remains the backstop for what neither can catch: SIGKILL,
-# a power cut, a severed network.
+# Every held lock and pin is registered with the process's exit cleanups
+# (``btrfs_backup_ng.lifecycle``): released on normal exit, after Ctrl-C has
+# unwound, and on SIGTERM or SIGHUP once the command-line entry point has
+# installed its handlers -- in every case only after the child processes that
+# were writing under it have been stopped. An entry is dropped from the
+# registry only once its release has run, so a release interrupted part-way is
+# retried at exit. The stale window remains the backstop for what none of this
+# can catch: SIGKILL, a power cut, a severed network.
 
-_CLEANUP_LOCK = threading.Lock()
-_CLEANUP_REGISTRY: "list[tuple[Any, str]]" = []
-_SIGNALS_INSTALLED = False
-_PREVIOUS_HANDLERS: dict = {}
+
+def _cleanup_key(manager: Any, key: str) -> tuple:
+    return ("remote-lock", id(manager), key)
 
 
 def _register_for_cleanup(manager: Any, key: str) -> None:
-    global _SIGNALS_INSTALLED
-    with _CLEANUP_LOCK:
-        _CLEANUP_REGISTRY.append((manager, key))
-        if not _SIGNALS_INSTALLED:
-            _SIGNALS_INSTALLED = True
-            atexit.register(_release_all_held)
-            _install_signal_handlers()
+    from .. import lifecycle
+
+    def release() -> None:
+        name, _, lock_id = key.partition("\x00")
+        if lock_id:
+            manager.release_shared(name, lock_id)
+        else:
+            manager.release(name)
+
+    lifecycle.register(_cleanup_key(manager, key), release, lifecycle.STAGE_LOCKS)
 
 
 def _unregister_for_cleanup(manager: Any, key: str) -> None:
-    with _CLEANUP_LOCK:
-        for i, (held_manager, held_key) in enumerate(_CLEANUP_REGISTRY):
-            if held_manager is manager and held_key == key:
-                del _CLEANUP_REGISTRY[i]
-                return
+    from .. import lifecycle
 
-
-def _release_all_held() -> None:
-    """Drop every pin this process still holds. Never raises."""
-    with _CLEANUP_LOCK:
-        pending = list(_CLEANUP_REGISTRY)
-        _CLEANUP_REGISTRY.clear()
-    for manager, key in pending:
-        try:
-            name, _, lock_id = key.partition("\x00")
-            if lock_id:
-                manager.release_shared(name, lock_id)
-            else:
-                manager.release(name)
-        except Exception as exc:  # noqa: BLE001 - cleanup must not raise on exit
-            logger.debug("Could not release %r during cleanup: %s", key, exc)
-
-
-def _install_signal_handlers() -> None:
-    """Release on SIGINT/SIGTERM, then do what the previous handler would.
-
-    Chained rather than replaced: this is a library, and swallowing the
-    application's own handler -- or the default that turns Ctrl-C into
-    KeyboardInterrupt -- would be a worse bug than the one being fixed.
-    Installing is skipped off the main thread, where signal() is not allowed.
-    """
-    if threading.current_thread() is not threading.main_thread():
-        return
-    for signum in (signal.SIGINT, signal.SIGTERM):
-        try:
-            previous = signal.getsignal(signum)
-        except (ValueError, OSError):  # pragma: no cover - platform dependent
-            continue
-        _PREVIOUS_HANDLERS[signum] = previous
-
-        def handler(sig: int, frame: Any, _previous: Any = previous) -> None:
-            _release_all_held()
-            if callable(_previous):
-                _previous(sig, frame)
-            elif _previous == signal.SIG_DFL:
-                signal.signal(sig, signal.SIG_DFL)
-                os.kill(os.getpid(), sig)
-
-        try:
-            signal.signal(signum, handler)
-        except (ValueError, OSError):  # pragma: no cover - platform dependent
-            continue
+    lifecycle.unregister(_cleanup_key(manager, key))
 
 
 class RemoteLockBusy(RuntimeError):
@@ -629,6 +584,7 @@ class RemoteLockManager:
                 f"could not record a shared lock on {name!r}: "
                 f"{err.strip() or out.strip() or f'exit {rc}'}"
             )
+        _register_for_cleanup(self, self._held_key(name, lock_id))
         return "acquired"
 
     def release_shared(self, name: str, lock_id: str) -> None:
@@ -638,7 +594,8 @@ class RemoteLockManager:
         another holder's file is still there -- so the last one out cleans up and
         nobody else can remove a pin that is still held.
         """
-        self._stop_heartbeat(self._held_key(name, lock_id))
+        key = self._held_key(name, lock_id)
+        self._stop_heartbeat(key)
         holder = shlex.quote(self._holder_file(name, lock_id))
         holders = shlex.quote(self._holders_dir(name))
         lock = shlex.quote(self._lock_dir(name))
@@ -652,6 +609,8 @@ class RemoteLockManager:
                 name,
                 err.strip(),
             )
+            return
+        _unregister_for_cleanup(self, key)
 
     def acquire_shared_persistent(
         self, name: str, lock_id: str, operation: str = ""
@@ -705,6 +664,10 @@ class RemoteLockManager:
             raise RemoteLockUnavailable(
                 f"could not operate the lock directory on the target: {err.strip() or rc}"
             )
+        if "ACQUIRED" in out:
+            # Registered at once, not when the heartbeat starts: a lock taken
+            # and never refreshed is still released at exit.
+            _register_for_cleanup(self, name)
         if "ACQUIRED_STALE" in out:
             logger.warning(
                 "Broke a stale lock %r on the target: its heartbeat was older than "
@@ -741,6 +704,8 @@ class RemoteLockManager:
             logger.warning(
                 "Could not fully release remote lock %r: %s", name, err.strip()
             )
+            return
+        _unregister_for_cleanup(self, name)
 
     def is_locked(self, name: str) -> Optional[dict]:
         """The holder's details if a LIVE lock exists, else None.
@@ -909,20 +874,33 @@ class RemoteLockManager:
 
         ``--unlock`` must be able to clear a holder whose payload is unreadable,
         which is precisely the one it cannot name. Addressing the record instead
-        of recomputing a path from a lock id makes that possible.
+        of recomputing a path from a lock id makes that possible. A holder
+        found in a directory that could not be listed has no record to
+        address, and is left alone.
         """
+        if not holder.file_name:
+            logger.warning(
+                "The holders of %r on the target could not be listed, so none of "
+                "them can be cleared from here.",
+                decode_name_for_display(holder.dir_name),
+            )
+            return
         base = f"{self._root}/{holder.dir_name}.lock"
         record = shlex.quote(f"{base}/{HOLDERS_DIR_NAME}/{holder.file_name}")
         holders = shlex.quote(f"{base}/{HOLDERS_DIR_NAME}")
         lock = shlex.quote(base)
+        own_key = None
         if holder.lock_id is not None:
             name = str(holder.info.get("name") or "")
             if name:
-                self._stop_heartbeat(self._held_key(name, holder.lock_id))
-        self._run(
+                own_key = self._held_key(name, holder.lock_id)
+                self._stop_heartbeat(own_key)
+        rc, _out, _err = self._run(
             f"rm -f {record} 2>/dev/null; "
             f"rmdir {holders} 2>/dev/null; rmdir {lock} 2>/dev/null; exit 0"
         )
+        if rc == 0 and own_key is not None:
+            _unregister_for_cleanup(self, own_key)
 
     # ------------------------------------------------------------- heartbeat
 
@@ -954,12 +932,13 @@ class RemoteLockManager:
         thread.start()
 
     def _stop_heartbeat(self, key: str) -> None:
+        """Stop refreshing. The exit-cleanup entry stays until the release
+        itself has run, so a release that does not complete is retried."""
         stop = self._held.pop(key, None)
         thread = self._threads.pop(key, None)
-        _unregister_for_cleanup(self, key)
         if stop is not None:
             stop.set()
-        if thread is not None:
+        if thread is not None and thread is not threading.current_thread():
             thread.join(timeout=5)
 
     def acquire_persistent(self, name: str, operation: str) -> str:
@@ -981,11 +960,19 @@ class RemoteLockManager:
 
     @contextmanager
     def hold(self, name: str, operation: str) -> Iterator[str]:
-        """Hold the lock for the duration of the block, refreshing it throughout."""
+        """Hold the lock for the duration of the block, refreshing it throughout.
+
+        Processes the block starts run inside it: if the block fails or is
+        interrupted, they are stopped and waited for before the lock is
+        released (see ``btrfs_backup_ng.lifecycle``).
+        """
+        from .. import lifecycle
+
         mode = self.acquire_once(name, operation)
         self._start_heartbeat(name)
         try:
-            yield mode
+            with lifecycle.process_scope():
+                yield mode
         finally:
             self.release(name)
 

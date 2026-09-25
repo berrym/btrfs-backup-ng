@@ -395,7 +395,16 @@ def exec_subprocess(
     command = [str(arg) for arg in command]
 
     try:
-        return m(command, **kwargs)
+        result = m(command, **kwargs)
+        if method == "Popen":
+            # A process left running for the caller -- the local endpoint's
+            # `btrfs send` or `btrfs receive` -- belongs to the caller's
+            # process scope, which stops it before the caller's locks are
+            # released if the caller fails (see btrfs_backup_ng.lifecycle).
+            from .lifecycle import track
+
+            track(result)
+        return result
     except FileNotFoundError as e:
         # Handle case where command is not found
         logger.error("Command not found: %s", command[0])
@@ -416,7 +425,12 @@ def exec_subprocess(
                     # Replace command with full path and retry
                     command[0] = full_path
                     logger.info("Retrying with full path: %s", command)
-                    return m(command, **kwargs)
+                    result = m(command, **kwargs)
+                    if method == "Popen":
+                        from .lifecycle import track
+
+                        track(result)
+                    return result
                 else:
                     logger.error("Command '%s' not found in PATH", command[0])
             except Exception as find_e:

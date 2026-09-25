@@ -1,15 +1,17 @@
-import atexit
 import getpass
 import hashlib
 import os
 import pwd
+import secrets
 import shutil
+import stat
 import subprocess
 import tempfile
 import threading
 from pathlib import Path
 from typing import List, Optional
 
+from btrfs_backup_ng import lifecycle
 from btrfs_backup_ng.__logger__ import logger
 
 
@@ -163,25 +165,53 @@ class SSHMasterManager:
         # trust even under sudo (was silently using root's store).
         self.known_hosts_path = ensure_operator_known_hosts()
 
+        self._instance_id = f"{os.getpid()}_{threading.get_ident()}"
         if control_dir:
             self.control_dir = Path(control_dir)
             self.control_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
             self._own_control_dir = False
         else:
-            # Create the ControlMaster socket dir with tempfile.mkdtemp: an UNPREDICTABLE,
-            # 0700, euid-owned directory. The old predictable /tmp/ssh-controlmasters-<user>
-            # + mkdir(exist_ok=True) let a local attacker pre-create the dir and capture the
-            # control socket -- which carries root's authenticated ssh to the backup host
-            # (socket hijack -> command execution as root@remote). An unguessable name that
-            # only euid owns closes it by design; the socket name already embeds pid+tid, so
-            # nothing relied on a stable path.
-            self.control_dir = Path(
-                tempfile.mkdtemp(prefix="bbng-cm-", dir=_control_dir_base())
-            )
             self._own_control_dir = True
-            # Backstop cleanup if stop_master()/cleanup_socket() is never reached.
-            atexit.register(shutil.rmtree, str(self.control_dir), ignore_errors=True)
+            self.control_dir = self._new_control_dir()
+        self._set_control_path()
+        self._lock = threading.Lock()
+        self._master_started = False
 
+    def _new_control_dir(self) -> Path:
+        """Create this manager's private control directory: an UNPREDICTABLE,
+        0700, euid-owned directory under ``$XDG_RUNTIME_DIR`` or the temp dir.
+
+        The old predictable /tmp/ssh-controlmasters-<user> + mkdir(exist_ok=True)
+        let a local attacker pre-create the dir and capture the control socket --
+        which carries root's authenticated ssh to the backup host. An unguessable
+        name that only euid owns closes it by design.
+
+        Its removal is registered BEFORE it is created, under the exact path, so
+        no moment exists at which the directory is there and nothing would
+        remove it: a signal between ``mkdir`` and a registration made afterwards
+        left it behind. The removal only ever deletes a directory this euid
+        owns, so a name that turned out to be taken is never someone else's
+        loss.
+        """
+        base = Path(_control_dir_base() or tempfile.gettempdir())
+        for _attempt in range(100):
+            path = base / f"bbng-cm-{secrets.token_hex(6)}"
+            self.control_dir = path
+            lifecycle.register(
+                self._exit_key, self._exit_cleanup, lifecycle.STAGE_CONNECTIONS
+            )
+            try:
+                os.mkdir(path, 0o700)
+            except FileExistsError:
+                continue
+            return path
+        raise FileExistsError(f"could not create a control directory under {base}")
+
+    @property
+    def _exit_key(self) -> tuple:
+        return ("ssh-control", id(self))
+
+    def _set_control_path(self) -> None:
         # The ControlPath must fit in a Unix domain socket sun_path (108 bytes on
         # Linux), and OpenSSH appends its own ~17-char ".<random>" suffix while
         # CREATING the master socket. The old
@@ -191,7 +221,6 @@ class SSHMasterManager:
         # aborts the master and makes EVERY ssh operation fail with a misleading
         # "authentication failed". Use a fixed-length digest of the same identity
         # components: unique per manager, but bounded regardless of user/host length.
-        self._instance_id = f"{os.getpid()}_{threading.get_ident()}"
         digest = hashlib.sha1(
             f"{self.username}_{self.hostname}_{self._instance_id}".encode()
         ).hexdigest()[:12]
@@ -210,8 +239,39 @@ class SSHMasterManager:
                 _effective_len,
                 self.control_path,
             )
-        self._lock = threading.Lock()
-        self._master_started = False
+
+    def _ensure_control_dir(self) -> None:
+        """A master stopped and started again needs its directory back:
+        ``stop_master`` removes it, and ssh cannot bind a socket in a directory
+        that is gone -- which it reports as a failed login."""
+        if self._own_control_dir and not self.control_dir.is_dir():
+            self.control_dir = self._new_control_dir()
+            self._set_control_path()
+
+    def _exit_cleanup(self) -> None:
+        """What the process's exit drain runs for this connection: stop the
+        master, then remove the directory. Never takes ``self._lock`` -- the
+        drain may run in a signal handler that interrupted a thread holding it.
+        """
+        if getattr(self, "_master_started", False):
+            try:
+                subprocess.run(
+                    [
+                        "ssh",
+                        "-O",
+                        "exit",
+                        "-o",
+                        f"ControlPath={self.control_path}",
+                        f"{self.username}@{self.hostname}",
+                    ],
+                    capture_output=True,
+                    stdin=subprocess.DEVNULL,
+                    timeout=10,
+                )
+            except Exception as exc:  # noqa: BLE001 - best-effort at exit
+                logger.debug("Could not stop the ssh master at exit: %s", exc)
+            self._master_started = False
+        self._remove_own_control_dir()
 
     def _ssh_base_cmd(self, force_tty: bool = False) -> List[str]:
         """Build base SSH command with appropriate options.
@@ -608,6 +668,7 @@ class SSHMasterManager:
         with self._lock:
             if self.is_master_alive():
                 return True
+            self._ensure_control_dir()
 
             env = os.environ.copy()
             if self.running_as_sudo and self.sudo_user:
@@ -785,7 +846,19 @@ class SSHMasterManager:
         """Remove the unpredictable per-manager control dir we created, so it does
         not linger in $XDG_RUNTIME_DIR / /tmp. Idempotent + best-effort; an explicit
         control_dir override (``_own_control_dir`` False) is never removed."""
-        if getattr(self, "_own_control_dir", False):
+        self._remove_own_control_dir()
+        lifecycle.unregister(self._exit_key)
+
+    def _remove_own_control_dir(self) -> None:
+        if not getattr(self, "_own_control_dir", False):
+            return
+        try:
+            st = os.lstat(self.control_dir)
+        except OSError:
+            return
+        # Only a real directory this euid owns: never a symlink, never a
+        # directory someone else made at a name this manager was about to use.
+        if stat.S_ISDIR(st.st_mode) and st.st_uid == os.geteuid():
             shutil.rmtree(self.control_dir, ignore_errors=True)
 
     def get_ssh_base_cmd(self, force_tty: bool = False) -> List[str]:

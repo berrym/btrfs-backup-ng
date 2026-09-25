@@ -506,20 +506,37 @@ class TestAbandonedHoldersAreSwept:
 
 
 class TestCleanupOnExit:
+    @staticmethod
+    def _of(manager):
+        return lambda key: key[:2] == ("remote-lock", id(manager))
+
     def test_an_interrupted_run_releases_its_pins(self, tmp_path):
         """Ctrl-C on a restore should free the snapshot now, not in three
         minutes when the stale window expires."""
-        from btrfs_backup_ng.sshutil import lock as lock_mod
+        from btrfs_backup_ng import lifecycle
 
         manager = _manager(tmp_path)
         manager.acquire_shared_persistent("snap-a", "restore:1")
         assert manager.live_lock_names() == {"snap-a"}
 
-        lock_mod._release_all_held()  # what atexit and the signal handler call
+        lifecycle.run_cleanups(self._of(manager))  # what the exit drain runs
         assert manager.live_lock_names() == set()
+
+    def test_an_exclusive_lock_taken_without_a_heartbeat_is_released_too(
+        self, tmp_path
+    ):
+        """Registered when it is taken, not when its heartbeat starts: a lock
+        acquired and never refreshed must not wait out the stale window."""
+        from btrfs_backup_ng import lifecycle
+
+        manager = _manager(tmp_path)
+        manager.acquire_once("target", "prune")
+        lifecycle.run_cleanups(self._of(manager))
+        assert _manager(tmp_path).acquire_once("target", "next") == "acquired"
 
     def test_cleanup_never_raises_on_a_broken_transport(self, tmp_path):
         """Exit-time cleanup that raises would mask the real failure."""
+        from btrfs_backup_ng import lifecycle
         from btrfs_backup_ng.sshutil import lock as lock_mod
 
         def broken(_script):
@@ -527,7 +544,35 @@ class TestCleanupOnExit:
 
         manager = RemoteLockManager(broken, str(tmp_path), hostname="h")
         lock_mod._register_for_cleanup(manager, "snap-a\x00restore:1")
-        lock_mod._release_all_held()  # must not raise
+        lifecycle.run_cleanups(self._of(manager))  # must not raise
+        assert not lifecycle.registered(
+            lock_mod._cleanup_key(manager, "snap-a\x00restore:1")
+        )
+
+    def test_a_release_that_did_not_run_stays_registered(self, tmp_path):
+        """The drain is resumable: an entry leaves the registry only once its
+        release has actually run, so one that failed is retried at exit."""
+        from btrfs_backup_ng import lifecycle
+        from btrfs_backup_ng.sshutil import lock as lock_mod
+
+        state = {"up": True}
+        real = _runner(tmp_path)
+
+        def flaky(script):
+            if not state["up"]:
+                return 255, "", "ssh: connection lost"
+            return real(script)
+
+        manager = RemoteLockManager(flaky, str(tmp_path), hostname="h")
+        manager.acquire_shared("snap-a", "restore:1")
+        state["up"] = False
+        manager.release_shared("snap-a", "restore:1")
+        key = lock_mod._cleanup_key(manager, "snap-a\x00restore:1")
+        assert lifecycle.registered(key)
+        state["up"] = True
+        lifecycle.run_cleanups(self._of(manager))
+        assert not lifecycle.registered(key)
+        assert manager.live_lock_names() == set()
 
 
 class TestStaleness:

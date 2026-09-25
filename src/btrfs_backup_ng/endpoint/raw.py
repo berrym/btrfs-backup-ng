@@ -30,6 +30,8 @@ from typing import Any, Optional, TypedDict
 
 from btrfs_backup_ng import __util__
 from btrfs_backup_ng.__logger__ import logger
+from btrfs_backup_ng.lifecycle import scoped as in_process_scope
+from btrfs_backup_ng.lifecycle import track as track_child
 from btrfs_backup_ng.core.transfer import (
     popen_pipeline_pipefail as _popen_pipeline_pipefail,
     tail_stderr,
@@ -961,11 +963,13 @@ class RawEndpoint(Endpoint):
             output_path = self._pending_metadata["part_path"]
             fd = self._open_part_file(output_path)
             try:
-                proc = subprocess.Popen(
-                    pipeline[0],
-                    stdin=stdin,
-                    stdout=fd,
-                    stderr=subprocess.PIPE,
+                proc = track_child(
+                    subprocess.Popen(
+                        pipeline[0],
+                        stdin=stdin,
+                        stdout=fd,
+                        stderr=subprocess.PIPE,
+                    )
                 )
             finally:
                 os.close(fd)
@@ -1202,6 +1206,7 @@ class RawEndpoint(Endpoint):
         overwritten with a backfill record. The raw+ssh subclass tests the remote."""
         return snapshot.metadata_path.exists()
 
+    @in_process_scope
     def remediate_plaintext(
         self,
         snapshot: RawSnapshot,
@@ -1260,8 +1265,13 @@ class RawEndpoint(Endpoint):
         )
         try:
             with open(orig, "rb") as stdin:
-                proc = subprocess.Popen(
-                    encrypt_argv, stdin=stdin, stdout=part_fd, stderr=subprocess.PIPE
+                proc = track_child(
+                    subprocess.Popen(
+                        encrypt_argv,
+                        stdin=stdin,
+                        stdout=part_fd,
+                        stderr=subprocess.PIPE,
+                    )
                 )
                 _, err = proc.communicate()
         finally:
@@ -1302,6 +1312,7 @@ class RawEndpoint(Endpoint):
         self._cached_snapshots = None  # a new stream now exists; re-discover on list
         return new_snap
 
+    @in_process_scope
     def decrypt_matches_plaintext(
         self, new_snapshot: RawSnapshot, plaintext_path: Path
     ) -> bool:
@@ -1639,11 +1650,13 @@ class RawEndpoint(Endpoint):
         """
         if len(pipeline) == 1:
             with open(input_path, "rb") as infile:
-                proc = subprocess.Popen(
-                    pipeline[0],
-                    stdin=infile,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
+                proc = track_child(
+                    subprocess.Popen(
+                        pipeline[0],
+                        stdin=infile,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                    )
                 )
             tail_stderr(proc)
             return proc
@@ -2663,11 +2676,13 @@ class SSHRawEndpoint(RawEndpoint):
         if not pipeline or pipeline == [["cat"]]:
             # No local processing, pipe directly to SSH
             full_cmd = ssh_cmd + [remote_cmd]
-            proc = subprocess.Popen(
-                full_cmd,
-                stdin=stdin,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.PIPE,
+            proc = track_child(
+                subprocess.Popen(
+                    full_cmd,
+                    stdin=stdin,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.PIPE,
+                )
             )
             # Drained as it is written and kept as a tail (core.transfer.StderrTail),
             # like every other pipeline an endpoint starts. This one was started

@@ -17,6 +17,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `[volumes.targets.retention]`), inherited like any other key, and not
   a degenerate policy.
 
+### Changed
+
+- **Ctrl-C no longer releases every pin at once.** Since 0.9.5 a SIGINT
+  handler released all of a run's pins and locks the moment Ctrl-C arrived,
+  before the interrupted operation had unwound and while any other thread's
+  transfer was still writing under them -- a `kill -INT` of a multi-target
+  run freed the receive locks of transfers that went on writing. Ctrl-C is
+  now Python's own interrupt: each operation stops its own child processes,
+  waits for them, and then releases its own locks and pins as it unwinds, and
+  what is left is released as the program exits. A transfer on another
+  thread keeps its locks until it finishes. The pins are still released
+  before the program exits; they are no longer released before the work
+  under them has stopped.
+
 ### Fixed
 
 - **`config import` kept less than btrbk did.** Three faults in one command,
@@ -160,6 +174,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `mkdir` and the check is taken; neither is a script error. The scripts
   parse under bash 3.2, dash and busybox, and survive an account whose login
   shell is csh or tcsh.
+- **A run ended by SIGTERM or SIGHUP left its pins, locks and ssh control
+  directories behind, and its child processes running.** Python's default
+  handling of both signals ends the process without running any cleanup, so a
+  run stopped by systemd or a closed terminal left every `bbng-cm-*` control
+  directory in `$XDG_RUNTIME_DIR` or `/tmp`, the `receiving-*` locks on its
+  `ssh://` targets until they went stale, and its `btrfs send` and `ssh`
+  processes writing to the target after it had gone. The command now stops
+  its child processes, then releases its locks and pins, then closes its ssh
+  connections, and then dies of the signal. A second signal (a closed
+  terminal sends more than one) does not cut that short, and a signal the
+  operator set to be ignored -- a run under `nohup` -- stays ignored.
+- **An ssh connection stopped and started again failed as an authentication
+  error.** Stopping the connection removed its control directory, and the
+  restart pointed ssh at a socket in the missing directory, which ssh
+  reports as a failed login. The restart now makes a new directory.
 - **`BTRFS_BACKUP_LOG_LEVEL` did nothing.** Documented for years, read once
   at import and overwritten by every command's logger setup. It now sets
   the console level where neither a command-line flag nor the

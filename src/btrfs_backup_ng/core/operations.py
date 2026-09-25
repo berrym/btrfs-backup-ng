@@ -15,7 +15,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Optional
 
-from .. import __util__
+from .. import __util__, lifecycle
 from ..endpoint.raw_metadata import StructureVerdict
 from ..transaction import log_transaction
 from .transfer import DEFAULT_STALL_TIMEOUT, DEFAULT_TRANSFER_TIMEOUT
@@ -99,6 +99,37 @@ def send_snapshot(
     resume_transfer_id: Optional[str] = None,
 ) -> Optional[str]:
     """Send a snapshot to destination endpoint using btrfs send/receive.
+
+    Every process the transfer starts -- the send, any compressor or throttle,
+    the receive, the ssh carrying the stream -- runs inside one process scope.
+    The caller holds the destination's receive lock and the pins on the source
+    and parent around this call; if the transfer fails or is interrupted
+    (Ctrl-C included), the scope stops those processes and waits for them
+    BEFORE the exception reaches the caller's releases. A lock or pin let go
+    while a stream is still being written protects nothing.
+    """
+    with lifecycle.process_scope():
+        return _send_snapshot(
+            snapshot,
+            destination_endpoint,
+            parent=parent,
+            clones=clones,
+            options=options,
+            chunked_manager=chunked_manager,
+            resume_transfer_id=resume_transfer_id,
+        )
+
+
+def _send_snapshot(
+    snapshot,
+    destination_endpoint,
+    parent=None,
+    clones=None,
+    options=None,
+    chunked_manager: Optional[ChunkedTransferManager] = None,
+    resume_transfer_id: Optional[str] = None,
+) -> Optional[str]:
+    """The transfer itself; see ``send_snapshot``.
 
     Args:
         snapshot: Source snapshot to send

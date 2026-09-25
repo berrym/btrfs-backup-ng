@@ -12,11 +12,17 @@ MIT License - See LICENSE file for details.
 
 import sys
 
+from . import lifecycle
 from .cli import main as cli_main
 
 
 def main() -> None:
     """Main entry point for btrfs-backup-ng."""
+    # Once, here, on the main thread: SIGTERM and SIGHUP stop this run's
+    # children, release its locks and close its connections before the process
+    # dies of the signal. Library code only registers what must be let go;
+    # installing is the program's decision. SIGINT keeps Python's own handling.
+    lifecycle.install_signal_handlers()
     try:
         sys.exit(cli_main())
     except KeyboardInterrupt:

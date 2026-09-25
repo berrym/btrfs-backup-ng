@@ -96,6 +96,23 @@ def reset_logging():
         pass
 
 
+@pytest.fixture(autouse=True)
+def exit_cleanups_end_with_the_test():
+    """Run, when a test ends, every exit cleanup it registered.
+
+    A test that takes a lock or pin and does not release it leaves an exit
+    cleanup registered (and a heartbeat thread running) for the rest of the
+    session, where it could act on another test's state. Running the test's
+    own entries at its end keeps each test's locks inside the test.
+    """
+    from btrfs_backup_ng import lifecycle
+
+    with lifecycle._LOCK:
+        before = set(lifecycle._CLEANUPS)
+    yield
+    lifecycle.run_cleanups(lambda key: key not in before)
+
+
 @pytest.fixture
 def tmp_config_dir(tmp_path):
     """Create a temporary config directory."""

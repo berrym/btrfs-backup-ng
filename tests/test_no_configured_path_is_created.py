@@ -127,7 +127,8 @@ REGISTRY: dict[str, tuple[str, ...]] = {
     "endpoint/common.py::_secure_lock_dir": (STATE,),
     "sshutil/diagnose.py::test_btrfs_receive": (STATE,),
     "sshutil/master.py::ensure_operator_known_hosts": (STATE,),
-    "sshutil/master.py::SSHMasterManager.__init__": (STATE, STATE),
+    "sshutil/master.py::SSHMasterManager.__init__": (STATE,),
+    "sshutil/master.py::SSHMasterManager._new_control_dir": (STATE,),
     # -- error text that names the mkdir the operator should run --------------
     "_legacy_main.py::refuse_silent_new_chain": (MESSAGE,),
     "config/loader.py::_validate_config": (MESSAGE,),

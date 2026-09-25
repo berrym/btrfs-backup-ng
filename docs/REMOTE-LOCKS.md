@@ -168,11 +168,29 @@ threshold. A live holder refreshes six times inside one threshold, so nothing
 that far behind can still be alive — and deleting somebody's live pin is far
 worse than leaving a small file lying around.
 
-An interrupted run does not wait for any of that. Pins are released on normal
-exit and on SIGINT/SIGTERM, so Ctrl-C on a restore frees the snapshot at once.
-The signal handlers chain to whatever was installed before them rather than
-replacing it. The stale window remains the backstop for what no handler can
-catch: SIGKILL, a power cut, a severed network.
+An interrupted run does not wait for any of that:
+
+* **Ctrl-C** is Python's own `KeyboardInterrupt`; no signal handler is
+  involved. Every transfer's child processes run inside a scope nested within
+  the locks and pins it holds, so as the interrupt unwinds, the scope stops
+  those processes and waits for them first, and only then does each
+  operation release its own locks. Whatever the unwind did not release, the
+  exit releases. A transfer running on a worker thread is not interrupted by
+  it, and keeps its locks until it finishes: a lock is never released while a
+  stream is still being written under it.
+* **SIGTERM and SIGHUP** (systemd stopping a run, a closed terminal) stop the
+  run's child processes, then release its locks and pins, then close its ssh
+  connections, and the process then dies of the signal. A second signal during
+  that does not cut it short.
+* **A signal that was set to be ignored stays ignored.** A run started under
+  `nohup` keeps its locks, pins and connections through a hangup, and lets
+  them go when it finishes.
+
+Before 0.9.11 a SIGINT handler released every pin at once, before the
+interrupted operation had unwound -- and while any other thread's transfer was
+still writing. The stale window remains the backstop for what nothing can catch:
+SIGKILL, a power cut, a severed network.
+
 
 ### Receiving
 
@@ -360,5 +378,6 @@ another:
 * a killed restore leaves a lock that the next contender breaks after the
   staleness window, rather than locking the target out permanently
 * a third process reads the lock state correctly via `restore --status`
-* SIGINT frees a pin immediately rather than after the staleness window
+* an interrupted restore frees its pin as it exits rather than after the
+  staleness window
 * an abandoned pin stops blocking after that window and is then swept

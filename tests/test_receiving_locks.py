@@ -263,3 +263,46 @@ class TestTheLockNameIsDistinctFromASnapshotPin:
             names = _manager(tmp_path).live_lock_names()
         assert any(n.startswith(RECEIVING_LOCK_PREFIX) for n in names)
         assert not any(n.startswith("snap-") for n in names)
+
+
+class TestTheReceiveStopsBeforeItsLockGoes:
+    """A receive interrupted inside its lock has its processes stopped and
+    waited for BEFORE the lock is released. Released first, a second transfer
+    could take the lock and start creating the same subvolume while the first
+    stream was still arriving."""
+
+    @staticmethod
+    def _watch_release(manager, child):
+        seen = {}
+        real = manager.release
+
+        def release(name):
+            seen.setdefault("writer_alive", child[0].poll() is None)
+            real(name)
+
+        manager.release = release
+        return seen
+
+    def test_the_ssh_receive_lock(self, tmp_path):
+        from btrfs_backup_ng import lifecycle
+
+        endpoint = _endpoint(tmp_path)
+        child: list = []
+        seen = self._watch_release(endpoint._build_lock_manager(), child)
+        with pytest.raises(KeyboardInterrupt):
+            with endpoint.receiving_lock(f"{tmp_path}/home.20240101T120000"):
+                child.append(lifecycle.track(subprocess.Popen(["sleep", "30"])))
+                raise KeyboardInterrupt
+        assert seen == {"writer_alive": False}
+
+    def test_every_exclusive_hold(self, tmp_path):
+        from btrfs_backup_ng import lifecycle
+
+        manager = _manager(tmp_path)
+        child: list = []
+        seen = self._watch_release(manager, child)
+        with pytest.raises(KeyboardInterrupt):
+            with manager.hold("target", "mutating operation"):
+                child.append(lifecycle.track(subprocess.Popen(["sleep", "30"])))
+                raise KeyboardInterrupt
+        assert seen == {"writer_alive": False}
