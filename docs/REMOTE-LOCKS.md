@@ -187,6 +187,37 @@ The age now falls back to the lock directory's own mtime, which `mkdir` sets
 atomically, so a lock taken microseconds ago cannot read as abandoned. The
 inverse still holds: a genuinely old lock is still broken.
 
+### Older versions on the same target
+
+The lock layout changed in 0.9.11: an exclusive lock's holder record is now
+`owner.<token>` where 0.9.10 and earlier wrote `info.json`. Lock names, their
+encoding and the pin layout (`holders/`) did not change. While clients of both
+versions use one target -- one machine upgraded before another -- this holds:
+
+* **Mutual exclusion holds.** Every version takes a lock with `mkdir` of the
+  same directory name, so a lock held by either kind of client refuses the
+  other.
+* **A live lock is judged live by both.** 0.9.11 refreshes the `heartbeat`
+  file an older client ages a lock by, beside its own record, so an older
+  client does not break a 0.9.11 lock that is still held.
+* **Pins work across versions.** Their layout did not change, so a pin taken
+  by either version blocks a deletion by either. An older client listing a
+  0.9.11 exclusive lock sees an unknown holder (it looks for `info.json`),
+  and still counts the lock as held.
+* **What the older client does is not protected by this version's fixes.** An
+  older client breaks a dead lock by renaming whatever directory sits at the
+  path, so two contenders can still both win when one of them is an older
+  client. An older holder that stalled past the threshold, whose lock was
+  broken and taken by a 0.9.11 client, deletes the `heartbeat` file of that
+  new lock when it releases; the new lock survives (its directory is not
+  empty), but older clients then age it by its directory's mtime and may
+  break it once that is past the threshold. An older client also counts a
+  pin whose age it cannot read as dead.
+
+The window lasts until every client that uses the target is upgraded; nothing
+needs cleaning up afterwards. Leftover `.stale.*` directories an older client
+left behind are not locks and are ignored.
+
 ### Staleness is judged from the target's clock
 
 The holder refreshes its file every 30 seconds. Age is `remote_now -
