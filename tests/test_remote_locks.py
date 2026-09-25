@@ -17,6 +17,7 @@ because a mock of its replies would pass whatever the protocol did.
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import threading
@@ -120,9 +121,17 @@ class TestExclusion:
         assert _manager(tmp_path).acquire_once("target", "restore") == "acquired"
 
     def test_concurrent_contenders_produce_exactly_one_winner(self, tmp_path):
-        """mkdir is the atomic primitive; this is what it is being trusted for."""
+        """mkdir is the atomic primitive; this is what it is being trusted for.
+
+        Every loser must be told BUSY. A contender that fails any other way
+        dies in its own thread, which pytest reports only as a warning while
+        the test passes, so every contender's outcome is recorded and checked.
+        """
+        contenders = 12
         wins: list[str] = []
-        barrier = threading.Barrier(12)
+        busy: list[str] = []
+        errors: list[str] = []
+        barrier = threading.Barrier(contenders)
 
         def contend(i: int) -> None:
             barrier.wait()
@@ -130,14 +139,20 @@ class TestExclusion:
                 _manager(tmp_path).acquire_once("target", f"op-{i}")
                 wins.append(f"op-{i}")
             except RemoteLockBusy:
-                pass
+                busy.append(f"op-{i}")
+            except Exception as exc:  # noqa: BLE001 - recorded and asserted on
+                errors.append(f"op-{i}: {type(exc).__name__}: {exc}")
 
-        threads = [threading.Thread(target=contend, args=(i,)) for i in range(12)]
+        threads = [
+            threading.Thread(target=contend, args=(i,)) for i in range(contenders)
+        ]
         for t in threads:
             t.start()
         for t in threads:
             t.join()
+        assert not errors, "a contender failed other than BUSY:\n" + "\n".join(errors)
         assert len(wins) == 1, f"expected one winner, got {wins}"
+        assert len(busy) == contenders - 1, f"expected every loser BUSY, got {busy}"
 
 
 class TestTheScriptsAreNotBashOnly:
@@ -607,6 +622,211 @@ class TestStaleness:
         script = _manager(tmp_path)._acquire_script("target", "{}", "tok")
         assert "date +%s" in script, "the target must supply the current time"
         assert "stat -c %Y" in script or "stat -f %m" in script
+
+
+class TestBreakingADeadLockHasOneWinner:
+    """Of any number of contenders that find the same dead lock, one takes it.
+
+    The old break read the lock's age, then renamed aside whatever directory
+    was at the lock path by the time its ``mv`` ran. A contender that judged
+    the dead lock and was descheduled could, once a faster one had broken it
+    and taken it afresh, rename THAT lock aside and take it too: two winners,
+    each told it had broken a dead lock. Twelve contenders racing one dead lock
+    had two to four winners in 35 of 40 runs; six racing over ssh against a
+    real target had two in 2 of 6.
+
+    The break now removes the one entry that identifies the instance judged
+    dead, and only its remover goes on. Each interleaving is forced by a shim
+    that runs a faster contender's WHOLE acquisition just before the slower
+    contender runs one step of its break.
+    """
+
+    DEAD = time.time() - 10_000
+
+    def _dead(self, sandbox: Path, shape: str) -> Path:
+        lock_dir = Path(_manager(sandbox)._lock_dir("target"))
+        lock_dir.mkdir(parents=True)
+        entries = []
+        if shape == "current":
+            entries = [lock_dir / "owner.deadbeef", lock_dir / "heartbeat"]
+            entries[0].write_text('{"name": "target", "operation": "dead"}')
+        elif shape == "older-version":
+            entries = [lock_dir / "info.json", lock_dir / "heartbeat"]
+            entries[0].write_text('{"name": "target", "operation": "dead"}')
+        for path in (*entries, lock_dir):
+            path.touch() if not path.exists() else None
+            os.utime(path, (self.DEAD, self.DEAD))
+        return lock_dir
+
+    def _race(self, tmp_path, monkeypatch, shape: str, command: str, pattern: str):
+        sandbox = tmp_path / "target"
+        sandbox.mkdir()
+        lock_dir = self._dead(sandbox, shape)
+        faster = tmp_path / "faster.sh"
+        faster.write_text(
+            _manager(sandbox, stale_after=60)._acquire_script(
+                "target", '{"name": "target", "operation": "faster"}', "faster"
+            )
+        )
+        faster_out = tmp_path / "faster.out"
+        fired = tmp_path / "fired"
+        real = subprocess.run(
+            ["sh", "-c", f"command -v {command}"], capture_output=True, text=True
+        ).stdout.strip()
+        shims = tmp_path / "shims"
+        shims.mkdir()
+        (shims / command).write_text(
+            "#!/bin/sh\n"
+            f'if [ -z "$BBNG_FASTER" ] && [ ! -e "{fired}" ]; then '
+            f'case "$*" in {pattern}) touch "{fired}"; '
+            f'BBNG_FASTER=1 sh "{faster}" > "{faster_out}" 2>&1;; esac; fi\n'
+            f'exec {real} "$@"\n'
+        )
+        (shims / command).chmod(0o755)
+        monkeypatch.setenv("PATH", f"{shims}:{os.environ['PATH']}")
+        try:
+            slower = _manager(sandbox, stale_after=60).acquire_once("target", "slower")
+        except RemoteLockBusy:
+            slower = "busy"
+        assert fired.exists(), f"the shim never interleaved at {command} {pattern}"
+        faster_verdict = (faster_out.read_text().split() or [""])[0]
+        return slower, faster_verdict, lock_dir
+
+    @pytest.mark.parametrize(
+        "shape,command,pattern",
+        [
+            # after reading the dead lock's age, before the clock
+            *[(shape, "date", "*") for shape in ("current", "older-version", "empty")],
+            # just before the removal (an empty lock has none: its rmdir is it)
+            *[
+                (shape, "rm", "*owner.*|*info.json|*heartbeat")
+                for shape in ("current", "older-version")
+            ],
+            # after the removal, before the rmdir
+            *[(shape, "rmdir", "*") for shape in ("current", "older-version", "empty")],
+        ],
+    )
+    def test_a_slower_breaker_never_takes_a_lock_broken_meanwhile(
+        self, tmp_path, monkeypatch, shape, command, pattern
+    ):
+        slower, faster, lock_dir = self._race(
+            tmp_path, monkeypatch, shape, command, pattern
+        )
+        winners = [
+            who
+            for who, v in (("slower", slower), ("faster", faster))
+            if v in ("stale-broken", "acquired", "ACQUIRED_STALE", "ACQUIRED")
+        ]
+        assert len(winners) == 1, (slower, faster)
+        owners = sorted(p.name for p in lock_dir.glob("owner.*"))
+        assert len(owners) == 1, owners
+        recorded = json.loads((lock_dir / owners[0]).read_text())["operation"]
+        assert recorded == winners[0], (winners, recorded)
+        # A breaker that did not win the removal touches nothing of the
+        # winner's: older versions judge a lock by this file.
+        assert (lock_dir / "heartbeat").exists()
+
+    def test_many_contenders_on_one_dead_lock_leave_one_winner(self, tmp_path):
+        """No shim: twelve contenders released together at a dead lock, again
+        and again. The old break failed this in most runs."""
+        for attempt in range(15):
+            sandbox = tmp_path / f"t{attempt}"
+            sandbox.mkdir()
+            self._dead(sandbox, "current" if attempt % 2 else "older-version")
+            wins: list[str] = []
+            errors: list[str] = []
+            barrier = threading.Barrier(12)
+
+            def contend(i: int, _sandbox=sandbox, _wins=wins, _errors=errors) -> None:
+                barrier.wait()
+                try:
+                    _manager(_sandbox).acquire_once("target", f"op-{i}")
+                    _wins.append(f"op-{i}")
+                except RemoteLockBusy:
+                    pass
+                except Exception as exc:  # noqa: BLE001 - asserted on below
+                    _errors.append(repr(exc))
+
+            threads = [threading.Thread(target=contend, args=(i,)) for i in range(12)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+            assert not errors, errors
+            assert len(wins) == 1, f"run {attempt}: winners {wins}"
+
+    def test_a_claimant_that_finds_another_record_withdraws(
+        self, tmp_path, monkeypatch
+    ):
+        """The one interleaving the removal cannot exclude ends with a second
+        record in the directory a claimant just made; the claimant that sees
+        it does not report the lock as taken, and removes only its own."""
+        sandbox = tmp_path / "target"
+        sandbox.mkdir()
+        manager = _manager(sandbox)
+        lock_dir = Path(manager._lock_dir("target"))
+        real = subprocess.run(
+            ["sh", "-c", "command -v mkdir"], capture_output=True, text=True
+        ).stdout.strip()
+        shims = tmp_path / "shims"
+        shims.mkdir()
+        (shims / "mkdir").write_text(
+            "#!/bin/sh\n"
+            f'{real} "$@" || exit $?\n'
+            f'case "$*" in *.lock) printf "{{}}" > "{lock_dir}/owner.other";; esac\n'
+        )
+        (shims / "mkdir").chmod(0o755)
+        monkeypatch.setenv("PATH", f"{shims}:{os.environ['PATH']}")
+        with pytest.raises(RemoteLockBusy):
+            manager.acquire_once("target", "late")
+        assert sorted(p.name for p in lock_dir.glob("owner.*")) == ["owner.other"]
+
+
+class TestReleaseTouchesOnlyItsOwnLock:
+    def _break_under(self, tmp_path):
+        """A holder stalled past the threshold, whose lock another took."""
+        stalled = _manager(tmp_path, stale_after=1)
+        stalled.acquire_once("target", "stalled")
+        lock_dir = Path(stalled._lock_dir("target"))
+        old = time.time() - 100
+        for path in (*lock_dir.iterdir(), lock_dir):
+            os.utime(path, (old, old))
+        successor = _manager(tmp_path, stale_after=1)
+        assert successor.acquire_once("target", "successor") == "stale-broken"
+        return stalled, successor, lock_dir
+
+    def test_a_holder_whose_lock_was_broken_leaves_the_successor_s_alone(
+        self, tmp_path, caplog
+    ):
+        """It used to delete the lock at the path whoever held it; a third
+        process could then take it while the second still believed it held
+        it."""
+        stalled, _successor, lock_dir = self._break_under(tmp_path)
+        with caplog.at_level("WARNING"):
+            stalled.release("target")
+        assert lock_dir.is_dir()
+        with pytest.raises(RemoteLockBusy):
+            _manager(tmp_path, stale_after=60).acquire_once("target", "third")
+        assert "no longer held by this process" in caplog.text
+
+    def test_its_heartbeat_does_not_write_itself_into_the_successor_s_lock(
+        self, tmp_path
+    ):
+        """The stalled holder wakes and its heartbeat thread beats: the real
+        refresh, several times over. It must not recreate its record inside
+        the lock another process now holds."""
+        stalled, _successor, lock_dir = self._break_under(tmp_path)
+        before = sorted(p.name for p in lock_dir.iterdir())
+        stalled._heartbeat_interval = 0.05
+        stalled._start_heartbeat("target")
+        time.sleep(0.4)
+        stalled._stop_heartbeat("target")
+        assert sorted(p.name for p in lock_dir.iterdir()) == before
+
+    def test_the_successor_releases_normally(self, tmp_path):
+        _stalled, successor, lock_dir = self._break_under(tmp_path)
+        successor.release("target")
+        assert not lock_dir.exists()
 
 
 class TestListing:

@@ -52,24 +52,27 @@ atomic on the remote filesystem:
 
 * **`mkdir` is atomic.** Exactly one of any number of racing creators wins; the
   rest get `EEXIST`. This is the whole mutual-exclusion primitive.
-* **`mv` is atomic within a filesystem.** This is what makes breaking a dead
-  lock safe: a contender that judges a lock stale renames it and proceeds only
-  if the rename succeeded, so two contenders that both see the same dead lock
-  cannot both go on to acquire it.
+* **Removing one name succeeds once.** Of any number of processes that `rm`
+  the same file, one succeeds and the rest are told it does not exist. An
+  exclusive lock's holder record is a file named by that holder's own random
+  token, so breaking a dead lock -- removing exactly that file -- can be won by
+  one contender only, and can never remove a newer holder's record. See
+  "Breaking a dead lock" below.
 
-Both were verified against a real remote with 20 concurrent contenders: one
-winner in each case.
+`mkdir` was verified against a real remote with 20 concurrent contenders: one
+winner.
 
 ### Layout
 
 ```
 <target>/.btrfs-backup-ng.locks/
     receiving-<dest>.lock/        EXCLUSIVE: the right to create one subvolume
-        info.json
+        owner.<token>
         heartbeat
     target.lock/                  EXCLUSIVE: a whole-target lock
-        info.json                 holder: operation, hostname, pid, token
-        heartbeat                 mtime refreshed while the holder lives
+        owner.<token>             holder: operation, hostname, pid, token;
+                                  its mtime is the holder's heartbeat
+        heartbeat                 refreshed beside it, for older versions
     snap-<name>.lock/             SHARED: a pin on one snapshot
         holders/
             restore_abc           one file per holder; its mtime is that
@@ -117,11 +120,51 @@ still there. The last one out cleans up.
 
 ### Exclusive acquisition is one round trip
 
-Try `mkdir`; if it fails, judge staleness; if stale, break it with `mv` and try
-again. This is deliberately a single script rather than a sequence of calls:
-split across round trips, another contender can slip between the staleness check
-and the break, which is exactly the race the atomic rename exists to close. The
-evaluation cannot be moved to the client for the same reason.
+Try `mkdir`; if it fails, judge staleness; if stale, break it and try again.
+This is deliberately a single script rather than a sequence of calls: split
+across round trips, another contender can slip between the staleness check and
+the break. The evaluation cannot be moved to the client for the same reason.
+
+### Breaking a dead lock has one winner
+
+An earlier version broke a dead lock by renaming its directory aside. The
+rename moved whatever directory sat at the lock path by the time it ran, which
+was not necessarily the one judged dead: a contender that judged the lock and
+was descheduled before its `mv` could, once a faster one had broken it and
+taken it afresh, rename THAT lock aside and take it too. Two winners, each told
+it had broken a dead lock. With nothing injected, twelve contenders racing one
+dead lock produced two to four winners in 35 of 40 runs, and six racing over
+ssh against a real target produced two in 2 of 6.
+
+The break now removes the one entry that identifies the instance judged dead:
+its `owner.<token>` file. That name exists only in that instance, and removing
+it succeeds for exactly one caller, so every other contender that judged the
+same dead lock is told BUSY -- and one that judged an older instance cannot
+touch a newer one's record. Only the winner goes on to `rmdir` the directory
+and `mkdir` it afresh. A lock left by an older version (no owner file) is
+broken the same way through its `info.json`, which this version never writes;
+an empty directory, through `rmdir`, which succeeds only while it is empty.
+
+A new holder then checks that its record is the only one in the directory
+before it reports the lock as taken. The one interleaving the removal cannot
+exclude -- an empty dead directory removed by a slow contender just after
+another had re-created it and before it wrote its record -- ends with the
+second record written into a directory someone else created, or not written at
+all, and the later claimant withdraws.
+
+What remains is the assumption every lease rests on: a holder that stops
+refreshing for longer than the threshold has lost its lock, even if it wakes
+later still believing it holds it.
+
+### Release removes only the holder's own lock
+
+A holder releases by removing its own `owner.<token>` and, only if that
+succeeded, the rest. A holder that was stalled past the threshold while its
+lock was broken and re-taken used to delete its successor's lock on waking,
+after which a third process could take it while the second still believed it
+held it. Now it finds its own record gone, leaves the lock alone and says so.
+Its heartbeat refreshes with `touch -c`, so it cannot recreate its record
+inside the successor's lock either.
 
 Shared pins need none of this. There is nothing to win, so acquiring one is a
 single write with no contention to resolve.
@@ -197,7 +240,6 @@ Before 0.9.11 a SIGINT handler released every pin at once, before the
 interrupted operation had unwound -- and while any other thread's transfer was
 still writing. The stale window remains the backstop for what nothing can catch:
 SIGKILL, a power cut, a severed network.
-
 
 ### Receiving
 

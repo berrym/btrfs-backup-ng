@@ -189,6 +189,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   error.** Stopping the connection removed its control directory, and the
   restart pointed ssh at a socket in the missing directory, which ssh
   reports as a failed login. The restart now makes a new directory.
+- **Breaking a dead lock could give two winners.** The break renamed aside
+  whatever lock directory sat at the path when it ran, so a contender that
+  judged a dead lock and was descheduled could break and take the lock a
+  faster contender had just taken afresh -- two processes each holding the
+  exclusive lock that guards an `ssh://` receive, the clash it exists to
+  prevent (two in 2 of 6 races over ssh to a real target). The break now
+  removes the dead holder's own record, a file named by its token, which one
+  contender only can remove; a new holder also checks that it is the only
+  one before it reports the lock as taken.
+- **Releasing a lock did not check whose it was.** A holder stalled past the
+  stale threshold, whose lock had been broken and taken by another process,
+  deleted that process's lock when it woke. It now removes only its own
+  record, leaves the successor's lock alone and says so, and its heartbeat
+  can no longer recreate its record inside the successor's lock.
 - **A pin whose age could not be read counted as abandoned.** Its mtime was
   read as 0, so a prune's guard reported a live pin as absent and `restore
   --unlock` swept it. A pin or lock whose age cannot be read, or on a target
