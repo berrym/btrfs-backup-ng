@@ -63,14 +63,17 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v10.2.0
+
+      # The exact versions in uv.lock, as in the unit job.
       - name: Install Python dependencies
         run: |
-          python3 -m pip install --upgrade pip
-          pip install -e ".[test]"
+          uv sync --frozen --extra test --python python3
 
       - name: Run Tier 2 integration tests
         run: |
-          pytest tests/integration/tier2/ -v -m tier2 --tb=long \
+          uv run --frozen pytest tests/integration/tier2/ -v -m tier2 --tb=long \
             --junitxml=tier2-results.xml ${{ inputs.debug == 'true' && '-s' || '' }}
 
       - name: Verify Tier 2 tests actually executed
@@ -103,8 +106,7 @@ jobs:
       - name: Run Tier 2 tests with coverage
         if: success()
         run: |
-          pip install pytest-cov
-          pytest tests/integration/tier2/ -v -m tier2 \
+          uv run --frozen pytest tests/integration/tier2/ -v -m tier2 \
             --cov=src/btrfs_backup_ng \
             --cov-report=xml:coverage-tier2.xml \
             --cov-report=term-missing \

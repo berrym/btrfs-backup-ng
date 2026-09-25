@@ -128,4 +128,3 @@ Thumbs.db
 # Project-specific
 *.log
 *.jsonl
-uv.lock
