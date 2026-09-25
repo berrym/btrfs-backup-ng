@@ -10,6 +10,7 @@ import subprocess
 
 import pytest
 
+from btrfs_backup_ng.core.transfer import finish_stderr
 from btrfs_backup_ng.endpoint.raw import RawEndpoint
 from btrfs_backup_ng.endpoint.raw_metadata import RawSnapshot
 from btrfs_backup_ng.endpoint.raw_metadata import COMPRESSION_CONFIG
@@ -37,15 +38,15 @@ class TestRealCompressionPipelines:
         output_file = tmp_path / "output.btrfs.gz"
 
         # Compress
-        with open(input_file, "rb") as stdin:
+        with open(input_file, "rb") as stdin, open(output_file, "wb") as stdout:
             proc = subprocess.Popen(
                 ["pigz", "-c"],
                 stdin=stdin,
-                stdout=open(output_file, "wb"),
+                stdout=stdout,
                 stderr=subprocess.PIPE,
             )
-            proc.wait()
-            assert proc.returncode == 0
+            _, err = proc.communicate()
+            assert proc.returncode == 0, err
 
         assert output_file.exists()
         assert output_file.stat().st_size < input_file.stat().st_size
@@ -68,15 +69,15 @@ class TestRealCompressionPipelines:
         output_file = tmp_path / "output.btrfs.bz2"
 
         # Compress
-        with open(input_file, "rb") as stdin:
+        with open(input_file, "rb") as stdin, open(output_file, "wb") as stdout:
             proc = subprocess.Popen(
                 ["bzip2", "-c"],
                 stdin=stdin,
-                stdout=open(output_file, "wb"),
+                stdout=stdout,
                 stderr=subprocess.PIPE,
             )
-            proc.wait()
-            assert proc.returncode == 0
+            _, err = proc.communicate()
+            assert proc.returncode == 0, err
 
         assert output_file.exists()
 
@@ -98,15 +99,15 @@ class TestRealCompressionPipelines:
         output_file = tmp_path / "output.btrfs.bz2"
 
         # Compress
-        with open(input_file, "rb") as stdin:
+        with open(input_file, "rb") as stdin, open(output_file, "wb") as stdout:
             proc = subprocess.Popen(
                 ["pbzip2", "-c"],
                 stdin=stdin,
-                stdout=open(output_file, "wb"),
+                stdout=stdout,
                 stderr=subprocess.PIPE,
             )
-            proc.wait()
-            assert proc.returncode == 0
+            _, err = proc.communicate()
+            assert proc.returncode == 0, err
 
         assert output_file.exists()
 
@@ -128,15 +129,15 @@ class TestRealCompressionPipelines:
         output_file = tmp_path / "output.btrfs.lzo"
 
         # Compress
-        with open(input_file, "rb") as stdin:
+        with open(input_file, "rb") as stdin, open(output_file, "wb") as stdout:
             proc = subprocess.Popen(
                 ["lzop", "-c"],
                 stdin=stdin,
-                stdout=open(output_file, "wb"),
+                stdout=stdout,
                 stderr=subprocess.PIPE,
             )
-            proc.wait()
-            assert proc.returncode == 0
+            _, err = proc.communicate()
+            assert proc.returncode == 0, err
 
         assert output_file.exists()
 
@@ -160,7 +161,7 @@ class TestRealCompressionPipelines:
         output_file = tmp_path / "output.btrfs.gz"
 
         # Compress using the actual pipeline
-        with open(input_file, "rb") as stdin:
+        with open(input_file, "rb") as stdin, open(output_file, "wb") as stdout:
             pipeline = endpoint._build_receive_pipeline(output_file)
             assert pipeline == [["gzip", "-c"]]
 
@@ -168,11 +169,11 @@ class TestRealCompressionPipelines:
             proc = subprocess.Popen(
                 ["gzip", "-c"],
                 stdin=stdin,
-                stdout=open(output_file, "wb"),
+                stdout=stdout,
                 stderr=subprocess.PIPE,
             )
-            proc.wait()
-            assert proc.returncode == 0
+            _, err = proc.communicate()
+            assert proc.returncode == 0, err
 
         # Verify compressed file exists and is smaller
         assert output_file.exists()
@@ -201,15 +202,15 @@ class TestRealCompressionPipelines:
         output_file = tmp_path / "output.btrfs.zst"
 
         # Compress
-        with open(input_file, "rb") as stdin:
+        with open(input_file, "rb") as stdin, open(output_file, "wb") as stdout:
             proc = subprocess.Popen(
                 ["zstd", "-c"],
                 stdin=stdin,
-                stdout=open(output_file, "wb"),
+                stdout=stdout,
                 stderr=subprocess.PIPE,
             )
-            proc.wait()
-            assert proc.returncode == 0
+            _, err = proc.communicate()
+            assert proc.returncode == 0, err
 
         assert output_file.exists()
 
@@ -231,15 +232,15 @@ class TestRealCompressionPipelines:
         output_file = tmp_path / "output.btrfs.lz4"
 
         # Compress
-        with open(input_file, "rb") as stdin:
+        with open(input_file, "rb") as stdin, open(output_file, "wb") as stdout:
             proc = subprocess.Popen(
                 ["lz4", "-c"],
                 stdin=stdin,
-                stdout=open(output_file, "wb"),
+                stdout=stdout,
                 stderr=subprocess.PIPE,
             )
-            proc.wait()
-            assert proc.returncode == 0
+            _, err = proc.communicate()
+            assert proc.returncode == 0, err
 
         assert output_file.exists()
 
@@ -261,15 +262,15 @@ class TestRealCompressionPipelines:
         output_file = tmp_path / "output.btrfs.xz"
 
         # Compress
-        with open(input_file, "rb") as stdin:
+        with open(input_file, "rb") as stdin, open(output_file, "wb") as stdout:
             proc = subprocess.Popen(
                 ["xz", "-c"],
                 stdin=stdin,
-                stdout=open(output_file, "wb"),
+                stdout=stdout,
                 stderr=subprocess.PIPE,
             )
-            proc.wait()
-            assert proc.returncode == 0
+            _, err = proc.communicate()
+            assert proc.returncode == 0, err
 
         assert output_file.exists()
 
@@ -298,7 +299,7 @@ class TestRealEncryptionPipelines:
         output_file = tmp_path / "output.btrfs.enc"
 
         # Encrypt
-        with open(input_file, "rb") as stdin:
+        with open(input_file, "rb") as stdin, open(output_file, "wb") as stdout:
             proc = subprocess.Popen(
                 [
                     "openssl",
@@ -310,11 +311,11 @@ class TestRealEncryptionPipelines:
                     f"pass:{passphrase}",
                 ],
                 stdin=stdin,
-                stdout=open(output_file, "wb"),
+                stdout=stdout,
                 stderr=subprocess.PIPE,
             )
-            proc.wait()
-            assert proc.returncode == 0
+            _, err = proc.communicate()
+            assert proc.returncode == 0, err
 
         assert output_file.exists()
         # Encrypted data should be different from input
@@ -356,9 +357,11 @@ class TestRealEncryptionPipelines:
         output_file = tmp_path / "output.btrfs.zst.enc"
 
         # Compress then encrypt (pipeline order: compress -> encrypt)
+        source = open(input_file, "rb")
+        sink = open(output_file, "wb")
         compress_proc = subprocess.Popen(
             ["zstd", "-c"],
-            stdin=open(input_file, "rb"),
+            stdin=source,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
         )
@@ -373,12 +376,15 @@ class TestRealEncryptionPipelines:
                 f"pass:{passphrase}",
             ],
             stdin=compress_proc.stdout,
-            stdout=open(output_file, "wb"),
+            stdout=sink,
             stderr=subprocess.PIPE,
         )
         compress_proc.stdout.close()
-        encrypt_proc.wait()
+        _, encrypt_err = encrypt_proc.communicate()
         compress_proc.wait()
+        compress_proc.stderr.close()
+        source.close()
+        sink.close()
 
         assert compress_proc.returncode == 0
         assert encrypt_proc.returncode == 0
@@ -409,6 +415,7 @@ class TestRealEncryptionPipelines:
         decrypt_proc.stdout.close()
         stdout, _ = decompress_proc.communicate()
         decrypt_proc.wait()
+        decrypt_proc.stderr.close()
 
         assert decrypt_proc.returncode == 0
         assert decompress_proc.returncode == 0
@@ -648,9 +655,11 @@ Expire-Date: 0
         output_file = tmp_path / "output.btrfs.zst.gpg"
 
         # Compress then encrypt (pipeline order: compress -> encrypt)
+        source = open(input_file, "rb")
+        sink = open(output_file, "wb")
         compress_proc = subprocess.Popen(
             ["zstd", "-c"],
-            stdin=open(input_file, "rb"),
+            stdin=source,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
         )
@@ -668,12 +677,15 @@ Expire-Date: 0
                 "always",
             ],
             stdin=compress_proc.stdout,
-            stdout=open(output_file, "wb"),
+            stdout=sink,
             stderr=subprocess.PIPE,
         )
         compress_proc.stdout.close()
-        encrypt_proc.wait()
+        _, encrypt_err = encrypt_proc.communicate()
         compress_proc.wait()
+        compress_proc.stderr.close()
+        source.close()
+        sink.close()
 
         assert compress_proc.returncode == 0
         assert encrypt_proc.returncode == 0
@@ -702,6 +714,7 @@ Expire-Date: 0
         decrypt_proc.stdout.close()
         stdout, _ = decompress_proc.communicate()
         decrypt_proc.wait()
+        decrypt_proc.stderr.close()
 
         assert decrypt_proc.returncode == 0
         assert decompress_proc.returncode == 0
@@ -1049,8 +1062,12 @@ class TestSSHRawEndpointIntegration:
         )
 
         result = endpoint._execute_pipeline([["zstd", "-c"]], proc.stdout)
+        proc.stdout.close()
         result.wait()
         proc.wait()
+        # The endpoint's stderr tail closes the pipe at EOF on its own thread;
+        # finish it here so the pipe is closed before the process object goes.
+        finish_stderr(result)
 
         assert result.returncode == 0
         endpoint.commit_receive()  # remote sync + atomic mv .part -> final
@@ -1078,15 +1095,15 @@ class TestBinaryDataIntegrity:
         output_file = tmp_path / "binary.gz"
 
         # Compress
-        with open(input_file, "rb") as stdin:
+        with open(input_file, "rb") as stdin, open(output_file, "wb") as stdout:
             proc = subprocess.Popen(
                 ["gzip", "-c"],
                 stdin=stdin,
-                stdout=open(output_file, "wb"),
+                stdout=stdout,
                 stderr=subprocess.PIPE,
             )
-            proc.wait()
-            assert proc.returncode == 0
+            _, err = proc.communicate()
+            assert proc.returncode == 0, err
 
         # Decompress and verify
         result = subprocess.run(
@@ -1117,9 +1134,11 @@ class TestBinaryDataIntegrity:
         output_file = tmp_path / "binary.zst.enc"
 
         # Compress then encrypt
+        source = open(input_file, "rb")
+        sink = open(output_file, "wb")
         compress_proc = subprocess.Popen(
             ["zstd", "-c"],
-            stdin=open(input_file, "rb"),
+            stdin=source,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
         )
@@ -1134,12 +1153,15 @@ class TestBinaryDataIntegrity:
                 f"pass:{passphrase}",
             ],
             stdin=compress_proc.stdout,
-            stdout=open(output_file, "wb"),
+            stdout=sink,
             stderr=subprocess.PIPE,
         )
         compress_proc.stdout.close()
-        encrypt_proc.wait()
+        _, encrypt_err = encrypt_proc.communicate()
         compress_proc.wait()
+        compress_proc.stderr.close()
+        source.close()
+        sink.close()
 
         assert compress_proc.returncode == 0
         assert encrypt_proc.returncode == 0
@@ -1169,6 +1191,7 @@ class TestBinaryDataIntegrity:
         decrypt_proc.stdout.close()
         stdout, _ = decompress_proc.communicate()
         decrypt_proc.wait()
+        decrypt_proc.stderr.close()
 
         assert decrypt_proc.returncode == 0
         assert decompress_proc.returncode == 0
@@ -1190,12 +1213,13 @@ class TestCompressionLevels:
         sizes = {}
         for level in [1, 10, 19]:  # Low, medium, high compression
             output_file = tmp_path / f"output_level{level}.zst"
-            result = subprocess.run(
-                ["zstd", f"-{level}", "-c"],
-                stdin=open(input_file, "rb"),
-                stdout=open(output_file, "wb"),
-                stderr=subprocess.PIPE,
-            )
+            with open(input_file, "rb") as source, open(output_file, "wb") as sink:
+                result = subprocess.run(
+                    ["zstd", f"-{level}", "-c"],
+                    stdin=source,
+                    stdout=sink,
+                    stderr=subprocess.PIPE,
+                )
             assert result.returncode == 0
             sizes[level] = output_file.stat().st_size
 

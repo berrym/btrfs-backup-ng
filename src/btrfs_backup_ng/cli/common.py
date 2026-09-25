@@ -285,7 +285,15 @@ def add_verbosity_args(parser: argparse.ArgumentParser) -> None:
 
 
 def get_log_level(args: argparse.Namespace) -> str:
-    """Determine log level from parsed arguments.
+    """Determine the console log level from the command line.
+
+    The command line decides first; without a flag the environment's
+    ``BTRFS_BACKUP_LOG_LEVEL`` decides; without that, INFO. The
+    configuration's ``quiet`` / ``verbose`` / ``btrfs_debug`` are applied
+    afterwards by ``apply_config_verbosity``, once the configuration is
+    read, and they win over the environment but not over a flag
+    (``config_log_level``). So: flags, then configuration, then environment,
+    then the default.
 
     Args:
         args: Parsed command line arguments
@@ -302,8 +310,9 @@ def get_log_level(args: argparse.Namespace) -> str:
         return "WARNING"
     elif getattr(args, "verbose", False):
         return "DEBUG"
-    else:
-        return "INFO"
+    from ..__logger__ import environment_log_level
+
+    return environment_log_level() or "INFO"
 
 
 def add_fs_checks_args(parser: argparse.ArgumentParser) -> None:
@@ -438,6 +447,33 @@ def apply_config_verbosity(args: argparse.Namespace | None, config=None) -> None
         set_console_level(level)
 
 
+def apply_configured_verbosity(args: argparse.Namespace | None) -> None:
+    """Apply ``[global] quiet`` / ``verbose`` / ``btrfs_debug`` for a command
+    that reads the configuration without keeping it.
+
+    The direct-mode commands -- ``restore`` on a location, ``verify``,
+    ``estimate`` on paths, ``snapper list/backup/status`` -- read the
+    configuration for a ``timestamp_format`` or a target's ssh options and
+    let it go, so ``apply_config_verbosity`` had no object to be given and
+    those commands were the exception to "every command that reads a
+    configuration applies them". This finds and loads the configuration the
+    same way they do (the operator's ``-c``, else the default locations) and
+    applies it; a configuration that is missing or does not load changes
+    nothing here, as those commands already tolerate that.
+    """
+    from ..config import ConfigError, find_config_file, load_config
+
+    try:
+        path = find_config_file(getattr(args, "config", None))
+        if path is None:
+            return
+        config, _warnings = load_config(path)
+    except (ConfigError, OSError) as e:
+        logger.debug("Configured verbosity not applied: %s", e)
+        return
+    apply_config_verbosity(args, config)
+
+
 def get_timestamp_format(config=None) -> str:
     """Return the configured snapshot ``timestamp_format`` or the built-in default.
 
@@ -546,6 +582,30 @@ def thread_ssh_target_config(kwargs: dict, target) -> None:
     ssh_auth_sock = getattr(target, "ssh_auth_sock", None)
     if ssh_auth_sock:
         kwargs["ssh_auth_sock"] = ssh_auth_sock
+
+
+def snapper_destination_options(
+    config, target, compress_override: str | None = None
+) -> dict[str, Any]:
+    """The endpoint options for a snapper volume's destination ``target``.
+
+    One builder for every command that opens a snapper destination -- ``run``
+    to transfer and prune, ``prune`` to prune -- so they open the same endpoint
+    with the same connection, encryption and compression settings and see the
+    same backups. A snapper destination has no snapshot prefix (its backups are
+    numbered slots), and the transfer stall timeout is a global setting that
+    the per-target helpers do not thread.
+    """
+    options: dict[str, Any] = {
+        "path": target.path,
+        "snap_prefix": "",
+        "timestamp_format": get_timestamp_format(config),
+        "transfer_stall_timeout": config.global_config.transfer_stall_timeout,
+    }
+    thread_ssh_target_config(options, target)
+    thread_raw_encryption(options, target)
+    thread_raw_compression(options, target, compress_override)
+    return options
 
 
 def thread_raw_compression(kwargs: dict, target, override: str | None = None) -> None:

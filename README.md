@@ -576,6 +576,10 @@ month (aligned with the monthly bucket boundary), not a flat 30 days, and `1y` i
 Weekly buckets use **ISO-8601 week numbering**, so a week that straddles a year boundary is counted
 once rather than split in two.
 
+**`min = "all"`** keeps every snapshot in that scope for ever: retention deletes nothing there,
+whatever the bucket counts or `keep` say. It is what btrbk means by `snapshot_preserve_min all`
+(btrbk's default), and what `config import` writes for a btrbk configuration that sets no minimum.
+
 An invalid `min` value (e.g. a typo) now **fails loudly** and prunes nothing for that volume, rather
 than silently falling back to a shorter window and deleting more than intended.
 
@@ -724,7 +728,7 @@ keep = 30
 
 `keep = N` keeps at least the N most recent snapshots and ignores the time buckets (`hourly`, `daily`, `weekly`, `monthly`, `yearly`) for that scope. It suits a drive that is only connected occasionally, where pruning by elapsed time behaves oddly. Setting `keep` alongside those buckets is reported as a warning, naming which keys are ignored.
 
-`min` is not a bucket and still applies — it is a floor ("keep everything for at least this long"), and a floor composes with a count without ambiguity, since both can only ever keep more. So `keep = 5` with `min = "1d"` keeps five snapshots *and* everything from the last day. Write `min = "0s"` if you want the count alone.
+`min` is not a bucket and still applies — it is a floor ("keep everything for at least this long"), and a floor composes with a count without ambiguity, since both can only ever keep more. So `keep = 5` with `min = "1d"` keeps five snapshots *and* everything from the last day. Write `min = "0s"` if you want the count alone, and `min = "all"` for a scope that keeps every snapshot and prunes nothing.
 
 Two things hold regardless of policy: a snapshot whose timestamp cannot be parsed is never deleted, and a snapshot still locked for a pending transfer is never deleted. Together with `min`, that is why `keep = N` means "at least N" rather than "exactly N".
 
@@ -1781,9 +1785,9 @@ Two situations are refused before anything is transferred:
 | `--no-fs-checks` | Skip btrfs subvolume verification (needed for backup directories) |
 | `--progress` | Show progress bars (default in terminal) |
 | `--no-progress` | Disable progress bars |
-| `--status` | Show locks and incomplete restores at backup location. On `ssh://` and `raw+ssh://` this reads locks recorded on the target, so it sees other processes and other machines |
+| `--status` | Show locks and incomplete restores at backup location. Every location type records its pins on the location itself -- local, `ssh://`, `raw://` and `raw+ssh://` -- so this sees other processes and other machines. A location holding snapper backups (numbered `.snapshots/<n>` slots, or raw streams with `.snapper-meta.json` sidecars) lists those backups too, each with the pins a snapper restore holds on it |
 | `--unlock [ID]` | Unlock stuck restore sessions ('all' or specific session ID) |
-| `--skip-remote-lock` | Proceed even if a lock cannot be recorded on the remote target. Only safe when nothing else can prune this target during the run |
+| `--skip-remote-lock` | Proceed even if a pin cannot be recorded on the location, wherever its lock store lives (a remote target's lock directory or a local location's lock file). Only safe when nothing else can prune this location during the run. Not needed for a medium mounted read-only: nothing can delete from it, so the restore goes on without the pin and says so |
 | `--cleanup` | Remove what an interrupted restore left at the destination: only a subvolume this tool's own run marker names that holds no received copy. Everything else is reported and left |
 
 **Config-driven restore options:**
@@ -2522,9 +2526,13 @@ snapper's own layout. What it does, in order:
    One restore runs into a config at a time; a second one started meanwhile is
    refused and restores nothing.
 5. Pins the backup on its location for the duration (under `restore:<session>`,
-   released when a transfer fails), so a prune on that target cannot delete
-   what is being read. A target you can read but not write takes
-   `--skip-remote-lock`.
+   released when a transfer fails or the run is interrupted), so a prune on
+   that location -- `run`'s or `prune`'s, in any process, on any machine --
+   cannot delete what is being read: the pin is recorded on the location for
+   every location type, and every deletion of a snapper slot or a raw stream
+   asks for it first. A target you can read but not write takes
+   `--skip-remote-lock`; a medium mounted read-only needs nothing, since
+   nothing can delete from it.
 
 Every selected backup lands in a **new** slot, present or not: snapper keeps
 every snapshot, so a restore is never skipped as "already restored". The

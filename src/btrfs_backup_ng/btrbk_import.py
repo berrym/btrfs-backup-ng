@@ -20,9 +20,11 @@ Timestamp format mapping (btrbk -> strftime):
 import logging
 import re
 from dataclasses import dataclass, field
+from datetime import timedelta
 from pathlib import Path
 
 from .__util__ import toml_str
+from .retention import MIN_KEEP_ALL, parse_duration
 from .core.transfer import COMPRESSION_PROGRAMS
 from .endpoint.raw_metadata import COMPRESSION_CONFIG
 
@@ -281,19 +283,30 @@ class BtrbkLexer:
             )
 
     def _read_quoted_string(self) -> None:
-        """Read a quoted string value."""
+        """Read a quoted string value.
+
+        Stops at the end of the line as well as at the closing quote: btrbk's
+        grammar is line-oriented and an unterminated quote is a value that
+        happens to start with a quote character, not the start of a string
+        spanning the rest of the file. Reading on to the next quote silently
+        swallowed every following line -- volumes, targets and all -- so the
+        converted config was missing whatever came after the typo.
+        """
         start_col = self.column
         start_pos = self.pos
         quote = self._advance()
         value = ""
-        while self.pos < len(self.content) and self.content[self.pos] != quote:
+        while self.pos < len(self.content) and self.content[self.pos] not in (
+            quote,
+            "\n",
+        ):
             if self.content[self.pos] == "\\":
                 self._advance()
                 if self.pos < len(self.content):
                     value += self._advance()
             else:
                 value += self._advance()
-        if self.pos < len(self.content):
+        if self.pos < len(self.content) and self.content[self.pos] == quote:
             self._advance()  # closing quote
         self.tokens.append(
             Token(TokenType.VALUE, value, self.line, start_col, start_pos, self.pos)
@@ -353,18 +366,19 @@ class BtrbkParser:
         self.pos += 1
         return token
 
-    def _peek_next(self) -> Token:
-        """The token after the current one, for deciding on optional tokens."""
-        if self.pos + 1 < len(self.tokens):
-            return self.tokens[self.pos + 1]
-        return Token(TokenType.EOF, "", 0, 0)
-
     def _skip_newlines(self) -> None:
         while not self._is_at_end() and self._current().type in (
             TokenType.NEWLINE,
             TokenType.COMMENT,
         ):
             self._advance()
+
+    #: btrbk's line grammar (``/usr/bin/btrbk``, ``sub parse_config``): after
+    #: comment removal and trimming, a line is a keyword and then the WHOLE
+    #: rest of the line. The whitespace class is Perl's ASCII ``\s`` -- Python's
+    #: ``\s`` also matches NBSP and other Unicode spaces, which btrbk does not.
+    _WS = " \t\r\f\v"
+    _LINE_RE = re.compile(r"^([a-zA-Z_]+)(?:[ \t\r\f\v]+(.*))?$")
 
     def _parse_line(self) -> None:
         """Parse a single line of configuration."""
@@ -377,15 +391,16 @@ class BtrbkParser:
         if token.type == TokenType.KEYWORD:
             keyword = token.value
             self._advance()
+            value = self._rest_of_line(token)
 
             if keyword == "volume":
-                self._parse_volume()
+                self._parse_volume(token, value)
             elif keyword == "subvolume":
-                self._parse_subvolume()
+                self._parse_subvolume(token, value)
             elif keyword == "target":
-                self._parse_target()
+                self._parse_target(token, value)
             else:
-                self._parse_option(keyword)
+                self._parse_option(keyword, value)
         elif token.type == TokenType.VALUE:
             # Could be a continuation or error
             self._advance()
@@ -413,110 +428,121 @@ class BtrbkParser:
 
     @staticmethod
     def _unquote(text: str) -> str:
-        """Strip one layer of matching surrounding quotes, as btrbk does."""
-        if len(text) >= 2 and text[0] == text[-1] and text[0] in "\"'":
-            return text[1:-1]
+        """Strip surrounding quotes the way btrbk does: a matching pair of
+        double quotes, then a matching pair of single quotes, in that order
+        (``s/^"(.*)"$/$1/; s/^'(.*)'$/$1/`` on every directive's value)."""
+        for quote in ('"', "'"):
+            if len(text) >= 2 and text[0] == quote and text[-1] == quote:
+                text = text[1:-1]
         return text
 
-    def _consume_rest_of_line(self, first: Token) -> str:
-        """Return the value the way btrbk reads it: the whole rest of the line.
+    def _rest_of_line(self, keyword: Token) -> str:
+        """The value of the directive ``keyword`` opens: the rest of its line,
+        verbatim, read the way btrbk reads every line.
 
-        btrbk matches ``^([a-zA-Z_]+)(?:\\s+(.*))?$`` against the comment-stripped,
-        whitespace-trimmed line, so a directive's value runs to end of line and
-        keeps its internal spacing exactly as written. Measured against btrbk
-        0.32.7:
+        btrbk matches ``^([a-zA-Z_]+)(?:\\s+(.*))?$`` against the comment-
+        stripped, whitespace-trimmed line, so a value runs to end of line and
+        keeps every character and its internal spacing exactly as written.
+        Measured against btrbk 0.32.7:
 
-            volume /mnt/sp ace          ->  /mnt/sp ace
-            volume /mnt/two  spaces     ->  /mnt/two  spaces   (both spaces kept)
-            volume "/mnt/quoted path"   ->  /mnt/quoted path   (quotes stripped)
-            volume /mnt/a#b             ->  /mnt/a
+            volume /mnt/sp ace            ->  /mnt/sp ace
+            volume /mnt/two  spaces       ->  /mnt/two  spaces   (both spaces kept)
+            volume "/mnt/quoted path"     ->  /mnt/quoted path   (quotes stripped)
+            volume /mnt/a#b               ->  /mnt/a
+            snapshot_preserve 14d 8w *m   ->  14d 8w *m
+            ssh_identity ~/.ssh/key       ->  ~/.ssh/key
 
-        This parser is token-based, and the section directives took only the
-        FIRST token, so every path was truncated at its first space and a
-        converted config silently named a different directory. Rejoining the
-        tokens would not be correct either -- it invents single spaces where the
-        source had a tab or several. The original text is sliced instead.
+        Two earlier readings were wrong in the same way. Section directives
+        sliced the line from the first VALUE token, and options were rebuilt
+        by joining tokens; the lexer discards any character it does not
+        classify -- ``*``, ``~``, ``%``, ``+`` and every other symbol -- so
+        ``*m`` (keep EVERY monthly snapshot) became ``m``, read as no monthly
+        snapshots at all, and a ``~`` at the start of a path vanished. Both
+        silently, and the first prune after migrating deleted history btrbk
+        was keeping. Slicing from the KEYWORD token's own start reaches every
+        character of the value whether or not the lexer had a class for it.
+
+        Without the source text (a parser built from tokens alone) the tokens
+        on the line are joined with single spaces, which is the most the
+        tokens can say. The tokens on the line are consumed either way.
         """
-        if not self.content:
-            self._advance()
-            return first.value
-
-        newline = self.content.find("\n", first.start)
-        line_end = len(self.content) if newline == -1 else newline
-        raw = self._strip_comment(self.content[first.start : line_end]).rstrip()
-
+        values: list[str] = []
         while not self._is_at_end():
             token = self._current()
-            if token.type not in (TokenType.VALUE, TokenType.KEYWORD):
+            if token.type == TokenType.NEWLINE:
                 break
-            if token.line != first.line:
-                break
+            if token.type != TokenType.COMMENT:
+                values.append(token.value)
             self._advance()
+        if not self.content:
+            return " ".join(values)
 
-        return self._unquote(raw)
+        newline = self.content.find("\n", keyword.start)
+        line_end = len(self.content) if newline == -1 else newline
+        raw = self._strip_comment(self.content[keyword.start : line_end]).strip(
+            self._WS
+        )
+        match = self._LINE_RE.match(raw)
+        if match is None or match.group(2) is None:
+            return ""
+        return self._unquote(match.group(2))
 
-    def _parse_volume(self) -> None:
+    def _parse_volume(self, keyword: Token, path: str) -> None:
         """Parse a volume section."""
-        path_token = self._current()
-        if path_token.type != TokenType.VALUE:
+        if not path:
             self.config.warnings.append(
-                f"Line {path_token.line}: Expected path after 'volume'"
+                f"Line {keyword.line}: Expected path after 'volume'"
             )
             return
 
-        path = self._consume_rest_of_line(path_token)
-        self.current_volume = BtrbkVolume(path=path, line=path_token.line)
+        self.current_volume = BtrbkVolume(path=path, line=keyword.line)
         self.current_subvolume = None
         self.current_target = None
         self.config.volumes.append(self.current_volume)
 
-    def _parse_subvolume(self) -> None:
+    def _parse_subvolume(self, keyword: Token, path: str) -> None:
         """Parse a subvolume section."""
-        path_token = self._current()
-        if path_token.type != TokenType.VALUE:
+        if not path:
             self.config.warnings.append(
-                f"Line {path_token.line}: Expected path after 'subvolume'"
+                f"Line {keyword.line}: Expected path after 'subvolume'"
             )
             return
 
-        path = self._consume_rest_of_line(path_token)
-
         if self.current_volume is None:
             self.config.warnings.append(
-                f"Line {path_token.line}: 'subvolume' outside of 'volume' section"
+                f"Line {keyword.line}: 'subvolume' outside of 'volume' section"
             )
             return
 
         self.current_target = None
-        self.current_subvolume = BtrbkSubvolume(path=path, line=path_token.line)
+        self.current_subvolume = BtrbkSubvolume(path=path, line=keyword.line)
         self.current_volume.subvolumes.append(self.current_subvolume)
 
-    def _parse_target(self) -> None:
+    #: ``target <type> <url>``: btrbk takes a leading word followed by
+    #: whitespace as the type (``s/^([a-zA-Z_-]+)\s+//``) and accepts
+    #: ``send-receive`` (the default) and ``raw``.
+    _TARGET_TYPE_RE = re.compile(r"^([a-zA-Z_-]+)[ \t\r\f\v]+(.*)$")
+
+    def _parse_target(self, keyword: Token, value: str) -> None:
         """Parse a target section."""
-        path_token = self._current()
-        if path_token.type not in (TokenType.VALUE, TokenType.KEYWORD):
+        if not value:
             self.config.warnings.append(
-                f"Line {path_token.line}: Expected path after 'target'"
+                f"Line {keyword.line}: Expected path after 'target'"
             )
             return
 
         # `target <type> <url>` is btrbk's documented form, and the type token
         # was being taken as the destination: `target send-receive ssh://nas/b`
         # produced a target called "send-receive" and dropped the real URL, so an
-        # imported config silently had nowhere to back up to.
+        # imported config silently had nowhere to back up to. The quotes are
+        # stripped from the URL AFTER the type is split off, as btrbk does.
         target_type = None
-        if path_token.value in ("send-receive", "raw"):
-            following = self._peek_next()
-            if following.type in (
-                TokenType.VALUE,
-                TokenType.KEYWORD,
-            ):
-                target_type = path_token.value
-                self._advance()
-                path_token = self._current()
-
-        path = self._consume_rest_of_line(path_token)
-        target = BtrbkTarget(path=path, line=path_token.line, target_type=target_type)
+        match = self._TARGET_TYPE_RE.match(value)
+        if match and match.group(1) in ("send-receive", "raw"):
+            target_type = match.group(1)
+            value = match.group(2)
+        path = self._unquote(value)
+        target = BtrbkTarget(path=path, line=keyword.line, target_type=target_type)
         self.current_target = target
 
         # Add to current scope
@@ -524,37 +550,16 @@ class BtrbkParser:
             self.current_subvolume.targets.append(target)
         elif self.current_volume is not None:
             self.current_volume.targets.append(target)
-        elif self.current_volume is None and self.current_subvolume is None:
+        else:
             # Global scope: inherited by every subvolume, as btrbk does.
             self.config.global_targets.append(target)
-        else:
-            self.config.warnings.append(
-                f"Line {path_token.line}: 'target' outside of 'volume' or 'subvolume' section"
-            )
 
-    def _parse_option(self, keyword: str) -> None:
-        """Parse an option key-value pair."""
-        # Collect all values until end of line (some options like preserve have multiple values)
-        values = []
-        while not self._is_at_end():
-            token = self._current()
-            if token.type == TokenType.NEWLINE or token.type == TokenType.COMMENT:
-                break
-            if token.type == TokenType.VALUE:
-                values.append(token.value)
-                self._advance()
-            elif token.type == TokenType.KEYWORD:
-                # Could be a value that looks like a keyword (e.g., "yes", "no")
-                values.append(token.value)
-                self._advance()
-            else:
-                break
+    def _parse_option(self, keyword: str, value: str) -> None:
+        """Store an option in the innermost open scope.
 
-        value = " ".join(values)
-
-        # Store in the innermost open scope. Target first: it is the narrowest,
-        # and the inheritance chain further down reads target -> subvolume ->
-        # volume -> global in that order.
+        Target first: it is the narrowest, and the inheritance chain further
+        down reads target -> subvolume -> volume -> global in that order.
+        """
         if self.current_target is not None:
             self.current_target.options[keyword] = value
         elif self.current_subvolume is not None:
@@ -581,10 +586,20 @@ def parse_btrbk_config(content: str) -> BtrbkConfig:
 
 
 def parse_btrbk_retention(value: str) -> dict[str, int]:
-    """Parse btrbk retention format into counts.
+    """Parse a btrbk preserve matrix into this tool's bucket counts.
 
-    btrbk format: "[<hourly>h] [<daily>d] [<weekly>w] [<monthly>m] [<yearly>y]"
-    Example: "14d 4w 6m" means 14 daily, 4 weekly, 6 monthly
+    btrbk format: "[<hourly>h] [<daily>d] [<weekly>w] [<monthly>m] [<yearly>y]".
+
+    btrbk's count is INCLUSIVE: ``14d`` keeps the first snapshot of each of
+    days 0..14 -- fifteen days -- because its scheduler preserves a period
+    while ``delta_days <= 14`` (``schedule()`` in btrbk 0.32.7); the same holds
+    for hours, weeks, months and years. This tool's ``daily = N`` keeps N day
+    buckets. So every count is written one higher than btrbk's number, which
+    keeps at least what btrbk keeps: "14d 4w 6m" becomes daily 15, weekly 5,
+    monthly 7. ``*`` keeps every period (999). btrbk reads the count as a
+    string and tests it for truth: ``0`` disables the period and stays 0;
+    ``00`` is true, enables the period with a bound of 0 and keeps the current
+    period, so it becomes 1.
 
     Args:
         value: btrbk retention string
@@ -614,7 +629,7 @@ def parse_btrbk_retention(value: str) -> dict[str, int]:
     pattern = re.compile(r"(\d+|\*)([hdwmy])")
     for match in pattern.finditer(value):
         count_str, unit = match.groups()
-        count = 999 if count_str == "*" else int(count_str)
+        count = _inclusive_count(count_str)
 
         if unit == "h":
             result["hourly"] = count
@@ -630,20 +645,39 @@ def parse_btrbk_retention(value: str) -> dict[str, int]:
     return result
 
 
+def _inclusive_count(count_str: str) -> int:
+    """One btrbk period count as this tool's bucket count: see
+    ``parse_btrbk_retention``."""
+    if count_str == "*":
+        return 999
+    if count_str == "0":
+        return 0
+    return int(count_str) + 1
+
+
 def _translate_preserve_min(value: str) -> tuple[str, list[str]]:
     """Translate a btrbk ``*_preserve_min`` value into a btrfs-backup-ng retention
     ``min`` duration.
 
-    Two btrbk-vs-btrfs-backup-ng mismatches make a straight passthrough wrong:
+    Three btrbk-vs-btrfs-backup-ng mismatches make a straight passthrough wrong:
 
     * **Unit clash on ``m``.** btrbk retention uses ``m`` for MONTHS, but
       btrfs-backup-ng's duration parser uses ``m`` for minutes and ``M`` for months.
       A btrbk ``3m`` (3 months) passed through verbatim would silently become 3
       *minutes*. We remap ``m`` -> ``M``.
-    * **Special tokens.** btrbk ``no``/``all``/``latest`` are not durations; passed
-      through they produce a ``min`` the loader rejects (fails to load). ``no`` maps
-      cleanly to ``0s`` (no age floor); ``all``/``latest`` have no age equivalent, so
-      we fall back to ``1d`` and warn.
+    * **btrbk's minimum is calendar-granular and inclusive.** ``2d`` keeps a
+      snapshot while ``delta_days <= 2``, where the delta counts whole days
+      from the start of the snapshot's day; at 19:19 on the 23rd that keeps a
+      snapshot from 03:00 on the 21st. ``min = "2d"`` here is exactly 48 hours
+      and would delete it. Written one unit higher (``3d``, 72 hours) the
+      window always contains btrbk's: the start of the Nth period back lies
+      within N+1 whole units of any moment inside the current one. The same
+      holds for hours, weeks, months and years.
+    * **Special tokens.** btrbk ``no``/``all``/``latest`` are not durations. ``no``
+      is no age floor (``0s``); ``latest`` keeps only the latest beyond the
+      schedule, which this project always keeps anyway (``0s``); ``all`` keeps
+      every snapshot (``min = "all"``). A value that is not understood becomes
+      ``"all"`` too, with a warning: never delete on ambiguous input.
 
     Returns ``(min_string, warnings)``.
     """
@@ -652,24 +686,22 @@ def _translate_preserve_min(value: str) -> tuple[str, list[str]]:
     if low in ("no", "none"):
         # No minimum age -- count-based rules apply fully. Faithful 1:1 mapping.
         return "0s", warnings
-    if low in ("all", "latest"):
-        warnings.append(
-            f"btrbk '*_preserve_min {value.strip()}' has no btrfs-backup-ng equivalent "
-            f'(there is no infinite/"keep-latest" minimum age); using min = "1d" -- '
-            f"review the generated [.retention] min"
-        )
-        return "1d", warnings
+    if low == "all":
+        return MIN_KEEP_ALL, warnings
+    if low == "latest":
+        return "0s", warnings
     m = re.fullmatch(r"(\d+)\s*([hdwmy])", low)
     if m:
         count, unit = m.groups()
         # btrbk m=months -> btrfs-backup-ng M=months (h/d/w/y are identical).
         bbng_unit = "M" if unit == "m" else unit
-        return f"{count}{bbng_unit}", warnings
+        return f"{int(count) + 1}{bbng_unit}", warnings
     warnings.append(
         f"btrbk retention minimum {value.strip()!r} was not understood; "
-        f'using min = "1d" -- review the generated [.retention] min'
+        f'using min = "all" (keep every snapshot) until you set it -- review the '
+        f"generated [.retention] min"
     )
-    return "1d", warnings
+    return MIN_KEEP_ALL, warnings
 
 
 def _parse_preserve_counts(value: str) -> tuple[dict[str, int], list[str]]:
@@ -702,78 +734,113 @@ def _parse_preserve_counts(value: str) -> tuple[dict[str, int], list[str]]:
     return counts, warnings
 
 
-def _retention_block(
-    header: str,
-    scope: str,
-    preserve: str | None,
-    preserve_min: str | None,
-    target_preserve: str | None,
-    target_preserve_min: str | None,
-) -> tuple[list[str], list[str]]:
-    """Build a ``[<header>.retention]`` TOML block from btrbk preserve directives.
+_NO_SCHEDULE = {"hourly": 0, "daily": 0, "weekly": 0, "monthly": 0, "yearly": 0}
+_SAFE_SCHEDULE = {"hourly": 24, "daily": 7, "weekly": 4, "monthly": 12, "yearly": 0}
 
-    btrfs-backup-ng has a SINGLE retention policy per scope, so btrbk's separate
-    SNAPSHOT (source) and TARGET (destination) schedules cannot both be represented.
-    We map from ``snapshot_preserve*`` and warn when ``target_preserve*`` differs, so
-    the operator knows the destination schedule was not applied separately.
 
-    ``scope`` is a human-readable label (e.g. ``"the global retention"`` or
-    ``'volume "/mnt/pool/home"'``) embedded in the divergence warnings so that
-    per-volume warnings stay DISTINCT through de-duplication (two subvolumes with
-    the same ``target_preserve`` value must each be reported).
+def _btrbk_policy(
+    preserve: str | None, preserve_min: str | None, scope: str
+) -> tuple[str, dict[str, int], list[str]]:
+    """One btrbk ``*_preserve`` / ``*_preserve_min`` pair as a policy:
+    ``(min, bucket counts, warnings)``, meaning what btrbk means by it.
 
-    Returns ``(toml_lines, warnings)``.
+    btrbk's defaults (``/usr/bin/btrbk:95-98``, 0.32.7): ``*_preserve`` is
+    undefined -- no schedule -- and ``*_preserve_min`` is ``all``. So a btrbk
+    configuration that says nothing about retention keeps EVERY snapshot, on the
+    source and on every target; one with only ``snapshot_preserve 14d`` keeps
+    every snapshot too, because the minimum still defaults to ``all``. Both are
+    written that way (``min = "all"``). A schedule with no minimum-age window is
+    all-zero buckets. The one pair this tool cannot express faithfully is no
+    schedule with a minimum of a day or less -- the prune refuses such a policy
+    as degenerate -- and that keeps the default schedule instead, which keeps
+    MORE than btrbk would, and says so.
     """
-    lines = [f"[{header}.retention]"]
     warnings: list[str] = []
-
     if preserve_min is not None:
         min_str, w = _translate_preserve_min(preserve_min)
         warnings += w
     else:
-        min_str = "1d"
-    lines.append("min = " + toml_str(min_str))
-
+        min_str = MIN_KEEP_ALL
     if preserve is not None:
         counts, w = _parse_preserve_counts(preserve)
         warnings += w
     else:
-        # btrfs-backup-ng defaults when btrbk specified no snapshot_preserve.
-        counts = {"hourly": 24, "daily": 7, "weekly": 4, "monthly": 12, "yearly": 0}
+        counts = dict(_NO_SCHEDULE)
+    # The same test the prune's degenerate-policy guard applies
+    # (cli.prune.is_degenerate_policy): no buckets and a minimum of a day or less.
+    if (
+        min_str != MIN_KEEP_ALL
+        and not any(counts.values())
+        and parse_duration(min_str) <= timedelta(days=1)
+    ):
+        counts = dict(_SAFE_SCHEDULE)
+        warnings.append(
+            f"{scope}: btrbk keeps no schedule and a minimum of {min_str}; that "
+            f"policy prunes to the latest snapshot and btrfs-backup-ng refuses it, "
+            f"so the default schedule (24 hourly, 7 daily, 4 weekly, 12 monthly) is "
+            f"used instead, which keeps more -- review the generated [.retention]"
+        )
+    return min_str, counts, warnings
+
+
+def _retention_block(
+    header: str, scope: str, preserve: str | None, preserve_min: str | None
+) -> tuple[list[str], list[str]]:
+    """A ``[<header>.retention]`` TOML block for one btrbk policy pair.
+
+    The source policy (``snapshot_preserve*``) goes in the global or volume
+    block; each target's own (``target_preserve*``) goes in that target's
+    ``[volumes.targets.retention]``, since this project has per-target
+    retention. Returns ``(toml_lines, warnings)``.
+    """
+    min_str, counts, warnings = _btrbk_policy(preserve, preserve_min, scope)
+    directive = "target" if header.endswith("targets") else "snapshot"
+    origin = ", ".join(
+        f"{directive}_{name} {value.strip()}"
+        for name, value in (("preserve", preserve), ("preserve_min", preserve_min))
+        if value is not None
+    )
+    lines = [f"[{header}.retention]"]
+    if origin:
+        lines.append(f"# btrbk: {origin}")
+        if _raises_a_number(preserve, preserve_min):
+            lines.append(INCLUSIVE_NOTE_COMMENT)
+    lines.append("min = " + toml_str(min_str))
     for key in ("hourly", "daily", "weekly", "monthly", "yearly"):
         lines.append(f"{key} = {counts[key]}")
-
-    # Divergence warnings compare the PARSED policy (so reordered-but-equal token
-    # lists don't warn) and state accurately what was actually used -- the source
-    # schedule, or the defaults when no snapshot_preserve was present.
-    if target_preserve is not None and (
-        preserve is None or parse_btrbk_retention(target_preserve) != counts
-    ):
-        used = (
-            "snapshot_preserve was used"
-            if preserve is not None
-            else "the default retention was used"
-        )
-        warnings.append(
-            f"btrbk 'target_preserve {target_preserve}' sets a destination schedule "
-            f"that differs from the source; btrfs-backup-ng uses one retention per "
-            f"volume, so it was NOT applied separately -- {used} for {scope}"
-        )
-    if target_preserve_min is not None:
-        target_min, _ = _translate_preserve_min(target_preserve_min)
-        if target_min != min_str:
-            used = (
-                "snapshot_preserve_min was used"
-                if preserve_min is not None
-                else "the default minimum was used"
-            )
-            warnings.append(
-                f"btrbk 'target_preserve_min {target_preserve_min}' differs from the "
-                f"source minimum; btrfs-backup-ng uses one retention minimum -- "
-                f"{used} for {scope}"
-            )
-
     return lines, warnings
+
+
+#: The comment written above a retention block whose numbers were raised by
+#: one, and (as ``INCLUSIVE_NOTE``) said once per import.
+INCLUSIVE_NOTE_COMMENT = (
+    "# counts and minimum are one higher than btrbk's: its N keeps periods "
+    "0..N and its minimum is inclusive"
+)
+INCLUSIVE_NOTE = (
+    "Retention counts and minimums are written one higher than btrbk's "
+    'numbers (14d -> daily = 15, snapshot_preserve_min 2d -> min = "3d"): '
+    "btrbk's count N keeps the first snapshot of each of periods 0..N, and its "
+    "minimum N keeps the whole Nth calendar unit back, so the imported policy "
+    "keeps at least what btrbk keeps. Weekly, monthly and yearly buckets start "
+    "on ISO Monday and on the first of the month and year here, where btrbk "
+    "starts them on preserve_day_of_week; the first snapshot of a week can "
+    "therefore differ."
+)
+
+
+def _raises_a_number(preserve: str | None, preserve_min: str | None) -> bool:
+    """Whether this pair contains a btrbk number the import writes one higher:
+    a period count other than ``*`` and ``0``, or an ``N<unit>`` minimum."""
+    if preserve is not None and any(
+        count not in ("*", "0")
+        for count, _unit in re.findall(r"(\*|\d+)([hdwmy])", preserve.lower())
+    ):
+        return True
+    return bool(
+        preserve_min is not None
+        and re.fullmatch(r"\s*\d+\s*[hdwmy]\s*", preserve_min.lower())
+    )
 
 
 def _is_disabled(value: object) -> bool:
@@ -841,8 +908,6 @@ def convert_to_toml(btrbk_config: BtrbkConfig) -> tuple[str, list[str]]:
         "the global retention",
         g.get("snapshot_preserve"),
         g.get("snapshot_preserve_min"),
-        g.get("target_preserve"),
-        g.get("target_preserve_min"),
     )
     lines.extend(global_ret_lines)
     warnings.extend(global_ret_warnings)
@@ -913,10 +978,6 @@ def convert_to_toml(btrbk_config: BtrbkConfig) -> tuple[str, list[str]]:
                     or btrbk_config.global_options.get("snapshot_preserve"),
                     sub_preserve_min
                     or btrbk_config.global_options.get("snapshot_preserve_min"),
-                    subvolume.options.get("target_preserve")
-                    or volume.options.get("target_preserve"),
-                    subvolume.options.get("target_preserve_min")
-                    or volume.options.get("target_preserve_min"),
                 )
                 lines.extend(sub_ret_lines)
                 warnings.extend(sub_ret_warnings)
@@ -1265,7 +1326,39 @@ def convert_to_toml(btrbk_config: BtrbkConfig) -> tuple[str, list[str]]:
                             )
                         )
 
+                # The target's own retention, from btrbk's target_preserve and
+                # target_preserve_min resolved at the narrowest scope that sets
+                # them. btrbk keeps every backup on a target that sets neither
+                # (target_preserve_min defaults to "all"), so every target gets
+                # a block: without one it would inherit the SOURCE schedule and
+                # the first prune would delete backups btrbk was keeping.
+                # Looked up raw: btrbk's `no` is a real value here
+                # (target_preserve_min no = no minimum age), not "unset".
+                def preserve_option(name: str) -> str | None:
+                    for scope_options in (
+                        target.options,
+                        subvolume.options,
+                        volume.options,
+                        btrbk_config.global_options,
+                    ):
+                        if scope_options.get(name) is not None:
+                            return scope_options[name]
+                    return None
+
+                target_lines, target_warnings = _retention_block(
+                    "volumes.targets",
+                    f"target {target_path}",
+                    preserve_option("target_preserve"),
+                    preserve_option("target_preserve_min"),
+                )
                 lines.append("")
+                lines.extend(target_lines)
+                warnings.extend(target_warnings)
+
+                lines.append("")
+
+    if INCLUSIVE_NOTE_COMMENT in lines:
+        warnings.append(INCLUSIVE_NOTE)
 
     # Options btrbk understands that this project has no equivalent for. They
     # were in the lexer's keyword set -- so they never looked unknown -- stored,

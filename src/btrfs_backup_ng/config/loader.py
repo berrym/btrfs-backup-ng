@@ -458,6 +458,7 @@ def _parse_email_notification(data: dict[str, Any]) -> EmailNotificationConfig:
         to_addrs=data.get("to_addrs", []),
         on_success=data.get("on_success", False),
         on_failure=data.get("on_failure", True),
+        timeout=data.get("timeout", EmailNotificationConfig.timeout),
     )
 
 
@@ -567,6 +568,7 @@ _KNOWN_EMAIL_KEYS = {
     "to_addrs",
     "on_success",
     "on_failure",
+    "timeout",
 }
 _KNOWN_WEBHOOK_KEYS = {
     "enabled",
@@ -605,6 +607,7 @@ _KNOWN_TARGET_KEYS = {
     "gpg_recipient",
     "gpg_keyring",
     "openssl_cipher",
+    "skip_remote_lock",
 }
 _KNOWN_SNAPPER_KEYS = {"config_name", "include_types", "exclude_cleanup", "min_age"}
 

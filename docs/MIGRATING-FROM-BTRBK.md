@@ -98,13 +98,14 @@ volume /mnt/btr_pool
     target /mnt/backup/home
 ```
 
-**btrfs-backup-ng** uses explicit TOML:
+**btrfs-backup-ng** uses explicit TOML (the numbers are one higher than btrbk's, which are
+inclusive; see [Retention Policy Mapping](#retention-policy-mapping)):
 
 ```toml
 [global.retention]
-min = "2d"
-daily = 14
-weekly = 4
+min = "3d"
+daily = 15
+weekly = 5
 
 [[volumes]]
 path = "/mnt/btr_pool/home"
@@ -115,35 +116,72 @@ path = "/mnt/backup/home"
 
 ### Retention Policy Mapping
 
-btrbk's retention syntax can be confusing. Here's how it maps:
+btrbk's retention syntax can be confusing. Here's how it maps. **Every btrbk number is
+written one higher**, because btrbk's numbers are inclusive: `snapshot_preserve 14d` keeps the
+first snapshot of each of days 0..14 (fifteen days), and `snapshot_preserve_min 2d` keeps a
+snapshot for the whole of the second calendar day back, at any time of day. `daily = 15` and
+`min = "3d"` keep at least that.
 
 | btrbk | btrfs-backup-ng | Notes |
 |-------|-----------------|-------|
-| `snapshot_preserve_min 2d` | `min = "2d"` | Minimum retention period |
-| `snapshot_preserve 24h` | `hourly = 24` | Hourly snapshots to keep |
-| `snapshot_preserve 14d` | `daily = 14` | Daily snapshots to keep |
-| `snapshot_preserve 4w` | `weekly = 4` | Weekly snapshots to keep |
-| `snapshot_preserve 6m` | `monthly = 6` | **Monthly** — btrbk's `m` is *months* |
-| `snapshot_preserve 2y` | `yearly = 2` | Yearly snapshots to keep |
-| `snapshot_preserve_min 3m` | `min = "3M"` | btrbk `m` (months) → btrfs-backup-ng `M`; note the case (`m` alone is *minutes*) |
-| `snapshot_preserve_min no` | `min = "0s"` | No age floor — count rules apply fully |
-| `target_preserve` / `target_preserve_min` | *(warned)* | See note below |
+| `snapshot_preserve_min 2d` | `min = "3d"` | Minimum retention period. btrbk keeps while `delta_days <= 2`, counted from the start of the snapshot's day; 72 hours contains that window from any time of day |
+| `snapshot_preserve 24h` | `hourly = 25` | Hourly snapshots to keep: btrbk keeps hours 0..24 |
+| `snapshot_preserve 14d` | `daily = 15` | Daily snapshots to keep: btrbk keeps days 0..14 |
+| `snapshot_preserve 4w` | `weekly = 5` | Weekly snapshots to keep: btrbk keeps weeks 0..4 |
+| `snapshot_preserve 6m` | `monthly = 7` | **Monthly** — btrbk's `m` is *months*; months 0..6 |
+| `snapshot_preserve 2y` | `yearly = 3` | Yearly snapshots to keep: years 0..2 |
+| `snapshot_preserve 0d` | `daily = 0` | btrbk reads the count as a string and tests it for truth: `0` disables the period; `00` is true and keeps the current period, so `00d` becomes `daily = 1` |
+| `snapshot_preserve_min 3m` | `min = "4M"` | btrbk `m` (months) → btrfs-backup-ng `M`; note the case (`m` alone is *minutes*) |
+| `snapshot_preserve_min all`, or **no `snapshot_preserve_min` at all** | `min = "all"` | Keep every snapshot, for ever. `all` is btrbk's **default**: a btrbk config that sets only a schedule keeps everything, and so does the imported one |
+| `snapshot_preserve_min latest` | `min = "0s"` | btrbk keeps the newest snapshot beyond the schedule; this tool always keeps the latest |
+| `target_preserve_min no` | `min = "0s"` | No age floor — count rules apply fully |
+| `snapshot_preserve *m` | `monthly = 999` | `*` = keep every snapshot of that period |
+| `target_preserve` / `target_preserve_min` | `[volumes.targets.retention]` | Each target gets its **own** retention block, resolved at the narrowest btrbk scope that sets it (target, subvolume, volume, global) |
+| *(no `target_preserve_min`)* | `[volumes.targets.retention] min = "all"` | btrbk's default for a target: keep every backup |
 
-> **`target_preserve` is not applied separately.** btrbk lets the destination keep a
-> *different* schedule than the source (`target_preserve` vs `snapshot_preserve`).
-> btrfs-backup-ng uses **one** retention policy per volume, so the importer maps from
-> `snapshot_preserve*` and **emits a warning** when `target_preserve*` differs, rather than
-> silently applying only one. If your source and destination schedules differed, review the
-> generated `[…].retention` and adjust.
+> **Retention is per source and per target, as in btrbk.** The source policy
+> (`snapshot_preserve*`) lands in `[global.retention]` or `[volumes.retention]`; each target's
+> policy (`target_preserve*`) lands in that target's `[volumes.targets.retention]`. A target
+> that sets neither keeps every backup, exactly as btrbk's `target_preserve_min all` default
+> does.
 >
-> **Directives with no equivalent are warned, not dropped silently.** `preserve_day_of_week`
-> and `preserve_hour_of_day` (which anchor btrbk retention to a specific weekday/hour) have no
-> btrfs-backup-ng counterpart; the importer warns that they were dropped. A `snapshot_preserve`
-> value it cannot parse (e.g. `latest`) is also warned rather than silently becoming a
+> **A minimum this tool cannot prune under is kept as more, and said.** btrbk with no schedule
+> and a minimum of a day or less (`target_preserve_min no`, `snapshot_preserve_min latest`)
+> keeps only the newest snapshot; this tool refuses a policy that prunes to the latest snapshot
+> as a misconfiguration, so the importer writes the default schedule there instead and warns
+> that it keeps **more** than btrbk did. A minimum it does not understand becomes `min = "all"`
+> with a warning: nothing is deleted on ambiguous input.
+>
+> **The imported numbers are one higher than btrbk's, and the file says so.** Each generated
+> retention block is preceded by a comment naming the btrbk lines it came from, and by the
+> one-higher rule where a number was raised; the import's messages state the rule once. A
+> minimum written one unit higher always contains btrbk's window: btrbk keeps while
+> `delta_days <= N`, counting whole days from the start of the snapshot's day (from the hour,
+> week, month or year for the other units), and the start of the Nth period back lies within
+> N+1 whole units of any moment in the current one. A count written one higher keeps one more
+> period than btrbk's 0..N. Measured against btrbk 0.32.7 at every hour of the day, on every
+> day of the week and in four time zones: the imported minimum and the hourly and daily
+> counts never delete a snapshot btrbk keeps.
+>
+> **Where the kept snapshot can still differ: the start of a week, month or year.** btrbk's
+> weeks start on `preserve_day_of_week` (Sunday unless set), its months and years on the
+> first such weekday, and its days at `preserve_hour_of_day`; the weekly, monthly and yearly
+> buckets here are ISO weeks (Monday), calendar months and calendar years, and days start at
+> midnight. The first snapshot of a btrbk week is its Sunday snapshot; the first of the ISO
+> week is Monday's. With more than one snapshot a week the two tools therefore keep the same
+> number of weekly, monthly and yearly representatives but not always the same ones, and a
+> Sunday snapshot btrbk keeps as a week's first can be pruned here once it leaves the daily
+> buckets and the minimum. The importer warns that `preserve_day_of_week` and
+> `preserve_hour_of_day` are not carried. Where a particular old snapshot must survive, pin it
+> with `snapshot_preserve *w` (`weekly = 999`) before migrating, or raise the daily count to
+> cover the span.
+>
+> **Directives with no equivalent are warned, not dropped silently.** A `snapshot_preserve`
+> value the importer cannot parse (e.g. `latest`) is warned rather than silently becoming a
 > keep-nothing policy. **Always review the importer's warnings** after a migration.
 
 **Important**: btrfs-backup-ng uses a simpler mental model:
-1. `min` - Keep everything for at least this duration
+1. `min` - Keep everything for at least this duration (`"all"`: for ever, whatever the buckets say)
 2. Time buckets (hourly, daily, weekly, monthly, yearly) - Keep N snapshots per bucket, keeping
    the **oldest** snapshot in each bucket (the same first-of-interval representative btrbk uses)
 
@@ -605,10 +643,12 @@ volume /mnt/btr_pool
 snapshot_dir = ".snapshots"
 
 [global.retention]
-min = "2d"
-daily = 14
-weekly = 4
-monthly = 6
+# btrbk: snapshot_preserve 14d 4w 6m, snapshot_preserve_min 2d
+# counts and minimum are one higher than btrbk's: its N keeps periods 0..N and its minimum is inclusive
+min = "3d"
+daily = 15
+weekly = 5
+monthly = 7
 
 [[volumes]]
 path = "/mnt/btr_pool/home"
@@ -617,22 +657,53 @@ snapshot_prefix = "home-"
 [[volumes.targets]]
 path = "/mnt/backup/home"
 
+[volumes.targets.retention]
+# btrbk: target_preserve 14d 4w 6m, target_preserve_min 2d
+# counts and minimum are one higher than btrbk's: its N keeps periods 0..N and its minimum is inclusive
+min = "3d"
+daily = 15
+weekly = 5
+monthly = 7
+
 [[volumes.targets]]
 path = "ssh://backup@nas:/backups/home"
 ssh_key = "/root/.ssh/backup_key"
 ssh_sudo = true
+
+[volumes.targets.retention]
+# btrbk: target_preserve 14d 4w 6m, target_preserve_min 2d
+# counts and minimum are one higher than btrbk's: its N keeps periods 0..N and its minimum is inclusive
+min = "3d"
+daily = 15
+weekly = 5
+monthly = 7
 
 [[volumes]]
 path = "/mnt/btr_pool/var/log"
 snapshot_prefix = "var-log-"
 
 [volumes.retention]
-daily = 7
-weekly = 2
+# btrbk: snapshot_preserve 7d 2w, snapshot_preserve_min 2d   (the global minimum, inherited)
+# counts and minimum are one higher than btrbk's: its N keeps periods 0..N and its minimum is inclusive
+min = "3d"
+daily = 8
+weekly = 3
 
 [[volumes.targets]]
 path = "/mnt/backup/var-log"
+
+[volumes.targets.retention]
+# btrbk: target_preserve 14d 4w 6m, target_preserve_min 2d
+# counts and minimum are one higher than btrbk's: its N keeps periods 0..N and its minimum is inclusive
+min = "3d"
+daily = 15
+weekly = 5
+monthly = 7
 ```
+
+Had the btrbk configuration set no `target_preserve_min`, every `[volumes.targets.retention]`
+above would read `min = "all"`: btrbk keeps every backup on such a target, and so does the
+imported configuration.
 
 ## Getting Help
 

@@ -4,6 +4,7 @@ Extracted from __main__.py for modularity and reuse.
 """
 
 import contextlib
+import functools
 import logging
 import os
 import shlex
@@ -15,7 +16,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Optional
 
-from .. import __util__
+from .. import __util__, lifecycle
 from ..endpoint.raw_metadata import StructureVerdict
 from ..transaction import log_transaction
 from .transfer import DEFAULT_STALL_TIMEOUT, DEFAULT_TRANSFER_TIMEOUT
@@ -99,6 +100,37 @@ def send_snapshot(
     resume_transfer_id: Optional[str] = None,
 ) -> Optional[str]:
     """Send a snapshot to destination endpoint using btrfs send/receive.
+
+    Every process the transfer starts -- the send, any compressor or throttle,
+    the receive, the ssh carrying the stream -- runs inside one process scope.
+    The caller holds the destination's receive lock and the pins on the source
+    and parent around this call; if the transfer fails or is interrupted
+    (Ctrl-C included), the scope stops those processes and waits for them
+    BEFORE the exception reaches the caller's releases. A lock or pin let go
+    while a stream is still being written protects nothing.
+    """
+    with lifecycle.process_scope():
+        return _send_snapshot(
+            snapshot,
+            destination_endpoint,
+            parent=parent,
+            clones=clones,
+            options=options,
+            chunked_manager=chunked_manager,
+            resume_transfer_id=resume_transfer_id,
+        )
+
+
+def _send_snapshot(
+    snapshot,
+    destination_endpoint,
+    parent=None,
+    clones=None,
+    options=None,
+    chunked_manager: Optional[ChunkedTransferManager] = None,
+    resume_transfer_id: Optional[str] = None,
+) -> Optional[str]:
+    """The transfer itself; see ``send_snapshot``.
 
     Args:
         snapshot: Source snapshot to send
@@ -1579,6 +1611,15 @@ def destination_artifact_exists(destination_endpoint, name: str) -> bool:
     backup that was not ours and the safe answer under uncertainty is to leave it
     alone.
     """
+    # A destination that lands each receive in a slot of its own (the snapper
+    # layout's receiver) answers for itself: its endpoint path moves between
+    # this probe and the cleanup, so a path derived here would name a
+    # different place later.
+    # Looked up on the TYPE: a test double built from MagicMock answers every
+    # attribute with a callable, and would otherwise be asked a question it
+    # never meant to answer.
+    if callable(getattr(type(destination_endpoint), "_artifact_preexists", None)):
+        return bool(destination_endpoint._artifact_preexists(name))
     try:
         base = str(destination_endpoint.config["path"]).rstrip("/")
         expected = f"{base}/{name}"
@@ -1630,6 +1671,18 @@ def _cleanup_partial_local_subvolume(
 
     from ..endpoint.raw import RawEndpoint
 
+    # A receiver that owns the place it received into removes exactly that
+    # place and nothing else. The snapper layout's receiver points the
+    # endpoint at ``.snapshots/<n>.incoming`` for a receive and back at the
+    # config's subvolume afterwards, so a path built here from the endpoint's
+    # current path and the snapshot's name (``<subvolume>/<name>``) could name
+    # a directory of the operator's, outside ``.snapshots``, and this function
+    # would have deleted it.
+    if callable(getattr(type(destination_endpoint), "_cleanup_partial_local", None)):
+        destination_endpoint._cleanup_partial_local(
+            name, created_by_this_run=created_by_this_run
+        )
+        return
     if getattr(destination_endpoint, "_is_remote", False):
         return
     if isinstance(destination_endpoint, RawEndpoint):
@@ -1661,6 +1714,22 @@ def _cleanup_partial_local_subvolume(
     except Exception as cleanup_e:
         # Best-effort: never let a cleanup problem mask the original transfer error.
         logger.debug("Partial local-subvolume cleanup failed: %s", cleanup_e)
+
+
+def _cleanup_this_runs_partial(
+    destination_endpoint, name: str, *, created_by_this_run: bool
+) -> None:
+    """What a failed transfer left at a local or raw destination, removed.
+
+    The one undo for a transfer that did not complete, whether it failed or was
+    interrupted: the partial local subvolume at ``name`` if this run created it,
+    and the raw ``.part`` this run wrote. A no-op for an ssh:// destination,
+    which undoes its own receive inside its receive lock.
+    """
+    _cleanup_partial_local_subvolume(
+        destination_endpoint, name, created_by_this_run=created_by_this_run
+    )
+    _cleanup_partial_raw_stream(destination_endpoint)
 
 
 def _cleanup_partial_remote_subvolume(
@@ -1962,12 +2031,28 @@ def _execute_transfers(
         invalid_artifact = False
         try:
             logger.info("Starting transfer of %s", best_snapshot)
-            send_snapshot(
-                best_snapshot,
-                destination_endpoint,
-                parent=parent,
-                options=options or {},
-            )
+            # A transfer that ends any way but a transfer error (handled
+            # below) -- Ctrl-C, SIGTERM or SIGHUP, an unexpected exception --
+            # also removes the partial it left at a local or raw destination.
+            # Left there, a local partial sits at the snapshot's own name and
+            # every later run refuses to remove what was there before it
+            # started. An ssh:// destination does this inside its receive
+            # lock (SSHEndpoint.receiving_lock).
+            with lifecycle.undo_on_failure(
+                functools.partial(
+                    _cleanup_this_runs_partial,
+                    destination_endpoint,
+                    best_snapshot.get_name(),
+                    created_by_this_run=not preexisting,
+                ),
+                unless=(__util__.SnapshotTransferError,),
+            ):
+                send_snapshot(
+                    best_snapshot,
+                    destination_endpoint,
+                    parent=parent,
+                    options=options or {},
+                )
             # The receive exited 0 and the commit held. What did it leave?
             # Recorded for every transfer; only ``invalid`` fails one. A check
             # that cannot even run is ``unverifiable``: the data has landed,
@@ -2018,12 +2103,11 @@ def _execute_transfers(
             # completed backup. Local btrfs and raw (whose distinct-per-run stream
             # file would otherwise be re-listed as a phantom backup) are cleaned
             # here; SSH btrfs endpoints clean their own partials during transfer.
-            _cleanup_partial_local_subvolume(
+            _cleanup_this_runs_partial(
                 destination_endpoint,
                 best_snapshot.get_name(),
                 created_by_this_run=not preexisting,
             )
-            _cleanup_partial_raw_stream(destination_endpoint)
             if invalid_artifact:
                 # A remote btrfs endpoint cleans its own partials only when its
                 # transfer fails; an invalid artifact after a transfer that
@@ -2033,6 +2117,30 @@ def _execute_transfers(
                     best_snapshot.get_name(),
                     created_by_this_run=not preexisting,
                 )
+        except BaseException:
+            # Anything else that ends the transfer -- Ctrl-C, a signal turned
+            # into SystemExit, an error no handler above names -- propagates,
+            # but not with the pins still on the source. A restore's pin on a
+            # backup location outlives the process otherwise, and blocks that
+            # location's prune until someone runs --unlock.
+            if release_on_failure:
+                logger.info(
+                    "Releasing the pin on %s: the transfer did not finish.",
+                    best_snapshot,
+                )
+                try:
+                    source_endpoint.set_lock(best_snapshot, destination_id, False)
+                    if parent:
+                        source_endpoint.set_lock(
+                            parent, destination_id, False, parent=True
+                        )
+                except Exception as release_error:  # noqa: BLE001 - the cause wins
+                    logger.warning(
+                        "Could not release the pin on %s: %s",
+                        best_snapshot,
+                        release_error,
+                    )
+            raise
 
     # Report honestly: a "complete!" banner must not print when a transfer failed.
     if result.failed:
@@ -2318,36 +2426,86 @@ def _enumerate_snapper_btrfs_backups(destination_endpoint) -> list:
     """Received snapper backups on a BTRFS destination, each carrying its ``received_uuid``,
     read from ``.snapshots/{num}/snapshot`` (local or over ssh). A SINGLE privileged shell
     pass emits ``<num> <received_uuid>`` for every numeric slot holding a ``snapshot``
-    subvolume with a real Received UUID -- one sudo call (not O(N) subprocesses) that degrades
-    to fewer/no backups on any failure (a missing match simply re-sends its source, which is
-    safe). NEVER raises: an ssh/permission/timeout failure returns what was parsed so far.
+    subvolume with a real Received UUID -- one sudo call, not O(N) subprocesses.
+
+    A listing that could not be made RAISES ``SnapshotTransferError``; it never reads as
+    "no backups". An empty answer here makes every source look unsent: a backup would
+    re-send them all as full streams into new slots, and a restore would find nothing to
+    restore. The script therefore ends by printing ``END``, and output without it -- the
+    shell never ran, sudo was refused, the account's login shell rejected the command --
+    is a failure, as is a ``.snapshots`` directory that exists but cannot be entered. A
+    missing ``.snapshots`` is a destination with no backups yet.
+
+    One slot whose subvolume cannot be read is left out with a warning (its source is
+    re-sent, which is safe); when no slot at all can be read, that is the listing
+    failing, and it raises.
     """
     snap_dir = f"{str(destination_endpoint.config['path']).rstrip('/')}/.snapshots"
+    quoted = shlex.quote(snap_dir)
     script = (
-        f"cd {shlex.quote(snap_dir)} 2>/dev/null || exit 0; "
+        # No negated bracket (`*[!0-9]*`): the command line is parsed by the
+        # account's login shell first, and csh/tcsh read `!0` as a history
+        # reference -- the whole command failed before sh ran. Digits are
+        # checked one character at a time instead.
+        'bbng_digits() { bbng_t=$1; [ -n "$bbng_t" ] || return 1; '
+        'while [ -n "$bbng_t" ]; do case $bbng_t in [0123456789]*) bbng_t=${bbng_t#?};; '
+        "*) return 1;; esac; done; return 0; }; "
+        f"if [ -e {quoted} ]; then cd {quoted} 2>/dev/null || {{ echo NOENTER; exit 0; }}; "
+        "else echo END; exit 0; fi; "
         "for n in */; do n=${n%/}; "
-        'case "$n" in ""|*[!0-9]*) continue ;; esac; '
+        'bbng_digits "$n" || continue; '
         '[ -e "$n/snapshot" ] || continue; '
-        f'ru=$({_snapper_btrfs(destination_endpoint)} subvolume show "$n/snapshot" 2>/dev/null '
-        '| sed -n "s/.*Received UUID:[[:space:]]*//p" | head -1); '
-        '[ -n "$ru" ] && [ "$ru" != "-" ] && printf "%s %s\\n" "$n" "$ru"; '
-        "done"
+        f'if show=$({_snapper_btrfs(destination_endpoint)} subvolume show "$n/snapshot" 2>/dev/null); then '
+        'ru=$(printf "%s\\n" "$show" | sed -n "s/.*Received UUID:[[:space:]]*//p" | head -1); '
+        'if [ -n "$ru" ] && [ "$ru" != "-" ]; then printf "%s %s\\n" "$n" "$ru"; fi; '
+        'else printf "? %s\\n" "$n"; fi; '
+        "done; echo END"
     )
     rc, out = _snapper_run_shell(destination_endpoint, script)
+    lines = out.split("\n")
+    host = destination_endpoint.config.get("hostname")
+    where = f"{snap_dir} on {host}" if host else snap_dir
+    if "NOENTER" in lines:
+        raise __util__.SnapshotTransferError(
+            f"Could not read the snapper backups in {where}: the directory exists but "
+            f"cannot be entered by the account running this. Refusing to treat that as "
+            f"'no backups', which would re-send every snapshot in full."
+        )
+    if rc != 0 or "END" not in lines:
+        raise __util__.SnapshotTransferError(
+            f"Could not list the snapper backups in {where} (exit {rc}). Refusing to "
+            f"treat a failed listing as 'no backups', which would re-send every "
+            f"snapshot in full. Run with --debug for the underlying error."
+        )
     backups: list = []
-    if rc == 0:
-        base = str(destination_endpoint.config["path"])
-        for line in out.split("\n"):
-            parts = line.split()
-            if len(parts) == 2 and parts[0].isdigit():
-                backups.append(
-                    _SnapperBtrfsBackup(
-                        int(parts[0]),
-                        parts[1],
-                        base=base,
-                        endpoint=destination_endpoint,
-                    )
+    unreadable: list[str] = []
+    base = str(destination_endpoint.config["path"])
+    for line in lines:
+        parts = line.split()
+        if len(parts) == 2 and parts[0] == "?" and parts[1].isdigit():
+            unreadable.append(parts[1])
+        elif len(parts) == 2 and parts[0].isdigit():
+            backups.append(
+                _SnapperBtrfsBackup(
+                    int(parts[0]),
+                    parts[1],
+                    base=base,
+                    endpoint=destination_endpoint,
                 )
+            )
+    if unreadable and not backups:
+        raise __util__.SnapshotTransferError(
+            f"Could not read any snapper backup in {where}: `btrfs subvolume show` "
+            f"failed for every slot ({', '.join(unreadable)}). Refusing to treat that "
+            f"as 'no backups', which would re-send every snapshot in full."
+        )
+    if unreadable:
+        logger.warning(
+            "Could not read the snapper backup(s) in slot(s) %s of %s; their sources "
+            "will be sent again rather than matched.",
+            ", ".join(unreadable),
+            where,
+        )
     return backups
 
 
@@ -2578,7 +2736,7 @@ def _snapper_info_xml_bytes(snapper_snapshot) -> Optional[bytes]:
     return info_xml_src.read_bytes()
 
 
-def _write_info_xml(destination_endpoint, slot_dir: str, content: bytes) -> None:
+def _write_info_xml(destination_endpoint, slot_dir: str, content: bytes) -> bool:
     """Write ``content`` as ``{slot_dir}/info.xml`` on the destination.
 
     The one writer for a snapper slot's metadata, in both directions: a backup
@@ -2588,10 +2746,11 @@ def _write_info_xml(destination_endpoint, slot_dir: str, content: bytes) -> None
     publishes the slot carries its metadata with it and no published slot is
     ever without.
 
-    Soft-fail by design: the snapshot itself is intact, and info.xml is
-    descriptive metadata. What was lost is said, so a later "listed without a
-    description" or "snapper does not show the restored slot" is traceable to
-    here rather than looking like a second bug.
+    Returns whether the file was written. A failure is logged here, with what
+    it means, and reported to the caller: the layout does not publish a slot
+    without its info.xml, because snapper does not list such a slot and a
+    restore that ended with one reported success for a copy snapper could
+    not see.
     """
     is_remote = getattr(destination_endpoint, "_is_remote", False)
     try:
@@ -2611,6 +2770,7 @@ def _write_info_xml(destination_endpoint, slot_dir: str, content: bytes) -> None
             # would have succeeded. That rule lives in __util__._privileged_fs.
             __util__.privileged_write_bytes(Path(slot_dir) / "info.xml", content)
         logger.debug("Placed info.xml at %s", slot_dir)
+        return True
     except Exception as e:
         logger.warning(
             "Failed to place info.xml at %s: %s. The snapshot itself is intact; "
@@ -2620,6 +2780,7 @@ def _write_info_xml(destination_endpoint, slot_dir: str, content: bytes) -> None
             slot_dir,
             e,
         )
+        return False
 
 
 def _cleanup_snapper_backup(destination_endpoint, snapshot_num, is_raw) -> None:
@@ -2650,11 +2811,36 @@ def _cleanup_snapper_backup(destination_endpoint, snapshot_num, is_raw) -> None:
     _snapper_run_shell(destination_endpoint, script)
 
 
+def _local_snapper_writer_lock(destination_endpoint, subject: str):
+    """The snapper layout's writer lock for a LOCAL btrfs destination, or a
+    no-op for a raw or remote one.
+
+    A remote target has the per-slot receive lock its lock store gives it; a
+    local one had nothing, so two ``snapper backup`` runs into one target
+    both opened slot n and the second removed the first's in-flight
+    ``.incoming`` as a crashed run's leftover. The lock is the one a restore
+    into a config holds (``SnapperLayout.writer_lock``): one writer at a time
+    below a ``.snapshots`` tree, whichever direction it writes in.
+    """
+    import contextlib
+
+    from ..endpoint.raw import RawEndpoint
+
+    if isinstance(destination_endpoint, RawEndpoint) or getattr(
+        destination_endpoint, "_is_remote", False
+    ):
+        return contextlib.nullcontext()
+    from .layout import SnapperLayout
+
+    return SnapperLayout(destination_endpoint).writer_lock(subject)
+
+
 def send_snapper_snapshot(
     snapper_snapshot,
     destination_endpoint,
     parent_snapper_snapshot=None,
     options: dict | None = None,
+    writer_lock_held: bool = False,
 ) -> None:
     """Send a snapper snapshot to a destination endpoint.
 
@@ -2669,9 +2855,13 @@ def send_snapper_snapshot(
         destination_endpoint: Destination Endpoint (its config["path"] is the base)
         parent_snapper_snapshot: Optional parent for incremental transfer
         options: Transfer options (compress, show_progress, rate_limit)
+        writer_lock_held: The caller already holds the destination's writer
+            lock for a longer span (``sync_snapper_snapshots`` holds it for
+            the whole sync); otherwise it is taken here around the slot.
 
     Raises:
-        SnapshotTransferError: If transfer fails
+        SnapshotTransferError: If transfer fails, or another process is
+            writing snapper backups into this destination.
     """
     from ..endpoint.raw import RawEndpoint
 
@@ -2681,6 +2871,26 @@ def send_snapper_snapshot(
     snapshot_num = snapper_snapshot.number
     is_raw = isinstance(destination_endpoint, RawEndpoint)
     base_path = str(destination_endpoint.config["path"])
+    if not writer_lock_held:
+        try:
+            held = _local_snapper_writer_lock(
+                destination_endpoint, f"Snapper backup into {base_path}"
+            )
+            held.__enter__()
+        except RuntimeError as e:
+            raise __util__.SnapshotTransferError(
+                f"{e}. Nothing was sent to {base_path}."
+            ) from e
+        try:
+            return send_snapper_snapshot(
+                snapper_snapshot,
+                destination_endpoint,
+                parent_snapper_snapshot=parent_snapper_snapshot,
+                options=options,
+                writer_lock_held=True,
+            )
+        finally:
+            held.__exit__(None, None, None)
 
     # Presence/skip is decided by the caller via correspondence (received_uuid for btrfs, name
     # for raw) -- NOT the snapper number, which is reused after a prune. So there is no
@@ -2950,6 +3160,7 @@ def sync_snapper_snapshots(
     destination_endpoint,
     snapper_config=None,
     options: dict | None = None,
+    select=None,
 ) -> int:
     """Synchronize snapper snapshots to a destination.
 
@@ -2967,6 +3178,11 @@ def sync_snapper_snapshots(
         destination_endpoint: Destination Endpoint (its config["path"] is the backup base)
         snapper_config: Optional SnapperSourceConfig with filtering options
         options: Additional transfer options
+        select: Optional ``(missing) -> list | None``: given the eligible
+            snapper snapshots the destination does not hold, the subset to
+            plan; None plans all of them. ``run`` passes one that leaves out
+            what the destination's own retention would delete straight after
+            the transfer (``cli.run._snapper_catch_up_selector``).
 
     Returns:
         Number of snapshots transferred (on full success).
@@ -3006,13 +3222,40 @@ def sync_snapper_snapshots(
 
     logger.info("Found %d snapper snapshot(s) to consider", len(snapper_snapshots))
 
+    # One writer into a local target for the whole sync: what the destination
+    # holds is read once below, and every slot this run opens is decided from
+    # that reading. A second sync started meanwhile is refused with the reason.
+    base_path = str(destination_endpoint.config["path"])
+    try:
+        held = _local_snapper_writer_lock(
+            destination_endpoint, f"Snapper backup into {base_path}"
+        )
+        held.__enter__()
+    except RuntimeError as e:
+        raise __util__.SnapshotTransferError(
+            f"{e}. Nothing was sent to {base_path}."
+        ) from e
+    try:
+        return _sync_snapper_snapshots_locked(
+            destination_endpoint, snapper_snapshots, options, select
+        )
+    finally:
+        held.__exit__(None, None, None)
+
+
+def _sync_snapper_snapshots_locked(
+    destination_endpoint, snapper_snapshots: list, options: dict, select
+) -> int:
+    """The body of ``sync_snapper_snapshots``, with the destination's writer
+    lock held for a local target."""
+
     # Decide skip + parent by CORRESPONDENCE via the shared planner (received_uuid for btrfs,
     # name for raw) instead of the brittle snapper-number scan: a recycled snapper number gets
     # a new uuid, so it is correctly "absent" and re-sent; and snapper->raw now gets
     # incrementals. Each snapper snapshot is wrapped as a uuid-enriched Snapshot; the planner
     # also projects in-run transfers, so a fresh full history is a tight incremental chain
     # (P3b-1), not all-full sends.
-    from .planning import plan_transfer_sequence
+    from .planning import plan_transfer_sequence, snapshots_present_on
 
     wrappers = [
         _create_snapper_snapshot_wrapper(s, destination_endpoint)
@@ -3022,7 +3265,25 @@ def sync_snapper_snapshots(
         w.get_name(): s for w, s in zip(wrappers, snapper_snapshots)
     }
     dest_view = _snapper_dest_view(destination_endpoint)
-    plan = plan_transfer_sequence(wrappers, dest_view)
+    only = None
+    if select is not None:
+        # The same presence authority the planner uses (correspondence), so
+        # "missing" here is what the planner would send.
+        present = snapshots_present_on(wrappers, dest_view)
+        missing = [
+            snapper_by_wrapper_name[w.get_name()]
+            for w in wrappers
+            if w.get_name() not in present
+        ]
+        chosen = select(missing)
+        if chosen is not None:
+            chosen_ids = {id(s) for s in chosen}
+            only = [
+                w
+                for w in wrappers
+                if id(snapper_by_wrapper_name[w.get_name()]) in chosen_ids
+            ]
+    plan = plan_transfer_sequence(wrappers, dest_view, only=only)
 
     if not plan:
         logger.info("All snapper snapshots already backed up")
@@ -3061,6 +3322,7 @@ def sync_snapper_snapshots(
                 destination_endpoint,
                 parent_snapper_snapshot=parent,
                 options=options,
+                writer_lock_held=True,
             )
             result.transferred.append(snap)
             transferred_names.add(w.get_name())

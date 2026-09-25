@@ -10,7 +10,7 @@ These options can be used with any command:
 -h, --help          Show help message and exit
 -V, --version       Show version and exit
 -c, --config FILE   Path to configuration file
--v, --verbose       Increase output verbosity (can be repeated: -vv)
+-v, --verbose       Show debug output on the console
 -q, --quiet         Suppress non-essential output
 --debug             Enable debug output
 --btrfs-debug       Run btrfs send and receive with -vv and log every line they
@@ -937,7 +937,7 @@ btrfs-backup-ng snapper restore SOURCE [CONFIG] [OPTIONS]
 | `--ssh-key FILE` | SSH private key file |
 | `--ssh-auth-sock PATH` | Explicit ssh-agent socket (overrides auto-discovery; useful under `sudo`) |
 | `--ssh-host-key-policy {accept-new,strict}` | Host-key verification policy (default `accept-new`) |
-| `--skip-remote-lock` | Do not pin the backup on its location for the duration of the restore; for a location you can read but not write |
+| `--skip-remote-lock` | Proceed when the pin on the backup cannot be recorded on its location (a remote lock directory or a local lock file); for a location you can read but not write. A medium mounted read-only needs it not: no pin is asked for there |
 | `--gpg-keyring PATH` | GPG keyring to decrypt an encrypted raw snapper backup (must match the keyring it was encrypted for) |
 | `--openssl-cipher CIPHER` | OpenSSL cipher fallback for a legacy raw backup whose `.meta` sidecar does not record one (modern sidecars are authoritative) |
 | `--json` | Output in JSON format (for `--list`) |
@@ -1422,6 +1422,11 @@ SSH ControlMaster sockets are created in an unpredictable, private (0700) direct
 multiplexed connection to your backup host. The internal command lock and the raw+ssh remote
 metadata write likewise avoid predictable, symlink-plantable paths.
 
+The command lock (`btrfs-backup-ng-<uid>/command.lock` under `$XDG_RUNTIME_DIR` or the temp
+directory) is left in place after a run, deliberately. It is an `flock`, which excludes by
+inode: removing the file while another process waits on it would let that process and a
+newcomer each hold a lock on a different file at the same path, and both would proceed.
+
 > **Upgrade note:** `raw+ssh://` targets now set an explicit `accept-new` policy (previously they
 > inherited the ambient SSH default, which under batch mode accidentally refused unknown hosts).
 > If you relied on that refuse-unknown behavior, set `ssh_host_key_policy = "strict"`.
@@ -1435,7 +1440,7 @@ metadata write likewise avoid predictable, symlink-plantable paths.
 | `BTRFS_BACKUP_SUDO_PASSWORD` | Sudo password for remote hosts (avoids interactive prompt) |
 | `BTRFS_BACKUP_SSH_PASSWORD` | Enable SSH password authentication |
 | `BTRFS_BACKUP_PASSWORDLESS_ONLY` | Only use passwordless sudo (fail if password required) |
-| `BTRFS_BACKUP_LOG_LEVEL` | Override log level (DEBUG, INFO, WARNING, ERROR) |
+| `BTRFS_BACKUP_LOG_LEVEL` | Console log level when nothing else says (DEBUG, INFO, WARNING, ERROR). The lowest-precedence source: `--debug`/`--btrfs-debug`/`-q`/`-v` win over it, and `[global] quiet`/`verbose`/`btrfs_debug` in the configuration win over it too. Any other value is ignored, with a warning. |
 | `SSH_AUTH_SOCK` | SSH agent socket (preserve with `sudo -E`) |
 
 ---

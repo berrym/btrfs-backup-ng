@@ -34,7 +34,7 @@ from ..notifications import (
 from ..notifications import (
     NotificationConfig as NotifConfig,
 )
-from ..retention import RetentionError
+from ..retention import RetentionError, extract_timestamp
 from ..transaction import set_transaction_log
 from .common import (
     apply_config_verbosity,
@@ -42,6 +42,7 @@ from .common import (
     get_log_level,
     get_timestamp_format,
     should_show_progress,
+    snapper_destination_options,
     space_options_from_args,
     thread_raw_compression,
     thread_raw_encryption,
@@ -54,6 +55,7 @@ from .prune import (
     is_degenerate_policy,
     plan_endpoint_retention,
     plan_retention_of,
+    plan_snapper_retention_of,
 )
 
 logger = logging.getLogger(__name__)
@@ -170,6 +172,10 @@ def execute_run(args: argparse.Namespace) -> int:
         logger.error("Configuration error: %s", e)
         return 1
 
+    # The configuration's quiet/verbose applies from here on -- before the
+    # line announcing the log file, which used to be the one INFO line printed
+    # under `quiet = true` after the configuration had been read.
+    apply_config_verbosity(args, config)
     # Enable file logging if configured
     if config.global_config.log_file:
         add_file_handler(config.global_config.log_file)
@@ -179,6 +185,8 @@ def execute_run(args: argparse.Namespace) -> int:
         # went to the console only -- an operator running from cron or systemd
         # with log_file set had a log that silently omitted every config
         # warning, which is the one place they would look afterwards.
+    # Applied again with the file handler in place, so the shared logger's
+    # floor accounts for the file's level (the call is idempotent).
     apply_config_verbosity(args, config)
     for warning in warnings:
         logger.warning("Config: %s", warning)
@@ -919,22 +927,12 @@ def _backup_snapper_volume(
                 **(space_options or {}),
             }
 
-            # Route the destination through the endpoint layer (local/ssh/raw),
-            # threading the target's SSH options so ssh:// / raw+ssh:// honor them.
-            snapper_endpoint_config: dict[str, Any] = {
-                "path": target.path,
-                "snap_prefix": "",
-                "timestamp_format": get_timestamp_format(config),
-            }
-            # A global setting, so it is threaded here rather than by the
-            # per-target helper. Without this the key loads, validates and does
-            # nothing -- the shape of defect this project keeps finding.
-            snapper_endpoint_config["transfer_stall_timeout"] = (
-                config.global_config.transfer_stall_timeout
+            # Route the destination through the endpoint layer (local/ssh/raw)
+            # with the options every command opens a snapper destination with,
+            # so `prune` later sees exactly the backups this run wrote.
+            snapper_endpoint_config = snapper_destination_options(
+                config, target, compress_override
             )
-            thread_ssh_target_config(snapper_endpoint_config, target)
-            thread_raw_encryption(snapper_endpoint_config, target)
-            thread_raw_compression(snapper_endpoint_config, target, compress_override)
             destination_endpoint = endpoint.choose_endpoint(
                 target.path, snapper_endpoint_config
             )
@@ -951,6 +949,13 @@ def _backup_snapper_volume(
                 destination_endpoint,
                 snapper_config=snapper_config,
                 options=options,
+                select=_snapper_catch_up_selector(
+                    volume,
+                    config,
+                    target,
+                    snapper_endpoint_config,
+                    destination_endpoint,
+                ),
             )
 
             stats["completed"] += transferred
@@ -1115,12 +1120,125 @@ def _catch_up_selector(
             )
             return None
         kept = {id(s) for s in to_keep}
-        chosen = [s for s in missing if id(s) in kept]
-        left_out = [s.get_name() for s in missing if id(s) not in kept]
+        get_id = getattr(destination_endpoint, "get_id", None)
+        destination_id = get_id() if callable(get_id) else None
+
+        def pinned_for_this_target(snap) -> bool:
+            # A lock this destination holds on the source snapshot is a
+            # transfer that did not finish. Only a completed transfer releases
+            # it (and a prune then deletes the copy as before); left out here
+            # it would never be released, and the source would keep the
+            # snapshot for ever with "Skipping locked snapshot" every run.
+            if destination_id is None:
+                return False
+            return destination_id in getattr(snap, "locks", ()) or (
+                destination_id in getattr(snap, "parent_locks", ())
+            )
+
+        def dated(snap) -> bool:
+            # The planner sends nothing it cannot order by time unless asked
+            # for it by name. A selection IS such an ask, so an undated
+            # subvolume in the snapshot directory -- kept by retention as
+            # unparseable -- must not be turned into a full send by being
+            # selected here. The plan without a selection leaves it out.
+            # Dated by the listing's rule, the one the retention above used.
+            return extract_timestamp(snap.get_name(), prefix, ts_format) is not None
+
+        chosen = [
+            s
+            for s in missing
+            if (id(s) in kept or pinned_for_this_target(s)) and dated(s)
+        ]
+        chosen_ids = {id(s) for s in chosen}
+        left_out = [
+            s.get_name() for s in missing if id(s) not in chosen_ids and dated(s)
+        ]
         if left_out:
             logger.info(
                 "Not sending %d of %d missing snapshot(s) to %s: the target's "
                 "retention would delete them straight after the transfer (%s).",
+                len(left_out),
+                len(missing),
+                target_config.path,
+                ", ".join(left_out),
+            )
+        return chosen
+
+    return select
+
+
+def _snapper_catch_up_selector(
+    volume: VolumeConfig,
+    config: Config,
+    target_config: TargetConfig,
+    endpoint_config: dict[str, Any],
+    destination_endpoint: Any = None,
+):
+    """What ``run`` sends a snapper target that is behind: what its prune keeps.
+
+    The snapper twin of ``_catch_up_selector``. ``run`` prunes each snapper
+    destination straight after transferring to it, with the target's own
+    policy, over the backups' info.xml dates (``_prune_snapper_after_transfer``
+    -> ``plan_snapper_retention``). A destination that has been away is
+    missing a backlog of snapper snapshots, and sending all of it means
+    sending snapshots that are neither the newest nor the oldest of their
+    time bucket only for the prune to delete them. So the same decision the
+    prune makes (``plan_snapper_retention_of``) is asked first, of the
+    destination's backups plus the snapshots it is missing, and only the
+    missing ones it keeps are sent; the planner then chains each against the
+    newest earlier snapshot the destination holds or receives in this run.
+    The destination ends up holding exactly what it would have held had
+    everything been sent and pruned.
+
+    Returns a ``select`` for ``sync_snapper_snapshots``, or None to send
+    everything: under a policy the prune refuses (degenerate -- it would
+    delete nothing, so nothing may be left out), and whenever the decision
+    cannot be made -- the destination cannot be enumerated, the policy is
+    invalid -- because leaving out a snapshot the prune would have kept loses
+    history.
+    """
+    retention = config.get_target_retention(volume, target_config)
+    if is_degenerate_policy(retention):
+        return None
+
+    def select(missing: list):
+        from ..core.restore import list_snapper_backups, snapper_layout_present
+
+        if len(missing) < 2:
+            return None
+        try:
+            # A destination that exists but has no .snapshots yet holds no
+            # backups: the first backup to it is a catch-up like any other.
+            # The enumeration refuses to call an absent layout "empty" (it is
+            # a restore-side reader), so it is asked only when there is one.
+            if destination_endpoint is not None and not snapper_layout_present(
+                destination_endpoint
+            ):
+                held: list = []
+            else:
+                held = list_snapper_backups(target_config.path, endpoint_config)
+        except Exception as e:  # noqa: BLE001 - cannot decide, so send everything
+            logger.debug(
+                "Catch-up: could not enumerate snapper backups at %s (%s); sending all",
+                target_config.path,
+                e,
+            )
+            return None
+        try:
+            to_keep, _ = plan_snapper_retention_of(held + list(missing), retention)
+        except Exception as e:  # noqa: BLE001 - cannot decide, so send everything
+            logger.debug(
+                "Catch-up: retention not decidable for %s (%s)", target_config.path, e
+            )
+            return None
+        kept = {id(s) for s in to_keep}
+        chosen = [s for s in missing if id(s) in kept]
+        left_out = [str(s.number) for s in missing if id(s) not in kept]
+        if left_out:
+            logger.info(
+                "Not sending %d of %d missing snapper snapshot(s) to %s: the "
+                "target's retention would delete them straight after the "
+                "transfer (%s).",
                 len(left_out),
                 len(missing),
                 target_config.path,

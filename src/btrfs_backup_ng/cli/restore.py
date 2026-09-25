@@ -27,6 +27,7 @@ from ..core.restore import (
 )
 from .common import (
     apply_config_verbosity,
+    apply_configured_verbosity,
     btrfs_debug_enabled,
     get_fs_checks_mode,
     get_log_level,
@@ -50,6 +51,10 @@ def execute_restore(args: argparse.Namespace) -> int:
     """
     log_level = get_log_level(args)
     create_logger(False, level=log_level)
+    # The location modes read the configuration for a target's options and a
+    # timestamp_format; its quiet/verbose applies to them too. The --volume
+    # modes load it again below and apply again, which is idempotent.
+    apply_configured_verbosity(args)
 
     # --in-place is NOT implemented, and the command refuses rather than
     # proceed as if it were. Accepting the flag and running the ordinary
@@ -705,6 +710,9 @@ def _prepare_backup_endpoint(args: argparse.Namespace, source: str):
     # Create endpoint - for restore, backup location needs to be set as "path"
     # (not "source") because list_snapshots() uses config["path"]
     # The source=False means the path will be stored in config["path"]
+    # A restore reads the backup location; the bookkeeping tree a destination
+    # gets is not created there (a read-only medium must serve as a source).
+    endpoint_kwargs["create_tree"] = False
     backup_ep = endpoint.choose_endpoint(
         source,
         endpoint_kwargs,
@@ -936,12 +944,10 @@ def _execute_status(args: argparse.Namespace) -> int:
     if not backup_endpoint.persists_locks:
         print("This target does not persist locks.")
         print()
-        print("Locks on a local raw:// target are held in memory for the duration of")
-        print("a single run, so nothing is written here. An interrupted run leaves")
-        print("nothing behind to inspect or unlock.")
-        print()
-        print("ssh:// and raw+ssh:// targets DO persist locks, on the target itself,")
-        print("and report them here.")
+        print("Its pins are held in memory for the duration of a single run, so")
+        print("nothing is written here and an interrupted run leaves nothing behind")
+        print("to inspect or unlock. Local, ssh://, raw:// and raw+ssh:// locations")
+        print("all persist their pins on the location itself and report them here.")
         return 0
 
     # Read through the endpoint rather than rebuilding the path here. The
@@ -1010,6 +1016,7 @@ def _execute_status(args: argparse.Namespace) -> int:
 
     # List snapshots for reference, under the prefix this location actually
     # uses -- reporting 0 for a location holding backups reads as data loss.
+    snapshots: list[Any] = []
     try:
         snapshots, inferred = _list_for_display(backup_endpoint)
         if inferred:
@@ -1019,7 +1026,112 @@ def _execute_status(args: argparse.Namespace) -> int:
     except Exception as e:
         logger.warning("Could not list snapshots: %s", e)
 
+    # A snapper backup location holds numbered slots (.snapshots/<n>/snapshot)
+    # or sidecar-named streams, not prefix-named snapshots, so the listing
+    # above is 0 for it however many backups it holds -- the same "0 for a
+    # location holding backups" this command is not allowed to print. Those
+    # backups are enumerated the way `snapper restore --list` enumerates them
+    # and reported with the pins a running snapper restore holds on them.
+    _print_snapper_backups(source, backup_endpoint, args, locks, snapshots)
+
     return 0
+
+
+def _snapper_endpoint_options(args: argparse.Namespace) -> dict[str, Any]:
+    """The restore command's connection options in the shape the snapper
+    enumeration (``list_snapper_backups``) takes: the same options
+    ``snapper restore`` threads, so a location written with ``--ssh-sudo`` is
+    read back with it and the enumeration is of what is there."""
+    options: dict[str, Any] = {}
+    if getattr(args, "ssh_sudo", False):
+        options["ssh_sudo"] = True
+    if getattr(args, "skip_remote_lock", None):
+        options["skip_remote_lock"] = True
+    if btrfs_debug_enabled(args):
+        options["btrfs_debug"] = True
+    if getattr(args, "ssh_key", None):
+        options["ssh_identity_file"] = args.ssh_key
+        options["ssh_key"] = args.ssh_key
+    if getattr(args, "ssh_auth_sock", None):
+        options["ssh_auth_sock"] = args.ssh_auth_sock
+    if getattr(args, "ssh_host_key_policy", None):
+        options["ssh_host_key_policy"] = args.ssh_host_key_policy
+    if getattr(args, "gpg_keyring", None):
+        options["gpg_keyring"] = args.gpg_keyring
+    if getattr(args, "openssl_cipher", None):
+        options["openssl_cipher"] = args.openssl_cipher
+    return options
+
+
+def _snapper_pin_key(backup: dict) -> str:
+    """The name under which a snapper restore pins this backup on its location:
+    the engine's key for a numbered slot is ``snapshot-<n>``, for a raw stream
+    its own file name (``core.operations._SnapperBtrfsBackup.get_name``,
+    ``RawSnapshot``)."""
+    name = backup.get("backup_name")
+    if name:
+        return str(name)
+    return f"snapshot-{backup.get('number')}"
+
+
+def _print_snapper_backups(
+    source: str,
+    backup_endpoint: Any,
+    args: argparse.Namespace,
+    locks: dict[str, Any],
+    prefix_snapshots: list[Any],
+) -> None:
+    """Report the snapper backups at ``source`` and the pins held on them.
+
+    Prints nothing for a location with no snapper layout. A layout that is
+    there but cannot be enumerated is reported as exactly that, never as
+    zero backups.
+    """
+    from ..core.restore import list_snapper_backups, snapper_layout_present
+
+    if not snapper_layout_present(backup_endpoint):
+        return
+    try:
+        backups = list_snapper_backups(source, _snapper_endpoint_options(args))
+    except Exception as e:
+        print()
+        print(f"Snapper backups: the layout at {source} could not be enumerated ({e}).")
+        print("This is NOT a report of zero backups; resolve the error before")
+        print("treating this location as empty.")
+        return
+
+    print()
+    print(f"Snapper backups: {len(backups)}")
+    if not prefix_snapshots:
+        print("(This location holds snapper backups, numbered by snapshot, rather")
+        print(" than prefix-named snapshots; list and restore them with")
+        print(" `btrfs-backup-ng snapper restore --list <source>`.)")
+    if not backups:
+        return
+    print()
+    pinned_total = 0
+    for backup in backups:
+        metadata = backup.get("metadata")
+        date = getattr(metadata, "date", None)
+        when = date.strftime("%Y-%m-%d %H:%M:%S") if date else "date unknown"
+        kind = getattr(metadata, "type", None) or "?"
+        description = getattr(metadata, "description", None) or ""
+        lock_info = locks.get(_snapper_pin_key(backup), {}) if locks else {}
+        pins = list(lock_info.get("locks", [])) + list(
+            lock_info.get("parent_locks", [])
+        )
+        line = f"  {backup.get('number'):>6}  {kind:<6}  {when:<19}  {description[:30]}"
+        if pins:
+            pinned_total += 1
+            line += "  pinned: " + ", ".join(pins)
+        print(line.rstrip())
+    if pinned_total:
+        print()
+        print(
+            f"{pinned_total} snapper backup(s) are pinned by a restore in progress "
+            f"(or one that did not finish); retention does not delete a pinned "
+            f"backup. Unlock a finished session with restore --unlock."
+        )
 
 
 def _execute_unlock(args: argparse.Namespace, lock_id: str) -> int:
@@ -1051,8 +1163,8 @@ def _execute_unlock(args: argparse.Namespace, lock_id: str) -> int:
     if not backup_endpoint.persists_locks:
         print("This target does not persist locks, so there is nothing to unlock.")
         print()
-        print("Locks on a local raw:// target are held in memory for the duration of")
-        print("a single run, so an interrupted run leaves nothing behind to clear.")
+        print("Its pins are held in memory for the duration of a single run, so an")
+        print("interrupted run leaves nothing behind to clear.")
         return 0
 
     # Same endpoint API as --status, for the same reason.

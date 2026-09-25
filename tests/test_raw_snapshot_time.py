@@ -33,11 +33,41 @@ ZONE = "America/New_York"
 
 @pytest.fixture
 def eastern(monkeypatch):
+    """The process in US Eastern for one test, and back to whatever it was.
+
+    The teardown used to delete TZ and call tzset: when the suite runs under
+    an explicit zone (TZ=UTC is the gate), that left the process in the
+    machine's own zone for every test after this file, which is exactly the
+    setting the gate exists to rule out. ``undo`` puts TZ back to its previous
+    state -- set or absent -- and tzset makes the process follow it.
+    """
     monkeypatch.setenv("TZ", ZONE)
     time.tzset()
     yield
-    monkeypatch.delenv("TZ", raising=False)
+    monkeypatch.undo()
     time.tzset()
+
+
+def test_the_zone_is_put_back_after_the_fixture(monkeypatch):
+    """Drives the fixture by hand: the process zone after it is the one
+    before it, with TZ set (the gate) and with TZ absent."""
+    import os
+
+    for previous in ("UTC", None):
+        if previous is None:
+            monkeypatch.delenv("TZ", raising=False)
+        else:
+            monkeypatch.setenv("TZ", previous)
+        time.tzset()
+        before = time.tzname
+        inner = pytest.MonkeyPatch()
+        gen = eastern.__wrapped__(inner)
+        next(gen)
+        assert os.environ.get("TZ") == ZONE
+        with pytest.raises(StopIteration):
+            next(gen)
+        assert os.environ.get("TZ") == previous
+        assert time.tzname == before
 
 
 def _raw(name, created):

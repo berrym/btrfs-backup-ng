@@ -143,48 +143,39 @@ class TestTheCapabilityMatchesTheBehaviour:
             assert "restore:s1" in snapshot.locks
 
 
-class TestATargetThatNeverPersistsLocks:
-    """Only local raw:// is still in this category; ssh:// and raw+ssh:// left it."""
+class TestARawLocationPersistsItsPins:
+    """Local raw:// was the last endpoint whose pins lived only in the process
+    that took them, so a prune in another process could delete the stream a
+    restore was reading, and --status said "does not persist locks" for it.
+    Its pins now live in the location's lock store, and the reporting
+    commands read them there like everywhere else."""
 
-    @pytest.mark.parametrize("cls", [RawEndpoint])
-    def test_status_says_so_instead_of_reporting_zero_locks(
-        self, cls, tmp_path, capsys
-    ):
-        with patch.object(
-            restore_cli,
-            "_prepare_backup_endpoint",
-            lambda a, s: _endpoint(cls, tmp_path),
-        ):
+    def _pinned(self, tmp_path):
+        ep = _endpoint(RawEndpoint, str(tmp_path))
+        snapshot = SimpleNamespace(
+            locks=set(), parent_locks=set(), get_name=lambda: "home-1.btrfs"
+        )
+        ep.set_lock(snapshot, "restore:s1", True)
+        return ep
+
+    def test_status_reports_the_pin(self, tmp_path, capsys):
+        ep = self._pinned(tmp_path)
+        with patch.object(restore_cli, "_prepare_backup_endpoint", lambda a, s: ep):
             rc = restore_cli._execute_status(_args(tmp_path))
         out = capsys.readouterr().out
         assert rc == 0
-        assert "does not persist locks" in out
-        assert "No active locks found" not in out, "a false all-clear"
+        assert "does not persist locks" not in out
+        assert "Restore locks" in out and "s1" in out
+        assert "No active locks found" not in out
 
-    @pytest.mark.parametrize("cls", [RawEndpoint])
-    def test_unlock_says_so_instead_of_nothing_to_unlock(self, cls, tmp_path, capsys):
-        with patch.object(
-            restore_cli,
-            "_prepare_backup_endpoint",
-            lambda a, s: _endpoint(cls, tmp_path),
-        ):
+    def test_unlock_clears_the_pin(self, tmp_path, capsys):
+        ep = self._pinned(tmp_path)
+        with patch.object(restore_cli, "_prepare_backup_endpoint", lambda a, s: ep):
             rc = restore_cli._execute_unlock(_args(tmp_path), "all")
         out = capsys.readouterr().out
         assert rc == 0
-        assert "does not persist locks" in out
-        assert "No lock file found" not in out
-
-    def test_a_remote_str_path_does_not_raise_a_typeerror(self, tmp_path, capsys):
-        """The production shape: an SSH endpoint's config['path'] is a str, which
-        is what the CLI's own `path / name` could not handle."""
-        ep = _endpoint(SSHEndpoint, str(tmp_path))  # str, as SSH endpoints keep it
-        ep._lock_manager = lambda: _local_manager(tmp_path)
-        with patch.object(restore_cli, "_prepare_backup_endpoint", lambda a, s: ep):
-            with patch.object(restore_cli, "list_remote_snapshots", lambda e: []):
-                rc = restore_cli._execute_status(_args("ssh://nas:/backups/home"))
-        out = capsys.readouterr().out
-        assert rc == 0
-        assert "unsupported operand" not in out
+        assert "does not persist locks" not in out
+        assert ep._read_locks() == {}
 
 
 class TestATargetThatDoesPersistLocks:

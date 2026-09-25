@@ -5,6 +5,343 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **`min = "all"` in a retention block** keeps every snapshot in that scope
+  for ever: retention deletes nothing there, whatever the bucket counts or
+  `keep` say. It is btrbk's `snapshot_preserve_min all`, and btrbk's
+  default. Accepted at every scope (`[global.retention]`,
+  `[volumes.retention]`, `[volumes.source_retention]`,
+  `[volumes.targets.retention]`), inherited like any other key, and not
+  a degenerate policy.
+
+### Changed
+
+- **Ctrl-C no longer releases every pin at once.** Since 0.9.5 a SIGINT
+  handler released all of a run's pins and locks the moment Ctrl-C arrived,
+  before the interrupted operation had unwound and while any other thread's
+  transfer was still writing under them -- a `kill -INT` of a multi-target
+  run freed the receive locks of transfers that went on writing. Ctrl-C is
+  now Python's own interrupt: each operation stops its own child processes,
+  waits for them, and then releases its own locks and pins as it unwinds, and
+  what is left is released as the program exits. A transfer on another
+  thread keeps its locks until it finishes. The pins are still released
+  before the program exits; they are no longer released before the work
+  under them has stopped.
+
+### Fixed
+
+- **`config import` kept less than btrbk did.** Three faults in one command,
+  each silent, each first noticed by a prune that deleted history btrbk was
+  keeping. The lexer discarded any character it had no class for, so
+  `snapshot_preserve 14d 8w *m` was read as `14d 8w m` and the `*m` (keep
+  every monthly snapshot) became no monthly snapshots; a leading `~` in a
+  path vanished the same way. A missing `snapshot_preserve_min` was written
+  as `min = "1d"` and a missing `snapshot_preserve` as this tool's default
+  buckets, while btrbk's defaults are no schedule and a minimum of `all`: a
+  btrbk configuration that says nothing about retention keeps everything.
+  And `target_preserve` / `target_preserve_min` were dropped with a warning
+  that this tool "uses one retention per volume", which has not been true
+  since retention became per target. Now a directive's value is the rest of
+  its line, verbatim, as btrbk reads it; an absent or `all` minimum is
+  `min = "all"`; `latest` and `no` are `0s`; a minimum the importer does not
+  understand is `all` with a warning; each target's `target_preserve*`,
+  resolved at the narrowest scope that sets it, becomes that target's own
+  `[volumes.targets.retention]`, and a target that sets neither keeps every
+  backup, as btrbk does. The one shape this tool cannot prune under -- no
+  schedule and a minimum of a day or less, which in btrbk keeps only the
+  newest snapshot -- gets the default schedule with a warning that it keeps
+  more. An unterminated quote no longer swallows the rest of the file.
+  btrbk's numbers are inclusive -- `snapshot_preserve 14d` keeps the first
+  snapshot of each of days 0..14, fifteen days, and `snapshot_preserve_min
+  2d` keeps a snapshot for the whole of the second calendar day back -- so
+  every count and every `N<unit>` minimum is written one higher (`daily =
+  15`, `min = "3d"`), which keeps at least what btrbk keeps; `0` still
+  disables a period and `00`, true to btrbk, keeps the current one. Each
+  generated retention block names the btrbk lines it came from and the
+  one-higher rule, and the import says the rule once. Measured against
+  btrbk 0.32.7 live, at every hour of the day and day of the week in four
+  zones: the minimum and the hourly and daily counts never delete a
+  snapshot btrbk keeps. The migration guide describes the mapping and the
+  one remaining difference: btrbk starts weeks on `preserve_day_of_week`
+  and months and years on the first such weekday, this tool on ISO Monday
+  and the first of the month, so the first snapshot of a week can differ.
+- **A `raw+ssh://` receive could stall on its own stderr.** The pipeline
+  that writes the stream over ssh was started with a stderr pipe nobody
+  read, so an ssh that said more than the 64 KiB pipe holds blocked, and
+  the stall detector reported a transfer that stopped moving. The chunked
+  `ssh://` receive read its stderr only after the process had exited, the
+  same fault one step later. Both are now drained as they are written, like
+  every other process an endpoint starts; a structural test over the
+  endpoint modules refuses any new `Popen(stderr=PIPE)` without a drain,
+  and a flood test per endpoint class proves the drain.
+- **`restore --status` reported "Available snapshots: 0" for a location
+  holding snapper backups.** Snapper backups are numbered slots, not
+  prefix-named snapshots, so the prefix listing was empty however many
+  backups the location held. The status now lists the snapper backups the
+  way `snapper restore --list` does, with the pins a snapper restore holds
+  on each, and says when the layout is there but could not be enumerated
+  rather than printing zero.
+- **`prune` did not prune snapper destinations.** A snapper destination
+  holds numbered slots, not prefix-named snapshots, so `prune` listed it
+  through the native endpoint, found nothing, reported "Keeping 0, deleting
+  0" and deleted nothing -- while `run` pruned the same destination after
+  transferring. `prune` now makes the same decision `run` makes
+  (`plan_snapper_retention`, each target under its own policy, the
+  destination opened with the same connection, encryption and compression
+  options) and carries out the same deletion (`delete_snapper_backups`),
+  local, `ssh://`, `raw://` and `raw+ssh://` alike. `--dry-run` lists the
+  slots it would delete, with their dates, and deletes nothing; the
+  confirmation prompt shows them the same way. The source is snapper's own
+  timeline and is not pruned, as before. This is a behaviour change for a
+  `prune` run on a snapper volume: it now deletes what `run` would.
+- **The configuration wizards replaced options they had not asked about.**
+  The carry-over that saves a wizard's answers over an existing file worked
+  from one fixed list of "asked" keys per wizard, while the wizards ask
+  conditionally. Declining "Configure global settings?" in `config detect
+  --wizard` replaced `snapshot_dir`, `timestamp_format`, `incremental`, the
+  parallel counts, the retention policy, `log_file` and the notifications
+  with defaults; a `raw+ssh://` target lost its `ssh_sudo` (the sudo
+  question is asked only for `ssh://`) and a target outside `/mnt` its
+  `require_mount`; a snapper volume re-entered through `config init -i`
+  became native and lost `[volumes.snapper]`; webhook headers and timeouts
+  were dropped; two volumes sharing a path collapsed into one; `--force`
+  skipped the carry-over along with the question; a changed answer was not
+  reported; and the diff summary compared the wizard's raw answers instead
+  of what would be written. Each wizard now records, as it prompts, which
+  keys it asked -- per volume and per target, with the snapper question
+  covering only the config name -- and everything else in the existing file
+  is kept, over any default the wizard wrote for it. Volumes and targets
+  are matched by path in order of occurrence; a changed answer is reported
+  with both values; `--force` skips only the question; the diff summary
+  reads the configuration that would be saved.
+- **Snapper backup and restore: seven edges.** After one snapshot's receive
+  failed and a later one's publish failed, the engine's cleanup of the
+  partial derived a path from the endpoint's current path and the copy's
+  name -- by then the config's subvolume, so `<subvolume>/snapshot-<n>`,
+  outside `.snapshots` -- and would have deleted a directory of the
+  operator's under that name; the snapper layout's receiver now removes
+  exactly the slot it opened and nothing else. A pin that could not be
+  written to a location's lock FILE aborted the restore, so a backup medium
+  mounted read-only could not be a snapper restore source and
+  `--skip-remote-lock` did not cover that store: the flag covers it, and a
+  read-only location proceeds without the pin and says so. That is one rule
+  for every pin writer -- the lock file of a local btrfs location and the
+  lock directory of `raw://`, `ssh://` and `raw+ssh://` alike: a location
+  whose filesystem is mounted read-only cannot have anything deleted from
+  it, so the pin protects against nothing and is not taken. Read-only is
+  decided from the kernel's mount table together with a failed write
+  attempt, by exit status, never from a tool's message; a location that
+  merely refuses the write keeps the refusal and its opt-out. A restore's
+  source got this tool's bookkeeping tree
+  (`.btrfs-backup-ng/`) created under it -- on a dry run too -- and it no
+  longer does. Two `snapper backup` runs into one local target both opened
+  slot n and the second removed the first's in-flight `.incoming`; the
+  backup direction now holds the same writer lock a restore holds
+  (`.snapshots/.btrfs-backup-ng.restore.lock`), for the whole sync, and a
+  second writer is refused with the reason. A regular file named like a
+  slot in `.snapshots` made the restore's publish ask for the same number a
+  thousand times; the number is now occupied by any entry named like a
+  slot, and a number that stands still is refused with the entry named.
+  `--dry-run` took the config's writer lock and created its file; it now
+  creates nothing. A pin stayed on the backup when the send died of
+  anything but the transfer error the executor expected (Ctrl-C included);
+  it is released for every kind of failure.
+- **Pins now protect on every location type.** A pin on a `raw://` stream
+  lived only in the process that took it, so a prune in another process
+  could delete the stream a restore was reading; it is now recorded in the
+  location's lock store, the same directory store `ssh://` and `raw+ssh://`
+  use, `--status` and `--unlock` read it, and the raw deletion asks for it
+  at delete time. The deletion of a snapper slot (`run`'s prune and
+  `prune`, local and `ssh://`) never consulted the lock store at all, so a
+  slot pinned by a restore could be deleted from under it; it now skips a
+  pinned slot and deletes nothing when the store cannot be read. The
+  documentation's "a prune cannot delete what is being read" is now true
+  wherever a backup lives.
+- **A contended lock could fail with a shell arithmetic error instead of
+  "busy".** The lock scripts read a heartbeat's mtime as `stat -c %Y FILE ||
+  stat -f %m FILE`, GNU first and BSD as a fallback. On GNU `stat -f` means
+  "file system status", so when the heartbeat was missing at the first call
+  (the holder had won the `mkdir` and not yet written it) and present at the
+  second, the fallback printed a multi-line status block and the age
+  arithmetic died on it; the contender reported "could not operate the lock
+  directory" for a lock that was simply held. Every lock script now reads
+  times through one function: the `stat` flavour is decided once, from `/`,
+  and whatever `stat` prints is checked to be digits before any arithmetic.
+  A lock whose age cannot be read is busy; one that vanished between the
+  `mkdir` and the check is taken; neither is a script error. The scripts
+  parse under bash 3.2, dash and busybox, and survive an account whose login
+  shell is csh or tcsh.
+- **A run ended by SIGTERM or SIGHUP left its pins, locks and ssh control
+  directories behind, and its child processes running.** Python's default
+  handling of both signals ends the process without running any cleanup, so a
+  run stopped by systemd or a closed terminal left every `bbng-cm-*` control
+  directory in `$XDG_RUNTIME_DIR` or `/tmp`, the `receiving-*` locks on its
+  `ssh://` targets until they went stale, and its `btrfs send` and `ssh`
+  processes writing to the target after it had gone. The command now stops
+  its child processes, then releases its locks and pins, then closes its ssh
+  connections, and then dies of the signal. A second signal (a closed
+  terminal sends more than one) does not cut that short, and a signal the
+  operator set to be ignored -- a run under `nohup` -- stays ignored.
+- **An ssh connection stopped and started again failed as an authentication
+  error.** Stopping the connection removed its control directory, and the
+  restart pointed ssh at a socket in the missing directory, which ssh
+  reports as a failed login. The restart now makes a new directory.
+- **Remote commands failed for an account whose login shell is csh or
+  tcsh.** A remote command is parsed by the account's login shell first, and
+  csh reads a `!` followed by a character as a history reference even inside
+  quotes. A digits check written `*[!0-9]*` made every lock script fail
+  there, and made the listing of snapper backups on a btrfs target return
+  nothing -- read as "no backups", so every snapshot would be sent again in
+  full. No command contains such a `!` now; a test checks every string in
+  the program.
+- **A snapper listing that failed read as "no backups".** Any failure --
+  ssh, a refused sudo, the login shell above -- and even a last slot that
+  was never received returned an empty list, so a backup re-sent every
+  snapshot in full into new slots and a restore found nothing. A listing
+  that did not complete is now an error naming the location; one slot that
+  cannot be read is left out with a warning.
+- **An interrupted receive left a partial subvolume that stopped every later
+  run.** Only a transfer error removed the partial a failed receive left at
+  the snapshot's name. Ctrl-C, SIGTERM, SIGHUP and unexpected errors left it,
+  and each later run then refused to remove something that was there before
+  it started, so that snapshot failed on every run -- and the incremental
+  chain behind it stopped -- until someone deleted it by hand. A receive that
+  does not complete now removes the partial it created, on every
+  destination type, after its writers have stopped; an ssh:// receive does
+  so before it releases the receive lock on that path. What was at the path
+  before the run is still never touched, and partials left by earlier runs
+  are not swept.
+- **Breaking a dead lock could give two winners.** The break renamed aside
+  whatever lock directory sat at the path when it ran, so a contender that
+  judged a dead lock and was descheduled could break and take the lock a
+  faster contender had just taken afresh -- two processes each holding the
+  exclusive lock that guards an `ssh://` receive, the clash it exists to
+  prevent (two in 2 of 6 races over ssh to a real target). The break now
+  removes the dead holder's own record, a file named by its token, which one
+  contender only can remove; a new holder also checks that it is the only
+  one before it reports the lock as taken.
+- **Releasing a lock did not check whose it was.** A holder stalled past the
+  stale threshold, whose lock had been broken and taken by another process,
+  deleted that process's lock when it woke. It now removes only its own
+  record, leaves the successor's lock alone and says so, and its heartbeat
+  can no longer recreate its record inside the successor's lock.
+- **A lock that could not be created was reported as held by another
+  process.** A `mkdir` that failed for a reason other than contention (a full
+  or read-only filesystem, a quota) read as "Already being received by
+  another process"; it is now reported as the lock not being creatable, with
+  the reason.
+- **A pin whose age could not be read counted as abandoned.** Its mtime was
+  read as 0, so a prune's guard reported a live pin as absent and `restore
+  --unlock` swept it. A pin or lock whose age cannot be read, or on a target
+  whose clock cannot be read, now counts as held: it blocks the deletion, it
+  is never swept, and a warning says so. A lock directory that exists but
+  cannot be listed is an error, not a target with no pins.
+- **`BTRFS_BACKUP_LOG_LEVEL` did nothing.** Documented for years, read once
+  at import and overwritten by every command's logger setup. It now sets
+  the console level where neither a command-line flag nor the
+  configuration's `quiet`/`verbose`/`btrfs_debug` says anything, and loses
+  to both; a value that is not `DEBUG`, `INFO`, `WARNING` or `ERROR` is
+  ignored with a warning.
+- **Retention and `list` disagreed about a snapshot's date.** Retention kept
+  a parser of its own -- a list of guessed formats and an unanchored search
+  for digits -- so under `timestamp_format = "%Y%m%d"` the snapshot
+  `20260921_1000000` was the 21st to the listing and 10:00:00 to retention,
+  and a name the listing showed as "unknown" could be bucketed and deleted
+  by a date only retention believed in. Retention now reads every name
+  with the listing's one rule, and a name the listing leaves undated stays
+  undated -- kept, never deleted -- as the README has always said. Names
+  that parse under neither the configured nor the default format, which
+  only the old guessed formats dated, are now kept rather than pruned.
+- **A snapper `run` sent a target that was behind everything it was
+  missing** and then pruned most of it. The native pipeline already sends
+  only what the target's prune keeps; the snapper pipeline now asks the
+  same decision its prune makes, over the target's backups plus the
+  snapshots it is missing, and sends only those the prune would keep. A
+  btrfs destination ends up holding exactly what it would have held had
+  everything been sent and pruned; a raw destination can hold fewer
+  streams, since its prune keeps a stored increment's parent and a parent
+  that was never sent needs no keeping. `snapper backup`, which does not
+  prune, still sends everything.
+- **`[global] quiet` could silence the endpoints for the rest of the
+  process.** The shared logger the endpoints write through was built
+  outside the logging manager, whose job it is to clear every logger's
+  level cache when a level changes; after `quiet` raised it to WARNING and
+  one INFO line was refused, lowering it again (a log file at DEBUG added
+  afterwards, `verbose`) changed the level and nothing else. The logger is
+  now registered with the manager.
+- **Snapper dates were read as local time; snapper writes them in UTC.**
+  Every `info.xml` `<date>` is UTC (a snapshot `snapper list` shows at
+  20:00 EDT is dated 00:00 the next day in its file), and it was parsed as
+  local time. West of UTC a fresh snapper backup was "dated in the future"
+  and kept out of retention for hours; east of UTC it looked older than it
+  was and left its minimum window early; and a destination's backups (dated
+  from `info.xml`) never agreed with the source's snapshots (dated by
+  `snapper list`) about when the same snapshot was taken. The date is now
+  converted at the file boundary in both directions; a raw sidecar's
+  stored `info.xml` is the authority for its date, so sidecars written
+  before this read correctly too.
+- **A collision counter was read off any name ending in digits.** The `_N`
+  that orders two snapshots sharing a timestamp was taken from the end of
+  the whole name, so under a `timestamp_format` ending in `_%H` or
+  `_%H%M%S`, or a prefix ending in `_`, the bare name carried a huge
+  "counter" and sorted newest on a tie: retention kept the first snapshot
+  of the hour as "latest" and deleted the ones created after it. The
+  counter now comes only from a name that parsed with a trailing `_N`
+  removed, in retention and in the listing's own order.
+- **`run`'s catch-up could strand a lock and send an undated subvolume.** A
+  missing snapshot this destination still held a transfer lock on (a send
+  that did not finish) was left out of the catch-up, so nothing ever
+  released the lock and the source kept the snapshot for ever; it is now
+  always sent. A subvolume in the snapshot directory whose name yields no
+  timestamp was kept by retention as unparseable, so the selection carried
+  it, and a selection is an explicit request to the planner: it was sent
+  as a full send, first, to every target, which the plan without a
+  selection never does. It is left out of the selection.
+- **The log file's completeness depended on the console level.** The
+  file handler is meant to record at DEBUG whatever the screen shows, but
+  the shared endpoint logger kept the console's level, so under `-q` every
+  endpoint INFO line was missing from `log_file` and under the default
+  level every endpoint DEBUG line. Adding the file handler now opens that
+  logger to the file's level, and removing it puts the level back.
+- **Commands that read the configuration for a `timestamp_format` or a
+  target's options ignored its `quiet` / `verbose`:** `restore` on a
+  location (`--list`, `--status`, a plain restore), `verify`, `estimate` on
+  paths, `snapper list`, `snapper backup` and `snapper status`. They apply
+  it now; `verify` also sets up the console logger every other command has,
+  so `-v verify` shows debug output and its warnings are formatted. `run`
+  printed one INFO line after reading a `quiet` configuration (the one
+  announcing the log file); it applies the setting before that line.
+- **A snapper slot could be published without its `info.xml`.** The write
+  of the slot's metadata was soft-fail, so a publish went ahead without it
+  and a restore reported success for a slot snapper does not list. In both
+  directions a slot whose `info.xml` cannot be written is now abandoned and
+  the transfer fails, as the documentation has said all along.
+- **Two configuration keys the loader read were reported as unknown.**
+  `skip_remote_lock` on a target and `timeout` under
+  `[global.notifications.email]` produced "Unknown config key ... (ignored)"
+  although the first was honoured and the second was in the schema; the
+  warning was untrue for one and the value was never read for the other.
+  Both are known and read.
+- **The chunked `ssh://` receive kept a stdout pipe it never read** and
+  left its stderr pipe open until garbage collection; the pipe nobody reads
+  is gone and the stderr is drained like every other receive's.
+- **Two snapper snapshots taken within one second could have the newer one
+  deleted.** snapper dates have one-second resolution and no collision
+  counter, so snapshots taken in quick succession share a timestamp, and
+  retention broke the tie by input order read newest-first: the lowest
+  number of a tie became "latest" and the highest its bucket's oldest member
+  or nothing. Measured on real btrfs with four snapshots taken in two
+  seconds under `daily = 1`: the plan kept 2 and 3 and deleted 1 and 4, the
+  newest snapshot among them -- from the prune and from `run`'s catch-up
+  alike. A snapper number is its creation order and now breaks the tie in
+  every snapper retention path.
+- Slot numbers under `.snapshots` are recognised as decimal digits only; a
+  name `str.isdigit` accepted but `int` refused (a superscript digit) made
+  the enumeration and the stale-temp sweep raise instead of skipping it.
+
 ## [0.9.10] - 2026-09-23
 
 This release fixes behaviour that did not match what the tool documents.

@@ -13,6 +13,7 @@ import time
 from typing import Any, Optional, TypedDict
 
 from .. import __util__
+from ..lifecycle import track as track_child
 from .compression import COMPRESSION_METHODS
 
 logger = logging.getLogger(__name__)
@@ -107,17 +108,19 @@ def popen_pipeline_pipefail(shell_cmd: str, **popen_kwargs: Any) -> subprocess.P
     """
     bash_path = shutil.which("bash")
     if bash_path:
-        return subprocess.Popen(
-            "set -o pipefail; " + shell_cmd,
-            shell=True,
-            executable=bash_path,
-            **popen_kwargs,
+        return track_child(
+            subprocess.Popen(
+                "set -o pipefail; " + shell_cmd,
+                shell=True,
+                executable=bash_path,
+                **popen_kwargs,
+            )
         )
     logger.warning(
         "bash not found; running raw pipeline without pipefail (a mid-pipe "
         "failure may be masked and produce a truncated backup)"
     )
-    return subprocess.Popen(shell_cmd, shell=True, **popen_kwargs)
+    return track_child(subprocess.Popen(shell_cmd, shell=True, **popen_kwargs))
 
 
 def check_pv_available() -> bool:
@@ -193,11 +196,13 @@ def create_compress_process(
     cmd = COMPRESSION_PROGRAMS[method]["compress"]
     logger.debug("Starting compression process: %s", cmd)
 
-    return subprocess.Popen(
-        cmd,
-        stdin=stdin,
-        stdout=stdout,
-        stderr=subprocess.PIPE,
+    return track_child(
+        subprocess.Popen(
+            cmd,
+            stdin=stdin,
+            stdout=stdout,
+            stderr=subprocess.PIPE,
+        )
     )
 
 
@@ -232,11 +237,13 @@ def create_decompress_process(
     cmd = COMPRESSION_PROGRAMS[method]["decompress"]
     logger.debug("Starting decompression process: %s", cmd)
 
-    return subprocess.Popen(
-        cmd,
-        stdin=stdin,
-        stdout=stdout,
-        stderr=subprocess.PIPE,
+    return track_child(
+        subprocess.Popen(
+            cmd,
+            stdin=stdin,
+            stdout=stdout,
+            stderr=subprocess.PIPE,
+        )
     )
 
 
@@ -276,11 +283,13 @@ def create_progress_process(
 
     logger.debug("Starting progress process: %s", cmd)
 
-    return subprocess.Popen(
-        cmd,
-        stdin=stdin,
-        stdout=stdout,
-        stderr=None,  # Let progress output go to stderr (terminal)
+    return track_child(
+        subprocess.Popen(
+            cmd,
+            stdin=stdin,
+            stdout=stdout,
+            stderr=None,  # Let progress output go to stderr (terminal)
+        )
     )
 
 
@@ -332,11 +341,13 @@ def create_throttle_process(
 
     logger.debug("Starting throttle process: %s (rate: %d bytes/s)", cmd, rate_bytes)
 
-    return subprocess.Popen(
-        cmd,
-        stdin=stdin,
-        stdout=stdout,
-        stderr=subprocess.PIPE if not show_progress else None,
+    return track_child(
+        subprocess.Popen(
+            cmd,
+            stdin=stdin,
+            stdout=stdout,
+            stderr=subprocess.PIPE if not show_progress else None,
+        )
     )
 
 

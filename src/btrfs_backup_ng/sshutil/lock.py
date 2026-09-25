@@ -18,10 +18,12 @@ persistent connection on which to hold an ``flock``:
 * **``mkdir`` is atomic.** Exactly one of any number of racing creators wins;
   the rest get EEXIST. Verified against a real remote: 20 concurrent contenders,
   one winner.
-* **``mv`` is atomic within a filesystem**, which is what makes breaking a stale
-  lock safe. A contender that judges a lock dead renames it and proceeds only if
-  the rename succeeded, so two contenders that both see a dead lock cannot both
-  acquire. Also verified: 20 concurrent breakers, one winner.
+* **``unlink`` of one name succeeds once.** Breaking a stale lock removes the
+  file that identifies the dead holder -- named by that holder's own token --
+  so of any number of contenders that judged the same lock dead, exactly one
+  goes on to take it, and none can remove a newer holder's record (see
+  ``RemoteLockManager._acquire_script``). Release removes only the holder's
+  own record, so a holder whose lock was broken cannot delete its successor's.
 
 Staleness is judged ON THE REMOTE
 ---------------------------------
@@ -42,12 +44,10 @@ nothing but the lock it created.
 
 from __future__ import annotations
 
-import atexit
 import hashlib
 import json
 import logging
 import os
-import signal
 import shlex
 import threading
 import uuid
@@ -88,6 +88,19 @@ RECEIVING_LOCK_PREFIX = "receiving-"
 #: Holder files for a SHARED lock live here, one per holder.
 HOLDERS_DIR_NAME = "holders"
 
+#: An exclusive lock's holder record: ``owner.<token>``, the holder's payload,
+#: its mtime refreshed by the heartbeat. Named by the holder's own token so
+#: that removing it can only ever remove that holder's lock.
+OWNER_PREFIX = "owner."
+
+#: Refreshed beside the owner file, for older versions that judge a lock's age
+#: by this name and would otherwise take a long-held lock for a dead one.
+HEARTBEAT_NAME = "heartbeat"
+
+#: The holder record older versions wrote. Never written now; read, shown and
+#: broken the same way when a lock left by an older version is met.
+LEGACY_INFO_NAME = "info.json"
+
 #: A holder file older than this multiple of the stale threshold is not merely
 #: unrefreshed, it is definitively abandoned: a live holder refreshes six times
 #: within one threshold. Only then is it safe to delete someone else's file.
@@ -98,82 +111,39 @@ DEAD_HOLDER_MULTIPLE = 2
 #
 # A lock outlives the process that took it -- that is the whole point -- so an
 # interrupted run must not leave its pins sitting on the target until the stale
-# window expires. Ctrl-C on a restore should free the snapshot immediately, not
-# in three minutes.
+# window expires.
 #
-# Registered holders are released on normal exit (atexit) and on SIGINT/SIGTERM.
-# The stale window remains the backstop for what neither can catch: SIGKILL,
-# a power cut, a severed network.
+# Every held lock and pin is registered with the process's exit cleanups
+# (``btrfs_backup_ng.lifecycle``): released on normal exit, after Ctrl-C has
+# unwound, and on SIGTERM or SIGHUP once the command-line entry point has
+# installed its handlers -- in every case only after the child processes that
+# were writing under it have been stopped. An entry is dropped from the
+# registry only once its release has run, so a release interrupted part-way is
+# retried at exit. The stale window remains the backstop for what none of this
+# can catch: SIGKILL, a power cut, a severed network.
 
-_CLEANUP_LOCK = threading.Lock()
-_CLEANUP_REGISTRY: "list[tuple[Any, str]]" = []
-_SIGNALS_INSTALLED = False
-_PREVIOUS_HANDLERS: dict = {}
+
+def _cleanup_key(manager: Any, key: str) -> tuple:
+    return ("remote-lock", id(manager), key)
 
 
 def _register_for_cleanup(manager: Any, key: str) -> None:
-    global _SIGNALS_INSTALLED
-    with _CLEANUP_LOCK:
-        _CLEANUP_REGISTRY.append((manager, key))
-        if not _SIGNALS_INSTALLED:
-            _SIGNALS_INSTALLED = True
-            atexit.register(_release_all_held)
-            _install_signal_handlers()
+    from .. import lifecycle
+
+    def release() -> None:
+        name, _, lock_id = key.partition("\x00")
+        if lock_id:
+            manager.release_shared(name, lock_id)
+        else:
+            manager.release(name)
+
+    lifecycle.register(_cleanup_key(manager, key), release, lifecycle.STAGE_LOCKS)
 
 
 def _unregister_for_cleanup(manager: Any, key: str) -> None:
-    with _CLEANUP_LOCK:
-        for i, (held_manager, held_key) in enumerate(_CLEANUP_REGISTRY):
-            if held_manager is manager and held_key == key:
-                del _CLEANUP_REGISTRY[i]
-                return
+    from .. import lifecycle
 
-
-def _release_all_held() -> None:
-    """Drop every pin this process still holds. Never raises."""
-    with _CLEANUP_LOCK:
-        pending = list(_CLEANUP_REGISTRY)
-        _CLEANUP_REGISTRY.clear()
-    for manager, key in pending:
-        try:
-            name, _, lock_id = key.partition("\x00")
-            if lock_id:
-                manager.release_shared(name, lock_id)
-            else:
-                manager.release(name)
-        except Exception as exc:  # noqa: BLE001 - cleanup must not raise on exit
-            logger.debug("Could not release %r during cleanup: %s", key, exc)
-
-
-def _install_signal_handlers() -> None:
-    """Release on SIGINT/SIGTERM, then do what the previous handler would.
-
-    Chained rather than replaced: this is a library, and swallowing the
-    application's own handler -- or the default that turns Ctrl-C into
-    KeyboardInterrupt -- would be a worse bug than the one being fixed.
-    Installing is skipped off the main thread, where signal() is not allowed.
-    """
-    if threading.current_thread() is not threading.main_thread():
-        return
-    for signum in (signal.SIGINT, signal.SIGTERM):
-        try:
-            previous = signal.getsignal(signum)
-        except (ValueError, OSError):  # pragma: no cover - platform dependent
-            continue
-        _PREVIOUS_HANDLERS[signum] = previous
-
-        def handler(sig: int, frame: Any, _previous: Any = previous) -> None:
-            _release_all_held()
-            if callable(_previous):
-                _previous(sig, frame)
-            elif _previous == signal.SIG_DFL:
-                signal.signal(sig, signal.SIG_DFL)
-                os.kill(os.getpid(), sig)
-
-        try:
-            signal.signal(signum, handler)
-        except (ValueError, OSError):  # pragma: no cover - platform dependent
-            continue
+    lifecycle.unregister(_cleanup_key(manager, key))
 
 
 class RemoteLockBusy(RuntimeError):
@@ -283,35 +253,167 @@ class Holder:
         )
 
 
-def _remote_mtime_expr(path: str) -> str:
-    """Shell yielding ``path``'s mtime, or nothing if it does not exist.
+#: Exit statuses of ``read_only_probe_script``: the location's filesystem is
+#: mounted read-only / is writable / the mount table could not be read.
+READ_ONLY, WRITABLE, UNKNOWN_MOUNT = 10, 11, 12
 
-    GNU ``stat -c %Y`` with a BSD ``stat -f %m`` fallback, matching how the rest
-    of the codebase probes remote files -- targets are not all Linux.
+
+def read_only_probe_script(path: str) -> str:
+    """Shell answering, by EXIT STATUS, whether ``path`` lies on a filesystem
+    mounted read-only: ``READ_ONLY``, ``WRITABLE`` or ``UNKNOWN_MOUNT`` (3 when
+    ``path`` is not a directory). Read-only means BOTH that a directory cannot
+    be created there and that the mount table says so; either alone is not
+    enough (a firmlinked path reads as its read-only parent in the table, a
+    permission refusal is not a read-only mount).
+
+    The one rule every pin writer decides read-only by, wherever the location
+    is. A location mounted read-only cannot have anything deleted from it, so
+    a pin there protects against nothing and is not needed; a location that
+    merely refuses the write (no permission) is a different thing, and the
+    pin is required. The two are told apart from the mount table -- the
+    ``ro`` option token in ``/proc/self/mounts`` on Linux, the ``read-only``
+    token in ``mount(8)``'s option list elsewhere -- never from a tool's
+    message, which is localised. Anything the script cannot classify is
+    ``UNKNOWN_MOUNT``, which the caller treats as NOT read-only, so an
+    unclassifiable location still gets the refusal and its opt-out.
+    ``BBNG_MOUNT_TABLE`` names another mount table file (the tests use it).
     """
     q = shlex.quote(path)
-    return f"stat -c %Y {q} 2>/dev/null || stat -f %m {q} 2>/dev/null"
+    # The matching runs in awk, present on every host this reaches (GNU,
+    # BSD, busybox): one program over "MNT OPTS" lines picks the longest mount
+    # point that is the real path or an ancestor of it. No shell ``case`` and
+    # no unbalanced parenthesis anywhere inside a command substitution --
+    # bash 3.2, macOS's /bin/sh, cannot parse those.
+    pick = (
+        r"""awk -v real="$real" '{ m = $1; gsub(/\\040/, " ", m); """
+        r"""if (m == "/" || m == real || index(real, m "/") == 1) """
+        r"""{ if (length(m) >= length(b)) { b = m; o = $2 } } } """
+        r"""END { printf "%s", o }'"""
+    )
+    # mount(8) prints "dev on MNT (opt, opt, ...)" (macOS, the BSDs) or
+    # "dev on MNT type T (opt,opt)" (Linux): reduce each line to "MNT OPTS".
+    convert = (
+        r"""awk '{ s = $0; i = index(s, " on "); if (i == 0) next; s = substr(s, i + 4); """
+        r"""j = index(s, " ("); if (j == 0) next; o = substr(s, j + 2); s = substr(s, 1, j - 1); """
+        r"""k = index(s, " type "); if (k > 0) s = substr(s, 1, k - 1); """
+        r"""o = substr(o, 1, length(o) - 1); gsub(/ /, "", o); print s, o }'"""
+    )
+    return (
+        f'p={q}; [ -d "$p" ] || exit 3; '
+        'real=$(cd "$p" 2>/dev/null && pwd -P) || exit 3; '
+        # A write that succeeds settles it: not read-only, whatever the table
+        # says (macOS reaches a writable data volume through firmlinks from
+        # its sealed, read-only root, so the table alone would call /tmp
+        # read-only). Only a write that FAILS is classified by the table.
+        'probe="$real/.btrfs-backup-ng.probe.$$"; '
+        f'if mkdir "$probe" 2>/dev/null; then rmdir "$probe" 2>/dev/null; exit {WRITABLE}; fi; '
+        "table=${BBNG_MOUNT_TABLE:-/proc/self/mounts}; "
+        'if [ -r "$table" ]; then '
+        # /proc/self/mounts: "dev MNT fstype OPTS freq passno"
+        "bestopts=$(awk '{ print $2, $4 }' \"$table\" | " + pick + "); "
+        f"else bestopts=$(mount 2>/dev/null | {convert} | {pick}) || exit {UNKNOWN_MOUNT}; fi; "
+        f'[ -n "$bestopts" ] || exit {UNKNOWN_MOUNT}; '
+        """if printf '%s' ",$bestopts," | grep -qF -e ',ro,' -e ',read-only,'; """
+        f"then exit {READ_ONLY}; fi; exit {WRITABLE}"
+    )
 
 
-def _remote_age_expr(path: str, fallback: Optional[str] = None) -> str:
-    """Shell computing the age in seconds of ``path``, on the remote.
+def local_path_is_read_only(path: str | os.PathLike) -> bool:
+    """The same rule for a path on THIS machine, asked of the kernel directly:
+    ``statvfs`` reports the read-only mount flag."""
+    try:
+        return bool(os.statvfs(path).f_flag & os.ST_RDONLY)
+    except OSError:
+        return False
 
-    ``fallback`` is a second path to age from when the first does not exist yet.
-    It closes a real race in acquisition: between the ``mkdir`` that wins a lock
-    and the ``touch`` that writes its first heartbeat there is a window in which
-    the heartbeat is absent. Ageing a missing file from epoch zero makes that
-    brand-new lock look infinitely old, and a contender arriving inside the
-    window breaks it and takes a lock somebody else already holds -- two winners.
-    Observed as an intermittent failure of the one-winner test, then reproduced
-    exactly by creating the directory without its heartbeat.
 
-    The lock directory itself is the fallback: ``mkdir`` creates it atomically,
-    so its mtime is a sound lower bound on the holder's age.
+def read_only_notice(name: str, where: str, location: str) -> None:
+    """What every pin writer says when it skips a pin on a read-only location."""
+    logger.info(
+        "%s is mounted read-only, so %s is not pinned on this %s: nothing can "
+        "delete from a read-only location while it is being read.",
+        location,
+        name,
+        where,
+    )
+
+
+#: Shell defining the functions every lock script reads times with.
+#:
+#: ``bbng_digits VALUE`` succeeds only for a non-empty string of ASCII digits.
+#: It walks the value one character at a time rather than matching a negated
+#: bracket such as ``*[!0-9]*``: these scripts reach a remote target as
+#: ``sh -c '<script>'`` on a command line the account's LOGIN shell parses
+#: first, and csh and tcsh read a ``!`` followed by anything but a blank, ``=``
+#: or ``(`` as a history reference even inside single quotes. The whole command
+#: then failed with "Event not found." before ``sh`` ever ran. No remote script
+#: may contain such a ``!`` (see ``csh_unsafe``).
+#:
+#: ``bbng_mtime FILE`` prints the file's mtime as a bare integer, or nothing.
+#: Which ``stat`` this host has is decided ONCE, from a path that always
+#: exists: GNU takes ``-c %Y``, BSD (macOS) ``-f %m``. The two must not be
+#: chained as fallbacks per file: on GNU, ``stat -f`` means "file system
+#: status", so ``stat -f %m FILE`` prints a multi-line block whenever FILE
+#: exists -- and a heartbeat that appeared between the failed ``-c`` call and
+#: the ``-f`` one handed that block to ``$(( ))``, which died with an
+#: arithmetic syntax error under contention. Whatever ``stat`` prints is then
+#: checked to be digits before it is printed at all.
+#:
+#: ``bbng_now`` prints the target's clock as a bare integer, or nothing.
+#:
+#: ``bbng_age FILE [FALLBACK]`` prints the age in seconds of FILE by the
+#: target's own clock, of FALLBACK when FILE has no readable mtime, or nothing
+#: when neither can be read or the clock cannot. Callers treat nothing as
+#: "cannot judge", never as an age of zero or of forever.
+MTIME_FUNCTIONS = (
+    "if stat -c %Y / >/dev/null 2>&1; then bbng_st='-c %Y'; else bbng_st='-f %m'; fi; "
+    'bbng_digits() { bbng_t=$1; [ -n "$bbng_t" ] || return 1; '
+    'while [ -n "$bbng_t" ]; do case $bbng_t in [0123456789]*) bbng_t=${bbng_t#?};; '
+    "*) return 1;; esac; done; return 0; }; "
+    'bbng_mtime() { bbng_m=$(stat $bbng_st "$1" 2>/dev/null) || bbng_m=; '
+    'bbng_digits "$bbng_m" || bbng_m=; '
+    'printf "%s" "$bbng_m"; }; '
+    "bbng_now() { bbng_c=$(date +%s 2>/dev/null) || bbng_c=; "
+    'bbng_digits "$bbng_c" || bbng_c=; printf "%s" "$bbng_c"; }; '
+    'bbng_age() { bbng_a=$(bbng_mtime "$1"); '
+    'if [ -z "$bbng_a" ] && [ -n "$2" ]; then bbng_a=$(bbng_mtime "$2"); fi; '
+    "bbng_n=$(bbng_now); "
+    'if [ -n "$bbng_a" ] && [ -n "$bbng_n" ]; then echo $(( bbng_n - bbng_a )); fi; }; '
+)
+
+
+def csh_unsafe(script: str) -> list[str]:
+    """The fragments of ``script`` a csh or tcsh login shell would misread.
+
+    Every remote command is parsed by the account's login shell before ``sh``
+    sees it. csh and tcsh begin a history substitution at any ``!`` that is not
+    followed by a blank, ``=`` or ``(`` -- inside single quotes too -- and
+    reject a quoted string that spans a line. Either fails the whole command
+    before it runs. Empty means the script is safe to send.
     """
-    primary = _remote_mtime_expr(path)
-    if fallback is not None:
-        primary = f"{primary} || {_remote_mtime_expr(fallback)}"
-    return f"$(( $(date +%s) - $({primary} || echo 0) ))"
+    bad = [
+        script[i : i + 2]
+        for i, c in enumerate(script)
+        if c == "!" and script[i + 1 : i + 2] not in (" ", "\t", "=", "(")
+    ]
+    if "\n" in script:
+        bad.append("\\n")
+    return bad
+
+
+def csh_safe_text(value: str) -> str:
+    """``value`` (JSON) with every ``!`` written as the JSON escape ``\\u0021``,
+    so a payload carrying a user-chosen name survives a csh login shell."""
+    return value.replace("!", "\\u0021")
+
+
+def _verdict(out: str) -> str:
+    """The first line a lock script printed: its verdict. What follows it is
+    detail (a holder's record), which must never be mistaken for one."""
+    for line in out.splitlines():
+        if line.strip():
+            return line.strip()
+    return ""
 
 
 class RemoteLockManager:
@@ -346,61 +448,153 @@ class RemoteLockManager:
         self._run_elevated = run_elevated
         self._held: dict[str, threading.Event] = {}
         self._threads: dict[str, threading.Thread] = {}
+        # The owner token of each exclusive lock this manager holds. The lock's
+        # owner file is named by it, and release removes only that file.
+        self._tokens: dict[str, str] = {}
+        self._state_lock = threading.RLock()
 
     # ---------------------------------------------------------------- helpers
 
     def _lock_dir(self, name: str) -> str:
         return f"{self._root}/{encode_name(name)}.lock"
 
+    @property
+    def location(self) -> str:
+        return self._target
+
+    def location_is_read_only(self) -> bool:
+        """Whether this manager's location lies on a read-only filesystem, by
+        ``read_only_probe_script`` run where the location is. Only the
+        READ_ONLY exit status says yes; a probe that fails to run says no."""
+        try:
+            rc, _out, _err = self._run(read_only_probe_script(self._target))
+        except Exception as exc:  # noqa: BLE001 - an unanswered probe is "not read-only"
+            logger.debug("Read-only probe of %s did not run: %s", self._target, exc)
+            return False
+        return rc == READ_ONLY
+
+    def _owner_file(self, name: str, token: str) -> str:
+        return f"{self._lock_dir(name)}/{OWNER_PREFIX}{token}"
+
+    def _exclusive_functions(self, name: str) -> str:
+        """Shell functions judging one exclusive lock (see ``_acquire_script``).
+
+        ``bbng_judge`` sets ``bbng_key`` to the entry that identifies THIS
+        instance of the lock -- the one a breaker must remove -- and ``AGE`` to
+        the lock's age, or leaves ``AGE`` empty when it cannot be read.
+        ``bbng_show`` prints the holder's recorded details.
+        """
+        lock = shlex.quote(self._lock_dir(name))
+        info = shlex.quote(f"{self._lock_dir(name)}/{LEGACY_INFO_NAME}")
+        hb = shlex.quote(f"{self._lock_dir(name)}/{HEARTBEAT_NAME}")
+        return (
+            MTIME_FUNCTIONS + "bbng_judge() { bbng_key=; AGE=; "
+            f'for bbng_f in {lock}/{OWNER_PREFIX}*; do [ -f "$bbng_f" ] && bbng_key=$bbng_f; done; '
+            'if [ -n "$bbng_key" ]; then AGE=$(bbng_age "$bbng_key"); '
+            f"elif [ -f {info} ]; then bbng_key={info}; AGE=$(bbng_age {hb} {lock}); "
+            f"elif [ -f {hb} ]; then bbng_key={hb}; AGE=$(bbng_age {hb}); "
+            f"else AGE=$(bbng_age {lock}); fi; return 0; }}; "
+            f"bbng_show() {{ for bbng_f in {lock}/{OWNER_PREFIX}*; do "
+            '[ -f "$bbng_f" ] && cat "$bbng_f" 2>/dev/null && echo; done; '
+            f"[ -f {info} ] && cat {info} 2>/dev/null; return 0; }}; "
+        )
+
     def _acquire_script(self, name: str, payload: str, token: str) -> str:
         """One round trip: try, judge staleness, break if dead, try again.
 
-        Written as a single script deliberately. Split across calls, another
-        contender can slip between the staleness check and the break, which is
-        precisely the race the atomic rename exists to close.
+        Written as a single script deliberately: split across calls, another
+        contender can slip between the staleness check and the break.
+
+        The lock is a directory; ``mkdir`` decides who creates it. Inside it,
+        the holder's record is a file named by the holder's own random token,
+        ``owner.<token>``, whose mtime the holder's heartbeat refreshes. (A
+        ``heartbeat`` file is refreshed beside it, for older versions that
+        judge a lock by that name.)
+
+        Breaking a stale lock is where two winners used to come from. The old
+        break renamed the lock directory away, but the directory it renamed
+        was whatever sat at that path by then: a contender that judged the
+        dead lock and was descheduled before its ``mv`` could, once another
+        had broken the lock and taken it afresh, rename the NEW holder's lock
+        and take it too. The break is now made by removing the one entry that
+        identifies the instance judged stale -- its ``owner.<token>`` file.
+        That name exists only in that instance, and ``unlink`` of one name
+        succeeds for exactly one caller: every other contender that judged the
+        same dead lock gets "no such file" and reports BUSY, and one that
+        judged an old instance can never remove a new one's record. Only the
+        winner goes on to ``rmdir`` and ``mkdir``.
+
+        Locks without an owner file are judged by what they hold: an older
+        version's lock by its ``info.json`` (removed the same way; this
+        version never writes one), a directory left mid-release by its
+        ``heartbeat``, an empty directory by its own mtime and ``rmdir``,
+        which succeeds only while it is empty.
+
+        A new holder then checks that its owner file is the only one in the
+        directory before it reports the lock as taken. The one interleaving
+        the removal cannot exclude -- an empty directory, judged dead, removed
+        by a slow contender just after another had created a new one and
+        before it wrote its record -- ends with the second record written into
+        a directory someone else created, or not written at all; either way
+        the check sees it, and the later claimant withdraws. Two holders
+        would each have to see only their own file, and whichever wrote
+        second cannot.
+
+        What remains is the lease assumption every such lock rests on: a
+        holder that stops refreshing for longer than the stale threshold has
+        lost the lock, even if it wakes later still believing it holds it.
         """
         lock = shlex.quote(self._lock_dir(name))
         root = shlex.quote(self._root)
-        hb = shlex.quote(f"{self._lock_dir(name)}/heartbeat")
-        info = shlex.quote(f"{self._lock_dir(name)}/info.json")
+        hb = shlex.quote(f"{self._lock_dir(name)}/{HEARTBEAT_NAME}")
+        info = shlex.quote(f"{self._lock_dir(name)}/{LEGACY_INFO_NAME}")
+        owner = shlex.quote(self._owner_file(name, token))
         target = shlex.quote(self._target)
-        stale_dir = shlex.quote(f"{self._lock_dir(name)}.stale.{token}")
-        age = _remote_age_expr(
-            f"{self._lock_dir(name)}/heartbeat", self._lock_dir(name)
-        )
+        body = shlex.quote(csh_safe_text(payload))
         return (
+            self._exclusive_functions(name) + "bbng_take() { "
+            f"if printf '%s' {body} > {owner} 2>/dev/null; then "
+            "bbng_c=0; "
+            f'for bbng_f in {lock}/{OWNER_PREFIX}*; do [ -f "$bbng_f" ] && bbng_c=$((bbng_c + 1)); done; '
+            f'if [ "$bbng_c" -eq 1 ]; then touch {hb} 2>/dev/null; echo "$1"; return 0; fi; '
+            f"rm -f {owner} 2>/dev/null; rmdir {lock} 2>/dev/null; "
+            "fi; echo BUSY; return 0; }; "
             # A lock directory that cannot be created is NOT contention. Reported
             # as BUSY -- which is what a bare mkdir failure looks like -- it sends
             # an operator hunting for a competing process that does not exist.
             # The lock tree is created only BELOW an existing target: a bare
-            # `mkdir -p` on the full path would invent a missing target (the
-            # 34904c6 class -- an unmounted destination rebuilt on the root
-            # filesystem by a lock acquisition). A missing target therefore
-            # falls through to the NOLOCKDIR verdict below, which callers
-            # already report distinctly from contention.
+            # `mkdir -p` on the full path would invent a missing target (an
+            # unmounted destination rebuilt on the root filesystem by a lock
+            # acquisition). A missing target therefore falls through to the
+            # NOLOCKDIR verdict below, which callers report distinctly.
             f"if [ -d {target} ]; then mkdir -p {root} 2>/dev/null; fi; "
             f"if [ ! -d {root} ] || [ ! -w {root} ]; then echo NOLOCKDIR; exit 0; fi; "
-            f"if mkdir {lock} 2>/dev/null; then "
-            f"  printf '%s' {shlex.quote(payload)} > {info}; touch {hb}; echo ACQUIRED; "
-            f"else "
-            f"  AGE={age}; "
-            f'  if [ "$AGE" -gt {self._stale_after} ]; then '
-            f"    if mv {lock} {stale_dir} 2>/dev/null; then "
-            f"      rm -f {stale_dir}/info.json {stale_dir}/heartbeat 2>/dev/null; "
-            f"      rmdir {stale_dir} 2>/dev/null; "
-            f"      if mkdir {lock} 2>/dev/null; then "
-            f"        printf '%s' {shlex.quote(payload)} > {info}; touch {hb}; "
-            f"        echo ACQUIRED_STALE; "
-            f"      else echo BUSY; fi; "
-            f"    else echo BUSY; fi; "
-            f"  else "
-            # `|| true` because a lock taken microseconds ago may not have its
-            # info.json yet, and cat's failure would otherwise make the script
-            # exit non-zero -- read as "the lock could not be operated" when the
-            # truthful answer is the BUSY it just printed.
-            f"    echo BUSY; cat {info} 2>/dev/null || true; "
-            f"  fi; "
-            f"fi"
+            f"if mkdir {lock} 2>/dev/null; then bbng_take ACQUIRED; exit 0; fi; "
+            # The mkdir failed with no lock there: the holder released in
+            # between (take it now), or the directory cannot be made at all
+            # (a full or read-only filesystem, a quota) -- which is not
+            # contention and is reported with the reason.
+            f"if [ ! -d {lock} ]; then "
+            f"  if bbng_e=$(mkdir {lock} 2>&1); then bbng_take ACQUIRED; exit 0; fi; "
+            f'  if [ ! -d {lock} ]; then printf "NOLOCK %s" "$bbng_e" | tr -d "\\n"; echo; exit 0; fi; '
+            "fi; "
+            "bbng_judge; "
+            # No readable age: a lock that cannot be judged is never broken.
+            f'if [ -z "$AGE" ]; then '
+            f"  if [ -d {lock} ]; then echo BUSY; bbng_show; exit 0; fi; "
+            f"  if mkdir {lock} 2>/dev/null; then bbng_take ACQUIRED; exit 0; fi; "
+            "  echo BUSY; exit 0; "
+            "fi; "
+            f'if [ "$AGE" -le {self._stale_after} ]; then echo BUSY; bbng_show; exit 0; fi; '
+            # Stale. Remove the entry identifying the instance that was judged
+            # (see the docstring); only one contender can.
+            'if [ -n "$bbng_key" ]; then '
+            '  if rm "$bbng_key" </dev/null 2>/dev/null; then :; else echo BUSY; exit 0; fi; '
+            f"  rm -f {hb} {info} 2>/dev/null; "
+            "fi; "
+            f"if rmdir {lock} 2>/dev/null; then :; else echo BUSY; exit 0; fi; "
+            f"if mkdir {lock} 2>/dev/null; then bbng_take ACQUIRED_STALE; exit 0; fi; "
+            "echo BUSY"
         )
 
     # ------------------------------------------------------------------- API
@@ -428,8 +622,6 @@ class RemoteLockManager:
 
     def acquire_shared(self, name: str, lock_id: str, operation: str = "") -> str:
         """Add this holder's pin to ``name``. Never blocks on another holder."""
-        import os
-
         payload = json.dumps(
             {
                 # The lock's REAL name, because the directory holding it carries
@@ -456,7 +648,7 @@ class RemoteLockManager:
             # competing process that does not exist.
             f"if [ ! -d {root} ] || [ ! -d {holders} ] || [ ! -w {holders} ]; then "
             f"  echo NOLOCKDIR; exit 0; fi; "
-            f"printf '%s' {shlex.quote(payload)} > {holder} 2>/dev/null "
+            f"printf '%s' {shlex.quote(csh_safe_text(payload))} > {holder} 2>/dev/null "
             f"&& echo ACQUIRED || echo FAILED"
         )
         rc, out, err = self._run(script)
@@ -469,11 +661,12 @@ class RemoteLockManager:
                 f"protect, so this path must be writable by the account running "
                 f"the backup, or that account must be able to elevate for it."
             )
-        if "ACQUIRED" not in out:
+        if _verdict(out) != "ACQUIRED":
             raise RemoteLockUnavailable(
                 f"could not record a shared lock on {name!r}: "
                 f"{err.strip() or out.strip() or f'exit {rc}'}"
             )
+        _register_for_cleanup(self, self._held_key(name, lock_id))
         return "acquired"
 
     def release_shared(self, name: str, lock_id: str) -> None:
@@ -483,7 +676,8 @@ class RemoteLockManager:
         another holder's file is still there -- so the last one out cleans up and
         nobody else can remove a pin that is still held.
         """
-        self._stop_heartbeat(self._held_key(name, lock_id))
+        key = self._held_key(name, lock_id)
+        self._stop_heartbeat(key)
         holder = shlex.quote(self._holder_file(name, lock_id))
         holders = shlex.quote(self._holders_dir(name))
         lock = shlex.quote(self._lock_dir(name))
@@ -497,6 +691,8 @@ class RemoteLockManager:
                 name,
                 err.strip(),
             )
+            return
+        _unregister_for_cleanup(self, key)
 
     def acquire_shared_persistent(
         self, name: str, lock_id: str, operation: str = ""
@@ -520,9 +716,7 @@ class RemoteLockManager:
 
     def acquire_once(self, name: str, operation: str) -> str:
         """Take the lock, or raise. Returns the acquisition mode."""
-        import os
-
-        token = uuid.uuid4().hex[:12]
+        token = uuid.uuid4().hex
         payload = json.dumps(
             {
                 "name": name,
@@ -535,22 +729,36 @@ class RemoteLockManager:
         )
         script = self._acquire_script(name, payload, token)
         rc, out, err = self._run(script)
-        if "NOLOCKDIR" in out and self._run_elevated is not None:
+        if _verdict(out) == "NOLOCKDIR" and self._run_elevated is not None:
             # Backup destinations are usually root-owned, so the unprivileged
             # attempt failing is the ordinary case rather than an error.
             rc, out, err = self._run_elevated(script)
-        if "NOLOCKDIR" in out:
+        verdict = _verdict(out)
+        if verdict == "NOLOCKDIR":
             raise RemoteLockUnavailable(
                 f"the lock directory {self._root!r} on the target could not be "
                 f"created or written to. Locks live beside the backups they "
                 f"protect, so this path must be writable by the account running "
                 f"the backup, or that account must be able to elevate for it."
             )
-        if rc != 0 and "ACQUIRED" not in out:
+        if verdict.startswith("NOLOCK"):
+            reason = verdict[len("NOLOCK") :].strip() or "no reason given"
             raise RemoteLockUnavailable(
-                f"could not operate the lock directory on the target: {err.strip() or rc}"
+                f"the lock {self._lock_dir(name)!r} could not be created on the "
+                f"target ({reason}). This is not another process holding it."
             )
-        if "ACQUIRED_STALE" in out:
+        if verdict not in ("ACQUIRED", "ACQUIRED_STALE", "BUSY"):
+            raise RemoteLockUnavailable(
+                f"could not operate the lock directory on the target: "
+                f"{err.strip() or out.strip() or f'exit {rc}'}"
+            )
+        if verdict.startswith("ACQUIRED"):
+            with self._state_lock:
+                self._tokens[name] = token
+            # Registered at once, not when the heartbeat starts: a lock taken
+            # and never refreshed is still released at exit.
+            _register_for_cleanup(self, name)
+        if verdict == "ACQUIRED_STALE":
             logger.warning(
                 "Broke a stale lock %r on the target: its heartbeat was older than "
                 "%ds, so the process holding it is gone.",
@@ -558,7 +766,7 @@ class RemoteLockManager:
                 self._stale_after,
             )
             return "stale-broken"
-        if "ACQUIRED" in out:
+        if verdict == "ACQUIRED":
             return "acquired"
 
         info = None
@@ -572,45 +780,99 @@ class RemoteLockManager:
         raise RemoteLockBusy(name, info)
 
     def release(self, name: str) -> None:
-        """Remove the lock. Named files only -- never a recursive delete."""
+        """Remove the lock -- only if it is still this holder's.
+
+        The holder removes its own ``owner.<token>`` file and nothing else
+        unless that succeeded. A holder that was stalled past the stale
+        threshold, whose lock was broken and taken by another process, used to
+        delete the NEW holder's lock on waking; a third process could then take
+        it while the second still believed it held it. Now it finds its own
+        record gone, leaves the lock alone, and says so.
+
+        Named files only, never a recursive delete; ``rmdir`` fails harmlessly
+        if anything unexpected is inside.
+        """
         self._stop_heartbeat(name)
-        lock = shlex.quote(self._lock_dir(name))
-        info = shlex.quote(f"{self._lock_dir(name)}/info.json")
-        hb = shlex.quote(f"{self._lock_dir(name)}/heartbeat")
-        # rmdir, not rm -rf: if anything unexpected is inside, this fails and
-        # leaves it alone rather than deleting whatever it happens to find.
-        rc, _out, err = self._run(
-            f"rm -f {info} {hb} 2>/dev/null; rmdir {lock} 2>/dev/null; exit 0"
-        )
-        if rc != 0:
-            logger.warning(
-                "Could not fully release remote lock %r: %s", name, err.strip()
+        with self._state_lock:
+            token = self._tokens.get(name)
+            if token is None:
+                # Already released (the exit drain and the operation's own
+                # unwind can both get here), or never taken by this manager.
+                _unregister_for_cleanup(self, name)
+                return
+            lock = shlex.quote(self._lock_dir(name))
+            owner = shlex.quote(self._owner_file(name, token))
+            hb = shlex.quote(f"{self._lock_dir(name)}/{HEARTBEAT_NAME}")
+            rc, out, err = self._run(
+                f"if rm {owner} </dev/null 2>/dev/null; then "
+                f"rm -f {hb} 2>/dev/null; rmdir {lock} 2>/dev/null; echo RELEASED; "
+                f"elif [ -e {owner} ]; then echo KEPT; else echo NOTOWNER; fi"
             )
+            verdict = _verdict(out)
+            if verdict in ("RELEASED", "NOTOWNER"):
+                self._tokens.pop(name, None)
+                _unregister_for_cleanup(self, name)
+            if verdict == "NOTOWNER":
+                logger.warning(
+                    "The lock %r on the target was no longer held by this process "
+                    "when it came to release it: its record was gone -- broken by "
+                    "another process after going unrefreshed for longer than %ds, "
+                    "or removed by hand. Whatever holds that lock now was left "
+                    "alone.",
+                    name,
+                    self._stale_after,
+                )
+            elif verdict != "RELEASED":
+                logger.warning(
+                    "Could not release remote lock %r: %s",
+                    name,
+                    err.strip() or out.strip() or f"exit {rc}",
+                )
 
     def is_locked(self, name: str) -> Optional[dict]:
-        """The holder's details if a LIVE lock exists, else None.
+        """The holder's details if a live lock exists, else None.
 
-        A lock whose heartbeat has gone stale reports as not held: it is a
-        leftover, and treating it as live would block every future operation on
-        the target until someone cleaned up by hand.
+        Raises ``RemoteLockUnavailable`` when the question could not be
+        answered: "not locked" is an answer, and a failed check must never
+        read as one. A lock whose age cannot be read is reported as held (its
+        details, or an empty dict). A lock whose heartbeat has gone stale
+        reports as not held: it is a leftover, and treating it as live would
+        block every future operation on the target until someone cleaned up by
+        hand.
         """
-        info = shlex.quote(f"{self._lock_dir(name)}/info.json")
-        age = _remote_age_expr(f"{self._lock_dir(name)}/heartbeat")
+        lock = shlex.quote(self._lock_dir(name))
         script = (
-            f"if [ -d {shlex.quote(self._lock_dir(name))} ]; then "
-            f'  AGE={age}; if [ "$AGE" -le {self._stale_after} ]; then '
-            f"    cat {info} 2>/dev/null; fi; "
-            f"fi"
+            self._exclusive_functions(name) + f"if [ -d {lock} ]; then "
+            'bbng_judge; printf "AGE %s\\n" "${AGE:-?}"; bbng_show; '
+            f"elif [ -e {lock} ]; then echo UNKNOWN; else echo ABSENT; fi"
         )
-        _rc, out, _err = self._run(script)
+        rc, out, err = self._run(script)
+        verdict = _verdict(out)
+        if rc != 0 or not (verdict == "ABSENT" or verdict.startswith("AGE ")):
+            raise RemoteLockUnavailable(
+                f"could not read the lock {name!r} on the target: "
+                f"{err.strip() or out.strip() or f'exit {rc}'}"
+            )
+        if verdict == "ABSENT":
+            return None
+        age = verdict[len("AGE ") :].strip()
+        if age.isdigit() and int(age) > self._stale_after:
+            return None
+        if not age.isdigit():
+            logger.warning(
+                "The age of the lock %r on the target could not be read, so it "
+                "is treated as held.",
+                name,
+            )
         for line in out.splitlines():
             line = line.strip()
             if line.startswith("{"):
                 try:
-                    return json.loads(line)
+                    info = json.loads(line)
                 except ValueError:
                     return {}
-        return None
+                return info if isinstance(info, dict) else {}
+        return {}
 
     def live_locks(self) -> dict[str, list[Holder]]:
         """Every lock on this target with a live holder, mapped to its holders.
@@ -654,29 +916,44 @@ class RemoteLockManager:
         root = shlex.quote(self._root)
         holders_dir = HOLDERS_DIR_NAME
         script = (
-            f'printf "NOW %s\\n" "$(date +%s)"; '
+            MTIME_FUNCTIONS + 'printf "NOW %s\\n" "$(bbng_now)"; '
+            # A lock root that exists but cannot be listed is not an empty one:
+            # the glob below would simply not expand, and "no pins" would be
+            # reported for a target this account cannot see into.
+            f"if [ -d {root} ] && {{ [ ! -r {root} ] || [ ! -x {root} ]; }}; then "
+            "echo UNLISTABLE; exit 0; fi; "
             f"for d in {root}/*.lock; do "
             f'  [ -d "$d" ] || continue; '
             f'  n=$(basename "$d" .lock); '
             f'  if [ -d "$d/{holders_dir}" ]; then '
+            f'    if [ ! -r "$d/{holders_dir}" ] || [ ! -x "$d/{holders_dir}" ]; then '
+            f'      printf "U %s\\n" "$n"; continue; fi; '
             f'    for h in "$d"/{holders_dir}/*; do '
             f'      [ -f "$h" ] || continue; '
-            f'      m=$(stat -c %Y "$h" 2>/dev/null '
-            f'|| stat -f %m "$h" 2>/dev/null || echo 0); '
-            f'      printf "H %s %s %s " "$n" "$m" "$(basename "$h")"; '
+            f'      m=$(bbng_mtime "$h"); '
+            f'      printf "H %s %s %s " "$n" "${{m:-?}}" "$(basename "$h")"; '
             f'      cat "$h" 2>/dev/null; printf "\\n"; '
             f"    done; "
             f"  else "
-            f'    m=$(stat -c %Y "$d/heartbeat" 2>/dev/null '
-            f'|| stat -f %m "$d/heartbeat" 2>/dev/null '
-            f'|| stat -c %Y "$d" 2>/dev/null '
-            f'|| stat -f %m "$d" 2>/dev/null || echo 0); '
-            f'    printf "X %s %s - "  "$n" "$m"; '
-            f'    cat "$d/info.json" 2>/dev/null; printf "\\n"; '
+            f'    k=; for f in "$d"/{OWNER_PREFIX}*; do [ -f "$f" ] && k=$f; done; '
+            f'    if [ -n "$k" ]; then m=$(bbng_mtime "$k"); '
+            f'    else k="$d/{LEGACY_INFO_NAME}"; m=$(bbng_mtime "$d/{HEARTBEAT_NAME}"); '
+            f'      [ -n "$m" ] || m=$(bbng_mtime "$d"); fi; '
+            f'    printf "X %s %s - " "$n" "${{m:-?}}"; '
+            f'    cat "$k" 2>/dev/null; printf "\\n"; '
             f"  fi; "
             f"done 2>/dev/null; exit 0"
         )
         rc, out, err = self._run(script)
+        if rc == 0 and "UNLISTABLE" in out.splitlines():
+            if self._run_elevated is not None:
+                rc, out, err = self._run_elevated(script)
+            if rc == 0 and "UNLISTABLE" in out.splitlines():
+                raise RemoteLockUnavailable(
+                    f"the lock directory {self._root!r} on the target exists but "
+                    f"cannot be listed by the account running this, so whether "
+                    f"anything is pinned there is not known"
+                )
         if rc != 0:
             # The script ends in `exit 0`, so a non-zero status means the shell
             # never ran it -- the host is unreachable, or the lock directory is
@@ -689,27 +966,42 @@ class RemoteLockManager:
             )
 
         now: Optional[int] = None
+        clock_read = False
         live: dict[str, list[Holder]] = {}
         dead: list[tuple[str, str]] = []
+        unjudged: list[str] = []
         for line in out.splitlines():
-            if line.startswith("NOW "):
-                try:
-                    now = int(line[4:].strip())
-                except ValueError:
-                    now = None
+            if line.startswith("NOW"):
+                clock_read = True
+                value = line[3:].strip()
+                now = int(value) if value.isdigit() else None
                 continue
-            if not line or line[0] not in ("H", "X") or now is None:
+            if line.startswith("U "):
+                # A holders directory that cannot be listed: something may
+                # hold this lock and nothing here can say what. Held.
+                dir_name = line[2:].strip()
+                live.setdefault(decode_name_for_display(dir_name), []).append(
+                    Holder(dir_name, "", {})
+                )
+                unjudged.append(decode_name_for_display(dir_name))
+                continue
+            if not line or line[0] not in ("H", "X"):
                 continue
             parts = line.split(" ", 4)
             if len(parts) < 4:
                 continue
             kind, dir_name, mtime_raw, file_name = parts[:4]
             raw = parts[4] if len(parts) > 4 else ""
-            try:
-                age = now - int(mtime_raw)
-            except ValueError:
-                continue
-            if age > self._stale_after:
+            # A holder whose age cannot be read -- no readable mtime, or no
+            # readable clock on the target -- is HELD. Counting it as dead
+            # (which an mtime read as 0 used to do) made the guard report a
+            # live pin as absent, and `restore --unlock` swept it.
+            age = (
+                now - int(mtime_raw)
+                if now is not None and mtime_raw.isdigit()
+                else None
+            )
+            if age is not None and age > self._stale_after:
                 if kind == "H" and age > self._stale_after * DEAD_HOLDER_MULTIPLE:
                     dead.append((dir_name, file_name))
                 continue
@@ -727,6 +1019,24 @@ class RemoteLockManager:
             # checks for both, so such a lock still blocks.
             key = str(info.get("name") or decode_name_for_display(dir_name))
             live.setdefault(key, []).append(Holder(dir_name, file_name, info))
+            if age is None:
+                unjudged.append(key)
+        if not clock_read:
+            # Every run of the script prints the NOW line first; output without
+            # it is not a listing, and an empty result would read as "nothing
+            # is locked".
+            raise RemoteLockUnavailable(
+                f"could not list locks on the target: unexpected output "
+                f"{(out.strip() or err.strip() or 'none')[:200]!r}"
+            )
+        if unjudged:
+            logger.warning(
+                "The age of %d lock record(s) on the target could not be read%s, "
+                "so they are treated as held: %s",
+                len(unjudged),
+                "" if now is not None else " (the target's clock could not be read)",
+                ", ".join(sorted(set(unjudged))),
+            )
         return live, dead
 
     def sweep_dead_holders(self) -> int:
@@ -754,38 +1064,61 @@ class RemoteLockManager:
 
         ``--unlock`` must be able to clear a holder whose payload is unreadable,
         which is precisely the one it cannot name. Addressing the record instead
-        of recomputing a path from a lock id makes that possible.
+        of recomputing a path from a lock id makes that possible. A holder
+        found in a directory that could not be listed has no record to
+        address, and is left alone.
         """
+        if not holder.file_name:
+            logger.warning(
+                "The holders of %r on the target could not be listed, so none of "
+                "them can be cleared from here.",
+                decode_name_for_display(holder.dir_name),
+            )
+            return
         base = f"{self._root}/{holder.dir_name}.lock"
         record = shlex.quote(f"{base}/{HOLDERS_DIR_NAME}/{holder.file_name}")
         holders = shlex.quote(f"{base}/{HOLDERS_DIR_NAME}")
         lock = shlex.quote(base)
+        own_key = None
         if holder.lock_id is not None:
             name = str(holder.info.get("name") or "")
             if name:
-                self._stop_heartbeat(self._held_key(name, holder.lock_id))
-        self._run(
+                own_key = self._held_key(name, holder.lock_id)
+                self._stop_heartbeat(own_key)
+        rc, _out, _err = self._run(
             f"rm -f {record} 2>/dev/null; "
             f"rmdir {holders} 2>/dev/null; rmdir {lock} 2>/dev/null; exit 0"
         )
+        if rc == 0 and own_key is not None:
+            _unregister_for_cleanup(self, own_key)
 
     # ------------------------------------------------------------- heartbeat
 
     def _start_heartbeat(self, key: str, path: Optional[str] = None) -> None:
-        """Refresh ``path``'s mtime until stopped. ``key`` identifies the holder.
+        """Refresh the holder's record until stopped. ``key`` identifies it.
 
-        For an exclusive lock the refreshed file is the lock's ``heartbeat``; for
-        a shared pin it is that holder's own file, so holders of the same
-        snapshot keep their pins alive independently.
+        For a shared pin ``path`` is that holder's own file, so holders of the
+        same snapshot keep their pins alive independently. For an exclusive
+        lock (no ``path``) it is the holder's ``owner.<token>`` file and the
+        ``heartbeat`` beside it, refreshed with ``touch -c``: a holder whose
+        lock was broken while it was stalled must not recreate its record
+        inside the next holder's lock.
         """
         stop = threading.Event()
-        target = path if path is not None else f"{self._lock_dir(key)}/heartbeat"
-        hb = shlex.quote(target)
+        if path is not None:
+            command = f"touch {shlex.quote(path)} 2>/dev/null; exit 0"
+        else:
+            with self._state_lock:
+                token = self._tokens.get(key, "")
+            files = [f"{self._lock_dir(key)}/{HEARTBEAT_NAME}"]
+            if token:
+                files.insert(0, self._owner_file(key, token))
+            command = f"touch -c {' '.join(shlex.quote(f) for f in files)} 2>/dev/null; exit 0"
 
         def beat() -> None:
             while not stop.wait(self._heartbeat_interval):
                 try:
-                    self._run(f"touch {hb} 2>/dev/null; exit 0")
+                    self._run(command)
                 except Exception as exc:  # noqa: BLE001 - a missed beat is not fatal
                     # One failed refresh must not end a transfer. Several in a
                     # row let the lock go stale, which is the designed outcome
@@ -799,12 +1132,13 @@ class RemoteLockManager:
         thread.start()
 
     def _stop_heartbeat(self, key: str) -> None:
+        """Stop refreshing. The exit-cleanup entry stays until the release
+        itself has run, so a release that does not complete is retried."""
         stop = self._held.pop(key, None)
         thread = self._threads.pop(key, None)
-        _unregister_for_cleanup(self, key)
         if stop is not None:
             stop.set()
-        if thread is not None:
+        if thread is not None and thread is not threading.current_thread():
             thread.join(timeout=5)
 
     def acquire_persistent(self, name: str, operation: str) -> str:
@@ -826,11 +1160,19 @@ class RemoteLockManager:
 
     @contextmanager
     def hold(self, name: str, operation: str) -> Iterator[str]:
-        """Hold the lock for the duration of the block, refreshing it throughout."""
+        """Hold the lock for the duration of the block, refreshing it throughout.
+
+        Processes the block starts run inside it: if the block fails or is
+        interrupted, they are stopped and waited for before the lock is
+        released (see ``btrfs_backup_ng.lifecycle``).
+        """
+        from .. import lifecycle
+
         mode = self.acquire_once(name, operation)
         self._start_heartbeat(name)
         try:
-            yield mode
+            with lifecycle.process_scope():
+                yield mode
         finally:
             self.release(name)
 
@@ -1020,10 +1362,17 @@ def record_pin(
         else:
             manager.release_shared(name, holder_id)
     except Exception as exc:  # noqa: BLE001 - reported, never silently passed
+        if lock_state and _read_only(manager):
+            read_only_notice(
+                snapshot_lock_name(snapshot),
+                where,
+                getattr(manager, "location", where),
+            )
+            return
         if lock_state and not skip_remote_lock:
             raise __util__.AbortError(
                 f"Could not lock {snapshot_lock_name(snapshot)} on this "
-                f"{where}: {exc}. Refusing to continue unprotected: another "
+                f"{where}: {reason_of(exc)}. Refusing to continue unprotected: another "
                 f"process pruning this {where} would not see the {noun} as in "
                 f"use and could delete it while it is being read. Make the "
                 f"{where} writable by the account running this, allow that "
@@ -1047,6 +1396,17 @@ def record_pin(
                 where,
                 exc,
             )
+
+
+def _read_only(manager: Any) -> bool:
+    probe = getattr(manager, "location_is_read_only", None)
+    return callable(probe) and bool(probe())
+
+
+def reason_of(exc: BaseException) -> str:
+    """An exception's message as a clause: without its own final period, so
+    a sentence built around it does not end in two."""
+    return str(exc).rstrip(". ")
 
 
 def blocked_by_remote_lock(manager: Any, snapshots: list) -> set[str]:

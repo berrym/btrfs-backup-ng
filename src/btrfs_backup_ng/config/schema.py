@@ -92,7 +92,12 @@ class RetentionConfig:
     """Retention policy configuration.
 
     Attributes:
-        min: Minimum retention period (e.g., "1d", "2h", "30m")
+        min: Minimum retention period (e.g., "1d", "2h", "30m"): nothing
+            younger than this is deleted, whatever the buckets say. ``"all"``
+            keeps every snapshot in the scope for ever (btrbk's
+            ``*_preserve_min all``, its default): retention then deletes
+            nothing there, and the bucket counts and ``keep`` cannot select
+            anything to delete.
         hourly: Number of hourly snapshots to keep
         daily: Number of daily snapshots to keep
         weekly: Number of weekly snapshots to keep

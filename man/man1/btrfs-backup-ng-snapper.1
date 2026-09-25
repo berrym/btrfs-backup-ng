@@ -134,8 +134,10 @@ Disable progress bars (default when not in terminal).
 Show progress bars (default when running in terminal).
 .TP
 .B \-\-skip-remote-lock
-Proceed even if a lock cannot be recorded on the remote target. Only safe
-when nothing else can prune this target during the run.
+Proceed even if a pin cannot be recorded on the backup location, wherever its
+lock store lives (a remote target's lock directory, or a local location's lock
+file). Only safe when nothing else can prune this location during the run. A
+medium mounted read-only needs no pin and none is asked for.
 .TP
 .BI \-\-timestamp-format " FMT"
 strftime format for the timestamp in backup names (default:
@@ -215,10 +217,13 @@ its renumbered \fIinfo.xml\fR and only then renamed to \fI.snapshots/{N}/\fR, so
 restore that fails mid\-receive leaves no numbered slot and no temp. The number is
 decided when the copy is published, with a rename that cannot replace an existing
 entry: a snapshot Snapper creates while the restore runs keeps its slot and the copy
-lands under the next free number. One restore runs into a config at a time; a second
-started meanwhile is refused. The backup
-is pinned on its location for the duration (released if a transfer fails);
-\fB\-\-skip-remote-lock\fR for a location that can be read but not written. A
+lands under the next free number. One writer runs below a \fI.snapshots\fR tree at a
+time, a restore into a config or a backup into a local target; a second started
+meanwhile is refused with the reason. The backup is pinned on its location for the
+duration (released if a transfer fails or the run is interrupted), and no prune deletes
+a pinned slot or stream, on any location type;
+\fB\-\-skip-remote-lock\fR for a location that can be read but not written, and
+nothing for a medium mounted read-only. A
 \fBraw://\fR increment whose parent is neither in the config nor selected is
 refused before anything is transferred.
 .PP

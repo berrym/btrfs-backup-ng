@@ -60,6 +60,8 @@ except ImportError:
 
 from btrfs_backup_ng import __util__  # noqa: E402
 from btrfs_backup_ng.__logger__ import logger  # noqa: E402
+from btrfs_backup_ng import lifecycle  # noqa: E402
+from btrfs_backup_ng.lifecycle import track as track_child  # noqa: E402
 from btrfs_backup_ng.endpoint.raw_metadata import StructureVerdict  # noqa: E402
 from btrfs_backup_ng.core.errors import (  # noqa: E402
     TransientNetworkError,
@@ -135,8 +137,11 @@ def _guarded_pipeline(pipeline: str) -> str:
     it wins. Verified delivering the full payload on all three shells above,
     with a failing `btrfs receive` still exiting non-zero through the group.
     """
+    # `$! ;`, never `$!;`: the command line is parsed by the account's login
+    # shell first, and csh/tcsh read a `!` followed by anything but a blank,
+    # `=` or `(` as a history reference, even inside single quotes.
     return (
-        f"exec 3<&0; {{ {pipeline}; }} <&3 & pid=$!; "
+        f"exec 3<&0; {{ {pipeline}; }} <&3 & pid=$! ; "
         f'trap "trap - HUP INT TERM; kill 0" HUP INT TERM; '
         f'wait "$pid"'
     )
@@ -1097,9 +1102,27 @@ class SSHEndpoint(Endpoint):
                 f"anyway."
             ) from exc
 
+        # Recorded while the lock is held and before anything is received: what
+        # is at the path now is not this run's work, and must survive this
+        # run's failure.
+        dest_dir, _, received = str(destination).rstrip("/").rpartition("/")
+        preexisted = self.artifact_exists(dest_dir or "/", received)
+
+        def remove_partial() -> None:
+            self._cleanup_partial_subvolume(
+                dest_dir or "/", received, created_by_this_run=not preexisted
+            )
+
         manager._start_heartbeat(name)
         try:
-            yield
+            # The order an interrupted or failed receive is unwound in (see
+            # btrfs_backup_ng.lifecycle): the receive's processes are stopped
+            # and waited for; then the partial subvolume THIS run created at
+            # the path is removed; only then is the lock released, so no other
+            # transfer can have started creating that path in between.
+            with lifecycle.undo_on_failure(remove_partial):
+                with lifecycle.process_scope():
+                    yield
         finally:
             manager.release(name)
 
@@ -1235,11 +1258,13 @@ class SSHEndpoint(Endpoint):
         # concurrently and keeps the last 64 KiB, so the remote "ERROR: ..."
         # line reaches the report. (Never redirect remote stderr into stdout
         # -- it corrupts the btrfs stream.)
-        process = subprocess.Popen(
-            ssh_cmd,
-            stdin=subprocess.PIPE if password else None,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+        process = track_child(
+            subprocess.Popen(
+                ssh_cmd,
+                stdin=subprocess.PIPE if password else None,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
         )
         tail_stderr(
             process,
@@ -2376,8 +2401,8 @@ print(json.dumps(result))
         command = ["btrfs", "send", source]
         logger.debug("Preparing to execute btrfs send: %s", command)
         try:
-            process = subprocess.Popen(
-                command, stdout=stdout_pipe, stderr=subprocess.PIPE
+            process = track_child(
+                subprocess.Popen(command, stdout=stdout_pipe, stderr=subprocess.PIPE)
             )
             tail_stderr(
                 process, log_as="btrfs send" if self.config.get("btrfs_debug") else None
@@ -2556,12 +2581,14 @@ print(json.dumps(result))
         logger.debug("SSH receive command: %s", " ".join(ssh_cmd))
 
         try:
-            receive_process = subprocess.Popen(
-                ssh_cmd,
-                stdin=stdin_pipe,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                bufsize=0,
+            receive_process = track_child(
+                subprocess.Popen(
+                    ssh_cmd,
+                    stdin=stdin_pipe,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    bufsize=0,
+                )
             )
             # The remote receive's stderr comes back over ssh. Drained as it
             # arrives (core.transfer.StderrTail): with -vv it is a line per
@@ -3904,27 +3931,31 @@ print(json.dumps(result))
             pipeline_env["BTRFS_BACKUP_SUDO_PW"] = sudo_password
         try:
             if bash_path:
-                proc = subprocess.Popen(
-                    "set -o pipefail; " + full_pipeline,
-                    shell=True,
-                    executable=bash_path,
-                    stdin=subprocess.DEVNULL,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    env=pipeline_env,
+                proc = track_child(
+                    subprocess.Popen(
+                        "set -o pipefail; " + full_pipeline,
+                        shell=True,
+                        executable=bash_path,
+                        stdin=subprocess.DEVNULL,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        env=pipeline_env,
+                    )
                 )
             else:
                 logger.warning(
                     "bash not found; running transfer pipeline without pipefail "
                     "(a btrfs send or pv failure may be masked by ssh's exit code)"
                 )
-                proc = subprocess.Popen(
-                    full_pipeline,
-                    shell=True,
-                    stdin=subprocess.DEVNULL,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    env=pipeline_env,
+                proc = track_child(
+                    subprocess.Popen(
+                        full_pipeline,
+                        shell=True,
+                        stdin=subprocess.DEVNULL,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        env=pipeline_env,
+                    )
                 )
 
             stderr_lines: List[str] = []
@@ -4195,8 +4226,10 @@ print(json.dumps(result))
             logger.debug(f"Local send command: {' '.join(send_cmd)}")
 
             # Start the local btrfs send process
-            send_process = subprocess.Popen(
-                send_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0
+            send_process = track_child(
+                subprocess.Popen(
+                    send_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0
+                )
             )
             tail_stderr(
                 send_process,
@@ -4211,11 +4244,13 @@ print(json.dumps(result))
                 if not buffer_cmd:
                     return None
                 logger.debug(f"Using {buffer_name} to improve transfer reliability")
-                return subprocess.Popen(
-                    buffer_cmd.split(),
-                    stdin=stdin,
-                    stdout=subprocess.PIPE,
-                    bufsize=0,
+                return track_child(
+                    subprocess.Popen(
+                        buffer_cmd.split(),
+                        stdin=stdin,
+                        stdout=subprocess.PIPE,
+                        bufsize=0,
+                    )
                 )
 
             # Stream compression: compress BEFORE the wire, decompress after it.
@@ -4235,11 +4270,13 @@ print(json.dumps(result))
                     "remote before btrfs receive)",
                     compress_method,
                 )
-                return subprocess.Popen(
-                    COMPRESSION_PROGRAMS[compress_method]["compress"],
-                    stdin=stdin,
-                    stdout=subprocess.PIPE,
-                    bufsize=0,
+                return track_child(
+                    subprocess.Popen(
+                        COMPRESSION_PROGRAMS[compress_method]["compress"],
+                        stdin=stdin,
+                        stdout=subprocess.PIPE,
+                        bufsize=0,
+                    )
                 )
 
             from ..core.transfer import chain_stages
@@ -4684,15 +4721,30 @@ print(json.dumps(result))
 
         # Start the receive process
         try:
-            receive_process = subprocess.Popen(
-                ssh_cmd,
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
+            # stdout is not read anywhere on this path; a pipe nobody reads is
+            # a second place the receive could block, and a file descriptor
+            # that was left open until garbage collection.
+            receive_process = track_child(
+                subprocess.Popen(
+                    ssh_cmd,
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.PIPE,
+                )
             )
         except Exception as e:
             logger.error("Failed to start SSH receive process: %s", e)
             return False
+        # The remote receive's stderr comes back over ssh. It is drained as it
+        # arrives (core.transfer.StderrTail) and read through stderr_text below;
+        # it used to be read only after the process had exited, so a receive
+        # that said more than the 64 KiB pipe holds -- -vv under btrfs_debug is
+        # a line per file operation -- blocked on stderr while this side waited
+        # for it to take the next chunk.
+        tail_stderr(
+            receive_process,
+            log_as="remote btrfs receive" if self.config.get("btrfs_debug") else None,
+        )
 
         # If sudo with password is needed, send it first
         if use_sudo and not passwordless:
@@ -4713,11 +4765,7 @@ print(json.dumps(result))
 
                 # Check if process is still alive
                 if receive_process.poll() is not None:
-                    stderr = ""
-                    if receive_process.stderr:
-                        stderr = receive_process.stderr.read().decode(
-                            "utf-8", errors="replace"
-                        )
+                    stderr = stderr_text(receive_process)
                     logger.error(
                         "SSH receive process died at chunk %d: %s",
                         chunks_sent,
@@ -4780,11 +4828,7 @@ print(json.dumps(result))
                 return False
 
             if return_code != 0:
-                stderr = ""
-                if receive_process.stderr:
-                    stderr = receive_process.stderr.read().decode(
-                        "utf-8", errors="replace"
-                    )
+                stderr = stderr_text(receive_process)
                 logger.error(
                     "SSH btrfs receive failed with code %d: %s",
                     return_code,

@@ -1,7 +1,7 @@
 """Tests for snapper metadata handling."""
 
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 
 import pytest
 
@@ -14,6 +14,16 @@ from btrfs_backup_ng.snapper.metadata import (
     parse_info_xml_string,
     save_backup_metadata,
 )
+
+
+def _local(utc_naive: datetime) -> datetime:
+    """A UTC wall time as this process's local naive time."""
+    return utc_naive.replace(tzinfo=timezone.utc).astimezone().replace(tzinfo=None)
+
+
+def _utc_text(local_naive: datetime) -> str:
+    """A local naive time as snapper's UTC ``<date>`` text."""
+    return local_naive.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
 
 class TestSnapperSnapshotBackupName:
@@ -200,7 +210,8 @@ class TestParseInfoXml:
         meta = parse_info_xml(xml_file)
         assert meta.type == "single"
         assert meta.num == 10368
-        assert meta.date == datetime(2025, 10, 1, 11, 42, 50)
+        # info.xml dates are UTC; the parsed date is that instant in local time.
+        assert meta.date == _local(datetime(2025, 10, 1, 11, 42, 50))
         assert meta.description == "timeline"
         assert meta.cleanup == "timeline"
         assert meta.pre_num is None
@@ -314,7 +325,8 @@ class TestGenerateInfoXml:
         assert "<snapshot>" in xml
         assert "<type>single</type>" in xml
         assert "<num>100</num>" in xml
-        assert "<date>2025-10-01 11:42:50</date>" in xml
+        # A local date is written back as UTC, snapper's convention.
+        assert f"<date>{_utc_text(datetime(2025, 10, 1, 11, 42, 50))}</date>" in xml
         assert "<description>timeline</description>" in xml
         assert "<cleanup>timeline</cleanup>" in xml
         assert "</snapshot>" in xml

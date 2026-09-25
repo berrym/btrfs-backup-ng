@@ -303,6 +303,44 @@ class TestForeignRawTarget:
         assert_payload_restored(res["restore_dest"], rig.payload)
 
     @requires_raw_remote
+    def test_a_receive_whose_ssh_floods_stderr_still_finishes(self, rig):
+        """The raw+ssh receive pipeline's last stage is ssh, and its stderr
+        was a pipe nobody read: an ssh that said more than the 64 KiB pipe
+        holds blocked, and the stall detector killed a healthy transfer.
+        Here the ssh the product finds on PATH writes 1 MiB to stderr before
+        handing over to the real one, through the real CLI to the real
+        foreign host; the stream still lands and restores."""
+        import os
+        import shutil
+
+        from .conftest import RAW_REMOTE_SPEC, raw_remote_sh
+
+        real_ssh = shutil.which("ssh")
+        assert real_ssh, "no ssh on the runner"
+        wrapper_dir = rig.root / "ssh-flood-bin"
+        wrapper_dir.mkdir(exist_ok=True)
+        wrapper = wrapper_dir / "ssh"
+        wrapper.write_text(
+            "#!/bin/sh\n"
+            "head -c 1048576 /dev/zero | tr '\\0' v >&2\n"
+            f'exec {shlex.quote(real_ssh)} "$@"\n'
+        )
+        wrapper.chmod(0o755)
+        dest = f"{rig.raw_remote_base}/raw-flood"
+        raw_remote_sh(f"mkdir -p '{dest}'")
+        loc = f"raw+ssh://{RAW_REMOTE_SPEC}:{dest}"
+        cfg = rig.write_config(
+            rig.root / "cfg-foreign-flood.toml", f'path = "{loc}"', prefix="t3fld-"
+        )
+        env = {**os.environ, "PATH": f"{wrapper_dir}:{os.environ['PATH']}"}
+        r = rig.cli("run", config=cfg, env=env, timeout=300)
+        out = r.stdout + r.stderr
+        assert r.returncode == 0, out[-3000:]
+        assert "stall" not in out.lower(), out[-3000:]
+        streams = rig.foreign_raw_streams(dest)
+        assert streams, "nothing landed on the foreign target"
+
+    @requires_raw_remote
     def test_the_published_stream_is_not_world_readable(self, rig):
         """The stream is the most sensitive file this tool writes. A remote
         `cat >` left it at the target's umask, typically 0644, while the .meta
@@ -834,3 +872,131 @@ class TestSnapperSource:
         assert remote_sh(f"test -e '{never}'").returncode != 0, (
             "the missing remote target was built"
         )
+
+    def test_run_sends_a_behind_target_only_what_its_prune_keeps(
+        self, rig, snapper_chain
+    ):
+        """Four same-day snapper snapshots and a target that has none of them:
+        `run` under a daily-only policy sends the day's first and the newest,
+        says which two it left out, and the target ends up holding exactly
+        what `snapper backup` of everything followed by the prune leaves.
+        Before this the snapper pipeline sent all four and pruned two a
+        moment later.
+        """
+        snap = snapper_chain
+        numbers = [snap.take(f"catch-up {i}") for i in range(4)]
+        policy = (
+            'min = "0s"\nhourly = 0\ndaily = 1\nweekly = 0\nmonthly = 0\nyearly = 0'
+        )
+
+        def slots(target: Path) -> list[int]:
+            snapshots = target / ".snapshots"
+            if not snapshots.is_dir():
+                return []
+            return sorted(
+                int(p.name) for p in snapshots.iterdir() if p.name.isdecimal()
+            )
+
+        selective = rig.dst / "snapper-catch-up-run"
+        selective.mkdir()
+        cfg = rig.write_config(
+            rig.root / "cfg-snapper-catch-up.toml",
+            f'path = "{selective}"',
+            source="snapper",
+            snapper_config=snap.name,
+            retention=policy,
+            prefix="t3sc-",
+        )
+        r = rig.cli("run", config=cfg)
+        out = r.stdout + r.stderr
+        assert r.returncode == 0, out[-3000:]
+        flat = " ".join(out.split())
+        assert "Not sending 2 of 4 missing snapper snapshot(s)" in flat, out[-3000:]
+        assert slots(selective) == [numbers[0], numbers[-1]], out[-3000:]
+
+        everything = rig.dst / "snapper-catch-up-all"
+        everything.mkdir()
+        r2 = rig.cli("snapper", "backup", snap.name, str(everything), "--min-age", "0s")
+        assert r2.returncode == 0, (r2.stdout + r2.stderr)[-3000:]
+        assert slots(everything) == numbers
+        cfg2 = rig.write_config(
+            rig.root / "cfg-snapper-catch-up-all.toml",
+            f'path = "{everything}"',
+            source="snapper",
+            snapper_config=snap.name,
+            retention=policy,
+            prefix="t3sca-",
+        )
+        r3 = rig.cli("run", config=cfg2)  # nothing new to send; the prune runs
+        assert r3.returncode == 0, (r3.stdout + r3.stderr)[-3000:]
+        assert slots(everything) == slots(selective) == [numbers[0], numbers[-1]]
+
+    def test_prune_deletes_from_a_snapper_destination_what_run_would(
+        self, rig, snapper_chain
+    ):
+        """`prune` on a snapper volume prunes its destination exactly as `run`
+        does after a transfer: four same-day snapper backups under a daily-only
+        policy, `prune --dry-run` names the two slots it would delete and
+        deletes nothing, `prune --yes` deletes them, and the destination ends
+        up holding what `run`'s own prune leaves on a twin destination. Before
+        this, `prune` listed a snapper destination through the native endpoint,
+        found no prefix-named snapshot and reported "Keeping 0, deleting 0".
+        """
+        snap = snapper_chain
+        numbers = [snap.take(f"prune {i}") for i in range(4)]
+        policy = (
+            'min = "0s"\nhourly = 0\ndaily = 1\nweekly = 0\nmonthly = 0\nyearly = 0'
+        )
+
+        def slots(target: Path) -> list[int]:
+            snapshots = target / ".snapshots"
+            if not snapshots.is_dir():
+                return []
+            return sorted(
+                int(p.name) for p in snapshots.iterdir() if p.name.isdecimal()
+            )
+
+        pruned = rig.dst / "snapper-prune-cmd"
+        pruned.mkdir()
+        r = rig.cli("snapper", "backup", snap.name, str(pruned), "--min-age", "0s")
+        assert r.returncode == 0, (r.stdout + r.stderr)[-3000:]
+        assert slots(pruned) == numbers
+        cfg = rig.write_config(
+            rig.root / "cfg-snapper-prune-cmd.toml",
+            f'path = "{pruned}"',
+            source="snapper",
+            snapper_config=snap.name,
+            retention=policy,
+            prefix="t3sp-",
+        )
+        dry = rig.cli("prune", "--dry-run", config=cfg)
+        out = dry.stdout + dry.stderr
+        assert dry.returncode == 0, out[-3000:]
+        flat = " ".join(out.split())
+        for n in numbers[1:-1]:
+            assert f"Would delete (target {pruned}): slot {n} (" in flat, out[-3000:]
+        assert f"slot {numbers[0]} (" not in flat.split("Would delete")[0]
+        assert slots(pruned) == numbers, "a dry run deleted a slot"
+
+        real = rig.cli("prune", "--yes", config=cfg)
+        out = real.stdout + real.stderr
+        assert real.returncode == 0, out[-3000:]
+        assert slots(pruned) == [numbers[0], numbers[-1]], out[-3000:]
+        for n in numbers[1:-1]:
+            assert not (pruned / ".snapshots" / str(n)).exists()
+
+        by_run = rig.dst / "snapper-prune-run"
+        by_run.mkdir()
+        r2 = rig.cli("snapper", "backup", snap.name, str(by_run), "--min-age", "0s")
+        assert r2.returncode == 0, (r2.stdout + r2.stderr)[-3000:]
+        cfg2 = rig.write_config(
+            rig.root / "cfg-snapper-prune-run.toml",
+            f'path = "{by_run}"',
+            source="snapper",
+            snapper_config=snap.name,
+            retention=policy,
+            prefix="t3spr-",
+        )
+        r3 = rig.cli("run", config=cfg2)
+        assert r3.returncode == 0, (r3.stdout + r3.stderr)[-3000:]
+        assert slots(by_run) == slots(pruned) == [numbers[0], numbers[-1]]

@@ -85,20 +85,23 @@ def _captured_argv(*, euid, compress):
     )
 
     seen = {"send": None, "compress": None, "remote": None}
+    procs: list = []
 
     class _Stop(Exception):
         pass
 
     def fake_popen(cmd, *a, **k):
         argv = list(cmd) if isinstance(cmd, (list, tuple)) else [str(cmd)]
-        if "send" in argv and any("btrfs" in part for part in argv):
-            seen["send"] = argv
-            return _FakeProc()
         if argv and argv[0] == "ssh":
             seen["remote"] = argv
             raise _Stop  # far enough: the remote command has been built
-        seen["compress"] = argv
-        return _FakeProc()
+        proc = _FakeProc()
+        procs.append(proc)
+        if "send" in argv and any("btrfs" in part for part in argv):
+            seen["send"] = argv
+        else:
+            seen["compress"] = argv
+        return proc
 
     class _FakeProc:
         def __init__(self):
@@ -136,6 +139,10 @@ def _captured_argv(*, euid, compress):
             )
         except Exception:
             pass
+    # The fake processes' stdout pipes are real file descriptors; nothing in
+    # the strategy closes a pipe it never read to the end.
+    for proc in procs:
+        proc.stdout.close()
     return seen
 
 
@@ -672,7 +679,102 @@ class TestTheCompressedRemoteCommandIsSupervised:
                 found.append(parts[2])
         return found
 
-    @pytest.mark.parametrize("sig", [signal.SIGHUP, signal.SIGTERM])
+    @staticmethod
+    def _signals_as_sshd_leaves_them() -> None:
+        """Runs in the child between fork and exec: HUP, INT and TERM back to
+        their default dispositions.
+
+        A signal that is IGNORED when a non-interactive shell starts cannot be
+        trapped by it (POSIX; bash and dash both silently keep ignoring it), so
+        the shell under test only shows what it does on the remote if it starts
+        the way sshd starts a session command -- every signal at its default.
+        The test process does not always have that: under ``nohup``, or any
+        harness that ignores SIGHUP, the ignore is inherited through fork and
+        exec, the emitted ``trap ... HUP`` installs nothing, and the shell
+        survives the SIGHUP this test sends. That is how this test failed in
+        some full-suite runs and never on its own: the runs that failed were
+        started under ``nohup``. Resetting here makes the test independent of
+        how pytest itself was started.
+        """
+        for signum in (signal.SIGHUP, signal.SIGINT, signal.SIGTERM):
+            signal.signal(signum, signal.SIG_DFL)
+
+    @staticmethod
+    def _picture_of(sid: int) -> str:
+        """The processes of session ``sid`` with their signal masks."""
+        ps = subprocess.run(
+            ["ps", "-o", "pid=,ppid=,pgid=,stat=,args=", "--sid", str(sid)],
+            capture_output=True,
+            text=True,
+        ).stdout
+        lines = []
+        for line in ps.splitlines():
+            parts = line.split(None, 4)
+            if not parts:
+                continue
+            try:
+                status = open(f"/proc/{parts[0]}/status").read().splitlines()
+                masks = " ".join(
+                    entry.replace("\t", "=")
+                    for entry in status
+                    if entry.startswith(("SigIgn", "SigBlk", "SigCgt"))
+                )
+            except OSError:
+                masks = "(gone)"
+            lines.append(f"{line.strip()}  {masks}")
+        try:
+            own = open("/proc/self/status").read().splitlines()
+            lines.append(
+                "this test process: "
+                + " ".join(
+                    entry.replace("\t", "=")
+                    for entry in own
+                    if entry.startswith(("SigIgn", "SigBlk", "SigCgt"))
+                )
+            )
+        except OSError:
+            pass
+        return "\n".join(lines) or "(no processes left in the session)"
+
+    def test_an_ignored_signal_at_entry_would_defeat_the_trap(self, tmp_path):
+        """The reason the shell must start with default dispositions: started
+        with SIGHUP ignored -- as under nohup -- the very same command keeps
+        running through a SIGHUP, because the shell cannot trap a signal it
+        inherited as ignored. This pins the mechanism the reset above defends
+        against, so the defence cannot be removed as unexplained."""
+        env = self._shims(tmp_path)
+        cmd = _build_receive_command(
+            "/backups", use_sudo=True, decompress="zstd"
+        ).replace("btrfs receive", "btrfs-slow receive")
+
+        def ignore_hup() -> None:
+            signal.signal(signal.SIGHUP, signal.SIG_IGN)
+
+        proc = subprocess.Popen(
+            ["/bin/sh", "-c", cmd],
+            start_new_session=True,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            env=env,
+            preexec_fn=ignore_hup,
+        )
+        try:
+            time.sleep(0.8)
+            os.kill(proc.pid, signal.SIGHUP)
+            time.sleep(1.0)
+            assert proc.poll() is None, (
+                "a shell started with SIGHUP ignored trapped it anyway; the "
+                "reset in the tests above is then no longer load-bearing"
+            )
+        finally:
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            proc.wait()
+
+    @pytest.mark.parametrize(
+        "sig", [signal.SIGHUP, signal.SIGTERM], ids=lambda s: signal.Signals(s).name
+    )
     @pytest.mark.parametrize("password_on_stdin", [False, True])
     def test_a_signal_mid_transfer_kills_the_whole_pipeline(
         self, tmp_path, sig, password_on_stdin
@@ -692,7 +794,9 @@ class TestTheCompressedRemoteCommandIsSupervised:
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             env=env,
+            preexec_fn=self._signals_as_sshd_leaves_them,
         )
+        picture = ""
         try:
             time.sleep(0.8)
             pgid = os.getpgid(proc.pid)
@@ -700,6 +804,12 @@ class TestTheCompressedRemoteCommandIsSupervised:
             time.sleep(1.5)
             rc = proc.poll()
             survivors = self._alive_in_group(pgid)
+            if rc is None:
+                # What the shell and its children were doing when they should
+                # have been dead: state, and the signals each one ignores,
+                # blocks or catches, plus this process's own -- an inherited
+                # ignore is the first thing to look for.
+                picture = self._picture_of(proc.pid)
         finally:
             if proc.poll() is None:
                 with contextlib.suppress(ProcessLookupError):
@@ -707,7 +817,8 @@ class TestTheCompressedRemoteCommandIsSupervised:
                 proc.wait()
 
         assert rc is not None, (
-            "the remote shell ignored the signal and kept the transfer running"
+            "the remote shell ignored the signal and kept the transfer running:\n"
+            + picture
         )
         assert rc != -signal.SIGSEGV, (
             "the trap handler recursed until the shell crashed"
@@ -743,7 +854,7 @@ class TestTheCompressedRemoteCommandIsSupervised:
     def test_the_pipeline_is_backgrounded_and_waited_on(self):
         """A foreground pipeline defers the trap until it is far too late."""
         cmd = _build_receive_command("/backups", use_sudo=True, decompress="zstd")
-        assert "& pid=$!" in cmd
+        assert "& pid=$! ;" in cmd
         assert 'wait "$pid"' in cmd
 
     def test_the_uncompressed_form_still_uses_exec(self):
@@ -848,24 +959,32 @@ class TestAFailedCompressorFailsTheTransfer:
             def kill(self):
                 pass
 
+        procs: list = []
+
         def fake_popen(cmd, *a, **k):
             argv = list(cmd) if isinstance(cmd, (list, tuple)) else [str(cmd)]
-            if argv[:1] == ["zstd"] or argv[:2] == ["zstd", "-c"]:
-                return _Proc(compressor_rc)
-            return _Proc(0)
+            rc = compressor_rc if argv[:1] == ["zstd"] else 0
+            proc = _Proc(rc)
+            procs.append(proc)
+            return proc
 
-        with (
-            patch.object(ssh_mod.subprocess, "Popen", fake_popen),
-            patch.object(ssh_mod.os.path, "exists", lambda p: True),
-            patch.object(ssh_mod.os, "geteuid", lambda: 1000),
-        ):
-            return endpoint._try_direct_transfer(
-                source_path="/snaps/snap",
-                dest_path="/dest",
-                snapshot_name="snap",
-                parent_path=None,
-                show_progress=False,
-            )
+        try:
+            with (
+                patch.object(ssh_mod.subprocess, "Popen", fake_popen),
+                patch.object(ssh_mod.os.path, "exists", lambda p: True),
+                patch.object(ssh_mod.os, "geteuid", lambda: 1000),
+            ):
+                return endpoint._try_direct_transfer(
+                    source_path="/snaps/snap",
+                    dest_path="/dest",
+                    snapshot_name="snap",
+                    parent_path=None,
+                    show_progress=False,
+                )
+        finally:
+            # The fake processes' stdout pipes are real file descriptors.
+            for proc in procs:
+                proc.stdout.close()
 
     def test_a_compressor_that_fails_is_not_a_successful_backup(self):
         assert self._run_with_failing_compressor(1) is False

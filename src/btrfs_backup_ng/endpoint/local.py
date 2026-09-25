@@ -139,8 +139,13 @@ class LocalEndpoint(Endpoint):
         # Create the .btrfs-backup-ng tree BELOW the destination just verified.
         # One component at a time, never with parents: a destination that
         # vanished between the check above and here (the drive unmounted) is
-        # refused rather than rebuilt on the filesystem underneath.
+        # refused rather than rebuilt on the filesystem underneath. A location
+        # that is only read (a restore's source) gets no tree: it may be
+        # another tool's, or a medium mounted read-only.
         backup_dir = Path(self.config["path"]) / ".btrfs-backup-ng"
+        if not self.config.get("create_tree", True):
+            logger.debug("Not creating %s: this endpoint only reads", backup_dir)
+            return
         try:
             __util__.create_below(
                 self.config["path"], ".btrfs-backup-ng", "snapshots", what="Destination"

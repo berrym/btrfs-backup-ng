@@ -16,6 +16,7 @@ renumbered ``info.xml`` a restored slot gets.
 
 import dataclasses
 import json
+import contextlib
 import logging
 import subprocess
 import time
@@ -603,7 +604,7 @@ def list_snapper_backups(
         )
 
     for item in snapshots_dir.iterdir():
-        if item.is_dir() and item.name.isdigit():
+        if item.is_dir() and item.name.isdecimal():
             snapshot_path = item / "snapshot"
             info_xml_path = item / "info.xml"
 
@@ -679,7 +680,15 @@ def _restore_endpoint_config(backup_path: str, endpoint_options: dict | None) ->
     now build their endpoint through here too and a "raw" name would suggest an
     ssh:// restore goes through raw code, which it does not.
     """
-    config: dict[str, Any] = {"path": backup_path, "snap_prefix": ""}
+    # A restore reads its source. The bookkeeping tree a destination gets
+    # (``.btrfs-backup-ng/``) is not created here: a location written by
+    # another tool or mounted read-only -- the disaster-recovery medium --
+    # must be restorable from as it is, and a dry run must create nothing.
+    config: dict[str, Any] = {
+        "path": backup_path,
+        "snap_prefix": "",
+        "create_tree": False,
+    }
     if endpoint_options:
         config.update(endpoint_options)
     return config
@@ -756,7 +765,7 @@ def _list_remote_snapper_backups(
         if not slot:
             continue
         name = slot.rsplit("/", 1)[-1]
-        if not name.isdigit():
+        if not name.isdecimal():
             # .incoming / .stale are this run's transactional temps, never backups.
             continue
 
@@ -794,6 +803,34 @@ def _list_remote_snapper_backups(
 
     backups.sort(key=lambda b: b["number"])
     return backups
+
+
+def snapper_layout_present(endpoint: Any) -> bool:
+    """Whether the endpoint's location is laid out as snapper backups: a
+    ``.snapshots`` directory on a btrfs location (local or ssh://), or
+    ``.snapper-meta.json`` sidecars on a raw one.
+
+    Read-only. Answers the question the enumeration deliberately does not --
+    ``list_snapper_backups`` raises for an absent layout, because a restore
+    must never mistake a mistyped path for an empty one -- so a caller that
+    needs "is there anything here at all" (the status command, the backup
+    direction's first transfer to a fresh target) asks this first. A probe
+    that cannot be made says no; the enumeration that follows a yes raises
+    its own error when it cannot look.
+    """
+    from ..endpoint.raw import RawEndpoint
+    from .operations import _list_snapper_backups_at_destination
+
+    base = str(endpoint.config["path"]).rstrip("/")
+    try:
+        if isinstance(endpoint, RawEndpoint):
+            return bool(_list_snapper_backups_at_destination(endpoint))
+        if getattr(endpoint, "_is_remote", False):
+            return _remote_dir_exists(endpoint, f"{base}/.snapshots")
+        return Path(base, ".snapshots").is_dir()
+    except Exception as e:  # noqa: BLE001 - a failed probe is "not snapper", said
+        logger.debug("Could not probe %s for a snapper layout: %s", base, e)
+        return False
 
 
 def _remote_dir_exists(endpoint: Any, path: str) -> bool:
@@ -1181,17 +1218,20 @@ def restore_snapper_snapshots(
         next_number=lambda: scanner.get_next_snapshot_number(local_config),
     )
 
-    # One restore at a time into a config, for the whole run. Two restores
+    # One writer at a time into a config, for the whole run. Two restores
     # would pick the same next free number and the second would remove the
     # first's in-flight temp as a crashed run's leftover; refused with words
-    # instead. The kernel drops the lock when the holder dies.
-    try:
-        held = layout.restore_lock(
-            f"Restoring into snapper config {snapper_config_name!r}"
-        )
-        held.__enter__()
-    except RuntimeError as e:
-        raise RestoreError(f"{e}. Nothing was restored.") from e
+    # instead. The kernel drops the lock when the holder dies. A dry run
+    # takes nothing: it creates no lock file and sweeps no temp.
+    held: Any = contextlib.nullcontext()
+    if not dry_run:
+        try:
+            held = layout.writer_lock(
+                f"Restoring into snapper config {snapper_config_name!r}"
+            )
+            held.__enter__()
+        except RuntimeError as e:
+            raise RestoreError(f"{e}. Nothing was restored.") from e
     try:
         return _restore_snapper_snapshots_locked(
             layout,

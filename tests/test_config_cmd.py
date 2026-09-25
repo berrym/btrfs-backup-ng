@@ -481,7 +481,7 @@ class TestInteractiveWizard:
                         "btrfs_backup_ng.cli.config_cmd.prompt_snapshot_prefix",
                         side_effect=["home-"],  # snapshot prefix
                     ):
-                        result = _run_interactive_wizard()
+                        result = _run_interactive_wizard().content
 
         assert "[global]" in result
         assert 'path = "/home"' in result
@@ -678,7 +678,7 @@ class TestMigrateSystemd:
                         "btrfs_backup_ng.cli.config_cmd.prompt_snapshot_prefix",
                         side_effect=["home-"],  # snapshot prefix
                     ):
-                        result = _run_interactive_wizard()
+                        result = _run_interactive_wizard().content
 
         assert 'path = "ssh://user@server:/backups"' in result
         assert "ssh_sudo = true" in result
@@ -725,7 +725,7 @@ class TestMigrateSystemd:
                         "btrfs_backup_ng.cli.config_cmd.prompt_snapshot_prefix",
                         side_effect=["home-"],  # snapshot prefix
                     ):
-                        result = _run_interactive_wizard()
+                        result = _run_interactive_wizard().content
 
         # Should have completed with the second volume attempt
         assert 'path = "/home"' in result
@@ -772,7 +772,7 @@ class TestMigrateSystemd:
                         "btrfs_backup_ng.cli.config_cmd.prompt_snapshot_prefix",
                         side_effect=["home-"],  # snapshot prefix
                     ):
-                        result = _run_interactive_wizard()
+                        result = _run_interactive_wizard().content
 
         assert 'path = "/mnt/backup"' in result
 

@@ -43,7 +43,7 @@ transfer_stall_timeout = 900    # Give up when no data has moved for this long; 
 # Duration format: 30m (minutes), 2h (hours), 1d (days), 1w (weeks)
 
 [global.retention]
-min = "1d"       # Keep ALL snapshots for at least 1 day
+min = "1d"       # Keep ALL snapshots for at least 1 day ("all" = keep every snapshot for ever)
 hourly = 24      # Then keep 24 hourly (one per hour)
 daily = 7        # Then keep 7 daily (one per day)
 weekly = 4       # Then keep 4 weekly (one per week)

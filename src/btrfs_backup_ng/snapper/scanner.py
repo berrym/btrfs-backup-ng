@@ -442,11 +442,14 @@ class SnapperScanner:
             config = config_obj
 
         # Scan the filesystem directly rather than using snapper list,
-        # because snapper list may not see recently restored snapshots
+        # because snapper list may not see recently restored snapshots.
+        # Every entry named like a slot counts, a directory or not: a regular
+        # file named ``42`` is not a snapshot, but it occupies the name, and
+        # a publish that keeps being offered 42 can never land.
         max_num = 0
         try:
             for item in config.snapshots_dir.iterdir():
-                if item.is_dir() and item.name.isdigit():
+                if item.name.isdecimal():
                     num = int(item.name)
                     if num > max_num:
                         max_num = num

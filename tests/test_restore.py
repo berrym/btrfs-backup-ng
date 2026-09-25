@@ -2366,7 +2366,16 @@ class TestListRawSnapperBackups:
         assert meta.num == 5
         assert meta.description == "before upgrade"
         assert meta.userdata == {"reason": "test"}
-        assert str(meta.date).startswith("2025-10-01 12:00:00")
+        # The sidecar's xml carries snapper's UTC date; it reads back in local time.
+        from datetime import datetime, timezone
+
+        expected = (
+            datetime(2025, 10, 1, 12, 0, 0)
+            .replace(tzinfo=timezone.utc)
+            .astimezone()
+            .replace(tzinfo=None)
+        )
+        assert meta.date == expected
 
     def test_ignores_non_snapper_sidecars(self, tmp_path):
         """Raw stream files and .meta sidecars are not mistaken for snapper backups."""

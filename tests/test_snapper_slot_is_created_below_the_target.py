@@ -91,7 +91,7 @@ class TestTheSendUsesTheSlot:
 
         monkeypatch.setattr(ops, "send_snapshot", fake_send)
         monkeypatch.setattr(ops, "_snapper_publish_slot", lambda ep, n: None)
-        monkeypatch.setattr(ops, "_write_info_xml", lambda ep, d, c: None)
+        monkeypatch.setattr(ops, "_write_info_xml", lambda ep, d, c: True)
         monkeypatch.setattr(ops, "_write_snapper_metadata", lambda *a, **k: None)
         monkeypatch.setattr(ops, "log_transaction", lambda **k: None)
         monkeypatch.setattr(

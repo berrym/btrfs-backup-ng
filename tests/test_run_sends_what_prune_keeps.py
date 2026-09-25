@@ -36,6 +36,12 @@ class Snap:
     def __init__(self, when: datetime):
         self.name = PREFIX + when.strftime(FMT)
 
+    @classmethod
+    def named(cls, name: str) -> "Snap":
+        snap = cls.__new__(cls)
+        snap.name = name
+        return snap
+
     def get_name(self) -> str:
         return self.name
 
@@ -151,6 +157,33 @@ class TestTheSelector:
     def test_one_missing_snapshot_is_simply_sent(self):
         _, chosen = self._select(_hourly(48, 3), _hourly(1, 1))
         assert chosen is None
+
+    def test_a_configured_timestamp_format_is_what_the_names_are_read_with(self):
+        """Snapshots named under a format of the operator's own. A selector
+        that read them with the default format would find no dates, judge
+        every missing snapshot undated, and send NOTHING -- leaving a target
+        that has missed runs without its backlog. The default-format cases
+        above cannot see that, because there the two formats coincide."""
+        fmt = "%d.%m.%Y_%H-%M"
+        base = NOW - timedelta(hours=24 * 5)
+        missing = [
+            Snap.named(PREFIX + (base + timedelta(hours=i)).strftime(fmt))
+            for i in range(24 * 5)
+        ]
+        held = [Snap.named(PREFIX + (NOW - timedelta(days=10)).strftime(fmt))]
+        target = TargetConfig(path="/backup", retention=self.DAILY)
+        volume = VolumeConfig(path="/home", snapshot_prefix=PREFIX, targets=[target])
+        config = Config(
+            global_config=GlobalConfig(timestamp_format=fmt), volumes=[volume]
+        )
+        select = run_cli._catch_up_selector(volume, config, target, _Target(held))
+        chosen = select(held + missing, _names(held))
+        assert chosen is not None
+        assert 0 < len(chosen) < len(missing)
+        newest = max(
+            missing, key=lambda s: datetime.strptime(s.name[len(PREFIX) :], fmt)
+        )
+        assert newest in chosen
 
 
 class TestTheWiring:

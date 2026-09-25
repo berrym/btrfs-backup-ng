@@ -26,8 +26,9 @@ Example:
 import calendar
 import logging
 import re
+import time
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
 
 from . import __util__
@@ -137,6 +138,17 @@ def _subtract_months(dt: datetime, months: int) -> datetime:
     return dt.replace(year=year, month=month, day=min(dt.day, last_day))
 
 
+#: ``min = "all"``: keep every snapshot, whatever its age -- btrbk's
+#: ``*_preserve_min all``, and its default. Nothing in the scope is ever
+#: deleted by retention; the bucket counts cannot select anything to delete.
+MIN_KEEP_ALL = "all"
+
+
+def keeps_everything(min_value: Any) -> bool:
+    """Whether a retention ``min`` is ``"all"``: keep every snapshot."""
+    return str(min_value).strip().lower() == MIN_KEEP_ALL
+
+
 def subtract_duration(now: datetime, duration_str: str) -> datetime:
     """Return ``now`` minus a duration string, CALENDAR-aware for month/year units.
 
@@ -148,6 +160,10 @@ def subtract_duration(now: datetime, duration_str: str) -> datetime:
     ambiguous input). ``parse_duration`` keeps its plain-timedelta contract for other callers.
     """
     s = duration_str.strip()
+    if keeps_everything(s):
+        # The earliest representable moment: every snapshot is younger than it,
+        # so every snapshot is "within min" and kept.
+        return datetime.min
     match = DURATION_PATTERN.match(s)
     if not match:
         raise ValueError(f"Invalid duration format: {duration_str}")
@@ -182,6 +198,12 @@ class SnapshotInfo:
     snapshot: object  # The actual snapshot object
     keep: bool = False
     keep_reason: str = ""
+    #: The ``_N`` collision counter the name carries beyond its timestamp, for
+    #: ordering two snapshots that share one; 0 when there is none.
+    counter: int = 0
+    #: The caller's creation order (``get_order``), the last resort for two
+    #: snapshots whose timestamp and counter are equal. 0 when none is given.
+    order: int = 0
 
 
 def _naive_local(moment: datetime) -> datetime:
@@ -211,84 +233,70 @@ def _naive_local(moment: datetime) -> datetime:
 def extract_timestamp(
     snapshot_name: str, prefix: str = "", preferred_fmt: str | None = None
 ) -> datetime | None:
-    """Extract timestamp from snapshot name.
+    """The time a snapshot's name carries, read the way every listing reads it.
 
-    ``preferred_fmt`` (the configured ``timestamp_format``) is tried first when
-    given, so snapshots named with a custom format parse correctly; a list of
-    common formats is tried as a fallback.
+    Strips ``prefix`` and hands the rest to ``__util__.derive_snapshot_time``:
+    the configured ``timestamp_format`` first, then the built-in default, and
+    only when neither parses the name as written, the same two with one
+    trailing ``_N`` collision counter removed. That is the one rule the
+    local and remote listings apply, so retention dates a snapshot exactly
+    as ``list`` shows it, and a name the listing calls undated is undated
+    here too -- kept, never deleted.
+
+    Retention used to keep a parser of its own: a list of fallback formats
+    and an unanchored search for eight-plus-six digits anywhere in the name.
+    The two disagreed. Under ``timestamp_format = "%Y%m%d"`` the name
+    ``20260921_1000000`` -- the day and a seven-digit counter -- is midnight
+    of the 21st to the listing, but the search matched ``20260921_100000``
+    inside it and retention called it 10:00:00; the search also dated
+    names the listing had declared undated, so a snapshot every other
+    command showed as "unknown" was bucketed and could be deleted, against
+    the documented rule that a snapshot whose timestamp cannot be parsed is
+    never deleted.
 
     Args:
         snapshot_name: Name of the snapshot
         prefix: Optional prefix to strip
-        preferred_fmt: Configured timestamp_format to try before the fallbacks
+        preferred_fmt: Configured timestamp_format to try before the default
 
     Returns:
-        datetime if parsed successfully, None otherwise
+        A naive local datetime if the name carries a time, None otherwise
+    """
+    return _date_and_counter(snapshot_name, prefix, preferred_fmt)[0]
+
+
+def _date_and_counter(
+    snapshot_name: str, prefix: str, preferred_fmt: str | None
+) -> tuple[datetime | None, int]:
+    """``(date, collision counter)`` for a name, both by the listing's rule.
+
+    The counter is non-zero only for a name that parsed with a trailing
+    ``_N`` removed (``__util__.collision_counter``): a name that parsed as
+    written ends in its own timestamp digits, which are not a counter.
     """
     name = snapshot_name
     if prefix and name.startswith(prefix):
         name = name[len(prefix) :]
-    found = _extract_from(name, preferred_fmt)
-    if found is not None:
-        return found
-    # A trailing ``_N`` -- the collision counter this tool and btrbk append
-    # when a timestamp recurs (a coarse timestamp_format, a scheduler that
-    # fires twice) -- is dated by the timestamp before it, the way every
-    # listing dates it (``__util__.derive_snapshot_time``). Tried only after
-    # the name as written has failed, so a timestamp that itself ends in
-    # ``_<digits>`` keeps the meaning it has today: ``20260904_120000`` is
-    # noon, never midnight with an ordinal of 120000.
-    match = __util__._TRAILING_ORDINAL_RE.search(name)
-    if match:
-        return _extract_from(name[: match.start()], preferred_fmt)
-    return None
+    time_obj, parsed_as_written = __util__.derive_snapshot_time(name, preferred_fmt)
+    if time_obj is None:
+        return None, 0
+    return (
+        _datetime_from_struct(time_obj),
+        __util__.collision_counter(name, time_obj, parsed_as_written),
+    )
 
 
-def _extract_from(name: str, preferred_fmt: str | None) -> datetime | None:
-    """``extract_timestamp``'s parse of one candidate string."""
-    # Common timestamp formats (fallbacks).
-    formats = [
-        "%Y%m%d-%H%M%S",  # 20240115-143022
-        "%Y-%m-%d_%H%M%S",  # 2024-01-15_143022
-        "%Y-%m-%d-%H%M%S",  # 2024-01-15-143022
-        "%Y%m%d%H%M%S",  # 20240115143022
-        "%Y-%m-%dT%H:%M:%S",  # 2024-01-15T14:30:22
-    ]
-    # Configured format takes precedence so custom-named snapshots parse.
-    if preferred_fmt and preferred_fmt not in formats:
-        formats.insert(0, preferred_fmt)
-
-    for fmt in formats:
-        try:
-            return _naive_local(datetime.strptime(name, fmt))
-        except ValueError:
-            continue
-
-    # Try to find timestamp pattern anywhere in name
-    patterns = [
-        (r"(\d{8})-(\d{6})", "%Y%m%d-%H%M%S"),
-        (r"(\d{8})_(\d{6})", "%Y%m%d_%H%M%S"),
-        (r"(\d{14})", "%Y%m%d%H%M%S"),
-    ]
-
-    for pattern, fmt in patterns:
-        match = re.search(pattern, name)
-        if match:
-            try:
-                timestamp_str = "".join(match.groups())
-                # Reconstruct with separator if needed
-                if "-" in fmt or "_" in fmt:
-                    timestamp_str = match.group(0)
-                # Defensive, and known to be so: the patterns above carry no
-                # %z, so this site cannot currently produce an aware datetime
-                # (removing the call breaks no test, checked). It matches the
-                # format-loop site so the two cannot drift if a pattern with an
-                # offset is ever added.
-                return _naive_local(datetime.strptime(timestamp_str, fmt))
-            except ValueError:
-                continue
-
-    return None
+def _datetime_from_struct(moment: time.struct_time) -> datetime:
+    """A listing's ``struct_time`` as the naive local datetime retention
+    compares. A ``%z`` in the format leaves ``tm_gmtoff`` set; that offset is
+    honoured and the instant converted to local time (``_naive_local``), so two
+    snapshots written in different zones still order correctly."""
+    result = datetime(*moment[:6])
+    if moment.tm_gmtoff is not None:
+        result = result.replace(
+            tzinfo=timezone(timedelta(seconds=int(moment.tm_gmtoff)))
+        )
+    return _naive_local(result)
 
 
 def get_bucket_key(timestamp: datetime, bucket_type: str) -> str:
@@ -328,6 +336,7 @@ def apply_retention(
     now: datetime | None = None,
     timestamp_format: str | None = None,
     get_timestamp: Callable[[Any], datetime | None] | None = None,
+    get_order: Callable[[Any], int] | None = None,
 ) -> tuple[list, list]:
     """Apply retention policy to a list of snapshots.
 
@@ -348,6 +357,18 @@ def apply_retention(
             report success having deleted nothing, which is a worse answer than
             not running at all. Returning None from this callable means the same
             thing an unparseable name means: quarantine and keep.
+        get_order: The creation order of a snapshot, for two whose timestamps
+            are EQUAL. A native snapshot's name carries a collision counter for
+            that; a snapper snapshot's date has one-second resolution and no
+            counter, and two taken within a second tie. Without this the tie
+            fell to the sort's stability, which keeps INPUT order under
+            ``reverse=True``: the first of the tie -- the OLDEST -- was
+            "latest" and the last -- the NEWEST -- was the bucket's oldest
+            member or nothing at all. Measured with four snapper snapshots
+            taken in two seconds under ``daily = 1``: retention kept 2 and 3
+            and deleted 1 and 4, the newest snapshot on the machine among
+            them. Snapper's number is its creation order and is what the
+            snapper callers pass.
 
     Returns:
         Tuple of (snapshots_to_keep, snapshots_to_delete)
@@ -386,10 +407,12 @@ def apply_retention(
     quarantined_infos: list[SnapshotInfo] = []
     for snap in snapshots:
         name = name_func(snap)
+        counter = 0
+        order = get_order(snap) if get_order is not None else 0
         if get_timestamp is not None:
             timestamp = get_timestamp(snap)
         else:
-            timestamp = extract_timestamp(name, prefix, timestamp_format)
+            timestamp, counter = _date_and_counter(name, prefix, timestamp_format)
 
         if timestamp is None:
             logger.warning(
@@ -428,16 +451,25 @@ def apply_retention(
             # newest and buckets correctly (it is within ``min`` anyway).
             effective = timestamp if timestamp <= now else now
             valid_infos.append(
-                SnapshotInfo(name=name, timestamp=effective, snapshot=snap)
+                SnapshotInfo(
+                    name=name,
+                    timestamp=effective,
+                    snapshot=snap,
+                    counter=counter,
+                    order=order,
+                )
             )
 
     # Sort valid snapshots newest-first (quarantined entries never participate in ordering).
     # Snapshots sharing a timestamp -- ``X``, ``X_1``, ``X_2`` under a coarse format --
     # order by their collision counter, so "latest" is the last one created and the
-    # oldest-first bucket walk keeps the first.
-    valid_infos.sort(
-        key=lambda s: (s.timestamp, __util__._name_ordinal(s.name)), reverse=True
-    )
+    # oldest-first bucket walk keeps the first. The counter is read from the part of the
+    # name after the timestamp, and only when there is one: read from the whole name, a
+    # prefix ending in ``_`` or a format ending in ``_%H`` gave the bare name a huge
+    # "counter" and made it newest, so the last snapshot created was the one deleted.
+    # A tie left after both is broken by the caller's creation order (``get_order``),
+    # never by the sort's stability, which reads input order as newest-first.
+    valid_infos.sort(key=lambda s: (s.timestamp, s.counter, s.order), reverse=True)
 
     # Rule 1: Always keep the latest VALID snapshot (never a quarantined entry).
     if valid_infos and not valid_infos[0].keep:

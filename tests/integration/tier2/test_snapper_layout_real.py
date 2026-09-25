@@ -176,9 +176,9 @@ class TestBackupThenRestoreThroughTheLayout:
         _data, snapshots, _delta = _snapper_source(first)
         _backup(snapshots, _target(second / "backup"))
         base = second / "backup" / ".snapshots"
-        assert sorted(p.name for p in base.iterdir()) == ["1", "2"], (
-            "a temp slot outlived its publish"
-        )
+        # The writer lock file lives beside the slots and is not a slot.
+        entries = sorted(p.name for p in base.iterdir() if not p.name.startswith("."))
+        assert entries == ["1", "2"], "a temp slot outlived its publish"
         for number in (1, 2):
             copy = _show(base / str(number) / "snapshot")
             assert (
@@ -465,3 +465,122 @@ class TestTheConfigIsLiveWhileTheRestoreRuns:
         assert outcome["first"]["restored"] == 1, outcome["first"]
         assert _slots(config) == [1] and _temps(config) == []
         assert (config.snapshots_dir / "1" / "snapshot" / "payload.bin").exists()
+
+
+@pytest.mark.tier2
+@requires_btrfs
+class TestTheEdgesHoldOnRealBtrfs:
+    """The snapper edges pinned by unit tests, run against real subvolumes:
+    one writer at a time into a target, a pinned slot that no prune deletes,
+    a raw pin another process can see, and a read-only medium as a source."""
+
+    def test_a_second_backup_into_a_busy_target_is_refused_and_disturbs_nothing(
+        self, btrfs_three_volumes
+    ):
+        from btrfs_backup_ng import __util__
+        from btrfs_backup_ng.core.layout import SnapperLayout
+
+        first, second, _third = btrfs_three_volumes
+        _data, snapshots, _delta = _snapper_source(first)
+        target = _target(second / "backup")
+        ops.send_snapper_snapshot(snapshots[0], target)
+        holder = SnapperLayout(_target(second / "backup"))
+        with holder.writer_lock("a backup already running"):
+            with pytest.raises(
+                __util__.SnapshotTransferError, match="another operation holds the lock"
+            ):
+                ops.send_snapper_snapshot(
+                    snapshots[1], target, parent_snapper_snapshot=snapshots[0]
+                )
+        snapshots_dir = second / "backup" / ".snapshots"
+        published = sorted(
+            p.name for p in snapshots_dir.iterdir() if not p.name.startswith(".")
+        )
+        assert published == ["1"], published
+        assert (snapshots_dir / SnapperLayout.WRITER_LOCK_NAME).is_file()
+        # Released: the same send goes through afterwards.
+        ops.send_snapper_snapshot(
+            snapshots[1], target, parent_snapper_snapshot=snapshots[0]
+        )
+        assert (second / "backup" / ".snapshots" / "2" / "snapshot").is_dir()
+
+    def test_a_slot_pinned_by_a_restore_survives_the_prune(self, btrfs_three_volumes):
+        from types import SimpleNamespace
+
+        from btrfs_backup_ng.cli.prune import delete_snapper_backups
+
+        first, second, _third = btrfs_three_volumes
+        _data, snapshots, _delta = _snapper_source(first)
+        backup = second / "backup"
+        _backup(snapshots, _target(backup))
+        # What a restore in another process does while it reads slot 2.
+        reader = LocalEndpoint(
+            config={"path": str(backup), "snap_prefix": "", "fs_checks": "skip"}
+        )
+        reader.set_lock(
+            SimpleNamespace(
+                locks=set(), parent_locks=set(), get_name=lambda: "snapshot-2"
+            ),
+            "restore:s1",
+            True,
+        )
+        backups = list_snapper_backups(str(backup))
+        assert [b["number"] for b in backups] == [1, 2]
+        deleted, errors = delete_snapper_backups(str(backup), backups, {})
+        assert (deleted, errors) == (1, [])
+        assert not (backup / ".snapshots" / "1").exists()
+        assert (backup / ".snapshots" / "2" / "snapshot").is_dir(), (
+            "the prune deleted the slot a restore was reading"
+        )
+
+    def test_a_raw_pin_is_honoured_by_a_prune_in_another_process(
+        self, btrfs_three_volumes
+    ):
+        first, second, _third = btrfs_three_volumes
+        _data, snapshots, _delta = _snapper_source(first)
+        store = second / "raw"
+        store.mkdir()
+        raw = RawEndpoint(config={"path": str(store), "snap_prefix": ""})
+        raw.prepare()
+        ops.send_snapper_snapshot(snapshots[0], raw)
+        streams = raw.list_snapshots()
+        assert len(streams) == 1
+        raw.set_lock(streams[0], "restore:s1", True)
+        pruner = RawEndpoint(config={"path": str(store), "snap_prefix": ""})
+        pruner.prepare()
+        theirs = pruner.list_snapshots()
+        result = pruner.delete_snapshots(theirs, delete_session={theirs[0].get_name()})
+        assert result.deleted_count == 0
+        assert streams[0].stream_path.exists()
+        raw.set_lock(streams[0], "restore:s1", False)
+        result = pruner.delete_snapshots(theirs, delete_session={theirs[0].get_name()})
+        assert result.deleted_count == 1
+        assert not streams[0].stream_path.exists()
+
+    def test_a_read_only_medium_restores_without_writing_to_it(
+        self, btrfs_three_volumes, monkeypatch
+    ):
+        first, second, third = btrfs_three_volumes
+        _data, snapshots, delta = _snapper_source(first)
+        backup = second / "backup"
+        _backup(snapshots, _target(backup))
+        config = _config(third, monkeypatch)
+        subprocess.run(
+            ["mount", "-o", "remount,ro", str(second)], check=True, capture_output=True
+        )
+        try:
+            before = sorted(p.name for p in backup.iterdir())
+            stats = _restore(str(backup), config, 2)
+            assert stats["restored"] == 1, stats
+            assert _slots(config) == [1]
+            landed = config.snapshots_dir / "1" / "snapshot" / "extra.bin"
+            assert landed.read_bytes() == delta
+            assert sorted(p.name for p in backup.iterdir()) == before, (
+                "the restore wrote to the read-only medium"
+            )
+        finally:
+            subprocess.run(
+                ["mount", "-o", "remount,rw", str(second)],
+                check=True,
+                capture_output=True,
+            )

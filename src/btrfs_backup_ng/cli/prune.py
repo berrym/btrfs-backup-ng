@@ -22,7 +22,12 @@ from ..notifications import (
 from ..notifications import (
     NotificationConfig as NotifConfig,
 )
-from ..retention import RetentionError, apply_retention, parse_duration
+from ..retention import (
+    RetentionError,
+    apply_retention,
+    keeps_everything,
+    parse_duration,
+)
 from .common import (
     apply_config_verbosity,
     btrfs_debug_enabled,
@@ -30,6 +35,7 @@ from .common import (
     assert_target_mounted,
     get_log_level,
     get_timestamp_format,
+    snapper_destination_options,
     thread_ssh_target_config,
 )
 
@@ -47,6 +53,9 @@ def is_degenerate_policy(retention: Any) -> bool:
     # even with every bucket at zero -- refusing it would block exactly the
     # configuration the count form exists for.
     if getattr(retention, "keep", 0) > 0:
+        return False
+    # min = "all" keeps every snapshot: the opposite of degenerate.
+    if keeps_everything(retention.min):
         return False
     if any(
         c > 0
@@ -152,12 +161,60 @@ def plan_snapper_retention(
     backups = list_snapper_backups(backup_path, endpoint_options)
     if not backups:
         return [], []
+    return plan_snapper_retention_of(backups, retention, now=now)
+
+
+def _snapper_item_name(item: Any) -> str:
+    """How a snapper item is named to the retention engine: a destination
+    backup (a dict from ``list_snapper_backups``) by its slot, a source
+    snapshot not yet transferred (a ``SnapperSnapshot``) by its number."""
+    if isinstance(item, dict):
+        return f"slot {item.get('number')}"
+    return f"source snapshot {getattr(item, 'number', '?')}"
+
+
+def _snapper_item_timestamp(item: Any) -> Any:
+    """A destination backup's date from its info.xml; a source snapshot's
+    from snapper. None when unknown, which the engine quarantines and keeps."""
+    if isinstance(item, dict):
+        return snapper_backup_timestamp(item)
+    date = getattr(item, "date", None)
+    return date if isinstance(date, datetime) else None
+
+
+def _snapper_item_order(item: Any) -> int:
+    """A snapper item's creation order: its snapper number, which snapper
+    hands out in creation order. Two backups or snapshots taken within one
+    second share a date, and this is what orders them."""
+    number = (
+        item.get("number") if isinstance(item, dict) else getattr(item, "number", 0)
+    )
+    try:
+        return int(str(number))
+    except (TypeError, ValueError):
+        return 0
+
+
+def plan_snapper_retention_of(
+    items: list, retention: Any, now: Any = None
+) -> tuple[list, list]:
+    """The snapper retention decision over ``items``: ``(keep, delete)``.
+
+    ``items`` are destination backups (``list_snapper_backups`` dicts), or
+    those plus source snapshots the destination does not hold yet. The one
+    place the decision is made: ``plan_snapper_retention`` asks it about a
+    destination's enumeration, and ``run`` asks it, before sending, about the
+    destination's backups plus the snapshots it is missing -- so what ``run``
+    leaves out of a snapper catch-up is exactly what its own prune would
+    delete a moment later.
+    """
     return apply_retention(
-        backups,
+        items,
         retention,
-        get_name=lambda b: f"slot {b.get('number')}",
+        get_name=_snapper_item_name,
         now=now,
-        get_timestamp=snapper_backup_timestamp,
+        get_timestamp=_snapper_item_timestamp,
+        get_order=_snapper_item_order,
     )
 
 
@@ -292,13 +349,41 @@ def delete_snapper_backups(
 
     base = str(endpoint_obj.config["path"]).rstrip("/")
     remote = scheme.kind is TargetKind.SSH
+    # A snapper restore pins the backup it reads on its location, under the
+    # slot's name (``snapshot-<n>``), in the location's lock store. This
+    # deletion is not the endpoint's guarded one -- it removes slot
+    # directories, not prefix-named snapshots -- so it asks the store itself,
+    # at delete time, and skips what is pinned. A store that cannot be read
+    # deletes nothing: "no pins" is the one answer that must not be invented.
+    try:
+        pinned = {
+            name
+            for name, entry in endpoint_obj._read_locks().items()
+            if entry.get("locks") or entry.get("parent_locks")
+        }
+    except Exception as e:  # noqa: BLE001 - fail closed, with the reason
+        errors.append(
+            f"Not deleting any snapper backup at {backup_path}: the lock store "
+            f"could not be read ({e}), so it is not known whether a restore is "
+            f"reading one of them"
+        )
+        return 0, errors
     for backup in backups:
-        slot_dir = f"{base}/.snapshots/{backup.get('number')}"
+        number = backup.get("number")
+        slot_name = f"snapshot-{number}"
+        if slot_name in pinned:
+            logger.info(
+                "  Kept slot %s at %s: pinned by a restore in progress",
+                number,
+                backup_path,
+            )
+            continue
+        slot_dir = f"{base}/.snapshots/{number}"
         try:
             _delete_snapper_slot_btrfs(endpoint_obj, slot_dir, remote)
             deleted += 1
         except Exception as e:  # noqa: BLE001 - record and continue
-            errors.append(f"Delete slot {backup.get('number')}: {e}")
+            errors.append(f"Delete slot {number}: {e}")
     return deleted, errors
 
 
@@ -382,6 +467,55 @@ def execute_retention_deletes(
         for snapshot, reason in outcome.skipped:
             logger.info("  Kept %s: %s", snapshot.get_name(), reason)
     return deleted, errors
+
+
+class PlannedDeletes:
+    """One endpoint's share of a prune plan: what would be deleted there, how
+    each item is shown, and how to carry the deletion out.
+
+    The plan pass collects these without touching anything, the command shows
+    them all and confirms once, and only then executes each. Native
+    destinations hold snapshots (deleted through their endpoint); a snapper
+    destination holds numbered slots (deleted through ``delete_snapper_backups``,
+    the function ``run`` prunes with). Both are shown and executed the same
+    way, so a snapper destination cannot be left out of the plan again.
+    """
+
+    def __init__(self, label: str, items: list, names: list[str], execute):
+        self.label = label
+        self.items = items
+        self.names = names
+        self._execute = execute
+
+    def execute(self) -> tuple[int, list[str]]:
+        return self._execute()
+
+
+def planned_endpoint_deletes(
+    endpoint_obj: Any, to_delete: list, label: str
+) -> PlannedDeletes:
+    return PlannedDeletes(
+        label,
+        to_delete,
+        [snap.get_name() + newly_visible_mark(snap) for snap in to_delete],
+        lambda: execute_retention_deletes(endpoint_obj, to_delete),
+    )
+
+
+def planned_snapper_deletes(
+    backup_path: str, to_delete: list, endpoint_options: dict, label: str
+) -> PlannedDeletes:
+    def name(backup: dict) -> str:
+        stamp = snapper_backup_timestamp(backup)
+        when = stamp.strftime("%Y-%m-%d %H:%M:%S") if stamp else "date unknown"
+        return f"slot {backup.get('number')} ({when})"
+
+    return PlannedDeletes(
+        label,
+        to_delete,
+        [name(backup) for backup in to_delete],
+        lambda: delete_snapper_backups(backup_path, to_delete, endpoint_options),
+    )
 
 
 def newly_visible_mark(snap: Any) -> str:
@@ -500,14 +634,28 @@ def execute_prune(args: argparse.Namespace) -> int:
     volumes_failed = 0
     error_messages: list[str] = []
     force = getattr(args, "force", False)
-    # PLAN pass: collect every deletion as (endpoint, [snapshots], label) WITHOUT touching
-    # anything, so the whole prune is shown and confirmed once before any delete happens.
-    plan: list[tuple[Any, list, str]] = []
+    # PLAN pass: collect every deletion WITHOUT touching anything, so the whole
+    # prune is shown and confirmed once before any delete happens.
+    plan: list[PlannedDeletes] = []
 
     for volume in volumes:
         logger.info("Volume: %s", volume.path)
         volume_had_errors = False
         volumes_processed += 1
+
+        if volume.is_snapper_source():
+            # A snapper volume's destinations hold numbered slots, not
+            # prefix-named snapshots: the native listing below finds nothing
+            # there and reported "Keeping 0, deleting 0" while `run` pruned the
+            # same destination. Its source is snapper's own timeline, which
+            # snapper's cleanup manages and this tool never prunes -- as `run`.
+            kept, failed = _plan_snapper_volume(
+                volume, config, force, plan, error_messages
+            )
+            total_kept += kept
+            if failed:
+                volumes_failed += 1
+            continue
 
         # Retention is resolved per endpoint, the same way the run pipeline
         # resolves it: source_retention for the source, each target's own policy
@@ -588,7 +736,9 @@ def execute_prune(args: argparse.Namespace) -> int:
                     total_kept += len(to_keep)
                     if to_delete:
                         plan.append(
-                            (source_endpoint, to_delete, f"source {volume.path}")
+                            planned_endpoint_deletes(
+                                source_endpoint, to_delete, f"source {volume.path}"
+                            )
                         )
 
             except Exception as e:
@@ -634,7 +784,11 @@ def execute_prune(args: argparse.Namespace) -> int:
                 logger.info("    Keeping %d, deleting %d", len(to_keep), len(to_delete))
                 total_kept += len(to_keep)
                 if to_delete:
-                    plan.append((dest_endpoint, to_delete, f"target {target.path}"))
+                    plan.append(
+                        planned_endpoint_deletes(
+                            dest_endpoint, to_delete, f"target {target.path}"
+                        )
+                    )
 
             except Exception as e:
                 if getattr(target, "optional", False):
@@ -652,16 +806,11 @@ def execute_prune(args: argparse.Namespace) -> int:
             volumes_failed += 1
 
     # ---- AGGREGATE + CONFIRM + EXECUTE ----
-    total_to_delete = sum(len(td) for _, td, _ in plan)
+    total_to_delete = sum(len(planned.items) for planned in plan)
     if dry_run:
-        for _ep, to_delete, label in plan:
-            for snap in to_delete:
-                logger.info(
-                    "  Would delete (%s): %s%s",
-                    label,
-                    snap.get_name(),
-                    newly_visible_mark(snap),
-                )
+        for planned in plan:
+            for name in planned.names:
+                logger.info("  Would delete (%s): %s", planned.label, name)
         total_deleted = total_to_delete
     elif total_to_delete == 0:
         logger.info("Nothing to prune")
@@ -672,19 +821,19 @@ def execute_prune(args: argparse.Namespace) -> int:
         proceed = getattr(args, "yes", False) or not sys.stdin.isatty()
         if not proceed:
             print(f"About to delete {total_to_delete} snapshot(s)/backup(s):")
-            for _ep, to_delete, label in plan:
-                print(f"  {label} -- {len(to_delete)}:")
-                for snap in to_delete:
-                    print(f"    - {snap.get_name()}{newly_visible_mark(snap)}")
+            for planned in plan:
+                print(f"  {planned.label} -- {len(planned.items)}:")
+                for name in planned.names:
+                    print(f"    - {name}")
             print(f"Proceed with deleting {total_to_delete}? [y/N] ", end="")
             proceed = input().strip().lower() in ("y", "yes")
         if not proceed:
             logger.info("Aborted; nothing deleted.")
         else:
-            for ep, to_delete, label in plan:
-                deleted, errs = execute_retention_deletes(ep, to_delete)
+            for planned in plan:
+                deleted, errs = planned.execute()
                 total_deleted += deleted
-                logger.info("  Deleted %d (%s)", deleted, label)
+                logger.info("  Deleted %d (%s)", deleted, planned.label)
                 for err in errs:
                     logger.error("  %s", err)
                 error_messages.extend(errs)
@@ -714,6 +863,63 @@ def execute_prune(args: argparse.Namespace) -> int:
         return 1
 
     return 0
+
+
+def _plan_snapper_volume(
+    volume: Any,
+    config: Config,
+    force: bool,
+    plan: list[PlannedDeletes],
+    error_messages: list[str],
+) -> tuple[int, bool]:
+    """Plan the prune of a snapper volume's destinations. Returns
+    ``(kept, had_errors)``.
+
+    The same decision `run` makes after transferring (``plan_snapper_retention``
+    with the destination opened through ``snapper_destination_options``), and
+    the same deletion (``delete_snapper_backups``), so the two commands cannot
+    disagree about a snapper destination. The source is snapper's timeline and
+    is not pruned, as in `run`.
+    """
+    logger.info("  Source: snapper (its timeline is managed by snapper, not pruned)")
+    kept = 0
+    had_errors = False
+    for target in volume.targets:
+        target_retention = config.get_target_retention(volume, target)
+        _log_retention(f"    Retention (target {target.path})", target_retention)
+        if _refuse_degenerate(
+            f"target {target.path}", target_retention, force, error_messages
+        ):
+            had_errors = True
+            continue
+        try:
+            assert_target_mounted(target.path, target.require_mount)
+            options = snapper_destination_options(config, target)
+            to_keep, to_delete = plan_snapper_retention(
+                target.path, target_retention, options
+            )
+            logger.info("    Keeping %d, deleting %d", len(to_keep), len(to_delete))
+            kept += len(to_keep)
+            if to_delete:
+                logger.debug(
+                    "%s", format_snapper_retention_plan(target.path, to_keep, to_delete)
+                )
+                plan.append(
+                    planned_snapper_deletes(
+                        target.path, to_delete, options, f"target {target.path}"
+                    )
+                )
+        except Exception as e:  # noqa: BLE001 - one target must not abort the rest
+            if getattr(target, "optional", False):
+                logger.warning("  Skipping optional target %s: %s", target.path, e)
+                continue
+            # An enumeration that failed is not an empty destination: nothing
+            # is planned there, and the command fails rather than reporting a
+            # clean prune.
+            logger.error("  Error pruning target %s: %s", target.path, e)
+            error_messages.append(f"Target {target.path}: {e}")
+            had_errors = True
+    return kept, had_errors
 
 
 def _send_prune_notifications(

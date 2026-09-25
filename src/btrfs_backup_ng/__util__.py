@@ -87,10 +87,33 @@ def _name_ordinal(name: str) -> int:
     ORDERING metadata only, never identity: two snapshots sharing a timestamp
     sort by it, so ``X_2`` precedes ``X_10`` where the bare name string would
     order them the other way round. The value is DERIVED from the name on each
-    comparison; nothing stores it.
+    comparison; nothing stores it. Callers pass the part of the name that
+    FOLLOWS the timestamp's own digits -- see ``collision_counter``.
     """
     match = _TRAILING_ORDINAL_RE.search(name)
     return int(match.group(1)) if match else 0
+
+
+def collision_counter(
+    time_string: str, time_obj: time.struct_time | None, parsed_as_written: bool
+) -> int:
+    """The collision counter a snapshot's timestamp part carries, else 0.
+
+    ``time_string`` is the name with the prefix removed, and the other two are
+    what ``derive_snapshot_time`` returned for it. A counter exists only when
+    the string parsed, and did so NOT as written but once its trailing ``_N``
+    was removed -- that ``_N`` is the counter. A string that did not parse at
+    all has no timestamp to collide with and no counter. A
+    string that parsed as written ends in its own digits (``%H``, ``%S``,
+    ``%Y%m%d`` under a prefix ending in ``_``), and reading those as a counter
+    made a bare name sort NEWER than its ``_1``, ``_2`` siblings on a timestamp
+    tie: the last snapshot created was the one retention deleted. Measured
+    with ``home_`` + ``%Y%m%d`` (counter 20260923 vs 1 and 2) and with
+    ``%Y%m%d_%H`` under a 15-minute timer (counter 14 vs 1, 2, 3).
+    """
+    if time_obj is None or parsed_as_written:
+        return 0
+    return _name_ordinal(time_string)
 
 
 @functools.total_ordering
@@ -212,14 +235,29 @@ class Snapshot:
         # -- find_parent must never pick one of two same-second snapshots
         # arbitrarily. A trailing _N (btrbk's collision counter) orders
         # numerically, so X_2 precedes X_10; any other difference falls back
-        # to the name string. Ordering metadata only -- the ordinal is derived
-        # from the name, never stored on the snapshot.
+        # to the name string. Ordering metadata only -- the counter is derived
+        # from the name, never stored on the snapshot, and only a name that did
+        # not parse as written carries one (``collision_counter``).
         self_name = self.get_name()
         other_name = other.get_name()
-        return (_name_ordinal(self_name), self_name) < (
-            _name_ordinal(other_name),
+        return (self.collision_counter(), self_name) < (
+            other.collision_counter(),
             other_name,
         )
+
+    def collision_counter(self) -> int:
+        """The ``_N`` this snapshot's name carries beyond its timestamp, else 0.
+
+        Derived from the name the way the listing dates it: the part after
+        the prefix, under the endpoint's ``timestamp_format`` and the default,
+        as written first and then with one trailing ``_N`` removed. Only a
+        name that parsed the second way carries a counter.
+        """
+        time_string = self.name[len(self.prefix) :] if self.prefix else self.name
+        config = getattr(self.endpoint, "config", None)
+        fmt = config.get("timestamp_format") if isinstance(config, dict) else None
+        time_obj, as_written = derive_snapshot_time(time_string, fmt)
+        return collision_counter(time_string, time_obj, as_written)
 
     def __repr__(self) -> str:
         return self.get_name()
@@ -357,7 +395,16 @@ def exec_subprocess(
     command = [str(arg) for arg in command]
 
     try:
-        return m(command, **kwargs)
+        result = m(command, **kwargs)
+        if method == "Popen":
+            # A process left running for the caller -- the local endpoint's
+            # `btrfs send` or `btrfs receive` -- belongs to the caller's
+            # process scope, which stops it before the caller's locks are
+            # released if the caller fails (see btrfs_backup_ng.lifecycle).
+            from .lifecycle import track
+
+            track(result)
+        return result
     except FileNotFoundError as e:
         # Handle case where command is not found
         logger.error("Command not found: %s", command[0])
@@ -378,7 +425,12 @@ def exec_subprocess(
                     # Replace command with full path and retry
                     command[0] = full_path
                     logger.info("Retrying with full path: %s", command)
-                    return m(command, **kwargs)
+                    result = m(command, **kwargs)
+                    if method == "Popen":
+                        from .lifecycle import track
+
+                        track(result)
+                    return result
                 else:
                     logger.error("Command '%s' not found in PATH", command[0])
             except Exception as find_e:

@@ -52,24 +52,27 @@ atomic on the remote filesystem:
 
 * **`mkdir` is atomic.** Exactly one of any number of racing creators wins; the
   rest get `EEXIST`. This is the whole mutual-exclusion primitive.
-* **`mv` is atomic within a filesystem.** This is what makes breaking a dead
-  lock safe: a contender that judges a lock stale renames it and proceeds only
-  if the rename succeeded, so two contenders that both see the same dead lock
-  cannot both go on to acquire it.
+* **Removing one name succeeds once.** Of any number of processes that `rm`
+  the same file, one succeeds and the rest are told it does not exist. An
+  exclusive lock's holder record is a file named by that holder's own random
+  token, so breaking a dead lock -- removing exactly that file -- can be won by
+  one contender only, and can never remove a newer holder's record. See
+  "Breaking a dead lock" below.
 
-Both were verified against a real remote with 20 concurrent contenders: one
-winner in each case.
+`mkdir` was verified against a real remote with 20 concurrent contenders: one
+winner.
 
 ### Layout
 
 ```
 <target>/.btrfs-backup-ng.locks/
     receiving-<dest>.lock/        EXCLUSIVE: the right to create one subvolume
-        info.json
+        owner.<token>
         heartbeat
     target.lock/                  EXCLUSIVE: a whole-target lock
-        info.json                 holder: operation, hostname, pid, token
-        heartbeat                 mtime refreshed while the holder lives
+        owner.<token>             holder: operation, hostname, pid, token;
+                                  its mtime is the holder's heartbeat
+        heartbeat                 refreshed beside it, for older versions
     snap-<name>.lock/             SHARED: a pin on one snapshot
         holders/
             restore_abc           one file per holder; its mtime is that
@@ -117,11 +120,55 @@ still there. The last one out cleans up.
 
 ### Exclusive acquisition is one round trip
 
-Try `mkdir`; if it fails, judge staleness; if stale, break it with `mv` and try
-again. This is deliberately a single script rather than a sequence of calls:
-split across round trips, another contender can slip between the staleness check
-and the break, which is exactly the race the atomic rename exists to close. The
-evaluation cannot be moved to the client for the same reason.
+Try `mkdir`; if it fails, judge staleness; if stale, break it and try again.
+This is deliberately a single script rather than a sequence of calls: split
+across round trips, another contender can slip between the staleness check and
+the break. The evaluation cannot be moved to the client for the same reason.
+
+A `mkdir` that fails with no lock there to contend with -- a full or read-only
+filesystem, a quota -- is reported as the lock not being creatable, with the
+reason, never as another process holding it.
+
+### Breaking a dead lock has one winner
+
+An earlier version broke a dead lock by renaming its directory aside. The
+rename moved whatever directory sat at the lock path by the time it ran, which
+was not necessarily the one judged dead: a contender that judged the lock and
+was descheduled before its `mv` could, once a faster one had broken it and
+taken it afresh, rename THAT lock aside and take it too. Two winners, each told
+it had broken a dead lock. With nothing injected, twelve contenders racing one
+dead lock produced two to four winners in 35 of 40 runs, and six racing over
+ssh against a real target produced two in 2 of 6.
+
+The break now removes the one entry that identifies the instance judged dead:
+its `owner.<token>` file. That name exists only in that instance, and removing
+it succeeds for exactly one caller, so every other contender that judged the
+same dead lock is told BUSY -- and one that judged an older instance cannot
+touch a newer one's record. Only the winner goes on to `rmdir` the directory
+and `mkdir` it afresh. A lock left by an older version (no owner file) is
+broken the same way through its `info.json`, which this version never writes;
+an empty directory, through `rmdir`, which succeeds only while it is empty.
+
+A new holder then checks that its record is the only one in the directory
+before it reports the lock as taken. The one interleaving the removal cannot
+exclude -- an empty dead directory removed by a slow contender just after
+another had re-created it and before it wrote its record -- ends with the
+second record written into a directory someone else created, or not written at
+all, and the later claimant withdraws.
+
+What remains is the assumption every lease rests on: a holder that stops
+refreshing for longer than the threshold has lost its lock, even if it wakes
+later still believing it holds it.
+
+### Release removes only the holder's own lock
+
+A holder releases by removing its own `owner.<token>` and, only if that
+succeeded, the rest. A holder that was stalled past the threshold while its
+lock was broken and re-taken used to delete its successor's lock on waking,
+after which a third process could take it while the second still believed it
+held it. Now it finds its own record gone, leaves the lock alone and says so.
+Its heartbeat refreshes with `touch -c`, so it cannot recreate its record
+inside the successor's lock either.
 
 Shared pins need none of this. There is nothing to win, so acquiring one is a
 single write with no contention to resolve.
@@ -139,6 +186,37 @@ heartbeat.
 The age now falls back to the lock directory's own mtime, which `mkdir` sets
 atomically, so a lock taken microseconds ago cannot read as abandoned. The
 inverse still holds: a genuinely old lock is still broken.
+
+### Older versions on the same target
+
+The lock layout changed in 0.9.11: an exclusive lock's holder record is now
+`owner.<token>` where 0.9.10 and earlier wrote `info.json`. Lock names, their
+encoding and the pin layout (`holders/`) did not change. While clients of both
+versions use one target -- one machine upgraded before another -- this holds:
+
+* **Mutual exclusion holds.** Every version takes a lock with `mkdir` of the
+  same directory name, so a lock held by either kind of client refuses the
+  other.
+* **A live lock is judged live by both.** 0.9.11 refreshes the `heartbeat`
+  file an older client ages a lock by, beside its own record, so an older
+  client does not break a 0.9.11 lock that is still held.
+* **Pins work across versions.** Their layout did not change, so a pin taken
+  by either version blocks a deletion by either. An older client listing a
+  0.9.11 exclusive lock sees an unknown holder (it looks for `info.json`),
+  and still counts the lock as held.
+* **What the older client does is not protected by this version's fixes.** An
+  older client breaks a dead lock by renaming whatever directory sits at the
+  path, so two contenders can still both win when one of them is an older
+  client. An older holder that stalled past the threshold, whose lock was
+  broken and taken by a 0.9.11 client, deletes the `heartbeat` file of that
+  new lock when it releases; the new lock survives (its directory is not
+  empty), but older clients then age it by its directory's mtime and may
+  break it once that is past the threshold. An older client also counts a
+  pin whose age it cannot read as dead.
+
+The window lasts until every client that uses the target is upgraded; nothing
+needs cleaning up afterwards. Leftover `.stale.*` directories an older client
+left behind are not locks and are ignored.
 
 ### Staleness is judged from the target's clock
 
@@ -168,11 +246,51 @@ threshold. A live holder refreshes six times inside one threshold, so nothing
 that far behind can still be alive — and deleting somebody's live pin is far
 worse than leaving a small file lying around.
 
-An interrupted run does not wait for any of that. Pins are released on normal
-exit and on SIGINT/SIGTERM, so Ctrl-C on a restore frees the snapshot at once.
-The signal handlers chain to whatever was installed before them rather than
-replacing it. The stale window remains the backstop for what no handler can
-catch: SIGKILL, a power cut, a severed network.
+A holder whose age cannot be read -- no readable mtime, or no readable clock on
+the target -- counts as HELD. It is listed, it blocks deletion, it is never
+swept, and a warning says so. Counting it as dead, as an mtime read as 0 once
+did, made the guard report a live pin as absent and let `restore --unlock`
+sweep it. A lock directory that exists but cannot be listed is reported as an
+error, never as a target with no pins.
+
+An interrupted run does not wait for any of that:
+
+* **Ctrl-C** is Python's own `KeyboardInterrupt`; no signal handler is
+  involved. Every transfer's child processes run inside a scope nested within
+  the locks and pins it holds, so as the interrupt unwinds, the scope stops
+  those processes and waits for them first; then the partial subvolume the
+  interrupted receive created is removed; and only then does each operation
+  release its own locks. Whatever the unwind did not release, the
+  exit releases. A transfer running on a worker thread is not interrupted by
+  it, and keeps its locks until it finishes: a lock is never released while a
+  stream is still being written under it.
+* **SIGTERM and SIGHUP** (systemd stopping a run, a closed terminal) stop the
+  run's child processes, then remove the partial subvolumes its unfinished
+  receives created, then release its locks and pins, then close its ssh
+  connections, and the process then dies of the signal. A second signal during
+  that does not cut it short.
+* **A signal that was set to be ignored stays ignored.** A run started under
+  `nohup` keeps its locks, pins and connections through a hangup, and lets
+  them go when it finishes.
+
+A partial is removed only if this run created it: whatever was at the path
+before the run started is left alone, as on every failure path. An ssh://
+receive removes its partial while it still holds the receive lock on that
+path, so no other transfer can have started creating it in the meantime.
+
+Before 0.9.11 a SIGINT handler released every pin at once, before the
+interrupted operation had unwound -- and while any other thread's transfer was
+still writing. The stale window remains the backstop for what nothing can catch:
+SIGKILL, a power cut, a severed network.
+
+### The account's login shell
+
+Every lock script reaches the target as one `sh -c '<script>'` on a command line
+the account's LOGIN shell parses first. csh and tcsh treat a `!` followed by
+anything but a blank, `=` or `(` as a history reference, even inside single
+quotes, and fail the whole command before `sh` runs. No script this program
+sends contains one; a digits check once written as `*[!0-9]*` made every lock
+script fail for such an account.
 
 ### Receiving
 
@@ -360,5 +478,6 @@ another:
 * a killed restore leaves a lock that the next contender breaks after the
   staleness window, rather than locking the target out permanently
 * a third process reads the lock state correctly via `restore --status`
-* SIGINT frees a pin immediately rather than after the staleness window
+* an interrupted restore frees its pin as it exits rather than after the
+  staleness window
 * an abandoned pin stops blocking after that window and is then swept

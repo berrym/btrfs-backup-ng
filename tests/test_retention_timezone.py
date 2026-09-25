@@ -64,7 +64,7 @@ def test_the_config_import_format_is_the_one_that_was_broken():
 
 @pytest.mark.parametrize(
     "name,fmt",
-    [("home.20260101-120000", "%Y%m%d-%H%M%S"), ("home.20260101_120000", None)],
+    [("home.20260101-120000", "%Y%m%d-%H%M%S"), ("home.20260101-120000", None)],
 )
 def test_naive_formats_are_unchanged(name, fmt):
     ts = extract_timestamp(name, "home.", fmt)

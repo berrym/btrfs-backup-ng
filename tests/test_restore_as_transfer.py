@@ -538,6 +538,9 @@ class TestARawSourceRestoresItsStoredChain:
 
         base = raw(STAMPS[0], "O1")
         inc = raw(STAMPS[1], "O2", parent_name=base.name)
+        # The location exists, as a real store does: the restore pins the
+        # streams it reads in the location's lock store.
+        (tmp_path / "raw").mkdir(exist_ok=True)
         store = RawEndpoint(
             config={"path": str(tmp_path / "raw"), "snap_prefix": PREFIX}
         )

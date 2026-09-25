@@ -13,6 +13,10 @@ jobs:
   test:
     name: Test (Python ${{ matrix.python-version }})
     runs-on: ubuntu-latest
+    env:
+      # The remote-command tests run every lock script through a real csh and
+      # tcsh login shell; here, a missing one fails them instead of skipping.
+      BBNG_REQUIRE_LOGIN_SHELLS: "1"
     strategy:
       fail-fast: false
       matrix:
@@ -26,6 +30,12 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
+
+      - name: Install login shells the remote-command tests run under
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y tcsh
+          command -v dash && command -v tcsh && command -v csh
 
       - name: Install dependencies
         run: |

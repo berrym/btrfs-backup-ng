@@ -194,7 +194,12 @@ before this age. Month and year units are calendar\(hyaware:
 .B 1M
 is one calendar month (not a flat 30 days) and
 .B 1y
-is one calendar year. An invalid value fails loudly and prunes nothing.
+is one calendar year. The value
+.B all
+keeps every snapshot in the scope for ever, whatever the bucket counts say
+(btrbk's
+.BR snapshot_preserve_min " all,"
+its default). An invalid value fails loudly and prunes nothing.
 .TP
 .B hourly
 Number of hourly snapshots to keep (one per clock hour).
@@ -264,7 +269,10 @@ precedence over the tool's default.
 SSH ControlMaster sockets are created in an unpredictable, private (0700) directory (preferring
 \fB$XDG_RUNTIME_DIR\fR) and removed when the connection closes, so a local user cannot hijack the
 multiplexed connection. The internal command lock is likewise placed in a private per-user
-directory rather than a predictable \fI/tmp\fR path.
+directory rather than a predictable \fI/tmp\fR path. It is left in place after a run,
+deliberately: it is an \fBflock\fR, which excludes by inode, and removing the file while
+another process waits on it would let two processes each lock a different file at the same
+path.
 .SH RAW TARGETS
 Raw targets write btrfs send streams directly to files instead of using
 \fBbtrfs receive\fR. This enables backups to non-btrfs filesystems (NFS, SMB,

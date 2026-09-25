@@ -118,8 +118,9 @@ class TestUnchangedBehaviourForOrdinaryConfigs:
         )
         content, _ = import_btrbk_config(source)
         retention = tomllib.loads(content)["volumes"][0]["retention"]
-        assert retention["daily"] == 14
-        assert retention["weekly"] == 8
+        # One higher than btrbk's numbers: its counts are inclusive.
+        assert retention["daily"] == 15
+        assert retention["weekly"] == 9
 
     def test_ssh_target_url_is_untouched(self, tmp_path):
         source = tmp_path / "btrbk.conf"
