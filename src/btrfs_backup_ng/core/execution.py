@@ -10,7 +10,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from typing import Callable
 
-from .. import __util__
+from .. import __util__, lifecycle
 from ..config import Config, TargetConfig, VolumeConfig
 from .operations import sync_snapshots
 
@@ -163,7 +163,12 @@ def execute_parallel(
     all_results = []
     enabled_volumes = config.get_enabled_volumes()
 
-    with ThreadPoolExecutor(max_workers=max_volumes) as volume_executor:
+    # Ctrl-C reaches only the waiting thread; the stop it requests is what keeps
+    # the workers from beginning anything new (see lifecycle).
+    with (
+        ThreadPoolExecutor(max_workers=max_volumes) as volume_executor,
+        lifecycle.stop_on_interrupt(volume_executor),
+    ):
         volume_futures = {
             volume_executor.submit(
                 _execute_volume_targets,
@@ -218,9 +223,12 @@ def _execute_volume_targets(
 
     logger.info("Processing volume: %s", volume.path)
 
-    with ThreadPoolExecutor(max_workers=max_targets) as target_executor:
+    with (
+        ThreadPoolExecutor(max_workers=max_targets) as target_executor,
+        lifecycle.stop_on_interrupt(target_executor),
+    ):
         target_futures = {
-            target_executor.submit(job_func, volume, target): target
+            target_executor.submit(_start_job, job_func, volume, target): target
             for target in volume.targets
         }
 
@@ -253,6 +261,26 @@ def _execute_volume_targets(
                 )
 
     return results
+
+
+def _start_job(
+    job_func: Callable[[VolumeConfig, TargetConfig], JobResult],
+    volume: VolumeConfig,
+    target: TargetConfig,
+) -> JobResult:
+    """Run one job on a worker, unless the run was interrupted before it began.
+
+    A target pool running on a volume worker never sees Ctrl-C, so its queued
+    jobs are not cancelled; each one asks here instead.
+    """
+    if lifecycle.stopped_before(f"the backup of {volume.path} to {target.path}"):
+        return JobResult(
+            volume_path=volume.path,
+            target_path=target.path,
+            success=False,
+            error=lifecycle.NOT_STARTED,
+        )
+    return job_func(volume, target)
 
 
 def execute_sequential(

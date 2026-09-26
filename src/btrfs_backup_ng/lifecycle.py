@@ -33,6 +33,20 @@ operation releases its own locks as it unwinds, and ``atexit`` sweeps whatever
 remains. A worker thread's transfer is not interrupted by it: its children are
 its own, and its locks stay held until it finishes.
 
+Nor does a worker start anything after it. There is one process-wide stop
+flag. The main thread, waiting on its workers, requests the stop the moment
+the interrupt reaches it (``stop_on_interrupt``, opened inside each worker
+pool) and cancels the jobs no worker has begun. Every point where a worker
+would begin something new -- a snapshot, a target, a transfer, a prune, a
+deletion -- asks first (``stopped_before``), and after a stop begins nothing
+and says so. Nothing is retried either: the retry framework refuses a further
+attempt, and its backoff wait returns at once (``sleep_unless_stopped``). So
+after ``kill -INT``, which reaches this process alone, what a worker is
+already sending finishes; after a terminal's Ctrl-C, which reaches the whole
+process group, its children die and the transfer fails. Either way it is the
+last thing that worker does, and it still releases its locks only after its
+writers have stopped. A drain requests the same stop as it starts.
+
 Exit cleanups and the fatal signals
 -----------------------------------
 Locks, pins and connections register an exit cleanup. The registry is drained
@@ -86,6 +100,9 @@ TERMINATE_GRACE = 5.0
 #: The signals whose default disposition ends the process without ``atexit``.
 FATAL_SIGNALS = (signal.SIGTERM, signal.SIGHUP)
 
+#: The reason recorded for work a worker declined to begin after a stop.
+NOT_STARTED = "not started: the run was interrupted"
+
 _LOCK = threading.RLock()
 _CLEANUPS: "dict[Any, tuple[int, Callable[[], None]]]" = {}
 _ATEXIT_REGISTERED = False
@@ -99,6 +116,70 @@ _SHUTTING_DOWN = False
 # reaped and dropped does not linger here.
 _ALL_CHILDREN: "weakref.WeakSet[Any]" = weakref.WeakSet()
 _SCOPES = threading.local()
+
+# Set once an interrupt or a fatal signal has been seen, and never cleared by
+# the program: see the module docstring's Ctrl-C part.
+_STOP = threading.Event()
+
+
+# ---------------------------------------------------------- stopping new work
+
+
+def request_stop() -> None:
+    """From now on no worker starts anything new, and nothing is retried."""
+    _STOP.set()
+
+
+def stop_requested() -> bool:
+    return _STOP.is_set()
+
+
+def stopped_before(what: str, later: int = 0) -> bool:
+    """Whether a stop was requested; if so, says that ``what`` is not starting.
+
+    Asked where a worker is about to begin something new. True means the
+    caller must not begin it, nor the ``later`` items it would have begun after
+    it, and reports them as not done (``NOT_STARTED``).
+    """
+    if not _STOP.is_set():
+        return False
+    logger.warning(
+        "Not starting %s%s: the run was interrupted.",
+        what,
+        f" or the {later} after it" if later else "",
+    )
+    return True
+
+
+def sleep_unless_stopped(seconds: float) -> bool:
+    """Sleep up to ``seconds``, returning at once when a stop is requested.
+
+    For backoff waits between attempts. Returns whether a stop was requested.
+    """
+    if seconds <= 0:
+        return _STOP.is_set()
+    return _STOP.wait(seconds)
+
+
+@contextmanager
+def stop_on_interrupt(executor: Any) -> Iterator[None]:
+    """Request the stop if Ctrl-C reaches this thread while it waits on
+    ``executor``'s workers, and cancel the jobs none of them has begun.
+
+    Opened INSIDE the executor's ``with`` block, so it runs before the
+    executor's own exit waits for the workers. What a worker is already doing
+    is not cancelled; the interrupt is re-raised.
+    """
+    try:
+        yield
+    except KeyboardInterrupt:
+        request_stop()
+        executor.shutdown(wait=False, cancel_futures=True)
+        logger.warning(
+            "Interrupted: nothing new will start; waiting for the work already "
+            "under way to end."
+        )
+        raise
 
 
 # ------------------------------------------------------------ child processes
@@ -333,6 +414,9 @@ def drain() -> None:
     ``KeyboardInterrupt`` inside one cleanup moves on to the next.
     """
     global _SHUTTING_DOWN
+    # Before anything is stopped: a worker whose transfer fails as its children
+    # are stopped must not retry it, or begin its next one, while the locks go.
+    request_stop()
     _SHUTTING_DOWN = True
     try:
         stop_processes(list(_ALL_CHILDREN))

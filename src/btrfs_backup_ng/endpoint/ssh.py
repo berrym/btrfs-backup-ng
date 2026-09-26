@@ -2108,6 +2108,7 @@ print(json.dumps(result))
                 if (
                     result.returncode != 0
                     and attempt < max_retries
+                    and not lifecycle.stop_requested()
                     and any(
                         arg == "-S"
                         for arg in self._build_remote_command([str(c) for c in command])
@@ -2159,6 +2160,14 @@ print(json.dumps(result))
 
             except Exception as e:
                 if attempt == max_retries:
+                    raise
+                if lifecycle.stop_requested():
+                    logger.warning(
+                        "Command execution failed on attempt %d; not retrying: "
+                        "the run was interrupted: %s",
+                        attempt + 1,
+                        e,
+                    )
                     raise
                 logger.warning(
                     f"Command execution failed on attempt {attempt + 1}, retrying: {e}"
@@ -4579,6 +4588,11 @@ print(json.dumps(result))
             logger.error("Pre-transfer diagnostics failed")
             return False
 
+        # The diagnostics above take seconds; a stop requested meanwhile still
+        # starts no stream.
+        if lifecycle.stopped_before(f"the transfer of {snapshot_name}"):
+            return False
+
         # Use retry framework for the actual transfer
         policy = retry_policy or DEFAULT_TRANSFER_POLICY
 
@@ -4605,6 +4619,8 @@ print(json.dumps(result))
                             suggested_action="Check network connectivity and retry",
                         )
                         if not ctx.record_failure(error):
+                            if lifecycle.stop_requested():
+                                break  # not retried after an interrupt; said below
                             logger.error(
                                 "Transfer failed after %d attempts", ctx.attempt_number
                             )
@@ -4620,6 +4636,8 @@ print(json.dumps(result))
                     # Classify the error to determine if it's retryable
                     classified = classify_error(e)
                     if not ctx.record_failure(classified):
+                        if classified.is_retryable and lifecycle.stop_requested():
+                            break  # not retried after an interrupt; said below
                         if classified.is_retryable:
                             logger.error(
                                 "Transfer failed after %d attempts: %s",
@@ -4642,6 +4660,16 @@ print(json.dumps(result))
                         classified.message,
                     )
                     ctx.wait()
+
+        # After Ctrl-C (or a fatal signal) the failed attempt is not repeated:
+        # a terminal's Ctrl-C kills this transfer's children too, and sending
+        # the whole snapshot again is new work the operator has just refused.
+        if lifecycle.stop_requested():
+            logger.error(
+                "Transfer of %s failed; not retrying: the run was interrupted.",
+                snapshot_name,
+            )
+            return False
 
         # All retries exhausted
         logger.error(

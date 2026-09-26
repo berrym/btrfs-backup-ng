@@ -8,7 +8,7 @@ import argparse
 import sys
 from typing import Callable
 
-from .. import __util__
+from .. import __util__, lifecycle
 from ..__logger__ import logger
 from .common import (
     add_fs_checks_args,
@@ -1801,6 +1801,8 @@ def run_subcommand(args: argparse.Namespace) -> int:
         return handler(args)
     except KeyboardInterrupt:
         # Ctrl-C: acknowledge cleanly instead of dumping a KeyboardInterrupt traceback.
+        # A worker thread still finishing must not begin anything new either.
+        lifecycle.request_stop()
         print("\nInterrupted.", file=sys.stderr)
         return 130
     except __util__.AbortError as e:

@@ -26,7 +26,9 @@ def main() -> None:
     try:
         sys.exit(cli_main())
     except KeyboardInterrupt:
-        # Graceful exit on Ctrl+C without printing traceback
+        # Graceful exit on Ctrl+C without printing traceback. A worker thread
+        # still finishing must not begin anything new either.
+        lifecycle.request_stop()
         print("\nInterrupted.")
         sys.exit(130)  # Standard exit code for SIGINT
 

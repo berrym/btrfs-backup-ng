@@ -166,6 +166,20 @@ def exit_cleanups_end_with_the_test():
     lifecycle.run_cleanups(lambda key: key not in before)
 
 
+@pytest.fixture(autouse=True)
+def the_stop_flag_ends_with_the_test():
+    """Clear the process-wide stop flag when a test ends.
+
+    The program never clears it: once set, nothing new starts and nothing is
+    retried for the rest of the process. A test that requests the stop would
+    otherwise make every later test in the session refuse its work.
+    """
+    from btrfs_backup_ng import lifecycle
+
+    yield
+    lifecycle._STOP.clear()
+
+
 @pytest.fixture
 def tmp_config_dir(tmp_path):
     """Create a temporary config directory."""

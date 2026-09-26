@@ -10,7 +10,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Literal
 
-from .. import __util__, endpoint
+from .. import __util__, endpoint, lifecycle
 from ..__logger__ import add_file_handler, create_logger
 from ..config import (
     Config,
@@ -287,8 +287,12 @@ def _run_configured_backups(args: argparse.Namespace, config: Config) -> int:
     error_messages = []
 
     if parallel_volumes > 1 and len(enabled_volumes) > 1:
-        # Parallel volume execution
-        with ThreadPoolExecutor(max_workers=parallel_volumes) as executor:
+        # Parallel volume execution. Ctrl-C reaches only this thread; the stop it
+        # requests is what keeps the workers from beginning anything new.
+        with (
+            ThreadPoolExecutor(max_workers=parallel_volumes) as executor,
+            lifecycle.stop_on_interrupt(executor),
+        ):
             futures = {
                 executor.submit(
                     _backup_volume,
@@ -545,6 +549,9 @@ def _backup_volume(
         return False, stats, errors
 
     # Create snapshot
+    if lifecycle.stopped_before(f"the backup of {volume.path}"):
+        errors.append(f"Volume {volume.path}: {lifecycle.NOT_STARTED}")
+        return False, stats, errors
     try:
         logger.info("Creating snapshot...")
         snapshot = source_endpoint.snapshot()
@@ -566,7 +573,20 @@ def _backup_volume(
 
     destination_endpoints = []
     prepare_failures = 0
-    for target in volume.targets:
+    for index, target in enumerate(volume.targets):
+        # Preparing a target is new work: an ssh master, remote diagnostics
+        # with a write test, perhaps a password prompt. None of it begins after
+        # an interrupt; this target and the rest are counted as not done.
+        remaining = volume.targets[index:]
+        if lifecycle.stopped_before(
+            f"the transfer to {target.path}", later=len(remaining) - 1
+        ):
+            stats["failed"] += len(remaining)
+            errors.extend(
+                f"Destination endpoint {t.path}: {lifecycle.NOT_STARTED}"
+                for t in remaining
+            )
+            return False, stats, errors
         try:
             # One mount check, shared with `transfer`. The inline copy this
             # replaces tested the scheme with path.startswith(...) and listed
@@ -636,7 +656,10 @@ def _backup_volume(
 
     if parallel_targets > 1 and len(destination_endpoints) > 1:
         # Parallel target transfers
-        with ThreadPoolExecutor(max_workers=parallel_targets) as executor:
+        with (
+            ThreadPoolExecutor(max_workers=parallel_targets) as executor,
+            lifecycle.stop_on_interrupt(executor),
+        ):
             futures = {
                 executor.submit(
                     _transfer_to_target,
@@ -744,6 +767,10 @@ def _prune_after_transfer(
     so ``run`` exits non-zero rather than silently skipping retention. ``run`` never forces a
     degenerate prune: an intentional keep-only-latest prune is the explicit ``prune --force``.
     """
+    if lifecycle.stopped_before(f"the prune of {volume.path} and its targets"):
+        errors.append(f"Prune {volume.path}: {lifecycle.NOT_STARTED}")
+        return False
+
     # Degeneracy is judged PER ENDPOINT below, not once for the volume: with
     # per-scope policies a volume default can be degenerate while every endpoint
     # that actually runs has a good policy of its own, and refusing the whole
@@ -895,6 +922,11 @@ def _backup_snapper_volume(
     all_success = True
     succeeded_targets: list[tuple[Any, dict[str, Any]]] = []
     for target in volume.targets:
+        if lifecycle.stopped_before(f"the transfer to {target.path}"):
+            errors.append(f"Target {target.path}: {lifecycle.NOT_STARTED}")
+            all_success = False
+            stats["failed"] += 1
+            continue
         try:
             # Same shared check as above. This copy also carried a shorter
             # message that omitted how to turn the check off.
@@ -1002,6 +1034,9 @@ def _prune_snapper_after_transfer(
     """
     if not succeeded_targets:
         return True
+    if lifecycle.stopped_before(f"the prune of the snapper backups of {volume.path}"):
+        errors.append(f"Prune {volume.path}: {lifecycle.NOT_STARTED}")
+        return False
 
     from .prune import (
         delete_snapper_backups,
@@ -1279,6 +1314,10 @@ def _transfer_to_target(
     Returns:
         True if successful
     """
+    # A queued target a worker picks up after Ctrl-C: the interrupt reached
+    # only the main thread, and this is where the worker hears of it.
+    if lifecycle.stopped_before(f"the transfer to {target_config.path}"):
+        return None
     try:
         # Build transfer options with compression and throttling
         # CLI overrides take precedence over config

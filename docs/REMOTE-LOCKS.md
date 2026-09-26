@@ -263,7 +263,9 @@ An interrupted run does not wait for any of that:
   release its own locks. Whatever the unwind did not release, the
   exit releases. A transfer running on a worker thread is not interrupted by
   it, and keeps its locks until it finishes: a lock is never released while a
-  stream is still being written under it.
+  stream is still being written under it. That in-flight transfer is the last
+  thing the worker does: after Ctrl-C no worker starts a new transfer, target,
+  prune or deletion, and a failed transfer is not retried.
 * **SIGTERM and SIGHUP** (systemd stopping a run, a closed terminal) stop the
   run's child processes, then remove the partial subvolumes its unfinished
   receives created, then release its locks and pins, then close its ssh

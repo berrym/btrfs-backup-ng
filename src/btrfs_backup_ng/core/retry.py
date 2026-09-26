@@ -3,6 +3,10 @@
 This module provides a robust retry mechanism with exponential backoff,
 jitter, and intelligent error classification to determine retryability.
 
+Nothing is retried once the run has been interrupted (``lifecycle.request_stop``):
+a further attempt is refused, and a backoff wait returns at once. The first
+attempt is the caller's to begin or not.
+
 Usage:
     from btrfs_backup_ng.core.retry import RetryPolicy, with_retry
 
@@ -34,7 +38,6 @@ import asyncio
 import functools
 import logging
 import random
-import time
 from dataclasses import dataclass, field
 from typing import (
     Any,
@@ -45,6 +48,7 @@ from typing import (
     Union,
 )
 
+from .. import lifecycle
 from .errors import BackupError, TransientError, classify_error
 
 logger = logging.getLogger(__name__)
@@ -133,6 +137,8 @@ class RetryPolicy:
                     attempt.wait()
         """
         for attempt_num in range(self.max_attempts):
+            if attempt_num and lifecycle.stop_requested():
+                return
             yield RetryAttempt(
                 attempt_number=attempt_num,
                 max_attempts=self.max_attempts,
@@ -171,20 +177,20 @@ class RetryAttempt:
             error: The exception that occurred
 
         Returns:
-            True if we should retry
+            True if we should retry; never once the run has been interrupted
         """
         self.last_error = error
-        if self.is_last:
+        if self.is_last or lifecycle.stop_requested():
             return False
         return self.policy.is_retryable(error)
 
     def wait(self) -> float:
-        """Wait for the calculated backoff delay.
+        """Wait for the calculated backoff delay, or until the run is interrupted.
 
         Returns:
             The delay that was waited
         """
-        if self.is_last:
+        if self.is_last or lifecycle.stop_requested():
             return 0
 
         delay = self.policy.calculate_delay(self.attempt_number)
@@ -202,7 +208,7 @@ class RetryAttempt:
             self.max_attempts,
             delay,
         )
-        time.sleep(delay)
+        lifecycle.sleep_unless_stopped(delay)
         return delay
 
     async def wait_async(self) -> float:
@@ -211,7 +217,7 @@ class RetryAttempt:
         Returns:
             The delay that was waited
         """
-        if self.is_last:
+        if self.is_last or lifecycle.stop_requested():
             return 0
 
         delay = self.policy.calculate_delay(self.attempt_number)
@@ -229,7 +235,11 @@ class RetryAttempt:
             self.max_attempts,
             delay,
         )
-        await asyncio.sleep(delay)
+        # On the stop flag, as the synchronous wait: a stop requested during
+        # the backoff ends it at once.
+        await asyncio.get_running_loop().run_in_executor(
+            None, lifecycle.sleep_unless_stopped, delay
+        )
         return delay
 
 
@@ -315,12 +325,21 @@ def with_retry(
                     last_error = e
 
                     if not attempt.should_retry(e):
-                        logger.warning(
-                            "Non-retryable error on attempt %d/%d: %s",
-                            attempt.attempt_number + 1,
-                            attempt.max_attempts,
-                            e,
-                        )
+                        if lifecycle.stop_requested():
+                            logger.warning(
+                                "Attempt %d/%d failed; not retrying: the run was "
+                                "interrupted: %s",
+                                attempt.attempt_number + 1,
+                                attempt.max_attempts,
+                                e,
+                            )
+                        else:
+                            logger.warning(
+                                "Non-retryable error on attempt %d/%d: %s",
+                                attempt.attempt_number + 1,
+                                attempt.max_attempts,
+                                e,
+                            )
                         raise
 
                     logger.info(
@@ -331,14 +350,20 @@ def with_retry(
                     )
                     total_delay += attempt.wait()
 
-            # All attempts exhausted
+            # All attempts exhausted, or the run was interrupted during a wait
             if last_error:
-                logger.error(
-                    "All %d attempts failed. Total delay: %.2fs. Last error: %s",
-                    policy.max_attempts,
-                    total_delay,
-                    last_error,
-                )
+                if lifecycle.stop_requested():
+                    logger.warning(
+                        "Not retrying: the run was interrupted. Last error: %s",
+                        last_error,
+                    )
+                else:
+                    logger.error(
+                        "All %d attempts failed. Total delay: %.2fs. Last error: %s",
+                        policy.max_attempts,
+                        total_delay,
+                        last_error,
+                    )
                 raise last_error
 
             # Should never reach here
@@ -448,11 +473,12 @@ def retry_call(
 
             total_delay += attempt.wait()
 
-    # All attempts exhausted
+    # All attempts exhausted, or a stop ended them early: one call was made per
+    # recorded error.
     return RetryResult(
         success=False,
         error=errors[-1] if errors else None,
-        attempts=policy.max_attempts,
+        attempts=len(errors),
         total_delay=total_delay,
         errors=errors,
     )
@@ -497,8 +523,11 @@ class RetryContext:
 
     @property
     def exhausted(self) -> bool:
-        """Return True if all attempts have been used."""
-        return self._attempt >= self.policy.max_attempts
+        """Return True if no further attempt may be made: all have been used,
+        or one has been made and the run has since been interrupted."""
+        return self._attempt >= self.policy.max_attempts or (
+            self._attempt > 0 and lifecycle.stop_requested()
+        )
 
     @property
     def attempt_number(self) -> int:
@@ -529,7 +558,8 @@ class RetryContext:
             error: The exception that occurred
 
         Returns:
-            True if we should retry, False if we should give up
+            True if we should retry, False if we should give up (always once
+            the run has been interrupted)
         """
         if not isinstance(error, BackupError):
             error = classify_error(error)
@@ -543,7 +573,7 @@ class RetryContext:
         return self.policy.is_retryable(error)
 
     def wait(self) -> float:
-        """Wait for the backoff delay.
+        """Wait for the backoff delay, or until the run is interrupted.
 
         Returns:
             The delay in seconds
@@ -560,7 +590,7 @@ class RetryContext:
             self._attempt + 1,
             self.policy.max_attempts,
         )
-        time.sleep(delay)
+        lifecycle.sleep_unless_stopped(delay)
         return delay
 
 

@@ -10,7 +10,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Literal
 
-from .. import __util__, endpoint
+from .. import __util__, endpoint, lifecycle
 from ..__logger__ import add_file_handler, create_logger
 from ..config import Config, ConfigError, find_config_file, load_config
 from ..notifications import (
@@ -329,7 +329,14 @@ def delete_snapper_backups(
                     f"Delete slot {backup.get('number')}: no raw stream named "
                     f"{name!r} at the destination"
                 )
-        if wanted:
+        if wanted and lifecycle.stopped_before(
+            f"the deletion of {len(wanted)} snapper backup(s) at {backup_path}"
+        ):
+            errors.append(
+                f"Delete {', '.join(s.get_name() for s in wanted)}: "
+                f"{lifecycle.NOT_STARTED}"
+            )
+        elif wanted:
             try:
                 outcome = endpoint_obj.delete_snapshots(
                     wanted, delete_session={s.get_name() for s in wanted}
@@ -368,8 +375,16 @@ def delete_snapper_backups(
             f"reading one of them"
         )
         return 0, errors
-    for backup in backups:
+    for position, backup in enumerate(backups):
         number = backup.get("number")
+        # After Ctrl-C a worker begins no further deletion.
+        if lifecycle.stopped_before(
+            f"the deletion of snapper slot {number} at {backup_path}",
+            later=len(backups) - position - 1,
+        ):
+            rest = ", ".join(str(b.get("number")) for b in backups[position:])
+            errors.append(f"Delete slot(s) {rest}: {lifecycle.NOT_STARTED}")
+            break
         slot_name = f"snapshot-{number}"
         if slot_name in pinned:
             logger.info(
@@ -442,7 +457,14 @@ def execute_retention_deletes(
     delete_session = {s.get_name() for s in to_delete}
     deleted = 0
     errors: list[str] = []
-    for snap in to_delete:
+    for position, snap in enumerate(to_delete):
+        # After Ctrl-C a worker begins no further deletion.
+        if lifecycle.stopped_before(
+            f"the deletion of {snap.get_name()}", later=len(to_delete) - position - 1
+        ):
+            rest = ", ".join(s.get_name() for s in to_delete[position:])
+            errors.append(f"Delete {rest}: {lifecycle.NOT_STARTED}")
+            break
         try:
             outcome = endpoint_obj.delete_snapshots(
                 [snap], delete_session=delete_session

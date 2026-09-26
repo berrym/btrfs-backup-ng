@@ -109,6 +109,11 @@ def send_snapshot(
     BEFORE the exception reaches the caller's releases. A lock or pin let go
     while a stream is still being written protects nothing.
     """
+    # The last moment before anything is sent: a stop requested while the
+    # caller was pinning the source or checking the destination still begins
+    # nothing. The caller treats it as a transfer that did not happen.
+    if lifecycle.stopped_before(f"the transfer of {snapshot}"):
+        raise __util__.SnapshotTransferError(lifecycle.NOT_STARTED)
     with lifecycle.process_scope():
         return _send_snapshot(
             snapshot,
@@ -2002,7 +2007,18 @@ def _execute_transfers(
     planned_names = {s.get_name() for s, _ in plan}
     transferred_names: set = set()
 
-    for best_snapshot, parent in plan:
+    for position, (best_snapshot, parent) in enumerate(plan):
+        # After Ctrl-C this worker begins no further transfer; the rest of the
+        # plan is reported as not transferred, never as delivered.
+        if lifecycle.stopped_before(
+            f"the transfer of {best_snapshot.get_name()}",
+            later=len(plan) - position - 1,
+        ):
+            for snap, _ in plan[position:]:
+                result.failed.append(
+                    (snap, __util__.SnapshotTransferError(lifecycle.NOT_STARTED))
+                )
+            break
         if parent is not None:
             parent_name = parent.get_name()
             # A parent that is itself scheduled in this run must have already succeeded
@@ -3301,6 +3317,18 @@ def _sync_snapper_snapshots_locked(
     result = TransferResult()
     for i, (w, parent_w) in enumerate(plan, 1):
         snap = snapper_by_wrapper_name[w.get_name()]
+        # As in the executor: after Ctrl-C no further snapshot is begun.
+        if lifecycle.stopped_before(
+            f"the transfer of snapper snapshot {snap.number}", later=len(plan) - i
+        ):
+            for rest, _ in plan[i - 1 :]:
+                result.failed.append(
+                    (
+                        snapper_by_wrapper_name[rest.get_name()],
+                        __util__.SnapshotTransferError(lifecycle.NOT_STARTED),
+                    )
+                )
+            break
         if (
             parent_w is not None
             and parent_w.get_name() in planned_names

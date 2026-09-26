@@ -158,7 +158,7 @@ class TestRetryAttempt:
         error = TransientNetworkError("Network error")
         assert not attempt.should_retry(error)  # Last attempt, can't retry
 
-    @patch("time.sleep")
+    @patch("btrfs_backup_ng.lifecycle.sleep_unless_stopped")
     def test_wait(self, mock_sleep):
         """Test wait with mocked sleep."""
         policy = RetryPolicy(initial_delay=1.0, jitter=0.0)
@@ -195,7 +195,7 @@ class TestWithRetryDecorator:
         assert result == "success"
         assert call_count == 1
 
-    @patch("time.sleep")
+    @patch("btrfs_backup_ng.lifecycle.sleep_unless_stopped")
     def test_success_after_retries(self, mock_sleep):
         """Test function that succeeds after retries."""
         call_count = 0
@@ -213,7 +213,7 @@ class TestWithRetryDecorator:
         assert call_count == 3
         assert mock_sleep.call_count == 2
 
-    @patch("time.sleep")
+    @patch("btrfs_backup_ng.lifecycle.sleep_unless_stopped")
     def test_failure_after_max_attempts(self, mock_sleep):
         """Test function that fails all attempts."""
         call_count = 0
@@ -257,7 +257,7 @@ class TestWithRetryDecorator:
                 raise TransientNetworkError("Error")
             return "success"
 
-        with patch("time.sleep"):
+        with patch("btrfs_backup_ng.lifecycle.sleep_unless_stopped"):
             result = function()
 
         assert result == "success"
@@ -280,7 +280,7 @@ class TestRetryCall:
         assert result.error is None
         assert len(result.errors) == 0
 
-    @patch("time.sleep")
+    @patch("btrfs_backup_ng.lifecycle.sleep_unless_stopped")
     def test_failure_returns_result(self, mock_sleep):
         """Test failed call returns RetryResult with errors."""
 
@@ -309,7 +309,7 @@ class TestRetryCall:
         def fails():
             raise TransientNetworkError("Error")
 
-        with patch("time.sleep"):
+        with patch("btrfs_backup_ng.lifecycle.sleep_unless_stopped"):
             result = retry_call(fails, max_attempts=1)
 
         with pytest.raises(TransientNetworkError):
@@ -338,7 +338,7 @@ class TestRetryContext:
         assert ctx.result.result == "result"
         assert ctx.attempt_number == 0
 
-    @patch("time.sleep")
+    @patch("btrfs_backup_ng.lifecycle.sleep_unless_stopped")
     def test_success_after_retries(self, mock_sleep):
         """Test success after retries."""
         attempts = 0
@@ -358,7 +358,7 @@ class TestRetryContext:
         assert ctx.result.result == "result"
         assert ctx.attempt_number == 2
 
-    @patch("time.sleep")
+    @patch("btrfs_backup_ng.lifecycle.sleep_unless_stopped")
     def test_exhausted_after_max_attempts(self, mock_sleep):
         """Test exhaustion after max attempts."""
         with RetryContext(RetryPolicy(max_attempts=2)) as ctx:
@@ -415,7 +415,7 @@ class TestAsyncRetry:
     """Tests for async retry functionality."""
 
     @pytest.mark.asyncio
-    @patch("asyncio.sleep")
+    @patch("btrfs_backup_ng.lifecycle.sleep_unless_stopped")
     async def test_wait_async(self, mock_sleep):
         """Test async wait."""
         from btrfs_backup_ng.core.retry import RetryAttempt
@@ -440,7 +440,7 @@ class TestAsyncRetry:
         assert delay == 0
 
     @pytest.mark.asyncio
-    @patch("asyncio.sleep")
+    @patch("btrfs_backup_ng.lifecycle.sleep_unless_stopped")
     async def test_with_retry_async_success(self, mock_sleep):
         """Test async retry decorator with success."""
         from btrfs_backup_ng.core.retry import with_retry_async
@@ -458,7 +458,7 @@ class TestAsyncRetry:
         assert call_count == 1
 
     @pytest.mark.asyncio
-    @patch("asyncio.sleep")
+    @patch("btrfs_backup_ng.lifecycle.sleep_unless_stopped")
     async def test_with_retry_async_retries(self, mock_sleep):
         """Test async retry decorator with retries."""
         from btrfs_backup_ng.core.retry import with_retry_async
@@ -478,7 +478,7 @@ class TestAsyncRetry:
         assert call_count == 3
 
     @pytest.mark.asyncio
-    @patch("asyncio.sleep")
+    @patch("btrfs_backup_ng.lifecycle.sleep_unless_stopped")
     async def test_with_retry_async_failure(self, mock_sleep):
         """Test async retry decorator exhausting attempts."""
         from btrfs_backup_ng.core.retry import with_retry_async
@@ -509,7 +509,7 @@ class TestAsyncRetry:
         assert call_count == 1
 
     @pytest.mark.asyncio
-    @patch("asyncio.sleep")
+    @patch("btrfs_backup_ng.lifecycle.sleep_unless_stopped")
     async def test_with_retry_async_with_policy(self, mock_sleep):
         """Test async retry decorator with RetryPolicy object."""
         from btrfs_backup_ng.core.retry import with_retry_async
@@ -527,7 +527,7 @@ class TestAsyncRetry:
 class TestOnRetryCallback:
     """Tests for on_retry callback."""
 
-    @patch("time.sleep")
+    @patch("btrfs_backup_ng.lifecycle.sleep_unless_stopped")
     def test_on_retry_callback_called(self, mock_sleep):
         """Test that on_retry callback is called."""
         callback_calls = []
@@ -557,7 +557,7 @@ class TestOnRetryCallback:
         assert callback_calls[1][0] == 2  # Second retry (attempt 2)
 
     @pytest.mark.asyncio
-    @patch("asyncio.sleep")
+    @patch("btrfs_backup_ng.lifecycle.sleep_unless_stopped")
     async def test_on_retry_callback_async(self, mock_sleep):
         """Test on_retry callback in async context."""
         callback_calls = []

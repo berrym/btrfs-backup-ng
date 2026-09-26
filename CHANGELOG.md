@@ -29,7 +29,8 @@ Five changes an upgrade can notice:
   snapshots taken within one second. `prune --dry-run` shows the effect.
 - **Ctrl-C no longer releases every pin at once.** Pins and locks are let
   go after the work under them has stopped, and a transfer on another
-  thread keeps its locks until it finishes (see Changed).
+  thread keeps its locks until it finishes (see Changed). After Ctrl-C no
+  thread begins anything new and nothing is retried (see Fixed).
 - **The lock format on a target changed.** While a 0.9.10 client and a
   0.9.11 client share one target, locking still excludes, but the older
   client keeps its own weaknesses until it is upgraded; see
@@ -215,6 +216,26 @@ Five changes an upgrade can notice:
   connections, and then dies of the signal. A second signal (a closed
   terminal sends more than one) does not cut that short, and a signal the
   operator set to be ignored -- a run under `nohup` -- stays ignored.
+- **After Ctrl-C, worker threads started the next snapshot and retried.**
+  Ctrl-C reaches only the main thread, and with parallel targets or volumes
+  -- the default `parallel_targets = 3` and two or more targets is enough --
+  the transfers run on worker threads that never saw it. After `kill -INT`
+  a worker finished the snapshot it was sending and then started the next
+  one in its plan; after a terminal's Ctrl-C, which also kills the
+  transfer's child processes, an `ssh://` worker counted the killed transfer
+  as a transient failure and sent the whole snapshot again. A volume worker
+  went on to prune after its transfers, and target and volume jobs still
+  waiting in the pool were started. Now the main thread requests a stop the
+  moment the interrupt reaches it and cancels the jobs no worker has begun,
+  and every point where a worker would begin something new -- a snapshot, a
+  target, a transfer, a prune, a deletion -- checks first and logs "Not
+  starting ...: the run was interrupted." instead. Nothing is retried: a
+  further attempt is refused and the backoff wait ends at once. What is
+  already being sent finishes (`kill -INT`) or fails as its children die (a
+  terminal's Ctrl-C), as before, and releases its locks only after its
+  writers have stopped. A snapshot that was not started is reported as not
+  transferred. SIGTERM and SIGHUP request the same stop before they stop the
+  run's processes.
 - **An ssh connection stopped and started again failed as an authentication
   error.** Stopping the connection removed its control directory, and the
   restart pointed ssh at a socket in the missing directory, which ssh
