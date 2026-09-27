@@ -30,7 +30,26 @@ required fields, and invalid values.
 .B btrfs-backup-ng config validate
 .RE
 .PP
-Exit status is 0 if valid, non-zero if errors are found.
+It also checks, on this machine and without root, that each enabled volume's
+source can be backed up: it can be read from this account, exists, and is a
+directory on btrfs. A native source must also be a subvolume root, since
+\fBbtrfs subvolume snapshot\fR refuses anything else; a directory inside a
+subvolume is reported with the subvolume that holds it. A snapper source
+(\fBsource = "snapper"\fR) is not required to be one: snapper takes its
+snapshots. Remote targets are not probed; \fBdoctor\fR does that.
+.PP
+Exit status:
+.TP
+.B 0
+The file is valid and its volumes are usable here.
+.TP
+.B 1
+No config file was found, or the file itself is invalid and must be edited.
+.TP
+.B 2
+The file is valid, but this machine cannot back up these volumes: a source is
+missing, cannot be read from this account, is not a directory, is not on
+btrfs, or (native sources) is not a subvolume root.
 .SS init
 Generate an example configuration file with comments explaining all options.
 Can be run in interactive mode for a guided setup wizard.

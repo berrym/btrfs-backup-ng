@@ -22,8 +22,9 @@ Check only the specified category. Valid categories:
 .RS
 .TP
 .B config
-Configuration checks: config file exists and valid, volume paths exist and are
-btrfs subvolumes, targets reachable, compression programs available.
+Configuration checks: config file exists and valid, volume sources usable (the
+same check as \fBconfig validate\fR), targets reachable, compression programs
+available.
 .TP
 .B snapshots
 Snapshot health checks: orphaned snapshots (on disk but not tracked), missing
@@ -62,7 +63,9 @@ specific backup volume.
 .IP \(bu 2
 Configuration file exists and is valid TOML
 .IP \(bu 2
-All configured volume paths exist and are btrfs subvolumes
+Every volume's source can be read, exists and is a directory on btrfs; a
+native source is also a subvolume root (a snapper source need not be, as
+snapper takes its snapshots)
 .IP \(bu 2
 SSH targets are reachable (connection test)
 .IP \(bu 2
@@ -159,7 +162,7 @@ btrfs-backup-ng Doctor
 
 Configuration
   [OK]    Config file valid
-  [OK]    Volume /home exists and is btrfs subvolume
+  [OK]    Volume path valid: /home
   [WARN]  Compression program 'pigz' not found
 
 Snapshots

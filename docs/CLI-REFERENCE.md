@@ -288,6 +288,24 @@ btrfs-backup-ng config validate
 btrfs-backup-ng -c /path/to/config.toml config validate
 ```
 
+Besides the file itself, `config validate` checks, on this machine and
+without root, that each enabled volume's source can be backed up: it can be
+read from this account, exists, and is a directory on btrfs. A native source
+must also be a subvolume root -- `btrfs subvolume snapshot` refuses anything
+else -- and a directory inside a subvolume is reported with the subvolume that
+holds it. A snapper source (`source = "snapper"`) is not required to be one:
+snapper takes its snapshots, and with `config_name = "auto"` any path at or
+below a snapper subvolume selects that config. Remote targets are not probed;
+`doctor` does that. `doctor` asks the same question of each source.
+
+**Exit status:**
+- `0` -- the file is valid and its volumes are usable here
+- `1` -- no config file was found, or the file itself is invalid and must be
+  edited
+- `2` -- the file is valid, but this machine cannot back up these volumes: a
+  source is missing, cannot be read from this account, is not a directory, is
+  not on btrfs, or (native sources) is not a subvolume root
+
 > **Note — unknown keys are reported.** Loading the config warns about any key a
 > parser does not recognize, e.g. `Unknown config key 'ssh_prot' in
 > [volumes[0].targets[0]] (ignored)`. A misspelled or misplaced key (a typo, or a
@@ -536,7 +554,7 @@ btrfs-backup-ng doctor [OPTIONS]
 **Categories:**
 | Category | What It Checks |
 |----------|----------------|
-| `config` | Config file exists and valid, volume paths exist, targets reachable, compression programs available |
+| `config` | Config file exists and valid, volume sources usable (the same check as `config validate`), targets reachable, compression programs available |
 | `snapshots` | Orphaned snapshots, missing snapshots, broken parent chains |
 | `transfers` | Stale locks (dead processes), incomplete transfers, recent failures in transaction log |
 | `system` | Destination space, quota limits, systemd timer status, backup age |

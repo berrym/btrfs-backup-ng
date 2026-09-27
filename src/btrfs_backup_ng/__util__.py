@@ -873,6 +873,11 @@ def is_btrfs(path: str | Path) -> bool:
     return result
 
 
+#: The root directory of every btrfs subvolume has this inode number, and no
+#: other directory on btrfs does; reading it needs no privilege.
+SUBVOLUME_ROOT_INODE = 256
+
+
 def is_subvolume(path: str | Path) -> bool:
     """Checks whether the given path is a btrfs subvolume.
 
@@ -888,11 +893,100 @@ def is_subvolume(path: str | Path) -> bool:
     if not is_btrfs(path):
         return False
     logger.debug("Checking for btrfs subvolume: %s", path)
-    # subvolumes always have inode 256
     st = path.stat()
-    result = st.st_ino == 256
+    result = st.st_ino == SUBVOLUME_ROOT_INODE
     logger.debug("  -> Inode is %d, result is %r", st.st_ino, result)
     return result
+
+
+class SourceProbeError(Exception):
+    """The filesystem holding a backup source could not be determined."""
+
+
+def backup_source_problems(path: str | Path, *, snapper: bool = False) -> list[str]:
+    """Why ``path`` cannot be backed up as a volume's source, in plain words.
+
+    The one answer to "can this volume be backed up from here", shared by
+    ``config validate`` and ``doctor``. Each used to ask only whether the path
+    exists, is a directory and is on btrfs, so both called a plain directory on
+    btrfs usable -- and ``btrfs subvolume snapshot`` refuses anything that is
+    not a subvolume.
+
+    Local and unprivileged: a stat and the mount table. An empty list means
+    nothing here says the source cannot work. A path this account cannot read
+    is reported as such, not as missing. A failure to read the mount table
+    raises ``SourceProbeError``, and each caller decides what it means:
+    ``validate`` treats it as no verdict, ``doctor`` reports the check as
+    failed. A relative path is reported as the absolute path it names.
+
+    ``snapper``: the volume's snapshots are taken by snapper, not by
+    btrfs-backup-ng. Its path is never snapshotted by ``run`` -- with
+    ``config_name = "auto"`` any path at or below a snapper subvolume selects
+    that config -- so a snapper source is not required to be a subvolume root;
+    it is checked as far as being a readable directory on btrfs.
+    """
+    source = Path(os.path.abspath(path))
+    try:
+        st = os.stat(source)
+    except PermissionError:
+        return [
+            f"Source {source} cannot be checked from this account: permission "
+            "is denied on it or on a directory above it. Check it as the user "
+            "that runs the backups, usually root."
+        ]
+    except (FileNotFoundError, NotADirectoryError):
+        return [f"Source {source} does not exist."]
+    except OSError as e:
+        return [f"Source {source} cannot be checked: {e.strerror or e}."]
+
+    if not stat_module.S_ISDIR(st.st_mode):
+        return [f"Source {source} is not a directory."]
+
+    try:
+        on_btrfs = is_btrfs(source)
+    except Exception as e:
+        raise SourceProbeError(
+            f"the filesystem of {source} could not be determined: {e}"
+        ) from e
+    if not on_btrfs:
+        return [f"Source {source} is not on a btrfs filesystem."]
+
+    if snapper or st.st_ino == SUBVOLUME_ROOT_INODE:
+        return []
+
+    holder = _containing_subvolume(source, st.st_dev)
+    make_one = "(`btrfs subvolume create`, then move the data into it)"
+    if holder is not None:
+        return [
+            f"Source {source} is a directory inside the btrfs subvolume "
+            f"{holder}, not a subvolume itself, and btrfs can snapshot only a "
+            f"subvolume. Point the volume at {holder}, or make {source} a "
+            f"subvolume of its own {make_one}."
+        ]
+    return [
+        f"Source {source} is a directory, not a btrfs subvolume, and btrfs can "
+        "snapshot only a subvolume. Point the volume at the subvolume that "
+        f"holds it, or make it a subvolume of its own {make_one}."
+    ]
+
+
+def _containing_subvolume(path: Path, device: int) -> Path | None:
+    """The subvolume whose tree holds the directory ``path``, if it can be read.
+
+    Every directory in one subvolume shares that subvolume's device number, and
+    its root is the nearest ancestor with the subvolume root inode. Crossing to
+    another device means a mount boundary was passed without finding it.
+    """
+    for parent in path.resolve().parents:
+        try:
+            st = os.stat(parent)
+        except OSError:
+            return None
+        if st.st_dev != device:
+            return None
+        if st.st_ino == SUBVOLUME_ROOT_INODE:
+            return parent
+    return None
 
 
 def delete_subvolume(path: str | Path) -> None:
