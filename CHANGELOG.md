@@ -5,7 +5,23 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.9.12] - 2026-09-27
+
+This release makes `config validate` and `doctor` answer the question they
+are asked: whether a volume's source can be backed up from this machine.
+Both now require a native source to be a btrfs subvolume, name the
+subvolume that holds a directory that is not one, and say when a source
+cannot be read from this account instead of calling it missing. It also
+fixes tests that failed wherever the temporary directory is on btrfs or
+has a long path.
+
+One change an upgrade can notice:
+
+- **`config validate` can exit 2, and `doctor` report an error, for a
+  config they used to pass.** A native volume whose path is a plain
+  directory, not a subvolume, never worked with `run`, which failed at the
+  snapshot; validate and doctor now say so, and name the subvolume that
+  holds the directory where one does. Snapper volumes are checked as before.
 
 ### Fixed
 
