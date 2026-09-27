@@ -431,7 +431,7 @@ work in progress.
 | local | yes | lock file beside the backups |
 | `ssh://` | yes | lock directory on the remote target |
 | `raw+ssh://` | yes | lock directory on the remote target |
-| local `raw://` | no | in memory, for the run only |
+| local `raw://` | yes | lock directory beside the streams |
 
 `persists_locks` states this per endpoint, and a test asserts the flag cannot
 drift from what `set_lock` actually does.

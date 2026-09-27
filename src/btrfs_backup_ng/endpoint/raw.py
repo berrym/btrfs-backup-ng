@@ -2164,7 +2164,7 @@ class SSHRawEndpoint(RawEndpoint):
 
     #: raw+ssh writes its snapshot locks on the remote target, so they survive
     #: the process and are visible to any other process or machine touching that
-    #: target. Local raw keeps the in-memory set (see RawEndpoint).
+    #: target. Local raw records its pins in a lock directory beside the streams.
     persists_locks: bool = True
 
     def _read_locks(self) -> dict:
