@@ -186,12 +186,13 @@ class TestTheExitStatusDistinguishesTheTwoFailures:
         assert self._validate(tmp_path, "[[volumes]]\npath =\n") == 1
 
     def test_a_valid_file_this_machine_cannot_run_exits_2(self, tmp_path):
-        source = tmp_path / "not-a-subvolume"
-        source.mkdir()
+        # /proc: a real directory that is not on btrfs on every Linux system.
+        # A directory under tmp_path answered that only where tmp_path was not
+        # on btrfs, so the test failed wherever the temporary directory is.
+        source = "/proc"
         code = self._validate(
             tmp_path,
-            f'[[volumes]]\npath = "{source}"\n'
-            f'snapshot_dir = "{source}/.snapshots"\n\n'
+            f'[[volumes]]\npath = "{source}"\n\n'
             f'[[volumes.targets]]\npath = "{tmp_path / "dest"}"\n',
         )
         assert code == 2, "a valid file was reported the same way as a broken one"
