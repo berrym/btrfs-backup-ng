@@ -628,7 +628,7 @@ class Doctor:
         if not self.config:
             return findings
 
-        from ..__util__ import is_btrfs
+        from ..__util__ import backup_source_problems
 
         volumes = self.config.get_enabled_volumes()
         volume_filter = getattr(self, "_volume_filter", None)
@@ -637,27 +637,23 @@ class Doctor:
             if volume_filter and volume.path != volume_filter:
                 continue
 
-            path = Path(volume.path)
-
-            if not path.exists():
+            # The same question `config validate` asks, so the two can never
+            # disagree. Exists-and-on-btrfs used to be reported "valid" here,
+            # for a plain directory btrfs refuses to snapshot.
+            problems = backup_source_problems(
+                volume.path, snapper=volume.is_snapper_source()
+            )
+            for problem in problems:
                 findings.append(
                     DiagnosticFinding(
                         category=DiagnosticCategory.CONFIG,
                         severity=DiagnosticSeverity.ERROR,
                         check_name="volume_paths",
-                        message=f"Volume path does not exist: {volume.path}",
+                        message=problem,
+                        details={"path": volume.path},
                     )
                 )
-            elif not is_btrfs(path):
-                findings.append(
-                    DiagnosticFinding(
-                        category=DiagnosticCategory.CONFIG,
-                        severity=DiagnosticSeverity.ERROR,
-                        check_name="volume_paths",
-                        message=f"Volume is not on btrfs filesystem: {volume.path}",
-                    )
-                )
-            else:
+            if not problems:
                 findings.append(
                     DiagnosticFinding(
                         category=DiagnosticCategory.CONFIG,

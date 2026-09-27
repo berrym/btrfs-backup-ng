@@ -783,14 +783,17 @@ class TestDoctorVolumePaths:
         findings = doctor._check_volume_paths()
         assert len(findings) == 0
 
-    @patch("btrfs_backup_ng.core.doctor.Path.exists")
-    @patch("btrfs_backup_ng.__util__.is_btrfs")
-    def test_check_volume_paths_valid(self, mock_is_btrfs, mock_exists):
-        """Test volume paths check with valid paths."""
-        mock_exists.return_value = True
-        mock_is_btrfs.return_value = True
+    def test_check_volume_paths_valid(self, monkeypatch):
+        """A source the shared check finds nothing wrong with is reported OK.
 
+        What makes a source usable is tested in test_backup_source_check.py and,
+        on real btrfs, in tier2's test_source_check_real.py.
+        """
+        import btrfs_backup_ng.__util__ as util
+
+        monkeypatch.setattr(util, "backup_source_problems", lambda p, **kw: [])
         mock_volume = MagicMock()
+        mock_volume.is_snapper_source.return_value = False
         mock_volume.path = "/home"
 
         mock_config = MagicMock()
@@ -799,11 +802,12 @@ class TestDoctorVolumePaths:
         doctor = Doctor(config=mock_config)
         findings = doctor._check_volume_paths()
 
-        assert any(f.severity == DiagnosticSeverity.OK for f in findings)
+        assert [f.severity for f in findings] == [DiagnosticSeverity.OK]
 
     def test_check_volume_paths_missing(self):
         """Test volume paths check with missing path."""
         mock_volume = MagicMock()
+        mock_volume.is_snapper_source.return_value = False
         mock_volume.path = "/nonexistent/path"
 
         mock_config = MagicMock()
@@ -814,15 +818,11 @@ class TestDoctorVolumePaths:
 
         assert any(f.severity == DiagnosticSeverity.ERROR for f in findings)
 
-    @patch("btrfs_backup_ng.core.doctor.Path.exists")
-    @patch("btrfs_backup_ng.__util__.is_btrfs")
-    def test_check_volume_paths_not_btrfs(self, mock_is_btrfs, mock_exists):
-        """Test volume paths check when path is not btrfs."""
-        mock_exists.return_value = True
-        mock_is_btrfs.return_value = False
-
+    def test_check_volume_paths_not_btrfs(self):
+        """Test volume paths check when path is not btrfs (/proc never is)."""
         mock_volume = MagicMock()
-        mock_volume.path = "/home"
+        mock_volume.is_snapper_source.return_value = False
+        mock_volume.path = "/proc"
 
         mock_config = MagicMock()
         mock_config.get_enabled_volumes.return_value = [mock_volume]
@@ -831,7 +831,8 @@ class TestDoctorVolumePaths:
         findings = doctor._check_volume_paths()
 
         assert any(
-            f.severity == DiagnosticSeverity.ERROR and "not on btrfs" in f.message
+            f.severity == DiagnosticSeverity.ERROR
+            and "not on a btrfs filesystem" in f.message
             for f in findings
         )
 

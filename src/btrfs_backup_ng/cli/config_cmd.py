@@ -1134,31 +1134,24 @@ def _volume_readiness_problems(volume: Any) -> list[str]:
     """Local, cheap reasons this volume could not actually be backed up.
 
     Deliberately limited to what can be answered on THIS machine without opening
-    a connection: does the source exist, is it a directory, is it on btrfs.
-    Remote targets are not probed -- that is `doctor`'s job, which is allowed to
-    reach the network; `validate` stays fast and offline.
+    a connection -- ``__util__.backup_source_problems``, the same question
+    ``doctor`` asks. Remote targets are not probed -- that is `doctor`'s job,
+    which is allowed to reach the network; `validate` stays fast and offline.
 
     Returns a list of human-readable problems; empty means "nothing local says
     this cannot work".
     """
-    from pathlib import Path
-
     from .. import __util__
 
-    problems: list[str] = []
-    path = Path(str(volume.path))
-    if not path.exists():
-        problems.append(f"source path does not exist: {path}")
-        return problems
-    if not path.is_dir():
-        problems.append(f"source path is not a directory: {path}")
-        return problems
     try:
-        if not __util__.is_btrfs(path):
-            problems.append(f"source path is not on a btrfs filesystem: {path}")
-    except Exception as e:  # noqa: BLE001 - a probe failure is not a verdict
-        logger.debug("Could not determine filesystem for %s: %s", path, e)
-    return problems
+        return __util__.backup_source_problems(
+            str(volume.path), snapper=volume.is_snapper_source()
+        )
+    except __util__.SourceProbeError as e:
+        # A probe failure is not a verdict. Only that is caught: anything else
+        # is a fault in the check, and must not read as "usable".
+        logger.debug("%s", e)
+        return []
 
 
 def _validate_config(args: argparse.Namespace) -> int:
@@ -1206,11 +1199,9 @@ def _validate_config(args: argparse.Namespace) -> int:
             )
             return 1
 
-        readiness: list[tuple[str, list[str]]] = []
+        readiness: list[str] = []
         for volume in enabled:
-            problems = _volume_readiness_problems(volume)
-            if problems:
-                readiness.append((str(volume.path), problems))
+            readiness.extend(_volume_readiness_problems(volume))
 
         print("")
         print("Configuration syntax and structure: valid.")
@@ -1223,9 +1214,8 @@ def _validate_config(args: argparse.Namespace) -> int:
         if readiness:
             print("")
             print("These volumes cannot be backed up from this machine:")
-            for path, problems in readiness:
-                for problem in problems:
-                    print(f"  - {path}: {problem}")
+            for problem in readiness:
+                print(f"  - {problem}")
             print("")
             print(
                 "The file itself is fine. Checked locally only -- remote targets "

@@ -40,25 +40,30 @@ def _args(path):
     return argparse.Namespace(config=str(path))
 
 
+def _native_volume(path):
+    """A volume whose snapshots btrfs-backup-ng takes itself."""
+    return type("V", (), {"path": path, "is_snapper_source": lambda self: False})()
+
+
 class TestTheLocalReadinessProbe:
     def test_a_missing_source_is_a_problem(self, tmp_path):
-        volume = type("V", (), {"path": str(tmp_path / "nope")})()
+        volume = _native_volume(str(tmp_path / "nope"))
         problems = _volume_readiness_problems(volume)
         assert problems and "does not exist" in problems[0]
 
     def test_a_file_where_a_subvolume_belongs_is_a_problem(self, tmp_path):
         target = tmp_path / "afile"
         target.write_text("x")
-        volume = type("V", (), {"path": str(target)})()
+        volume = _native_volume(str(target))
         problems = _volume_readiness_problems(volume)
         assert problems and "not a directory" in problems[0]
 
     def test_an_existing_directory_is_reported_on_its_filesystem(self, tmp_path):
-        """tmp_path is usually NOT btrfs, so this should say so -- and must not
-        crash when it cannot tell."""
-        volume = type("V", (), {"path": str(tmp_path)})()
+        """tmp_path is a plain directory, never a subvolume root, so it is
+        refused on any filesystem: as not on btrfs, or as not a subvolume."""
+        volume = _native_volume(str(tmp_path))
         problems = _volume_readiness_problems(volume)
-        assert problems == [] or "btrfs" in problems[0]
+        assert problems and "btrfs" in problems[0]
 
     def test_a_probe_failure_is_not_a_verdict(self, tmp_path, monkeypatch):
         """If the filesystem cannot be determined, that is not evidence the
@@ -73,7 +78,7 @@ class TestTheLocalReadinessProbe:
         monkeypatch.setattr(
             util, "is_btrfs", lambda p: (_ for _ in ()).throw(OSError("boom"))
         )
-        volume = type("V", (), {"path": str(tmp_path)})()
+        volume = _native_volume(str(tmp_path))
         assert _volume_readiness_problems(volume) == []
 
 
@@ -118,7 +123,7 @@ class TestValidateReportsBothHalves:
         assert "Checked locally only" in out
         assert "doctor" in out
 
-    def test_a_usable_source_still_passes(self, tmp_path, capsys):
+    def test_a_usable_source_still_passes(self, tmp_path, capsys, monkeypatch):
         """Guard against over-correcting: a real directory must not be failed."""
         source = tmp_path / "src"
         source.mkdir()
@@ -128,20 +133,18 @@ class TestValidateReportsBothHalves:
             '[[volumes.targets]]\npath = "/mnt/backup"\n',
         )
 
-        # Pretend the source is on btrfs; the point here is the pass path.
+        # The shared source check answers "nothing wrong"; the point here is
+        # validate's pass path. A real subvolume passing is proven on real
+        # btrfs in tests/integration/tier2/test_source_check_real.py.
         import btrfs_backup_ng.__util__ as util
 
-        original = util.is_btrfs
-        util.is_btrfs = lambda p: True
-        try:
-            rc = _validate_config(_args(cfg))
-        finally:
-            util.is_btrfs = original
+        monkeypatch.setattr(util, "backup_source_problems", lambda p, **kw: [])
+        rc = _validate_config(_args(cfg))
         out = capsys.readouterr().out
         assert rc == 0, out
         assert "look usable from this machine" in out
 
-    def test_remote_targets_are_not_probed(self, tmp_path, capsys):
+    def test_remote_targets_are_not_probed(self, tmp_path, capsys, monkeypatch):
         """validate stays offline. A network probe here would make a config
         check hang on an unreachable host."""
         source = tmp_path / "src"
@@ -153,12 +156,8 @@ class TestValidateReportsBothHalves:
         )
         import btrfs_backup_ng.__util__ as util
 
-        original = util.is_btrfs
-        util.is_btrfs = lambda p: True
-        try:
-            rc = _validate_config(_args(cfg))
-        finally:
-            util.is_btrfs = original
+        monkeypatch.setattr(util, "backup_source_problems", lambda p, **kw: [])
+        rc = _validate_config(_args(cfg))
         assert rc == 0
         assert "unreachable" not in capsys.readouterr().out.lower()
 
