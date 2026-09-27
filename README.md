@@ -2830,7 +2830,7 @@ Fixable: 1 issue (run with --fix)
 
 | Category | Checks |
 |----------|--------|
-| **config** | Config file exists and valid, volume paths exist, targets reachable, compression programs available |
+| **config** | Config file exists and valid, volume sources usable (the same check as `config validate`), targets reachable, compression programs available |
 | **snapshots** | Orphaned snapshots, missing snapshots, broken parent chains |
 | **transfers** | Stale locks (dead processes), incomplete transfers, recent failures |
 | **system** | Destination space, quota limits, systemd timer status, backup age |

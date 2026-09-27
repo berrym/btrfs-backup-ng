@@ -5,6 +5,38 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **`config validate` and `doctor` called a directory that is not a
+  subvolume a usable source.** Both asked only whether a source exists, is
+  a directory and is on btrfs, so a plain directory on btrfs passed:
+  validate printed "All enabled volumes look usable from this machine." and
+  exited 0, doctor printed "Volume path valid", and `run` then failed,
+  because `btrfs subvolume snapshot` refuses anything that is not a
+  subvolume. Both now ask one shared check, which also requires the source
+  to be a subvolume root and names the subvolume that holds a directory
+  that is not one: "Source /home/user is a directory inside the btrfs
+  subvolume /home, not a subvolume itself, ...". validate exits 2 for it,
+  as for a source that is not on btrfs, and doctor reports an error. The
+  check reads an inode number and needs no root. A snapper source is not
+  required to be a subvolume root: snapper takes its snapshots, and with
+  `config_name = "auto"` any path at or below a snapper subvolume selects
+  that config. It is checked as before (#110).
+- **A source this account could not read was reported wrongly.** Depending
+  on the Python version, `config validate` said it did not exist, or
+  stopped with a raw "Permission denied" and exit status 1, the status that
+  says the file itself must be edited; doctor said it did not exist, or
+  reported its check as failed with the raw error. Both now say the source
+  cannot be checked from this account, and validate exits 2.
+- **Tests failed where the temporary directory is on btrfs or has a long
+  path.** The ssh-agent discovery tests bind real sockets under the test's
+  temporary directory, and a long enough path passes the 108-byte limit on
+  a socket path; a `config validate` test relied on its temporary
+  directory not being on btrfs. Both now pass wherever the suite runs
+  (#111).
+
 ## [0.9.11] - 2026-09-27
 
 This release is about what happens when a run is interrupted or has
