@@ -73,6 +73,9 @@ class SpaceCheck:
         required_with_margin: Total bytes needed including safety margin
         available_after: Estimated available space after operation
         warning_message: Optional warning about the space check
+        estimate_bound: What the estimated size proves, as
+            ``core.estimate.bound_of`` names it ("measurement", "upper" or
+            "lower"), or None when the caller did not say
     """
 
     space_info: SpaceInfo
@@ -83,6 +86,7 @@ class SpaceCheck:
     required_with_margin: int = 0
     available_after: int = 0
     warning_message: Optional[str] = None
+    estimate_bound: Optional[str] = None
 
 
 def get_filesystem_space(
@@ -302,6 +306,7 @@ def check_space_availability(
     required_bytes: int,
     safety_margin_percent: float = DEFAULT_SAFETY_MARGIN_PERCENT,
     min_safety_bytes: int = MIN_SAFETY_BYTES,
+    estimate_bound: Optional[str] = None,
 ) -> SpaceCheck:
     """Check if sufficient space is available for an operation.
 
@@ -314,6 +319,8 @@ def check_space_availability(
         required_bytes: Estimated bytes needed for the operation
         safety_margin_percent: Percentage to add as safety margin (default 10%)
         min_safety_bytes: Minimum safety margin in bytes (default 100 MiB)
+        estimate_bound: What ``required_bytes`` proves ("measurement",
+            "upper" or "lower"); carried to the report, which says so
 
     Returns:
         SpaceCheck with the result of the availability check
@@ -359,6 +366,7 @@ def check_space_availability(
         required_with_margin=required_with_margin,
         available_after=available_after,
         warning_message=warning_message,
+        estimate_bound=estimate_bound,
     )
 
 
@@ -465,6 +473,18 @@ def format_space_check(check: SpaceCheck) -> str:
         f"(+ {check.safety_margin_percent:.0f}% safety margin = "
         f"{_format_size(check.required_with_margin)})"
     )
+    if check.estimate_bound == "upper":
+        lines.append(
+            "Estimate:          an upper bound, measured by du, which counts "
+            "sparse-file holes and data shared between files in full; the "
+            "transfer may need less"
+        )
+    elif check.estimate_bound == "lower":
+        lines.append(
+            "Estimate:          a floor; incremental sizes are measured with "
+            "`btrfs send --no-data`, which carries no file contents, so the "
+            "transfer needs more"
+        )
 
     # Status
     if check.sufficient:

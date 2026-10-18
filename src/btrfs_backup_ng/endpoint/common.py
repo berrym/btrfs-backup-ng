@@ -16,6 +16,7 @@ from filelock import FileLock
 
 from btrfs_backup_ng import __util__
 from btrfs_backup_ng.__logger__ import logger
+from btrfs_backup_ng.core.estimate import SizeEstimate
 from btrfs_backup_ng.core.space import SpaceInfo
 from btrfs_backup_ng.core.space import get_space_info as _get_space_info
 from btrfs_backup_ng.core.transfer import tail_stderr
@@ -1046,7 +1047,17 @@ class Endpoint:
         self, snapshot: Any, parent: Any = None
     ) -> Optional[int]:
         """Bytes a ``btrfs send`` of ``snapshot`` (against ``parent``) is expected to
-        carry, or None when unknown or incremental.
+        carry, or None when unknown or incremental: ``measure_transfer_size``
+        without the method.
+        """
+        measured = self.measure_transfer_size(snapshot, parent)
+        return None if measured is None else measured.bytes
+
+    def measure_transfer_size(
+        self, snapshot: Any, parent: Any = None
+    ) -> Optional[SizeEstimate]:
+        """The size of a ``btrfs send`` of ``snapshot`` (against ``parent``) with
+        the method that measured it, or None when unknown or incremental.
 
         Asked of the endpoint that HOLDS the snapshot, because that is the only
         place ``btrfs subvolume show`` can measure it. The transfer engine used
@@ -1054,14 +1065,13 @@ class Endpoint:
         source's path measured nothing here, and every transfer from an ssh://
         source warned "Could not estimate transfer size for space check". This
         base implementation is the local measurement (``core.progress``); the
-        ssh endpoint overrides it to measure on the remote host.
+        ssh endpoint overrides it to measure on the remote host. The method
+        travels with the figure so the space check knows what it proves.
         """
         from btrfs_backup_ng.core import progress as progress_utils
 
         parent_path = str(parent.get_path()) if parent is not None else None
-        return progress_utils.estimate_snapshot_size(
-            str(snapshot.get_path()), parent_path
-        )
+        return progress_utils.measure_snapshot(str(snapshot.get_path()), parent_path)
 
     def test_send_stream(self, snapshot: Any, parent: Any = None) -> None:
         """Verify a ``btrfs send`` stream can be generated for ``snapshot`` -- the STREAM

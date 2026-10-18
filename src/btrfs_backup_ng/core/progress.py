@@ -49,6 +49,9 @@ import sys
 import threading
 from typing import IO, Optional
 
+from .estimate import SizeEstimate, measure_snapshot_full_size
+from .estimate import _parse_size as _parse_size_table
+
 logger = logging.getLogger(__name__)
 
 
@@ -57,14 +60,34 @@ def is_interactive() -> bool:
     return sys.stdout.isatty()
 
 
+def measure_snapshot(
+    snapshot_path: str, parent_path: Optional[str] = None
+) -> Optional[SizeEstimate]:
+    """The size of a full transfer of ``snapshot_path``, with the method that
+    measured it, for the progress bar's total and the engine's space check.
+
+    An incremental transfer (``parent_path`` exists) is not sized: the delta
+    is expensive to measure and usually fast to move, so None, an
+    indeterminate bar. A full transfer is measured by ``core.estimate``, the
+    one local measurement. This used to be a second copy of its ladder that
+    reported a ``btrfs filesystem du`` Total of 0 as a size and let an
+    OSError out to the caller.
+    """
+    logger.debug(
+        "measure_snapshot called: snapshot_path=%s, parent_path=%s",
+        snapshot_path,
+        parent_path,
+    )
+    if parent_path and os.path.exists(str(parent_path)):
+        logger.debug("Incremental transfer - using indeterminate progress bar")
+        return None
+    return measure_snapshot_full_size(snapshot_path)
+
+
 def estimate_snapshot_size(
     snapshot_path: str, parent_path: Optional[str] = None
 ) -> Optional[int]:
-    """Estimate the size of a snapshot transfer for progress display.
-
-    For full transfers: Uses btrfs subvolume show to get exclusive data size.
-    For incremental transfers: Returns None (indeterminate) since estimating
-    the delta accurately is expensive and the actual transfer is usually fast.
+    """``measure_snapshot`` as bytes alone, or None.
 
     Args:
         snapshot_path: Path to the snapshot
@@ -73,146 +96,16 @@ def estimate_snapshot_size(
     Returns:
         Estimated size in bytes, or None if unable to determine or incremental
     """
-    logger.debug(
-        "estimate_snapshot_size called: snapshot_path=%s, parent_path=%s",
-        snapshot_path,
-        parent_path,
-    )
-
-    # For incremental transfers, return None (indeterminate progress)
-    if parent_path and os.path.exists(str(parent_path)):
-        logger.debug("Incremental transfer - using indeterminate progress bar")
-        return None
-
-    # Try btrfs subvolume show for full transfers (requires quotas enabled)
-    try:
-        cmd = ["btrfs", "subvolume", "show", snapshot_path]
-        if os.geteuid() != 0:
-            cmd = ["sudo", "-n"] + cmd
-
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=30,
-        )
-        logger.debug("btrfs subvolume show returned: %d", result.returncode)
-        if result.returncode == 0:
-            # Parse "Exclusive" line for data size (only present if quotas enabled)
-            for line in result.stdout.splitlines():
-                if line.strip().startswith("Exclusive"):
-                    parts = line.split(":")
-                    if len(parts) >= 2:
-                        size_str = parts[1].strip()
-                        parsed = _parse_size(size_str)
-                        if parsed:
-                            logger.debug(
-                                "Parsed exclusive size '%s' -> %s bytes",
-                                size_str,
-                                parsed,
-                            )
-                            return parsed
-        else:
-            logger.debug("btrfs subvolume show failed: %s", result.stderr)
-    except (subprocess.TimeoutExpired, FileNotFoundError) as e:
-        logger.debug("Failed to get snapshot size via btrfs: %s", e)
-
-    # Fallback: use btrfs filesystem du for accurate size (handles reflinks/dedup)
-    try:
-        cmd = ["btrfs", "filesystem", "du", "-s", "--raw", snapshot_path]
-        if os.geteuid() != 0:
-            cmd = ["sudo", "-n"] + cmd
-
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=120,
-        )
-        if result.returncode == 0:
-            # Output format with --raw:
-            # Total   Exclusive  Set shared  Filename
-            # 12345   6789       5000        /path
-            lines = result.stdout.strip().splitlines()
-            if len(lines) >= 2:
-                # Parse the data line (skip header)
-                parts = lines[1].split()
-                if len(parts) >= 3:
-                    try:
-                        total_size = int(parts[0])
-                        logger.debug(
-                            "Estimated size via btrfs filesystem du: %d bytes",
-                            total_size,
-                        )
-                        return total_size
-                    except ValueError:
-                        logger.debug("Failed to parse btrfs du output: %s", lines[1])
-        else:
-            logger.debug("btrfs filesystem du failed: %s", result.stderr)
-    except (subprocess.TimeoutExpired, FileNotFoundError) as e:
-        logger.debug("Failed to get snapshot size via btrfs filesystem du: %s", e)
-
-    # Final fallback: use regular du
-    try:
-        cmd = ["du", "-sb", snapshot_path]
-        if os.geteuid() != 0:
-            cmd = ["sudo", "-n"] + cmd
-
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=120,
-        )
-        if result.returncode == 0:
-            size_str = result.stdout.split()[0]
-            try:
-                size = int(size_str)
-                logger.debug("Estimated size via du: %d bytes", size)
-                return size
-            except ValueError:
-                logger.debug("Failed to parse du output: %s", result.stdout)
-        else:
-            logger.debug("du failed: %s", result.stderr)
-    except (subprocess.TimeoutExpired, FileNotFoundError) as e:
-        logger.debug("Failed to get snapshot size via du: %s", e)
-
-    return None
+    measured = measure_snapshot(snapshot_path, parent_path)
+    return None if measured is None else measured.bytes
 
 
 def _parse_size(size_str: str) -> Optional[int]:
-    """Parse a size string like '1.23GiB' or '123.45MiB' to bytes."""
-    size_str = size_str.strip()
+    """Parse a size string like '1.23GiB' or '123.45MiB' to bytes.
 
-    multipliers = {
-        "B": 1,
-        "KiB": 1024,
-        "MiB": 1024**2,
-        "GiB": 1024**3,
-        "TiB": 1024**4,
-        "KB": 1000,
-        "MB": 1000**2,
-        "GB": 1000**3,
-        "TB": 1000**4,
-    }
-
-    # Longest suffix first: every unit ends in "B", so testing "B" before
-    # "MiB" matched "12.00MiB" as bytes, failed to parse "12.00Mi", and
-    # returned None -- which is what every quota-enabled ``btrfs subvolume
-    # show`` Exclusive line did here, silently, until the du fallback ran.
-    for suffix, multiplier in sorted(multipliers.items(), key=lambda kv: -len(kv[0])):
-        if size_str.endswith(suffix):
-            try:
-                value = float(size_str[: -len(suffix)].strip())
-                return int(value * multiplier)
-            except ValueError:
-                return None
-
-    # Try parsing as plain bytes
-    try:
-        return int(float(size_str))
-    except ValueError:
-        return None
+    ``core.estimate`` holds the one table; this name is kept for its readers.
+    """
+    return _parse_size_table(size_str)
 
 
 class RichProgressPipe:

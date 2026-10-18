@@ -32,6 +32,7 @@ import pytest
 import btrfs_backup_ng.core.operations as ops
 from btrfs_backup_ng import __util__
 from btrfs_backup_ng.core import progress as progress_utils
+from btrfs_backup_ng.core.estimate import SizeEstimate
 from btrfs_backup_ng.core.space import SpaceCheck, SpaceInfo
 from btrfs_backup_ng.endpoint.local import LocalEndpoint
 from btrfs_backup_ng.endpoint.ssh import SSHEndpoint
@@ -441,7 +442,9 @@ class TestTheEstimateIsAskedOfTheSource:
         it measures nothing and warns on every transfer."""
         snapshot = MagicMock()
         snapshot.get_path.return_value = "/remote/p-1"
-        snapshot.endpoint.estimate_transfer_size.return_value = 4096
+        snapshot.endpoint.measure_transfer_size.return_value = SizeEstimate(
+            4096, "filesystem_du"
+        )
         dest = MagicMock()
         info = SpaceInfo(
             path="/d", total_bytes=10**9, used_bytes=0, available_bytes=10**9
@@ -451,11 +454,13 @@ class TestTheEstimateIsAskedOfTheSource:
         def forbidden(*a, **k):
             raise AssertionError("the local estimate ran")
 
+        monkeypatch.setattr(progress_utils, "measure_snapshot", forbidden)
         monkeypatch.setattr(progress_utils, "estimate_snapshot_size", forbidden)
         seen = {}
 
-        def check(space_info, size, safety_margin_percent):
+        def check(space_info, size, safety_margin_percent, estimate_bound=None):
             seen["size"] = size
+            seen["bound"] = estimate_bound
             return SpaceCheck(
                 space_info=info,
                 estimated_size=size,
@@ -467,8 +472,8 @@ class TestTheEstimateIsAskedOfTheSource:
         monkeypatch.setattr(ops, "check_space_availability", check)
         with caplog.at_level(logging.WARNING, logger=ops.logger.name):
             ops._verify_destination_space(snapshot, dest, None, {})
-        assert seen == {"size": 4096}
-        snapshot.endpoint.estimate_transfer_size.assert_called_once_with(snapshot, None)
+        assert seen == {"size": 4096, "bound": "measurement"}
+        snapshot.endpoint.measure_transfer_size.assert_called_once_with(snapshot, None)
         assert not any("Could not estimate" in r.getMessage() for r in caplog.records)
 
     def test_an_incremental_transfer_is_not_a_failed_estimate(
@@ -478,7 +483,7 @@ class TestTheEstimateIsAskedOfTheSource:
         used to be reported as "Could not estimate", a warning, on every
         incremental transfer."""
         snapshot, parent = MagicMock(), MagicMock()
-        snapshot.endpoint.estimate_transfer_size.return_value = None
+        snapshot.endpoint.measure_transfer_size.return_value = None
         dest = MagicMock()
         with caplog.at_level(logging.INFO, logger=ops.logger.name):
             ops._verify_destination_space(snapshot, dest, parent, {})
@@ -488,9 +493,9 @@ class TestTheEstimateIsAskedOfTheSource:
 
     def test_the_parent_is_handed_to_the_source_endpoint(self):
         snapshot, parent = MagicMock(), MagicMock()
-        snapshot.endpoint.estimate_transfer_size.return_value = None
+        snapshot.endpoint.measure_transfer_size.return_value = None
         assert ops._estimate_transfer_size(snapshot, parent) is None
-        snapshot.endpoint.estimate_transfer_size.assert_called_once_with(
+        snapshot.endpoint.measure_transfer_size.assert_called_once_with(
             snapshot, parent
         )
 
@@ -502,9 +507,11 @@ class TestTheEstimateIsAskedOfTheSource:
         snapshot = MagicMock(spec=["get_path"])
         snapshot.get_path.return_value = "/local/p-1"
         monkeypatch.setattr(
-            progress_utils, "estimate_snapshot_size", lambda p, pp=None: 77
+            progress_utils,
+            "measure_snapshot",
+            lambda p, pp=None: SizeEstimate(77, "du"),
         )
-        assert ops._estimate_transfer_size(snapshot, None) == 77
+        assert ops._estimate_transfer_size(snapshot, None) == SizeEstimate(77, "du")
 
     def test_a_local_endpoint_measures_locally(self, monkeypatch, tmp_path):
         ep = LocalEndpoint(
@@ -513,8 +520,10 @@ class TestTheEstimateIsAskedOfTheSource:
         seen = {}
         monkeypatch.setattr(
             progress_utils,
-            "estimate_snapshot_size",
-            lambda p, pp=None: seen.update(path=p, parent=pp) or 5,
+            "measure_snapshot",
+            lambda p, pp=None: (
+                seen.update(path=p, parent=pp) or SizeEstimate(5, "filesystem_du")
+            ),
         )
         snapshot = __util__.Snapshot(tmp_path, PREFIX, ep, name=NAME)
         assert ep.estimate_transfer_size(snapshot) == 5

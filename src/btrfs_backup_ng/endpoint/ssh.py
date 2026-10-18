@@ -44,7 +44,7 @@ from typing import (
 )
 
 if TYPE_CHECKING:
-    pass
+    from btrfs_backup_ng.core.estimate import SizeEstimate
 
 # Handle pwd import with proper typing
 _pwd: Optional[types.ModuleType]
@@ -3120,6 +3120,16 @@ print(json.dumps(result))
             out = out.decode("utf-8", errors="replace")
         return __util__.parse_subvolume_show(out)
 
+    def measure_transfer_size(
+        self, snapshot: Any, parent: Any = None
+    ) -> Optional["SizeEstimate"]:
+        """``estimate_transfer_size`` with its method: the remote measurement
+        is ``btrfs filesystem du`` alone, what a full stream carries."""
+        from btrfs_backup_ng.core.estimate import SizeEstimate
+
+        size = self.estimate_transfer_size(snapshot, parent)
+        return None if size is None else SizeEstimate(size, "filesystem_du")
+
     def estimate_transfer_size(
         self, snapshot: Any, parent: Any = None
     ) -> Optional[int]:
@@ -3612,104 +3622,25 @@ print(json.dumps(result))
     def _estimate_snapshot_size(
         self, snapshot_path: str, parent_path: Optional[str] = None
     ) -> Optional[int]:
-        """Estimate the size of a snapshot transfer for progress display.
+        """The local snapshot's size, for the ``pv`` total and the log; None for
+        an incremental transfer or when it cannot be measured.
 
-        For full transfers: Uses btrfs subvolume show to get exclusive data size.
-        For incremental transfers: Returns None (indeterminate) since estimating
-        the delta accurately is expensive and the actual transfer is usually fast.
-
-        Args:
-            snapshot_path: Path to the snapshot
-            parent_path: Optional parent snapshot path for incremental transfers
-
-        Returns:
-            Estimated size in bytes, or None if unable to determine or incremental
+        The one local measurement (``core.progress``): ``sudo -n`` and then
+        this user, never a prompting ``sudo``. This ran plain ``sudo`` for
+        every method, as root too, and on the password-sudo route the local
+        ticket is not primed under a btrfs-only rule, so the measurement
+        itself could prompt or fail.
         """
-        # For incremental transfers, return None (indeterminate progress)
-        # The delta size is hard to estimate accurately without doing the actual send
-        if parent_path and os.path.exists(parent_path):
-            logger.debug(
-                "Incremental transfer detected - using indeterminate progress bar"
-            )
-            return None
+        from btrfs_backup_ng.core import progress as progress_utils
 
-        # Try btrfs subvolume show first for full transfers
-        try:
-            result = subprocess.run(
-                ["sudo", "btrfs", "subvolume", "show", snapshot_path],
-                capture_output=True,
-                text=True,
-                timeout=30,
-            )
-            if result.returncode == 0:
-                # Parse "Exclusive" line for data size
-                for line in result.stdout.splitlines():
-                    if "Exclusive" in line and "Exclusive" not in line.split(":")[
-                        0
-                    ].strip().replace(" ", ""):
-                        continue
-                    if line.strip().startswith("Exclusive"):
-                        # Format: "Exclusive: 1.23GiB" or similar
-                        size_str = line.split(":")[-1].strip()
-                        return self._parse_size_string(size_str)
-        except Exception as e:
-            logger.debug(f"btrfs subvolume show failed: {e}")
-
-        # Fallback to du
-        try:
-            result = subprocess.run(
-                ["sudo", "du", "-sb", snapshot_path],
-                capture_output=True,
-                text=True,
-                timeout=60,
-            )
-            if result.returncode == 0:
-                size_str = result.stdout.split()[0]
-                return int(size_str)
-        except Exception as e:
-            logger.debug(f"du failed: {e}")
-
-        return None
+        return progress_utils.estimate_snapshot_size(snapshot_path, parent_path)
 
     def _parse_size_string(self, size_str: str) -> Optional[int]:
-        """Parse a human-readable size string to bytes.
+        """Parse a human-readable size string like "1.23GiB" or "512M" to bytes,
+        or None: ``core.estimate``'s one table."""
+        from btrfs_backup_ng.core.estimate import _parse_size
 
-        Args:
-            size_str: Size string like "1.23GiB", "500MiB", "1024KiB"
-
-        Returns:
-            Size in bytes, or None if parsing fails
-        """
-        size_str = size_str.strip()
-        multipliers = {
-            "B": 1,
-            "KiB": 1024,
-            "MiB": 1024**2,
-            "GiB": 1024**3,
-            "TiB": 1024**4,
-            "KB": 1000,
-            "MB": 1000**2,
-            "GB": 1000**3,
-            "TB": 1000**4,
-            "K": 1024,
-            "M": 1024**2,
-            "G": 1024**3,
-            "T": 1024**4,
-        }
-
-        for suffix, multiplier in sorted(multipliers.items(), key=lambda x: -len(x[0])):
-            if size_str.endswith(suffix):
-                try:
-                    num = float(size_str[: -len(suffix)].strip())
-                    return int(num * multiplier)
-                except ValueError:
-                    continue
-
-        # Try parsing as plain number
-        try:
-            return int(float(size_str))
-        except ValueError:
-            return None
+        return _parse_size(size_str)
 
     def _do_piped_transfer(
         self,
