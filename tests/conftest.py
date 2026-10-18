@@ -113,6 +113,13 @@ case "$1" in
         exit 1
         ;;
 esac
+# Under the sudo_refuses fixture: what sudo -n says and returns to a user it
+# has no rule for, with the command recorded so the test can see it was asked.
+if [ -n "$BBNG_SUDO_STAND_IN_REFUSES" ]; then
+    printf '%s\\n' "$*" >> "$BBNG_SUDO_STAND_IN_REFUSES"
+    echo "sudo: a password is required" >&2
+    exit 1
+fi
 # What sudo itself says and returns for a command it cannot find.
 if ! command -v "$1" >/dev/null 2>&1; then
     echo "sudo: $1: command not found" >&2
@@ -198,6 +205,24 @@ def unit_tests_use_the_stand_ins(
             f"the option in tests/conftest.py or avoid it:\n{calls}",
             pytrace=False,
         )
+
+
+@pytest.fixture
+def sudo_refuses(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> Callable[[], list[str]]:
+    """Run the test as a user whose sudo refuses, as ``sudo -n`` does without a rule.
+
+    The stand-in otherwise always agrees, so the product's refused-sudo paths
+    run only where a test asks for them, here. The process is also presented as
+    non-root, because root never asks sudo. Returns a function listing the
+    commands the stand-in refused, so a test can show the refusal was reached.
+    """
+    record = tmp_path / "sudo-refused"
+    record.write_text("")
+    monkeypatch.setenv("BBNG_SUDO_STAND_IN_REFUSES", str(record))
+    monkeypatch.setattr(os, "geteuid", lambda: 1000)
+    return lambda: record.read_text().splitlines()
 
 
 @functools.cache

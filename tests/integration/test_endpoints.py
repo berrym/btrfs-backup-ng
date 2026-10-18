@@ -590,6 +590,41 @@ class TestEndpointCommandExecution:
         called_cmd = mock_exec.call_args[0][0]
         assert called_cmd[0] == "btrfs"
 
+    def test_a_refused_sudo_fails_the_command(self, tmp_path, sudo_refuses):
+        """A non-root btrfs command is elevated; refused, it raises rather than
+        returning as though it had run."""
+        endpoint = LocalEndpoint(config={"path": str(tmp_path)})
+        with patch(
+            "btrfs_backup_ng.endpoint.common._command_lock_path",
+            return_value=tmp_path / "cmd.lock",
+        ):
+            with pytest.raises(AbortError):
+                endpoint._exec_command(
+                    {
+                        "command": [
+                            ("btrfs", False),
+                            ("subvolume", False),
+                            ("list", False),
+                            (str(tmp_path), True),
+                        ],
+                        "no_password_sudo": True,
+                    }
+                )
+        assert sudo_refuses() == [f"btrfs subvolume list {tmp_path}"]
+
+    def test_a_refused_sudo_fails_the_remount(self, tmp_path, sudo_refuses):
+        """Remounting a read-only mount point is elevated when not root;
+        refused, it raises instead of carrying on read-only."""
+        endpoint = LocalEndpoint(config={"path": str(tmp_path)})
+        listing = f"/dev/sdz1 on {tmp_path} type btrfs (ro,relatime)\n"
+        with patch(
+            "btrfs_backup_ng.endpoint.common.subprocess.check_output",
+            return_value=listing,
+        ):
+            with pytest.raises(AbortError):
+                endpoint._remount(tmp_path, read_write=True)
+        assert sudo_refuses() == [f"mount -o remount,rw {tmp_path}"]
+
 
 class TestEndpointErrorHandling:
     """Test endpoint error handling scenarios."""
