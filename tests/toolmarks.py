@@ -36,6 +36,7 @@ KNOWN_TOOLS = frozenset(
         "pigz",
         "ps",
         "sh",
+        "snapper",
         "tcsh",
         "xz",
         "zsh",

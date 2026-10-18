@@ -15,7 +15,8 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from btrfs_backup_ng.__util__ import backup_source_problems
+import btrfs_backup_ng.snapper.scanner as scanner_mod
+from btrfs_backup_ng.__util__ import backup_source_problems, snapshot_dir_problems
 from btrfs_backup_ng.cli.config_cmd import _validate_config
 from btrfs_backup_ng.core.doctor import DiagnosticSeverity, Doctor
 
@@ -30,10 +31,16 @@ def _subvolume(path: Path) -> Path:
 
 
 def _validate(
-    tmp_path: Path, source: Path, capsys, snapper: bool = False
+    tmp_path: Path,
+    source: Path,
+    capsys,
+    snapper: bool = False,
+    snapshot_dir: Path | None = None,
 ) -> tuple[int, str]:
     config = tmp_path / "config.toml"
     body = f'[[volumes]]\npath = "{source}"\n'
+    if snapshot_dir is not None:
+        body += f'snapshot_dir = "{snapshot_dir}"\n'
     if snapper:
         body += 'source = "snapper"\n\n[volumes.snapper]\nconfig_name = "home"\n'
     body += f'\n[[volumes.targets]]\npath = "{tmp_path / "dest"}"\n'
@@ -42,10 +49,12 @@ def _validate(
     return rc, capsys.readouterr().out
 
 
-def _doctor(source: Path, snapper: bool = False):
+def _doctor(source: Path, snapper: bool = False, snapshot_dir: Path | None = None):
     volume = MagicMock()
     volume.path = str(source)
     volume.is_snapper_source.return_value = snapper
+    volume.snapper = MagicMock(config_name="home") if snapper else None
+    volume.snapshot_dir = str(snapshot_dir) if snapshot_dir else ".snapshots"
     config = MagicMock()
     config.get_enabled_volumes.return_value = [volume]
     return Doctor(config=config)._check_volume_paths()
@@ -155,8 +164,11 @@ class TestASnapperSourceNeedNotBeASubvolumeRoot:
         assert backup_source_problems(source)  # native: refused
 
     def test_validate_and_doctor_accept_it(
-        self, btrfs_volume: Path, tmp_path: Path, capsys
+        self, btrfs_volume: Path, tmp_path: Path, capsys, monkeypatch
     ):
+        # The snapper config named here is this host's business; the check of
+        # it has its own tests. This one is about the source alone.
+        monkeypatch.setattr(scanner_mod, "snapper_config_problems", lambda *a, **k: [])
         holder = _subvolume(btrfs_volume / "home")
         source = holder / "user"
         source.mkdir()
@@ -165,3 +177,52 @@ class TestASnapperSourceNeedNotBeASubvolumeRoot:
         assert "All enabled volumes look usable from this machine." in out
         findings = _doctor(source, snapper=True)
         assert [f.severity for f in findings] == [DiagnosticSeverity.OK]
+
+
+@pytest.mark.tier2
+@requires_btrfs
+class TestSnapshotDirOnRealBtrfs:
+    """`btrfs subvolume snapshot` cannot cross filesystems, so an absolute
+    snapshot_dir must be on the source's filesystem. Two loop filesystems:
+    a snapshot_dir on the source's passes, one on the other is refused and
+    names both devices, and validate and doctor say the same."""
+
+    def test_on_the_sources_filesystem(
+        self, btrfs_volume: Path, tmp_path: Path, capsys
+    ):
+        source = _subvolume(btrfs_volume / "home")
+        snaps = btrfs_volume / "snaps"
+        snaps.mkdir()
+        assert snapshot_dir_problems(str(snaps), source) == []
+        rc, out = _validate(tmp_path, source, capsys, snapshot_dir=snaps)
+        assert rc == 0, out
+        assert [f.severity for f in _doctor(source, snapshot_dir=snaps)] == [
+            DiagnosticSeverity.OK
+        ]
+
+    def test_on_another_btrfs_filesystem(
+        self, btrfs_source_and_dest: tuple[Path, Path], tmp_path: Path, capsys
+    ):
+        src_fs, other_fs = btrfs_source_and_dest
+        source = _subvolume(src_fs / "home")
+        snaps = other_fs / "snaps"
+        snaps.mkdir()
+
+        (problem,) = snapshot_dir_problems(str(snaps), source)
+
+        assert f"snapshot_dir {snaps.resolve()} is on a different filesystem (" in (
+            problem
+        )
+        assert "/dev/loop" in problem and "cannot cross filesystems" in problem
+        rc, out = _validate(tmp_path, source, capsys, snapshot_dir=snaps)
+        assert rc == 2, out
+        findings = _doctor(source, snapshot_dir=snaps)
+        assert [f.severity for f in findings] == [DiagnosticSeverity.ERROR]
+        assert f"  - {findings[0].message}" in out.splitlines()
+
+    def test_not_on_btrfs_at_all(self, btrfs_volume: Path, tmp_path: Path):
+        source = _subvolume(btrfs_volume / "home")
+        (problem,) = snapshot_dir_problems(str(tmp_path), source)
+        assert "is not on a btrfs filesystem" in problem or (
+            "is on a different filesystem" in problem
+        )

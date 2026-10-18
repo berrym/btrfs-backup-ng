@@ -795,6 +795,8 @@ class TestDoctorVolumePaths:
         mock_volume = MagicMock()
         mock_volume.is_snapper_source.return_value = False
         mock_volume.path = "/home"
+        mock_volume.snapper = None
+        mock_volume.snapshot_dir = ".snapshots"
 
         mock_config = MagicMock()
         mock_config.get_enabled_volumes.return_value = [mock_volume]
@@ -809,6 +811,8 @@ class TestDoctorVolumePaths:
         mock_volume = MagicMock()
         mock_volume.is_snapper_source.return_value = False
         mock_volume.path = "/nonexistent/path"
+        mock_volume.snapper = None
+        mock_volume.snapshot_dir = ".snapshots"
 
         mock_config = MagicMock()
         mock_config.get_enabled_volumes.return_value = [mock_volume]
@@ -823,6 +827,8 @@ class TestDoctorVolumePaths:
         mock_volume = MagicMock()
         mock_volume.is_snapper_source.return_value = False
         mock_volume.path = "/proc"
+        mock_volume.snapper = None
+        mock_volume.snapshot_dir = ".snapshots"
 
         mock_config = MagicMock()
         mock_config.get_enabled_volumes.return_value = [mock_volume]

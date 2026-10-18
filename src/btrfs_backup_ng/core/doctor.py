@@ -632,13 +632,14 @@ class Doctor:
         return findings
 
     def _check_volume_paths(self) -> list[DiagnosticFinding]:
-        """Check that volume paths exist and are btrfs subvolumes."""
+        """Check that each volume could be backed up from here: its source,
+        and the snapper config or snapshot_dir ``run`` would use."""
         findings: list[DiagnosticFinding] = []
 
         if not self.config:
             return findings
 
-        from ..__util__ import backup_source_problems
+        from ..__util__ import backup_volume_problems
 
         volumes = self.config.get_enabled_volumes()
         volume_filter = getattr(self, "_volume_filter", None)
@@ -649,9 +650,16 @@ class Doctor:
 
             # The same question `config validate` asks, so the two can never
             # disagree. Exists-and-on-btrfs used to be reported "valid" here,
-            # for a plain directory btrfs refuses to snapshot.
-            problems = backup_source_problems(
-                volume.path, snapper=volume.is_snapper_source()
+            # for a plain directory btrfs refuses to snapshot, and the snapper
+            # config and snapshot_dir were not asked about at all.
+            snapper_source = volume.snapper
+            problems = backup_volume_problems(
+                volume.path,
+                snapper=volume.is_snapper_source(),
+                snapper_config_name=(
+                    snapper_source.config_name if snapper_source else None
+                ),
+                snapshot_dir=volume.snapshot_dir,
             )
             for problem in problems:
                 findings.append(
