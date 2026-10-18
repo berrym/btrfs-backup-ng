@@ -264,6 +264,19 @@ def test_enrichment_graceful_when_subprocess_raises(tmp_path, monkeypatch):
     assert all(s.uuid == "" for s in snaps)
 
 
+def test_a_refused_sudo_leaves_the_identities_unread(tmp_path, sudo_refuses):
+    """A non-root run whose sudo has no rule for btrfs: each ``subvolume show``
+    is refused, and the identities stay empty, for the verdict to call
+    unverifiable, rather than the listing failing."""
+    ep = _local(tmp_path)
+    snaps = _named_snaps(ep, tmp_path)
+    ep._load_subvolume_ids_into(snaps)  # must not raise
+    assert all(s.uuid == "" and s.received_uuid == "" for s in snaps)
+    assert [cmd.split()[:3] for cmd in sudo_refuses()] == [
+        ["btrfs", "subvolume", "show"]
+    ] * len(snaps)
+
+
 # --------------------------------------------------------------------------- #
 # Non-behavioral guard: snapshot identity is STILL name/time
 # --------------------------------------------------------------------------- #

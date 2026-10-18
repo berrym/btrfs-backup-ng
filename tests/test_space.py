@@ -321,6 +321,12 @@ class TestGetBtrfsQuotaInfo:
         assert cmd[0] == "sudo"
         assert cmd[1] == "-n"
 
+    def test_a_refused_sudo_reads_as_no_quota_information(self, sudo_refuses):
+        """A non-root run whose sudo refuses: the query cannot be made, and the
+        answer is None, as for any failed query, not an error."""
+        assert get_btrfs_quota_info("/mnt/btrfs") is None
+        assert sudo_refuses() == ["btrfs qgroup show -re --raw /mnt/btrfs"]
+
     @patch("subprocess.run")
     @patch("os.geteuid", return_value=0)
     def test_no_sudo_when_root(self, mock_euid, mock_run):

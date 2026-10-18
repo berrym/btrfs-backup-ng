@@ -40,6 +40,8 @@ from btrfs_backup_ng.sshutil.lock import (
     write_persisted_locks,
 )
 
+from .lockshell import shell_params
+
 _real_run = subprocess.run
 
 
@@ -164,51 +166,44 @@ class TestTheScriptsAreNotBashOnly:
     that, so a bashism cannot pass review unnoticed.
     """
 
-    def test_the_protocol_behaves_identically_under_every_posix_shell(self, tmp_path):
-        from .lockshell import available_shells
+    @staticmethod
+    def _protocol_outcome(shell, sandbox):
+        sandbox.mkdir()
 
-        shells = available_shells()
-        assert "dash" in shells, (
-            "dash is not installed, so this test would silently prove nothing"
+        def run(script):
+            proc = subprocess.run([shell, "-c", script], capture_output=True, text=True)
+            return proc.returncode, proc.stdout, proc.stderr
+
+        manager = RemoteLockManager(run, str(sandbox), hostname="h")
+        outcome = {}
+        outcome["exclusive"] = manager.acquire_once("target", "prune")
+        try:
+            RemoteLockManager(run, str(sandbox), hostname="h2").acquire_once(
+                "target", "other"
+            )
+            outcome["second_exclusive"] = "ACQUIRED (exclusion broken)"
+        except RemoteLockBusy:
+            outcome["second_exclusive"] = "refused"
+        manager.acquire_shared("snap-a", "restore:1")
+        RemoteLockManager(run, str(sandbox), hostname="h2").acquire_shared(
+            "snap-a", "restore:2"
         )
+        outcome["shared_holders"] = len(manager.live_locks()["snap-a"])
+        outcome["names"] = sorted(manager.live_lock_names())
+        outcome["status"] = read_persisted_locks(manager)
+        manager.release_shared("snap-a", "restore:1")
+        outcome["after_one_release"] = len(manager.live_locks()["snap-a"])
+        return outcome
 
-        results = {}
-        for shell in shells:
-            sandbox = tmp_path / shell
-            sandbox.mkdir()
-
-            def run(script, _sh=shell):
-                proc = subprocess.run(
-                    [_sh, "-c", script], capture_output=True, text=True
-                )
-                return proc.returncode, proc.stdout, proc.stderr
-
-            manager = RemoteLockManager(run, str(sandbox), hostname="h")
-            outcome = {}
-            outcome["exclusive"] = manager.acquire_once("target", "prune")
-            try:
-                RemoteLockManager(run, str(sandbox), hostname="h2").acquire_once(
-                    "target", "other"
-                )
-                outcome["second_exclusive"] = "ACQUIRED (exclusion broken)"
-            except RemoteLockBusy:
-                outcome["second_exclusive"] = "refused"
-            manager.acquire_shared("snap-a", "restore:1")
-            RemoteLockManager(run, str(sandbox), hostname="h2").acquire_shared(
-                "snap-a", "restore:2"
-            )
-            outcome["shared_holders"] = len(manager.live_locks()["snap-a"])
-            outcome["names"] = sorted(manager.live_lock_names())
-            outcome["status"] = read_persisted_locks(manager)
-            manager.release_shared("snap-a", "restore:1")
-            outcome["after_one_release"] = len(manager.live_locks()["snap-a"])
-            results[shell] = outcome
-
-        reference = results[shells[0]]
-        for shell, outcome in results.items():
-            assert outcome == reference, (
-                f"{shell} disagrees with {shells[0]}: {outcome} != {reference}"
-            )
+    @pytest.mark.parametrize("shell", shell_params("dash", "bash"))
+    def test_the_protocol_behaves_identically_under_every_posix_shell(
+        self, tmp_path, shell
+    ):
+        reference = self._protocol_outcome("sh", tmp_path / "sh")
+        outcome = self._protocol_outcome(shell, tmp_path / shell)
+        assert outcome == reference, (
+            f"{shell} disagrees with sh: {outcome} != {reference}"
+        )
 
 
 class TestSharedPinsDoNotBlockEachOther:
@@ -1340,43 +1335,39 @@ class TestTheAgeIsAlwaysAnInteger:
         os.utime(lock_dir, (old, old))
         assert "target" not in manager.live_locks()
 
+    @pytest.mark.parametrize("shell", shell_params())
     def test_is_locked_answers_live_stale_and_unreadable_correctly(
-        self, tmp_path, monkeypatch
+        self, tmp_path, monkeypatch, shell
     ):
         """A live lock is reported with its holder, a stale one is not, and one
         whose age cannot be read is reported HELD -- without a script error,
-        under every shell present."""
-        from .lockshell import available_shells
-
+        under each shell."""
         self._shim(
             tmp_path,
             monkeypatch,
             'case "$*" in *unreadable*) exit 1;; esac',
         )
-        for shell in available_shells():
-            errors: list[str] = []
+        errors: list[str] = []
 
-            def run(script, _sh=shell, _errors=errors):
-                proc = subprocess.run(
-                    [_sh, "-c", script], capture_output=True, text=True
-                )
-                _errors.append(proc.stderr)
-                return proc.returncode, proc.stdout, proc.stderr
+        def run(script):
+            proc = subprocess.run([shell, "-c", script], capture_output=True, text=True)
+            errors.append(proc.stderr)
+            return proc.returncode, proc.stdout, proc.stderr
 
-            sandbox = tmp_path / shell
-            sandbox.mkdir()
-            manager = RemoteLockManager(run, str(sandbox), hostname="testhost")
-            _manager(sandbox).acquire_once("live", "prune")
-            stale = self._held_lock(manager, "stale")
-            old = time.time() - 10_000
-            os.utime(stale / "heartbeat", (old, old))
-            self._held_lock(manager, "unreadable")
+        sandbox = tmp_path / shell
+        sandbox.mkdir()
+        manager = RemoteLockManager(run, str(sandbox), hostname="testhost")
+        _manager(sandbox).acquire_once("live", "prune")
+        stale = self._held_lock(manager, "stale")
+        old = time.time() - 10_000
+        os.utime(stale / "heartbeat", (old, old))
+        self._held_lock(manager, "unreadable")
 
-            assert (manager.is_locked("live") or {}).get("operation") == "prune", shell
-            assert manager.is_locked("stale") is None, shell
-            assert manager.is_locked("unreadable") is not None, shell
-            assert manager.is_locked("absent") is None, shell
-            assert errors == ["", "", "", ""], (shell, errors)
+        assert (manager.is_locked("live") or {}).get("operation") == "prune"
+        assert manager.is_locked("stale") is None
+        assert manager.is_locked("unreadable") is not None
+        assert manager.is_locked("absent") is None
+        assert errors == ["", "", "", ""], errors
 
     def test_is_locked_never_answers_not_locked_when_it_could_not_ask(self, tmp_path):
         """It returned None -- "not locked" -- whenever its script failed."""

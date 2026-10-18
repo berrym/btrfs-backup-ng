@@ -25,6 +25,8 @@ from btrfs_backup_ng.cli import restore as restore_cli
 from btrfs_backup_ng.core.layout import marker_dir
 from btrfs_backup_ng.endpoint.local import LocalEndpoint
 
+_REAL_RUN = subprocess.run
+
 
 def _dead_pid() -> int:
     proc = subprocess.Popen(["true"])
@@ -269,6 +271,25 @@ def test_a_deletion_that_fails_is_counted_and_keeps_the_marker(
     assert rc == 1
     assert marker.exists()
     assert "0 deleted, 1 failed" in capsys.readouterr().out
+
+
+def test_a_refused_sudo_deletes_nothing_and_keeps_the_marker(
+    rig, capsys, monkeypatch, sudo_refuses
+):
+    """A non-root cleanup whose sudo refuses: the delete is counted as failed,
+    the marker stays for the next attempt, and the exit status says so."""
+    partial = rig.dest / "home.20260101"
+    partial.mkdir()
+    marker = _mark(rig.dest, "home.20260101", _dead_pid())
+    rig.identities[str(partial)] = {"uuid": "x", "received_uuid": ""}
+    monkeypatch.setattr(subprocess, "run", _REAL_RUN)
+
+    rc = _cleanup(rig.dest)
+
+    assert rc == 1
+    assert marker.exists() and partial.is_dir()
+    assert "0 deleted, 1 failed" in capsys.readouterr().out
+    assert sudo_refuses() == [f"btrfs subvolume delete {partial}"]
 
 
 def test_the_delete_is_btrfs_subvolume_delete_of_the_marked_path(rig, monkeypatch):

@@ -25,6 +25,8 @@ import time
 from pathlib import Path
 from unittest.mock import MagicMock
 
+import pytest
+
 from btrfs_backup_ng import __util__
 from btrfs_backup_ng.core import operations as ops
 from btrfs_backup_ng.core.chunked_transfer import TransferManifest
@@ -244,6 +246,7 @@ def test_raw_destination_correspondence_stays_by_name(tmp_path):
     assert ep.correspondent_of(other) is None
 
 
+@pytest.mark.requires_tool("openssl")
 def test_remediation_carries_source_uuid_into_the_encrypted_sidecar(
     tmp_path, monkeypatch
 ):

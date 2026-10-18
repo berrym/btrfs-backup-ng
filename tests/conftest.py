@@ -2,10 +2,227 @@
 
 import functools
 import logging
+import os
+import shutil
 import subprocess
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
+from pathlib import Path
 
 import pytest
+
+# Which missing tools fail the tests that need them instead of skipping them:
+# "1" for every tool, or a comma-separated list of names, as a package build
+# lists what it installed. Unset, empty or "0", every missing tool skips.
+REQUIRE_TOOLS_ENV = "BBNG_TEST_REQUIRE_TOOLS"
+
+
+def _required_tools() -> tuple[bool, frozenset[str]]:
+    """``(every tool, the named tools)`` that ``BBNG_TEST_REQUIRE_TOOLS`` asks for."""
+    value = os.environ.get(REQUIRE_TOOLS_ENV, "").strip()
+    if value in ("", "0"):
+        return False, frozenset()
+    if value == "1":
+        return True, frozenset()
+    return False, frozenset(name.strip() for name in value.split(",") if name.strip())
+
+
+def _is_required(tool: str) -> bool:
+    every, named = _required_tools()
+    return every or tool in named
+
+
+def _tools_of(item: pytest.Item) -> Iterator[tuple[str, str]]:
+    """``(tool, reason)`` for each ``requires_tool`` mark on ``item``."""
+    for marker in item.iter_markers("requires_tool"):
+        (tool,) = marker.args
+        yield tool, marker.kwargs.get("reason", f"{tool} is not installed")
+
+
+@pytest.hookimpl(tryfirst=True)
+def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
+    """Skip a test whose ``@pytest.mark.requires_tool(name)`` is missing.
+
+    A test that runs an external program for real proves nothing where the
+    program is missing. Skipping through a mark reports the reason at the test
+    itself in the ``-rs`` summary. A tool ``BBNG_TEST_REQUIRE_TOOLS`` names is
+    not skipped; ``pytest_runtest_setup`` fails the test instead.
+
+    Runs before deselection, so a name in the list is checked against every
+    test collected: one no test uses is a misspelling that would otherwise
+    enforce nothing.
+    """
+    used = {tool for item in items for tool, _ in _tools_of(item)}
+    unknown = _required_tools()[1] - used
+    if unknown:
+        raise pytest.UsageError(
+            f"{REQUIRE_TOOLS_ENV} names {', '.join(sorted(unknown))}, which no "
+            f"collected test requires; tools the tests require: "
+            f"{', '.join(sorted(used))}"
+        )
+    for item in items:
+        for tool, reason in _tools_of(item):
+            if shutil.which(tool) is None and not _is_required(tool):
+                item.add_marker(pytest.mark.skip(reason=reason))
+                break
+
+
+def pytest_runtest_setup(item: pytest.Item) -> None:
+    """Fail a test whose tool is missing when ``BBNG_TEST_REQUIRE_TOOLS`` requires it."""
+    for tool, reason in _tools_of(item):
+        if shutil.which(tool) is None and _is_required(tool):
+            pytest.fail(f"{reason}, and {REQUIRE_TOOLS_ENV} requires it", pytrace=False)
+
+
+@pytest.fixture
+def tool_unusable() -> Callable[[str, str], None]:
+    """Skip a test whose tool is installed but cannot be used here, or fail it
+    when ``BBNG_TEST_REQUIRE_TOOLS`` requires that tool."""
+
+    def unusable(tool: str, reason: str) -> None:
+        if _is_required(tool):
+            pytest.fail(
+                f"{reason}, and {REQUIRE_TOOLS_ENV} requires {tool}", pytrace=False
+            )
+        pytest.skip(reason)
+
+    return unusable
+
+
+def _in_a_real_tier(node: pytest.Item) -> bool:
+    """Whether this test runs against real btrfs and real privilege."""
+    return any(node.get_closest_marker(tier) for tier in ("tier2", "tier3"))
+
+
+# Takes only what the product passes to a local sudo. An option it does not
+# know is written down and makes the test fail, so a new one is decided on
+# rather than guessed at, and a refusal can never pass for an answer.
+_SUDO_STAND_IN = """\
+#!/bin/sh
+# Test stand-in for sudo: runs the command as the calling user, never as root.
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -n) shift ;;
+        --) shift; break ;;
+        *) break ;;
+    esac
+done
+case "$1" in
+    ''|-*)
+        printf '%s\\n' "sudo $*" >> "$BBNG_SUDO_STAND_IN_UNSUPPORTED"
+        echo "sudo stand-in: cannot run 'sudo $*'" >&2
+        exit 1
+        ;;
+esac
+# Under the sudo_refuses fixture: what sudo -n says and returns to a user it
+# has no rule for, with the command recorded so the test can see it was asked.
+if [ -n "$BBNG_SUDO_STAND_IN_REFUSES" ]; then
+    printf '%s\\n' "$*" >> "$BBNG_SUDO_STAND_IN_REFUSES"
+    echo "sudo: a password is required" >&2
+    exit 1
+fi
+# What sudo itself says and returns for a command it cannot find.
+if ! command -v "$1" >/dev/null 2>&1; then
+    echo "sudo: $1: command not found" >&2
+    exit 1
+fi
+exec "$@"
+"""
+
+_BTRFS_PLACEHOLDER = """\
+#!/bin/sh
+# Test placeholder for a btrfs this machine does not have: a lookup finds it,
+# and running it fails as a missing command does.
+echo "btrfs: not installed (placeholder from tests/conftest.py)" >&2
+exit 127
+"""
+
+
+@pytest.fixture(scope="session")
+def stand_in_bin(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """The directory unit tests put first on PATH, checked to actually run."""
+    bin_dir = tmp_path_factory.mktemp("stand-in-bin")
+    scripts = {"sudo": _SUDO_STAND_IN}
+    if shutil.which("btrfs") is None:
+        scripts["btrfs"] = _BTRFS_PLACEHOLDER
+    for name, text in scripts.items():
+        (bin_dir / name).write_text(text)
+        (bin_dir / name).chmod(0o755)
+    # A temporary directory mounted noexec would leave the stand-in unrunnable,
+    # and the product's fallbacks would read that as a refused sudo in every
+    # test. Find out once, here, instead.
+    sudo = bin_dir / "sudo"
+    probe = subprocess.run(
+        [str(sudo), "-n", "id", "-u"], capture_output=True, text=True
+    )
+    if probe.returncode != 0 or probe.stdout.strip() != str(os.getuid()):
+        pytest.fail(
+            f"the sudo stand-in at {sudo} does not run: {probe.stderr.strip()}",
+            pytrace=False,
+        )
+    return bin_dir
+
+
+@pytest.fixture(autouse=True)
+def unit_tests_use_the_stand_ins(
+    request: pytest.FixtureRequest,
+    monkeypatch: pytest.MonkeyPatch,
+    stand_in_bin: Path,
+) -> Iterator[None]:
+    """Put the stand-in directory first on PATH for every unit test.
+
+    sudo: the product retries a privileged call through ``sudo -n`` when the
+    direct one fails, and in a unit test the direct one usually fails, because
+    the temporary directory is not btrfs. Those retries reached the real sudo
+    about 250 times a run: as root wherever sudo needs no password, as a
+    refusal wherever it does, and as "command not found" in a build root
+    without it. The stand-in gives every machine the same answer, and none of
+    it as root.
+
+    btrfs, only on a machine without it: ``LocalEndpoint`` refuses to start
+    when ``shutil.which("btrfs")`` finds nothing, so every unit test that
+    builds one failed there, although none of them runs btrfs. The placeholder
+    satisfies the lookup, in the test and in any CLI it starts, and fails like
+    a missing command if run. Where btrfs is installed it is used as before. A
+    test about the missing-btrfs path patches ``shutil.which`` itself.
+
+    Tier 2 and tier 3 use real btrfs and real privilege on purpose and keep
+    the real tools.
+    """
+    if _in_a_real_tier(request.node):
+        yield
+        return
+    unsupported = stand_in_bin / "unsupported"
+    unsupported.write_text("")
+    monkeypatch.setenv("BBNG_SUDO_STAND_IN_UNSUPPORTED", str(unsupported))
+    monkeypatch.setenv(
+        "PATH", f"{stand_in_bin}{os.pathsep}{os.environ.get('PATH', '')}"
+    )
+    yield
+    calls = unsupported.read_text()
+    if calls:
+        pytest.fail(
+            "the sudo stand-in was asked for something it does not take; teach it "
+            f"the option in tests/conftest.py or avoid it:\n{calls}",
+            pytrace=False,
+        )
+
+
+@pytest.fixture
+def sudo_refuses(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> Callable[[], list[str]]:
+    """Run the test as a user whose sudo refuses, as ``sudo -n`` does without a rule.
+
+    The stand-in otherwise always agrees, so the product's refused-sudo paths
+    run only where a test asks for them, here. The process is also presented as
+    non-root, because root never asks sudo. Returns a function listing the
+    commands the stand-in refused, so a test can show the refusal was reached.
+    """
+    record = tmp_path / "sudo-refused"
+    record.write_text("")
+    monkeypatch.setenv("BBNG_SUDO_STAND_IN_REFUSES", str(record))
+    monkeypatch.setattr(os, "geteuid", lambda: 1000)
+    return lambda: record.read_text().splitlines()
 
 
 @functools.cache

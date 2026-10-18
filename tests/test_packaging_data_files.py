@@ -124,6 +124,21 @@ class TestLookupFindsDataUnderThePrefix:
         )
 
 
+def _imported_from_this_checkout() -> bool:
+    import btrfs_backup_ng
+
+    return (REPO_ROOT / "src").resolve() in Path(
+        btrfs_backup_ng.__file__
+    ).resolve().parents
+
+
+# A package build runs the suite against the copy it installed into its build
+# root, where neither the prefix nor the checkout holds the files, so the
+# question this asks has no answer there.
+@pytest.mark.skipif(
+    not _imported_from_this_checkout(),
+    reason="btrfs_backup_ng is imported from an installed copy, not this checkout's src/",
+)
 @pytest.mark.parametrize(
     "lookup", [get_manpages_dir, get_completions_dir], ids=["manpages", "completions"]
 )

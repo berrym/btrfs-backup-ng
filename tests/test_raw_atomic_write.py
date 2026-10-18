@@ -22,6 +22,8 @@ import pytest
 from btrfs_backup_ng.endpoint.raw import RawEndpoint, SSHRawEndpoint
 from btrfs_backup_ng.endpoint.raw_metadata import discover_raw_snapshots
 
+from .lockshell import shell_params
+
 
 @contextlib.contextmanager
 def _null_lock(self, **kwargs):
@@ -236,13 +238,14 @@ def test_ssh_commit_raises_on_remote_failure():
 
 def test_ssh_commit_wraps_in_sudo_when_configured(tmp_path):
     """With ssh_sudo, the remote commit is wrapped in sudo. Exercises the real
-    command construction (only subprocess.run is mocked) -- no live SSH -- so the
-    sudo path is proven without setting up passwordless root access.
+    command construction (only subprocess.run is mocked) -- no live SSH.
 
     The lock protocol runs for real against a sandbox directory (see
     tests/lockshell.py): answering it with a canned object would have the manager
     correctly refuse a lock it could not confirm, and the commit would never
-    reach the mv this test is about.
+    reach the mv this test is about. Those scripts carry the same ``sudo -n``
+    prefix, so they go through the sudo stand-in (tests/conftest.py) and run as
+    the calling user: the sudo-prefixed text is executed, nothing is elevated.
     """
     from .lockshell import lock_aware
 
@@ -325,15 +328,11 @@ def test_remote_part_write_refuses_to_clobber_or_follow_a_symlink():
     assert "umask 077" in remote, f"remote stream left world-readable: {remote}"
 
 
-@pytest.mark.parametrize("shell", ["sh", "dash", "bash"])
+@pytest.mark.parametrize("shell", shell_params())
 def test_the_refusal_works_in_the_shells_a_remote_may_run(tmp_path, shell):
     """The remote is not this machine. Two shipped bugs came from assuming bash;
     the script has to behave in whatever /bin/sh the target actually has."""
-    import shutil as _shutil
     import subprocess as _sp
-
-    if not _shutil.which(shell):
-        pytest.skip(f"{shell} not installed")
 
     ep = SSHRawEndpoint(config={"path": str(tmp_path), "hostname": "nas"})
     victim = tmp_path / "secret"

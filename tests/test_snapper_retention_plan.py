@@ -355,6 +355,27 @@ class TestTheDeletePrimitive:
             "info.xml removed despite live data"
         )
 
+    def test_a_refused_sudo_on_a_local_destination_leaves_the_slot_alone(
+        self, tmp_path, sudo_refuses
+    ):
+        """Locally, a non-root prune elevates the subvolume delete. Refused, it
+        fails naming the snapshot and what sudo said, and info.xml stays with
+        the data it describes."""
+        from btrfs_backup_ng.cli import prune
+        from btrfs_backup_ng.retention import RetentionError
+
+        slot = tmp_path / ".snapshots" / "9"
+        (slot / "snapshot").mkdir(parents=True)
+        (slot / "info.xml").write_text("<snapshot/>")
+
+        with pytest.raises(
+            RetentionError,
+            match=f"could not delete {slot}/snapshot: sudo: a password is required",
+        ):
+            prune._delete_snapper_slot_btrfs(None, str(slot), False)
+        assert (slot / "info.xml").exists() and (slot / "snapshot").is_dir()
+        assert sudo_refuses() == [f"btrfs subvolume delete {slot}/snapshot"]
+
     def test_a_failed_directory_removal_is_not_fatal(self):
         """The space is already reclaimed; a leftover empty directory is litter,
         and enumeration ignores a slot with no published snapshot."""

@@ -52,6 +52,7 @@ def _encrypt(tmp_path, **kw):
 # --------------------------------------------------------------------------- #
 # encrypt keeps plaintext by default; produces a verifiable encrypted stream
 # --------------------------------------------------------------------------- #
+@pytest.mark.requires_tool("openssl")
 def test_encrypt_keeps_plaintext_and_writes_remediation_sidecar(tmp_path, monkeypatch):
     monkeypatch.setenv("BTRFS_BACKUP_PASSPHRASE", "rempass")
     _plaintext_backup(tmp_path)
@@ -93,6 +94,7 @@ def test_encrypt_keeps_plaintext_and_writes_remediation_sidecar(tmp_path, monkey
 # --------------------------------------------------------------------------- #
 # THE safety guard: plaintext removed ONLY after a verified decrypt proof
 # --------------------------------------------------------------------------- #
+@pytest.mark.requires_tool("openssl")
 def test_shred_removes_plaintext_only_after_verified_proof(tmp_path, monkeypatch):
     monkeypatch.setenv("BTRFS_BACKUP_PASSPHRASE", "rempass")
     _plaintext_backup(tmp_path)
@@ -105,6 +107,7 @@ def test_shred_removes_plaintext_only_after_verified_proof(tmp_path, monkeypatch
     assert (tmp_path / "root.20240101T120000.btrfs.gz.enc").exists()
 
 
+@pytest.mark.requires_tool("openssl")
 def test_shred_keeps_plaintext_when_proof_fails(tmp_path, monkeypatch, capsys):
     """If the decrypt proof fails (e.g. gpg without the secret key on this host),
     the plaintext MUST be kept even with --shred. Removing regardless of the proof
@@ -126,6 +129,7 @@ def test_shred_keeps_plaintext_when_proof_fails(tmp_path, monkeypatch, capsys):
 # --------------------------------------------------------------------------- #
 # decrypt_matches_plaintext directly
 # --------------------------------------------------------------------------- #
+@pytest.mark.requires_tool("openssl")
 def test_decrypt_matches_plaintext_true_and_false(tmp_path, monkeypatch):
     monkeypatch.setenv("BTRFS_BACKUP_PASSPHRASE", "rempass")
     _plaintext_backup(tmp_path)
@@ -191,6 +195,7 @@ def test_encrypt_openssl_requires_passphrase(tmp_path, monkeypatch, capsys):
     assert "requires a passphrase" in capsys.readouterr().out
 
 
+@pytest.mark.requires_tool("openssl")
 def test_encrypt_no_plaintext_streams(tmp_path, monkeypatch, capsys):
     """A target whose streams are already encrypted has nothing to remediate."""
     monkeypatch.setenv("BTRFS_BACKUP_PASSPHRASE", "rempass")
@@ -229,6 +234,7 @@ def test_dispatcher_parses_raw_encrypt():
     assert args.shred is True and args.yes is True and args.dry_run is True
 
 
+@pytest.mark.requires_tool("openssl")
 @pytest.mark.parametrize("shred", [False, True])
 def test_encrypted_stream_verifies_after_remediation(tmp_path, monkeypatch, shred):
     """The remediated (encrypted) stream is a valid backup: raw verify -> ok."""
@@ -302,6 +308,7 @@ def test_existing_encrypted_not_clobbered(tmp_path, monkeypatch, capsys):
 # --------------------------------------------------------------------------- #
 # partial failure across a batch
 # --------------------------------------------------------------------------- #
+@pytest.mark.requires_tool("openssl")
 def test_partial_failure_shreds_verified_keeps_unverified(tmp_path, monkeypatch):
     monkeypatch.setenv("BTRFS_BACKUP_PASSPHRASE", "rempass")
     _plaintext_backup(tmp_path, name="aaa")
@@ -336,6 +343,7 @@ def test_confirm_prompt_abort_keeps_plaintext(tmp_path, monkeypatch):
     assert not (tmp_path / "root.20240101T120000.btrfs.gz.enc").exists()
 
 
+@pytest.mark.requires_tool("openssl")
 def test_confirm_prompt_yes_proceeds(tmp_path, monkeypatch):
     monkeypatch.setenv("BTRFS_BACKUP_PASSPHRASE", "rempass")
     _plaintext_backup(tmp_path)
@@ -347,6 +355,7 @@ def test_confirm_prompt_yes_proceeds(tmp_path, monkeypatch):
     assert not plain.exists()  # proceeded, removed after the proof
 
 
+@pytest.mark.requires_tool("openssl")
 def test_encrypt_json_output(tmp_path, monkeypatch, capsys):
     monkeypatch.setenv("BTRFS_BACKUP_PASSPHRASE", "rempass")
     _plaintext_backup(tmp_path)

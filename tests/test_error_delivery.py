@@ -236,6 +236,7 @@ def test_constant_format_collision_blames_the_format(tmp_path, monkeypatch):
 # --- openssl: an unsupported cipher fails clearly, not with an EVP dump -------
 
 
+@pytest.mark.requires_tool("openssl")
 def test_unsupported_openssl_cipher_aborts_with_clear_message():
     """A cipher this host's openssl does not know (a different openssl build, or a
     hand-edited sidecar) must fail BEFORE the pipeline dumps a cryptic OpenSSL EVP
@@ -268,6 +269,7 @@ def test_supported_openssl_cipher_is_not_false_rejected(monkeypatch):
     assert any("openssl" in stage[0] for stage in pipeline)
 
 
+@pytest.mark.requires_tool("openssl")
 def test_openssl_support_probe_discriminates():
     assert raw_mod._openssl_supports_cipher("aes-256-cbc") is True
     assert raw_mod._openssl_supports_cipher("aes-256-cbcx") is False

@@ -5,6 +5,28 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **The unit tests ran the real `sudo`.** The product retries a privileged
+  call through `sudo -n` when the direct one fails, and in a unit test it
+  usually fails, so a test run reached the real sudo about 250 times: as
+  root wherever sudo needs no password, including `btrfs subvolume delete`
+  on test paths, and as a refusal or a missing command elsewhere. Every unit
+  test now finds a stand-in first on `PATH` that runs the command as the
+  calling user. What each local fallback does when sudo refuses is now
+  tested on purpose instead of depending on the machine.
+- **The unit tests failed in a minimal build environment.** In a package
+  build root without btrfs-progs, openssl, `ps` or dash, 65 tests failed.
+  42 of them only needed `btrfs` to be found, never run, and now pass. A
+  test that runs an external program for real is skipped where it is
+  missing, with the reason printed, or failed when `BBNG_TEST_REQUIRE_TOOLS`
+  names the program; that now includes the lock-script checks under dash,
+  which failed outright before, and four that silently disappeared. The two
+  tests about running from a source checkout are skipped when the package
+  is imported from an installed copy.
+
 ## [0.9.12] - 2026-09-27
 
 This release makes `config validate` and `doctor` answer the question they

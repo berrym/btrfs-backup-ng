@@ -16,7 +16,6 @@ shape a failing ``btrfs send`` has.
 from __future__ import annotations
 
 import logging
-import shutil
 import subprocess
 from pathlib import Path
 from unittest.mock import MagicMock
@@ -27,6 +26,8 @@ import btrfs_backup_ng.core.operations as ops
 import btrfs_backup_ng.endpoint.ssh as ssh_mod
 from btrfs_backup_ng import __util__
 from btrfs_backup_ng.endpoint.ssh import SSHEndpoint, _compressed_send_script
+
+from .lockshell import shell_params
 
 
 def _ep(compress=None, **config):
@@ -153,13 +154,6 @@ class TestTheRemoteCompressesAndThisHostDecompresses:
         )
 
 
-def _shells():
-    found = ["sh"]
-    if shutil.which("dash"):
-        found.append("dash")
-    return found
-
-
 class TestTheRemoteScriptExitsWithTheSendsStatus:
     """A real shell runs the script the remote will run, with ``cat`` standing
     in for the compressor so the bytes can be read back."""
@@ -176,7 +170,7 @@ class TestTheRemoteScriptExitsWithTheSendsStatus:
             timeout=30,
         )
 
-    @pytest.mark.parametrize("shell", _shells())
+    @pytest.mark.parametrize("shell", shell_params("sh", "dash"))
     def test_a_failing_send_fails_the_script_even_through_the_compressor(self, shell):
         """This is the case a plain pipeline gets wrong: ``cat`` exits 0 after
         the send failed, and the pipeline's status would be 0."""
@@ -184,12 +178,12 @@ class TestTheRemoteScriptExitsWithTheSendsStatus:
         assert r.stdout == b"abc"
         assert r.returncode == 1, r.stderr
 
-    @pytest.mark.parametrize("shell", _shells())
+    @pytest.mark.parametrize("shell", shell_params("sh", "dash"))
     def test_a_clean_send_exits_zero_with_its_bytes_on_stdout(self, shell):
         r = self._run(shell, "printf abc")
         assert r.stdout == b"abc" and r.returncode == 0
 
-    @pytest.mark.parametrize("shell", _shells())
+    @pytest.mark.parametrize("shell", shell_params("sh", "dash"))
     def test_the_send_stage_reads_the_sessions_stdin(self, shell):
         """Where ``sudo -S`` sits, the password must arrive: the first stage
         inherits the script's stdin, the compressor reads only the pipe."""

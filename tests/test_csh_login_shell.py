@@ -15,9 +15,7 @@ read as "no backups".
 from __future__ import annotations
 
 import ast
-import os
 import shlex
-import shutil
 import subprocess
 from pathlib import Path
 
@@ -156,17 +154,16 @@ def test_every_lock_script_is_csh_safe(tmp_path):
     assert unsafe == {}
 
 
-@pytest.mark.parametrize("login", ["tcsh", "csh"])
+@pytest.mark.parametrize(
+    "login",
+    [
+        pytest.param(login, marks=pytest.mark.requires_tool(login))
+        for login in ("tcsh", "csh")
+    ],
+)
 def test_the_whole_protocol_works_under_a_csh_login_shell(tmp_path, login):
     """The real shell, where one is installed. The static checks above are
     what enforces this everywhere; this shows they are checking the right
     thing."""
-    if shutil.which(login) is None:
-        if os.environ.get("BBNG_REQUIRE_LOGIN_SHELLS"):
-            pytest.fail(
-                f"{login} is not installed, and BBNG_REQUIRE_LOGIN_SHELLS says this "
-                f"run must prove the protocol under it rather than skip"
-            )
-        pytest.skip(f"{login} is not installed here")
     run, _seen = _recording(tmp_path, [login, "-f", "-c"])
     assert _exercise(run, tmp_path) == EXPECTED

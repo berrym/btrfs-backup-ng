@@ -5,7 +5,6 @@ end-to-end functionality. They are skipped if the required tools are not
 available on the system.
 """
 
-import shutil
 import subprocess
 
 import pytest
@@ -16,11 +15,6 @@ from btrfs_backup_ng.endpoint.raw_metadata import RawSnapshot
 from btrfs_backup_ng.endpoint.raw_metadata import COMPRESSION_CONFIG
 
 
-def tool_available(tool: str) -> bool:
-    """Check if a command-line tool is available."""
-    return shutil.which(tool) is not None
-
-
 # Test data - simulates a btrfs send stream (just random bytes for testing)
 TEST_DATA = b"This is test data that simulates a btrfs send stream.\n" * 1000
 
@@ -28,7 +22,7 @@ TEST_DATA = b"This is test data that simulates a btrfs send stream.\n" * 1000
 class TestRealCompressionPipelines:
     """Tests that actually run compression/decompression pipelines."""
 
-    @pytest.mark.skipif(not tool_available("pigz"), reason="pigz not available")
+    @pytest.mark.requires_tool("pigz")
     def test_pigz_roundtrip(self, tmp_path):
         """Test that pigz compression and decompression work end-to-end."""
         RawEndpoint(config={"path": tmp_path, "compress": "pigz"})
@@ -59,7 +53,7 @@ class TestRealCompressionPipelines:
         assert result.returncode == 0
         assert result.stdout == TEST_DATA
 
-    @pytest.mark.skipif(not tool_available("bzip2"), reason="bzip2 not available")
+    @pytest.mark.requires_tool("bzip2")
     def test_bzip2_roundtrip(self, tmp_path):
         """Test that bzip2 compression and decompression work end-to-end."""
         RawEndpoint(config={"path": tmp_path, "compress": "bzip2"})
@@ -89,7 +83,7 @@ class TestRealCompressionPipelines:
         assert result.returncode == 0
         assert result.stdout == TEST_DATA
 
-    @pytest.mark.skipif(not tool_available("pbzip2"), reason="pbzip2 not available")
+    @pytest.mark.requires_tool("pbzip2")
     def test_pbzip2_roundtrip(self, tmp_path):
         """Test that pbzip2 compression and decompression work end-to-end."""
         RawEndpoint(config={"path": tmp_path, "compress": "pbzip2"})
@@ -119,7 +113,7 @@ class TestRealCompressionPipelines:
         assert result.returncode == 0
         assert result.stdout == TEST_DATA
 
-    @pytest.mark.skipif(not tool_available("lzop"), reason="lzop not available")
+    @pytest.mark.requires_tool("lzop")
     def test_lzo_roundtrip(self, tmp_path):
         """Test that lzo (lzop) compression and decompression work end-to-end."""
         RawEndpoint(config={"path": tmp_path, "compress": "lzo"})
@@ -149,7 +143,7 @@ class TestRealCompressionPipelines:
         assert result.returncode == 0
         assert result.stdout == TEST_DATA
 
-    @pytest.mark.skipif(not tool_available("gzip"), reason="gzip not available")
+    @pytest.mark.requires_tool("gzip")
     def test_gzip_roundtrip(self, tmp_path):
         """Test that gzip compression and decompression work end-to-end."""
         endpoint = RawEndpoint(config={"path": tmp_path, "compress": "gzip"})
@@ -192,7 +186,7 @@ class TestRealCompressionPipelines:
         assert result.returncode == 0
         assert result.stdout == TEST_DATA
 
-    @pytest.mark.skipif(not tool_available("zstd"), reason="zstd not available")
+    @pytest.mark.requires_tool("zstd")
     def test_zstd_roundtrip(self, tmp_path):
         """Test that zstd compression and decompression work end-to-end."""
         RawEndpoint(config={"path": tmp_path, "compress": "zstd"})
@@ -222,7 +216,7 @@ class TestRealCompressionPipelines:
         assert result.returncode == 0
         assert result.stdout == TEST_DATA
 
-    @pytest.mark.skipif(not tool_available("lz4"), reason="lz4 not available")
+    @pytest.mark.requires_tool("lz4")
     def test_lz4_roundtrip(self, tmp_path):
         """Test that lz4 compression and decompression work end-to-end."""
         RawEndpoint(config={"path": tmp_path, "compress": "lz4"})
@@ -252,7 +246,7 @@ class TestRealCompressionPipelines:
         assert result.returncode == 0
         assert result.stdout == TEST_DATA
 
-    @pytest.mark.skipif(not tool_available("xz"), reason="xz not available")
+    @pytest.mark.requires_tool("xz")
     def test_xz_roundtrip(self, tmp_path):
         """Test that xz compression and decompression work end-to-end."""
         RawEndpoint(config={"path": tmp_path, "compress": "xz"})
@@ -286,7 +280,7 @@ class TestRealCompressionPipelines:
 class TestRealEncryptionPipelines:
     """Tests that actually run encryption/decryption pipelines."""
 
-    @pytest.mark.skipif(not tool_available("openssl"), reason="openssl not available")
+    @pytest.mark.requires_tool("openssl")
     def test_openssl_roundtrip(self, tmp_path, monkeypatch):
         """Test that OpenSSL encryption and decryption work end-to-end."""
         passphrase = "test_passphrase_123"
@@ -339,10 +333,8 @@ class TestRealEncryptionPipelines:
         assert result.returncode == 0
         assert result.stdout == TEST_DATA
 
-    @pytest.mark.skipif(
-        not tool_available("openssl") or not tool_available("zstd"),
-        reason="openssl or zstd not available",
-    )
+    @pytest.mark.requires_tool("openssl")
+    @pytest.mark.requires_tool("zstd")
     def test_compression_plus_openssl_roundtrip(self, tmp_path, monkeypatch):
         """Test compression followed by OpenSSL encryption."""
         passphrase = "test_passphrase_456"
@@ -425,7 +417,7 @@ class TestRealEncryptionPipelines:
 class TestShellPipelineExecution:
     """Test the actual shell pipeline execution used by RawEndpoint."""
 
-    @pytest.mark.skipif(not tool_available("gzip"), reason="gzip not available")
+    @pytest.mark.requires_tool("gzip")
     def test_execute_pipeline_actually_compresses(self, tmp_path):
         """Test that _execute_pipeline actually runs and compresses data."""
         endpoint = RawEndpoint(config={"path": tmp_path, "compress": "gzip"})
@@ -472,10 +464,8 @@ class TestShellPipelineExecution:
         assert result.returncode == 0
         assert result.stdout == TEST_DATA
 
-    @pytest.mark.skipif(
-        not tool_available("gzip") or not tool_available("cat"),
-        reason="gzip or cat not available",
-    )
+    @pytest.mark.requires_tool("gzip")
+    @pytest.mark.requires_tool("cat")
     def test_multi_stage_pipeline_execution(self, tmp_path):
         """Test multi-stage pipeline (compression + another command)."""
         endpoint = RawEndpoint(config={"path": tmp_path, "compress": "gzip"})
@@ -509,7 +499,7 @@ class TestShellPipelineExecution:
 class TestRestorePipelineExecution:
     """Test restore pipeline execution with real data."""
 
-    @pytest.mark.skipif(not tool_available("gzip"), reason="gzip not available")
+    @pytest.mark.requires_tool("gzip")
     def test_restore_pipeline_decompresses(self, tmp_path):
         """Test that restore pipeline actually decompresses data."""
         endpoint = RawEndpoint(config={"path": tmp_path})
@@ -550,7 +540,7 @@ class TestGPGEncryptionPipelines:
     """
 
     @pytest.fixture
-    def gpg_home(self, tmp_path):
+    def gpg_home(self, tmp_path, tool_unusable):
         """Create a temporary GPG home directory with a test key."""
         gpg_dir = tmp_path / "gnupg"
         gpg_dir.mkdir(mode=0o700)
@@ -576,7 +566,7 @@ Expire-Date: 0
             text=True,
         )
         if result.returncode != 0:
-            pytest.skip(f"Failed to generate GPG key: {result.stderr}")
+            tool_unusable("gpg", f"Failed to generate GPG key: {result.stderr}")
 
         try:
             yield gpg_dir
@@ -597,7 +587,7 @@ Expire-Date: 0
                 env={**os.environ, "GNUPGHOME": str(gpg_dir)},
             )
 
-    @pytest.mark.skipif(not tool_available("gpg"), reason="gpg not available")
+    @pytest.mark.requires_tool("gpg")
     def test_gpg_roundtrip(self, tmp_path, gpg_home):
         """Test that GPG encryption and decryption work end-to-end."""
         input_file = tmp_path / "input.bin"
@@ -644,10 +634,8 @@ Expire-Date: 0
         assert result.returncode == 0, f"GPG decrypt failed: {result.stderr.decode()}"
         assert result.stdout == TEST_DATA
 
-    @pytest.mark.skipif(
-        not tool_available("gpg") or not tool_available("zstd"),
-        reason="gpg or zstd not available",
-    )
+    @pytest.mark.requires_tool("gpg")
+    @pytest.mark.requires_tool("zstd")
     def test_compression_plus_gpg_roundtrip(self, tmp_path, gpg_home):
         """Test compression followed by GPG encryption."""
         input_file = tmp_path / "input.bin"
@@ -846,7 +834,7 @@ class TestMetadataIntegration:
 class TestFullReceiveWorkflow:
     """Integration tests for the complete receive workflow."""
 
-    @pytest.mark.skipif(not tool_available("gzip"), reason="gzip not available")
+    @pytest.mark.requires_tool("gzip")
     def test_receive_commit_restore_workflow(self, tmp_path):
         """The full receive -> commit -> restore workflow through the real atomic
         path (receive writes a .part, commit_receive publishes it + the sidecar,
@@ -882,7 +870,7 @@ class TestFullReceiveWorkflow:
         assert rproc.returncode == 0
         assert out == input_data
 
-    @pytest.mark.skipif(not tool_available("zstd"), reason="zstd not available")
+    @pytest.mark.requires_tool("zstd")
     def test_list_and_delete_workflow(self, tmp_path):
         """Test listing and deleting snapshots."""
         endpoint = RawEndpoint(config={"path": tmp_path, "compress": "zstd"})
@@ -1023,7 +1011,7 @@ class TestSSHRawEndpointIntegration:
         assert remote_path.exists()
         assert remote_path.is_dir()
 
-    @pytest.mark.skipif(not tool_available("zstd"), reason="zstd not available")
+    @pytest.mark.requires_tool("zstd")
     def test_ssh_localhost_pipeline(self, tmp_path, requires_ssh_localhost):
         """Test SSH pipeline execution to localhost."""
         from btrfs_backup_ng.endpoint.raw import SSHRawEndpoint
@@ -1084,7 +1072,7 @@ class TestSSHRawEndpointIntegration:
 class TestBinaryDataIntegrity:
     """Tests for handling binary data correctly through pipelines."""
 
-    @pytest.mark.skipif(not tool_available("gzip"), reason="gzip not available")
+    @pytest.mark.requires_tool("gzip")
     def test_binary_data_with_null_bytes(self, tmp_path):
         """Test that binary data with null bytes survives compression."""
         # Create data with null bytes and all byte values
@@ -1113,10 +1101,8 @@ class TestBinaryDataIntegrity:
         assert result.returncode == 0
         assert result.stdout == binary_data
 
-    @pytest.mark.skipif(
-        not tool_available("openssl") or not tool_available("zstd"),
-        reason="openssl or zstd not available",
-    )
+    @pytest.mark.requires_tool("openssl")
+    @pytest.mark.requires_tool("zstd")
     def test_binary_data_through_full_pipeline(self, tmp_path, monkeypatch):
         """Test binary data through compress + encrypt pipeline."""
         passphrase = "test_binary_passphrase"
@@ -1201,7 +1187,7 @@ class TestBinaryDataIntegrity:
 class TestCompressionLevels:
     """Tests for different compression levels."""
 
-    @pytest.mark.skipif(not tool_available("zstd"), reason="zstd not available")
+    @pytest.mark.requires_tool("zstd")
     def test_zstd_levels_produce_different_sizes(self, tmp_path):
         """Test that zstd compression levels affect output size."""
         # Use compressible data
@@ -1238,7 +1224,7 @@ class TestCompressionLevels:
 class TestEdgeCases:
     """Test edge cases and error conditions with real execution."""
 
-    @pytest.mark.skipif(not tool_available("gzip"), reason="gzip not available")
+    @pytest.mark.requires_tool("gzip")
     def test_empty_input(self, tmp_path):
         """Test handling of empty input data."""
         endpoint = RawEndpoint(config={"path": tmp_path, "compress": "gzip"})
@@ -1273,7 +1259,7 @@ class TestEdgeCases:
         assert result.returncode == 0
         assert result.stdout == b""
 
-    @pytest.mark.skipif(not tool_available("gzip"), reason="gzip not available")
+    @pytest.mark.requires_tool("gzip")
     def test_large_data(self, tmp_path):
         """Test handling of larger data (10MB)."""
         endpoint = RawEndpoint(config={"path": tmp_path, "compress": "gzip"})
