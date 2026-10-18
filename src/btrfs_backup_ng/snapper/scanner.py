@@ -5,6 +5,7 @@ and enumerate their snapshots.
 """
 
 import json
+import os
 import re
 import subprocess
 from dataclasses import dataclass, field
@@ -15,7 +16,12 @@ from ..__logger__ import logger
 from .metadata import SnapperMetadata, parse_info_xml
 from .snapshot import SnapperSnapshot
 
-__all__ = ["SnapperConfig", "SnapperScanner", "SnapperNotFoundError"]
+__all__ = [
+    "SnapperConfig",
+    "SnapperScanner",
+    "SnapperNotFoundError",
+    "snapper_config_problems",
+]
 
 SNAPPER_CONFIGS_DIR = Path("/etc/snapper/configs")
 SNAPSHOTS_DIR_NAME = ".snapshots"
@@ -70,17 +76,20 @@ class SnapperScanner:
 
     def __init__(
         self,
-        configs_dir: Path | str = SNAPPER_CONFIGS_DIR,
+        configs_dir: Path | str | None = None,
         use_snapper_command: bool = True,
     ):
         """Initialize the scanner.
 
         Args:
-            configs_dir: Path to snapper configs directory
+            configs_dir: Path to snapper configs directory; the system's own
+                         (``SNAPPER_CONFIGS_DIR``) when not given
             use_snapper_command: If True, use `snapper` command when available
                                 for snapshot listing (more reliable)
         """
-        self.configs_dir = Path(configs_dir)
+        self.configs_dir = (
+            Path(configs_dir) if configs_dir is not None else SNAPPER_CONFIGS_DIR
+        )
         self.use_snapper_command = use_snapper_command
         self._snapper_available: Optional[bool] = None
 
@@ -99,8 +108,71 @@ class SnapperScanner:
                 self._snapper_available = False
         return self._snapper_available
 
+    def _configs_via_command(self) -> Optional[list[tuple[str, Path]]]:
+        """``(name, subvolume)`` for each config ``snapper --jsonout list-configs``
+        lists, or None where the command is absent, fails, or is not the one
+        to ask.
+
+        snapper answers through its service, which reads the config files as
+        root, so a user who cannot read them (Fedora writes the configs it
+        makes as 0640 root:root) still gets the list; read as files, such a
+        config was logged as unparseable and dropped, and an unprivileged
+        ``config validate``, ``doctor`` or ``run`` did not know it existed.
+        Only the system's own configs directory is asked for this way: a
+        scanner pointed at another directory is asked about those files alone.
+        """
+        if (
+            not self.use_snapper_command
+            or self.configs_dir != SNAPPER_CONFIGS_DIR
+            or not self.is_snapper_available()
+        ):
+            return None
+        try:
+            result = subprocess.run(
+                ["snapper", "--jsonout", "list-configs"],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=30,
+            )
+        except (OSError, subprocess.TimeoutExpired) as e:
+            logger.debug("snapper list-configs could not be run: %s", e)
+            return None
+        if result.returncode != 0:
+            logger.debug(
+                "snapper list-configs exited %d: %s",
+                result.returncode,
+                result.stderr.strip(),
+            )
+            return None
+        try:
+            data = json.loads(result.stdout)
+            return [
+                (str(entry["config"]), Path(str(entry["subvolume"])))
+                for entry in data["configs"]
+            ]
+        except (ValueError, KeyError, TypeError) as e:
+            logger.debug("snapper list-configs output not understood: %s", e)
+            return None
+
+    def _config_from_listing(self, name: str, subvolume: Path) -> SnapperConfig:
+        """The config snapper listed, with the file's other fields where the
+        file can be read and the defaults where it cannot."""
+        try:
+            return self._parse_config_file(self.configs_dir / name)
+        except OSError as e:
+            logger.debug(
+                "Snapper config %s is known through snapper alone: %s", name, e
+            )
+        except Exception as e:
+            logger.warning("Failed to parse snapper config %s: %s", name, e)
+        return SnapperConfig(name=name, subvolume=subvolume)
+
     def list_configs(self) -> list[SnapperConfig]:
         """List all snapper configurations.
+
+        Asked of ``snapper`` itself where it is installed, and read from the
+        config files otherwise.
 
         Returns:
             List of SnapperConfig objects
@@ -108,6 +180,12 @@ class SnapperScanner:
         Raises:
             SnapperNotFoundError: If snapper configs directory doesn't exist
         """
+        listed = self._configs_via_command()
+        if listed is not None:
+            return sorted(
+                (self._config_from_listing(name, subvol) for name, subvol in listed),
+                key=lambda c: c.name,
+            )
         if not self.configs_dir.exists():
             raise SnapperNotFoundError(
                 f"Snapper configs directory not found: {self.configs_dir}"
@@ -135,6 +213,12 @@ class SnapperScanner:
         Returns:
             SnapperConfig if found, None otherwise
         """
+        listed = self._configs_via_command()
+        if listed is not None:
+            for listed_name, subvolume in listed:
+                if listed_name == name:
+                    return self._config_from_listing(name, subvolume)
+            return None
         config_file = self.configs_dir / name
         if not config_file.exists():
             return None
@@ -460,3 +544,51 @@ class SnapperScanner:
                 max_num = max(s.number for s in snapshots)
 
         return max_num + 1
+
+
+def snapper_config_problems(
+    path: str | Path, config_name: str, scanner: Optional[SnapperScanner] = None
+) -> list[str]:
+    """Why ``run`` could not find the snapper config of the volume at ``path``.
+
+    ``run`` never snapshots a snapper volume's path. With a ``config_name`` it
+    uses that snapper config, and with ``"auto"`` the config whose subvolume
+    is the path or holds it (``find_config_for_path``), failing the volume
+    with "cannot detect snapper config" when none does. ``config validate``
+    and ``doctor`` checked the path alone, so a volume naming a config this
+    machine does not have, or lying under no config, passed both and failed
+    at the first run. Asked through ``__util__.backup_volume_problems``;
+    each message says which configs snapper does have, so the fix is visible.
+    """
+    scanner = scanner or SnapperScanner()
+    source = Path(os.path.abspath(path))
+    try:
+        configs = scanner.list_configs()
+    except SnapperNotFoundError as e:
+        return [
+            f"Source {source} is a snapper volume, but snapper is not set up on "
+            f"this machine: {e}. Install snapper and create a config for the "
+            "volume, or make it a native volume."
+        ]
+    if configs:
+        known = "snapper manages " + ", ".join(
+            f"{c.name} ({c.subvolume})" for c in configs
+        )
+    else:
+        known = "snapper has no configs on this machine"
+    if config_name == "auto":
+        if scanner.find_config_for_path(source) is None:
+            return [
+                f"Source {source} is under no snapper config's subvolume, so "
+                f'`run` cannot find its snapshots (config_name is "auto"); '
+                f"{known}. Set config_name to one of them, or point the volume at "
+                "a path under one of their subvolumes."
+            ]
+        return []
+    if not any(c.name == config_name for c in configs):
+        return [
+            f"Source {source} names the snapper config '{config_name}', which "
+            f"does not exist on this machine; {known}. Set config_name to one of "
+            'them, or to "auto" to select the one holding the path.'
+        ]
+    return []

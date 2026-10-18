@@ -846,32 +846,60 @@ def iter_mounts(mounts_file: str | None = None) -> Iterator[tuple[str, str, str]
             )
 
 
+def mount_holding(path: str | Path) -> tuple[str, str, str] | None:
+    """``(device, mount_point, fs_type)`` of the mount whose tree holds ``path``:
+    the longest mount point that is the path or an ancestor of it, or None
+    when the mount table names none (a path outside every mount)."""
+    path = Path(path).resolve()
+    best: tuple[str, str, str] | None = None
+    for device, mount_point, fs_type in iter_mounts():
+        prefix = Path(mount_point)
+        if path == prefix or path.is_relative_to(prefix):
+            if best is None or len(mount_point) > len(best[1]):
+                best = (device, mount_point, fs_type)
+    logger.debug("Mount holding %s: %s", path, best)
+    return best
+
+
 def is_btrfs(path: str | Path) -> bool:
     """Checks whether path is inside a btrfs file system."""
-    path = Path(path).resolve()
-    logger.debug("Checking for btrfs filesystem: %s", path)
-    best_match = ""
-    best_match_fs_type = ""
-    logger.debug("  Reading mounts file: %s", MOUNTS_FILE)
-    for _device, mount_point, fs_type in iter_mounts():
-        mount_point_prefix = Path(mount_point)
-        if path == mount_point_prefix or path.is_relative_to(mount_point_prefix):
-            if len(str(mount_point)) > len(best_match):
-                best_match = mount_point
-                best_match_fs_type = fs_type
-                logger.debug(
-                    "  New best_match with filesystem type %s: %s",
-                    best_match_fs_type,
-                    best_match,
-                )
+    mount = mount_holding(path)
+    return mount is not None and mount[2] == "btrfs"
 
-    result = best_match_fs_type == "btrfs"
-    logger.debug(
-        "  -> best_match_fs_type is %s, result is %r",
-        best_match_fs_type,
-        result,
-    )
-    return result
+
+#: Where the kernel lists each mounted btrfs filesystem by its UUID, with a
+#: ``devices/`` entry per member device; readable by anyone.
+SYSFS_BTRFS = Path("/sys/fs/btrfs")
+#: Where udev names every filesystem by UUID.
+DISK_BY_UUID = Path("/dev/disk/by-uuid")
+
+
+def filesystem_identity(device: str) -> str:
+    """What identifies the filesystem on ``device``, as the mount table names it.
+
+    A mounted btrfs is known by the UUID under ``SYSFS_BTRFS`` that lists the
+    device among its members, so a multi-device filesystem mounted through
+    any of them is one filesystem; any other filesystem by the UUID
+    ``DISK_BY_UUID`` links to the device; and failing both, by the device.
+    """
+    target = os.path.realpath(device)
+    name = Path(target).name
+    try:
+        for fs in SYSFS_BTRFS.iterdir():
+            if (fs / "devices" / name).exists():
+                return f"btrfs:{fs.name}"
+    except OSError:
+        pass
+    try:
+        for link in DISK_BY_UUID.iterdir():
+            try:
+                if os.path.realpath(link) == target:
+                    return f"UUID={link.name}"
+            except OSError:
+                continue
+    except OSError:
+        pass
+    return device
 
 
 #: The root directory of every btrfs subvolume has this inode number, and no
@@ -969,6 +997,99 @@ def backup_source_problems(path: str | Path, *, snapper: bool = False) -> list[s
         "snapshot only a subvolume. Point the volume at the subvolume that "
         f"holds it, or make it a subvolume of its own {make_one}."
     ]
+
+
+def snapshot_dir_problems(configured: str, source: str | Path) -> list[str]:
+    """Why ``run`` would refuse the ``snapshot_dir`` of the native volume at
+    ``source``, in plain words.
+
+    A relative snapshot_dir under the source is created by ``run`` below the
+    source and needs no check. An absolute one, or a relative one that climbs
+    out of the source, must be there already -- ``run`` refuses to create a
+    base, since an absent base once put the snapshots on the root filesystem
+    -- must be a directory this account can read, and must be on the same
+    btrfs filesystem as the source, since ``btrfs subvolume snapshot`` cannot
+    cross filesystems. ``config validate`` and ``doctor`` did not ask, so a
+    config that fails either way passed both and failed at the first run.
+
+    Asked after the source passed its own check, so its filesystem is known.
+    Whether two mounts are one filesystem is decided from the mount table's
+    device for each, as ``filesystem_identity`` names it: ``statvfs`` cannot
+    say, because btrfs gives every subvolume its own ``f_fsid``.
+    """
+    source = Path(os.path.abspath(source))
+    configured_path = Path(configured)
+    if configured_path.is_absolute():
+        base = configured_path
+    else:
+        full = (source / configured_path).resolve()
+        if full == source.resolve() or full.is_relative_to(source.resolve()):
+            return []
+        base = full
+    try:
+        st = os.stat(base)
+    except PermissionError:
+        return [
+            f"snapshot_dir {base} cannot be checked from this account: permission "
+            "is denied on it or on a directory above it. Check it as the user "
+            "that runs the backups, usually root."
+        ]
+    except (FileNotFoundError, NotADirectoryError):
+        return [
+            missing_backup_location_message("snapshot_dir", base)
+            + " `run` refuses to create it."
+        ]
+    except OSError as e:
+        return [f"snapshot_dir {base} cannot be checked: {e.strerror or e}."]
+    if not stat_module.S_ISDIR(st.st_mode):
+        return [f"snapshot_dir {base} is not a directory."]
+    holder = mount_holding(base)
+    if holder is None or holder[2] != "btrfs":
+        return [
+            f"snapshot_dir {base} is not on a btrfs filesystem, and a btrfs "
+            "snapshot can only be made on the filesystem holding its source. "
+            "Point snapshot_dir at a directory on the source's filesystem."
+        ]
+    source_holder = mount_holding(source)
+    if source_holder is None:
+        return []
+    if filesystem_identity(holder[0]) != filesystem_identity(source_holder[0]):
+        return [
+            f"snapshot_dir {base} is on a different filesystem ({holder[0]}) from "
+            f"the source {source} ({source_holder[0]}), and a btrfs snapshot cannot "
+            "cross filesystems. Point snapshot_dir at a directory on the source's "
+            "filesystem."
+        ]
+    return []
+
+
+def backup_volume_problems(
+    path: str | Path,
+    *,
+    snapper: bool = False,
+    snapper_config_name: str | None = None,
+    snapshot_dir: str | None = None,
+) -> list[str]:
+    """Why this volume cannot be backed up from here: the one question
+    ``config validate`` and ``doctor`` ask, so the two can never disagree.
+
+    The source first (``backup_source_problems``); a source with a problem
+    ends it, since the other answers presume a usable source. Then, for a
+    snapper volume, whether ``run`` could find its snapper config
+    (``snapper_config_problems``), and for a native one, whether ``run``
+    would accept its ``snapshot_dir`` (``snapshot_dir_problems``); a snapper
+    volume's snapshot_dir is never read by ``run`` and is not checked.
+    """
+    problems = backup_source_problems(path, snapper=snapper)
+    if problems:
+        return problems
+    if snapper:
+        from .snapper.scanner import snapper_config_problems
+
+        return snapper_config_problems(path, snapper_config_name or "auto")
+    if snapshot_dir is not None:
+        return snapshot_dir_problems(snapshot_dir, path)
+    return []
 
 
 def _containing_subvolume(path: Path, device: int) -> Path | None:

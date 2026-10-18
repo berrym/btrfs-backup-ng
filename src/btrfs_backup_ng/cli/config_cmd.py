@@ -1134,9 +1134,11 @@ def _volume_readiness_problems(volume: Any) -> list[str]:
     """Local, cheap reasons this volume could not actually be backed up.
 
     Deliberately limited to what can be answered on THIS machine without opening
-    a connection -- ``__util__.backup_source_problems``, the same question
-    ``doctor`` asks. Remote targets are not probed -- that is `doctor`'s job,
-    which is allowed to reach the network; `validate` stays fast and offline.
+    a connection -- ``__util__.backup_volume_problems``, the same question
+    ``doctor`` asks: the source, then the snapper config a snapper volume
+    names or lies under, or the snapshot_dir a native volume would use.
+    Remote targets are not probed -- that is `doctor`'s job, which is allowed
+    to reach the network; `validate` stays fast and offline.
 
     Returns a list of human-readable problems; empty means "nothing local says
     this cannot work".
@@ -1144,8 +1146,11 @@ def _volume_readiness_problems(volume: Any) -> list[str]:
     from .. import __util__
 
     try:
-        return __util__.backup_source_problems(
-            str(volume.path), snapper=volume.is_snapper_source()
+        return __util__.backup_volume_problems(
+            str(volume.path),
+            snapper=volume.is_snapper_source(),
+            snapper_config_name=volume.snapper.config_name if volume.snapper else None,
+            snapshot_dir=volume.snapshot_dir,
         )
     except __util__.SourceProbeError as e:
         # A probe failure is not a verdict. Only that is caught: anything else

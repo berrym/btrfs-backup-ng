@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`config validate` and `doctor` passed a snapper volume `run` could not
+  back up, and a native volume whose snapshot_dir `run` would refuse.** A
+  snapper volume was checked only as far as its path; `run` never snapshots
+  that path, it uses the snapper config named by `config_name`, or under
+  `auto` the one whose subvolume holds the path, and failed when there was
+  none. Both now check that the config exists, or that one covers the path,
+  and say which configs snapper has. A native volume's `snapshot_dir` was
+  not checked at all; an absolute one must exist and be on the same btrfs
+  filesystem as the source, since a snapshot cannot cross filesystems, and
+  both now say so. Snapper's configs are read through
+  `snapper --jsonout list-configs` where snapper is installed, so a config
+  whose file only root can read is found without root, by `run` and
+  `snapper detect` as well (#112, #113).
 - **A compressed backup to an `ssh://` target failed when the remote's `sh`
   was dash 0.5.13.0 to 0.5.13.4.** With `ssh_sudo` and a remote sudo that
   wants a password, the receive took the password line off its input with

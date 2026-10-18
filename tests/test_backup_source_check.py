@@ -64,6 +64,8 @@ def _doctor_volume_findings(source, snapper=False):
     volume = MagicMock()
     volume.path = str(source)
     volume.is_snapper_source.return_value = snapper
+    volume.snapper = MagicMock(config_name="data") if snapper else None
+    volume.snapshot_dir = ".snapshots"
     config = MagicMock()
     config.get_enabled_volumes.return_value = [volume]
     return Doctor(config=config)._check_volume_paths()
@@ -187,6 +189,8 @@ class TestDoctorUsesIt:
         volume = MagicMock()
         volume.path = "/"
         volume.is_snapper_source.return_value = False
+        volume.snapper = None
+        volume.snapshot_dir = ".snapshots"
         config = MagicMock()
         config.get_enabled_volumes.return_value = [volume]
         report = Doctor(config=config).run_diagnostics(
@@ -226,11 +230,14 @@ class TestSnapperSources:
     def test_validate_asks_with_the_volume_source_kind(
         self, tmp_path, capsys, monkeypatch, source, snapper
     ):
+        """The source check is asked through the one volume question, with the
+        kind of source; what else that question asks is tested in
+        test_backup_volume_check.py."""
         asked = []
         monkeypatch.setattr(
             util,
             "backup_source_problems",
-            lambda p, **kw: asked.append(kw) or [],
+            lambda p, **kw: asked.append(kw) or ["no"],
         )
         config = tmp_path / "config.toml"
         body = f'[[volumes]]\npath = "/data"\nsource = "{source}"\n\n'
@@ -238,7 +245,7 @@ class TestSnapperSources:
             body += '[volumes.snapper]\nconfig_name = "data"\n\n'
         body += f'[[volumes.targets]]\npath = "{tmp_path / "dest"}"\n'
         config.write_text(body)
-        assert _validate_config(argparse.Namespace(config=str(config))) == 0
+        assert _validate_config(argparse.Namespace(config=str(config))) == 2
         assert asked == [{"snapper": snapper}]
 
     @pytest.mark.parametrize("snapper", [True, False])
@@ -247,7 +254,7 @@ class TestSnapperSources:
         monkeypatch.setattr(
             util,
             "backup_source_problems",
-            lambda p, **kw: asked.append(kw) or [],
+            lambda p, **kw: asked.append(kw) or ["no"],
         )
         _doctor_volume_findings("/data", snapper=snapper)
         assert asked == [{"snapper": snapper}]

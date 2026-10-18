@@ -42,7 +42,16 @@ def _args(path):
 
 def _native_volume(path):
     """A volume whose snapshots btrfs-backup-ng takes itself."""
-    return type("V", (), {"path": path, "is_snapper_source": lambda self: False})()
+    return type(
+        "V",
+        (),
+        {
+            "path": path,
+            "is_snapper_source": lambda self: False,
+            "snapper": None,
+            "snapshot_dir": ".snapshots",
+        },
+    )()
 
 
 class TestTheLocalReadinessProbe:
