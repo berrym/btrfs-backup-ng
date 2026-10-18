@@ -236,13 +236,14 @@ def test_ssh_commit_raises_on_remote_failure():
 
 def test_ssh_commit_wraps_in_sudo_when_configured(tmp_path):
     """With ssh_sudo, the remote commit is wrapped in sudo. Exercises the real
-    command construction (only subprocess.run is mocked) -- no live SSH -- so the
-    sudo path is proven without setting up passwordless root access.
+    command construction (only subprocess.run is mocked) -- no live SSH.
 
     The lock protocol runs for real against a sandbox directory (see
     tests/lockshell.py): answering it with a canned object would have the manager
     correctly refuse a lock it could not confirm, and the commit would never
-    reach the mv this test is about.
+    reach the mv this test is about. Those scripts carry the same ``sudo -n``
+    prefix, so they go through the sudo stand-in (tests/conftest.py) and run as
+    the calling user: the sudo-prefixed text is executed, nothing is elevated.
     """
     from .lockshell import lock_aware
 

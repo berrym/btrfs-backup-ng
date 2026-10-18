@@ -2,10 +2,125 @@
 
 import functools
 import logging
+import os
+import shutil
 import subprocess
 from collections.abc import Iterator
+from pathlib import Path
 
 import pytest
+
+
+def _in_a_real_tier(node: pytest.Item) -> bool:
+    """Whether this test runs against real btrfs and real privilege."""
+    return any(node.get_closest_marker(tier) for tier in ("tier2", "tier3"))
+
+
+# Takes only what the product passes to a local sudo. An option it does not
+# know is written down and makes the test fail, so a new one is decided on
+# rather than guessed at, and a refusal can never pass for an answer.
+_SUDO_STAND_IN = """\
+#!/bin/sh
+# Test stand-in for sudo: runs the command as the calling user, never as root.
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -n) shift ;;
+        --) shift; break ;;
+        *) break ;;
+    esac
+done
+case "$1" in
+    ''|-*)
+        printf '%s\\n' "sudo $*" >> "$BBNG_SUDO_STAND_IN_UNSUPPORTED"
+        echo "sudo stand-in: cannot run 'sudo $*'" >&2
+        exit 1
+        ;;
+esac
+# What sudo itself says and returns for a command it cannot find.
+if ! command -v "$1" >/dev/null 2>&1; then
+    echo "sudo: $1: command not found" >&2
+    exit 1
+fi
+exec "$@"
+"""
+
+_BTRFS_PLACEHOLDER = """\
+#!/bin/sh
+# Test placeholder for a btrfs this machine does not have: a lookup finds it,
+# and running it fails as a missing command does.
+echo "btrfs: not installed (placeholder from tests/conftest.py)" >&2
+exit 127
+"""
+
+
+@pytest.fixture(scope="session")
+def stand_in_bin(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """The directory unit tests put first on PATH, checked to actually run."""
+    bin_dir = tmp_path_factory.mktemp("stand-in-bin")
+    scripts = {"sudo": _SUDO_STAND_IN}
+    if shutil.which("btrfs") is None:
+        scripts["btrfs"] = _BTRFS_PLACEHOLDER
+    for name, text in scripts.items():
+        (bin_dir / name).write_text(text)
+        (bin_dir / name).chmod(0o755)
+    # A temporary directory mounted noexec would leave the stand-in unrunnable,
+    # and the product's fallbacks would read that as a refused sudo in every
+    # test. Find out once, here, instead.
+    sudo = bin_dir / "sudo"
+    probe = subprocess.run(
+        [str(sudo), "-n", "id", "-u"], capture_output=True, text=True
+    )
+    if probe.returncode != 0 or probe.stdout.strip() != str(os.getuid()):
+        pytest.fail(
+            f"the sudo stand-in at {sudo} does not run: {probe.stderr.strip()}",
+            pytrace=False,
+        )
+    return bin_dir
+
+
+@pytest.fixture(autouse=True)
+def unit_tests_use_the_stand_ins(
+    request: pytest.FixtureRequest,
+    monkeypatch: pytest.MonkeyPatch,
+    stand_in_bin: Path,
+) -> Iterator[None]:
+    """Put the stand-in directory first on PATH for every unit test.
+
+    sudo: the product retries a privileged call through ``sudo -n`` when the
+    direct one fails, and in a unit test the direct one usually fails, because
+    the temporary directory is not btrfs. Those retries reached the real sudo
+    about 250 times a run: as root wherever sudo needs no password, as a
+    refusal wherever it does, and as "command not found" in a build root
+    without it. The stand-in gives every machine the same answer, and none of
+    it as root.
+
+    btrfs, only on a machine without it: ``LocalEndpoint`` refuses to start
+    when ``shutil.which("btrfs")`` finds nothing, so every unit test that
+    builds one failed there, although none of them runs btrfs. The placeholder
+    satisfies the lookup, in the test and in any CLI it starts, and fails like
+    a missing command if run. Where btrfs is installed it is used as before. A
+    test about the missing-btrfs path patches ``shutil.which`` itself.
+
+    Tier 2 and tier 3 use real btrfs and real privilege on purpose and keep
+    the real tools.
+    """
+    if _in_a_real_tier(request.node):
+        yield
+        return
+    unsupported = stand_in_bin / "unsupported"
+    unsupported.write_text("")
+    monkeypatch.setenv("BBNG_SUDO_STAND_IN_UNSUPPORTED", str(unsupported))
+    monkeypatch.setenv(
+        "PATH", f"{stand_in_bin}{os.pathsep}{os.environ.get('PATH', '')}"
+    )
+    yield
+    calls = unsupported.read_text()
+    if calls:
+        pytest.fail(
+            "the sudo stand-in was asked for something it does not take; teach it "
+            f"the option in tests/conftest.py or avoid it:\n{calls}",
+            pytrace=False,
+        )
 
 
 @functools.cache
