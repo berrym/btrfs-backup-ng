@@ -7,7 +7,6 @@ for disaster recovery, migration, or backup verification.
 import argparse
 import dataclasses
 import logging
-import os
 import subprocess
 import time
 from datetime import datetime
@@ -1374,6 +1373,13 @@ def _execute_cleanup(args: argparse.Namespace) -> int:
         print("Dry run - no changes made.")
         return 0
 
+    # Deleting a subvolume needs root. Asked once, before the operator is
+    # asked anything, rather than failing each subvolume after the confirmation.
+    problem = __util__.local_elevation_problem()
+    if problem:
+        print(f"Error: {problem}")
+        return 1
+
     print("These subvolumes are named by this tool's own run markers and hold no")
     print("received copy.")
     confirm = input("Delete them? [y/N]: ").strip().lower()
@@ -1423,7 +1429,7 @@ def _execute_cleanup(args: argparse.Namespace) -> int:
 def _sudo_prefix() -> list[str]:
     """``btrfs subvolume delete`` needs privilege; the same escalation the
     engine's partial cleanup applies, and none when already root."""
-    return [] if os.geteuid() == 0 else ["sudo", "-n"]
+    return __util__.sudo_argv()
 
 
 def _remove_marker(marker: Path) -> None:

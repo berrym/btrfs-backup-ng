@@ -2,7 +2,6 @@
 
 import argparse
 import logging
-import os
 import subprocess
 import sys
 import time
@@ -267,9 +266,10 @@ def _delete_snapper_slot_btrfs(endpoint: Any, slot_dir: str, remote: bool) -> No
             )
         return
 
-    argv = ["btrfs", "subvolume", "delete", subvolume]
-    if os.geteuid() != 0:
-        argv = ["sudo", "-n", *argv]
+    try:
+        argv = [*__util__.sudo_argv(), "btrfs", "subvolume", "delete", subvolume]
+    except __util__.AbortError as e:
+        raise RetentionError(f"could not delete {subvolume}: {e}") from None
     result = subprocess.run(argv, capture_output=True)
     if result.returncode != 0:
         stderr = (result.stderr or b"").decode(errors="replace").strip()

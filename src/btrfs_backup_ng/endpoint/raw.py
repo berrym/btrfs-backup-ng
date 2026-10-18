@@ -1817,7 +1817,11 @@ class RawEndpoint(Endpoint):
             return proc.returncode, proc.stdout, proc.stderr
 
         def run_elevated(script: str) -> tuple[int, str, str]:
-            return run(f"sudo -n sh -c {shlex.quote(script)}")
+            try:
+                sudo = " ".join(__util__.sudo_argv())
+            except __util__.AbortError as e:
+                return 127, "", str(e)
+            return run(f"{sudo} sh -c {shlex.quote(script)}".lstrip())
 
         return RemoteLockManager(
             run, path, hostname=socket.gethostname(), run_elevated=run_elevated

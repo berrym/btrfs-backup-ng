@@ -11,6 +11,7 @@ import os
 from collections.abc import Iterator
 import stat as stat_module
 import re
+import shutil
 import subprocess
 import time
 from datetime import datetime, timedelta, timezone
@@ -1186,6 +1187,41 @@ def atomic_write_bytes(
         raise
 
 
+def local_elevation_problem() -> str | None:
+    """Why this process could not escalate a local command, or None.
+
+    btrfs needs root. Not running as root, the product escalates through
+    sudo; without a sudo to run, as in a container or a minimal install, it
+    cannot. Asked once at the start of a run and by doctor, and by
+    ``sudo_argv`` at every site, so the answer is the same everywhere.
+    """
+    if os.geteuid() == 0 or shutil.which("sudo") is not None:
+        return None
+    return (
+        "This needs root for btrfs, and sudo is not installed, so it cannot ask "
+        "for it. Run this command as root, or install sudo and grant this user "
+        "sudo for /usr/bin/btrfs."
+    )
+
+
+def sudo_argv(*, allow_prompt: bool = False) -> list[str]:
+    """The prefix that escalates a local command: nothing as root, otherwise
+    ``sudo -n``, or plain ``sudo`` where a prompt is acceptable.
+
+    The one place a local command decides how to escalate. Raises AbortError,
+    with ``local_elevation_problem``'s message, when escalation is needed and
+    there is no sudo to do it: before this, each site built its own prefix and
+    a missing sudo surfaced as "[Errno 2] No such file or directory: 'sudo'",
+    as the shell's "sudo: not found", or as nothing at all.
+    """
+    if os.geteuid() == 0:
+        return []
+    problem = local_elevation_problem()
+    if problem is not None:
+        raise AbortError(problem)
+    return ["sudo"] if allow_prompt else ["sudo", "-n"]
+
+
 def _privileged_fs(
     direct: Callable[[], Any],
     argv: list[str],
@@ -1257,7 +1293,11 @@ def _privileged_fs(
             raise
         first_error = direct_error
 
-    sudo = ["sudo"] if allow_prompt else ["sudo", "-n"]
+    reason = getattr(first_error, "strerror", None) or str(first_error)
+    try:
+        sudo = sudo_argv(allow_prompt=allow_prompt)
+    except AbortError as e:
+        raise PermissionError(f"Cannot {action} {path}: {reason}. {e}") from None
     proc = subprocess.run(
         [*sudo, *argv],
         input=stdin_bytes,
@@ -1268,7 +1308,6 @@ def _privileged_fs(
 
     stderr_lines = (proc.stderr or b"").decode(errors="replace").strip().splitlines()
     detail = stderr_lines[-1] if stderr_lines else f"sudo exited {proc.returncode}"
-    reason = getattr(first_error, "strerror", None) or str(first_error)
     raise PermissionError(
         f"Cannot {action} {path}: {reason}. Elevation was refused as well "
         f"({detail}). Either run this command as root, or give {_current_user()} "
@@ -1440,7 +1479,6 @@ def privileged_rmtree(path: str | Path, *, allow_prompt: bool = False) -> None:
     -- so callers keep their own guard around it rather than this swallowing the
     error and reporting a cleanup that did not happen.
     """
-    import shutil
 
     path = Path(path)
     return _privileged_fs(
