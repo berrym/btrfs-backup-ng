@@ -419,12 +419,19 @@ class TestSudoersPolicies:
     """
 
     #: (label, sudoers body, must the payload arrive?)
+    # (label, sudoers, must_arrive, asks_for_password). A host whose rule wants a
+    # password takes the prefixed path and `sudo -S` prompts on stderr; only a
+    # NOPASSWD rule takes the scoped `sudo -n` path and prompts for nothing.
+    # Asserting the prompt is what tells the two paths apart: both deliver.
+    # None: not asserted -- with no rights, sudo prompts first and refuses
+    # after, sudo-rs refuses without prompting.
     POLICIES = [
-        ("full-sudo-caching", "bbng ALL=(ALL) ALL", True),
-        ("btrfs-only-caching", "bbng ALL=(ALL) /usr/bin/btrfs", True),
+        ("full-sudo-caching", "bbng ALL=(ALL) ALL", True, True),
+        ("btrfs-only-caching", "bbng ALL=(ALL) /usr/bin/btrfs", True, True),
         (
             "full-sudo-no-caching",
             "bbng ALL=(ALL) ALL\nDefaults:bbng timestamp_timeout=0",
+            True,
             True,
         ),
         # Was the one policy nothing could serve: sudo wants the password for
@@ -434,30 +441,40 @@ class TestSudoersPolicies:
             "btrfs-only-no-caching",
             "bbng ALL=(ALL) /usr/bin/btrfs\nDefaults:bbng timestamp_timeout=0",
             True,
+            True,
         ),
+        ("btrfs-only-nopasswd", "bbng ALL=(ALL) NOPASSWD: /usr/bin/btrfs", True, False),
         # A host that grants nothing useful must FAIL, and fail loudly. Without
         # this the table could be satisfied by a command that elevated
         # everything, which is the defect these cells exist to prevent.
-        ("no-sudo-rights", "bbng ALL=(ALL) /bin/false", False),
+        ("no-sudo-rights", "bbng ALL=(ALL) /bin/false", False, None),
     ]
 
     #: /bin/sh differs across these three, and this project has shipped two bugs
     #: from exactly that difference.
-    IMAGES = ["fedora:latest", "debian:stable-slim", "alpine:latest"]
+    # ubuntu:26.04 for its uutils dd, which reads a zero-padded count as octal.
+    IMAGES = ["fedora:latest", "debian:stable-slim", "alpine:latest", "ubuntu:26.04"]
+    # Longer than nine bytes, so a count read as octal ("0010" -> 8) shows.
+    PASSWORD = "hunter2-and-more"
 
     @requires_container
     @pytest.mark.parametrize("image", IMAGES)
-    @pytest.mark.parametrize("label,sudoers,must_arrive", POLICIES)
+    @pytest.mark.parametrize("label,sudoers,must_arrive,asks_for_password", POLICIES)
     def test_the_emitted_receive_command_under_a_sudoers_policy(
-        self, tmp_path, image, label, sudoers, must_arrive
+        self, tmp_path, image, label, sudoers, must_arrive, asks_for_password
     ):
-        from btrfs_backup_ng.endpoint.ssh import _build_receive_command
+        from btrfs_backup_ng.endpoint.ssh import (
+            _build_receive_command,
+            _frame_sudo_password,
+        )
 
         from .conftest import run_in_container
 
         emitted = _build_receive_command(
             "/backup/dest", use_sudo=True, password_on_stdin=True, decompress="gzip"
         )
+        # Sent exactly as the product sends it to a compressed receive.
+        frame = _frame_sudo_password(self.PASSWORD)
         command_file = tmp_path / "emitted.txt"
         command_file.write_text(emitted)
 
@@ -472,7 +489,7 @@ else
     apt-get -qq install -y sudo gzip >/dev/null 2>&1
 fi
 useradd -m bbng 2>/dev/null || adduser -D bbng 2>/dev/null
-echo 'bbng:hunter2' | chpasswd
+printf 'bbng:%s\n' "$PW" | chpasswd
 mkdir -p /backup
 cat > /usr/bin/btrfs <<'STUB'
 #!/bin/sh
@@ -486,22 +503,30 @@ printf '%b
 ' "$SUDOERS" > /etc/sudoers.d/bbng
 chmod 440 /etc/sudoers.d/bbng
 CMD=$(cat /emitted.txt)
-{ printf 'hunter2
-'; cat /tmp/data.gz; } | runuser -u bbng -- sh -c "$CMD" >/dev/null 2>&1 || true
+{ printf '%s' "$PW_FRAME"; cat /tmp/data.gz; } | runuser -u bbng -- sh -c "$CMD" >/dev/null 2>/tmp/err.txt || true
 echo "DELIVERED:$(cat /tmp/received.bin 2>/dev/null || echo NOTHING)"
+# "[sudo] password for bbng:" from sudo, "[sudo: authenticate] Password:" from sudo-rs.
+if grep -qiE 'password for|Password:' /tmp/err.txt; then echo "PROMPTED:yes"; else echo "PROMPTED:no"; fi
+echo "STDERR:$(tr '\n' ' ' < /tmp/err.txt)"
 """
         result = run_in_container(
             image,
-            f"SUDOERS={shlex.quote(sudoers)}; {script}",
+            f"SUDOERS={shlex.quote(sudoers)}; PW={shlex.quote(self.PASSWORD)}; "
+            f"PW_FRAME={shlex.quote(frame)}; {script}",
             mounts={str(command_file): "/emitted.txt"},
         )
         arrived = "DELIVERED:PAYLOAD-BYTES-THAT-MUST-SURVIVE" in result.stdout
+        detail = f"stdout: {result.stdout[-1500:]}\nstderr: {result.stderr[-1500:]}"
 
-        if must_arrive:
-            assert arrived, (
-                f"{image} / {label}: the backup did not arrive.\n"
-                f"stdout: {result.stdout[-1500:]}\nstderr: {result.stderr[-1500:]}"
+        if asks_for_password is not None:
+            assert ("PROMPTED:yes" in result.stdout) == asks_for_password, (
+                f"{image} / {label}: expected the sudo password prompt "
+                f"{'present' if asks_for_password else 'absent'}, so the "
+                f"{'prefixed' if asks_for_password else 'scoped'} path did not "
+                f"run.\n{detail}"
             )
+        if must_arrive:
+            assert arrived, f"{image} / {label}: the backup did not arrive.\n{detail}"
         else:
             assert not arrived, (
                 f"{image} / {label} now works. That is good news, but this cell "
@@ -560,6 +585,7 @@ class TestCompressedRestoreSendUnderEachShell:
         "fedora:latest": "bash",
         "debian:stable-slim": "dash",
         "alpine:latest": "busybox",
+        "ubuntu:26.04": "dash",
     }
 
     @requires_container

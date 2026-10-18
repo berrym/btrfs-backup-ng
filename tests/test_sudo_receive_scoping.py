@@ -12,6 +12,8 @@ password line instead ("not in gzip format", measured) and break every
 password-sudo transfer, not just restricted ones.
 """
 
+import re
+
 from btrfs_backup_ng.endpoint.ssh import _build_receive_command
 
 DEST = "/backup/dest"
@@ -39,20 +41,18 @@ def test_the_decompressor_never_precedes_the_password_reader():
 def test_the_password_is_read_before_anything_consumes_the_stream():
     command = _cmd(use_sudo=True, password_on_stdin=True, decompress="gzip")
 
-    assert command.index("read -r __bbng_pw") < command.index("gzip -dc")
+    assert command.index('dd bs=1 count="$__bbng_n"') < command.index("gzip -dc")
 
 
-def test_priming_happens_inside_the_backgrounded_group():
-    """With no tty, sudo keys its credential ticket on the PARENT PID. The
-    transfer runs in a backgrounded subshell, so priming outside that subshell
-    records a ticket its `sudo -n` cannot see -- measured as "a password is
-    required" on bash and dash, payload never delivered."""
+def test_the_decision_is_made_inside_the_backgrounded_group():
+    """The probe and both branches run in the group that `exec 3<&0` feeds, so
+    the stream they read is the transfer and nothing primes a credential cache
+    outside it: with no tty sudo keys its ticket on the parent process, and a
+    prime in a pipeline stage was measured never to take effect."""
     command = _cmd(use_sudo=True, password_on_stdin=True, decompress="gzip")
 
-    assert command.index("exec 3<&0") < command.index("sudo -S -v"), (
-        "credential priming runs before the subshell is created, so the ticket "
-        "is recorded against the wrong parent pid"
-    )
+    assert command.index("exec 3<&0") < command.index("sudo -n btrfs --version")
+    assert "sudo -S -v" not in command
 
 
 def test_the_capability_probe_cannot_consume_the_stream():
@@ -71,8 +71,9 @@ def test_the_fallback_prefixes_the_decompressed_stream():
     `sudo -S` eats that line and btrfs receive gets the decompressed stream."""
     command = _cmd(use_sudo=True, password_on_stdin=True, decompress="gzip")
 
-    assert '{ printf "%s\\n" "$__bbng_pw"; gzip -dc; } | sudo -S btrfs receive' in (
-        command
+    assert (
+        '{ dd bs=1 count="$__bbng_n" 2>/dev/null; gzip -dc; } | sudo -S btrfs receive'
+        in command
     ), "the fallback does not prefix the decompressed stream with the password"
 
 
@@ -86,14 +87,17 @@ def test_no_path_ever_elevates_a_shell():
     assert "sudo sh" not in command
 
 
-def test_the_password_never_reaches_a_process_argument_list():
-    """printf is a builtin in dash, bash and busybox ash (checked in all three),
-    so the value stays out of `ps`. `echo` would also mangle a backslash."""
+def test_the_password_is_never_held_by_the_shell():
+    """dd passes each copy of the password straight to sudo, so it can reach
+    neither an argument list nor a `$(...)`, where Fedora's dash 0.5.13.1
+    damaged non-ASCII bytes. The one value taken off stdin into the shell is
+    the four-digit count."""
     command = _cmd(use_sudo=True, password_on_stdin=True, decompress="gzip")
 
-    assert 'printf "%s\\n" "$__bbng_pw"' in command
-    assert "echo $__bbng_pw" not in command
-    assert 'echo "$__bbng_pw"' not in command
+    assert "__bbng_pw" not in command
+    substitutions = re.findall(r"\$\((?!\()", command)  # not $(( arithmetic
+    assert len(substitutions) == 1, substitutions
+    assert "__bbng_n=$(dd bs=1 count=4 2>/dev/null)" in command
 
 
 def test_a_passwordless_host_is_untouched():

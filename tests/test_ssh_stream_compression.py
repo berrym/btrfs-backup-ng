@@ -31,7 +31,9 @@ import os
 import re
 import shlex
 import signal
+import shutil
 import subprocess
+import sys
 import time
 import collections
 import io
@@ -42,7 +44,13 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from btrfs_backup_ng.core.transfer import COMPRESSION_PROGRAMS
-from btrfs_backup_ng.endpoint.ssh import SSHEndpoint, _build_receive_command
+from btrfs_backup_ng.endpoint.ssh import (
+    SSHEndpoint,
+    _build_receive_command,
+    _frame_sudo_password,
+)
+
+from .lockshell import shell_params
 
 DEST = "/backups/home"
 
@@ -447,15 +455,15 @@ class TestEveryTransferStrategyIsCovered:
 
         The command no longer nests the pipeline inside `sudo sh -c` to arrange
         that -- asking sudoers for permission to run a shell is what broke a
-        btrfs-only policy. The password is taken off stdin by `read` before any
-        decompressor starts, and where it must still be spent it is prefixed to
-        the decompressor's OUTPUT, which is sudo's stdin.
+        btrfs-only policy. The password is taken off stdin by `dd`, exactly its
+        bytes, before any decompressor starts, and where it must still be spent its second copy is
+        prefixed to the decompressor's OUTPUT, which is sudo's stdin.
         """
         cmd = _build_receive_command(
             DEST, use_sudo=True, password_on_stdin=True, decompress="zstd"
         )
-        assert cmd.index("read -r __bbng_pw") < cmd.index("zstd -dc"), cmd
-        fallback = re.search(r"\{ printf[^|]*\| sudo -S btrfs receive", cmd)
+        assert cmd.index('dd bs=1 count="$__bbng_n"') < cmd.index("zstd -dc"), cmd
+        fallback = re.search(r"\{ dd bs=1[^|]*\| sudo -S btrfs receive", cmd)
         assert fallback, cmd
         assert "zstd -dc" in fallback.group(0), (
             f"the decompressor is not inside the prefixed group: {fallback.group(0)}"
@@ -739,6 +747,7 @@ class TestTheCompressedRemoteCommandIsSupervised:
             pass
         return "\n".join(lines) or "(no processes left in the session)"
 
+    @pytest.mark.requires_tool("zstd")
     def test_an_ignored_signal_at_entry_would_defeat_the_trap(self, tmp_path):
         """The reason the shell must start with default dispositions: started
         with SIGHUP ignored -- as under nohup -- the very same command keeps
@@ -776,6 +785,7 @@ class TestTheCompressedRemoteCommandIsSupervised:
             proc.wait()
 
     @pytest.mark.requires_tool("ps")
+    @pytest.mark.requires_tool("zstd")
     @pytest.mark.parametrize(
         "sig", [signal.SIGHUP, signal.SIGTERM], ids=lambda s: signal.Signals(s).name
     )
@@ -829,6 +839,7 @@ class TestTheCompressedRemoteCommandIsSupervised:
         )
         assert not survivors, f"orphans left behind after {sig!r}: {survivors}"
 
+    @pytest.mark.requires_tool("zstd")
     def test_a_failing_receive_is_still_a_failure(self, tmp_path):
         """Supervision must not swallow the status -- that is the bug this whole
         area keeps producing: a failed check reported as a clean result."""
@@ -841,6 +852,7 @@ class TestTheCompressedRemoteCommandIsSupervised:
         )
         assert result.returncode != 0
 
+    @pytest.mark.requires_tool("zstd")
     def test_a_succeeding_receive_still_reports_success(self, tmp_path):
         env = self._shims(tmp_path)
         cmd = _build_receive_command("/backups", use_sudo=True, decompress="zstd")
@@ -1025,8 +1037,12 @@ class TestTheDestinationSurvivesBothShells:
         env = {**os.environ, "PATH": f"{tmp_path}:{os.environ['PATH']}"}
 
         cmd = _build_receive_command(dest, **kwargs)
+        stream = b"x" * 256
+        if kwargs.get("password_on_stdin"):
+            # As the product sends it: the framed password ahead of the stream.
+            stream = os.fsencode(_frame_sudo_password("pw")) + stream
         subprocess.run(
-            ["/bin/sh", "-c", cmd], input=b"x" * 256, capture_output=True, env=env
+            ["/bin/sh", "-c", cmd], input=stream, capture_output=True, env=env
         )
         argv = record.read_text().splitlines() if record.exists() else []
         return dest, argv, marker.exists()
@@ -1034,11 +1050,18 @@ class TestTheDestinationSurvivesBothShells:
     @pytest.mark.parametrize(
         "kwargs",
         [
-            {"use_sudo": True},
-            {"use_sudo": True, "decompress": "zstd"},
-            {"use_sudo": True, "password_on_stdin": True, "decompress": "zstd"},
+            pytest.param({"use_sudo": True}, id="plain"),
+            pytest.param(
+                {"use_sudo": True, "decompress": "zstd"},
+                id="compressed",
+                marks=pytest.mark.requires_tool("zstd"),
+            ),
+            pytest.param(
+                {"use_sudo": True, "password_on_stdin": True, "decompress": "zstd"},
+                id="compressed-password-sudo",
+                marks=pytest.mark.requires_tool("zstd"),
+            ),
         ],
-        ids=["plain", "compressed", "compressed-password-sudo"],
     )
     def test_the_path_arrives_intact_and_nothing_is_injected(self, tmp_path, kwargs):
         dest, argv, injected = self._run_and_capture(tmp_path, **kwargs)
@@ -1123,27 +1146,100 @@ class TestThePayloadActuallyReachesTheRemote:
     the argv is what let the bug ship.
     """
 
-    SHELLS = [sh for sh in ("/bin/sh", "/bin/bash", "/bin/dash") if os.path.exists(sh)]
+    # Lengths either side of the octal trap (a zero-padded "0008" is not a
+    # number to uutils dd, "0010" is eight), and contents a shell could mangle.
+    PASSWORDS = [
+        pytest.param("hunter2", id="7-bytes"),
+        pytest.param("eightchr", id="8-bytes"),
+        pytest.param("nine-char", id="9-bytes"),
+        pytest.param("ten-chars!", id="10-bytes"),
+        pytest.param("x" * 300, id="300-bytes"),
+        pytest.param("pässwörd-€", id="non-ascii"),
+        # Where a 0x81-0x88 byte opens one of dash's 128-byte reads: Fedora's
+        # dash 0.5.13.1 added a byte there to a value held in a `$(...)`.
+        pytest.param("a" * 126 + "€", id="non-ascii-at-126"),
+        pytest.param("a" * 127 + "€", id="non-ascii-at-127"),
+        pytest.param("€" * 50, id="non-ascii-throughout"),
+        pytest.param("ends with space ", id="trailing-space"),
+        pytest.param("back\\slash %s $(id) 'q\"", id="shell-characters"),
+    ]
 
-    def _deliver(self, shell, tmp_path, **kwargs):
-        """Run the emitted command and report how many bytes reached btrfs."""
+    @staticmethod
+    def _bin(tmp_path, shell, sudo_n_refuses=False, sh_prelude=""):
+        """A bin directory to put first on PATH: ``shell`` installed AS ``sh``,
+        and stand-ins for sudo, btrfs and dd.
+
+        The emitted command execs ``sh -c``, so ``sh`` must be the shell under
+        test. These tests used to run their outer shell by name while ``sh``
+        stayed the machine's own, so on a bash host they never ran dash at all.
+        """
+        bin_dir = tmp_path / "bin"
+        bin_dir.mkdir()
+        real = shutil.which(shell)
+        # A wrapper rather than a symlink, so a prelude can be put in front of
+        # the script; with no prelude it is the shell itself.
+        (bin_dir / "sh").write_text(
+            f'#!/bin/sh\nif [ "$1" = -c ]; then shift; '
+            f'exec {shlex.quote(real)} -c {shlex.quote(sh_prelude)}"$1"; fi\n'
+            f'exec {shlex.quote(real)} "$@"\n'
+        )
         # The real btrfs answers --version without reading stdin; a stub that
         # counts bytes regardless would swallow the payload when the command
         # probes for sudo capability, and report the product as broken.
-        (tmp_path / "btrfs").write_text(
+        (bin_dir / "btrfs").write_text(
             '#!/bin/sh\ncase "${1:-}" in --version) echo v6.17; exit 0;; esac\nwc -c\n'
         )
-        # `read` takes EXACTLY one line, as sudo -S does; `head -n 1` would read a
-        # block and swallow part of the stream.
-        (tmp_path / "sudo").write_text(
+        # As strict as uutils dd, the default on Ubuntu 26.04, which reads a
+        # count with a leading zero as octal: refused here outright, so the
+        # remote script is held to plain decimal counts on every machine.
+        (bin_dir / "dd").write_text(
             "#!/bin/sh\n"
-            'if [ "$1" = "-S" ]; then shift; IFS= read -r _pw; fi\n'
-            'while [ "${1#-}" != "$1" ]; do shift; done\n'
-            'exec "$@"\n'
+            'for a in "$@"; do case "$a" in count=0?*) '
+            'echo "dd: invalid number: ${a#count=}" >&2; exit 1;; esac; done\n'
+            f'exec {shlex.quote(shutil.which("dd"))} "$@"\n'
         )
-        for name in ("btrfs", "sudo"):
-            (tmp_path / name).chmod(0o755)
+        # Takes a password the way sudo -S does: byte by byte up to the newline,
+        # so it never reads into the stream behind it, and records it, so a test
+        # can see what sudo was given. Not in shell, whose `read` is what this
+        # class is about. `sudo -n` can be made to refuse, as it does on a host
+        # whose rule wants a password, which sends the command down the
+        # prefixed path; where it is accepted the host is one with NOPASSWD.
+        (bin_dir / "sudo").write_text(
+            f"#!{sys.executable}\n"
+            "import os, sys\n"
+            "args = sys.argv[1:]\n"
+            f"if args[:1] == ['-n'] and {sudo_n_refuses!r}:\n"
+            "    sys.exit('sudo: a password is required')\n"
+            "if args[:1] == ['-S']:\n"
+            "    line = b''\n"
+            "    while (c := os.read(0, 1)) not in (b'\\n', b''):\n"
+            "        line += c\n"
+            f"    with open({str(bin_dir / 'passwords')!r}, 'ab') as f:\n"
+            "        f.write(line + b'\\n')\n"
+            "while args and args[0].startswith('-'):\n"
+            "    args = args[1:]\n"
+            "if args:\n"
+            "    os.execvp(args[0], args)\n"
+        )
+        for name in ("sh", "btrfs", "dd", "sudo"):
+            (bin_dir / name).chmod(0o755)
+        return bin_dir
 
+    def _deliver(
+        self,
+        shell,
+        tmp_path,
+        sudo_n_refuses=False,
+        sh_prelude="",
+        password="hunter2",
+        frame=None,
+        **kwargs,
+    ):
+        """Run the emitted command; return the bytes that reached btrfs, every
+        password sudo was given, and the command's stderr."""
+        bin_dir = self._bin(tmp_path, shell, sudo_n_refuses, sh_prelude)
+        # Zeros compress to a stream full of NUL bytes: the input dash 0.5.13's
+        # `read` over-consumed.
         payload = b"\0" * 4096
         blob = subprocess.run(
             COMPRESSION_PROGRAMS["gzip"]["compress"],
@@ -1152,49 +1248,138 @@ class TestThePayloadActuallyReachesTheRemote:
             check=True,
         ).stdout
         if kwargs.get("password_on_stdin"):
-            blob = b"hunter2\n" + blob
+            if frame is None:
+                frame = os.fsencode(_frame_sudo_password(password))
+            blob = frame + blob
 
         result = subprocess.run(
-            [shell, "-c", _build_receive_command(DEST, **kwargs)],
+            [str(bin_dir / "sh"), "-c", _build_receive_command(DEST, **kwargs)],
             input=blob,
             capture_output=True,
-            env={**os.environ, "PATH": f"{tmp_path}:{os.environ['PATH']}"},
+            env={**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}"},
+            timeout=60,
         )
         digits = result.stdout.decode(errors="replace").strip().split()
-        return int(digits[0]) if digits and digits[0].isdigit() else 0
+        recorded = bin_dir / "passwords"
+        given = recorded.read_bytes().split(b"\n")[:-1] if recorded.exists() else []
+        delivered = int(digits[0]) if digits and digits[0].isdigit() else 0
+        return delivered, given, result.stderr.decode(errors="replace")
 
-    @pytest.mark.parametrize("shell", SHELLS)
+    @pytest.mark.parametrize("shell", shell_params())
     def test_a_compressed_stream_arrives_whole(self, shell, tmp_path):
-        delivered = self._deliver(shell, tmp_path, use_sudo=True, decompress="gzip")
+        delivered, _, _ = self._deliver(
+            shell, tmp_path, use_sudo=True, decompress="gzip"
+        )
         assert delivered == 4096, (
             f"{shell} delivered {delivered} of 4096 bytes to btrfs receive; a "
             f"backgrounded pipeline loses stdin unless it is redirected back"
         )
 
-    @pytest.mark.parametrize("shell", SHELLS)
-    def test_the_password_form_delivers_too(self, shell, tmp_path):
-        delivered = self._deliver(
+    @pytest.mark.parametrize("password", PASSWORDS)
+    @pytest.mark.parametrize("shell", shell_params())
+    def test_a_password_host_gets_the_line_then_the_stream(
+        self, shell, password, tmp_path
+    ):
+        """`sudo -n` is refused, so the line is prefixed to the decompressed
+        stream and `sudo -S btrfs receive` reads it: sudo must be given the
+        password exactly, once, and btrfs the whole stream."""
+        delivered, given, _ = self._deliver(
             shell,
             tmp_path,
+            sudo_n_refuses=True,
+            password=password,
+            use_sudo=True,
+            password_on_stdin=True,
+            decompress="gzip",
+        )
+        assert delivered == 4096, f"{shell} delivered {delivered} of 4096 bytes"
+        assert given == [os.fsencode(password)], given
+
+    @pytest.mark.parametrize("password", PASSWORDS)
+    @pytest.mark.parametrize("shell", shell_params())
+    def test_a_nopasswd_host_discards_the_line(self, shell, password, tmp_path):
+        """`sudo -n` works, so the line is taken off the stream and dropped, sudo
+        -S is never asked, and btrfs receive gets the whole stream."""
+        delivered, given, _ = self._deliver(
+            shell,
+            tmp_path,
+            password=password,
+            use_sudo=True,
+            password_on_stdin=True,
+            decompress="gzip",
+        )
+        assert delivered == 4096, f"{shell} delivered {delivered} of 4096 bytes"
+        assert given == [], given
+
+    @pytest.mark.parametrize("shell", shell_params())
+    def test_a_header_that_is_not_a_count_stops_before_sudo(self, shell, tmp_path):
+        """Four bytes that are not digits mean there is no frame: the command
+        says so and asks sudo nothing, rather than failing on arithmetic."""
+        delivered, given, err = self._deliver(
+            shell,
+            tmp_path,
+            sudo_n_refuses=True,
+            frame=b"abcd" + b"hunter2\n",
+            use_sudo=True,
+            password_on_stdin=True,
+            decompress="gzip",
+        )
+        assert (delivered, given) == (0, [])
+        assert "no sudo password frame on stdin" in err, err
+
+    @pytest.mark.parametrize("shell", shell_params())
+    def test_the_password_passes_through_no_shell_command(self, shell, tmp_path):
+        """dd hands each copy straight to sudo. A shell that held the password
+        would have to print it again -- the route by which Fedora's dash damaged
+        it -- so printf and echo record what they are given, and the password
+        must not be among it."""
+        record = tmp_path / "printed"
+        prelude = (
+            f'printf() {{ echo_args="$*"; command printf \'%s\\n\' "$echo_args" '
+            f'>> {shlex.quote(str(record))}; command printf "$@"; }}; '
+            f"echo() {{ command printf '%s\\n' \"$*\" >> {shlex.quote(str(record))}; "
+            'command echo "$@"; }; '
+        )
+        delivered, given, _ = self._deliver(
+            shell,
+            tmp_path,
+            sudo_n_refuses=True,
+            sh_prelude=prelude,
+            password="hunter2-and-more",
+            use_sudo=True,
+            password_on_stdin=True,
+            decompress="gzip",
+        )
+        assert delivered == 4096 and given
+        printed = record.read_text() if record.exists() else ""
+        assert "hunter2-and-more" not in printed, printed
+
+    @pytest.mark.parametrize("shell", shell_params())
+    def test_no_shell_read_takes_the_password(self, shell, tmp_path):
+        """Whatever reads the password line must read nothing more. A shell's
+        `read` may read ahead -- dash 0.5.13.0-0.5.13.4 lose one byte per NUL
+        behind the line -- so the remote script must not use it at all. This
+        holds the script to that on every machine, whatever its dash: `read`
+        is made to fail."""
+        delivered, _, _ = self._deliver(
+            shell,
+            tmp_path,
+            sudo_n_refuses=True,
+            sh_prelude='read() { echo "read was called" >&2; exit 97; }; ',
             use_sudo=True,
             password_on_stdin=True,
             decompress="gzip",
         )
         assert delivered == 4096, f"{shell} delivered {delivered} of 4096 bytes"
 
-    @pytest.mark.parametrize("shell", SHELLS)
+    @pytest.mark.parametrize("shell", shell_params())
     def test_the_uncompressed_form_is_unaffected(self, shell, tmp_path):
-        (tmp_path / "btrfs").write_text("#!/bin/sh\nwc -c\n")
-        (tmp_path / "sudo").write_text(
-            '#!/bin/sh\nwhile [ "${1#-}" != "$1" ]; do shift; done\nexec "$@"\n'
-        )
-        for name in ("btrfs", "sudo"):
-            (tmp_path / name).chmod(0o755)
+        bin_dir = self._bin(tmp_path, shell)
         result = subprocess.run(
-            [shell, "-c", _build_receive_command(DEST, use_sudo=True)],
+            [str(bin_dir / "sh"), "-c", _build_receive_command(DEST, use_sudo=True)],
             input=b"\0" * 4096,
             capture_output=True,
-            env={**os.environ, "PATH": f"{tmp_path}:{os.environ['PATH']}"},
+            env={**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}"},
         )
         digits = result.stdout.decode(errors="replace").strip().split()
         assert digits and digits[0] == "4096", result.stdout

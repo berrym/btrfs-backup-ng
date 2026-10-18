@@ -9,6 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A compressed backup to an `ssh://` target failed when the remote's `sh`
+  was dash 0.5.13.0 to 0.5.13.4.** With `ssh_sudo` and a remote sudo that
+  wants a password, the receive took the password line off its input with
+  the shell's `read` and handed the rest to the decompressor. Those dash
+  versions read one byte past the line for every NUL byte behind it, so the
+  compressed stream lost its first bytes and the decompressor rejected it.
+  The transfer failed and nothing was written; backups already made are not
+  affected. The password is now sent with its length in front and taken
+  with `dd` by byte count, which reads nothing past it in any shell, and
+  `dd` hands it straight to the sudo that reads it, so the remote shell
+  never holds it. That also avoids a second fault: Fedora's dash 0.5.13.1
+  could add a byte to a non-ASCII password kept in a shell variable, so
+  sudo refused it. On a host whose rule wants a password the line is
+  prefixed to the decompressed stream for `sudo -S btrfs receive`; only a
+  NOPASSWD rule takes the `sudo -n` path. A sudo
+  password containing a newline or carriage return is now refused with a
+  message saying so: sudo would use only the part before it and the rest
+  would be sent into the stream. A value read from a file with Windows line
+  endings ends in a carriage return (#115).
 - **The unit tests ran the real `sudo`.** The product retries a privileged
   call through `sudo -n` when the direct one fails, and in a unit test it
   usually fails, so a test run reached the real sudo about 250 times: as
