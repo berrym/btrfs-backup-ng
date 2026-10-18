@@ -10,15 +10,33 @@ from pathlib import Path
 
 import pytest
 
+# tests/test_skip_probes_are_bounded.py imports this file as a top-level
+# module, where a relative import has no package.
+try:
+    from .toolmarks import KNOWN_TOOLS
+except ImportError:
+    from toolmarks import KNOWN_TOOLS
+
 # Which missing tools fail the tests that need them instead of skipping them:
 # "1" for every tool, or a comma-separated list of names, as a package build
 # lists what it installed. Unset, empty or "0", every missing tool skips.
 REQUIRE_TOOLS_ENV = "BBNG_TEST_REQUIRE_TOOLS"
 
+# PATH as the run started. The lookups below must not see the stand-ins a
+# fixture puts first on PATH for each test, whichever hook runs first.
+_PATH_AT_START = os.environ.get("PATH", os.defpath)
 
-def _required_tools() -> tuple[bool, frozenset[str]]:
+_REQUIRED = pytest.StashKey[tuple[bool, frozenset[str]]]()
+_UNUSED = pytest.StashKey[frozenset[str]]()
+
+
+def _tool_is_installed(tool: str) -> bool:
+    return shutil.which(tool, path=_PATH_AT_START) is not None
+
+
+def _parse_required(value: str) -> tuple[bool, frozenset[str]]:
     """``(every tool, the named tools)`` that ``BBNG_TEST_REQUIRE_TOOLS`` asks for."""
-    value = os.environ.get(REQUIRE_TOOLS_ENV, "").strip()
+    value = value.strip()
     if value in ("", "0"):
         return False, frozenset()
     if value == "1":
@@ -26,8 +44,30 @@ def _required_tools() -> tuple[bool, frozenset[str]]:
     return False, frozenset(name.strip() for name in value.split(",") if name.strip())
 
 
-def _is_required(tool: str) -> bool:
-    every, named = _required_tools()
+def pytest_configure(config: pytest.Config) -> None:
+    every, named = _parse_required(os.environ.get(REQUIRE_TOOLS_ENV, ""))
+    unknown = named - KNOWN_TOOLS
+    if unknown:
+        raise pytest.UsageError(
+            f"{REQUIRE_TOOLS_ENV} names {', '.join(sorted(unknown))}, which no test "
+            f"can require; the tools tests may require are listed in "
+            f"tests/toolmarks.py: {', '.join(sorted(KNOWN_TOOLS))}"
+        )
+    config.stash[_REQUIRED] = (every, named)
+    config.stash[_UNUSED] = frozenset()
+
+
+def pytest_report_header(config: pytest.Config) -> str | None:
+    every, named = config.stash[_REQUIRED]
+    if every:
+        return f"{REQUIRE_TOOLS_ENV}: every tool a test requires must be installed"
+    if named:
+        return f"{REQUIRE_TOOLS_ENV}: {', '.join(sorted(named))}"
+    return None
+
+
+def _is_required(config: pytest.Config, tool: str) -> bool:
+    every, named = config.stash[_REQUIRED]
     return every or tool in named
 
 
@@ -38,48 +78,72 @@ def _tools_of(item: pytest.Item) -> Iterator[tuple[str, str]]:
         yield tool, marker.kwargs.get("reason", f"{tool} is not installed")
 
 
-@pytest.hookimpl(tryfirst=True)
-def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
+def _verdict(item: pytest.Item, tool: str, reason: str) -> tuple[str, str] | None:
+    """The one decision: None where the tool is installed, ``("fail", why)``
+    where it is missing and required, ``("skip", why)`` where it is missing."""
+    if _tool_is_installed(tool):
+        return None
+    if _is_required(item.config, tool):
+        return "fail", f"{reason}, and {REQUIRE_TOOLS_ENV} requires it"
+    return "skip", reason
+
+
+def pytest_collection_modifyitems(
+    config: pytest.Config, items: list[pytest.Item]
+) -> None:
     """Skip a test whose ``@pytest.mark.requires_tool(name)`` is missing.
 
     A test that runs an external program for real proves nothing where the
     program is missing. Skipping through a mark reports the reason at the test
-    itself in the ``-rs`` summary. A tool ``BBNG_TEST_REQUIRE_TOOLS`` names is
-    not skipped; ``pytest_runtest_setup`` fails the test instead.
-
-    Runs before deselection, so a name in the list is checked against every
-    test collected: one no test uses is a misspelling that would otherwise
-    enforce nothing.
+    itself in the ``-rs`` summary. A test is not skipped when any of its tools
+    is missing and required: ``pytest_runtest_setup`` fails it instead, so a
+    skip for one missing tool cannot hide a required one on the same test.
     """
-    used = {tool for item in items for tool, _ in _tools_of(item)}
-    unknown = _required_tools()[1] - used
-    if unknown:
-        raise pytest.UsageError(
-            f"{REQUIRE_TOOLS_ENV} names {', '.join(sorted(unknown))}, which no "
-            f"collected test requires; tools the tests require: "
-            f"{', '.join(sorted(used))}"
-        )
+    used: set[str] = set()
     for item in items:
-        for tool, reason in _tools_of(item):
-            if shutil.which(tool) is None and not _is_required(tool):
-                item.add_marker(pytest.mark.skip(reason=reason))
+        verdicts = [_verdict(item, tool, reason) for tool, reason in _tools_of(item)]
+        used.update(tool for tool, _ in _tools_of(item))
+        if any(v is not None and v[0] == "fail" for v in verdicts):
+            continue
+        for v in verdicts:
+            if v is not None:
+                item.add_marker(pytest.mark.skip(reason=v[1]))
                 break
+    unregistered = used - KNOWN_TOOLS
+    if unregistered:
+        raise pytest.UsageError(
+            f"requires_tool names {', '.join(sorted(unregistered))}, which "
+            f"tests/toolmarks.py does not list in KNOWN_TOOLS; add it there"
+        )
+    config.stash[_UNUSED] = config.stash[_REQUIRED][1] - used
+
+
+def pytest_terminal_summary(
+    terminalreporter: pytest.TerminalReporter, config: pytest.Config
+) -> None:
+    unused = config.stash.get(_UNUSED, frozenset())
+    if unused:
+        terminalreporter.write_line(
+            f"note: {REQUIRE_TOOLS_ENV} names {', '.join(sorted(unused))}, which no "
+            "selected test requires"
+        )
 
 
 def pytest_runtest_setup(item: pytest.Item) -> None:
     """Fail a test whose tool is missing when ``BBNG_TEST_REQUIRE_TOOLS`` requires it."""
     for tool, reason in _tools_of(item):
-        if shutil.which(tool) is None and _is_required(tool):
-            pytest.fail(f"{reason}, and {REQUIRE_TOOLS_ENV} requires it", pytrace=False)
+        verdict = _verdict(item, tool, reason)
+        if verdict is not None and verdict[0] == "fail":
+            pytest.fail(verdict[1], pytrace=False)
 
 
 @pytest.fixture
-def tool_unusable() -> Callable[[str, str], None]:
+def tool_unusable(request: pytest.FixtureRequest) -> Callable[[str, str], None]:
     """Skip a test whose tool is installed but cannot be used here, or fail it
     when ``BBNG_TEST_REQUIRE_TOOLS`` requires that tool."""
 
     def unusable(tool: str, reason: str) -> None:
-        if _is_required(tool):
+        if _is_required(request.config, tool):
             pytest.fail(
                 f"{reason}, and {REQUIRE_TOOLS_ENV} requires {tool}", pytrace=False
             )
@@ -93,9 +157,10 @@ def _in_a_real_tier(node: pytest.Item) -> bool:
     return any(node.get_closest_marker(tier) for tier in ("tier2", "tier3"))
 
 
-# Takes only what the product passes to a local sudo. An option it does not
-# know is written down and makes the test fail, so a new one is decided on
-# rather than guessed at, and a refusal can never pass for an answer.
+# Takes what the product passes to a local sudo: no option, `-n`, or `--`. An
+# option it does not know, or a VAR=value word, is written down and makes the
+# test fail, so a new form is decided on rather than guessed at, and a refusal
+# can never pass for an answer.
 _SUDO_STAND_IN = """\
 #!/bin/sh
 # Test stand-in for sudo: runs the command as the calling user, never as root.
@@ -107,7 +172,7 @@ while [ $# -gt 0 ]; do
     esac
 done
 case "$1" in
-    ''|-*)
+    ''|-*|*=*)
         printf '%s\\n' "sudo $*" >> "$BBNG_SUDO_STAND_IN_UNSUPPORTED"
         echo "sudo stand-in: cannot run 'sudo $*'" >&2
         exit 1
@@ -182,8 +247,13 @@ def unit_tests_use_the_stand_ins(
     when ``shutil.which("btrfs")`` finds nothing, so every unit test that
     builds one failed there, although none of them runs btrfs. The placeholder
     satisfies the lookup, in the test and in any CLI it starts, and fails like
-    a missing command if run. Where btrfs is installed it is used as before. A
-    test about the missing-btrfs path patches ``shutil.which`` itself.
+    a missing command if run. Where btrfs is installed it is used as before.
+    Tests that run btrfs only to see it fail (about 80 of them, on paths that
+    are not subvolumes) get the placeholder's failure instead of btrfs-progs'
+    and are not affected. A test that must see btrfs-progs' own behaviour marks
+    ``requires_tool("btrfs")``, which is judged against the PATH the run
+    started with; a test about the missing-btrfs path patches ``shutil.which``
+    itself.
 
     Tier 2 and tier 3 use real btrfs and real privilege on purpose and keep
     the real tools.

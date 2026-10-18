@@ -249,7 +249,6 @@ def isolated_gpg(tmp_path, monkeypatch):
         )
 
 
-@pytest.mark.requires_tool("gpg")
 class TestRealGpgPipeline:
     """Prove the raw pipeline produces genuine, decryptable GPG ciphertext -- and
     that a plaintext control is NOT encrypted. This is the end-to-end security
@@ -273,6 +272,7 @@ class TestRealGpgPipeline:
         out = next(p for p in dest.iterdir() if p.name.startswith("r6snap"))
         return out
 
+    @pytest.mark.requires_tool("gpg")
     def test_gpg_output_is_real_ciphertext_and_decrypts(self, tmp_path, isolated_gpg):
         import subprocess
 

@@ -20,6 +20,8 @@ from btrfs_backup_ng.config.schema import (
 )
 from btrfs_backup_ng.core.operations import TransferResult
 
+import pytest
+
 
 def _spy_choose(captured):
     """A choose_endpoint that returns a mock SOURCE endpoint but builds the REAL
@@ -57,6 +59,7 @@ class TestRunThreadsEncryption:
             targets=[target],
         )
 
+    @pytest.mark.requires_tool("gpg")
     def test_encryption_reaches_the_real_destination_endpoint(
         self, tmp_path, monkeypatch
     ):
@@ -163,6 +166,7 @@ class TestTransferThreadsEncryption:
         rc = transfer_mod.execute_transfer(args)
         return rc, captured
 
+    @pytest.mark.requires_tool("gpg")
     def test_encryption_reaches_endpoint_via_transfer_command(
         self, tmp_path, monkeypatch
     ):

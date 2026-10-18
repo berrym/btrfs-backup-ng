@@ -291,6 +291,7 @@ def test_remediate_refuses_existing_encrypted_target(tmp_path, monkeypatch):
 # --------------------------------------------------------------------------- #
 # no-clobber: a pre-existing, non-matching encrypted stream is never overwritten
 # --------------------------------------------------------------------------- #
+@pytest.mark.requires_tool("openssl")
 def test_existing_encrypted_not_clobbered(tmp_path, monkeypatch, capsys):
     monkeypatch.setenv("BTRFS_BACKUP_PASSPHRASE", "rempass")
     _plaintext_backup(tmp_path)

@@ -67,24 +67,31 @@ pytest --cov=src/btrfs_backup_ng --cov-report=term-missing
 pytest tests/test_config_loader.py -v
 ```
 
-Tier 1 needs no root, no btrfs filesystem and no btrfs-progs, and it never
-runs the real `sudo`. Every tier 1 test finds a stand-in first on `PATH` that
-runs the command as you; an option the stand-in does not take fails the
-test. A test of what happens when sudo refuses asks for the `sudo_refuses`
-fixture, which makes the stand-in answer as `sudo -n` does for a user with no
-rule. On a machine without btrfs-progs, a placeholder `btrfs` on the same
-`PATH` satisfies the presence check and fails if it is run.
+Tier 1 needs no root, no btrfs filesystem and no btrfs-progs. Every tier 1
+test finds a stand-in `sudo` first on `PATH` that runs the command as you;
+a form the stand-in does not take fails the test. That is a `PATH`
+convention: a test that starts a child with a `PATH` of its own bypasses it,
+so such a child must not call `sudo`. A test of what happens when sudo
+refuses asks for the `sudo_refuses` fixture, which makes the stand-in answer
+as `sudo -n` does for a user with no rule. On a machine without btrfs-progs,
+a placeholder `btrfs` on the same `PATH` satisfies the presence check and
+fails if it is run; the tests that run `btrfs` only to see it fail (about 80
+of them) are unaffected by that. A test that must see btrfs-progs' own
+behaviour marks `requires_tool("btrfs")`.
 
 A test that runs an external program for real is marked
-`@pytest.mark.requires_tool("name")`. Where the program is missing, the test
-is skipped and the summary prints why. `BBNG_TEST_REQUIRE_TOOLS` turns a
-missing tool into a failure instead: `1` for every tool, or a comma-separated
-list such as `openssl,ps,dash`. A name in the list that no collected test
-requires is reported as an error, so a misspelling cannot quietly enforce
-nothing; when running a subset of the tests, list only what that subset
-uses. CI sets the list of tools its runner provides, and a package build
-should set the list of tools it installs, so that a missing dependency fails
-the build instead of quietly removing tests from it.
+`@pytest.mark.requires_tool("name")`; the names it may use are listed in
+`tests/toolmarks.py`, and `tool_params()` there builds one parameter per
+program for a parametrized test. Where the program is missing, the test is
+skipped and the summary prints why. `BBNG_TEST_REQUIRE_TOOLS` makes a
+missing tool an error instead, and the run fails: `1` for every tool, or a
+comma-separated list such as `openssl,ps,dash` (unset, empty or `0` means
+skip). A name outside `tests/toolmarks.py` stops the run at once, so a
+misspelling cannot quietly enforce nothing; a listed tool that no selected
+test requires is noted in the summary, so a subset of the suite can be run
+with the same list. CI sets the list of tools its runner provides, and a
+package build should set the list of tools it installs, so that a missing
+dependency fails the build instead of quietly removing tests from it.
 
 ### Running Tier 2 Tests (btrfs Integration)
 
