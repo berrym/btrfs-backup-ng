@@ -71,6 +71,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   will ask for a password to run btrfs; `restore --cleanup` says it before
   asking whether to delete anything; an ssh:// send that cannot escalate
   stops at once instead of being reported as a failed transfer.
+- **Restoring an openssl-encrypted backup without openssl asked for the
+  passphrase first.** On a machine with neither openssl nor a passphrase
+  set, the restore said only that a passphrase was needed; once it was
+  set, the restore failed again on the missing openssl. The tools are now
+  checked first and the passphrase once openssl is found, both before the
+  stream is read or, for raw+ssh://, fetched from the remote (#118).
 - **The unit tests ran the real `sudo`.** The product retries a privileged
   call through `sudo -n` when the direct one fails, and in a unit test it
   usually fails, so a test run reached the real sudo about 250 times: as

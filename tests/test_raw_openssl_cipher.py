@@ -18,7 +18,9 @@ sidecar. These tests pin the contract established around that value:
 Each test is written to FAIL if its guard is reverted (mutation-verified).
 """
 
+import os
 import subprocess
+from types import SimpleNamespace
 
 import pytest
 
@@ -209,21 +211,104 @@ def test_malicious_sidecar_cipher_rejected_at_restore(tmp_path, monkeypatch):
 # --------------------------------------------------------------------------- #
 # (2/5) restore without any passphrase fails loud
 # --------------------------------------------------------------------------- #
-def test_restore_without_passphrase_fails_loud(tmp_path, monkeypatch):
-    """Building an openssl restore pipeline with no passphrase env set must
-    raise, not silently run openssl with an empty password. Reverting to the
-    hardcoded ``env:BTRFS_BACKUP_PASSPHRASE`` arg removes the raise -> fails."""
+def _with_stand_in_openssl(tmp_path, monkeypatch):
+    """An `openssl` that is found and accepts any cipher, and no passphrase.
+
+    These tests are about what happens before openssl would run, so it only has
+    to be found; a machine without openssl, where the missing-passphrase check
+    matters as much as anywhere, runs them too.
+    """
+    bin_dir = tmp_path / "stand-in-bin"
+    bin_dir.mkdir()
+    (bin_dir / "openssl").write_text("#!/bin/sh\nexit 0\n")
+    (bin_dir / "openssl").chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
     monkeypatch.delenv("BTRFS_BACKUP_PASSPHRASE", raising=False)
     monkeypatch.delenv("BTRBK_PASSPHRASE", raising=False)
+
+
+def test_restore_without_passphrase_fails_loud(tmp_path, monkeypatch):
+    """A restore of an openssl backup with no passphrase env set must fail
+    before openssl runs with an empty password. Removing the passphrase check
+    from _preflight_restore_tools lets the restore start -> fails."""
+    _with_stand_in_openssl(tmp_path, monkeypatch)
     restore_ep = RawEndpoint(config={"path": str(tmp_path)})
+    stream = tmp_path / "s.btrfs.enc"
+    stream.write_bytes(b"ciphertext")
     snap = RawSnapshot(
         name="s",
-        stream_path=tmp_path / "s.btrfs",
+        stream_path=stream,
         encrypt="openssl_enc",
         openssl_cipher="aes-256-cbc",
     )
-    with pytest.raises(ValueError, match="requires a passphrase"):
-        restore_ep._build_restore_pipeline(snap)
+    with pytest.raises(raw_mod.__util__.AbortError, match="requires a passphrase"):
+        restore_ep.preflight_send(snap)
+
+
+def _without_openssl(tmp_path, monkeypatch):
+    """A PATH holding nothing, so there is no openssl, and no passphrase set."""
+    empty = tmp_path / "empty-bin"
+    empty.mkdir()
+    monkeypatch.setenv("PATH", str(empty))
+    monkeypatch.delenv("BTRFS_BACKUP_PASSPHRASE", raising=False)
+    monkeypatch.delenv("BTRBK_PASSPHRASE", raising=False)
+
+
+def _encrypted(tmp_path):
+    stream = tmp_path / "s.btrfs.enc"
+    stream.write_bytes(b"ciphertext")
+    return RawSnapshot(
+        name="s",
+        stream_path=stream,
+        encrypt="openssl_enc",
+        openssl_cipher="aes-256-cbc",
+    )
+
+
+def test_a_missing_openssl_is_named_before_a_missing_passphrase(tmp_path, monkeypatch):
+    """Told only about the passphrase, an operator set it and was then told
+    about openssl: two failed restores for one machine that lacked two
+    things, the second of which no passphrase could fix (#118)."""
+    _without_openssl(tmp_path, monkeypatch)
+    restore_ep = RawEndpoint(config={"path": str(tmp_path)})
+
+    with pytest.raises(raw_mod.__util__.AbortError) as excinfo:
+        restore_ep.preflight_send(_encrypted(tmp_path))
+
+    msg = str(excinfo.value)
+    assert "'openssl' is required" in msg and "not installed" in msg
+    assert "passphrase" not in msg
+
+
+def test_a_raw_ssh_restore_names_it_before_contacting_the_remote(tmp_path, monkeypatch):
+    _without_openssl(tmp_path, monkeypatch)
+    restore_ep = SSHRawEndpoint(config={"path": "/backup", "hostname": "nas"})
+    contacted: list = []
+    restore_ep._exec_remote_command = lambda *a, **k: contacted.append(a)
+
+    with pytest.raises(raw_mod.__util__.AbortError, match="'openssl' is required"):
+        restore_ep.preflight_send(_encrypted(tmp_path))
+    assert contacted == []
+
+
+def test_a_raw_ssh_restore_without_passphrase_fails_before_contacting_the_remote(
+    tmp_path, monkeypatch
+):
+    _with_stand_in_openssl(tmp_path, monkeypatch)
+    restore_ep = SSHRawEndpoint(config={"path": "/backup", "hostname": "nas"})
+    contacted: list = []
+
+    def remote(*args, **kwargs):
+        # Answers as a reachable remote holding the stream would, so a restore
+        # that skipped the check would go on, rather than fail here by accident.
+        contacted.append(args)
+        return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
+
+    restore_ep._exec_remote_command = remote
+
+    with pytest.raises(raw_mod.__util__.AbortError, match="requires a passphrase"):
+        restore_ep.preflight_send(_encrypted(tmp_path))
+    assert contacted == []
 
 
 # --------------------------------------------------------------------------- #
