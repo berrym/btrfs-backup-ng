@@ -17,6 +17,9 @@ jobs:
       # The remote-command tests run every lock script through a real csh and
       # tcsh login shell; here, a missing one fails them instead of skipping.
       BBNG_REQUIRE_LOGIN_SHELLS: "1"
+      # The tools this runner has that tests run for real; a missing one fails
+      # the tests that need it instead of skipping them.
+      BBNG_TEST_REQUIRE_TOOLS: "openssl,ps,awk"
     strategy:
       fail-fast: false
       matrix:

@@ -18,7 +18,6 @@ sidecar. These tests pin the contract established around that value:
 Each test is written to FAIL if its guard is reverted (mutation-verified).
 """
 
-import shutil
 import subprocess
 
 import pytest
@@ -27,9 +26,7 @@ from btrfs_backup_ng.endpoint import raw as raw_mod
 from btrfs_backup_ng.endpoint.raw import RawEndpoint, SSHRawEndpoint
 from btrfs_backup_ng.endpoint.raw_metadata import RawSnapshot
 
-requires_openssl = pytest.mark.skipif(
-    shutil.which("openssl") is None, reason="openssl not installed"
-)
+requires_openssl = pytest.mark.requires_tool("openssl")
 
 
 def _write_encrypted_backup(tmp_path, cipher, payload, name="snap"):

@@ -118,6 +118,8 @@ def test_remote_sha256_empty_output_returns_none():
     assert ep._remote_sha256(Path("/backup/x.btrfs")) is None
 
 
+@pytest.mark.requires_tool("openssl")
+@pytest.mark.requires_tool("awk")
 def test_remote_hash_script_falls_through_when_sha256sum_absent(tmp_path):
     """Run the ACTUAL remote-hash shell string through a real /bin/sh with a PATH
     that lacks sha256sum/shasum (simulating macOS's missing sha256sum), leaving only
@@ -126,8 +128,6 @@ def test_remote_hash_script_falls_through_when_sha256sum_absent(tmp_path):
     bug the mocked tests miss. Reverting to `tool | awk || ...` makes this fail."""
     openssl = shutil.which("openssl")
     awk = shutil.which("awk")
-    if not openssl or not awk:
-        pytest.skip("openssl/awk not available")
 
     blob = tmp_path / "stream.btrfs"
     data = b"remote-fallthrough-" * 500

@@ -305,9 +305,7 @@ class TestRealGpgPipeline:
         assert self.PLAINTEXT in out.read_bytes()
 
 
-@pytest.mark.skipif(
-    __import__("shutil").which("openssl") is None, reason="openssl required"
-)
+@pytest.mark.requires_tool("openssl")
 class TestRealOpensslPipeline:
     PLAINTEXT = b"BTRFS-SEND-STREAM-OPENSSL-SECRET-9876543210"
 

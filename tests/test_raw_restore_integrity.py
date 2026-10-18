@@ -93,6 +93,7 @@ def test_restore_pipeline_pipefail_surfaces_midpipe_failure(tmp_path):
     assert proc.returncode != 0
 
 
+@pytest.mark.requires_tool("openssl")
 def test_multistage_restore_pipeline_uses_pipefail(tmp_path, monkeypatch):
     """A multi-stage restore pipeline (decrypt|decompress) must run under pipefail so
     a mid-pipe failure is not masked by the last stage's exit 0."""

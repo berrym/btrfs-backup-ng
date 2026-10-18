@@ -10,6 +10,68 @@ from pathlib import Path
 
 import pytest
 
+# Which missing tools fail the tests that need them instead of skipping them:
+# "1" for every tool, or a comma-separated list of names, as a package build
+# lists what it installed. Unset, empty or "0", every missing tool skips.
+REQUIRE_TOOLS_ENV = "BBNG_TEST_REQUIRE_TOOLS"
+
+
+def _required_tools() -> tuple[bool, frozenset[str]]:
+    """``(every tool, the named tools)`` that ``BBNG_TEST_REQUIRE_TOOLS`` asks for."""
+    value = os.environ.get(REQUIRE_TOOLS_ENV, "").strip()
+    if value in ("", "0"):
+        return False, frozenset()
+    if value == "1":
+        return True, frozenset()
+    return False, frozenset(name.strip() for name in value.split(",") if name.strip())
+
+
+def _is_required(tool: str) -> bool:
+    every, named = _required_tools()
+    return every or tool in named
+
+
+def _tools_of(item: pytest.Item) -> Iterator[tuple[str, str]]:
+    """``(tool, reason)`` for each ``requires_tool`` mark on ``item``."""
+    for marker in item.iter_markers("requires_tool"):
+        (tool,) = marker.args
+        yield tool, marker.kwargs.get("reason", f"{tool} is not installed")
+
+
+@pytest.hookimpl(tryfirst=True)
+def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
+    """Skip a test whose ``@pytest.mark.requires_tool(name)`` is missing.
+
+    A test that runs an external program for real proves nothing where the
+    program is missing. Skipping through a mark reports the reason at the test
+    itself in the ``-rs`` summary. A tool ``BBNG_TEST_REQUIRE_TOOLS`` names is
+    not skipped; ``pytest_runtest_setup`` fails the test instead.
+
+    Runs before deselection, so a name in the list is checked against every
+    test collected: one no test uses is a misspelling that would otherwise
+    enforce nothing.
+    """
+    used = {tool for item in items for tool, _ in _tools_of(item)}
+    unknown = _required_tools()[1] - used
+    if unknown:
+        raise pytest.UsageError(
+            f"{REQUIRE_TOOLS_ENV} names {', '.join(sorted(unknown))}, which no "
+            f"collected test requires; tools the tests require: "
+            f"{', '.join(sorted(used))}"
+        )
+    for item in items:
+        for tool, reason in _tools_of(item):
+            if shutil.which(tool) is None and not _is_required(tool):
+                item.add_marker(pytest.mark.skip(reason=reason))
+                break
+
+
+def pytest_runtest_setup(item: pytest.Item) -> None:
+    """Fail a test whose tool is missing when ``BBNG_TEST_REQUIRE_TOOLS`` requires it."""
+    for tool, reason in _tools_of(item):
+        if shutil.which(tool) is None and _is_required(tool):
+            pytest.fail(f"{reason}, and {REQUIRE_TOOLS_ENV} requires it", pytrace=False)
+
 
 def _in_a_real_tier(node: pytest.Item) -> bool:
     """Whether this test runs against real btrfs and real privilege."""

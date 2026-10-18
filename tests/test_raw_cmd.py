@@ -122,6 +122,7 @@ def test_raw_list_human_lists_backups(tmp_path, capsys, monkeypatch):
     assert "gzip" in out
 
 
+@pytest.mark.requires_tool("openssl")
 def test_raw_list_json_is_valid_and_authoritative(tmp_path, capsys, monkeypatch):
     monkeypatch.setenv("BTRFS_BACKUP_PASSPHRASE", "x")
     _build_backup(tmp_path, "root.20260101T120000", encrypt="openssl_enc")

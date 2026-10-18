@@ -775,6 +775,7 @@ class TestTheCompressedRemoteCommandIsSupervised:
                 os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
             proc.wait()
 
+    @pytest.mark.requires_tool("ps")
     @pytest.mark.parametrize(
         "sig", [signal.SIGHUP, signal.SIGTERM], ids=lambda s: signal.Signals(s).name
     )
