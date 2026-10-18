@@ -36,7 +36,7 @@ Tests are organized into two tiers:
 
 | Tier | Description | Requirements | CI |
 |------|-------------|--------------|-----|
-| **Tier 1** | Unit tests and mocked integration tests | Python only | Every push |
+| **Tier 1** | Unit tests and mocked integration tests | Python; some tests run openssl, ps, dash and other tools | Every push |
 | **Tier 2** | Real btrfs integration tests | btrfs-progs, root, Linux | Weekly/manual |
 
 ### What a test needs to do
@@ -66,6 +66,25 @@ pytest --cov=src/btrfs_backup_ng --cov-report=term-missing
 # Specific test file
 pytest tests/test_config_loader.py -v
 ```
+
+Tier 1 needs no root, no btrfs filesystem and no btrfs-progs, and it never
+runs the real `sudo`. Every tier 1 test finds a stand-in first on `PATH` that
+runs the command as you; an option the stand-in does not take fails the
+test. A test of what happens when sudo refuses asks for the `sudo_refuses`
+fixture, which makes the stand-in answer as `sudo -n` does for a user with no
+rule. On a machine without btrfs-progs, a placeholder `btrfs` on the same
+`PATH` satisfies the presence check and fails if it is run.
+
+A test that runs an external program for real is marked
+`@pytest.mark.requires_tool("name")`. Where the program is missing, the test
+is skipped and the summary prints why. `BBNG_TEST_REQUIRE_TOOLS` turns a
+missing tool into a failure instead: `1` for every tool, or a comma-separated
+list such as `openssl,ps,dash`. A name in the list that no collected test
+requires is reported as an error, so a misspelling cannot quietly enforce
+nothing; when running a subset of the tests, list only what that subset
+uses. CI sets the list of tools its runner provides, and a package build
+should set the list of tools it installs, so that a missing dependency fails
+the build instead of quietly removing tests from it.
 
 ### Running Tier 2 Tests (btrfs Integration)
 
