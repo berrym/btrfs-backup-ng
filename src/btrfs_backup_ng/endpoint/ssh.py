@@ -147,6 +147,43 @@ def _guarded_pipeline(pipeline: str) -> str:
     )
 
 
+# `sudo -S` ends the password at the first newline OR carriage return (measured
+# with sudo 1.9.16p2 and 1.9.17p2: "abcd\rjunk" authenticates as "abcd"). A
+# password containing either cannot be handed over whole on stdin: sudo uses the
+# part before the break, and whatever follows it lands in the transfer stream.
+_SUDO_PASSWORD_LINE_BREAKS = ("\n", "\r")
+
+# Width of the byte count that precedes the password on the compressed receive.
+_PASSWORD_FRAME_DIGITS = 4
+
+
+def _frame_sudo_password(password: str) -> str:
+    """The password as the compressed receive reads it: the length in bytes of
+    its line (the password and a newline) as four decimal digits, then the line.
+
+    The remote cannot take the password line with the shell's ``read``: dash
+    0.5.13.0-0.5.13.4 consume one extra byte past the newline for every NUL in
+    the input they buffered, and the bytes after the password are a compressed
+    stream, so its first bytes were lost and the decompressor rejected it. With
+    the length known in advance, ``dd bs=1`` takes exactly the line, one
+    ``read(2)`` per byte, and passes it straight to sudo, so the password is
+    never held in a shell variable. Measured with a NUL-dense stream on bash,
+    dash, busybox ash, GNU dd, busybox dd and uutils dd.
+
+    The count is of the bytes the environment hands the local shell, which is
+    what ``printf`` writes and ``dd`` counts on the remote.
+    """
+    line = password + "\n"
+    size = len(os.fsencode(line))
+    limit = 10**_PASSWORD_FRAME_DIGITS - 1
+    if size > limit:
+        raise __util__.AbortError(
+            f"The sudo password is {size - 1} bytes long; the most that can be "
+            f"passed to the remote is {limit - 1} bytes."
+        )
+    return f"{size:0{_PASSWORD_FRAME_DIGITS}d}{line}"
+
+
 def _build_receive_command(
     dest_path: str,
     use_sudo: bool = False,
@@ -165,6 +202,9 @@ def _build_receive_command(
         use_sudo: Whether to run with sudo
         password_on_stdin: If True, use 'sudo -S' (read password from stdin).
                           If False, use 'sudo -n' (passwordless sudo).
+                          The caller sends the password ahead of the stream:
+                          as one line, or framed by _frame_sudo_password when
+                          ``decompress`` is given.
         decompress: Compression method the stream was compressed with, or None.
                     When given, the remote runs `<decompressor> | btrfs receive`
                     so the compression applied before the wire is undone after
@@ -229,67 +269,88 @@ def _build_receive_command(
             # the ordering is what breaks every host -- neither one alone can be
             # fixed by rewriting the other.
             #
-            # Both are satisfied without ever elevating a shell. The password
-            # primes sudo's credential cache, after which the pipeline runs with
-            # `sudo -n` scoped to btrfs alone. Where that cache is refused
-            # (timestamp_timeout=0) the decompressor runs UNELEVATED and its
-            # output is prefixed with the password line, so `sudo -S` consumes
-            # that line and btrfs receive gets the decompressed stream -- scoped
-            # to btrfs again. Root therefore runs exactly one known binary on
-            # every path. Measured across six sudoers policies, on remotes whose
-            # /bin/sh is bash, dash and busybox ash:
+            # Both are satisfied without ever elevating a shell. The remote asks
+            # itself whether `sudo -n btrfs --version` works: where it does (a
+            # NOPASSWD rule for btrfs, or a ticket this session can see) the
+            # password line is discarded and the decompressed stream goes to
+            # `sudo -n btrfs receive`; where it does not, the decompressor runs
+            # UNELEVATED and its output is prefixed with the password line, so
+            # `sudo -S` consumes that line and btrfs receive gets the stream.
+            # Root therefore runs exactly one known binary on either path.
+            # Measured with real sudo on debian, fedora, alpine and ubuntu 26.04
+            # (sudo-rs), remotes whose sh is bash, dash and busybox ash:
             #
-            #   full sudo, caching               scoped    works
-            #   btrfs-only, caching              scoped    works  (was BROKEN)
+            #   full sudo, caching               prefixed  works
+            #   btrfs-only, caching              prefixed  works  (was BROKEN)
             #   full sudo, timestamp_timeout=0   prefixed  works
             #   btrfs-only, timestamp_timeout=0  prefixed  works  (was BROKEN)
             #   btrfs-only NOPASSWD              scoped    works
             #   no sudo rights at all            --        fails loudly
+            #
+            # A password host always takes the prefixed path: with no tty sudo
+            # keys its ticket on the parent process, so nothing this command
+            # could do beforehand would be seen by the `sudo -n` that follows.
+            # An earlier design primed the cache with `sudo -S -v` inside a
+            # pipeline stage, which is a child that exits at once, and the prime
+            # never took effect. The password is sent once and spent once.
             #
             # The remote decides for itself. sudo deliberately gives the same
             # answer ("a password is required") whether a command is forbidden or
             # merely needs authenticating, so NO non-interactive probe from this
             # side can tell those apart -- the choice cannot be made here.
             #
-            # `printf` is a shell builtin in dash, bash and busybox ash (checked
-            # in all three), so the password never reaches a process argument
-            # list; and `printf %s` preserves backslashes, which dash's `echo`
-            # would eat.
+            # The password is never held in a shell variable. It arrives framed by
+            # _frame_sudo_password -- its line after the line's length -- and
+            # `dd bs=1` hands it straight to the pipe that needs it, one byte per
+            # read(2), so nothing reads past it into the stream. A shell would
+            # also have to keep it in memory, and in a `$(...)` it was damaged:
+            # Fedora's dash 0.5.13.1 leaves its internal escape byte in a value
+            # where one of its control bytes (0x81-0x88, which UTF-8 uses in most
+            # non-ASCII characters) opens one of its 128-byte reads, so a
+            # non-ASCII password reached sudo with a byte added -- measured,
+            # intermittent with `dd bs=1` and certain at a boundary.
             #
             # Gated on use_sudo, not on password_on_stdin alone: a caller that
             # asked for no elevation must not be handed a `sudo -S` command
             # merely because it offered a password. The uncompressed branch has
             # always honoured use_sudo, and this branch has to agree with it.
-            # Priming, the decision and the transfer all live INSIDE the guarded
-            # group, and that placement is load-bearing. With no tty -- which is
-            # every ssh command -- sudo keys its credential ticket on the PARENT
-            # PID. _guarded_pipeline runs the transfer in a BACKGROUNDED subshell,
-            # so priming outside it records a ticket against this shell that the
-            # subshell's `sudo -n` cannot see: measured as "a password is
-            # required" on bash and dash alike, with the payload never delivered,
-            # while the identical commands unbackgrounded succeeded.
+            # The decision and the transfer live INSIDE the guarded group, whose
+            # `exec 3<&0` is what gives a backgrounded pipeline its stdin on
+            # dash and busybox ash.
+            take_line = 'dd bs=1 count="$__bbng_n" 2>/dev/null'
             group = (
-                'printf "%s\\n" "$__bbng_pw" | sudo -S -v 2>/dev/null; '
                 # </dev/null so the capability probe cannot consume a single byte of
                 # the stream: its stdin is fd 3, the transfer itself. `btrfs
                 # --version` does not read stdin, but a probe sharing the
                 # payload's file description should not depend on that.
                 "if sudo -n btrfs --version </dev/null >/dev/null 2>&1; then "
+                # No password wanted: the line is discarded, never fed to btrfs.
+                f"{take_line} >/dev/null; "
                 f"{decompressor} | sudo -n btrfs receive {quoted_dest}; "
                 "else "
-                # No usable credential cache (timestamp_timeout=0). Decompress
-                # UNELEVATED and prefix the decompressed stream with the password
-                # line, so `sudo -S` eats that line and hands the rest to btrfs
-                # receive. sudo stays scoped to btrfs here too, so this path needs
-                # no permission to run a shell as root either -- and a host that
-                # does not actually want a password is caught by the branch above,
-                # whose `sudo -n` probe succeeds there, so the password line can
-                # never reach btrfs as stream data.
-                f'{{ printf "%s\\n" "$__bbng_pw"; {decompressor}; }} | '
+                # Decompress UNELEVATED and prefix the decompressed stream with
+                # the password line, so `sudo -S` eats that line and hands the
+                # rest to btrfs receive. sudo stays scoped to btrfs here too, so
+                # this path needs no permission to run a shell as root either.
+                f"{{ {take_line}; {decompressor}; }} | "
                 f"sudo -S btrfs receive {quoted_dest}; "
                 "fi"
             )
-            script = 'trap "" PIPE; IFS= read -r __bbng_pw; ' + _guarded_pipeline(group)
+            # The count is the only part of the frame the shell keeps: four
+            # ASCII digits. It never reaches dd zero-padded: uutils dd, the
+            # default on Ubuntu 26.04, reads a leading zero as octal ("0010" is 8
+            # bytes, "0008" an invalid number -- measured), and so does shell
+            # arithmetic on a bare "0010". `1` in front makes it a plain decimal
+            # 10000 + n. A header that is not four digits fails here, before sudo
+            # is handed a password it would count as a failed attempt.
+            take_count = (
+                f"__bbng_n=$(dd bs=1 count={_PASSWORD_FRAME_DIGITS} 2>/dev/null); "
+                'case "$__bbng_n" in [0-9][0-9][0-9][0-9]) ;; '
+                '*) echo "btrfs-backup-ng: no sudo password frame on stdin" >&2; '
+                "exit 1;; esac; "
+                "__bbng_n=$((1$__bbng_n - 10000)); "
+            )
+            script = 'trap "" PIPE; ' + take_count + _guarded_pipeline(group)
             return f"exec sh -c {shlex.quote(script)}"
         script = (
             f'trap "" PIPE; {_guarded_pipeline(f"{decompressor} | {base_receive}")}'
@@ -1914,6 +1975,34 @@ print(json.dumps(result))
         return command
 
     def _get_sudo_password(self, retry_on_failure: bool = False) -> Optional[str]:
+        """The remote sudo password, from whichever source has one, or None.
+
+        Refused when it contains a line break: `sudo -S` stops reading at the
+        first newline or carriage return, so it would authenticate with only
+        the part before it, and what follows would be sent into the transfer
+        stream. A typed password cannot contain one; BTRFS_BACKUP_SUDO_PASSWORD,
+        or the BTRFS_BACKUP_SSH_PASSWORD reused as the sudo password, can -- a
+        value read from a file with Windows line endings ends in one.
+        """
+        password = self._sudo_password_from_sources(retry_on_failure)
+        if password is not None and any(
+            brk in password for brk in _SUDO_PASSWORD_LINE_BREAKS
+        ):
+            raise __util__.AbortError(
+                f"The sudo password for {self.config.get('username', 'the remote user')}"
+                f"@{self.hostname} contains a line break. sudo reads a password "
+                "only up to the first newline or carriage return, so it would use "
+                "only the part before it, and the rest would be sent into the "
+                "backup stream. Remove the line break from "
+                "BTRFS_BACKUP_SUDO_PASSWORD (a value read from a file with Windows "
+                "line endings ends in one), or grant the remote user passwordless "
+                "sudo for /usr/bin/btrfs."
+            )
+        return password
+
+    def _sudo_password_from_sources(
+        self, retry_on_failure: bool = False
+    ) -> Optional[str]:
         logger.debug("Attempting to get sudo password...")
 
         # Build cache key from user@hostname
@@ -2158,6 +2247,11 @@ print(json.dumps(result))
 
                 return result
 
+            except __util__.AbortError:
+                # An AbortError is a decision to stop, not a fault a second
+                # attempt could clear: a sudo password refused for its content
+                # was retried and logged as "retrying" before it failed anyway.
+                raise
             except Exception as e:
                 if attempt == max_retries:
                     raise
@@ -2753,7 +2847,12 @@ print(json.dumps(result))
             raise
         except Exception as e:
             logger.error(f"Exception while listing remote snapshots: {e}")
-            self._run_diagnostics(path, force_refresh=True)
+            # An AbortError already says what is wrong (a sudo password refused
+            # for its content, for one); re-running the diagnostics would issue
+            # the same commands and repeat it, so they run only for a failure
+            # they could explain.
+            if not isinstance(e, __util__.AbortError):
+                self._run_diagnostics(path, force_refresh=True)
             # Same reasoning as above: an exception means we do not know what is
             # there, which must never be presented as "nothing is there".
             raise RuntimeError(
@@ -3916,8 +4015,10 @@ print(json.dumps(result))
             #
             # The password reaches the shell through the environment rather than
             # the command line, so it does not appear in `ps` for other users.
+            # The variable holds exactly the bytes to send: one line for the
+            # uncompressed receive, the framed password for the compressed one.
             full_pipeline = (
-                f'{{ printf "%s\\n" "$BTRFS_BACKUP_SUDO_PW"; {stream}; }} | {ssh_cmd}'
+                f'{{ printf "%s" "$BTRFS_BACKUP_SUDO_PW"; {stream}; }} | {ssh_cmd}'
             )
         else:
             full_pipeline = f"{stream} | {ssh_cmd}"
@@ -3937,7 +4038,11 @@ print(json.dumps(result))
         # would show the password to every user on the machine.
         pipeline_env = dict(os.environ)
         if needs_password and sudo_password:
-            pipeline_env["BTRFS_BACKUP_SUDO_PW"] = sudo_password
+            pipeline_env["BTRFS_BACKUP_SUDO_PW"] = (
+                _frame_sudo_password(sudo_password)
+                if compress_method
+                else sudo_password + "\n"
+            )
         try:
             if bash_path:
                 proc = track_child(
@@ -4747,6 +4852,12 @@ print(json.dumps(result))
 
         logger.debug("SSH chunked receive command: %s", " ".join(ssh_cmd))
 
+        # Before the receive starts: the password can be refused, and a refusal
+        # after the Popen would leave the receive running with nobody to stop it.
+        sudo_password = (
+            self._get_sudo_password() if use_sudo and not passwordless else None
+        )
+
         # Start the receive process
         try:
             # stdout is not read anywhere on this path; a pipe nobody reads is
@@ -4775,11 +4886,9 @@ print(json.dumps(result))
         )
 
         # If sudo with password is needed, send it first
-        if use_sudo and not passwordless:
-            sudo_password = self._get_sudo_password()
-            if sudo_password and receive_process.stdin:
-                receive_process.stdin.write((sudo_password + "\n").encode())
-                receive_process.stdin.flush()
+        if sudo_password and receive_process.stdin:
+            receive_process.stdin.write((sudo_password + "\n").encode())
+            receive_process.stdin.flush()
 
         start_time = time.time()
         chunks_sent = 0
