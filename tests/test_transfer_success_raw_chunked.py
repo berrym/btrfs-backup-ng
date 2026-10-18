@@ -20,11 +20,10 @@ from btrfs_backup_ng.endpoint.raw import (
     _popen_pipeline_pipefail,
 )
 
-pytestmark = pytest.mark.requires_tool(
+
+@pytest.mark.requires_tool(
     "bash", reason="bash is not installed, and the pipefail behaviour needs it"
 )
-
-
 class TestRawPipelinePipefail:
     """A raw stream pipeline fails when ANY stage fails, not just the last.
 

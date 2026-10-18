@@ -58,6 +58,7 @@ def test_restore_missing_tool_preflights_with_clear_message(tmp_path, monkeypatc
         ep.send(snap)
 
 
+@pytest.mark.requires_tool("zstd")
 def test_restore_preflight_passes_when_tools_present(tmp_path):
     ep = RawEndpoint(config={"path": str(tmp_path)})
     snap = RawSnapshot(name="s", stream_path=tmp_path / "s.btrfs.zst", compress="zstd")
@@ -88,6 +89,7 @@ def test_backup_prepare_fails_loud_on_missing_tool(tmp_path, monkeypatch):
         ep.prepare()
 
 
+@pytest.mark.requires_tool("zstd")
 def test_backup_prepare_ok_when_tools_present(tmp_path):
     ep = RawEndpoint(config={"path": str(tmp_path), "compress": "zstd"})
     ep.prepare()  # zstd installed here -> no raise

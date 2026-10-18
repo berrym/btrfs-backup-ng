@@ -29,6 +29,8 @@ from btrfs_backup_ng.sshutil.lock import (
     read_only_probe_script,
 )
 
+from .toolmarks import tool_params
+
 SRC = Path(btrfs_backup_ng.__file__).parent
 
 #: String literals that contain a csh-unsafe ``!`` and are never sent to a
@@ -154,13 +156,7 @@ def test_every_lock_script_is_csh_safe(tmp_path):
     assert unsafe == {}
 
 
-@pytest.mark.parametrize(
-    "login",
-    [
-        pytest.param(login, marks=pytest.mark.requires_tool(login))
-        for login in ("tcsh", "csh")
-    ],
-)
+@pytest.mark.parametrize("login", tool_params("tcsh", "csh"))
 def test_the_whole_protocol_works_under_a_csh_login_shell(tmp_path, login):
     """The real shell, where one is installed. The static checks above are
     what enforces this everywhere; this shows they are checking the right

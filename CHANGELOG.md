@@ -45,13 +45,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   tested on purpose instead of depending on the machine.
 - **The unit tests failed in a minimal build environment.** In a package
   build root without btrfs-progs, openssl, `ps` or dash, 65 tests failed.
-  42 of them only needed `btrfs` to be found, never run, and now pass. A
-  test that runs an external program for real is skipped where it is
-  missing, with the reason printed, or failed when `BBNG_TEST_REQUIRE_TOOLS`
-  names the program; that now includes the lock-script checks under dash,
-  which failed outright before, and four that silently disappeared. The two
-  tests about running from a source checkout are skipped when the package
-  is imported from an installed copy.
+  42 of them only needed `btrfs` to be found, and now pass; the tests that
+  run `btrfs` only to see it fail get a placeholder's failure there instead
+  of btrfs-progs'. A test that runs an external program for real is skipped
+  where it is missing, with the reason printed, or failed when
+  `BBNG_TEST_REQUIRE_TOOLS` names the program; that now includes the
+  lock-script checks under dash, which failed outright before, and four that
+  silently disappeared, and the tests that run zstd, gpg or openssl without
+  having said so. The names the list may use are declared in one place, so
+  a misspelling stops the run while a subset of the suite can be run with
+  the same list. The two tests about running from a source checkout are
+  skipped when the package is imported from an installed copy.
 
 ## [0.9.12] - 2026-09-27
 

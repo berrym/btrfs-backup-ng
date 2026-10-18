@@ -26,6 +26,7 @@ from pathlib import Path
 import pytest
 
 from btrfs_backup_ng.cli.completion_gen import GENERATORS, generate
+from .toolmarks import tool_params
 
 COMPLETIONS = Path(__file__).resolve().parent.parent / "completions"
 
@@ -104,16 +105,10 @@ SYNTAX_CHECK = {
 
 @pytest.mark.parametrize(
     "shell",
-    [
-        pytest.param(
-            shell,
-            marks=pytest.mark.requires_tool(
-                shell,
-                reason=f"{shell} is not installed, so its syntax cannot be checked",
-            ),
-        )
-        for shell in sorted(SYNTAX_CHECK)
-    ],
+    tool_params(
+        *sorted(SYNTAX_CHECK),
+        reason="{tool} is not installed, so its syntax cannot be checked",
+    ),
 )
 def test_the_generated_completion_parses_in_its_own_shell(shell):
     import subprocess

@@ -255,6 +255,7 @@ def test_unsupported_openssl_cipher_aborts_with_clear_message():
     assert "openssl" in str(ei.value).lower()
 
 
+@pytest.mark.requires_tool("openssl")
 def test_supported_openssl_cipher_is_not_false_rejected(monkeypatch):
     """The probe must not block a real cipher (guards over-eager rejection)."""
     monkeypatch.setenv("BTRFS_BACKUP_PASSPHRASE", "pw")  # so the decrypt stage builds

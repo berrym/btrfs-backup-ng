@@ -81,6 +81,7 @@ def pipeline(monkeypatch):
     return captured
 
 
+@pytest.mark.requires_tool("zstd")
 class TestTheRemoteCompressesAndThisHostDecompresses:
     def test_the_send_runs_through_a_compressor_and_a_local_decompressor(
         self, pipeline

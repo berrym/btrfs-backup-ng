@@ -95,6 +95,7 @@ def test_prepare_fails_loud_when_local_compress_tool_missing():
                 ep._prepare()
 
 
+@pytest.mark.requires_tool("gpg")
 def test_send_encrypted_decrypts_locally_after_ssh_cat():
     """Security invariant: gpg decrypt runs LOCALLY, downstream of the ssh cat --
     the key/passphrase are never shipped to the (untrusted) remote."""

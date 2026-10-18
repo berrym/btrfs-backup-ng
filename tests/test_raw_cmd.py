@@ -103,6 +103,7 @@ def test_execute_raw_dispatches_list(tmp_path, capsys):
 # --------------------------------------------------------------------------- #
 # raw list output
 # --------------------------------------------------------------------------- #
+@pytest.mark.requires_tool("openssl")
 def test_raw_list_human_lists_backups(tmp_path, capsys, monkeypatch):
     monkeypatch.setenv("BTRFS_BACKUP_PASSPHRASE", "x")
     _build_backup(

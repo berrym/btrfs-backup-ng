@@ -136,7 +136,9 @@ class TestAgainstRealBtrbk:
 
     @pytest.mark.requires_tool("btrbk")
     @pytest.mark.parametrize("written,expected", MEASURED)
-    def test_matches_btrbk_config_print(self, tmp_path, written, expected):
+    def test_matches_btrbk_config_print(
+        self, tmp_path, written, expected, tool_unusable
+    ):
         source = tmp_path / "btrbk.conf"
         source.write_text(f"volume {written}\n  subvolume home\n    target /backup\n")
         result = subprocess.run(
@@ -146,7 +148,9 @@ class TestAgainstRealBtrbk:
             timeout=30,
         )
         if result.returncode != 0:
-            pytest.skip(f"btrbk rejected the probe config: {result.returncode}")
+            tool_unusable(
+                "btrbk", f"btrbk rejected the probe config: {result.returncode}"
+            )
 
         theirs = next(
             (
