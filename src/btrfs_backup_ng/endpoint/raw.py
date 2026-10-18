@@ -181,8 +181,9 @@ def _openssl_pass_arg() -> str:
     openssl reads the passphrase from the named environment variable itself, so
     the secret never appears on the command line. Raises ValueError if neither
     variable is set -- the caller must not run openssl with an empty passphrase,
-    which silently produces an unreadable stream on encrypt and garbage on
-    decrypt."""
+    which silently produces an unreadable stream. Used where a backup is
+    encrypted; a restore names the variable in _build_restore_pipeline and
+    checks it in _preflight_restore_tools, once openssl itself is found."""
     name = _selected_passphrase_env()
     if name is None:
         raise ValueError(
@@ -1562,6 +1563,11 @@ class RawEndpoint(Endpoint):
                     "that host, install an openssl that provides the cipher, or run "
                     "'openssl enc -ciphers' to see what this host supports."
                 )
+            # Only names the variable openssl reads the passphrase from. Whether
+            # one is set is checked by _preflight_restore_tools, once openssl is
+            # found: a restore on a machine with neither openssl nor a
+            # passphrase was told only about the passphrase, and then, once it
+            # was set, about openssl.
             openssl_cmd = [
                 "openssl",
                 "enc",
@@ -1569,7 +1575,7 @@ class RawEndpoint(Endpoint):
                 f"-{cipher}",
                 "-pbkdf2",
                 "-pass",
-                _openssl_pass_arg(),
+                f"env:{_selected_passphrase_env() or OPENSSL_PASSPHRASE_ENV}",
             ]
             pipeline.append(openssl_cmd)
         elif snapshot.encrypt:
@@ -1620,10 +1626,17 @@ class RawEndpoint(Endpoint):
         self, pipeline: list[list[str]], snapshot: RawSnapshot
     ) -> None:
         """Fail loud (before any bytes flow) if a tool the restore pipeline needs is
-        not installed, so a missing decompressor/decryptor gives a clear, actionable
-        message instead of a raw FileNotFoundError traceback part-way through the
-        restore. Kept separate from pipeline CONSTRUCTION so the built pipeline can be
-        inspected without requiring the tools to be present."""
+        not installed, or a secret it reads is not set, so a missing
+        decompressor/decryptor gives a clear, actionable message instead of a raw
+        FileNotFoundError traceback part-way through the restore. Kept separate
+        from pipeline CONSTRUCTION so the built pipeline can be inspected without
+        requiring the tools to be present.
+
+        A tool's secret is checked once the tool is found: a machine missing both
+        openssl and the passphrase is told about openssl, which no passphrase can
+        fix, rather than about the passphrase and then, once it is set, about
+        openssl. openssl must not run with no passphrase, which on decrypt yields
+        garbage or an EVP error dump."""
         for stage in pipeline:
             tool = stage[0]
             # "cat" is the pipeline's no-op passthrough sentinel (always present,
@@ -1634,6 +1647,13 @@ class RawEndpoint(Endpoint):
                     "to restore this backup (it is "
                     f"{self._describe_pipeline(snapshot)}) but is not installed. "
                     f"Install {tool!r} and retry."
+                )
+            if tool == "openssl" and _selected_passphrase_env() is None:
+                raise __util__.AbortError(
+                    f"Cannot restore {snapshot.name}: it is encrypted with "
+                    f"openssl_enc, which requires a passphrase in "
+                    f"{OPENSSL_PASSPHRASE_ENV} or {BTRBK_PASSPHRASE_ENV}, but "
+                    "neither is set."
                 )
 
     def _execute_restore_pipeline(
