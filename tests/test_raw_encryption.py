@@ -249,7 +249,7 @@ def isolated_gpg(tmp_path, monkeypatch):
         )
 
 
-@pytest.mark.skipif(__import__("shutil").which("gpg") is None, reason="gpg required")
+@pytest.mark.requires_tool("gpg")
 class TestRealGpgPipeline:
     """Prove the raw pipeline produces genuine, decryptable GPG ciphertext -- and
     that a plaintext control is NOT encrypted. This is the end-to-end security
@@ -398,10 +398,7 @@ class TestSSHRawEndpointEncryption:
 # here and, in test_raw_endpoint_integration.py, without a timeout.
 
 
-@pytest.mark.skipif(
-    __import__("shutil").which("gpg") is None,
-    reason="gpg required",
-)
+@pytest.mark.requires_tool("gpg")
 class TestSSHRawRealRoundTrip:
     """Definitive: a real raw+ssh://localhost backup with encrypt=gpg produces a
     file on the (local)host that is genuine ciphertext and decrypts back."""

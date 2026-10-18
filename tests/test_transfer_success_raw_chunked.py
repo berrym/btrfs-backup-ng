@@ -9,7 +9,6 @@ chunked transfers must not report success before `btrfs receive` confirms.
 from __future__ import annotations
 
 import shlex
-import shutil
 import subprocess
 
 import pytest
@@ -21,8 +20,8 @@ from btrfs_backup_ng.endpoint.raw import (
     _popen_pipeline_pipefail,
 )
 
-pytestmark = pytest.mark.skipif(
-    shutil.which("bash") is None, reason="bash required for pipefail behavior"
+pytestmark = pytest.mark.requires_tool(
+    "bash", reason="bash is not installed, and the pipefail behaviour needs it"
 )
 
 

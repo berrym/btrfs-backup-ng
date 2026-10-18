@@ -102,13 +102,21 @@ SYNTAX_CHECK = {
 }
 
 
-@pytest.mark.parametrize("shell", sorted(SYNTAX_CHECK))
+@pytest.mark.parametrize(
+    "shell",
+    [
+        pytest.param(
+            shell,
+            marks=pytest.mark.requires_tool(
+                shell,
+                reason=f"{shell} is not installed, so its syntax cannot be checked",
+            ),
+        )
+        for shell in sorted(SYNTAX_CHECK)
+    ],
+)
 def test_the_generated_completion_parses_in_its_own_shell(shell):
-    import shutil
     import subprocess
-
-    if shutil.which(shell) is None:
-        pytest.skip(f"{shell} is not installed, so its syntax cannot be checked")
 
     path = COMPLETIONS / f"btrfs-backup-ng.{shell}"
     result = subprocess.run(
@@ -119,13 +127,10 @@ def test_the_generated_completion_parses_in_its_own_shell(shell):
     )
 
 
+@pytest.mark.requires_tool("bash")
 def test_bash_completion_actually_offers_run_flags():
     """Parsing is not working. This sources it and asks for real completions."""
-    import shutil
     import subprocess
-
-    if shutil.which("bash") is None:
-        pytest.skip("bash is not installed")
 
     script = (
         f"source {COMPLETIONS / 'btrfs-backup-ng.bash'}\n"
@@ -140,12 +145,9 @@ def test_bash_completion_actually_offers_run_flags():
     assert "--dry-run" in out
 
 
+@pytest.mark.requires_tool("fish")
 def test_fish_completion_actually_offers_run_flags():
-    import shutil
     import subprocess
-
-    if shutil.which("fish") is None:
-        pytest.skip("fish is not installed")
 
     script = (
         f"source {COMPLETIONS / 'btrfs-backup-ng.fish'}; "

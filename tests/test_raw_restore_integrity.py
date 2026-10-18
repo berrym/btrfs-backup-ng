@@ -83,6 +83,9 @@ def test_skip_verify_allows_corrupt_restore_for_last_copy_recovery(tmp_path):
     proc.wait()
 
 
+@pytest.mark.requires_tool(
+    "bash", reason="bash is not installed, and the pipefail behaviour needs it"
+)
 def test_restore_pipeline_pipefail_surfaces_midpipe_failure(tmp_path):
     """A real multi-stage restore where an EARLY stage fails but the LAST exits 0 must
     still report non-zero -- proving pipefail actually surfaces a masked mid-pipe

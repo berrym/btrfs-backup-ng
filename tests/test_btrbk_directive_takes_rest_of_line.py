@@ -27,7 +27,6 @@ TestAgainstRealBtrbk re-measures when the binary is present.
 
 from __future__ import annotations
 
-import shutil
 import subprocess
 import tomllib
 from pathlib import Path
@@ -135,11 +134,9 @@ class TestUnchangedBehaviourForOrdinaryConfigs:
 class TestAgainstRealBtrbk:
     """Re-measure rather than trust the table above, when btrbk is installed."""
 
+    @pytest.mark.requires_tool("btrbk")
     @pytest.mark.parametrize("written,expected", MEASURED)
     def test_matches_btrbk_config_print(self, tmp_path, written, expected):
-        if shutil.which("btrbk") is None:
-            pytest.skip("btrbk is not installed")
-
         source = tmp_path / "btrbk.conf"
         source.write_text(f"volume {written}\n  subvolume home\n    target /backup\n")
         result = subprocess.run(

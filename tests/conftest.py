@@ -5,7 +5,7 @@ import logging
 import os
 import shutil
 import subprocess
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from pathlib import Path
 
 import pytest
@@ -71,6 +71,21 @@ def pytest_runtest_setup(item: pytest.Item) -> None:
     for tool, reason in _tools_of(item):
         if shutil.which(tool) is None and _is_required(tool):
             pytest.fail(f"{reason}, and {REQUIRE_TOOLS_ENV} requires it", pytrace=False)
+
+
+@pytest.fixture
+def tool_unusable() -> Callable[[str, str], None]:
+    """Skip a test whose tool is installed but cannot be used here, or fail it
+    when ``BBNG_TEST_REQUIRE_TOOLS`` requires that tool."""
+
+    def unusable(tool: str, reason: str) -> None:
+        if _is_required(tool):
+            pytest.fail(
+                f"{reason}, and {REQUIRE_TOOLS_ENV} requires {tool}", pytrace=False
+            )
+        pytest.skip(reason)
+
+    return unusable
 
 
 def _in_a_real_tier(node: pytest.Item) -> bool:
