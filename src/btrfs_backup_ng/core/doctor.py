@@ -16,6 +16,8 @@ from typing import Any, Callable, Optional
 
 from .target import TargetKind, TargetScheme, parse_target
 
+from .. import __util__
+
 logger = logging.getLogger(__name__)
 
 
@@ -247,6 +249,14 @@ class Doctor:
     def _register_all_checks(self) -> None:
         """Register all diagnostic checks."""
         # Configuration checks
+        self._register_check(
+            DiagnosticCheck(
+                name="local_privilege",
+                category=DiagnosticCategory.SYSTEM,
+                description="This machine can run btrfs as root",
+                check_func=self._check_local_privilege,
+            )
+        )
         self._register_check(
             DiagnosticCheck(
                 name="config_exists",
@@ -1654,6 +1664,69 @@ class Doctor:
             )
 
         return findings
+
+    def _check_local_privilege(self) -> list[DiagnosticFinding]:
+        """Whether btrfs can be run as root here: as root, or through sudo.
+
+        Every local snapshot, send, receive and delete needs it. A machine that
+        is not root and has no sudo cannot do any of them, and used to find out
+        at the first btrfs command, with "No such file or directory: 'sudo'".
+        """
+        import subprocess
+
+        if os.geteuid() == 0:
+            return [
+                DiagnosticFinding(
+                    category=DiagnosticCategory.SYSTEM,
+                    severity=DiagnosticSeverity.OK,
+                    check_name="local_privilege",
+                    message="Running as root",
+                )
+            ]
+        problem = __util__.local_elevation_problem()
+        if problem:
+            return [
+                DiagnosticFinding(
+                    category=DiagnosticCategory.SYSTEM,
+                    severity=DiagnosticSeverity.ERROR,
+                    check_name="local_privilege",
+                    message="Not root, and sudo is not installed",
+                    details={"hint": problem},
+                )
+            ]
+        try:
+            probe = subprocess.run(
+                ["sudo", "-n", "btrfs", "--version"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            passwordless = probe.returncode == 0
+        except (subprocess.TimeoutExpired, OSError):
+            passwordless = False
+        if passwordless:
+            message = "sudo runs btrfs without a password"
+            severity = DiagnosticSeverity.OK
+            details: dict[str, Any] = {}
+        else:
+            message = "sudo will ask for a password to run btrfs"
+            severity = DiagnosticSeverity.INFO
+            details = {
+                "hint": (
+                    "Unattended runs need a rule such as "
+                    f"'{getpass.getuser()} ALL=(ALL) NOPASSWD: /usr/bin/btrfs' "
+                    "in /etc/sudoers.d/, or must run as root."
+                )
+            }
+        return [
+            DiagnosticFinding(
+                category=DiagnosticCategory.SYSTEM,
+                severity=severity,
+                check_name="local_privilege",
+                message=message,
+                details=details,
+            )
+        ]
 
     def _check_systemd_timer(self) -> list[DiagnosticFinding]:
         """Check if systemd timer is active."""

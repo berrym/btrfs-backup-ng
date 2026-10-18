@@ -202,6 +202,14 @@ def execute_run(args: argparse.Namespace) -> int:
         logger.error("No volumes configured")
         return 1
 
+    # Every run snapshots locally, which needs root. Said once here, before
+    # the lock is taken or any volume is touched, instead of at the first
+    # btrfs command of each.
+    problem = __util__.local_elevation_problem()
+    if problem:
+        logger.error(problem)
+        return 1
+
     # Dry run mode
     if getattr(args, "dry_run", False):
         return _dry_run(config)

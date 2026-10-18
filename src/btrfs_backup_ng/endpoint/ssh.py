@@ -3492,6 +3492,9 @@ print(json.dumps(result))
         Returns:
             True if sudo credentials were successfully cached, False otherwise
         """
+        if os.geteuid() == 0:
+            return True  # root needs no priming and never asks sudo
+        __util__.sudo_argv()  # raises when there is no sudo to prime
         # Check if we already have passwordless sudo for btrfs
         # Use btrfs --version instead of true since sudoers may only allow btrfs
         try:
@@ -3813,7 +3816,7 @@ print(json.dumps(result))
             )
 
         # Build send command
-        send_parts = ["sudo", "btrfs", "send"]
+        send_parts = [*__util__.sudo_argv(allow_prompt=True), "btrfs", "send"]
         if is_incremental and parent_path is not None:
             send_parts.extend(["-p", shlex.quote(parent_path)])
             logger.info(f"Using parent: {os.path.basename(parent_path)}")
@@ -4042,6 +4045,8 @@ print(json.dumps(result))
                 )
                 return False
 
+        except __util__.AbortError:
+            raise  # a decision to stop; not a transfer failure to retry
         except Exception as e:
             logger.error(f"Transfer failed with exception: {e}")
             return False
@@ -4085,6 +4090,8 @@ print(json.dumps(result))
                     logger.error("Failed to re-establish SSH master connection")
                     return False
                 logger.info("SSH master connection re-established")
+            except __util__.AbortError:
+                raise  # a decision to stop; not a transfer failure to retry
             except Exception as e:
                 logger.error(f"Failed to restart SSH master: {e}")
                 return False
@@ -4229,8 +4236,7 @@ print(json.dumps(result))
             # "ERROR: cannot open '/home'" before a byte moved, whatever else was
             # configured. `sudo -n` is what the documented sudoers grants
             # (NOPASSWD: /usr/bin/btrfs); running as root skips it entirely.
-            if os.geteuid() != 0:
-                send_cmd = ["sudo", "-n"] + send_cmd
+            send_cmd = __util__.sudo_argv() + send_cmd
 
             logger.debug(f"Local send command: {' '.join(send_cmd)}")
 
@@ -4427,6 +4433,8 @@ print(json.dumps(result))
                 )
             return False
 
+        except __util__.AbortError:
+            raise  # a decision to stop; not a transfer failure to retry
         except Exception as e:
             logger.error(f"Error during transfer: {e}")
             logger.debug(f"Full error details: {e}", exc_info=True)
@@ -4632,6 +4640,8 @@ print(json.dumps(result))
                         )
                         ctx.wait()
 
+                except __util__.AbortError:
+                    raise  # a decision to stop; the executor reports it as such
                 except Exception as e:
                     # Classify the error to determine if it's retryable
                     classified = classify_error(e)

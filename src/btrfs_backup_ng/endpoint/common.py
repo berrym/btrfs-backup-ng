@@ -1690,10 +1690,12 @@ class Endpoint:
                         # This preserves just using "btrfs" which will use PATH
                         pass
 
-                    if options.get("no_password_sudo"):
-                        command = ["sudo", "-n"] + command
-                    else:
-                        command = ["sudo"] + command
+                    command = (
+                        __util__.sudo_argv(
+                            allow_prompt=not options.get("no_password_sudo")
+                        )
+                        + command
+                    )
 
                 # Ensure all command arguments are strings
                 command = [str(arg) for arg in command]
@@ -1785,9 +1787,12 @@ class Endpoint:
             raise __util__.AbortError from e
 
         # Path is a mount point, attempt remount
-        cmd = ["mount", "-o", f"remount,{mode}", path_str]
-        if os.geteuid() != 0:
-            cmd = ["sudo"] + cmd
+        cmd = __util__.sudo_argv(allow_prompt=True) + [
+            "mount",
+            "-o",
+            f"remount,{mode}",
+            path_str,
+        ]
         logger.debug("Executing remount command: %s", cmd)
         try:
             env = os.environ.copy()
@@ -2007,7 +2012,13 @@ class Endpoint:
         def run_elevated(script: str) -> tuple[int, str, str]:
             import shlex
 
-            return run(f"sudo -n sh -c {shlex.quote(script)}")
+            try:
+                sudo = " ".join(__util__.sudo_argv())
+            except __util__.AbortError as e:
+                # The manager reports what stderr said, so the reason reaches
+                # the operator instead of the shell's "sudo: not found".
+                return 127, "", str(e)
+            return run(f"{sudo} sh -c {shlex.quote(script)}".lstrip())
 
         return RemoteLockManager(
             run,

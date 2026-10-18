@@ -1672,7 +1672,6 @@ def _cleanup_partial_local_subvolume(
     Only handles LOCAL btrfs destinations: SSH endpoints clean their own partials
     during the transfer, and raw destinations are handled by the raw cleanup path.
     """
-    import os
 
     from ..endpoint.raw import RawEndpoint
 
@@ -1708,7 +1707,11 @@ def _cleanup_partial_local_subvolume(
         if not Path(expected).exists():
             return
         logger.warning("Cleaning up partial local transfer artifact at %s", expected)
-        sudo = [] if os.geteuid() == 0 else ["sudo"]
+        try:
+            sudo = __util__.sudo_argv(allow_prompt=True)
+        except __util__.AbortError as e:
+            logger.warning("Cannot remove the partial %s: %s", expected, e)
+            return
         deleted = subprocess.run(
             [*sudo, "btrfs", "subvolume", "delete", expected],
             capture_output=True,
@@ -2324,7 +2327,14 @@ def _snapper_btrfs(destination_endpoint) -> str:
     if getattr(destination_endpoint, "_is_remote", False):
         cfg = getattr(destination_endpoint, "config", {}) or {}
         return "sudo -n btrfs" if cfg.get("ssh_sudo", False) else "btrfs"
-    return "btrfs" if os.geteuid() == 0 else "sudo -n btrfs"
+    try:
+        return " ".join([*__util__.sudo_argv(), "btrfs"])
+    except __util__.AbortError as e:
+        # The scripts tolerate a failing verb where they can (`|| rm -rf`, `||
+        # true`), so the verb is replaced by one that fails and says why, and
+        # the rest of the script still runs. _snapper_exec_shell reports the
+        # reason from stderr.
+        return f"sh -c {shlex.quote(f'echo {shlex.quote(str(e))} >&2; exit 127')} btrfs"
 
 
 def _snapper_exec_shell(destination_endpoint, script: str, *, privileged: bool):
@@ -2335,10 +2345,12 @@ def _snapper_exec_shell(destination_endpoint, script: str, *, privileged: bool):
     the remote shell would run the whole script as a single command name (rc 127). Words
     interpolated INSIDE the script text are the caller's to quote -- a different level.
     """
-    argv = ["sudo", "-n", "sh", "-c", script] if privileged else ["sh", "-c", script]
     if getattr(destination_endpoint, "_is_remote", False) and hasattr(
         destination_endpoint, "_exec_remote_command"
     ):
+        argv = (
+            ["sudo", "-n", "sh", "-c", script] if privileged else ["sh", "-c", script]
+        )
         result = destination_endpoint._exec_remote_command(
             argv, check=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE
         )
@@ -2348,9 +2360,21 @@ def _snapper_exec_shell(destination_endpoint, script: str, *, privileged: bool):
             else ""
         )
         return getattr(result, "returncode", 1), out
-    if not privileged or os.geteuid() == 0:
+    if privileged:
+        try:
+            argv = [*__util__.sudo_argv(), "sh", "-c", script]
+        except __util__.AbortError as e:
+            # The caller turns any exception into a failure logged at debug
+            # level, so the reason is given here, where it is known.
+            logger.error("%s", e)
+            return 127, ""
+    else:
         argv = ["sh", "-c", script]
     result = subprocess.run(argv, capture_output=True, text=True)
+    if result.returncode == 127 and result.stderr.strip():
+        # 127 is "command not found" -- the verb _snapper_btrfs stands in when
+        # sudo is missing says why on stderr, which is otherwise discarded.
+        logger.error("%s", result.stderr.strip().splitlines()[-1])
     return result.returncode, result.stdout
 
 

@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A machine without sudo failed with "No such file or directory: 'sudo'".**
+  Not running as root, every local btrfs command, privileged write, remount,
+  snapper slot script, partial-transfer cleanup, restore cleanup and local
+  `btrfs send` of an ssh:// backup escalated through sudo, and none of them
+  handled sudo being absent, as in a container or a minimal install. Where
+  Python started it, the failure was "[Errno 2] No such file or directory:
+  'sudo'"; where a slot script ran it, the shell's "sudo: not found"; the
+  cleanup of a failed transfer's partial subvolume failed silently and left
+  it behind. One place now builds the escalation for every local site and
+  says, when there is no sudo, that this needs root for btrfs, that sudo is
+  not installed, and to run as root or install sudo and grant this user
+  sudo for btrfs. `run` says it once at the start, before the lock is
+  taken; `doctor` reports it as an error, and otherwise says whether sudo
+  will ask for a password to run btrfs; `restore --cleanup` says it before
+  asking whether to delete anything; an ssh:// send that cannot escalate
+  stops at once instead of being reported as a failed transfer.
 - **The unit tests ran the real `sudo`.** The product retries a privileged
   call through `sudo -n` when the direct one fails, and in a unit test it
   usually fails, so a test run reached the real sudo about 250 times: as
