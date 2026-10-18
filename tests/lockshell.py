@@ -68,11 +68,25 @@ def run_lock_script(cmd, sandbox: Path, remote_root: str = "/backup") -> _Result
 POSIX_SHELLS = ("sh", "dash", "bash")
 
 
-def available_shells() -> list:
-    """Which POSIX shells this machine can actually test against."""
-    import shutil as _shutil
+def shell_params(*names: str) -> list:
+    """One test parameter per shell, ``POSIX_SHELLS`` by default.
 
-    return [name for name in POSIX_SHELLS if _shutil.which(name)]
+    Each is marked ``requires_tool``, so a shell this machine lacks shows up as
+    a skip that says so, or as a failure under ``BBNG_TEST_REQUIRE_TOOLS``,
+    rather than vanishing from the run while the test still passes.
+    """
+    import pytest
+
+    return [
+        pytest.param(
+            name,
+            marks=pytest.mark.requires_tool(
+                name,
+                reason=f"{name} is not installed, so these scripts are NOT verified under it",
+            ),
+        )
+        for name in names or POSIX_SHELLS
+    ]
 
 
 def lock_aware(fake_run, sandbox: Path, remote_root: str = "/backup"):
