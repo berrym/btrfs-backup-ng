@@ -83,6 +83,23 @@ class TestAFailedListingIsNotAnEmptyLocation:
             with pytest.raises(RuntimeError, match="NOT an empty target"):
                 ep.list_snapshots()
 
+    def test_a_refusal_meant_to_stop_the_run_is_not_diagnosed_again(self):
+        """An AbortError already says what is wrong -- a sudo password refused
+        for its content, for one. Re-running the connection diagnostics would
+        issue the same commands and repeat it, so they run only for a failure
+        they could explain; the listing still raises as unknowable."""
+        from btrfs_backup_ng import __util__
+
+        ep = _endpoint()
+        with patch.object(
+            ep,
+            "_exec_remote_command",
+            side_effect=__util__.AbortError("The sudo password contains a line break"),
+        ):
+            with pytest.raises(RuntimeError, match="contains a line break"):
+                ep.list_snapshots()
+        ep._run_diagnostics.assert_not_called()
+
     def test_a_successful_empty_listing_is_still_empty(self):
         """Exit 0 with no output is the one case that IS an empty location."""
         ep = _endpoint()

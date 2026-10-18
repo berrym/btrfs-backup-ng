@@ -2247,6 +2247,11 @@ print(json.dumps(result))
 
                 return result
 
+            except __util__.AbortError:
+                # An AbortError is a decision to stop, not a fault a second
+                # attempt could clear: a sudo password refused for its content
+                # was retried and logged as "retrying" before it failed anyway.
+                raise
             except Exception as e:
                 if attempt == max_retries:
                     raise
@@ -2842,7 +2847,12 @@ print(json.dumps(result))
             raise
         except Exception as e:
             logger.error(f"Exception while listing remote snapshots: {e}")
-            self._run_diagnostics(path, force_refresh=True)
+            # An AbortError already says what is wrong (a sudo password refused
+            # for its content, for one); re-running the diagnostics would issue
+            # the same commands and repeat it, so they run only for a failure
+            # they could explain.
+            if not isinstance(e, __util__.AbortError):
+                self._run_diagnostics(path, force_refresh=True)
             # Same reasoning as above: an exception means we do not know what is
             # there, which must never be presented as "nothing is there".
             raise RuntimeError(

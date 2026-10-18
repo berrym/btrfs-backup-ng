@@ -28,6 +28,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   message saying so: sudo would use only the part before it and the rest
   would be sent into the stream. A value read from a file with Windows line
   endings ends in a carriage return (#115).
+- **A remote command that was refused outright was attempted again.** A
+  remote command that failed with an error meant to stop the run, such as
+  a sudo password refused for containing a line break, was attempted up to
+  three times, logging "Command execution failed ... retrying" after each,
+  before it failed anyway; a failed listing then re-ran the connection
+  diagnostics, which repeated it. It now stops at once, and the diagnostics
+  are not re-run for such an error; a dropped connection is still retried.
 - **The unit tests ran the real `sudo`.** The product retries a privileged
   call through `sudo -n` when the direct one fails, and in a unit test it
   usually fails, so a test run reached the real sudo about 250 times: as
