@@ -35,6 +35,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   before it failed anyway; a failed listing then re-ran the connection
   diagnostics, which repeated it. It now stops at once, and the diagnostics
   are not re-run for such an error; a dropped connection is still retried.
+- **Size estimates failed for a user whose sudo refuses or who has no sudo,
+  although the snapshot was readable.** The transfer estimate, the progress
+  bar's estimate and the local estimate on the password-sudo `ssh://` route
+  each ran every measuring command under sudo when not root and never as
+  the user; the last of the three ran a plain `sudo`, which can prompt, and
+  ran it as root too. Where `sudo -n` is refused or sudo is not installed,
+  every estimate failed: `estimate` printed "unknown", the progress bar had
+  no total and the space check did not run. `btrfs filesystem du` and `du`
+  need no privilege on a tree the user can read, so each is now run once
+  more as the user when sudo gave no answer; `btrfs subvolume show` is not,
+  since it cannot read a subvolume without privilege. The three copies of
+  this logic are now one, which also stops the progress estimate reporting
+  a `btrfs filesystem du` total of 0 (what it prints for a tree it cannot
+  read) as a size. The space check now knows which tool measured: a figure
+  from `du`, which counts sparse-file holes and shared data in full, is an
+  upper bound, so when it does not fit the check warns and proceeds instead
+  of refusing a transfer that may fit; a `btrfs filesystem du` figure is
+  refused on as before. `estimate` marks such a size `<=` and its total
+  "AT MOST", and `--check-space` says when its figure is an upper bound,
+  in the text and as `total_transfer_is_upper_bound` in JSON.
 - **A machine without sudo failed with "No such file or directory: 'sudo'".**
   Not running as root, every local btrfs command, privileged write, remount,
   snapper slot script, partial-transfer cleanup, restore cleanup and local

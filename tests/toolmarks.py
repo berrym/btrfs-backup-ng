@@ -25,6 +25,7 @@ KNOWN_TOOLS = frozenset(
         "cat",
         "csh",
         "dash",
+        "du",
         "fish",
         "gpg",
         "gzip",

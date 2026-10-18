@@ -325,6 +325,7 @@ def _print_space_check(
             space_info,
             estimate.total_incremental_size,
             safety_margin_percent=safety_margin,
+            estimate_bound=estimate.total_bound,
         )
         print()
         print(format_space_check(space_check))
@@ -361,6 +362,9 @@ def _print_json(
         # from a floor; the human output says so in words, and dropping it here
         # would leave the machine-readable form the more misleading of the two.
         "total_transfer_is_lower_bound": estimate.total_is_lower_bound,
+        # The mirror image: a full size that only `du` could measure counts
+        # sparse-file holes and shared data in full, so the total is a ceiling.
+        "total_transfer_is_upper_bound": estimate.total_is_upper_bound,
         "total_full_bytes": estimate.total_full_size,
         "total_full_human": format_size(estimate.total_full_size),
         "estimation_time_seconds": round(estimate.estimation_time, 2),
@@ -391,6 +395,7 @@ def _print_json(
                 space_info,
                 estimate.total_incremental_size,
                 safety_margin_percent=safety_margin,
+                estimate_bound=estimate.total_bound,
             )
             data["space_check"] = {
                 "path": space_info.path,

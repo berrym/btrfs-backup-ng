@@ -239,8 +239,9 @@ class TestEstimateSnapshotFullSize:
         assert method == "filesystem_du"
 
     @patch("subprocess.run")
-    def test_du_fallback(self, mock_run, tmp_path):
-        """Test fallback to regular du."""
+    @patch("os.geteuid", return_value=0)
+    def test_du_fallback(self, mock_euid, mock_run, tmp_path):
+        """Test fallback to regular du (as root: one run per method)."""
         from btrfs_backup_ng.core.estimate import estimate_snapshot_full_size
 
         # All btrfs commands fail, du succeeds

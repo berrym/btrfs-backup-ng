@@ -21,6 +21,7 @@ from ..endpoint.raw_metadata import StructureVerdict
 from ..transaction import log_transaction
 from .transfer import DEFAULT_STALL_TIMEOUT, DEFAULT_TRANSFER_TIMEOUT
 from . import progress as progress_utils
+from .estimate import SizeEstimate
 from . import transfer as transfer_utils
 from .chunked_transfer import (
     ChunkedTransferManager,
@@ -346,7 +347,8 @@ def _send_snapshot(
             logger.debug(
                 "Getting size estimate for: %s (parent: %s)", snapshot_path, parent_path
             )
-            estimated_size = _estimate_transfer_size(snapshot, parent)
+            measured = _estimate_transfer_size(snapshot, parent)
+            estimated_size = measured.bytes if measured is not None else None
             if estimated_size:
                 logger.debug(
                     "Estimated transfer size: %d bytes (%.2f MB)",
@@ -971,23 +973,25 @@ def _transfer_chunks_ssh(
             raise
 
 
-def _estimate_transfer_size(snapshot, parent) -> Optional[int]:
-    """The transfer's size estimate, asked of the SOURCE endpoint.
+def _estimate_transfer_size(snapshot, parent) -> Optional[SizeEstimate]:
+    """The transfer's size estimate, asked of the SOURCE endpoint, with the
+    method that measured it.
 
-    ``Endpoint.estimate_transfer_size`` measures where the snapshot lives: a
-    local endpoint runs ``btrfs subvolume show`` here, the ssh endpoint runs
-    it on the remote host. Running the local measurement whatever the source
-    was how every transfer from an ssh:// source warned "Could not estimate
-    transfer size for space check" -- the local command was aimed at a remote
-    path. A snapshot object without an endpoint that can measure (a wrapper
-    carrying only a path) falls back to the local measurement it always had.
+    ``Endpoint.measure_transfer_size`` measures where the snapshot lives: a
+    local endpoint runs the local measurement here, the ssh endpoint runs
+    ``btrfs filesystem du`` on the remote host. Running the local measurement
+    whatever the source was how every transfer from an ssh:// source warned
+    "Could not estimate transfer size for space check" -- the local command
+    was aimed at a remote path. A snapshot object without an endpoint that can
+    measure (a wrapper carrying only a path) falls back to the local
+    measurement it always had.
     """
     endpoint = getattr(snapshot, "endpoint", None)
-    measure = getattr(endpoint, "estimate_transfer_size", None)
+    measure = getattr(endpoint, "measure_transfer_size", None)
     if callable(measure):
         return measure(snapshot, parent)
     parent_path = str(parent.get_path()) if parent is not None else None
-    return progress_utils.estimate_snapshot_size(str(snapshot.get_path()), parent_path)
+    return progress_utils.measure_snapshot(str(snapshot.get_path()), parent_path)
 
 
 def _verify_destination_space(snapshot, destination_endpoint, parent, options) -> None:
@@ -1009,9 +1013,9 @@ def _verify_destination_space(snapshot, destination_endpoint, parent, options) -
         space_info = destination_endpoint.get_space_info()
 
         # Estimate transfer size, asked of the endpoint that holds the snapshot
-        estimated_size = _estimate_transfer_size(snapshot, parent)
+        measured = _estimate_transfer_size(snapshot, parent)
 
-        if estimated_size is None:
+        if measured is None:
             if parent is not None:
                 # An incremental send is deliberately not sized (the delta is
                 # expensive to measure and usually small), so this is not a
@@ -1028,11 +1032,31 @@ def _verify_destination_space(snapshot, destination_endpoint, parent, options) -
             )
             return
 
-        # Check space availability
+        # Check space availability, knowing what the figure proves: a
+        # measurement is refused on; an upper bound (du, taken where nothing
+        # better could measure) proves the transfer fits when it fits and
+        # nothing when it does not; a floor proves it does not fit when even
+        # that does not. The branch is total so a new method cannot pass for
+        # a measurement by default.
+        estimated_size = measured.bytes
         space_check = check_space_availability(
-            space_info, estimated_size, safety_margin_percent=safety_margin
+            space_info,
+            estimated_size,
+            safety_margin_percent=safety_margin,
+            estimate_bound=measured.bound,
         )
 
+        if not space_check.sufficient and measured.bound == "upper":
+            logger.warning("Destination space check did not pass on an upper bound:")
+            logger.warning(format_space_check(space_check))
+            logger.warning(
+                "The size was measured by %s, which counts sparse-file holes and "
+                "data shared between files in full, so the transfer may still "
+                "fit; proceeding. Running out of space during the receive is "
+                "reported as a failed transfer.",
+                measured.method,
+            )
+            return
         if not space_check.sufficient:
             logger.error("Destination space check failed:")
             logger.error(format_space_check(space_check))
@@ -1040,14 +1064,19 @@ def _verify_destination_space(snapshot, destination_endpoint, parent, options) -
                 space_check.warning_message
                 or f"Insufficient space at destination: need {estimated_size} bytes"
             )
-        else:
-            logger.debug(
-                "Space check passed: %d bytes available, %d bytes needed",
-                space_check.effective_limit,
-                space_check.required_with_margin,
+        logger.debug(
+            "Space check passed: %d bytes available, %d bytes needed",
+            space_check.effective_limit,
+            space_check.required_with_margin,
+        )
+        if space_check.warning_message:
+            logger.warning(space_check.warning_message)
+        if measured.bound == "lower":
+            logger.warning(
+                "The space check passed on a floor (%s): the transfer is at "
+                "least that size, so space was not verified",
+                measured.method,
             )
-            if space_check.warning_message:
-                logger.warning(space_check.warning_message)
 
     except __util__.InsufficientSpaceError:
         raise
