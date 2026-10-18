@@ -5,7 +5,42 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.9.13] - 2026-10-18
+
+This release corrects failures in environments without the usual
+privileges or tools. A compressed backup to an `ssh://` target whose
+remote shell is dash lost the first bytes of the stream. A machine
+without sudo failed with "No such file or directory: 'sudo'". A size
+estimate failed when sudo refused, although the user could read the
+snapshot. A restore on a machine without openssl reported the missing
+passphrase before the missing program. In addition, `config validate`
+and `doctor` now check the snapper configuration and the `snapshot_dir`
+that `run` depends on, and the unit tests run in a minimal build
+environment, with a switch that lets a package build require the tools
+it provides.
+
+Changes an upgrade can observe:
+
+- **`config validate` can exit 2, and `doctor` can report an error, for a
+  configuration they previously accepted.** A snapper volume whose named
+  configuration does not exist, or whose path no configuration covers
+  under `auto`, and a native volume whose absolute `snapshot_dir` is
+  missing or on another filesystem, could never be backed up by `run`.
+  Both commands now report these conditions.
+- **`run` stops at startup on a machine that is not root and has no
+  sudo.** It reports the condition once, before taking its lock, instead
+  of failing at the first btrfs command of each volume.
+- **A space check based on a `du` figure warns and proceeds instead of
+  refusing.** Such a figure counts sparse-file holes and shared data in
+  full and is therefore an upper bound. A `btrfs filesystem du` figure is
+  still refused on. `estimate` marks a `du` size with `<=`, labels the
+  total "AT MOST", and its JSON output gains
+  `total_transfer_is_upper_bound`.
+- **A sudo password containing a line break is refused**, with a message
+  stating the reason, rather than partly used.
+- **`doctor` has a new check, `local_privilege`.** It reports whether the
+  machine can run btrfs as root and whether sudo will prompt for a
+  password.
 
 ### Fixed
 
