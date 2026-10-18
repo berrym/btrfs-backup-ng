@@ -67,6 +67,43 @@ jobs:
           fail_ci_if_error: false
           verbose: true
 
+  test-oldest-pytest:
+    name: Test (oldest pytest)
+    runs-on: ubuntu-latest
+    env:
+      BBNG_TEST_REQUIRE_TOOLS: "awk,bash,bzip2,cat,csh,dash,gpg,gzip,lz4,openssl,pigz,ps,sh,tcsh,xz,zstd"
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install login shells the remote-command tests run under
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y tcsh
+          command -v dash && command -v tcsh && command -v csh
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v10.2.0
+
+      # The oldest pytest pyproject.toml allows, installed on purpose, so the
+      # declared floor is a tested fact. The lock file pins the newest, and a
+      # suite that could not start under pytest 8.3 was released that way.
+      - name: Install with the oldest supported pytest
+        run: |
+          uv venv --python 3.11
+          uv pip install -e . "pytest==7.0.0" "pytest-asyncio>=0.23.0"
+          .venv/bin/python -m pytest --version
+
+      - name: Run tests
+        run: |
+          .venv/bin/python -m pytest tests/ -q --tb=short
+
   lint:
     name: Lint & Type Check
     runs-on: ubuntu-latest
