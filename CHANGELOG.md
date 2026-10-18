@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **The test suite failed to start with pytest older than 8.4.** The test
+  configuration annotated a hook with a name pytest made public in 8.4,
+  while the project declares pytest 7.0 or newer, so a package build on
+  pytest 7.0 to 8.3 failed before any test ran. The annotation is no
+  longer evaluated, and CI now runs the suite on the oldest pytest the
+  project allows (#121).
+
 ## [0.9.13] - 2026-10-18
 
 This release corrects failures in environments without the usual
