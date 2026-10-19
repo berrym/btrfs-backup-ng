@@ -80,7 +80,7 @@ class TestTheDeletionFlagsTakeEffect:
         """Waiting for the cleanup of deletions that did not happen."""
         ep, snaps = _local(tmp_path, subvolume_sync=True)
         for snap in snaps:
-            snap.locks.add("restore")
+            ep.set_lock(snap, "restore", True)
         commands = _issued(ep, snaps)
 
         assert commands == []

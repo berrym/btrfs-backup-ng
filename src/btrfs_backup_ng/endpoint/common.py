@@ -10,7 +10,7 @@ import subprocess
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 from filelock import FileLock
 
@@ -815,7 +815,10 @@ class Endpoint:
     def _load_locks_into(self, snapshots: List[Any]) -> None:
         """Populate each snapshot's in-memory lock sets from the persisted lock file.
 
-        Locks are keyed by ``get_name()`` (see ``set_lock``). A damaged or unreadable
+        Locks are keyed by ``get_name()`` (see ``set_lock``). Each snapshot's sets
+        become exactly what the file records for it, and empty when the file has no
+        entry for it, so the same loader refreshes snapshots listed earlier: the
+        delete guard reads the file again through it. A damaged or unreadable
         lock file must never abort the whole listing (that would also stop new snapshots),
         so it lists as unlocked but sets ``_locks_read_failed`` -- retention then refuses
         to delete anything (fail-safe) rather than silently pruning a still-needed
@@ -838,9 +841,7 @@ class Endpoint:
             )
             return
         for snap in snapshots:
-            entry = lock_dict.get(snap.get_name())
-            if not entry:
-                continue
+            entry = lock_dict.get(snap.get_name()) or {}
             snap.locks = set(entry.get("locks", []))
             snap.parent_locks = set(entry.get("parent_locks", []))
 
@@ -1157,32 +1158,45 @@ class Endpoint:
                 ),
             )
             return
-        # Read-modify-write against the AUTHORITATIVE on-disk lock file, serialized by a
-        # FileLock so concurrent parallel-target transfers (multiple threads sharing this
-        # source endpoint) and concurrent processes cannot lose each other's updates. The
-        # previous rebuild-from-cache dropped a lock written after this run's cache was
-        # populated (last-writer-wins) and could lose the mutation entirely on a cache
-        # miss. We only touch THIS snapshot's entry; every other snapshot's locks come
-        # straight from disk, so a concurrent writer's locks survive.
-        guard = str(self._get_lock_file_path()) + ".guard"
+        # The file records this one change and nothing else: ``lock_id`` added
+        # to or removed from one key of this snapshot's entry, applied to the
+        # entry as the file holds it now, under the guard that serialises the
+        # file's writers across threads and processes. The caller's in-memory
+        # sets are not written out: every parallel target's thread lists the
+        # source for itself, so each holds its own copy of a snapshot, and
+        # writing a copy whole erased the pins other threads had taken since
+        # and brought back the ones they had released. Every other holder, the
+        # other key and every other snapshot's entry are written back as read.
+        # The caller's copy keeps only its own change (made above): nothing in
+        # this run reads another thread's pins from it, since the source is
+        # pruned only when every target succeeded and released, and the next
+        # run lists the source, and so the file, afresh.
+        name = snapshot.get_name()
+        key = "parent_locks" if parent else "locks"
+        if not lock_state:
+            self._unrecorded_pins().discard((name, key, lock_id))
+
+        def change(entry: Dict[str, List[Any]]) -> Dict[str, List[Any]]:
+            held = entry.get(key, [])
+            if lock_state:
+                if lock_id not in held:
+                    held.append(lock_id)
+            else:
+                held = [other for other in held if other != lock_id]
+            entry[key] = held
+            return entry
+
         try:
-            with FileLock(guard):
-                # _read_locks raises on a corrupt file: abort loudly rather than overwrite
-                # (which would silently discard locks we could not read).
-                lock_dict = self._read_locks()
-                name = snapshot.get_name()
-                entry: Dict[str, Any] = {}
-                if snapshot.locks:
-                    entry["locks"] = list(snapshot.locks)
-                if snapshot.parent_locks:
-                    entry["parent_locks"] = list(snapshot.parent_locks)
-                if entry:
-                    lock_dict[name] = entry
-                else:
-                    lock_dict.pop(name, None)
-                self._write_locks(lock_dict)
+            self._update_lock_entry(name, change)
         except (OSError, __util__.AbortError) as exc:
             self._lock_file_not_written(snapshot, lock_state, exc)
+            if lock_state:
+                # Reached only when the operation goes on with the pin held in
+                # memory alone (a read-only medium, --skip-remote-lock); it
+                # raised otherwise. The delete guard reads the file again at
+                # delete time and adds these back, so a snapshot this process
+                # pinned is not deleted by this process.
+                self._unrecorded_pins().add((name, key, lock_id))
         logger.debug(
             "Lock state for %s and lock_id %s changed to %s (parent = %s)",
             snapshot,
@@ -1190,6 +1204,50 @@ class Endpoint:
             lock_state,
             parent,
         )
+
+    def _update_lock_entry(
+        self,
+        name: str,
+        change: Callable[[Dict[str, List[Any]]], Dict[str, List[Any]]],
+    ) -> Dict[str, List[Any]]:
+        """Apply ``change`` to snapshot ``name``'s entry in the lock file and
+        return the entry as the file now holds it.
+
+        Under the guard file, so that threads and processes writing the same
+        file cannot lose each other's changes, the file is read, ``change`` is
+        given a copy of the entry (``{}`` when there is none) and returns the
+        new one; empty lists are dropped, and an entry left empty is removed.
+        The file is written only when the entry changed, and every other entry
+        is written back as it was read. A corrupt or unreadable file raises
+        ``AbortError`` and is left untouched: rewriting it would discard locks
+        nobody could read.
+        """
+        guard = str(self._get_lock_file_path()) + ".guard"
+        with FileLock(guard):
+            lock_dict = self._read_locks()
+            old: Dict[str, List[Any]] = lock_dict.get(name) or {}
+            new = change({key: list(ids) for key, ids in old.items()})
+            new = {key: ids for key, ids in new.items() if ids}
+            if new == old:
+                return old
+            if new:
+                lock_dict[name] = new
+            else:
+                lock_dict.pop(name, None)
+            self._write_locks(lock_dict)
+            return new
+
+    def _unrecorded_pins(self) -> Set[Tuple[str, str, Any]]:
+        """The pins this process holds in memory only, as ``(snapshot name,
+        key, lock id)``: ``set_lock`` could not record them in the lock file
+        and the operation went on without them there (a medium mounted
+        read-only, ``--skip-remote-lock``). A release drops its own. The
+        delete guard adds them back after it reads the file again, so a
+        snapshot this process pinned is not deleted by this process."""
+        pins: Set[Tuple[str, str, Any]] = self.__dict__.setdefault(
+            "_unrecorded_pin_set", set()
+        )
+        return pins
 
     def _lock_file_not_written(self, snapshot: Any, lock_state: bool, exc: Any) -> None:
         """What a lock FILE that could not be written means, decided the way
@@ -1278,7 +1336,30 @@ class Endpoint:
         as a deletion.
         """
         result = DeletionResult()
-        if getattr(self, "_locks_read_failed", False):
+        store = self._lock_store_manager()
+        listing_unreadable = bool(getattr(self, "_locks_read_failed", False))
+        unreadable = listing_unreadable
+        if store is None:
+            # The lock FILE is read again AT DELETE TIME, and each snapshot's
+            # lock sets become what it records now. The sets these objects
+            # carry are a copy taken at some listing: another target's thread
+            # or another process may have pinned or released a snapshot since,
+            # and a prune decided from that copy kept what nothing pinned any
+            # more and would have deleted what the file pinned. A file that was
+            # unreadable at the listing refuses the batch even if it reads now:
+            # the listing is what chose these snapshots. One that cannot be
+            # read now refuses this batch only; the listing's own verdict is
+            # what a later batch from the same listing is judged by.
+            self._load_locks_into(list(snapshots))
+            unreadable = listing_unreadable or self._locks_read_failed
+            self._locks_read_failed = listing_unreadable
+            by_name: Dict[str, List[Any]] = {}
+            for snapshot in snapshots:
+                by_name.setdefault(snapshot.get_name(), []).append(snapshot)
+            for name, key, lock_id in list(self._unrecorded_pins()):
+                for snapshot in by_name.get(name, ()):
+                    getattr(snapshot, key).add(lock_id)
+        if unreadable:
             reason = (
                 "the lock file is unreadable/corrupt, so locked (still-needed) "
                 f"snapshots cannot be identified; repair or remove "
@@ -1293,7 +1374,6 @@ class Endpoint:
         # same guard the ssh endpoint's delete runs on the remote; here the
         # store is on this machine. An unanswerable query deletes nothing.
         store_locked: set = set()
-        store = self._lock_store_manager()
         if store is not None:
             from ..sshutil.lock import (
                 RemoteLockUnavailable,

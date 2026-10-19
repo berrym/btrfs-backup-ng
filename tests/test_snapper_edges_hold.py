@@ -214,6 +214,10 @@ class TestAReadOnlySourceNeedsNoLockFile:
         self, tmp_path, monkeypatch, shared_log
     ):
         ep = self._location(tmp_path)
+        # A pin the file holds; releasing it has to rewrite the file, and
+        # the rewrite is what is refused. A release of a pin the file never
+        # took writes nothing and has nothing to warn about.
+        ep.set_lock(_snap("home-1"), "restore:s1", True)
         self._refuse_writes(monkeypatch)
         ep.set_lock(_snap("home-1"), "restore:s1", False)
         warnings = shared_log.messages(logging.WARNING)

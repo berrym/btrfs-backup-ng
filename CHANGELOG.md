@@ -5,6 +5,23 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **Pins on the source were lost or left behind when several targets sent
+  in parallel, or after an interrupted run.** Each target's thread held its
+  own copy of a snapshot's pins and wrote that copy to the source's lock
+  file whole, so a pin another target had taken was erased and one it had
+  released came back; the prune at the end of a run then read the pins
+  from a copy taken at some listing rather than from the file. A pin left
+  behind kept a snapshot on the source after retention would have deleted
+  it; a lost pin let retention delete a snapshot a target still needed as
+  an incremental parent, so the next run sent it again in full. The lock
+  file now records each change on its own, applied to the entry as the
+  file holds it, and a deletion reads the file again before it decides.
+  Backups on the targets were never affected (#122).
+
 ## [0.9.14] - 2026-10-18
 
 This release corrects one defect in the 0.9.13 test suite: it did not start

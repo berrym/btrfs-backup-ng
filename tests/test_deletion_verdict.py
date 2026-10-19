@@ -91,7 +91,7 @@ class TestTheBaseEndpoint:
 
     def test_a_retention_lock_is_a_skip_and_does_not_fail_the_run(self, tmp_path):
         ep, snaps = _local(tmp_path)
-        snaps[0].locks.add("restore")
+        ep.set_lock(snaps[0], "restore", True)
         with patch.object(LocalEndpoint, "_exec_command", return_value=None):
             result = ep.delete_snapshots(snaps)
 
@@ -312,7 +312,7 @@ class TestPruneReportsTheRealCount:
     def test_skips_are_reported_without_failing_the_run(self, tmp_path):
         ep, snaps = _local(tmp_path)
         for snap in snaps:
-            snap.locks.add("restore")
+            ep.set_lock(snap, "restore", True)
         with patch.object(LocalEndpoint, "_exec_command", return_value=None):
             deleted, errors = execute_retention_deletes(ep, snaps)
 
