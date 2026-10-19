@@ -22,6 +22,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   file holds it, and a deletion reads the file again before it decides.
   Backups on the targets were never affected (#122).
 
+- **A compressed backup to an `ssh://` target whose remote lacks the
+  decompressor sent the whole stream before failing.** The remote ran
+  `zstd -dc | btrfs receive` and reported the receive's failure on a
+  stream cut short, with the shell's "zstd: command not found" inside the
+  error output, after every byte had crossed the wire. The pre-transfer
+  check now asks the remote for the configured decompressor as it asks
+  for btrfs, and refuses before the transfer starts, naming the program
+  and the host; `doctor` already reported it (#120).
 ## [0.9.14] - 2026-10-18
 
 This release corrects one defect in the 0.9.13 test suite: it did not start
