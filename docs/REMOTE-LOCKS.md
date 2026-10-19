@@ -400,7 +400,7 @@ already has for a prune that could not run.
 ### Reporting
 
 `restore --status` and `--unlock` go through `Endpoint._read_locks` and
-`_write_locks`. Remote endpoints implement both against the target, so those
+`_release_locks`. Remote endpoints implement both against the target, so those
 commands describe a remote target as accurately as a local one:
 
 ```
@@ -414,11 +414,15 @@ A lock whose `info.json` cannot be parsed is still reported, with the holder
 shown as `unknown`. "Something holds this and we cannot say what" must never be
 rounded down to "nothing holds this".
 
-`--unlock` clears leftover snapshot pins. It addresses holders by the record
-they were found in rather than by lock id, so it can clear the one holder it
-cannot name — the one whose payload is unreadable. Addressed by id, that holder
-survived `--unlock all` forever and the only remedy was deleting files on the
-target by hand.
+`--unlock` clears leftover snapshot pins. It decides which pins to clear from
+the state it read, and releases exactly those, each by the holder record it was
+found in: a pin taken after the read belongs to a restore that is running now,
+and is kept, under `--unlock all` as well. Writing the read state back whole,
+as the command once did, dropped such a pin along with the leftovers. Addressing
+by record is also what lets `--unlock all` clear the one holder it cannot name,
+the one whose payload is unreadable; addressed by id, that holder survived
+forever and the only remedy was deleting files on the target by hand. A named
+session leaves it in place.
 
 It deliberately leaves whole-target locks alone: those belong to an operation
 running right now, and the command exists to clear leftovers, not to interrupt

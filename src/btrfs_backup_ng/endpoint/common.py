@@ -10,7 +10,7 @@ import subprocess
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, Iterator, List, Optional, Set, Tuple
 
 from filelock import FileLock
 
@@ -1237,6 +1237,56 @@ class Endpoint:
             self._write_locks(lock_dict)
             return new
 
+    def _release_locks(
+        self, pins: Dict[str, Dict[str, List[Any]]]
+    ) -> Iterator[Tuple[str, Dict[str, List[Any]], bool]]:
+        """Release the given pins, each from the lock state as it is when the
+        release is written, and say what was released.
+
+        ``pins`` is in the shape ``_read_locks`` returns: for each snapshot,
+        the ids under ``locks`` and ``parent_locks`` to release. This is how
+        ``restore --unlock`` writes. It read the state, removed the ids from
+        its copy and wrote the copy back whole, outside the guard, so a pin a
+        run took between that read and that write was erased and a pin the
+        run released came back. Now each snapshot's entry is changed under
+        the guard through ``_update_lock_entry``, and only the ids read are
+        removed from it: a pin taken since is kept, a pin released since is
+        not found. A location that carries the directory store is released
+        per holder record by ``sshutil.lock.release_persisted_locks``, with
+        the same contract.
+
+        Yields, per snapshot in ``pins`` and in that order, its name, the ids
+        that were there to release in the same shape, and whether the
+        snapshot still holds a pin. A write that fails raises after the
+        snapshots before it were released, so a caller iterating this knows
+        how far it got.
+        """
+        store = self._lock_store_manager()
+        if store is not None:
+            from ..sshutil.lock import release_persisted_locks
+
+            yield from release_persisted_locks(store, pins)
+            return
+        for name, wanted in pins.items():
+            ids = {key: {str(x) for x in held} for key, held in wanted.items()}
+            released: Dict[str, List[Any]] = {}
+
+            def change(
+                entry: Dict[str, List[Any]],
+                _ids: Dict[str, Set[str]] = ids,
+                _released: Dict[str, List[Any]] = released,
+            ) -> Dict[str, List[Any]]:
+                for key, gone in _ids.items():
+                    held = entry.get(key, [])
+                    found = [x for x in held if str(x) in gone]
+                    if found:
+                        _released[key] = found
+                    entry[key] = [x for x in held if str(x) not in gone]
+                return entry
+
+            left = self._update_lock_entry(name, change)
+            yield name, released, bool(left)
+
     def _unrecorded_pins(self) -> Set[Tuple[str, str, Any]]:
         """The pins this process holds in memory only, as ``(snapshot name,
         key, lock id)``: ``set_lock`` could not record them in the lock file
@@ -2054,7 +2104,7 @@ class Endpoint:
         When the directory is there, this endpoint USES it: the same scripts
         the ssh endpoint runs on the remote, run here through ``sh``. Reads
         (``_read_locks``, the delete guard), writes (``set_lock``) and
-        ``restore --unlock`` (``_write_locks``) all go through the one store.
+        ``restore --unlock`` (``_release_locks``) all go through the one store.
         A location that carries no directory keeps its lock file exactly as
         before; nothing is renamed or migrated. The store is recognised only
         where the lock FILE would have been, i.e. under the default

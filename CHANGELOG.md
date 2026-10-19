@@ -5,6 +5,26 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **`restore --unlock` erased a pin a run took while the command ran, and
+  brought back a pin the run had released.** The command read the lock
+  state, removed the restore pins from its copy and wrote the copy back
+  whole, outside the guard `set_lock` takes: to the lock file of a local
+  location, and as a reconcile of every holder record at a location that
+  carries the directory store (`ssh://`, `raw://`, `raw+ssh://`, a local
+  location over an `ssh://` mirror). The command now releases only the pins
+  it read, each from the state at the moment of writing: a lock-file entry
+  is changed under the guard through the writer `set_lock` uses, and a
+  directory-store pin is dropped by its own holder record. A restore that
+  begins after the command has read the state keeps its pin, under
+  `--unlock all` as well. The count the command reports is what it
+  released, and a write that fails part-way says how many were unlocked
+  before it. A holder record the directory store cannot parse is cleared by
+  `--unlock all` only; any `--unlock` cleared it before (#125).
+
 ## [0.9.15] - 2026-10-19
 
 This release corrects four defects found after 0.9.14. Pins on the source

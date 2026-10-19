@@ -1133,6 +1133,22 @@ def _print_snapper_backups(
         )
 
 
+def _cleared_by_unlock(held: Any, lock_id: str) -> bool:
+    """Whether ``--unlock LOCK_ID`` clears a pin held under ``held``.
+
+    ``all`` clears every restore pin, and with it a holder whose record in a
+    directory store could not be read (reported as ``unknown``): nothing can
+    name it, and ``all`` is the one request that does not need to. A named
+    session clears that session's pin only, with or without the ``restore:``
+    prefix; a pin another kind of operation holds is never cleared here.
+    """
+    held = str(held)
+    if lock_id == "all":
+        return held == "unknown" or held.startswith("restore:")
+    wanted = lock_id if lock_id.startswith("restore:") else f"restore:{lock_id}"
+    return held == wanted
+
+
 def _execute_unlock(args: argparse.Namespace, lock_id: str) -> int:
     """Unlock stuck restore session(s).
 
@@ -1177,59 +1193,47 @@ def _execute_unlock(args: argparse.Namespace, lock_id: str) -> int:
         print("No locks found - nothing to unlock.")
         return 0
 
-    # Find and remove matching locks
-    unlocked_count = 0
-    new_locks: dict[str, Any] = {}
-
+    # The pins to release are decided from what was read: a restore that
+    # begins after this read is live and was never shown as a leftover, so
+    # it is kept even under "all". The release itself is written as a change
+    # to the state at that moment, snapshot by snapshot, through the
+    # endpoint: under the guard for the lock file, per holder record for a
+    # directory store. Writing the read copy back whole, as this did, erased
+    # the pins a run took in between and brought back the ones it released.
+    to_release: dict[str, dict[str, list[Any]]] = {}
     for snap_name, lock_info in locks.items():
-        snap_locks = set(lock_info.get("locks", []))
-        parent_locks = set(lock_info.get("parent_locks", []))
+        cleared = {
+            key: [
+                lk for lk in lock_info.get(key, []) if _cleared_by_unlock(lk, lock_id)
+            ]
+            for key in ("locks", "parent_locks")
+        }
+        cleared = {key: ids for key, ids in cleared.items() if ids}
+        if cleared:
+            to_release[snap_name] = cleared
 
-        if lock_id == "all":
-            # Remove all restore locks
-            restore_snap_locks = {lk for lk in snap_locks if lk.startswith("restore:")}
-            restore_parent_locks = {
-                lk for lk in parent_locks if lk.startswith("restore:")
-            }
-            unlocked_count += len(restore_snap_locks) + len(restore_parent_locks)
-            snap_locks -= restore_snap_locks
-            parent_locks -= restore_parent_locks
-        else:
-            # Remove specific lock
-            full_lock_id = (
-                f"restore:{lock_id}" if not lock_id.startswith("restore:") else lock_id
+    unlocked_count = 0
+    remaining = len(locks) - len(to_release)
+    if to_release:
+        try:
+            for _name, released, still_held in backup_endpoint._release_locks(
+                to_release
+            ):
+                unlocked_count += sum(len(ids) for ids in released.values())
+                remaining += 1 if still_held else 0
+        except Exception as e:
+            logger.error(
+                "Could not write the lock state: %s (%d lock(s) unlocked before "
+                "this; the rest are unchanged).",
+                e,
+                unlocked_count,
             )
-            if full_lock_id in snap_locks:
-                snap_locks.discard(full_lock_id)
-                unlocked_count += 1
-            if full_lock_id in parent_locks:
-                parent_locks.discard(full_lock_id)
-                unlocked_count += 1
-
-        # Keep entry if it still has locks
-        if snap_locks or parent_locks:
-            new_entry = {}
-            if snap_locks:
-                new_entry["locks"] = list(snap_locks)
-            if parent_locks:
-                new_entry["parent_locks"] = list(parent_locks)
-            new_locks[snap_name] = new_entry
-
-    # Write through the endpoint's own writer, which does the atomic replace
-    # (temp -> fsync -> os.replace -> parent fsync, 0600). A torn lock file
-    # is misread as "no locks" and lets retention prune a snapshot that is still
-    # locked, so this must not be a plain open("w") -- and must not be a second
-    # copy of the careful version either.
-    try:
-        backup_endpoint._write_locks(new_locks)
-    except Exception as e:
-        logger.error("Could not write the lock file: %s", e)
-        return 1
+            return 1
 
     if unlocked_count > 0:
         print(f"Unlocked {unlocked_count} lock(s).")
-        if new_locks:
-            print(f"Remaining locks: {len(new_locks)} snapshot(s)")
+        if remaining:
+            print(f"Remaining locks: {remaining} snapshot(s)")
         else:
             print("All locks cleared.")
     else:
