@@ -239,8 +239,11 @@ class TestEstimateReadsWhatTransferReads:
         vol.mkdir()
         store = tmp_path / "store"
         (store / "vol").mkdir(parents=True)
-        (store / "vol" / "vol-20260101-000000").mkdir()
-        (store / "vol" / "vol-20260102-000000").mkdir()
+        for name in ("vol-20260101-000000", "vol-20260102-000000"):
+            (store / "vol" / name).mkdir()
+            # A byte to measure: an empty directory has no apparent size, and
+            # an estimate that measures nothing exits 2 (test_estimate_exit_status).
+            (store / "vol" / name / "data").write_bytes(b"x" * 1024)
         target = tmp_path / "target"
         target.mkdir()
         cfg = tmp_path / "cfg.toml"
