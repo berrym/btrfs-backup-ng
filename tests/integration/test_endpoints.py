@@ -455,8 +455,11 @@ class TestEndpointDeletionOperations:
 
         mock_snapshot = MagicMock()
         mock_snapshot.get_path.return_value = dest / "test-20240115-120000"
-        mock_snapshot.locks = {"some-lock-id"}
+        mock_snapshot.get_name.return_value = "test-20240115-120000"
+        mock_snapshot.locks = set()
         mock_snapshot.parent_locks = set()
+        # Pinned through the endpoint: the lock file is what a delete reads.
+        endpoint.set_lock(mock_snapshot, "some-lock-id", True)
 
         endpoint.delete_snapshots([mock_snapshot])
 
