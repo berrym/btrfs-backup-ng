@@ -1458,6 +1458,8 @@ class SSHEndpoint(Endpoint):
             {
                 'ssh_connection': bool,  # Basic SSH connectivity
                 'btrfs_command': bool,   # btrfs command exists on remote
+                'decompressor': bool,    # the configured decompressor exists on
+                                         # remote; True when nothing is compressed
                 'passwordless_sudo': bool,  # Sudo without password works
                 'sudo_btrfs': bool,      # Can run btrfs with sudo
                 'write_permissions': bool,  # Can write to path
@@ -1493,6 +1495,7 @@ class SSHEndpoint(Endpoint):
         results: Dict[str, bool] = {
             "ssh_connection": False,
             "btrfs_command": False,
+            "decompressor": True,
             "passwordless_sudo": False,
             "sudo_btrfs": False,
             "write_permissions": False,
@@ -1539,6 +1542,39 @@ class SSHEndpoint(Endpoint):
         except Exception as e:
             logger.error(f"Error checking btrfs command: {e}")
             logger.debug(f"btrfs command check exception: {e}", exc_info=True)
+
+        # With `compress` set, the remote has to run the decompressor in front
+        # of `btrfs receive`. Without it the pipeline still exits non-zero, since
+        # the receive is handed a truncated stream, but only after the whole
+        # stream has crossed the wire, and the shell's "not found" line sits
+        # inside the receive's error output. Asked here, like btrfs itself, so
+        # the transfer is refused before a byte is sent. `doctor` asks the same
+        # question for every compressed ssh:// target (compression_programs).
+        method = self._stream_compress_method()
+        if method is not None:
+            from ..core.transfer import COMPRESSION_PROGRAMS
+
+            program = COMPRESSION_PROGRAMS[method]["decompress"][0]
+            logger.debug("Testing for %s on the remote...", program)
+            try:
+                result = self._exec_remote_command(
+                    ["command", "-v", program], check=False
+                )
+                results["decompressor"] = result.returncode == 0
+            except Exception as e:
+                # Not asked is not answered: a probe that could not run refuses
+                # the transfer rather than passing for one that found the program.
+                results["decompressor"] = False
+                logger.debug("Decompressor check exception: %s", e, exc_info=True)
+            if not results["decompressor"]:
+                logger.error(
+                    "The remote %s has no %s to decompress the stream. Install %s "
+                    "on %s, or set compress to a method it has, or to none.",
+                    self.hostname,
+                    program,
+                    program,
+                    self.hostname,
+                )
 
         # Test passwordless sudo for btrfs commands
         # We test with btrfs directly since sudoers rules often only allow specific commands
@@ -4211,6 +4247,7 @@ print(json.dumps(result))
             [
                 diagnostics["ssh_connection"],
                 diagnostics["btrfs_command"],
+                diagnostics.get("decompressor", True),
                 diagnostics["write_permissions"],
                 diagnostics["btrfs_filesystem"],
             ]
@@ -4625,6 +4662,7 @@ print(json.dumps(result))
             [
                 diagnostics["ssh_connection"],
                 diagnostics["btrfs_command"],
+                diagnostics.get("decompressor", True),
                 diagnostics["write_permissions"],
                 diagnostics["btrfs_filesystem"],
             ]
