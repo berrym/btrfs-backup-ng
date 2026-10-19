@@ -5,7 +5,29 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.9.15] - 2026-10-19
+
+This release corrects four defects found after 0.9.14. Pins on the source
+could be lost or left behind when several targets sent in parallel, which
+was the known issue carried since 0.9.12. A compressed backup to an
+`ssh://` target whose remote lacked the decompressor sent the whole
+stream before failing. `estimate` exited 0 when it had measured nothing
+or found the destination short, and it could not estimate an `ssh://`
+source at all.
+
+Changes an upgrade can observe:
+
+- **`estimate` can exit 2 or 3 where it exited 0.** 2 means the estimate
+  ran but is not a measurement, 3 that the space check found the
+  destination short; 0 now means complete and fitting. A script that
+  treated any non-zero status as a failure sees the status the words
+  already said.
+- **A compressed `ssh://` transfer is refused before it starts when the
+  remote has no decompressor**, naming the program and the host, instead
+  of failing after the stream has crossed the wire.
+- **`estimate ssh://host:/snapshots DEST` works**, measuring the snapshots
+  on the remote host; incremental sizes are not estimated for a remote
+  source, and the estimate says so.
 
 ### Fixed
 
