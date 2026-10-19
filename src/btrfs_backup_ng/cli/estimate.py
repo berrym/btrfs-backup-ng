@@ -22,6 +22,7 @@ from ..core.estimate import (
     format_size,
     print_estimate,
 )
+from ..core.target import parse_target
 from ..core.space import (
     DEFAULT_SAFETY_MARGIN_PERCENT,
     SpaceCheck,
@@ -234,7 +235,24 @@ def _estimate_direct(args: argparse.Namespace, source: str, destination: str) ->
             "fs_checks": fs_checks_mode,
             "timestamp_format": ts_fmt,
         }
-        if not source.startswith("ssh://"):
+        if source.startswith("ssh://"):
+            # The estimate's source is the directory holding the snapshots,
+            # on whichever host. choose_endpoint keeps an ssh:// source's URL
+            # path under "source", the subvolume a legacy run would snapshot,
+            # and left "path", which the listing reads, unset: every estimate
+            # of a remote source failed to list it. The ssh options given for
+            # the destination apply to the source host as well, which has to
+            # list and measure its snapshots as root.
+            source_kwargs["path"] = parse_target(source).path
+            if getattr(args, "ssh_host_key_policy", None):
+                source_kwargs["ssh_host_key_policy"] = args.ssh_host_key_policy
+            if ssh_sudo:
+                source_kwargs["ssh_sudo"] = True
+            if ssh_key:
+                source_kwargs["ssh_identity_file"] = ssh_key
+            if ssh_auth_sock:
+                source_kwargs["ssh_auth_sock"] = ssh_auth_sock
+        else:
             source_kwargs["path"] = Path(source).resolve()
 
         source_ep = endpoint.choose_endpoint(
