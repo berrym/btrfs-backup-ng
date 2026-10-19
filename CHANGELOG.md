@@ -5,6 +5,20 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **`estimate` exited 0 when nothing could be measured, and when the space
+  check found the destination short.** It returned 1 only when nothing ran;
+  once the estimate had run it returned 0 whatever it found, so a script
+  could not tell "nothing to transfer" from "nothing could be measured", or
+  a destination that fits from one that does not, without parsing the
+  output. It now exits 2 when a snapshot that would transfer has no size or
+  `--check-space` could not be made, and 3 when the check ran on measured
+  sizes and the destination is short; 0 means complete and fitting. The
+  JSON output gains `unmeasured_count`, and the text output says when a
+  checked total is a partial sum (#123).
 ## [0.9.14] - 2026-10-18
 
 This release corrects one defect in the 0.9.13 test suite: it did not start

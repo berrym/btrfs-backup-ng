@@ -24,6 +24,7 @@ from ..core.estimate import (
 )
 from ..core.space import (
     DEFAULT_SAFETY_MARGIN_PERCENT,
+    SpaceCheck,
     check_space_availability,
     format_space_check,
 )
@@ -50,7 +51,14 @@ def execute_estimate(args: argparse.Namespace) -> int:
         args: Parsed command line arguments
 
     Returns:
-        Exit code (0 for success, non-zero for failure)
+        Exit status: 0 when the estimate is complete (every snapshot that
+        would transfer has a size, and with --check-space the destination
+        has room); 1 when nothing ran (no config, no such volume, an
+        endpoint that could not be opened, the estimate raised); 2 when the
+        estimate ran but is not a measurement (a snapshot without a size, or
+        a space check that could not be made); 3 when the space check ran on
+        measured sizes and the destination is short. See EXIT_INCOMPLETE and
+        EXIT_INSUFFICIENT.
     """
     log_level = get_log_level(args)
     create_logger(False, level=log_level)
@@ -184,14 +192,12 @@ def _estimate_from_config(args: argparse.Namespace, volume_path: str) -> int:
         logger.error("Estimation failed: %s", e)
         return 1
 
-    # Output results
+    # Output results. The status says what the words say: 0 only for a
+    # complete estimate that fits, so a script need not parse the output.
     if json_output:
-        _print_json(estimate, str(snapshot_dir), target.path, dest_ep, args)
-    else:
-        print_estimate(estimate, str(snapshot_dir), target.path)
-        _print_space_check(args, dest_ep, estimate)
-
-    return 0
+        return _print_json(estimate, str(snapshot_dir), target.path, dest_ep, args)
+    print_estimate(estimate, str(snapshot_dir), target.path)
+    return _print_space_check(args, dest_ep, estimate)
 
 
 def _estimate_direct(args: argparse.Namespace, source: str, destination: str) -> int:
@@ -276,13 +282,40 @@ def _estimate_direct(args: argparse.Namespace, source: str, destination: str) ->
         logger.error("Estimation failed: %s", e)
         return 1
 
-    # Output results
+    # Output results. The status says what the words say: 0 only for a
+    # complete estimate that fits, so a script need not parse the output.
     if json_output:
-        _print_json(estimate, source, destination, dest_ep, args)
-    else:
-        print_estimate(estimate, source, destination)
-        _print_space_check(args, dest_ep, estimate)
+        return _print_json(estimate, source, destination, dest_ep, args)
+    print_estimate(estimate, source, destination)
+    return _print_space_check(args, dest_ep, estimate)
 
+
+#: The estimate ran but is not a measurement: a snapshot that would transfer
+#: has no size, or --check-space could not be made. The convention `config
+#: validate` set for "ran, but cannot answer"; 1 stays for nothing having run.
+EXIT_INCOMPLETE = 2
+#: --check-space ran on measured sizes and the destination is short.
+EXIT_INSUFFICIENT = 3
+
+
+def _exit_status(
+    estimate: TransferEstimate,
+    space_check: SpaceCheck | None,
+    *,
+    check_failed: bool,
+) -> int:
+    """The command's exit status, from what was measured and what was checked.
+
+    Every snapshot that would transfer must have a size, or the total is a
+    partial sum and nothing about it is a measurement. A requested check that
+    could not be made is the same case. A check that was made and found the
+    destination short is its own status, so a guard script reads 0 as "fits"
+    without parsing the output. The command returned 0 for all of these.
+    """
+    if estimate.unmeasured_count or check_failed:
+        return EXIT_INCOMPLETE
+    if space_check is not None and not space_check.sufficient:
+        return EXIT_INSUFFICIENT
     return 0
 
 
@@ -290,8 +323,8 @@ def _print_space_check(
     args: argparse.Namespace,
     dest_ep: Any,
     estimate: TransferEstimate,
-) -> None:
-    """Print space availability check if requested.
+) -> int:
+    """Print space availability check if requested; return the exit status.
 
     Args:
         args: Command arguments (check for --check-space flag)
@@ -299,7 +332,7 @@ def _print_space_check(
         estimate: Transfer estimate with size information
     """
     if not getattr(args, "check_space", False):
-        return
+        return _exit_status(estimate, None, check_failed=False)
 
     if estimate.total_incremental_size == 0:
         # A zero total is not self-explanatory: a snapshot whose size could not
@@ -313,9 +346,9 @@ def _print_space_check(
                 f"snapshot(s) could not be determined, so the total is not a "
                 f"measurement of what would transfer. Space was NOT verified."
             )
-            return
+            return EXIT_INCOMPLETE
         print("\nNo data to transfer - skipping space check.")
-        return
+        return 0
 
     safety_margin = getattr(args, "safety_margin", DEFAULT_SAFETY_MARGIN_PERCENT)
 
@@ -332,6 +365,16 @@ def _print_space_check(
     except Exception as e:
         logger.warning("Could not check destination space: %s", e)
         print(f"\nWarning: Could not check destination space: {e}")
+        return _exit_status(estimate, None, check_failed=True)
+    if estimate.unmeasured_count:
+        # A partial total was checked: some of what would transfer is not in
+        # it, so the verdict above is not about the whole transfer.
+        print(
+            f"The size of {estimate.unmeasured_count} snapshot(s) could not be "
+            f"determined, so the total checked is a partial sum. Space was NOT "
+            f"verified."
+        )
+    return _exit_status(estimate, space_check, check_failed=False)
 
 
 def _print_json(
@@ -340,8 +383,8 @@ def _print_json(
     destination: str,
     dest_ep: Any = None,
     args: argparse.Namespace | None = None,
-) -> None:
-    """Print estimate as JSON.
+) -> int:
+    """Print estimate as JSON; return the exit status.
 
     Args:
         estimate: The transfer estimate
@@ -365,6 +408,9 @@ def _print_json(
         # The mirror image: a full size that only `du` could measure counts
         # sparse-file holes and shared data in full, so the total is a ceiling.
         "total_transfer_is_upper_bound": estimate.total_is_upper_bound,
+        # Snapshots that would transfer and have no size at all. Above zero the
+        # totals are partial sums and the command exits 2.
+        "unmeasured_count": estimate.unmeasured_count,
         "total_full_bytes": estimate.total_full_size,
         "total_full_human": format_size(estimate.total_full_size),
         "estimation_time_seconds": round(estimate.estimation_time, 2),
@@ -387,6 +433,8 @@ def _print_json(
         data["snapshots"].append(snap_data)
 
     # Add space check if requested
+    space_check: SpaceCheck | None = None
+    check_failed = False
     if args and getattr(args, "check_space", False) and dest_ep:
         safety_margin = getattr(args, "safety_margin", DEFAULT_SAFETY_MARGIN_PERCENT)
         try:
@@ -425,5 +473,8 @@ def _print_json(
                 "error": str(e),
                 "sufficient": None,
             }
+            space_check = None
+            check_failed = True
 
     print(json.dumps(data, indent=2))
+    return _exit_status(estimate, space_check, check_failed=check_failed)

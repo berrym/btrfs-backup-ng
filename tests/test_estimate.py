@@ -1048,6 +1048,9 @@ class TestEstimateFromConfig:
     ):
         """Test successful estimation with JSON output."""
         from btrfs_backup_ng.cli.estimate import _estimate_from_config
+
+        # The printer decides the exit status now; the stand-in answers 0.
+        mock_json.return_value = 0
         from btrfs_backup_ng.config.schema import Config, VolumeConfig, TargetConfig
 
         mock_find.return_value = str(tmp_path / "config.toml")
@@ -1212,6 +1215,9 @@ class TestEstimateDirect:
     ):
         """Test successful estimation with JSON output."""
         from btrfs_backup_ng.cli.estimate import _estimate_direct
+
+        # The printer decides the exit status now; the stand-in answers 0.
+        mock_json.return_value = 0
 
         mock_ep = MagicMock()
         mock_endpoint.choose_endpoint.return_value = mock_ep

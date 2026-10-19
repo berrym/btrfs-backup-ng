@@ -522,6 +522,16 @@ btrfs-backup-ng estimate /mnt/snapshots /mnt/backup --check-space --safety-margi
 btrfs-backup-ng estimate --volume /home --check-space --json
 ```
 
+**Exit status:**
+- `0` -- the estimate is complete: every snapshot that would transfer has a
+  size, and with `--check-space` the destination has room for the total
+- `1` -- nothing ran: no config file, no such volume, an endpoint that could
+  not be opened, or the estimate itself failed
+- `2` -- the estimate ran but is not a measurement: at least one snapshot that
+  would transfer has no size (its row reads "unknown"), or `--check-space`
+  could not be made; the totals are partial sums
+- `3` -- `--check-space` ran on measured sizes and the destination is short
+
 **Space Check Output:**
 
 When `--check-space` is enabled, the output includes destination space information:
