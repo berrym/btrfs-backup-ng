@@ -3253,40 +3253,42 @@ print(json.dumps(result))
         if parent is not None:
             return None
         path = self._normalize_path(snapshot.get_path())
-        use_sudo = self.config.get("ssh_sudo", False)
         cmd = ["btrfs", "filesystem", "du", "-s", "--raw", path]
-        try:
-            if use_sudo:
-                result = self._exec_remote_command_with_retry(
-                    cmd,
-                    max_retries=2,
-                    check=False,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    timeout=120,
-                )
-            else:
+        # The same two attempts the local ladder makes: `sudo -n` first where
+        # the endpoint elevates, since a snapshot made by root holds
+        # directories only root can walk, then once more as the remote user,
+        # who can measure any tree they can read. This ran the command as the
+        # user alone, so a root-made snapshot on a sudo-elevated target
+        # measured nothing. A Total of 0 is no answer: the tool prints it for
+        # a tree it cannot read in full.
+        attempts = [cmd]
+        if self.config.get("ssh_sudo", False):
+            attempts.insert(0, ["sudo", "-n", *cmd])
+        for argv in attempts:
+            try:
                 result = self._exec_remote_command(
-                    cmd,
+                    argv,
                     check=False,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
                     timeout=120,
                 )
-        except Exception as e:  # noqa: BLE001 - an estimate is advisory
-            logger.debug("Remote filesystem du failed for %s: %s", path, e)
-            return None
-        if result.returncode != 0:
-            return None
-        out = result.stdout or b""
-        text = out.decode("utf-8", errors="replace") if isinstance(out, bytes) else out
-        lines = text.strip().splitlines()
-        if len(lines) >= 2:
-            parts = lines[1].split()
-            if len(parts) >= 3:
-                parsed = _parse_size(parts[0])
-                if parsed:
-                    return parsed
+            except Exception as e:  # noqa: BLE001 - an estimate is advisory
+                logger.debug("Remote filesystem du failed for %s: %s", path, e)
+                continue
+            if result.returncode != 0:
+                continue
+            out = result.stdout or b""
+            text = (
+                out.decode("utf-8", errors="replace") if isinstance(out, bytes) else out
+            )
+            lines = text.strip().splitlines()
+            if len(lines) >= 2:
+                parts = lines[1].split()
+                if len(parts) >= 3:
+                    parsed = _parse_size(parts[0])
+                    if parsed:
+                        return parsed
         return None
 
     def _verify_snapshot_exists(self, dest_path: str, snapshot_name: str) -> bool:

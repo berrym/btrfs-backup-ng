@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **`estimate` measured an `ssh://` source's snapshots on the local
+  machine.** It ran the local size commands on the remote path, so every
+  row of an estimate from a remote source read "unknown", where the
+  command had not already failed to list the remote directory at all,
+  since it never handed the source endpoint the path. The source
+  endpoint now receives the snapshot directory and the ssh options, and
+  measures its own snapshots, as the engine's space check
+  already asked it to, and the remote measurement runs `btrfs filesystem
+  du` through `sudo -n` first where the target elevates and then as the
+  remote user, as the local one does. Incremental sizes are not estimated
+  for a remote source, and the estimate says so once (#124).
 ## [0.9.14] - 2026-10-18
 
 This release corrects one defect in the 0.9.13 test suite: it did not start

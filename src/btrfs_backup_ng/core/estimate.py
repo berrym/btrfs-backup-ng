@@ -493,6 +493,19 @@ def estimate_transfer(
 
     # Use sudo if configured
     use_sudo = source_endpoint.config.get("ssh_sudo", False)
+    # A remote source's snapshots live on the remote host; the local ladder
+    # aimed at config["path"] / name measured nothing there and every row read
+    # "unknown". The endpoint that holds them measures them, as the engine's
+    # space check already asks (measure_transfer_size). The incremental
+    # estimate runs `btrfs send --no-data` locally and has no remote form, so a
+    # remote source gets full sizes only, said once below.
+    remote_source = getattr(source_endpoint, "_is_remote", False) is True
+    if remote_source:
+        logger.info(
+            "The source is on %s: full sizes are measured there; incremental "
+            "sizes are not estimated for a remote source.",
+            getattr(source_endpoint, "hostname", "the remote host"),
+        )
 
     # Sort snapshots by time for incremental parent detection. A snapshot
     # whose name yields no timestamp is not part of the estimate -- the
@@ -520,18 +533,22 @@ def estimate_transfer(
             estimate.skipped_count += 1
             continue
 
-        # Get snapshot path
-        snap_path = source_endpoint.config["path"] / name
-
-        # Estimate full size
-        full_size, method = estimate_snapshot_full_size(snap_path, use_sudo)
+        # Estimate full size. A remote endpoint's path is a string naming a
+        # directory on the other host, not a local Path, and is never joined.
+        if remote_source:
+            measured = source_endpoint.measure_transfer_size(snap)
+            full_size = measured.bytes if measured is not None else None
+            method = measured.method if measured is not None else "failed"
+        else:
+            snap_path = source_endpoint.config["path"] / name
+            full_size, method = estimate_snapshot_full_size(snap_path, use_sudo)
 
         # Check for incremental opportunity
         parent_name = None
         incremental_size = None
         is_incremental = False
 
-        if last_snapshot:
+        if last_snapshot and not remote_source:
             parent_path = source_endpoint.config["path"] / last_snapshot.get_name()
             if parent_path.exists():
                 parent_name = last_snapshot.get_name()
