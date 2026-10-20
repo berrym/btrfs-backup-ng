@@ -5,7 +5,43 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.9.16] - 2026-10-20
+
+This release closes the lock rework begun in 0.9.15. Five defects in how
+pins and locks were taken, kept, released and reported are corrected, the
+lock file gains a record of who holds each pin, and `doctor` repairs what
+it can prove. It also adds a glossary of the project's words and removes
+a size-estimate step that never matched.
+
+Changes an upgrade can observe:
+
+- **A `.btrfs-backup-ng.locks.holders` directory appears beside every lock
+  file**, in each snapshot directory and at each local backup location,
+  holding one small record per pin with the hostname, pid and heartbeat of
+  the holder. The lock file's format is unchanged; older versions read the
+  file as before and ignore the directory.
+- **`doctor` reports each pin with its holder, and `--fix` repairs real
+  things.** The `stale_locks` check keeps its name for `--check` and JSON
+  consumers; its findings now carry `pid`, `hostname` and `age`, and a
+  finding is fixable only when the fix can be proven: an entry for a
+  snapshot that no longer exists, an entry with nothing in it, a restore
+  pin or a parent pin whose holder's beat has stopped, a dead record in a
+  lock store. A pin whose holder is alive, a pin with no record, and a
+  backup's own pin kept for the next run are never touched.
+- **`restore --status` shows who holds each pin** and whether they are
+  still there, after the pin on the same line.
+- **`restore --unlock` keeps the pin of a restore that began after the
+  command read the lock state**, under `all` as well, and clears a holder
+  record that cannot be parsed under `all` only.
+- **On a root-owned destination the lock heartbeat, release and sweep now
+  elevate** as the acquire always did, so `sudo -n sh -c` appears in the
+  sudo log once per beat while a transfer or restore runs there; before,
+  every beat failed silently and the lock went stale after three minutes.
+- **A parent pin is released at the start of every sync.** A source that
+  kept a snapshot for ever as "held by a retention lock", and sent it again
+  in full on every run, stops doing both on the first run.
+- **`estimate` no longer runs `btrfs subvolume show`**; the `subvolume_show`
+  method name no longer appears in its output.
 
 ### Added
 
