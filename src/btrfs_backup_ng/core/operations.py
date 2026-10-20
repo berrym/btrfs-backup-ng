@@ -1580,15 +1580,24 @@ def sync_snapshots(
     # failed/pending). Presence-based, not time-based -- a long outage never prunes a
     # needed snapshot; and a re-created snapshot (same name, new uuid) is correctly "not
     # present", so its lock is not cleared by a name coincidence.
+    #
+    # A PARENT pin is released whether or not the snapshot is present. It was
+    # taken because the destination held the snapshot as the base of a
+    # ``send -p``; once the destination no longer holds it, by its own prune
+    # after an interrupted run, the pin protects nothing, since a snapshot the
+    # destination does not hold cannot be the base of any incremental to it.
+    # Kept, it was never released: the source kept the snapshot for ever, and
+    # the catch-up selection counted the pin as a transfer that had not
+    # finished and sent the snapshot again in full on every run.
     present_names = snapshots_present_on(source_snapshots, destination_endpoint)
     destination_id = destination_endpoint.get_id()
     for snap in source_snapshots:
-        if snap.get_name() not in present_names:
-            continue  # not yet on the destination -> keep any lock
-        if destination_id in snap.locks:
-            source_endpoint.set_lock(snap, destination_id, False)
         if destination_id in snap.parent_locks:
             source_endpoint.set_lock(snap, destination_id, False, parent=True)
+        if snap.get_name() not in present_names:
+            continue  # not yet on the destination -> keep its own lock
+        if destination_id in snap.locks:
+            source_endpoint.set_lock(snap, destination_id, False)
 
     logger.debug("Source snapshots found: %d", len(source_snapshots))
 

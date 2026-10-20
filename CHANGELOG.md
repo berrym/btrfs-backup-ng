@@ -5,6 +5,27 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **A parent pin on a snapshot the destination no longer held was never
+  released, so every run sent that snapshot again in full.** A transfer
+  pins its incremental parent on the source under the destination's id,
+  because the destination holds that parent as the base of the `send -p`.
+  An interrupted run keeps its pins. When the destination's own prune then
+  deleted the parent there, the pin protected nothing, but the reconcile at
+  the start of a sync released pins only on snapshots present on the
+  destination, and the catch-up selection counted a parent pin as a
+  transfer that had not finished. Every run sent the snapshot again in
+  full, the destination's prune deleted it again, and the source kept it
+  for ever as held by a retention lock. The reconcile now releases this
+  destination's parent pin on every snapshot, since a snapshot the
+  destination does not hold cannot be the base of an incremental to it, and
+  the catch-up selection counts only a snapshot's own pin as pending work.
+  A snapshot's own pin on a snapshot the destination lacks is kept as
+  before: that transfer has not finished (#126).
+
 ## [0.9.15] - 2026-10-19
 
 This release corrects four defects found after 0.9.14. Pins on the source

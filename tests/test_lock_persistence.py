@@ -23,7 +23,7 @@ Persistence has three parts, each pinned below:
 from __future__ import annotations
 
 import time
-from unittest.mock import MagicMock
+from unittest.mock import call, MagicMock
 
 import pytest
 
@@ -239,7 +239,10 @@ def test_reconcile_keeps_lock_for_recreated_snapshot_via_real_correspondence(
     STALE same-named subvolume (received_uuid = OLD) is correctly ABSENT, so its lock is KEPT
     -- retention cannot prune the snapshot the next real transfer still needs. Mutation guard:
     reverting the reconcile to name-based presence clears the lock on the name coincidence and
-    fails this; the name-fake reconcile tests above structurally cannot catch that."""
+    fails this; the name-fake reconcile tests above structurally cannot catch that.
+
+    Its PARENT pin is released: the destination does not hold this snapshot, so it cannot be
+    the base of an incremental to it, and the pin protects nothing (#126)."""
     monkeypatch.setattr(
         "btrfs_backup_ng.core.planning.plan_transfer_sequence", lambda *a, **k: []
     )
@@ -262,7 +265,7 @@ def test_reconcile_keeps_lock_for_recreated_snapshot_via_real_correspondence(
         for c in src.set_lock.call_args_list
         if c.args[:3] == (recreated, "dest-1", False)
     ]
-    assert clears == []
+    assert clears == [call(recreated, "dest-1", False, parent=True)]
 
 
 def test_reconcile_and_planner_agree_end_to_end(monkeypatch):
