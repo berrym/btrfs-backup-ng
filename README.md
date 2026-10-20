@@ -2108,7 +2108,8 @@ leftovers, it does not interrupt work in progress.
 On `ssh://` and `raw+ssh://` targets these locks live **on the target**, so `--status`
 reports what other processes and other machines are holding, and a lock left by an
 interrupted run is visible from anywhere that can reach the target. See
-[Remote Locks](docs/REMOTE-LOCKS.md) for how they work and when they expire.
+[Remote Locks](docs/REMOTE-LOCKS.md) for how they work and when they expire, and
+[the glossary](docs/GLOSSARY.md) for what a lock, a pin and a holder record are.
 
 #### Clean Up Partial Restores
 
@@ -3461,6 +3462,7 @@ src/btrfs_backup_ng/
 ## Documentation
 
 - [CLI Reference](docs/CLI-REFERENCE.md) - Complete command and option reference
+- [Glossary](docs/GLOSSARY.md) - The project's words: plain meaning, technical meaning, and where each lives in the code
 - [Migrating from btrbk](docs/MIGRATING-FROM-BTRBK.md) - Guide for btrbk users
 - [Snapper Integration](docs/SNAPPER-INTEGRATION.md) - Backing up and restoring snapper snapshots
 - [Remote Locks](docs/REMOTE-LOCKS.md) - How a restore is protected from a concurrent prune

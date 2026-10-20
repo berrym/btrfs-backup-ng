@@ -1,5 +1,7 @@
 # Remote Locks
 
+The words used here are defined in [the glossary](GLOSSARY.md).
+
 Locks that outlive the process that took them, so a restore reading a snapshot
 on a remote target cannot have that snapshot deleted out from under it by a
 prune running somewhere else.

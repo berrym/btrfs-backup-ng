@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **A glossary of the project's words**, `docs/GLOSSARY.md`: each term with
+  its plain meaning, its technical meaning and where it lives in the code,
+  the on-disk form of the lock file, the holder record and the directory
+  store, the lifecycle of a pin and of a record, and the words the project
+  does not use. `tests/test_glossary.py` keeps it true: every code reference
+  must import, every excerpt must still be in the file it names, every
+  on-disk example must be what the writer produces, and the retired words
+  must stay out of the source and the other documentation.
+
 ### Fixed
 
 - **`restore --unlock` erased a pin a run took while the command ran, and
