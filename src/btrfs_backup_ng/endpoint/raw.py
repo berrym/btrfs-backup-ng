@@ -2205,12 +2205,23 @@ class SSHRawEndpoint(RawEndpoint):
         return read_persisted_locks(self._lock_manager())
 
     def _write_locks(self, lock_dict: dict) -> None:
-        """Reconcile this target's locks to ``lock_dict`` (``restore --unlock``)."""
+        """Reconcile this target's locks to ``lock_dict``, whole."""
         from ..sshutil.lock import write_persisted_locks
 
         if self._lock_target_path() is None:
             return
         write_persisted_locks(self._lock_manager(), lock_dict)
+
+    def _release_locks(
+        self, pins: dict[str, dict[str, list[Any]]]
+    ) -> Iterator[tuple[str, dict[str, list[Any]], bool]]:
+        """Release the given pins on this location, each by its own holder
+        record (``restore --unlock``); see ``Endpoint._release_locks``."""
+        from ..sshutil.lock import release_persisted_locks
+
+        if self._lock_target_path() is None:
+            return
+        yield from release_persisted_locks(self._lock_manager(), pins)
 
     def set_lock(
         self,

@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`restore --unlock` erased a pin a run took while the command ran, and
+  brought back a pin the run had released.** The command read the lock
+  state, removed the restore pins from its copy and wrote the copy back
+  whole, outside the guard `set_lock` takes: to the lock file of a local
+  location, and as a reconcile of every holder record at a location that
+  carries the directory store (`ssh://`, `raw://`, `raw+ssh://`, a local
+  location over an `ssh://` mirror). The command now releases only the pins
+  it read, each from the state at the moment of writing: a lock-file entry
+  is changed under the guard through the writer `set_lock` uses, and a
+  directory-store pin is dropped by its own holder record. A restore that
+  begins after the command has read the state keeps its pin, under
+  `--unlock all` as well. The count the command reports is what it
+  released, and a write that fails part-way says how many were unlocked
+  before it. A holder record the directory store cannot parse is cleared by
+  `--unlock all` only; any `--unlock` cleared it before (#125).
+
 - **A pin's heartbeat could not bring back a record removed from under a
   running restore, and lost the pin outright when that restore was the
   only holder.** A shared pin's heartbeat refreshed the holder's file with
@@ -40,6 +56,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   now runs again elevated, with the runner the acquire used; one that could
   write does not elevate. Confirmed on a root-owned target directory on a
   real host before and after (#129).
+
+- **A deleted snapshot's entry could stay in the lock file for ever.**
+  `delete_snapshots` reads the lock file again before it deletes, so a
+  snapshot it deletes holds no pin at that moment; a pin taken after that
+  read and before the deletion, by another target's thread or another
+  process, landed in an entry for a snapshot that no longer existed.
+  Nothing lists a deleted snapshot again, so nothing released that pin,
+  and `restore --status` and `doctor` reported a lock held on a snapshot
+  that did not exist until `--unlock` cleared it by hand; an entry with
+  nothing in it, as a hand edit can leave, stayed the same way. After a
+  successful deletion the entry is now removed through the guarded
+  by-change writer, with a warning that names the pin when one was taken
+  after the read and quietly when the entry held nothing. The deletion
+  stands either way; an entry that cannot be removed is a warning that
+  says how to clear it (#127).
+
+- **A parent pin on a snapshot the destination no longer held was never
+  released, so every run sent that snapshot again in full.** A transfer
+  pins its incremental parent on the source under the destination's id,
+  because the destination holds that parent as the base of the `send -p`.
+  An interrupted run keeps its pins. When the destination's own prune then
+  deleted the parent there, the pin protected nothing, but the reconcile at
+  the start of a sync released pins only on snapshots present on the
+  destination, and the catch-up selection counted a parent pin as a
+  transfer that had not finished. Every run sent the snapshot again in
+  full, the destination's prune deleted it again, and the source kept it
+  for ever as held by a retention lock. The reconcile now releases this
+  destination's parent pin on every snapshot, since a snapshot the
+  destination does not hold cannot be the base of an incremental to it, and
+  the catch-up selection counts only a snapshot's own pin as pending work.
+  A snapshot's own pin on a snapshot the destination lacks is kept as
+  before: that transfer has not finished (#126).
 
 ## [0.9.15] - 2026-10-19
 

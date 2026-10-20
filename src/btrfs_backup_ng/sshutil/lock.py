@@ -1268,11 +1268,13 @@ def read_persisted_locks(manager: Any) -> dict[str, dict]:
 def write_persisted_locks(manager: Any, lock_dict: dict[str, Any]) -> None:
     """Reconcile the target's snapshot pins to ``lock_dict``.
 
-    The caller (``restore --unlock``) computes the state it wants and writes it
-    whole, matching the local lock-file contract. Here that means dropping every
-    holder the new state no longer lists -- per holder, not per snapshot, so
-    clearing one session's lock leaves another session's pin on the same
-    snapshot intact.
+    The caller computes the state it wants and writes it whole, matching the
+    local lock-file contract. Here that means dropping every holder the new
+    state no longer lists -- per holder, not per snapshot, so clearing one
+    session's lock leaves another session's pin on the same snapshot intact.
+    A holder taken after the caller read the store is not in the new state
+    and is dropped with the rest, which is why ``restore --unlock`` releases
+    through ``release_persisted_locks`` instead.
 
     Holders are dropped by the record they were found in, so a holder whose
     payload cannot be parsed -- reported as ``unknown``, and therefore impossible
@@ -1294,6 +1296,52 @@ def write_persisted_locks(manager: Any, lock_dict: dict[str, Any]) -> None:
         for holder in holders:
             if holder.lock_id is None or holder.lock_id not in keep:
                 manager.release_holder(holder)
+    manager.sweep_dead_holders()
+
+
+def release_persisted_locks(
+    manager: Any, pins: dict[str, dict[str, list[Any]]]
+) -> Iterator[tuple[str, dict[str, list[str]], bool]]:
+    """Release the given snapshot pins, each by its own holder record.
+
+    ``pins`` is in the lock-file shape ``read_persisted_locks`` returns: for
+    each snapshot, the ids under ``locks`` and ``parent_locks`` to release.
+    The holders are listed once, when this runs, and only a holder whose id
+    is listed in ``pins`` is dropped, so a pin taken after the caller read
+    the store (a restore that began meanwhile) is kept, and a pin released
+    meanwhile is simply not found. ``unknown`` under ``locks`` names the
+    holders of that snapshot whose record could not be parsed, the way
+    ``read_persisted_locks`` reports them.
+
+    Yields, per snapshot in ``pins``, its name, the ids actually released in
+    the same shape, and whether the snapshot still has a holder afterwards.
+    A holder found in a directory that could not be listed cannot be
+    addressed and counts as still held. Locks that are not snapshot pins --
+    the whole-target lock a prune holds -- are never touched. Abandoned
+    holder records are swept at the end, as before.
+    """
+    live = manager.live_locks()
+    for snapshot, wanted in pins.items():
+        ids = {str(x) for x in wanted.get("locks", [])}
+        ids |= {f"p:{x}" for x in wanted.get("parent_locks", [])}
+        released: dict[str, list[str]] = {}
+        still_held = False
+        for holder in live.get(f"{SNAPSHOT_LOCK_PREFIX}{snapshot}", []):
+            lock_id = holder.lock_id
+            selected = "unknown" in ids if lock_id is None else lock_id in ids
+            if not selected:
+                still_held = True
+                continue
+            manager.release_holder(holder)
+            if not holder.file_name:
+                # ``release_holder`` said why nothing could be removed.
+                still_held = True
+                continue
+            key = "parent_locks" if str(lock_id or "").startswith("p:") else "locks"
+            released.setdefault(key, []).append(
+                lock_id.removeprefix("p:") if lock_id else "unknown"
+            )
+        yield snapshot, released, still_held
     manager.sweep_dead_holders()
 
 
