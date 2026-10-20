@@ -256,42 +256,6 @@ def test_unlock_torn_write_preserves_lock_file(tmp_path, monkeypatch):
     }
 
 
-# ---------------------------------- review fix: doctor _fix_stale_lock atomic (was a bypass)
-
-
-def test_doctor_fix_stale_lock_is_atomic(tmp_path):
-    """The doctor's --fix stale-lock action must use the atomic lock writer (it was a
-    plain write_text bypass, the same class as the G3 restore-unlock bypass)."""
-    from btrfs_backup_ng.core.doctor import Doctor
-
-    lock_file = tmp_path / ".btrfs-backup-ng.locks"
-    lock_file.write_text(__util__.write_locks({"snap": {"locks": ["stale:1"]}}))
-
-    ok = Doctor()._fix_stale_lock(lock_file, "snap", "stale:1")
-
-    assert ok is True
-    assert __util__.read_locks(lock_file.read_text()) == {}  # stale lock removed
-    assert not (tmp_path / ".btrfs-backup-ng.locks.tmp").exists()
-
-
-def test_doctor_fix_stale_lock_torn_write_preserves_lock_file(tmp_path, monkeypatch):
-    """Mutation guard: revert to plain ``write_text`` and a crash before the rename
-    truncates the lock file -> retention misreads it as 'no locks'. The atomic writer
-    leaves the original lock file intact."""
-    from btrfs_backup_ng.core.doctor import Doctor
-
-    lock_file = tmp_path / ".btrfs-backup-ng.locks"
-    lock_file.write_text(__util__.write_locks({"snap": {"locks": ["stale:1"]}}))
-
-    monkeypatch.setattr(os, "replace", _raise_oserror)
-    ok = Doctor()._fix_stale_lock(lock_file, "snap", "stale:1")
-
-    assert ok is False  # write failed -> fix reports failure
-    assert __util__.read_locks(lock_file.read_text()) == {
-        "snap": {"locks": ["stale:1"]}
-    }
-
-
 # ---------------------------------- review fix: archive_operation never drops a record
 
 

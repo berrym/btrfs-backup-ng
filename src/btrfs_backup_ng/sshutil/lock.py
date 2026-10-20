@@ -435,6 +435,7 @@ class RemoteLockManager:
         stale_after: int = DEFAULT_STALE_AFTER,
         hostname: str = "",
         run_elevated: Optional[Callable[[str], tuple[int, str, str]]] = None,
+        dir_name: str = LOCK_DIR_NAME,
     ) -> None:
         """``run_elevated`` is used only when the unprivileged attempt could
         not write: the acquire when the lock directory cannot be created or
@@ -442,10 +443,15 @@ class RemoteLockManager:
         record could not be refreshed or removed, since a record the acquire
         wrote elevated is root-owned for the whole of its life. Backup
         destinations are commonly root-owned, and the lock has to live beside
-        the data it protects."""
+        the data it protects.
+
+        ``dir_name`` is the directory under the target the records live in:
+        ``LOCK_DIR_NAME`` for a location's lock store, and the holders
+        directory beside a lock file for the records that say who holds the
+        pins the file lists (``holders_beside``)."""
         self._run = run_remote
         self._target = str(target_path).rstrip("/") or "/"
-        self._root = f"{self._target}/{LOCK_DIR_NAME}"
+        self._root = f"{self._target}/{dir_name}"
         self._heartbeat_interval = heartbeat_interval
         self._stale_after = stale_after
         self._hostname = hostname
@@ -726,6 +732,20 @@ class RemoteLockManager:
         )
         return mode
 
+    def keep_record_past_exit(self, name: str, lock_id: str) -> None:
+        """Leave this holder's record where it is when the process exits.
+
+        A pin in a lock file survives the process that took it, on purpose:
+        an interrupted backup keeps its pin so the source cannot prune what
+        a later run still has to send. The record beside the file is the
+        evidence of who took the pin and whether they are still at it, so it
+        has to outlive the process too: released at exit, an interrupted
+        restore's pin would have no record and doctor could not tell it from
+        one taken by an earlier version. The beat stops with the process, so
+        the record reads as a holder that is gone, which is the truth.
+        """
+        _unregister_for_cleanup(self, self._held_key(name, lock_id))
+
     @staticmethod
     def _held_key(name: str, lock_id: str) -> str:
         return f"{name}\x00{lock_id}"
@@ -932,8 +952,35 @@ class RemoteLockManager:
         """Names of locks with at least one live holder."""
         return set(self.live_locks())
 
+    def shared_records(self) -> dict[str, list[tuple[Holder, Optional[int]]]]:
+        """Every shared holder record on the target, live or not, with its
+        age in seconds by the target's clock (None when it cannot be read),
+        keyed by the lock's real name.
+
+        ``live_locks`` answers the guard's question, "is this held", and
+        leaves out a record whose beat has stopped. Doctor asks a different
+        one, "who holds this and are they still there", and needs the
+        records a stopped beat would hide, with the age that says so.
+        """
+        records: dict[str, list[tuple[Holder, Optional[int]]]] = {}
+        for kind, key, holder, age in self._scan()[2]:
+            if kind == "H":
+                records.setdefault(key, []).append((holder, age))
+        return records
+
     def _scan_holders(self) -> tuple[dict[str, list[Holder]], list[tuple[str, str]]]:
-        """(live locks by real name, (dir, file) of abandoned holder records).
+        live, dead, _records = self._scan()
+        return live, dead
+
+    def _scan(
+        self,
+    ) -> tuple[
+        dict[str, list[Holder]],
+        list[tuple[str, str]],
+        list[tuple[str, str, Holder, Optional[int]]],
+    ]:
+        """(live locks by real name, (dir, file) of abandoned holder records,
+        every record as (kind, real name, holder, age)).
 
         The remote emits NAMES, never paths. Paths are rebuilt here from the root
         this manager already knows. A path was emitted at first, and split off a
@@ -999,6 +1046,7 @@ class RemoteLockManager:
         clock_read = False
         live: dict[str, list[Holder]] = {}
         dead: list[tuple[str, str]] = []
+        records: list[tuple[str, str, Holder, Optional[int]]] = []
         unjudged: list[str] = []
         for line in out.splitlines():
             if line.startswith("NOW"):
@@ -1031,10 +1079,6 @@ class RemoteLockManager:
                 if now is not None and mtime_raw.isdigit()
                 else None
             )
-            if age is not None and age > self._stale_after:
-                if kind == "H" and age > self._stale_after * DEAD_HOLDER_MULTIPLE:
-                    dead.append((dir_name, file_name))
-                continue
             try:
                 info = json.loads(raw.strip()) if raw.strip() else {}
             except ValueError:
@@ -1048,7 +1092,13 @@ class RemoteLockManager:
             # payload is unreadable the encoded name is all there is; the guard
             # checks for both, so such a lock still blocks.
             key = str(info.get("name") or decode_name_for_display(dir_name))
-            live.setdefault(key, []).append(Holder(dir_name, file_name, info))
+            holder = Holder(dir_name, file_name, info)
+            records.append((kind, key, holder, age))
+            if age is not None and age > self._stale_after:
+                if kind == "H" and age > self._stale_after * DEAD_HOLDER_MULTIPLE:
+                    dead.append((dir_name, file_name))
+                continue
+            live.setdefault(key, []).append(holder)
             if age is None:
                 unjudged.append(key)
         if not clock_read:
@@ -1067,7 +1117,7 @@ class RemoteLockManager:
                 "" if now is not None else " (the target's clock could not be read)",
                 ", ".join(sorted(set(unjudged))),
             )
-        return live, dead
+        return live, dead, records
 
     def sweep_dead_holders(self) -> int:
         """Remove holder records far past the point of any doubt.
@@ -1343,6 +1393,69 @@ def release_persisted_locks(
             )
         yield snapshot, released, still_held
     manager.sweep_dead_holders()
+
+
+def local_manager(
+    target_path: str | os.PathLike, *, dir_name: str = LOCK_DIR_NAME
+) -> "RemoteLockManager":
+    """A lock manager over a location on this machine, running the same
+    scripts an ssh endpoint runs on its remote, through ``sh``.
+
+    Elevation mirrors the ssh endpoint's: the unprivileged attempt first,
+    ``sudo -n sh -c`` only when a directory or record could not be created
+    or written -- a mirror received under ``--ssh-sudo`` is root-owned, and
+    its lock directory with it.
+    """
+    import shlex
+    import socket as _socket
+    import subprocess
+
+    from .. import __util__
+
+    def run(script: str) -> tuple[int, str, str]:
+        proc = subprocess.run(
+            ["sh", "-c", script], capture_output=True, text=True, check=False
+        )
+        return proc.returncode, proc.stdout, proc.stderr
+
+    def run_elevated(script: str) -> tuple[int, str, str]:
+        try:
+            sudo = " ".join(__util__.sudo_argv())
+        except __util__.AbortError as e:
+            # The manager reports what stderr said, so the reason reaches
+            # the operator instead of the shell's "sudo: not found".
+            return 127, "", str(e)
+        return run(f"{sudo} sh -c {shlex.quote(script)}".lstrip())
+
+    return RemoteLockManager(
+        run,
+        str(target_path),
+        hostname=_socket.gethostname(),
+        run_elevated=run_elevated,
+        dir_name=dir_name,
+    )
+
+
+def holders_dir_name(lock_file_name: str) -> str:
+    """The directory beside a lock file that holds who-holds-what records."""
+    return f"{lock_file_name}.holders"
+
+
+def holders_beside(lock_file: str | os.PathLike) -> "RemoteLockManager":
+    """The records beside a lock FILE: who holds each pin the file lists.
+
+    A pin in the lock file is the protection and survives the process that
+    took it. The record beside it is the evidence: the same payload a
+    directory-store holder writes (name, lock id, operation, hostname, pid)
+    with the same heartbeat, so doctor can say whether the holder of a pin
+    is still at work, is gone, or never wrote a record. The file's format is
+    untouched; every reader of it, and every older version, is unaffected.
+    """
+    path = os.fspath(lock_file)
+    return local_manager(
+        os.path.dirname(path) or ".",
+        dir_name=holders_dir_name(os.path.basename(path)),
+    )
 
 
 _MANAGER_CACHE_LOCK = threading.Lock()

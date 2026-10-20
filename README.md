@@ -2786,12 +2786,16 @@ btrfs-backup-ng doctor --quiet
 btrfs-backup-ng doctor --volume /home
 ```
 
-### Auto-Fix Issues
+### Apply Fixes
 
-Some issues can be automatically fixed:
+A finding offers a fix when doctor can prove it is safe: a lock entry for a
+snapshot that no longer exists or that holds nothing, a restore pin or a parent
+pin whose holder's heartbeat has stopped, and a dead holder record in a lock
+store. A pin whose holder is alive, a pin with no holder record, and a backup's
+own pin kept for the next run are never touched:
 
 ```bash
-# Auto-fix safe issues (stale locks, temp files)
+# Apply the fixes doctor can prove (leftover lock entries and pins, dead holder records)
 btrfs-backup-ng doctor --fix
 
 # Interactive fix (confirm each fix)
@@ -2813,8 +2817,9 @@ Snapshots
   [OK]    Volume /home: 24 snapshots, chain intact
 
 Transfers
-  [WARN]  Stale lock: home-20260110 (process 12345 not running)
-          [FIXABLE] Run with --fix to remove
+  [INFO]  Restore pin held on home-20260110 by 'restore:3f8a1c2e': pid 4211 on fedora, beat 12s ago
+  [WARN]  Restore pin held on home-20260109 by 'restore:9c0d11aa' whose holder is gone (pid 3980 on fedora, beat 7310s ago); a restore pin has no life after its process
+          [FIXABLE] Run with --fix to repair
 
 System
   [OK]    Destination: 524 GiB available (52%)
@@ -2823,7 +2828,7 @@ System
 
 =======================================================
 Summary: 8 passed, 2 warnings, 0 errors
-Fixable: 1 issue (run with --fix)
+Fixable: 1 issue(s) (run with --fix)
 ```
 
 ### What Doctor Checks
@@ -2832,7 +2837,7 @@ Fixable: 1 issue (run with --fix)
 |----------|--------|
 | **config** | Config file exists and valid, volume sources usable (the same check as `config validate`), targets reachable, compression programs available |
 | **snapshots** | Orphaned snapshots, missing snapshots, broken parent chains |
-| **transfers** | Stale locks (dead processes), incomplete transfers, recent failures |
+| **transfers** | Pins held on snapshots and who holds them, incomplete transfers, recent failures |
 | **system** | Destination space, quota limits, systemd timer status, backup age |
 
 ### Exit Codes
@@ -2849,7 +2854,7 @@ Fixable: 1 issue (run with --fix)
 |--------|-------------|
 | `--json` | Output in JSON format |
 | `--check CATEGORY` | Check specific category: config, snapshots, transfers, system |
-| `--fix` | Auto-fix safe issues |
+| `--fix` | Apply the fixes doctor can prove: lock entries for snapshots that no longer exist or that hold nothing, restore and parent pins whose holder is gone, dead holder records |
 | `--interactive` | Confirm each fix before applying |
 | `--quiet` | Only show problems |
 | `--volume PATH` | Check specific volume only |

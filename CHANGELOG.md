@@ -89,6 +89,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   A snapshot's own pin on a snapshot the destination lacks is kept as
   before: that transfer has not finished (#126).
 
+- **`doctor` read the wrong lock file for a volume with an absolute
+  `snapshot_dir`, could not say who held a pin, and offered a fix that
+  could never run.** The lock check looked for the file at the configured
+  base, while `run` keeps each volume's snapshots, and the lock file, at
+  `<base>/<source name>`, so for every such volume it reported "No locks
+  held" where locks were held; it now reads the file where `run` writes
+  it, and a base that is not there is reported. It judged a lock stale by
+  a process id in the lock id, which no id this project writes carries,
+  and offered to remove the stale lock by rewriting the file whole; the
+  verdict could never be reached and the fix could never run, and both are
+  gone. In their place, every pin taken in a lock file now has a holder
+  record beside the file, in `<lock file>.holders`: the record a directory
+  store already keeps, with hostname, pid and a heartbeat, written by the
+  same machinery. The file's format is unchanged, so every reader of it
+  and every older version is unaffected; the record outlives the process
+  as the pin does, and its beat stops with the process. `doctor` reports
+  each pin with its holder, live or gone, and `restore --status` shows the
+  same. `doctor --fix` now repairs what it can prove: an entry for a
+  snapshot that no longer exists, an entry with nothing in it, a restore
+  pin or a parent pin whose holder's beat has stopped, and a dead record in
+  a directory store, local or reached over ssh. It never touches a pin
+  whose holder is alive, a pin with no record, or a backup's own pin kept
+  for the next run. `restore --unlock` releases the records of the pins it
+  removes (#128).
+
 ## [0.9.15] - 2026-10-19
 
 This release corrects four defects found after 0.9.14. Pins on the source

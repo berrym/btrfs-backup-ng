@@ -428,6 +428,34 @@ It deliberately leaves whole-target locks alone: those belong to an operation
 running right now, and the command exists to clear leftovers, not to interrupt
 work in progress.
 
+## Holder records beside a lock file
+
+A local location keeps its pins in a lock file, a JSON ledger of
+`{snapshot: {locks, parent_locks}}`. A pin there survives the process that took
+it, on purpose: an interrupted backup keeps its pin so the source cannot prune a
+snapshot a later run still has to send. Nothing in the file said who took a pin
+or whether they were still there, so `doctor` could not tell a leftover from a
+pin at work.
+
+Since 0.9.16 every pin taken in a lock file also has a holder record beside the
+file, in `<lock file>.holders`: the same record a directory store keeps, with
+the lock's name, the lock id, hostname, pid and a heartbeat, written and
+refreshed by the same machinery, with the same elevation. The file's format is
+unchanged. The record is evidence, not protection: it outlives the process as
+the pin does, its beat stops with the process, and a record that cannot be
+written is a warning, never a failed pin. `restore --unlock` releases the
+records of the pins it removes.
+
+`doctor` joins the ledger with the records and reports each pin as held by a
+live process, held by a process whose beat has stopped, or held with no record,
+which a pin taken by an earlier version looks like. It fixes what it can
+prove: an entry for a snapshot that no longer exists, an entry with nothing in
+it, a restore pin or a parent pin whose holder is gone, and a dead record in a
+directory store. It never touches a pin whose holder is alive, a pin with no
+record, or a backup's own pin whose holder is gone, which is kept for the next
+run to complete the transfer. `restore --status` shows the same evidence
+beside each pin.
+
 ## Which targets persist locks
 
 | Target | Persists | Where |

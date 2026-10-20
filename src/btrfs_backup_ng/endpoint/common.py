@@ -1197,6 +1197,8 @@ class Endpoint:
                 # delete time and adds these back, so a snapshot this process
                 # pinned is not deleted by this process.
                 self._unrecorded_pins().add((name, key, lock_id))
+        else:
+            self._record_holder(name, key, lock_id, lock_state)
         logger.debug(
             "Lock state for %s and lock_id %s changed to %s (parent = %s)",
             snapshot,
@@ -1285,6 +1287,9 @@ class Endpoint:
                 return entry
 
             left = self._update_lock_entry(name, change)
+            for key, gone in released.items():
+                for lock_id in gone:
+                    self._record_holder(name, key, lock_id, False)
             yield name, released, bool(left)
 
     def _unrecorded_pins(self) -> Set[Tuple[str, str, Any]]:
@@ -2175,40 +2180,64 @@ class Endpoint:
         return cached_manager(self, str(path), self._build_local_lock_manager)
 
     def _build_local_lock_manager(self) -> Any:
-        """A lock manager over this location, running its scripts locally.
+        """A lock manager over this location, running its scripts locally;
+        see ``sshutil.lock.local_manager`` for the elevation rule."""
+        from ..sshutil.lock import local_manager
 
-        Elevation mirrors the ssh endpoint's: the unprivileged attempt first,
-        ``sudo -n sh -c`` only when the lock directory could not be created or
-        written -- a mirror received under ``--ssh-sudo`` is root-owned, and
-        its lock directory with it.
+        return local_manager(str(self.config["path"]))
+
+    def _holders_manager(self) -> Any:
+        """The who-holds-what records beside this location's lock FILE.
+
+        A location that carries the directory store has no lock file and no
+        records beside one: there the record is the pin. For a lock file the
+        records live in ``<lock file>.holders`` beside it, written by
+        ``_record_holder`` when a pin is taken and removed when it is
+        released, and read by doctor and ``restore --status``.
         """
-        import socket as _socket
+        from ..sshutil.lock import cached_manager, holders_beside
 
-        from ..sshutil.lock import RemoteLockManager
-
-        def run(script: str) -> tuple[int, str, str]:
-            proc = subprocess.run(
-                ["sh", "-c", script], capture_output=True, text=True, check=False
-            )
-            return proc.returncode, proc.stdout, proc.stderr
-
-        def run_elevated(script: str) -> tuple[int, str, str]:
-            import shlex
-
-            try:
-                sudo = " ".join(__util__.sudo_argv())
-            except __util__.AbortError as e:
-                # The manager reports what stderr said, so the reason reaches
-                # the operator instead of the shell's "sudo: not found".
-                return 127, "", str(e)
-            return run(f"{sudo} sh -c {shlex.quote(script)}".lstrip())
-
-        return RemoteLockManager(
-            run,
-            str(self.config["path"]),
-            hostname=_socket.gethostname(),
-            run_elevated=run_elevated,
+        lock_file = self._get_lock_file_path()
+        return cached_manager(
+            self, f"{lock_file}#holders", lambda: holders_beside(lock_file)
         )
+
+    def _record_holder(
+        self, name: str, key: str, lock_id: Any, lock_state: bool
+    ) -> None:
+        """Write or remove this process's record of a pin in the lock file.
+
+        Best effort, after the pin itself is in the file: the pin is the
+        protection, the record is the evidence of who took it and whether
+        they are still there, so a record that cannot be written is a
+        warning that doctor will be blind to this holder, never a failed
+        pin. The record outlives the process, as the pin does
+        (``keep_record_past_exit``); its beat stops with the process.
+        """
+        from ..sshutil.lock import SNAPSHOT_LOCK_PREFIX
+
+        lock_name = f"{SNAPSHOT_LOCK_PREFIX}{name}"
+        holder_id = f"p:{lock_id}" if key == "parent_locks" else str(lock_id)
+        try:
+            manager = self._holders_manager()
+            if lock_state:
+                if not manager.holds_shared(lock_name, holder_id):
+                    manager.acquire_shared_persistent(
+                        lock_name, holder_id, str(lock_id)
+                    )
+                    manager.keep_record_past_exit(lock_name, holder_id)
+            else:
+                manager.release_shared(lock_name, holder_id)
+        except Exception as exc:  # noqa: BLE001 - evidence, not protection
+            logger.warning(
+                "The pin on %s by %s is recorded in the lock file, but its holder "
+                "record beside the file could not be %s (%s): doctor cannot tell "
+                "whether this process holds it.",
+                name,
+                lock_id,
+                "written" if lock_state else "removed",
+                exc,
+            )
 
     def _read_locks(self) -> Dict[str, Any]:
         path = self._get_lock_file_path()

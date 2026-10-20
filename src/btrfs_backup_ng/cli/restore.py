@@ -905,6 +905,39 @@ def _interactive_select(backup_endpoint) -> str | None:
             return None
 
 
+def _holder_evidence(backup_endpoint: Any) -> dict[tuple[str, str], str]:
+    """What the holder records beside a lock FILE say about each pin, as a
+    suffix for the status line: who holds it and whether they are still
+    there. Empty for a location that carries the directory store, where the
+    record is the pin and the listing already is the evidence, and when the
+    records cannot be read.
+    """
+    from ..sshutil.lock import DEFAULT_STALE_AFTER, SNAPSHOT_LOCK_PREFIX
+
+    try:
+        if backup_endpoint._lock_store_manager() is not None:
+            return {}
+        records = backup_endpoint._holders_manager().shared_records()
+    except Exception:  # noqa: BLE001 - evidence only; the pins are listed anyway
+        return {}
+    evidence: dict[tuple[str, str], str] = {}
+    for lock_name, items in records.items():
+        if not lock_name.startswith(SNAPSHOT_LOCK_PREFIX):
+            continue
+        snap_name = lock_name[len(SNAPSHOT_LOCK_PREFIX) :]
+        for holder, age in items:
+            lock_id = (holder.lock_id or "").removeprefix("p:")
+            who = f"pid {holder.info.get('pid', '?')} on {holder.info.get('hostname', '?')}"
+            if age is None:
+                state = f"{who}, age of the record unknown"
+            elif age > DEFAULT_STALE_AFTER:
+                state = f"holder gone: {who}, beat stopped {age}s ago"
+            else:
+                state = f"{who}, beat {age}s ago"
+            evidence[(snap_name, lock_id)] = f" ({state})"
+    return evidence
+
+
 def _execute_status(args: argparse.Namespace) -> int:
     """Show status of locks and incomplete restores at backup location.
 
@@ -990,18 +1023,22 @@ def _execute_status(args: argparse.Namespace) -> int:
                         other_locks[snap_name] = []
                     other_locks[snap_name].append(lock_id)
 
+        evidence = _holder_evidence(backup_endpoint)
+
         if restore_locks:
             print("\n  Restore locks (from restore operations):")
             for snap_name, lock_ids in restore_locks.items():
                 for lock_id in lock_ids:
                     session_id = lock_id.replace("restore:", "")
-                    print(f"    {snap_name}: session {session_id}")
+                    who = evidence.get((snap_name, lock_id), "")
+                    print(f"    {snap_name}: session {session_id}{who}")
 
         if other_locks:
             print("\n  Other locks (from backup/transfer operations):")
             for snap_name, lock_ids in other_locks.items():
                 for lock_id in lock_ids:
-                    print(f"    {snap_name}: {lock_id}")
+                    who = evidence.get((snap_name, lock_id), "")
+                    print(f"    {snap_name}: {lock_id}{who}")
 
         print()
         print(f"Total: {len(locks)} snapshot(s) with locks")
