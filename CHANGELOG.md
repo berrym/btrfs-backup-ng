@@ -5,6 +5,126 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **A glossary of the project's words**, `docs/GLOSSARY.md`: each term with
+  its plain meaning, its technical meaning and where it lives in the code,
+  the on-disk form of the lock file, the holder record and the directory
+  store, the lifecycle of a pin and of a record, and the words the project
+  does not use. `tests/test_glossary.py` keeps it true: every code reference
+  must import, every excerpt must still be in the file it names, every
+  on-disk example must be what the writer produces, and the retired words
+  must stay out of the source and the other documentation.
+
+### Fixed
+
+- **`restore --unlock` erased a pin a run took while the command ran, and
+  brought back a pin the run had released.** The command read the lock
+  state, removed the restore pins from its copy and wrote the copy back
+  whole, outside the guard `set_lock` takes: to the lock file of a local
+  location, and as a reconcile of every holder record at a location that
+  carries the directory store (`ssh://`, `raw://`, `raw+ssh://`, a local
+  location over an `ssh://` mirror). The command now releases only the pins
+  it read, each from the state at the moment of writing: a lock-file entry
+  is changed under the guard through the writer `set_lock` uses, and a
+  directory-store pin is dropped by its own holder record. A restore that
+  begins after the command has read the state keeps its pin, under
+  `--unlock all` as well. The count the command reports is what it
+  released, and a write that fails part-way says how many were unlocked
+  before it. A holder record the directory store cannot parse is cleared by
+  `--unlock all` only; any `--unlock` cleared it before (#125).
+
+- **A pin's heartbeat could not bring back a record removed from under a
+  running restore, and lost the pin outright when that restore was the
+  only holder.** A shared pin's heartbeat refreshed the holder's file with
+  a plain `touch`. When `restore --unlock all` was run while a restore was
+  in progress, it removed that live pin's record; the next beat recreated
+  the file empty, which the listing reports as `unknown`, so the snapshot
+  stayed protected but the session could no longer be named or addressed.
+  When the restore was the only holder, the release had removed the
+  directories with the record, the `touch` had nowhere to write, and the
+  restore ran on with no pin at all: a prune on the target was free to
+  delete the snapshot it was reading. The beat now runs the script the
+  acquire ran, which creates the directories below the target and writes
+  the complete record, so a live pin returns whole. An exclusive lock's
+  beat still only touches its own files, so a holder whose lock was broken
+  does not write itself into the next holder's lock.
+- **Only the acquire of a lock elevated; its heartbeat, its release and
+  the sweep ran unprivileged, so on a root-owned destination every pin and
+  lock went stale while its holder was at work and stayed behind when the
+  holder was done.** The acquire runs unprivileged first and elevates when
+  the lock directory cannot be created or written, the case of a root-owned
+  mirror received under `ssh_sudo`; the record it writes is then root-owned
+  for the whole of its life. Every beat failed without a word, so a shared
+  pin stopped protecting a restore after three minutes and an exclusive
+  lock could be broken by a second process after the same interval. Every
+  release failed the same way, so each pin and lock stayed on the target
+  after its holder had finished, the next prune waited out the stale window
+  before it could take the target lock, and the sweep could not remove what
+  accumulated. A beat or a removal whose verdict says it could not write
+  now runs again elevated, with the runner the acquire used; one that could
+  write does not elevate. Confirmed on a root-owned target directory on a
+  real host before and after (#129).
+
+- **A deleted snapshot's entry could stay in the lock file for ever.**
+  `delete_snapshots` reads the lock file again before it deletes, so a
+  snapshot it deletes holds no pin at that moment; a pin taken after that
+  read and before the deletion, by another target's thread or another
+  process, landed in an entry for a snapshot that no longer existed.
+  Nothing lists a deleted snapshot again, so nothing released that pin,
+  and `restore --status` and `doctor` reported a lock held on a snapshot
+  that did not exist until `--unlock` cleared it by hand; an entry with
+  nothing in it, as a hand edit can leave, stayed the same way. After a
+  successful deletion the entry is now removed through the guarded
+  by-change writer, with a warning that names the pin when one was taken
+  after the read and quietly when the entry held nothing. The deletion
+  stands either way; an entry that cannot be removed is a warning that
+  says how to clear it (#127).
+
+- **A parent pin on a snapshot the destination no longer held was never
+  released, so every run sent that snapshot again in full.** A transfer
+  pins its incremental parent on the source under the destination's id,
+  because the destination holds that parent as the base of the `send -p`.
+  An interrupted run keeps its pins. When the destination's own prune then
+  deleted the parent there, the pin protected nothing, but the reconcile at
+  the start of a sync released pins only on snapshots present on the
+  destination, and the catch-up selection counted a parent pin as a
+  transfer that had not finished. Every run sent the snapshot again in
+  full, the destination's prune deleted it again, and the source kept it
+  for ever as held by a retention lock. The reconcile now releases this
+  destination's parent pin on every snapshot, since a snapshot the
+  destination does not hold cannot be the base of an incremental to it, and
+  the catch-up selection counts only a snapshot's own pin as pending work.
+  A snapshot's own pin on a snapshot the destination lacks is kept as
+  before: that transfer has not finished (#126).
+
+- **`doctor` read the wrong lock file for a volume with an absolute
+  `snapshot_dir`, could not say who held a pin, and offered a fix that
+  could never run.** The lock check looked for the file at the configured
+  base, while `run` keeps each volume's snapshots, and the lock file, at
+  `<base>/<source name>`, so for every such volume it reported "No locks
+  held" where locks were held; it now reads the file where `run` writes
+  it, and a base that is not there is reported. It judged a lock stale by
+  a process id in the lock id, which no id this project writes carries,
+  and offered to remove the stale lock by rewriting the file whole; the
+  verdict could never be reached and the fix could never run, and both are
+  gone. In their place, every pin taken in a lock file now has a holder
+  record beside the file, in `<lock file>.holders`: the record a directory
+  store already keeps, with hostname, pid and a heartbeat, written by the
+  same machinery. The file's format is unchanged, so every reader of it
+  and every older version is unaffected; the record outlives the process
+  as the pin does, and its beat stops with the process. `doctor` reports
+  each pin with its holder, live or gone, and `restore --status` shows the
+  same. `doctor --fix` now repairs what it can prove: an entry for a
+  snapshot that no longer exists, an entry with nothing in it, a restore
+  pin or a parent pin whose holder's beat has stopped, and a dead record in
+  a directory store, local or reached over ssh. It never touches a pin
+  whose holder is alive, a pin with no record, or a backup's own pin kept
+  for the next run. `restore --unlock` releases the records of the pins it
+  removes (#128).
+
 ## [0.9.15] - 2026-10-19
 
 This release corrects four defects found after 0.9.14. Pins on the source

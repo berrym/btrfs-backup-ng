@@ -35,11 +35,15 @@ NOW = datetime.now()
 class Snap:
     def __init__(self, when: datetime):
         self.name = PREFIX + when.strftime(FMT)
+        self.locks: set = set()
+        self.parent_locks: set = set()
 
     @classmethod
     def named(cls, name: str) -> "Snap":
         snap = cls.__new__(cls)
         snap.name = name
+        snap.locks = set()
+        snap.parent_locks = set()
         return snap
 
     def get_name(self) -> str:

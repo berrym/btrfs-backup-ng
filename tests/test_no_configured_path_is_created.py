@@ -95,7 +95,7 @@ REGISTRY: dict[str, tuple[str, ...]] = {
     "endpoint/common.py::Endpoint.snapshot": (BELOW,),
     "endpoint/local.py::LocalEndpoint._prepare": (BELOW,),
     "sshutil/lock.py::RemoteLockManager._acquire_script": (BELOW,),
-    "sshutil/lock.py::RemoteLockManager.acquire_shared": (BELOW,),
+    "sshutil/lock.py::RemoteLockManager._shared_record_script": (BELOW,),
     # The read-only probe makes one directory directly below a location that
     # `[ -d ]` has just confirmed, and removes it at once; a location that is
     # not there exits before it.

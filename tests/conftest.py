@@ -439,6 +439,32 @@ def shared_log() -> Iterator[SharedLogCapture]:
 
 
 @pytest.fixture(autouse=True)
+def heartbeats_end_with_the_test(monkeypatch):
+    """Stop every lock heartbeat a test started when the test ends.
+
+    A pin taken in a lock file keeps its holder record past the exit
+    cleanups, and the record's heartbeat thread beats until the process
+    exits; in the suite that is the rest of the session, and a test that
+    forks then runs in a multi-threaded process (``os.fork`` warns, and may
+    deadlock). The beats are tracked by wrapping the method that starts
+    them, so a test need not know which manager a pin went through.
+    """
+    from btrfs_backup_ng.sshutil.lock import RemoteLockManager
+
+    started: list = []
+    real_start = RemoteLockManager._start_heartbeat
+
+    def tracked(self, key, *args, **kwargs):
+        started.append((self, key))
+        return real_start(self, key, *args, **kwargs)
+
+    monkeypatch.setattr(RemoteLockManager, "_start_heartbeat", tracked)
+    yield
+    for manager, key in started:
+        manager._stop_heartbeat(key)
+
+
+@pytest.fixture(autouse=True)
 def exit_cleanups_end_with_the_test():
     """Run, when a test ends, every exit cleanup it registered.
 

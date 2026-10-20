@@ -556,7 +556,7 @@ btrfs-backup-ng doctor [OPTIONS]
 |--------|-------------|
 | `--json` | Output in JSON format for scripting |
 | `--check CATEGORY` | Check specific category: config, snapshots, transfers, system |
-| `--fix` | Auto-fix safe issues (stale locks, temp files) |
+| `--fix` | Apply the fixes doctor can prove: lock entries for snapshots that no longer exist or that hold nothing, restore and parent pins whose holder is gone, dead holder records |
 | `--interactive` | Confirm each fix before applying (requires --fix) |
 | `-q, --quiet` | Only show problems (suppress OK messages) |
 | `--volume PATH` | Check specific volume only |
@@ -566,7 +566,7 @@ btrfs-backup-ng doctor [OPTIONS]
 |----------|----------------|
 | `config` | Config file exists and valid, volume sources usable (the same check as `config validate`), targets reachable, compression programs available |
 | `snapshots` | Orphaned snapshots, missing snapshots, broken parent chains |
-| `transfers` | Stale locks (dead processes), incomplete transfers, recent failures in transaction log |
+| `transfers` | Pins held on snapshots and who holds them, incomplete transfers, recent failures in transaction log |
 | `system` | Destination space, quota limits, systemd timer status, backup age |
 
 **Exit Codes:**
@@ -590,7 +590,7 @@ btrfs-backup-ng doctor --check config
 # Check only snapshot health
 btrfs-backup-ng doctor --check snapshots
 
-# Auto-fix safe issues
+# Apply the fixes doctor can prove (leftover lock entries and pins, dead holder records)
 btrfs-backup-ng doctor --fix
 
 # Interactive fix (confirm each)
@@ -617,8 +617,9 @@ Snapshots
   [OK]    Volume /home: 24 snapshots, chain intact
 
 Transfers
-  [WARN]  Stale lock: home-20260110 (process 12345 not running)
-          [FIXABLE] Run with --fix to remove
+  [INFO]  Restore pin held on home-20260110 by 'restore:3f8a1c2e': pid 4211 on fedora, beat 12s ago
+  [WARN]  Restore pin held on home-20260109 by 'restore:9c0d11aa' whose holder is gone (pid 3980 on fedora, beat 7310s ago); a restore pin has no life after its process
+          [FIXABLE] Run with --fix to repair
 
 System
   [OK]    Destination: 524 GiB available (52%)
@@ -626,7 +627,7 @@ System
 
 =======================================================
 Summary: 7 passed, 2 warnings, 0 errors
-Fixable: 1 issue (run with --fix)
+Fixable: 1 issue(s) (run with --fix)
 ```
 
 **JSON Output:**
@@ -640,10 +641,10 @@ Fixable: 1 issue (run with --fix)
       "category": "transfers",
       "severity": "warn",
       "check": "stale_locks",
-      "message": "Stale lock detected",
-      "details": {"snapshot": "home-20260110", "pid": 12345},
+      "message": "Restore pin held on home-20260109 by 'restore:9c0d11aa' whose holder is gone (pid 3980 on fedora, beat 7310s ago); a restore pin has no life after its process",
+      "details": {"lock_file": "/home/.snapshots/.btrfs-backup-ng.locks", "snapshot": "home-20260109", "lock_id": "restore:9c0d11aa", "kind": "restore pin", "pid": 3980, "hostname": "fedora", "age": 7310},
       "fixable": true,
-      "fix_description": "Remove stale lock file"
+      "fix_description": "Remove the restore pin and its record"
     }
   ]
 }

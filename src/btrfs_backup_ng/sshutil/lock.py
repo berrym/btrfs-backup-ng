@@ -435,13 +435,23 @@ class RemoteLockManager:
         stale_after: int = DEFAULT_STALE_AFTER,
         hostname: str = "",
         run_elevated: Optional[Callable[[str], tuple[int, str, str]]] = None,
+        dir_name: str = LOCK_DIR_NAME,
     ) -> None:
-        """``run_elevated`` is used only when the unprivileged attempt cannot
-        create the lock directory. Backup destinations are commonly root-owned,
-        and the lock has to live beside the data it protects."""
+        """``run_elevated`` is used only when the unprivileged attempt could
+        not write: the acquire when the lock directory cannot be created or
+        written, and then every beat and every removal whose verdict says the
+        record could not be refreshed or removed, since a record the acquire
+        wrote elevated is root-owned for the whole of its life. Backup
+        destinations are commonly root-owned, and the lock has to live beside
+        the data it protects.
+
+        ``dir_name`` is the directory under the target the records live in:
+        ``LOCK_DIR_NAME`` for a location's lock store, and the holders
+        directory beside a lock file for the records that say who holds the
+        pins the file lists (``holders_beside``)."""
         self._run = run_remote
         self._target = str(target_path).rstrip("/") or "/"
-        self._root = f"{self._target}/{LOCK_DIR_NAME}"
+        self._root = f"{self._target}/{dir_name}"
         self._heartbeat_interval = heartbeat_interval
         self._stale_after = stale_after
         self._hostname = hostname
@@ -620,8 +630,17 @@ class RemoteLockManager:
     def _holder_file(self, name: str, lock_id: str) -> str:
         return f"{self._holders_dir(name)}/{encode_name(str(lock_id))}"
 
-    def acquire_shared(self, name: str, lock_id: str, operation: str = "") -> str:
-        """Add this holder's pin to ``name``. Never blocks on another holder."""
+    def _shared_record_script(self, name: str, lock_id: str, operation: str) -> str:
+        """The script that writes this holder's record of its pin on ``name``.
+
+        Run by ``acquire_shared`` to take the pin and by the pin's heartbeat
+        to keep it: the beat writes the record again, whole, so a record
+        removed from under a live holder (``restore --unlock`` run during a
+        restore, a sweep after a long stall) returns with its identity and
+        inside its directories, rather than as an empty file ``touch`` left
+        where the file was, or as nothing at all once the directories had
+        been tidied away with the last record.
+        """
         payload = json.dumps(
             {
                 # The lock's REAL name, because the directory holding it carries
@@ -639,7 +658,7 @@ class RemoteLockManager:
         target = shlex.quote(self._target)
         holders = shlex.quote(self._holders_dir(name))
         holder = shlex.quote(self._holder_file(name, lock_id))
-        script = (
+        return (
             # Same rule as acquisition: create only below an existing target,
             # never the target itself (mkdir -p would build every component).
             f"if [ -d {target} ]; then mkdir -p {holders} 2>/dev/null; fi; "
@@ -651,6 +670,10 @@ class RemoteLockManager:
             f"printf '%s' {shlex.quote(csh_safe_text(payload))} > {holder} 2>/dev/null "
             f"&& echo ACQUIRED || echo FAILED"
         )
+
+    def acquire_shared(self, name: str, lock_id: str, operation: str = "") -> str:
+        """Add this holder's pin to ``name``. Never blocks on another holder."""
+        script = self._shared_record_script(name, lock_id, operation)
         rc, out, err = self._run(script)
         if "NOLOCKDIR" in out and self._run_elevated is not None:
             rc, out, err = self._run_elevated(script)
@@ -681,15 +704,19 @@ class RemoteLockManager:
         holder = shlex.quote(self._holder_file(name, lock_id))
         holders = shlex.quote(self._holders_dir(name))
         lock = shlex.quote(self._lock_dir(name))
-        rc, _out, err = self._run(
-            f"rm -f {holder} 2>/dev/null; "
-            f"rmdir {holders} 2>/dev/null; rmdir {lock} 2>/dev/null; exit 0"
+        script = (
+            f"if rm -f {holder} 2>/dev/null; then "
+            f"rmdir {holders} 2>/dev/null; rmdir {lock} 2>/dev/null; echo RELEASED; "
+            f"else echo UNWRITABLE; fi; exit 0"
         )
-        if rc != 0:
+        rc, out, err = self._run(script)
+        if _verdict(out) == "UNWRITABLE" and self._run_elevated is not None:
+            rc, out, err = self._run_elevated(script)
+        if rc != 0 or _verdict(out) != "RELEASED":
             logger.warning(
                 "Could not fully release the shared lock %r on the target: %s",
                 name,
-                err.strip(),
+                err.strip() or out.strip(),
             )
             return
         _unregister_for_cleanup(self, key)
@@ -700,9 +727,24 @@ class RemoteLockManager:
         """Pin ``name`` and keep the pin alive until ``release_shared``."""
         mode = self.acquire_shared(name, lock_id, operation)
         self._start_heartbeat(
-            self._held_key(name, lock_id), self._holder_file(name, lock_id)
+            self._held_key(name, lock_id),
+            self._shared_record_script(name, lock_id, operation),
         )
         return mode
+
+    def keep_record_past_exit(self, name: str, lock_id: str) -> None:
+        """Leave this holder's record where it is when the process exits.
+
+        A pin in a lock file survives the process that took it, on purpose:
+        an interrupted backup keeps its pin so the source cannot prune what
+        a later run still has to send. The record beside the file is the
+        evidence of who took the pin and whether they are still at it, so it
+        has to outlive the process too: released at exit, an interrupted
+        restore's pin would have no record and doctor could not tell it from
+        one taken by an earlier version. The beat stops with the process, so
+        the record reads as a holder that is gone, which is the truth.
+        """
+        _unregister_for_cleanup(self, self._held_key(name, lock_id))
 
     @staticmethod
     def _held_key(name: str, lock_id: str) -> str:
@@ -803,12 +845,20 @@ class RemoteLockManager:
             lock = shlex.quote(self._lock_dir(name))
             owner = shlex.quote(self._owner_file(name, token))
             hb = shlex.quote(f"{self._lock_dir(name)}/{HEARTBEAT_NAME}")
-            rc, out, err = self._run(
+            script = (
                 f"if rm {owner} </dev/null 2>/dev/null; then "
                 f"rm -f {hb} 2>/dev/null; rmdir {lock} 2>/dev/null; echo RELEASED; "
                 f"elif [ -e {owner} ]; then echo KEPT; else echo NOTOWNER; fi"
             )
+            rc, out, err = self._run(script)
             verdict = _verdict(out)
+            if verdict == "KEPT" and self._run_elevated is not None:
+                # The record is there and could not be removed: a root-owned
+                # store, whose lock the acquire took elevated. NOTOWNER is
+                # not this case; the record is gone, and nothing elevated
+                # would change that.
+                rc, out, err = self._run_elevated(script)
+                verdict = _verdict(out)
             if verdict in ("RELEASED", "NOTOWNER"):
                 self._tokens.pop(name, None)
                 _unregister_for_cleanup(self, name)
@@ -902,8 +952,35 @@ class RemoteLockManager:
         """Names of locks with at least one live holder."""
         return set(self.live_locks())
 
+    def shared_records(self) -> dict[str, list[tuple[Holder, Optional[int]]]]:
+        """Every shared holder record on the target, live or not, with its
+        age in seconds by the target's clock (None when it cannot be read),
+        keyed by the lock's real name.
+
+        ``live_locks`` answers the guard's question, "is this held", and
+        leaves out a record whose beat has stopped. Doctor asks a different
+        one, "who holds this and are they still there", and needs the
+        records a stopped beat would hide, with the age that says so.
+        """
+        records: dict[str, list[tuple[Holder, Optional[int]]]] = {}
+        for kind, key, holder, age in self._scan()[2]:
+            if kind == "H":
+                records.setdefault(key, []).append((holder, age))
+        return records
+
     def _scan_holders(self) -> tuple[dict[str, list[Holder]], list[tuple[str, str]]]:
-        """(live locks by real name, (dir, file) of abandoned holder records).
+        live, dead, _records = self._scan()
+        return live, dead
+
+    def _scan(
+        self,
+    ) -> tuple[
+        dict[str, list[Holder]],
+        list[tuple[str, str]],
+        list[tuple[str, str, Holder, Optional[int]]],
+    ]:
+        """(live locks by real name, (dir, file) of abandoned holder records,
+        every record as (kind, real name, holder, age)).
 
         The remote emits NAMES, never paths. Paths are rebuilt here from the root
         this manager already knows. A path was emitted at first, and split off a
@@ -969,6 +1046,7 @@ class RemoteLockManager:
         clock_read = False
         live: dict[str, list[Holder]] = {}
         dead: list[tuple[str, str]] = []
+        records: list[tuple[str, str, Holder, Optional[int]]] = []
         unjudged: list[str] = []
         for line in out.splitlines():
             if line.startswith("NOW"):
@@ -1001,10 +1079,6 @@ class RemoteLockManager:
                 if now is not None and mtime_raw.isdigit()
                 else None
             )
-            if age is not None and age > self._stale_after:
-                if kind == "H" and age > self._stale_after * DEAD_HOLDER_MULTIPLE:
-                    dead.append((dir_name, file_name))
-                continue
             try:
                 info = json.loads(raw.strip()) if raw.strip() else {}
             except ValueError:
@@ -1018,7 +1092,13 @@ class RemoteLockManager:
             # payload is unreadable the encoded name is all there is; the guard
             # checks for both, so such a lock still blocks.
             key = str(info.get("name") or decode_name_for_display(dir_name))
-            live.setdefault(key, []).append(Holder(dir_name, file_name, info))
+            holder = Holder(dir_name, file_name, info)
+            records.append((kind, key, holder, age))
+            if age is not None and age > self._stale_after:
+                if kind == "H" and age > self._stale_after * DEAD_HOLDER_MULTIPLE:
+                    dead.append((dir_name, file_name))
+                continue
+            live.setdefault(key, []).append(holder)
             if age is None:
                 unjudged.append(key)
         if not clock_read:
@@ -1037,7 +1117,7 @@ class RemoteLockManager:
                 "" if now is not None else " (the target's clock could not be read)",
                 ", ".join(sorted(set(unjudged))),
             )
-        return live, dead
+        return live, dead, records
 
     def sweep_dead_holders(self) -> int:
         """Remove holder records far past the point of any doubt.
@@ -1055,7 +1135,10 @@ class RemoteLockManager:
             shlex.quote(f"{self._root}/{dir_name}.lock/{HOLDERS_DIR_NAME}/{file_name}")
             for dir_name, file_name in dead
         ]
-        self._run(f"rm -f {' '.join(paths)} 2>/dev/null; exit 0")
+        script = f"rm -f {' '.join(paths)} 2>/dev/null && echo SWEPT || echo UNWRITABLE; exit 0"
+        _rc, out, _err = self._run(script)
+        if _verdict(out) == "UNWRITABLE" and self._run_elevated is not None:
+            self._run_elevated(script)
         logger.debug("Swept %d abandoned holder record(s) on the target", len(dead))
         return len(dead)
 
@@ -1085,40 +1168,66 @@ class RemoteLockManager:
             if name:
                 own_key = self._held_key(name, holder.lock_id)
                 self._stop_heartbeat(own_key)
-        rc, _out, _err = self._run(
-            f"rm -f {record} 2>/dev/null; "
-            f"rmdir {holders} 2>/dev/null; rmdir {lock} 2>/dev/null; exit 0"
+        script = (
+            f"if rm -f {record} 2>/dev/null; then "
+            f"rmdir {holders} 2>/dev/null; rmdir {lock} 2>/dev/null; echo RELEASED; "
+            f"else echo UNWRITABLE; fi; exit 0"
         )
+        rc, out, _err = self._run(script)
+        if _verdict(out) == "UNWRITABLE" and self._run_elevated is not None:
+            rc, out, _err = self._run_elevated(script)
         if rc == 0 and own_key is not None:
             _unregister_for_cleanup(self, own_key)
 
     # ------------------------------------------------------------- heartbeat
 
-    def _start_heartbeat(self, key: str, path: Optional[str] = None) -> None:
+    def _start_heartbeat(self, key: str, record: Optional[str] = None) -> None:
         """Refresh the holder's record until stopped. ``key`` identifies it.
 
-        For a shared pin ``path`` is that holder's own file, so holders of the
-        same snapshot keep their pins alive independently. For an exclusive
-        lock (no ``path``) it is the holder's ``owner.<token>`` file and the
-        ``heartbeat`` beside it, refreshed with ``touch -c``: a holder whose
-        lock was broken while it was stalled must not recreate its record
-        inside the next holder's lock.
+        For a shared pin ``record`` is the script that writes this holder's
+        own record (``_shared_record_script``), run again at every beat, so
+        holders of the same snapshot keep their pins alive independently and
+        a record removed from under a live holder comes back whole. For an
+        exclusive lock (no ``record``) the beat is a ``touch -c`` of the
+        holder's ``owner.<token>`` file and the ``heartbeat`` beside it: a
+        holder whose lock was broken while it was stalled must not recreate
+        its record inside the next holder's lock.
+
+        A beat elevates as the acquire did. The acquire runs unprivileged
+        first and elevates when the lock directory cannot be created or
+        written, which is a root-owned destination; the record it then
+        writes is root-owned too, and a beat run unprivileged alone could
+        not refresh it, so the pin went stale after ``stale_after`` seconds
+        while its holder was still at work, and an exclusive lock could be
+        broken under a running operation. A beat whose verdict says it
+        could not write is run again elevated, with the same runner.
         """
         stop = threading.Event()
-        if path is not None:
-            command = f"touch {shlex.quote(path)} 2>/dev/null; exit 0"
+        if record is not None:
+            command = record
         else:
             with self._state_lock:
                 token = self._tokens.get(key, "")
             files = [f"{self._lock_dir(key)}/{HEARTBEAT_NAME}"]
             if token:
                 files.insert(0, self._owner_file(key, token))
-            command = f"touch -c {' '.join(shlex.quote(f) for f in files)} 2>/dev/null; exit 0"
+            command = (
+                f"touch -c {' '.join(shlex.quote(f) for f in files)} 2>/dev/null "
+                f"&& echo REFRESHED || echo UNWRITABLE; exit 0"
+            )
+
+        def beat_once() -> None:
+            _rc, out, _err = self._run(command)
+            if (
+                _verdict(out) not in ("ACQUIRED", "REFRESHED")
+                and self._run_elevated is not None
+            ):
+                self._run_elevated(command)
 
         def beat() -> None:
             while not stop.wait(self._heartbeat_interval):
                 try:
-                    self._run(command)
+                    beat_once()
                 except Exception as exc:  # noqa: BLE001 - a missed beat is not fatal
                     # One failed refresh must not end a transfer. Several in a
                     # row let the lock go stale, which is the designed outcome
@@ -1209,11 +1318,13 @@ def read_persisted_locks(manager: Any) -> dict[str, dict]:
 def write_persisted_locks(manager: Any, lock_dict: dict[str, Any]) -> None:
     """Reconcile the target's snapshot pins to ``lock_dict``.
 
-    The caller (``restore --unlock``) computes the state it wants and writes it
-    whole, matching the local lock-file contract. Here that means dropping every
-    holder the new state no longer lists -- per holder, not per snapshot, so
-    clearing one session's lock leaves another session's pin on the same
-    snapshot intact.
+    The caller computes the state it wants and writes it whole, matching the
+    local lock-file contract. Here that means dropping every holder the new
+    state no longer lists -- per holder, not per snapshot, so clearing one
+    session's lock leaves another session's pin on the same snapshot intact.
+    A holder taken after the caller read the store is not in the new state
+    and is dropped with the rest, which is why ``restore --unlock`` releases
+    through ``release_persisted_locks`` instead.
 
     Holders are dropped by the record they were found in, so a holder whose
     payload cannot be parsed -- reported as ``unknown``, and therefore impossible
@@ -1236,6 +1347,115 @@ def write_persisted_locks(manager: Any, lock_dict: dict[str, Any]) -> None:
             if holder.lock_id is None or holder.lock_id not in keep:
                 manager.release_holder(holder)
     manager.sweep_dead_holders()
+
+
+def release_persisted_locks(
+    manager: Any, pins: dict[str, dict[str, list[Any]]]
+) -> Iterator[tuple[str, dict[str, list[str]], bool]]:
+    """Release the given snapshot pins, each by its own holder record.
+
+    ``pins`` is in the lock-file shape ``read_persisted_locks`` returns: for
+    each snapshot, the ids under ``locks`` and ``parent_locks`` to release.
+    The holders are listed once, when this runs, and only a holder whose id
+    is listed in ``pins`` is dropped, so a pin taken after the caller read
+    the store (a restore that began meanwhile) is kept, and a pin released
+    meanwhile is simply not found. ``unknown`` under ``locks`` names the
+    holders of that snapshot whose record could not be parsed, the way
+    ``read_persisted_locks`` reports them.
+
+    Yields, per snapshot in ``pins``, its name, the ids actually released in
+    the same shape, and whether the snapshot still has a holder afterwards.
+    A holder found in a directory that could not be listed cannot be
+    addressed and counts as still held. Locks that are not snapshot pins --
+    the whole-target lock a prune holds -- are never touched. Abandoned
+    holder records are swept at the end, as before.
+    """
+    live = manager.live_locks()
+    for snapshot, wanted in pins.items():
+        ids = {str(x) for x in wanted.get("locks", [])}
+        ids |= {f"p:{x}" for x in wanted.get("parent_locks", [])}
+        released: dict[str, list[str]] = {}
+        still_held = False
+        for holder in live.get(f"{SNAPSHOT_LOCK_PREFIX}{snapshot}", []):
+            lock_id = holder.lock_id
+            selected = "unknown" in ids if lock_id is None else lock_id in ids
+            if not selected:
+                still_held = True
+                continue
+            manager.release_holder(holder)
+            if not holder.file_name:
+                # ``release_holder`` said why nothing could be removed.
+                still_held = True
+                continue
+            key = "parent_locks" if str(lock_id or "").startswith("p:") else "locks"
+            released.setdefault(key, []).append(
+                lock_id.removeprefix("p:") if lock_id else "unknown"
+            )
+        yield snapshot, released, still_held
+    manager.sweep_dead_holders()
+
+
+def local_manager(
+    target_path: str | os.PathLike, *, dir_name: str = LOCK_DIR_NAME
+) -> "RemoteLockManager":
+    """A lock manager over a location on this machine, running the same
+    scripts an ssh endpoint runs on its remote, through ``sh``.
+
+    Elevation mirrors the ssh endpoint's: the unprivileged attempt first,
+    ``sudo -n sh -c`` only when a directory or record could not be created
+    or written -- a mirror received under ``--ssh-sudo`` is root-owned, and
+    its lock directory with it.
+    """
+    import shlex
+    import socket as _socket
+    import subprocess
+
+    from .. import __util__
+
+    def run(script: str) -> tuple[int, str, str]:
+        proc = subprocess.run(
+            ["sh", "-c", script], capture_output=True, text=True, check=False
+        )
+        return proc.returncode, proc.stdout, proc.stderr
+
+    def run_elevated(script: str) -> tuple[int, str, str]:
+        try:
+            sudo = " ".join(__util__.sudo_argv())
+        except __util__.AbortError as e:
+            # The manager reports what stderr said, so the reason reaches
+            # the operator instead of the shell's "sudo: not found".
+            return 127, "", str(e)
+        return run(f"{sudo} sh -c {shlex.quote(script)}".lstrip())
+
+    return RemoteLockManager(
+        run,
+        str(target_path),
+        hostname=_socket.gethostname(),
+        run_elevated=run_elevated,
+        dir_name=dir_name,
+    )
+
+
+def holders_dir_name(lock_file_name: str) -> str:
+    """The directory beside a lock file that holds who-holds-what records."""
+    return f"{lock_file_name}.holders"
+
+
+def holders_beside(lock_file: str | os.PathLike) -> "RemoteLockManager":
+    """The records beside a lock FILE: who holds each pin the file lists.
+
+    A pin in the lock file is the protection and survives the process that
+    took it. The record beside it is the evidence: the same payload a
+    directory-store holder writes (name, lock id, operation, hostname, pid)
+    with the same heartbeat, so doctor can say whether the holder of a pin
+    is still at work, is gone, or never wrote a record. The file's format is
+    untouched; every reader of it, and every older version, is unaffected.
+    """
+    path = os.fspath(lock_file)
+    return local_manager(
+        os.path.dirname(path) or ".",
+        dir_name=holders_dir_name(os.path.basename(path)),
+    )
 
 
 _MANAGER_CACHE_LOCK = threading.Lock()

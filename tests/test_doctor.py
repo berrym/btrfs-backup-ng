@@ -506,43 +506,6 @@ class TestDoctor:
             for f in findings
         )
 
-    def test_is_lock_stale_not_pid(self):
-        """A lock id with no pid yields None, not False.
-
-        None means "cannot determine" and False means "the holder is alive".
-        Collapsing them is what made this check inert: NO lock id this project
-        writes carries a pid -- a restore session is restore:{session_id} and a
-        destination id is a path or a URL -- so every real input took the False
-        branch and doctor reported "no stale locks found" for a lock file full
-        of them.
-        """
-        doctor = Doctor()
-        assert doctor._is_lock_stale("restore:abc123") is None
-        # The forms this project actually writes, all undeterminable:
-        for lock_id in (
-            "/mnt/backup",
-            "ssh://user@host:/mnt/backup",
-            "raw:///mnt/backup",
-            "unknown://mnt/backup",
-        ):
-            assert doctor._is_lock_stale(lock_id) is None, lock_id
-
-    @patch("os.kill")
-    def test_is_lock_stale_process_running(self, mock_kill):
-        """Test _is_lock_stale when process is running."""
-        mock_kill.return_value = None  # Process exists
-
-        doctor = Doctor()
-        assert doctor._is_lock_stale("transfer:12345") is False
-
-    @patch("os.kill")
-    def test_is_lock_stale_process_not_running(self, mock_kill):
-        """Test _is_lock_stale when process is not running."""
-        mock_kill.side_effect = OSError("No such process")
-
-        doctor = Doctor()
-        assert doctor._is_lock_stale("transfer:12345") is True
-
     def test_run_diagnostics_filters_categories(self):
         """Test run_diagnostics filters by category."""
         doctor = Doctor()
@@ -1339,61 +1302,6 @@ class TestDoctorSSHTarget:
         assert any("failed" in f.message.lower() for f in findings)
 
 
-class TestDoctorStaleLocks:
-    """Tests for stale lock detection and fixing."""
-
-    def test_fix_stale_lock_success(self, tmp_path):
-        """Test successfully fixing a stale lock."""
-        # Create a mock lock file
-        lock_file = tmp_path / ".locks"
-        lock_content = '{"snapshot-1": {"locks": ["transfer:99999"]}}'
-        lock_file.write_text(lock_content)
-
-        doctor = Doctor()
-        result = doctor._fix_stale_lock(lock_file, "snapshot-1", "transfer:99999")
-
-        assert result is True
-        # Lock should be removed
-        new_content = lock_file.read_text()
-        assert "transfer:99999" not in new_content
-
-    def test_fix_stale_lock_file_not_found(self, tmp_path):
-        """Test fixing lock when file doesn't exist."""
-        lock_file = tmp_path / "nonexistent_locks"
-
-        doctor = Doctor()
-        result = doctor._fix_stale_lock(lock_file, "snapshot-1", "transfer:99999")
-
-        assert result is False
-
-    def test_fix_stale_lock_snapshot_not_in_locks(self, tmp_path):
-        """Test fixing lock when snapshot not in lock file."""
-        lock_file = tmp_path / ".locks"
-        lock_content = '{"other-snapshot": {"locks": ["transfer:12345"]}}'
-        lock_file.write_text(lock_content)
-
-        doctor = Doctor()
-        result = doctor._fix_stale_lock(lock_file, "snapshot-1", "transfer:99999")
-
-        assert result is False
-
-    def test_make_lock_fix_action(self, tmp_path):
-        """Test creating a lock fix action."""
-        lock_file = tmp_path / ".locks"
-        lock_content = '{"snapshot-1": {"locks": ["transfer:99999"]}}'
-        lock_file.write_text(lock_content)
-
-        doctor = Doctor()
-        fix_action = doctor._make_lock_fix_action(
-            lock_file, "snapshot-1", "transfer:99999"
-        )
-
-        # Should be callable and return True on success
-        assert callable(fix_action)
-        result = fix_action()
-        assert result is True
-
-
 class TestDoctorRecentFailures:
     """Tests for recent failures check."""
 
@@ -1544,21 +1452,19 @@ class TestDoctorSnapshotChecks:
 
 
 class TestDoctorStaleLockLoop:
-    """Tests for stale lock detection loop (lines 844-872)."""
+    """Tests for the lock check's loop over a volume's lock file."""
 
     @patch("btrfs_backup_ng.__util__.read_locks")
     @patch("btrfs_backup_ng.core.doctor.Path.exists")
     @patch("btrfs_backup_ng.core.doctor.Path.read_text")
-    @patch("os.kill")
-    def test_check_stale_locks_with_stale_lock(
-        self, mock_kill, mock_read_text, mock_exists, mock_read_locks
+    def test_check_stale_locks_reports_a_held_lock(
+        self, mock_read_text, mock_exists, mock_read_locks
     ):
-        """Test stale lock detection finds stale locks."""
+        """A held lock is reported as held, and offered no fix: no lock id
+        this project writes says which process holds it."""
         mock_exists.return_value = True
         mock_read_text.return_value = '{"snapshot-1": {"locks": ["transfer:99999"]}}'
         mock_read_locks.return_value = {"snapshot-1": {"locks": ["transfer:99999"]}}
-        # Process not running
-        mock_kill.side_effect = OSError("No such process")
 
         mock_target = MagicMock()
         mock_target.path = "/mnt/backup"
@@ -1573,24 +1479,21 @@ class TestDoctorStaleLockLoop:
         doctor = Doctor(config=mock_config)
         findings = doctor._check_stale_locks()
 
-        # Should find stale lock
-        assert any(
-            f.severity == DiagnosticSeverity.WARN and f.fixable for f in findings
-        )
+        assert [f.severity for f in findings] == [DiagnosticSeverity.INFO]
+        assert "transfer:99999" in findings[0].message
+        assert not findings[0].fixable
 
     @patch("btrfs_backup_ng.__util__.read_locks")
     @patch("btrfs_backup_ng.core.doctor.Path.exists")
     @patch("btrfs_backup_ng.core.doctor.Path.read_text")
-    @patch("os.kill")
-    def test_check_stale_locks_process_running(
-        self, mock_kill, mock_read_text, mock_exists, mock_read_locks
+    def test_check_stale_locks_held_lock_is_not_an_all_clear(
+        self, mock_read_text, mock_exists, mock_read_locks
     ):
-        """Test stale lock detection when process is running."""
+        """A lock IS held. "No locks held" would be false, so the all-clear
+        is not emitted alongside the held lock, and nothing is a warning."""
         mock_exists.return_value = True
         mock_read_text.return_value = '{"snapshot-1": {"locks": ["transfer:12345"]}}'
         mock_read_locks.return_value = {"snapshot-1": {"locks": ["transfer:12345"]}}
-        # Process is running
-        mock_kill.return_value = None
 
         mock_target = MagicMock()
         mock_target.path = "/mnt/backup"
@@ -1605,17 +1508,10 @@ class TestDoctorStaleLockLoop:
         doctor = Doctor(config=mock_config)
         findings = doctor._check_stale_locks()
 
-        # A live pid-bearing holder is not stale, and is not reported as a
-        # problem. It is also not "no locks held": one IS held, by a process that
-        # is running, so the OK summary must not be emitted alongside it.
         assert not any(f.severity == DiagnosticSeverity.WARN for f in findings)
-        # A lock IS held, by a process that is running. "No locks held" would be
-        # false; the all-clear has to say which all-clear it is.
-        assert any(
-            f.severity == DiagnosticSeverity.OK
-            and "1 lock(s) held, none stale" in f.message
-            for f in findings
-        ), [f.message for f in findings]
+        assert not any(f.severity == DiagnosticSeverity.OK for f in findings), [
+            f.message for f in findings
+        ]
 
     @patch("btrfs_backup_ng.__util__.read_locks")
     @patch("btrfs_backup_ng.core.doctor.Path.exists")

@@ -12,7 +12,7 @@ import time
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Any, Callable
 
 from .target import TargetKind, TargetScheme, parse_target
 
@@ -41,6 +41,16 @@ def _ts_to_epoch(ts: Any) -> float:
         except ValueError:
             return 0.0
     return 0.0
+
+
+def _sweep_action(manager: Any, holder: Any) -> Callable[[], bool]:
+    """A fix that removes one holder record by the record it was found in."""
+
+    def fix() -> bool:
+        manager.release_holder(holder)
+        return True
+
+    return fix
 
 
 class DiagnosticSeverity(Enum):
@@ -1251,203 +1261,455 @@ class Doctor:
     # =========================================================================
 
     def _check_stale_locks(self) -> list[DiagnosticFinding]:
-        """Check for stale locks from crashed operations."""
-        findings: list[DiagnosticFinding] = []
-        #: Locks examined, so the all-clear can say which all-clear it is. "No
-        #: stale locks found" used to cover a lock file with none, a lock file
-        #: full of locks nothing could identify, and a lock file that could not
-        #: be read at all.
-        locks_seen = 0
+        """Report every pin held at each volume's snapshot directory and at
+        each target's lock store, say who holds it, and offer the fixes that
+        can be proven.
 
+        The lock file is read where ``run`` writes it, through the same
+        resolver: under the source for a relative ``snapshot_dir``, and at
+        ``<base>/<source name>`` for an absolute one. The check used to look
+        at the base alone, found no file there, and reported "No locks held"
+        for every volume with an absolute ``snapshot_dir``.
+
+        A pin in the file is the protection and survives its process. Who
+        took it, and whether they are still there, is read from the holder
+        records beside the file (``sshutil.lock.holders_beside``): the same
+        record a directory store keeps, with hostname, pid and a heartbeat.
+        From that evidence each pin is one of: held by a live process; held
+        by a process whose beat has stopped; held with no record, which a
+        pin taken by an earlier version or by a process that could not write
+        one looks like. The fixes, each with its proof:
+
+        * an entry for a snapshot that no longer exists is removed, since
+          nothing can use it and nothing will ever release it;
+        * an entry with nothing in it is removed;
+        * a restore pin whose holder's beat has stopped is removed with its
+          record, since a restore pin has no life after its process;
+        * a parent pin whose holder's beat has stopped is removed, since the
+          next run's reconcile releases every parent pin anyway;
+        * a dead record in a directory store, where the record is the pin,
+          is swept by the store's own rule.
+
+        Never touched: a pin whose holder is alive; a pin with no record,
+        since no evidence is not evidence of abandonment; a backup's own pin
+        whose holder is gone, which is kept for the next run to complete the
+        transfer. Every removal goes through the guarded by-change writer.
+        The former verdict looked for a pid in the lock id, which no id this
+        project writes carries, and the fix it offered could not run.
+        """
+        findings: list[DiagnosticFinding] = []
         if not self.config:
             return findings
 
-        from ..__util__ import read_locks
+        from ..__util__ import AbortError
+        from ..cli.common import resolve_snapshot_dir
+        from ..sshutil.lock import LOCK_DIR_NAME
 
         volumes = self.config.get_enabled_volumes()
         volume_filter = getattr(self, "_volume_filter", None)
+        seen_targets: set[str] = set()
 
         for volume in volumes:
             if volume_filter and volume.path != volume_filter:
                 continue
-
-            snapshot_dir = Path(volume.path) / volume.snapshot_dir
-            lock_file = snapshot_dir / ".btrfs-backup-ng.locks"
-
-            if not lock_file.exists():
-                continue
-
             try:
-                lock_content = lock_file.read_text()
-                locks = read_locks(lock_content)
-                if not locks:
-                    continue
-
-                for snapshot_name, lock_info in locks.items():
-                    snapshot_locks = lock_info.get("locks", [])
-                    for lock_id in snapshot_locks:
-                        locks_seen += 1
-                        # Check if process is still running
-                        # Lock ID format: "operation:session_id" or contains PID
-                        is_stale = self._is_lock_stale(lock_id)
-
-                        if is_stale is None:
-                            # A lock is held and nothing in its id says by whom.
-                            # Reported rather than passed over: a lock is what
-                            # stops retention pruning a snapshot, so one nobody
-                            # can account for is exactly what the operator ran
-                            # this command to find.
-                            findings.append(
-                                DiagnosticFinding(
-                                    category=DiagnosticCategory.TRANSFERS,
-                                    severity=DiagnosticSeverity.INFO,
-                                    check_name="stale_locks",
-                                    message=(
-                                        f"Lock held on {snapshot_name} by "
-                                        f"{lock_id!r}; whether its holder is still "
-                                        "running cannot be determined from the "
-                                        "lock record"
-                                    ),
-                                    details={
-                                        "snapshot": snapshot_name,
-                                        "lock_id": lock_id,
-                                        "lock_file": str(lock_file),
-                                    },
-                                )
-                            )
-                            continue
-
-                        if is_stale:
-                            finding = DiagnosticFinding(
-                                category=DiagnosticCategory.TRANSFERS,
-                                severity=DiagnosticSeverity.WARN,
-                                check_name="stale_locks",
-                                message=f"Stale lock on {snapshot_name}",
-                                details={
-                                    "snapshot": snapshot_name,
-                                    "lock_id": lock_id,
-                                    "lock_file": str(lock_file),
-                                },
-                                fixable=True,
-                                fix_description="Remove stale lock",
-                            )
-                            # Set up fix action - use closure to capture values
-                            finding.fix_action = self._make_lock_fix_action(
-                                lock_file, snapshot_name, lock_id
-                            )
-                            findings.append(finding)
-
-            except Exception as e:
-                # Previously a bare logger.warning and no finding, so an
-                # unreadable lock file produced the same "No stale locks found"
-                # as a lock file that was read and had none. An unreadable lock
-                # file is precisely the state that silently stops retention.
-                logger.warning("Could not check locks at %s: %s", lock_file, e)
+                snapshot_dir = resolve_snapshot_dir(
+                    volume.snapshot_dir, Path(volume.path)
+                )
+            except AbortError as e:
+                # An absolute snapshot_dir whose base is not there. The volume
+                # check reports the base; this one says the locks could not be
+                # examined, which "No locks held" would have hidden.
                 findings.append(
                     DiagnosticFinding(
                         category=DiagnosticCategory.TRANSFERS,
                         severity=DiagnosticSeverity.WARN,
                         check_name="stale_locks",
-                        message=f"Could not read the lock file {lock_file}: {e}",
-                        details={"lock_file": str(lock_file), "error": str(e)},
+                        message=f"Could not examine the locks of {volume.path}: {e}",
+                        details={"path": volume.path, "error": str(e)},
                     )
                 )
+                continue
+            lock_path = snapshot_dir / LOCK_DIR_NAME
+            if lock_path.is_dir():
+                findings.extend(self._lock_store_findings(str(snapshot_dir)))
+            elif lock_path.exists():
+                findings.extend(self._lock_file_findings(snapshot_dir, lock_path))
+            for target in getattr(volume, "targets", None) or ():
+                path = getattr(target, "path", None)
+                if not path or path in seen_targets:
+                    continue
+                seen_targets.add(path)
+                findings.extend(self._target_store_findings(target))
 
         if not findings:
-            # Said precisely, because "no stale locks found" was previously
-            # printed for three different states: no locks at all, locks whose
-            # staleness could not be determined, and a lock file that could not
-            # be read. Only the first is a clean bill of health.
             findings.append(
                 DiagnosticFinding(
                     category=DiagnosticCategory.TRANSFERS,
                     severity=DiagnosticSeverity.OK,
                     check_name="stale_locks",
-                    message=(
-                        "No locks held"
-                        if locks_seen == 0
-                        else f"{locks_seen} lock(s) held, none stale"
-                    ),
-                    details={"locks_examined": locks_seen},
+                    message="No locks held",
+                    details={"locks_examined": 0},
                 )
             )
-
         return findings
 
-    def _make_lock_fix_action(
-        self, lock_file: Path, snapshot_name: str, lock_id: str
-    ) -> Callable[[], bool]:
-        """Create a fix action for removing a stale lock."""
+    @staticmethod
+    def _holder_words(holder: Any, age: Any) -> str:
+        """``pid N on HOST, beat Ns ago`` as the record says it."""
+        who = f"pid {holder.info.get('pid', '?')} on {holder.info.get('hostname', '?')}"
+        if age is None:
+            return f"{who}, age of the record unknown"
+        return f"{who}, beat {age}s ago"
 
-        def fix_action() -> bool:
-            return self._fix_stale_lock(lock_file, snapshot_name, lock_id)
+    def _lock_file_findings(
+        self, snapshot_dir: Path, lock_file: Path
+    ) -> list[DiagnosticFinding]:
+        """The pins a lock file lists, joined with the records beside it."""
+        from ..__util__ import read_locks
+        from ..endpoint.local import LocalEndpoint
+        from ..sshutil.lock import (
+            DEFAULT_STALE_AFTER,
+            SNAPSHOT_LOCK_PREFIX,
+            holders_beside,
+            holders_dir_name,
+        )
 
-        return fix_action
-
-    def _is_lock_stale(self, lock_id: str) -> Optional[bool]:
-        """True if the holder is gone, False if it is alive, None if unknowable.
-
-        Staleness is decided by looking for a pid in the lock id. NO LOCK ID THIS
-        PROJECT WRITES CONTAINS ONE. The ids are a restore session
-        (``restore:{session_id}``, core/restore.py) and a destination id
-        (``/path``, ``ssh://user@host:/path``, ``raw:///path``,
-        ``unknown://path``) -- measured, every one of them returns "not a pid".
-
-        So the check was inert for every real input and, returning False for all
-        of them, reported "no stale locks found" for a lock file full of them.
-        The third answer is the honest one: nothing in the current lock format
-        says which process holds a lock, so doctor can report that a lock is
-        HELD without claiming to know whether its holder still exists. Giving it
-        that knowledge means putting a pid and a host in the lock record, which
-        is a format change, not a fix to this function.
-        """
-        # Common formats: "restore:abc123", "transfer:12345", etc.
-        parts = lock_id.split(":")
-        if len(parts) >= 2:
-            try:
-                pid = int(parts[1])
-            except ValueError:
-                return None  # Not a pid: staleness is not determinable
-            try:
-                os.kill(pid, 0)
-                return False  # Process is running
-            except OSError:
-                return True  # Process not running
-
-        return None
-
-    def _fix_stale_lock(
-        self, lock_file: Path, snapshot_name: str, lock_id: str
-    ) -> bool:
-        """Remove a stale lock."""
-        from btrfs_backup_ng import __util__
-
+        findings: list[DiagnosticFinding] = []
         try:
-            lock_content = lock_file.read_text()
-            locks = __util__.read_locks(lock_content)
-            if snapshot_name in locks:
-                snapshot_locks = locks[snapshot_name].get("locks", [])
-                if lock_id in snapshot_locks:
-                    snapshot_locks.remove(lock_id)
-                    if not snapshot_locks and not locks[snapshot_name].get(
-                        "parent_locks"
-                    ):
-                        del locks[snapshot_name]
-                    else:
-                        locks[snapshot_name]["locks"] = snapshot_locks
-                    # Atomic replace via the shared primitive: a plain write_text
-                    # here could leave a torn lock file on a crash, which read_locks then
-                    # misreads as "no locks" -> retention prunes a still-locked snapshot.
-                    __util__.atomic_write_bytes(
-                        lock_file, __util__.write_locks(locks), mode=0o600
+            locks = read_locks(lock_file.read_text())
+        except Exception as e:  # noqa: BLE001 - reported as a finding
+            # An unreadable lock file is precisely the state that silently
+            # stops retention; it must never read as "No locks held".
+            logger.warning("Could not check locks at %s: %s", lock_file, e)
+            findings.append(
+                DiagnosticFinding(
+                    category=DiagnosticCategory.TRANSFERS,
+                    severity=DiagnosticSeverity.WARN,
+                    check_name="stale_locks",
+                    message=f"Could not read the lock file {lock_file}: {e}",
+                    details={"lock_file": str(lock_file), "error": str(e)},
+                )
+            )
+            return findings
+        if not locks:
+            return findings
+
+        manager = holders_beside(lock_file)
+        records: dict[str, list[tuple[Any, Any]]] = {}
+        if (snapshot_dir / holders_dir_name(lock_file.name)).is_dir():
+            try:
+                records = manager.shared_records()
+            except Exception as e:  # noqa: BLE001 - reported, pins still listed
+                findings.append(
+                    DiagnosticFinding(
+                        category=DiagnosticCategory.TRANSFERS,
+                        severity=DiagnosticSeverity.WARN,
+                        check_name="stale_locks",
+                        message=(
+                            f"Could not read the holder records beside {lock_file}: "
+                            f"{e}; the pins are listed without their holders"
+                        ),
+                        details={"lock_file": str(lock_file), "error": str(e)},
                     )
-                    logger.info(
-                        "Removed stale lock: %s from %s", lock_id, snapshot_name
+                )
+        endpoint = LocalEndpoint(config={"path": snapshot_dir, "snap_prefix": ""})
+
+        def record_of(name: str, holder_id: str) -> tuple[Any, Any] | None:
+            for holder, age in records.get(f"{SNAPSHOT_LOCK_PREFIX}{name}", []):
+                if holder.lock_id == holder_id:
+                    return holder, age
+            return None
+
+        def remove_entry(name: str) -> Callable[[], bool]:
+            def fix() -> bool:
+                endpoint._update_lock_entry(name, lambda entry: {})
+                for holder, _age in records.get(f"{SNAPSHOT_LOCK_PREFIX}{name}", []):
+                    manager.release_holder(holder)
+                return True
+
+            return fix
+
+        def remove_pin(name: str, key: str, lock_id: str) -> Callable[[], bool]:
+            def fix() -> bool:
+                def change(entry: dict) -> dict:
+                    entry[key] = [x for x in entry.get(key, []) if x != lock_id]
+                    return entry
+
+                endpoint._update_lock_entry(name, change)
+                found = record_of(
+                    name, f"p:{lock_id}" if key == "parent_locks" else lock_id
+                )
+                if found is not None:
+                    manager.release_holder(found[0])
+                return True
+
+            return fix
+
+        def finding(
+            severity: DiagnosticSeverity,
+            message: str,
+            details: dict,
+            fix: Callable[[], bool] | None = None,
+            fix_description: str = "",
+        ) -> DiagnosticFinding:
+            item = DiagnosticFinding(
+                category=DiagnosticCategory.TRANSFERS,
+                severity=severity,
+                check_name="stale_locks",
+                message=message,
+                details={"lock_file": str(lock_file), **details},
+                fixable=fix is not None,
+                fix_description=fix_description,
+            )
+            if fix is not None:
+                item.fix_action = fix
+            return item
+
+        pinned: set[tuple[str, str]] = set()
+        for name, entry in locks.items():
+            pins = [
+                (key, str(lock_id))
+                for key in ("locks", "parent_locks")
+                for lock_id in entry.get(key, [])
+            ]
+            if not pins:
+                findings.append(
+                    finding(
+                        DiagnosticSeverity.WARN,
+                        f"The lock file has an entry for {name} that holds nothing",
+                        {"snapshot": name},
+                        remove_entry(name),
+                        "Remove the empty entry",
                     )
-                    return True
-        except Exception as e:
-            logger.error("Failed to remove lock: %s", e)
-        return False
+                )
+                continue
+            if not (snapshot_dir / name).exists():
+                pinned.update(
+                    (name, f"p:{i}" if k == "parent_locks" else i) for k, i in pins
+                )
+                findings.append(
+                    finding(
+                        DiagnosticSeverity.WARN,
+                        f"Lock(s) held on {name} by "
+                        f"{', '.join(repr(i) for _k, i in pins)}, but {name} no "
+                        "longer exists; nothing can use the pin and nothing will "
+                        "release it",
+                        {"snapshot": name, "lock_ids": [i for _k, i in pins]},
+                        remove_entry(name),
+                        "Remove the entry of the deleted snapshot",
+                    )
+                )
+                continue
+            for key, lock_id in pins:
+                holder_id = f"p:{lock_id}" if key == "parent_locks" else lock_id
+                pinned.add((name, holder_id))
+                kind = (
+                    "restore pin"
+                    if lock_id.startswith("restore:")
+                    else "parent pin"
+                    if key == "parent_locks"
+                    else "pin"
+                )
+                details = {"snapshot": name, "lock_id": lock_id, "kind": kind}
+                found = record_of(name, holder_id)
+                if found is None:
+                    hint = (
+                        "; clear it with restore --unlock once it is known to be "
+                        "a leftover"
+                        if kind == "restore pin"
+                        else ""
+                    )
+                    findings.append(
+                        finding(
+                            DiagnosticSeverity.INFO,
+                            f"{kind.capitalize()} held on {name} by {lock_id!r}; "
+                            "no holder record says whether its holder is still "
+                            f"running{hint}",
+                            details,
+                        )
+                    )
+                    continue
+                holder, age = found
+                words = self._holder_words(holder, age)
+                details.update(
+                    {
+                        "pid": holder.info.get("pid"),
+                        "hostname": holder.info.get("hostname"),
+                        "age": age,
+                    }
+                )
+                if age is None or age <= DEFAULT_STALE_AFTER:
+                    findings.append(
+                        finding(
+                            DiagnosticSeverity.INFO,
+                            f"{kind.capitalize()} held on {name} by {lock_id!r}: "
+                            f"{words}",
+                            details,
+                        )
+                    )
+                elif kind == "restore pin":
+                    findings.append(
+                        finding(
+                            DiagnosticSeverity.WARN,
+                            f"Restore pin held on {name} by {lock_id!r} whose "
+                            f"holder is gone ({words}); a restore pin has no life "
+                            "after its process",
+                            details,
+                            remove_pin(name, key, lock_id),
+                            "Remove the restore pin and its record",
+                        )
+                    )
+                elif kind == "parent pin":
+                    findings.append(
+                        finding(
+                            DiagnosticSeverity.WARN,
+                            f"Parent pin held on {name} by {lock_id!r} whose "
+                            f"holder is gone ({words}); the next run releases "
+                            "it, and so can this",
+                            details,
+                            remove_pin(name, key, lock_id),
+                            "Remove the parent pin and its record",
+                        )
+                    )
+                else:
+                    findings.append(
+                        finding(
+                            DiagnosticSeverity.INFO,
+                            f"Pin held on {name} by {lock_id!r} by a run that has "
+                            f"ended ({words}); kept until the next run completes "
+                            "the transfer to that destination",
+                            details,
+                        )
+                    )
+        for lock_name, items in records.items():
+            name = lock_name[len(SNAPSHOT_LOCK_PREFIX) :]
+            for holder, age in items:
+                if (name, holder.lock_id or "") in pinned:
+                    continue
+                words = self._holder_words(holder, age)
+                details = {
+                    "snapshot": name,
+                    "lock_id": holder.lock_id,
+                    "pid": holder.info.get("pid"),
+                    "hostname": holder.info.get("hostname"),
+                    "age": age,
+                }
+                if age is not None and age > DEFAULT_STALE_AFTER:
+                    findings.append(
+                        finding(
+                            DiagnosticSeverity.WARN,
+                            f"A holder record on {name} by {holder.lock_id!r} "
+                            f"outlived its pin ({words})",
+                            details,
+                            _sweep_action(manager, holder),
+                            "Remove the record",
+                        )
+                    )
+                else:
+                    findings.append(
+                        finding(
+                            DiagnosticSeverity.INFO,
+                            f"A holder record on {name} by {holder.lock_id!r} has "
+                            f"no pin in the lock file ({words})",
+                            details,
+                        )
+                    )
+        return findings
+
+    def _lock_store_findings(
+        self, location: str, manager: Any = None
+    ) -> list[DiagnosticFinding]:
+        """The records of a directory store, where the record is the pin: a
+        dead one is swept by the store's own rule."""
+        from ..sshutil.lock import DEFAULT_STALE_AFTER, local_manager
+
+        findings: list[DiagnosticFinding] = []
+        manager = manager if manager is not None else local_manager(location)
+        try:
+            records = manager.shared_records()
+        except Exception as e:  # noqa: BLE001 - reported as a finding
+            findings.append(
+                DiagnosticFinding(
+                    category=DiagnosticCategory.TRANSFERS,
+                    severity=DiagnosticSeverity.WARN,
+                    check_name="stale_locks",
+                    message=f"Could not examine the lock store at {location}: {e}",
+                    details={"location": location, "error": str(e)},
+                )
+            )
+            return findings
+        for lock_name, items in records.items():
+            for holder, age in items:
+                words = self._holder_words(holder, age)
+                details = {
+                    "location": location,
+                    "lock": lock_name,
+                    "lock_id": holder.lock_id,
+                    "pid": holder.info.get("pid"),
+                    "hostname": holder.info.get("hostname"),
+                    "age": age,
+                }
+                if age is not None and age > DEFAULT_STALE_AFTER:
+                    item = DiagnosticFinding(
+                        category=DiagnosticCategory.TRANSFERS,
+                        severity=DiagnosticSeverity.WARN,
+                        check_name="stale_locks",
+                        message=(
+                            f"Pin {lock_name!r} at {location} held by "
+                            f"{holder.lock_id!r} whose holder is gone ({words})"
+                        ),
+                        details=details,
+                        fixable=True,
+                        fix_description="Sweep the dead record",
+                    )
+                    item.fix_action = _sweep_action(manager, holder)
+                    findings.append(item)
+                else:
+                    findings.append(
+                        DiagnosticFinding(
+                            category=DiagnosticCategory.TRANSFERS,
+                            severity=DiagnosticSeverity.INFO,
+                            check_name="stale_locks",
+                            message=(
+                                f"Pin {lock_name!r} at {location} held by "
+                                f"{holder.lock_id!r}: {words}"
+                            ),
+                            details=details,
+                        )
+                    )
+        return findings
+
+    def _target_store_findings(self, target: Any) -> list[DiagnosticFinding]:
+        """A target's lock store, local or reached over ssh."""
+        from ..sshutil.lock import LOCK_DIR_NAME
+
+        scheme = parse_target(target.path)
+        if scheme.is_remote:
+            try:
+                from ..cli.common import thread_ssh_target_config
+                from ..endpoint import choose_endpoint
+
+                kwargs: dict[str, Any] = {"snap_prefix": ""}
+                thread_ssh_target_config(kwargs, target)
+                endpoint = choose_endpoint(target.path, kwargs, source=False)
+                manager = endpoint._lock_manager()
+            except Exception as e:  # noqa: BLE001 - reported as a finding
+                return [
+                    DiagnosticFinding(
+                        category=DiagnosticCategory.TRANSFERS,
+                        severity=DiagnosticSeverity.WARN,
+                        check_name="stale_locks",
+                        message=f"Could not examine the lock store at {target.path}: {e}",
+                        details={"location": target.path, "error": str(e)},
+                    )
+                ]
+            return self._lock_store_findings(target.path, manager)
+        if scheme.kind is TargetKind.UNSUPPORTED or not scheme.path:
+            return []
+        if not (Path(scheme.path) / LOCK_DIR_NAME).is_dir():
+            return []
+        return self._lock_store_findings(scheme.path)
 
     def _check_recent_failures(self) -> list[DiagnosticFinding]:
         """Check transaction log for recent failures."""

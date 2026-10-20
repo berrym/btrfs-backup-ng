@@ -1,5 +1,7 @@
 # Remote Locks
 
+The words used here are defined in [the glossary](GLOSSARY.md).
+
 Locks that outlive the process that took them, so a restore reading a snapshot
 on a remote target cannot have that snapshot deleted out from under it by a
 prune running somewhere else.
@@ -400,7 +402,7 @@ already has for a prune that could not run.
 ### Reporting
 
 `restore --status` and `--unlock` go through `Endpoint._read_locks` and
-`_write_locks`. Remote endpoints implement both against the target, so those
+`_release_locks`. Remote endpoints implement both against the target, so those
 commands describe a remote target as accurately as a local one:
 
 ```
@@ -414,15 +416,47 @@ A lock whose `info.json` cannot be parsed is still reported, with the holder
 shown as `unknown`. "Something holds this and we cannot say what" must never be
 rounded down to "nothing holds this".
 
-`--unlock` clears leftover snapshot pins. It addresses holders by the record
-they were found in rather than by lock id, so it can clear the one holder it
-cannot name — the one whose payload is unreadable. Addressed by id, that holder
-survived `--unlock all` forever and the only remedy was deleting files on the
-target by hand.
+`--unlock` clears leftover snapshot pins. It decides which pins to clear from
+the state it read, and releases exactly those, each by the holder record it was
+found in: a pin taken after the read belongs to a restore that is running now,
+and is kept, under `--unlock all` as well. Writing the read state back whole,
+as the command once did, dropped such a pin along with the leftovers. Addressing
+by record is also what lets `--unlock all` clear the one holder it cannot name,
+the one whose payload is unreadable; addressed by id, that holder survived
+forever and the only remedy was deleting files on the target by hand. A named
+session leaves it in place.
 
 It deliberately leaves whole-target locks alone: those belong to an operation
 running right now, and the command exists to clear leftovers, not to interrupt
 work in progress.
+
+## Holder records beside a lock file
+
+A local location keeps its pins in a lock file, a JSON ledger of
+`{snapshot: {locks, parent_locks}}`. A pin there survives the process that took
+it, on purpose: an interrupted backup keeps its pin so the source cannot prune a
+snapshot a later run still has to send. Nothing in the file said who took a pin
+or whether they were still there, so `doctor` could not tell a leftover from a
+pin at work.
+
+Since 0.9.16 every pin taken in a lock file also has a holder record beside the
+file, in `<lock file>.holders`: the same record a directory store keeps, with
+the lock's name, the lock id, hostname, pid and a heartbeat, written and
+refreshed by the same machinery, with the same elevation. The file's format is
+unchanged. The record is evidence, not protection: it outlives the process as
+the pin does, its beat stops with the process, and a record that cannot be
+written is a warning, never a failed pin. `restore --unlock` releases the
+records of the pins it removes.
+
+`doctor` joins the ledger with the records and reports each pin as held by a
+live process, held by a process whose beat has stopped, or held with no record,
+which a pin taken by an earlier version looks like. It fixes what it can
+prove: an entry for a snapshot that no longer exists, an entry with nothing in
+it, a restore pin or a parent pin whose holder is gone, and a dead record in a
+directory store. It never touches a pin whose holder is alive, a pin with no
+record, or a backup's own pin whose holder is gone, which is kept for the next
+run to complete the transfer. `restore --status` shows the same evidence
+beside each pin.
 
 ## Which targets persist locks
 
@@ -442,6 +476,16 @@ Locks live beside the data they protect, so the lock directory inherits that
 directory's permissions. Backup destinations are commonly root-owned. The
 unprivileged attempt is made first; if the lock directory cannot be created, the
 same script is retried elevated.
+
+The rule covers the whole of a lock's life, not the acquire alone. A record
+the acquire wrote elevated is root-owned for as long as it exists, so a
+heartbeat or a removal whose verdict says it could not write is run again
+elevated with the same runner, and one that could write is not. A shared pin's
+heartbeat runs the script that wrote its record, so a record removed from under
+a live holder returns whole, directories included. Before 0.9.16 only the
+acquire elevated: on a root-owned destination every pin and lock went stale
+within the window while its holder was still at work, and stayed behind once
+the holder was done.
 
 A directory that cannot be created is reported as such and never as contention.
 A bare `mkdir` failure looks exactly like losing a race, and reporting it that
