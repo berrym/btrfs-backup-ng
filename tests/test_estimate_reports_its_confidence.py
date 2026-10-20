@@ -9,7 +9,7 @@ Anyone sizing a link or a maintenance window off that would be out by up to two
 orders of magnitude. Found while answering #93, where the same underestimate
 came up as a reason NOT to derive a transfer timeout from it.
 
-A full transfer is measured directly (btrfs subvolume show / filesystem du / du)
+A full transfer is measured directly (btrfs filesystem du / du)
 and is not affected -- so the labelling has to distinguish the two, not blanket
 everything with a disclaimer nobody reads.
 """

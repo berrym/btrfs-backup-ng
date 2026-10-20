@@ -90,7 +90,7 @@ class SnapshotEstimate:
         incremental_size: Estimated incremental transfer size (if parent available)
         parent_name: Name of parent snapshot for incremental
         is_incremental: Whether this would be an incremental transfer
-        method: Method used to estimate ("subvolume_show", "filesystem_du", "du", "send_estimate")
+        method: Method used to estimate ("filesystem_du", "du", "send_estimate")
     """
 
     name: str
@@ -288,24 +288,6 @@ def _run_measurement(
     return None
 
 
-def _parse_subvolume_show(out: str) -> Optional[int]:
-    """The ``Exclusive`` line of ``btrfs subvolume show``, when quotas give one.
-
-    btrfs-progs 7.1 prints the field as ``Usage exclusive``, which this does
-    not match, and exclusive bytes are what is unique to this subvolume, not
-    what a full send carries; a test pins that a ``Usage exclusive`` line is
-    not taken as the size, so that remains a decision rather than an accident.
-    """
-    for line in out.splitlines():
-        if line.strip().startswith("Exclusive"):
-            parts = line.split(":")
-            if len(parts) >= 2:
-                parsed = _parse_size(parts[1].strip())
-                if parsed and parsed > 0:
-                    return parsed
-    return None
-
-
 def _parse_filesystem_du(out: str) -> Optional[int]:
     """The Total of ``btrfs filesystem du -s --raw``; a Total of 0 is no answer.
 
@@ -346,15 +328,19 @@ def estimate_snapshot_full_size(
 ) -> tuple[Optional[int], str]:
     """Estimate the full size of a snapshot.
 
-    Tries multiple methods in order of preference:
-    1. btrfs subvolume show (requires quotas, exclusive data); elevated
-       only, since it cannot read a subvolume without privilege
-    2. btrfs filesystem du (referenced data, shared extents once)
-    3. Regular du (apparent size: an upper bound, see OVERCOUNTING_METHODS)
+    Tries two methods in order of preference:
+    1. btrfs filesystem du (referenced data, shared extents once): the
+       Total is what a full send carries
+    2. Regular du (apparent size: an upper bound, see OVERCOUNTING_METHODS)
 
-    Each method is elevated through ``sudo -n`` when not root, and the two
-    that need no privilege on a readable tree run once more as this user
-    when sudo gave no answer (``_run_measurement``). Root never asks sudo.
+    Each method is elevated through ``sudo -n`` when not root, and both
+    run once more as this user when sudo gave no answer, since neither
+    needs privilege on a readable tree (``_run_measurement``). Root never
+    asks sudo. ``btrfs subvolume show`` used to be tried first for an
+    ``Exclusive`` line; btrfs-progs prints that field as ``Usage
+    exclusive`` and only with quotas enabled, so the step never matched,
+    and exclusive bytes are what is unique to the subvolume, not what a
+    full send moves, so it would have measured the wrong thing (#119).
 
     Args:
         snapshot_path: Path to the snapshot
@@ -369,13 +355,6 @@ def estimate_snapshot_full_size(
         tuple[str, list[str], int, Callable[[Any], Optional[int]], bool], ...
     ]
     methods = (
-        (
-            "subvolume_show",
-            ["btrfs", "subvolume", "show", path],
-            30,
-            _parse_subvolume_show,
-            False,
-        ),
         (
             "filesystem_du",
             ["btrfs", "filesystem", "du", "-s", "--raw", path],
