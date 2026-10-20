@@ -1480,6 +1480,8 @@ class Endpoint:
             else:
                 logger.info("Deleted snapshot subvolume: %s", snapshot.get_path())
                 result.deleted.append(snapshot)
+                if store is None:
+                    self._forget_lock_entry(snapshot.get_name())
                 # Evicted only on success, inside this branch. It used to sit at
                 # the loop's own indent, so a snapshot whose deletion FAILED was
                 # dropped from the cache anyway and every later list_snapshots()
@@ -1509,6 +1511,47 @@ class Endpoint:
                         e,
                     )
         return result
+
+    def _forget_lock_entry(self, name: str) -> None:
+        """Remove a deleted snapshot's entry from the lock file, if it has one.
+
+        The file was read again before the deletion was decided, so the
+        snapshot held no pin then. A pin taken after that read, by another
+        target's thread or another process, lands in an entry for a snapshot
+        that no longer exists; nothing lists a deleted snapshot again, so
+        nothing would ever release it, and ``restore --status`` and ``doctor``
+        reported a lock held on a snapshot that did not exist until
+        ``--unlock`` cleared it by hand. An entry with nothing in it, as a
+        hand edit can leave, is removed the same way. The deletion stands
+        either way: an entry that cannot be removed is a warning.
+        """
+        held: Dict[str, List[Any]] = {}
+
+        def change(entry: Dict[str, List[Any]]) -> Dict[str, List[Any]]:
+            held.update(entry)
+            return {}
+
+        try:
+            self._update_lock_entry(name, change)
+        except (OSError, __util__.AbortError) as exc:
+            logger.warning(
+                "Deleted %s, but its entry in the lock file %s could not be "
+                "removed: %s. The lock state will report a lock on a snapshot "
+                "that no longer exists; clear it with restore --unlock.",
+                name,
+                self._get_lock_file_path(),
+                exc,
+            )
+            return
+        pins = [f"{lock_id} ({key})" for key, ids in held.items() for lock_id in ids]
+        if pins:
+            logger.warning(
+                "Deleted %s, and removed the pin(s) taken on it after the deletion "
+                "was decided: %s. The operation that took them cannot use this "
+                "snapshot; it will find it missing.",
+                name,
+                ", ".join(sorted(pins)),
+            )
 
     def delete_snapshot(self, snapshot: Any, **kwargs: Any) -> DeletionResult:
         """Delete a snapshot."""
