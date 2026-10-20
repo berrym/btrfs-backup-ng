@@ -120,7 +120,6 @@ class TestWhereSudoRefuses:
         assert estimate_snapshot_full_size(readable, use_sudo=True) == expected
 
         refused = [line.split()[:3] for line in sudo_refuses()]
-        assert ["btrfs", "subvolume", "show"] in refused
         assert ["btrfs", "filesystem", "du"] in refused, "sudo was not asked first"
         if expected[1] == "du":
             assert ["du", "-sb", str(readable)] in refused, "sudo was not asked first"
@@ -484,24 +483,29 @@ class TestOneTable:
                 == expected
             ), text
 
-    def test_a_usage_exclusive_line_is_not_taken_as_the_size(
-        self, tmp_path, monkeypatch
-    ):
-        """btrfs-progs 7.1 prints 'Usage exclusive'; that figure is what is
-        unique to the subvolume, not what a full send carries, and is not
-        read as the size unless that is decided on purpose."""
+    def test_subvolume_show_is_never_run(self, tmp_path, monkeypatch):
+        """The size ladder starts at ``btrfs filesystem du``. It used to try
+        ``btrfs subvolume show`` first for an ``Exclusive`` line that
+        btrfs-progs prints as ``Usage exclusive`` and only with quotas, so
+        the step never matched; had it matched, the exclusive bytes are not
+        what a full send carries, so it would have measured the wrong thing
+        (#119). The step is gone: a show-only answer is no answer."""
         monkeypatch.setattr(os, "geteuid", lambda: 0)
+        asked: list = []
 
         def run(argv, **kwargs):
+            asked.append(argv[:3])
             if argv[:3] == ["btrfs", "subvolume", "show"]:
                 return subprocess.CompletedProcess(
-                    argv, 0, "\t  Usage exclusive:\t1.00GiB\n", ""
+                    argv, 0, "\t  Usage exclusive:\t1.00GiB\n\tExclusive: 1.00GiB\n", ""
                 )
             return subprocess.CompletedProcess(argv, 1, "", "")
 
         monkeypatch.setattr(estimate_mod.subprocess, "run", run)
 
         assert estimate_snapshot_full_size(tmp_path) == (None, "failed")
+        assert ["btrfs", "subvolume", "show"] not in asked
+        assert asked[0] == ["btrfs", "filesystem", "du"]
 
     def test_a_filesystem_du_total_of_zero_is_not_a_size(self, tmp_path, monkeypatch):
         monkeypatch.setattr(os, "geteuid", lambda: 0)

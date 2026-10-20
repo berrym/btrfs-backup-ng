@@ -90,18 +90,19 @@ class TestEstimateSnapshotSize:
 
     @patch("os.geteuid")
     @patch("subprocess.run")
-    def test_parses_exclusive_size_bytes(self, mock_run, mock_euid):
-        """Test parsing exclusive size from btrfs subvolume show (plain bytes)."""
+    def test_parses_the_filesystem_du_total(self, mock_run, mock_euid):
+        """The Total of btrfs filesystem du is the size, from the first call."""
         mock_euid.return_value = 0  # Running as root
         mock_run.return_value = MagicMock(
             returncode=0,
-            stdout="Name: snapshot\nExclusive: 1234567890B\nOther: data\n",
+            stdout="Total   Exclusive  Set shared  Filename\n1234567890   0   0   /snapshot\n",
         )
 
         result = estimate_snapshot_size("/snapshot")
 
         assert result == 1234567890
         mock_run.assert_called_once()
+        assert mock_run.call_args[0][0][:3] == ["btrfs", "filesystem", "du"]
 
     @patch("os.geteuid")
     @patch("subprocess.run")
@@ -110,7 +111,7 @@ class TestEstimateSnapshotSize:
         mock_euid.return_value = 1000  # Not root
         mock_run.return_value = MagicMock(
             returncode=0,
-            stdout="Name: snapshot\nExclusive: 104857600B\n",
+            stdout="Total   Exclusive  Set shared  Filename\n104857600   0   0   /snapshot\n",
         )
 
         result = estimate_snapshot_size("/snapshot")
@@ -122,34 +123,12 @@ class TestEstimateSnapshotSize:
 
     @patch("os.geteuid")
     @patch("subprocess.run")
-    def test_fallback_to_btrfs_du(self, mock_run, mock_euid):
-        """Test fallback to btrfs filesystem du."""
-        mock_euid.return_value = 0
-
-        # First call (btrfs subvolume show) fails
-        # Second call (btrfs filesystem du) succeeds
-        mock_run.side_effect = [
-            MagicMock(returncode=1, stderr="Error"),
-            MagicMock(
-                returncode=0,
-                stdout="Total   Exclusive  Set shared  Filename\n12345678   6789000    5000000    /snapshot\n",
-            ),
-        ]
-
-        result = estimate_snapshot_size("/snapshot")
-
-        assert result == 12345678
-        assert mock_run.call_count == 2
-
-    @patch("os.geteuid")
-    @patch("subprocess.run")
     def test_fallback_to_du(self, mock_run, mock_euid):
         """Test fallback to regular du command."""
         mock_euid.return_value = 0
 
-        # First two calls fail, third (du) succeeds
+        # btrfs filesystem du fails, du succeeds
         mock_run.side_effect = [
-            MagicMock(returncode=1, stderr="Error"),
             MagicMock(returncode=1, stderr="Error"),
             MagicMock(returncode=0, stdout="98765432\t/snapshot\n"),
         ]
@@ -157,7 +136,7 @@ class TestEstimateSnapshotSize:
         result = estimate_snapshot_size("/snapshot")
 
         assert result == 98765432
-        assert mock_run.call_count == 3
+        assert mock_run.call_count == 2
 
     @patch("os.geteuid")
     @patch("subprocess.run")

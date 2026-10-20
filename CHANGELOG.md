@@ -20,6 +20,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The size estimate no longer runs `btrfs subvolume show` for every
+  snapshot.** The step looked for an `Exclusive` line that btrfs-progs
+  prints as `Usage exclusive`, and only with quotas enabled, so it never
+  matched and every estimate fell through to `btrfs filesystem du` after a
+  wasted command per snapshot. Had it matched, the exclusive bytes are what
+  is unique to the subvolume, not what a full send carries, so the space
+  check and the progress bar would have been fed a figure near zero. The
+  ladder now starts at `btrfs filesystem du`, whose Total is what a full
+  send moves, with `du` as the fallback (#119).
 - **`restore --unlock` erased a pin a run took while the command ran, and
   brought back a pin the run had released.** The command read the lock
   state, removed the restore pins from its copy and wrote the copy back

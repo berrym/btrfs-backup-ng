@@ -2982,11 +2982,10 @@ Estimation time: 1.23s
 
 ### Estimation Methods
 
-The estimate command uses multiple methods to determine sizes:
+The estimate command uses two methods to determine the size of a full transfer:
 
-1. **btrfs subvolume show** - Uses exclusive data size (most accurate, requires quotas)
-2. **btrfs filesystem du** - Handles reflinks and deduplication correctly
-3. **du** - Fallback for when btrfs commands aren't available
+1. **btrfs filesystem du** - The referenced data a full send carries; reflinks and shared extents counted once
+2. **du** - Fallback for when the btrfs command gives no answer; an apparent size, which can overcount
 
 For incremental transfers, the command uses `btrfs send --no-data` to estimate the delta size without actually transferring data.
 

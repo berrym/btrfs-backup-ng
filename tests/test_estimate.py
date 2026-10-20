@@ -191,47 +191,14 @@ class TestEstimateSnapshotFullSize:
     """Tests for estimate_snapshot_full_size function."""
 
     @patch("subprocess.run")
-    def test_subvolume_show_success(self, mock_run, tmp_path):
-        """Test successful estimation via btrfs subvolume show."""
+    def test_filesystem_du_is_the_first_method(self, mock_run, tmp_path):
+        """btrfs filesystem du is asked first; its Total is the size."""
         from btrfs_backup_ng.core.estimate import estimate_snapshot_full_size
 
         mock_run.return_value = MagicMock(
             returncode=0,
-            stdout="""snapshot-1
-\tName: \t\t\tsnapshot-1
-\tUUID: \t\t\t12345678-1234-1234-1234-123456789abc
-\tParent UUID: \t\t-
-\tReceived UUID: \t\t-
-\tCreation time: \t\t2026-01-01 12:00:00 +0000
-\tSubvolume ID: \t\t256
-\tGeneration: \t\t1234
-\tGen at creation: \t1234
-\tParent ID: \t\t5
-\tTop level ID: \t\t5
-\tFlags: \t\t\treadonly
-\tSnapshot(s):
-\tExclusive: \t\t2.50GiB
-""",
+            stdout="Total   Exclusive  Set shared  Filename\n1073741824  536870912  536870912  /snap\n",
         )
-
-        size, method = estimate_snapshot_full_size(tmp_path / "snap")
-
-        assert size == int(2.5 * 1024**3)
-        assert method == "subvolume_show"
-
-    @patch("subprocess.run")
-    def test_filesystem_du_fallback(self, mock_run, tmp_path):
-        """Test fallback to btrfs filesystem du."""
-        from btrfs_backup_ng.core.estimate import estimate_snapshot_full_size
-
-        # First call (subvolume show) fails, second (filesystem du) succeeds
-        mock_run.side_effect = [
-            MagicMock(returncode=1, stdout="", stderr="error"),
-            MagicMock(
-                returncode=0,
-                stdout="Total   Exclusive  Set shared  Filename\n1073741824  536870912  536870912  /snap\n",
-            ),
-        ]
 
         size, method = estimate_snapshot_full_size(tmp_path / "snap")
 
@@ -244,9 +211,8 @@ class TestEstimateSnapshotFullSize:
         """Test fallback to regular du (as root: one run per method)."""
         from btrfs_backup_ng.core.estimate import estimate_snapshot_full_size
 
-        # All btrfs commands fail, du succeeds
+        # btrfs filesystem du fails, du succeeds
         mock_run.side_effect = [
-            MagicMock(returncode=1, stdout="", stderr="error"),
             MagicMock(returncode=1, stdout="", stderr="error"),
             MagicMock(returncode=0, stdout="1073741824\t/snap\n"),
         ]
@@ -383,7 +349,7 @@ class TestEstimateSnapshotFullSizeAdvanced:
         """Test that sudo is used when not running as root."""
         mock_run.return_value = MagicMock(
             returncode=0,
-            stdout="Exclusive:\t\t1.00GiB\n",
+            stdout="Total   Exclusive  Set shared  Filename\n1073741824  0  0  /snap\n",
         )
 
         estimate_snapshot_full_size(tmp_path / "snap", use_sudo=True)
@@ -398,7 +364,7 @@ class TestEstimateSnapshotFullSizeAdvanced:
         """Test that sudo is not used when running as root."""
         mock_run.return_value = MagicMock(
             returncode=0,
-            stdout="Exclusive:\t\t1.00GiB\n",
+            stdout="Total   Exclusive  Set shared  Filename\n1073741824  0  0  /snap\n",
         )
 
         estimate_snapshot_full_size(tmp_path / "snap")
@@ -416,22 +382,6 @@ class TestEstimateSnapshotFullSizeAdvanced:
 
         assert size is None
         assert method == "failed"
-
-    @patch("subprocess.run")
-    @patch("os.geteuid", return_value=0)
-    def test_exclusive_size_zero_falls_through(self, mock_euid, mock_run, tmp_path):
-        """Test that zero exclusive size falls through to next method."""
-        mock_run.side_effect = [
-            # subvolume show returns 0 for exclusive
-            MagicMock(returncode=0, stdout="Exclusive:\t\t0B\n"),
-            # filesystem du succeeds
-            MagicMock(returncode=0, stdout="Total\tExclusive\n12345\t12345\n"),
-        ]
-
-        size, method = estimate_snapshot_full_size(tmp_path / "snap")
-
-        assert size == 12345
-        assert method == "filesystem_du"
 
     @patch("subprocess.run")
     @patch("os.geteuid", return_value=0)

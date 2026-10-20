@@ -3287,11 +3287,8 @@ print(json.dumps(result))
         and usually fast to move. A full send is sized by
         ``btrfs filesystem du -s --raw`` on the snapshot, run remotely under
         this endpoint's elevation: its Total is the referenced data a full
-        stream carries. (The local measurement also consults ``subvolume
-        show`` for an ``Exclusive`` line first; btrfs-progs prints that field
-        as ``Usage exclusive`` and only with quotas enabled, and exclusive
-        bytes are not what a full send moves, so the branch is not mirrored
-        here.) The engine used to run the local measurement on this remote
+        stream carries, the same first method the local measurement uses.
+        The engine used to run the local measurement on this remote
         path, which measured nothing and warned on every transfer from an
         ssh:// source.
         """
