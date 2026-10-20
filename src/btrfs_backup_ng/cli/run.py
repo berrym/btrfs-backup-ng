@@ -1172,11 +1172,13 @@ def _catch_up_selector(
             # it (and a prune then deletes the copy as before); left out here
             # it would never be released, and the source would keep the
             # snapshot for ever with "Skipping locked snapshot" every run.
+            # A PARENT pin is not a transfer of this snapshot: it pinned a
+            # base the destination held, and the sync's reconcile releases it
+            # before this selection is made. Counted here, it sent a snapshot
+            # the destination's prune had deleted again in full on every run.
             if destination_id is None:
                 return False
-            return destination_id in getattr(snap, "locks", ()) or (
-                destination_id in getattr(snap, "parent_locks", ())
-            )
+            return destination_id in getattr(snap, "locks", ())
 
         def dated(snap) -> bool:
             # The planner sends nothing it cannot order by time unless asked

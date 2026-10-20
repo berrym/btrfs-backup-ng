@@ -7,7 +7,9 @@ keeps. Two inputs the equivalence argument did not cover:
   did not finish. Only a completed transfer releases the lock, and the
   reconcile at the start of a sync clears locks only for snapshots present
   on the destination. Left out of the catch-up, the snapshot kept its lock
-  for ever and the source prune skipped it every run.
+  for ever and the source prune skipped it every run. A parent pin is not
+  such a lock: the reconcile releases it before the selection is made, and
+  counting it sent the snapshot in full on every run.
 - an undated subvolume in the snapshot directory is kept by retention as
   unparseable, so the selector kept it in the selection; and a selection is
   an explicit request to the planner, which then sent it as a full send,
@@ -72,13 +74,19 @@ class TestALockedSnapshotIsAlwaysSent:
         assert victim in chosen, "a locked snapshot left out keeps its lock for ever"
         assert _names(chosen) == _names([older, victim, newest])
 
-    def test_a_parent_lock_counts_too(self, tmp_path):
+    def test_a_parent_lock_alone_does_not_count(self, tmp_path):
+        """A parent pin is not an unfinished transfer of the snapshot: it
+        pinned a base the destination held, and the sync's reconcile releases
+        it before the selection is made. Counted here, it sent a snapshot the
+        destination's prune had deleted again in full on every run, and the
+        source kept it for ever."""
         victim = _snapshot(tmp_path, NOW - timedelta(days=5, hours=2))
         older = _snapshot(tmp_path, NOW - timedelta(days=5, hours=6))
         newest = _snapshot(tmp_path, NOW - timedelta(hours=1))
         victim.parent_locks.add("dest")
         chosen = _selector()([older, victim, newest], set())
-        assert victim in chosen
+        assert victim not in chosen
+        assert _names(chosen) == _names([older, newest])
 
     def test_another_destinations_lock_does_not_count(self, tmp_path):
         victim = _snapshot(tmp_path, NOW - timedelta(days=5, hours=2))
