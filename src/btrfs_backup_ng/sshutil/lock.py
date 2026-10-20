@@ -436,9 +436,13 @@ class RemoteLockManager:
         hostname: str = "",
         run_elevated: Optional[Callable[[str], tuple[int, str, str]]] = None,
     ) -> None:
-        """``run_elevated`` is used only when the unprivileged attempt cannot
-        create the lock directory. Backup destinations are commonly root-owned,
-        and the lock has to live beside the data it protects."""
+        """``run_elevated`` is used only when the unprivileged attempt could
+        not write: the acquire when the lock directory cannot be created or
+        written, and then every beat and every removal whose verdict says the
+        record could not be refreshed or removed, since a record the acquire
+        wrote elevated is root-owned for the whole of its life. Backup
+        destinations are commonly root-owned, and the lock has to live beside
+        the data it protects."""
         self._run = run_remote
         self._target = str(target_path).rstrip("/") or "/"
         self._root = f"{self._target}/{LOCK_DIR_NAME}"
@@ -620,8 +624,17 @@ class RemoteLockManager:
     def _holder_file(self, name: str, lock_id: str) -> str:
         return f"{self._holders_dir(name)}/{encode_name(str(lock_id))}"
 
-    def acquire_shared(self, name: str, lock_id: str, operation: str = "") -> str:
-        """Add this holder's pin to ``name``. Never blocks on another holder."""
+    def _shared_record_script(self, name: str, lock_id: str, operation: str) -> str:
+        """The script that writes this holder's record of its pin on ``name``.
+
+        Run by ``acquire_shared`` to take the pin and by the pin's heartbeat
+        to keep it: the beat writes the record again, whole, so a record
+        removed from under a live holder (``restore --unlock`` run during a
+        restore, a sweep after a long stall) returns with its identity and
+        inside its directories, rather than as an empty file ``touch`` left
+        where the file was, or as nothing at all once the directories had
+        been tidied away with the last record.
+        """
         payload = json.dumps(
             {
                 # The lock's REAL name, because the directory holding it carries
@@ -639,7 +652,7 @@ class RemoteLockManager:
         target = shlex.quote(self._target)
         holders = shlex.quote(self._holders_dir(name))
         holder = shlex.quote(self._holder_file(name, lock_id))
-        script = (
+        return (
             # Same rule as acquisition: create only below an existing target,
             # never the target itself (mkdir -p would build every component).
             f"if [ -d {target} ]; then mkdir -p {holders} 2>/dev/null; fi; "
@@ -651,6 +664,10 @@ class RemoteLockManager:
             f"printf '%s' {shlex.quote(csh_safe_text(payload))} > {holder} 2>/dev/null "
             f"&& echo ACQUIRED || echo FAILED"
         )
+
+    def acquire_shared(self, name: str, lock_id: str, operation: str = "") -> str:
+        """Add this holder's pin to ``name``. Never blocks on another holder."""
+        script = self._shared_record_script(name, lock_id, operation)
         rc, out, err = self._run(script)
         if "NOLOCKDIR" in out and self._run_elevated is not None:
             rc, out, err = self._run_elevated(script)
@@ -681,15 +698,19 @@ class RemoteLockManager:
         holder = shlex.quote(self._holder_file(name, lock_id))
         holders = shlex.quote(self._holders_dir(name))
         lock = shlex.quote(self._lock_dir(name))
-        rc, _out, err = self._run(
-            f"rm -f {holder} 2>/dev/null; "
-            f"rmdir {holders} 2>/dev/null; rmdir {lock} 2>/dev/null; exit 0"
+        script = (
+            f"if rm -f {holder} 2>/dev/null; then "
+            f"rmdir {holders} 2>/dev/null; rmdir {lock} 2>/dev/null; echo RELEASED; "
+            f"else echo UNWRITABLE; fi; exit 0"
         )
-        if rc != 0:
+        rc, out, err = self._run(script)
+        if _verdict(out) == "UNWRITABLE" and self._run_elevated is not None:
+            rc, out, err = self._run_elevated(script)
+        if rc != 0 or _verdict(out) != "RELEASED":
             logger.warning(
                 "Could not fully release the shared lock %r on the target: %s",
                 name,
-                err.strip(),
+                err.strip() or out.strip(),
             )
             return
         _unregister_for_cleanup(self, key)
@@ -700,7 +721,8 @@ class RemoteLockManager:
         """Pin ``name`` and keep the pin alive until ``release_shared``."""
         mode = self.acquire_shared(name, lock_id, operation)
         self._start_heartbeat(
-            self._held_key(name, lock_id), self._holder_file(name, lock_id)
+            self._held_key(name, lock_id),
+            self._shared_record_script(name, lock_id, operation),
         )
         return mode
 
@@ -803,12 +825,20 @@ class RemoteLockManager:
             lock = shlex.quote(self._lock_dir(name))
             owner = shlex.quote(self._owner_file(name, token))
             hb = shlex.quote(f"{self._lock_dir(name)}/{HEARTBEAT_NAME}")
-            rc, out, err = self._run(
+            script = (
                 f"if rm {owner} </dev/null 2>/dev/null; then "
                 f"rm -f {hb} 2>/dev/null; rmdir {lock} 2>/dev/null; echo RELEASED; "
                 f"elif [ -e {owner} ]; then echo KEPT; else echo NOTOWNER; fi"
             )
+            rc, out, err = self._run(script)
             verdict = _verdict(out)
+            if verdict == "KEPT" and self._run_elevated is not None:
+                # The record is there and could not be removed: a root-owned
+                # store, whose lock the acquire took elevated. NOTOWNER is
+                # not this case; the record is gone, and nothing elevated
+                # would change that.
+                rc, out, err = self._run_elevated(script)
+                verdict = _verdict(out)
             if verdict in ("RELEASED", "NOTOWNER"):
                 self._tokens.pop(name, None)
                 _unregister_for_cleanup(self, name)
@@ -1055,7 +1085,10 @@ class RemoteLockManager:
             shlex.quote(f"{self._root}/{dir_name}.lock/{HOLDERS_DIR_NAME}/{file_name}")
             for dir_name, file_name in dead
         ]
-        self._run(f"rm -f {' '.join(paths)} 2>/dev/null; exit 0")
+        script = f"rm -f {' '.join(paths)} 2>/dev/null && echo SWEPT || echo UNWRITABLE; exit 0"
+        _rc, out, _err = self._run(script)
+        if _verdict(out) == "UNWRITABLE" and self._run_elevated is not None:
+            self._run_elevated(script)
         logger.debug("Swept %d abandoned holder record(s) on the target", len(dead))
         return len(dead)
 
@@ -1085,40 +1118,66 @@ class RemoteLockManager:
             if name:
                 own_key = self._held_key(name, holder.lock_id)
                 self._stop_heartbeat(own_key)
-        rc, _out, _err = self._run(
-            f"rm -f {record} 2>/dev/null; "
-            f"rmdir {holders} 2>/dev/null; rmdir {lock} 2>/dev/null; exit 0"
+        script = (
+            f"if rm -f {record} 2>/dev/null; then "
+            f"rmdir {holders} 2>/dev/null; rmdir {lock} 2>/dev/null; echo RELEASED; "
+            f"else echo UNWRITABLE; fi; exit 0"
         )
+        rc, out, _err = self._run(script)
+        if _verdict(out) == "UNWRITABLE" and self._run_elevated is not None:
+            rc, out, _err = self._run_elevated(script)
         if rc == 0 and own_key is not None:
             _unregister_for_cleanup(self, own_key)
 
     # ------------------------------------------------------------- heartbeat
 
-    def _start_heartbeat(self, key: str, path: Optional[str] = None) -> None:
+    def _start_heartbeat(self, key: str, record: Optional[str] = None) -> None:
         """Refresh the holder's record until stopped. ``key`` identifies it.
 
-        For a shared pin ``path`` is that holder's own file, so holders of the
-        same snapshot keep their pins alive independently. For an exclusive
-        lock (no ``path``) it is the holder's ``owner.<token>`` file and the
-        ``heartbeat`` beside it, refreshed with ``touch -c``: a holder whose
-        lock was broken while it was stalled must not recreate its record
-        inside the next holder's lock.
+        For a shared pin ``record`` is the script that writes this holder's
+        own record (``_shared_record_script``), run again at every beat, so
+        holders of the same snapshot keep their pins alive independently and
+        a record removed from under a live holder comes back whole. For an
+        exclusive lock (no ``record``) the beat is a ``touch -c`` of the
+        holder's ``owner.<token>`` file and the ``heartbeat`` beside it: a
+        holder whose lock was broken while it was stalled must not recreate
+        its record inside the next holder's lock.
+
+        A beat elevates as the acquire did. The acquire runs unprivileged
+        first and elevates when the lock directory cannot be created or
+        written, which is a root-owned destination; the record it then
+        writes is root-owned too, and a beat run unprivileged alone could
+        not refresh it, so the pin went stale after ``stale_after`` seconds
+        while its holder was still at work, and an exclusive lock could be
+        broken under a running operation. A beat whose verdict says it
+        could not write is run again elevated, with the same runner.
         """
         stop = threading.Event()
-        if path is not None:
-            command = f"touch {shlex.quote(path)} 2>/dev/null; exit 0"
+        if record is not None:
+            command = record
         else:
             with self._state_lock:
                 token = self._tokens.get(key, "")
             files = [f"{self._lock_dir(key)}/{HEARTBEAT_NAME}"]
             if token:
                 files.insert(0, self._owner_file(key, token))
-            command = f"touch -c {' '.join(shlex.quote(f) for f in files)} 2>/dev/null; exit 0"
+            command = (
+                f"touch -c {' '.join(shlex.quote(f) for f in files)} 2>/dev/null "
+                f"&& echo REFRESHED || echo UNWRITABLE; exit 0"
+            )
+
+        def beat_once() -> None:
+            _rc, out, _err = self._run(command)
+            if (
+                _verdict(out) not in ("ACQUIRED", "REFRESHED")
+                and self._run_elevated is not None
+            ):
+                self._run_elevated(command)
 
         def beat() -> None:
             while not stop.wait(self._heartbeat_interval):
                 try:
-                    self._run(command)
+                    beat_once()
                 except Exception as exc:  # noqa: BLE001 - a missed beat is not fatal
                     # One failed refresh must not end a transfer. Several in a
                     # row let the lock go stale, which is the designed outcome

@@ -5,6 +5,42 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **A pin's heartbeat could not bring back a record removed from under a
+  running restore, and lost the pin outright when that restore was the
+  only holder.** A shared pin's heartbeat refreshed the holder's file with
+  a plain `touch`. When `restore --unlock all` was run while a restore was
+  in progress, it removed that live pin's record; the next beat recreated
+  the file empty, which the listing reports as `unknown`, so the snapshot
+  stayed protected but the session could no longer be named or addressed.
+  When the restore was the only holder, the release had removed the
+  directories with the record, the `touch` had nowhere to write, and the
+  restore ran on with no pin at all: a prune on the target was free to
+  delete the snapshot it was reading. The beat now runs the script the
+  acquire ran, which creates the directories below the target and writes
+  the complete record, so a live pin returns whole. An exclusive lock's
+  beat still only touches its own files, so a holder whose lock was broken
+  does not write itself into the next holder's lock.
+- **Only the acquire of a lock elevated; its heartbeat, its release and
+  the sweep ran unprivileged, so on a root-owned destination every pin and
+  lock went stale while its holder was at work and stayed behind when the
+  holder was done.** The acquire runs unprivileged first and elevates when
+  the lock directory cannot be created or written, the case of a root-owned
+  mirror received under `ssh_sudo`; the record it writes is then root-owned
+  for the whole of its life. Every beat failed without a word, so a shared
+  pin stopped protecting a restore after three minutes and an exclusive
+  lock could be broken by a second process after the same interval. Every
+  release failed the same way, so each pin and lock stayed on the target
+  after its holder had finished, the next prune waited out the stale window
+  before it could take the target lock, and the sweep could not remove what
+  accumulated. A beat or a removal whose verdict says it could not write
+  now runs again elevated, with the runner the acquire used; one that could
+  write does not elevate. Confirmed on a root-owned target directory on a
+  real host before and after (#129).
+
 ## [0.9.15] - 2026-10-19
 
 This release corrects four defects found after 0.9.14. Pins on the source

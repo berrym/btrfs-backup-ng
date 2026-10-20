@@ -443,6 +443,16 @@ directory's permissions. Backup destinations are commonly root-owned. The
 unprivileged attempt is made first; if the lock directory cannot be created, the
 same script is retried elevated.
 
+The rule covers the whole of a lock's life, not the acquire alone. A record
+the acquire wrote elevated is root-owned for as long as it exists, so a
+heartbeat or a removal whose verdict says it could not write is run again
+elevated with the same runner, and one that could write is not. A shared pin's
+heartbeat runs the script that wrote its record, so a record removed from under
+a live holder returns whole, directories included. Before 0.9.16 only the
+acquire elevated: on a root-owned destination every pin and lock went stale
+within the window while its holder was still at work, and stayed behind once
+the holder was done.
+
 A directory that cannot be created is reported as such and never as contention.
 A bare `mkdir` failure looks exactly like losing a race, and reporting it that
 way sends an operator hunting for a competing process that does not exist.
