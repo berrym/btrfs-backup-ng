@@ -5,6 +5,25 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **A deleted snapshot's entry could stay in the lock file for ever.**
+  `delete_snapshots` reads the lock file again before it deletes, so a
+  snapshot it deletes holds no pin at that moment; a pin taken after that
+  read and before the deletion, by another target's thread or another
+  process, landed in an entry for a snapshot that no longer existed.
+  Nothing lists a deleted snapshot again, so nothing released that pin,
+  and `restore --status` and `doctor` reported a lock held on a snapshot
+  that did not exist until `--unlock` cleared it by hand; an entry with
+  nothing in it, as a hand edit can leave, stayed the same way. After a
+  successful deletion the entry is now removed through the guarded
+  by-change writer, with a warning that names the pin when one was taken
+  after the read and quietly when the entry held nothing. The deletion
+  stands either way; an entry that cannot be removed is a warning that
+  says how to clear it (#127).
+
 ## [0.9.15] - 2026-10-19
 
 This release corrects four defects found after 0.9.14. Pins on the source
