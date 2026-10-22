@@ -1838,6 +1838,8 @@ class LocalLockManager(RemoteLockManager):
         """``bbng_judge``: the entry identifying this instance of the lock,
         and its age by this machine's clock -- which IS the target's clock
         here -- or None where no age can be read."""
+        from .. import __util__
+
         now = int(time.time())
 
         def age_of(name: str) -> Optional[int]:
@@ -1852,7 +1854,7 @@ class LocalLockManager(RemoteLockManager):
             return now - int(st.st_mtime)
 
         try:
-            entries = sorted(os.listdir(lock_fd))
+            entries = sorted(__util__.listdir_current(lock_fd))
         except OSError:
             entries = []
         owners = [
@@ -1871,9 +1873,11 @@ class LocalLockManager(RemoteLockManager):
 
     def _show(self, lock_fd: int) -> list[str]:
         """``bbng_show``: the holder's recorded details, one record a line."""
+        from .. import __util__
+
         lines = []
         try:
-            entries = sorted(os.listdir(lock_fd))
+            entries = sorted(__util__.listdir_current(lock_fd))
         except OSError:
             entries = []
         names = [n for n in entries if n.startswith(OWNER_PREFIX)] + [LEGACY_INFO_NAME]
@@ -1919,7 +1923,7 @@ class LocalLockManager(RemoteLockManager):
             with os.fdopen(fd, "wb") as f:
                 f.write(payload.encode("utf-8"))
             try:
-                entries = os.listdir(lock_fd)
+                entries = __util__.listdir_current(lock_fd)
             except OSError:
                 entries = []
             records = [

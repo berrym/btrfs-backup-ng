@@ -504,3 +504,103 @@ class TestTheRemoteBeatHasNoDeletionWindow:
         assert f"rm -f {holder}" not in script and f"rm -f '{holder}'" not in script, (
             "the record must never be removed on a beat (reopens a deletion window)"
         )
+
+
+# --------------------------------------- the listing sees what exists now
+
+
+def _fs_type(path: Path) -> str:
+    try:
+        out = subprocess.run(
+            ["stat", "-f", "-c", "%T", str(path)],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return ""
+    return out.stdout.strip()
+
+
+def _a_btrfs_dir() -> Path | None:
+    """A writable btrfs directory to exercise the real store on, or None.
+
+    pytest's ``tmp_path`` defaults to ``/tmp``, which is a tmpfs on many
+    machines and never shows the descriptor-snapshot this guards against, so
+    the store test below runs only where a btrfs scratch directory exists --
+    which is exactly where the tool is meant to run, and where the Fedora
+    build's ``%check`` found the regression.
+    """
+    for base in (os.environ.get("BBNG_BTRFS_DIR"), "/var/tmp", "/tmp"):
+        if base and _fs_type(Path(base)) == "btrfs" and os.access(base, os.W_OK):
+            return Path(base)
+    return None
+
+
+class TestTheStoreListingSeesWhatExistsNow:
+    """A lock store decides it holds a lock by listing the lock directory and
+    finding its own record the only owner there. The directory is listed
+    through a descriptor the store already holds, and on btrfs (since kernel
+    6.6) a directory descriptor carries the index snapshot taken when it was
+    opened: a record written through that same descriptor is invisible to a
+    bare ``os.listdir(fd)`` until the position is rewound. A listing that does
+    not rewind first finds no records, concludes the lock could not be taken,
+    and every exclusive acquire on a local btrfs target reports it busy.
+    """
+
+    def test_listdir_current_rewinds_before_listing(self, tmp_path, monkeypatch):
+        """``listdir_current`` must see an entry created through the same
+        descriptor after it was opened. btrfs's snapshot is emulated here so
+        the guarantee is checked on any filesystem: drop the rewind and the
+        emulated descriptor stays stale and this fails."""
+        from btrfs_backup_ng import __util__
+
+        directory = tmp_path / "store"
+        directory.mkdir()
+        fd = os.open(str(directory), os.O_RDONLY | os.O_DIRECTORY)
+
+        real_listdir = os.listdir
+        real_lseek = os.lseek
+        # The descriptor shows the entries from when it was last positioned at
+        # the start; a seek-to-0 refreshes that view (btrfs_dir_llseek).
+        snapshot = {"names": real_listdir(fd)}
+
+        def fake_lseek(f, pos, how):
+            result = real_lseek(f, pos, how)
+            if f == fd and pos == 0 and how == os.SEEK_SET:
+                snapshot["names"] = real_listdir(fd)
+            return result
+
+        def fake_listdir(f):
+            return list(snapshot["names"]) if f == fd else real_listdir(f)
+
+        try:
+            # A record appears after the descriptor was opened, then the
+            # snapshot is frozen in place of the real listing for this fd.
+            os.close(os.open("owner.tok", os.O_WRONLY | os.O_CREAT, 0o600, dir_fd=fd))
+            monkeypatch.setattr(os, "lseek", fake_lseek)
+            monkeypatch.setattr(os, "listdir", fake_listdir)
+            assert "owner.tok" not in os.listdir(fd), "emulation is not stale"
+            assert "owner.tok" in __util__.listdir_current(fd)
+        finally:
+            os.close(fd)
+
+    def test_an_exclusive_acquire_succeeds_on_a_real_btrfs_target(self):
+        """The whole store, on real btrfs: an exclusive acquire must take the
+        lock, not report it busy. Skips where no btrfs scratch directory is
+        available (a tmpfs ``/tmp`` never shows the snapshot)."""
+        base = _a_btrfs_dir()
+        if base is None:
+            pytest.skip("no btrfs scratch directory available")
+        import uuid
+
+        store = base / f"bbng-store-{uuid.uuid4().hex}"
+        store.mkdir()
+        try:
+            manager = local_manager(store)
+            manager.acquire_once("target", "prune")
+            assert manager.live_lock_names() == {"target"}
+            manager.release("target")
+            assert manager.live_lock_names() == set()
+        finally:
+            subprocess.run(["rm", "-rf", str(store)], check=False)
