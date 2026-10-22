@@ -122,6 +122,15 @@ LEGACY_INFO_NAME = "info.json"
 #: within one threshold. Only then is it safe to delete someone else's file.
 DEAD_HOLDER_MULTIPLE = 2
 
+#: How many times a SHARED acquire re-runs its record script before reporting the
+#: store unavailable. A concurrent ``release_shared`` can ``rmdir`` the lock and
+#: holders directories between this script creating them and writing the record
+#: into them, so a single NOLOCKDIR/FAILED verdict can be a lost race rather than
+#: an unwritable store; the exclusive acquire already recovers from the same race
+#: by re-``mkdir``-ing within its own script. A couple of extra attempts cover it;
+#: a genuinely unwritable store still fails, just after this many cheap retries.
+SHARED_ACQUIRE_ATTEMPTS = 3
+
 
 # --------------------------------------------------------------- cleanup
 #
@@ -872,16 +881,33 @@ class RemoteLockManager:
         )
 
     def acquire_shared(self, name: str, lock_id: str, operation: str = "") -> str:
-        """Add this holder's pin to ``name``. Never blocks on another holder."""
-        rc, out, err = self._record_shared(name, lock_id, operation)
-        if _verdict(out).startswith("UNSAFE"):
-            raise RemoteLockUnavailable(unsafe_store_message(_verdict(out)))
-        if "NOLOCKDIR" in out and self._run_elevated is not None:
-            rc, out, err = self._run_elevated(
-                self._shared_record_script(name, lock_id, operation)
-            )
-        if _verdict(out).startswith("UNSAFE"):
-            raise RemoteLockUnavailable(unsafe_store_message(_verdict(out)))
+        """Add this holder's pin to ``name``. Never blocks on another holder.
+
+        A concurrent ``release_shared`` can ``rmdir`` the lock and holders
+        directories between this script creating them and writing the record
+        into them, so a NOLOCKDIR or FAILED verdict can be a lost race rather
+        than an unwritable store. Re-run the record script a bounded number of
+        times (``SHARED_ACQUIRE_ATTEMPTS``) -- it recreates the directories each
+        time -- before reporting the store unavailable, which is how the
+        exclusive acquire recovers from the same race within its own script. An
+        UNSAFE verdict is a safety refusal, never a race, and is raised at once.
+        """
+        rc, out, err = 0, "", ""
+        for _ in range(SHARED_ACQUIRE_ATTEMPTS):
+            rc, out, err = self._record_shared(name, lock_id, operation)
+            if _verdict(out).startswith("UNSAFE"):
+                raise RemoteLockUnavailable(unsafe_store_message(_verdict(out)))
+            if "NOLOCKDIR" in out and self._run_elevated is not None:
+                rc, out, err = self._run_elevated(
+                    self._shared_record_script(name, lock_id, operation)
+                )
+                if _verdict(out).startswith("UNSAFE"):
+                    raise RemoteLockUnavailable(unsafe_store_message(_verdict(out)))
+            if _verdict(out) == "ACQUIRED":
+                _register_for_cleanup(self, self._held_key(name, lock_id))
+                return "acquired"
+            # NOLOCKDIR / FAILED: a concurrent release may have removed the lock
+            # directories mid-write. Loop; the next run recreates and retries.
         if "NOLOCKDIR" in out:
             raise RemoteLockUnavailable(
                 f"the lock directory {self._root!r} on the target could not be "
@@ -889,13 +915,10 @@ class RemoteLockManager:
                 f"protect, so this path must be writable by the account running "
                 f"the backup, or that account must be able to elevate for it."
             )
-        if _verdict(out) != "ACQUIRED":
-            raise RemoteLockUnavailable(
-                f"could not record a shared lock on {name!r}: "
-                f"{err.strip() or out.strip() or f'exit {rc}'}"
-            )
-        _register_for_cleanup(self, self._held_key(name, lock_id))
-        return "acquired"
+        raise RemoteLockUnavailable(
+            f"could not record a shared lock on {name!r}: "
+            f"{err.strip() or out.strip() or f'exit {rc}'}"
+        )
 
     def release_shared(self, name: str, lock_id: str) -> None:
         """Drop THIS holder's pin. Others keep theirs.
