@@ -2003,8 +2003,9 @@ class RawEndpoint(Endpoint):
                     snapshot, "needed as the incremental parent of a kept stream"
                 )
                 continue
+            # The stream file IS the backup; removing it is the deletion. Only a
+            # failure HERE is a delete failure.
             try:
-                # Delete stream file
                 if snapshot.stream_path.exists():
                     snapshot.stream_path.unlink()
                     logger.info("Deleted stream file: %s", snapshot.stream_path)
@@ -2018,21 +2019,42 @@ class RawEndpoint(Endpoint):
                         snapshot.stream_path,
                     )
                     result.skip(snapshot, "stream file already absent")
-
-                # Delete metadata file
-                if snapshot.metadata_path.exists():
-                    snapshot.metadata_path.unlink()
-                    logger.debug("Deleted metadata file: %s", snapshot.metadata_path)
-
-                # Update cache
-                if self._cached_snapshots is not None:
-                    self._cached_snapshots = [
-                        s for s in self._cached_snapshots if s.name != snapshot.name
-                    ]
-
             except OSError as e:
                 logger.error("Failed to delete snapshot %s: %s", snapshot.name, e)
                 result.fail(snapshot, e)
+                # The stream is still there; leave its cache entry and sidecar
+                # alone and do NOT count it deleted.
+                continue
+
+            # The .meta sidecar is bookkeeping beside the stream, not the backup.
+            # Its removal is attempted in its OWN try/except: once the stream is
+            # gone the snapshot is deleted, so a sidecar that cannot be unlinked
+            # is a leftover to WARN about, never a second verdict. Folding it into
+            # the delete's try counted the SAME snapshot both deleted (stream
+            # unlinked) and failed (sidecar OSError), and skipped the cache drop.
+            if snapshot.metadata_path.exists():
+                try:
+                    snapshot.metadata_path.unlink()
+                    logger.debug("Deleted metadata file: %s", snapshot.metadata_path)
+                except OSError as e:
+                    logger.warning(
+                        "Removed the stream %s but could not remove its .meta "
+                        "sidecar %s: %s. The backup is gone; the orphaned sidecar "
+                        "is harmless -- a later listing refuses a sidecar whose "
+                        "stream is missing -- and can be removed by hand.",
+                        snapshot.name,
+                        snapshot.metadata_path,
+                        e,
+                    )
+
+            # The stream is gone (deleted here or already absent), so drop it from
+            # the cache regardless of how the sidecar fared -- otherwise every
+            # later list_snapshots() in this process reports a stream that is not
+            # there.
+            if self._cached_snapshots is not None:
+                self._cached_snapshots = [
+                    s for s in self._cached_snapshots if s.name != snapshot.name
+                ]
         return result
 
     def delete_snapshot(self, snapshot: RawSnapshot, **kwargs: Any) -> DeletionResult:
