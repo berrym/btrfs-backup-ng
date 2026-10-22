@@ -1597,6 +1597,30 @@ def open_regular_nofollow(
     return fd
 
 
+def listdir_current(dir_fd: int) -> list[str]:
+    """The names in the directory ``dir_fd`` as they exist now, including an
+    entry created through this very descriptor, or by another writer, since it
+    was opened.
+
+    ``os.listdir(fd)`` reads the directory through the descriptor's own
+    position, and on btrfs (since kernel 6.6) that descriptor holds a snapshot
+    of the directory index taken when it was opened, so a reader always
+    terminates: an entry created afterwards -- the record a holder has just
+    written through the same ``fd``, or one a concurrent holder added -- is
+    invisible until the position is rewound. On tmpfs, where the suite runs,
+    the first listing already reflects it, which is why a store exercised only
+    on ``/tmp`` never shows the gap and the suite stayed green. Seeking to the
+    start refreshes the snapshot (``btrfs_dir_llseek``), so the listing that
+    follows is of the directory's current contents on every filesystem. A lock
+    store cannot tell whether its own record is the only owner of a lock --
+    cannot be a lock at all -- unless this listing sees the records written
+    concurrently with it on the btrfs target the tool exists to back up.
+    """
+    with contextlib.suppress(OSError):
+        os.lseek(dir_fd, 0, os.SEEK_SET)
+    return os.listdir(dir_fd)
+
+
 def privileged_mkdir(
     path: str | Path,
     *,

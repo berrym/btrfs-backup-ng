@@ -5,6 +5,26 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.18] - 2026-10-22
+
+A bugfix release for a regression introduced in 0.9.17. **Do not use 0.9.17
+on a btrfs destination;** 0.9.18 carries both the GHSA-5xvm-66c9-p5ph security
+fix and this one.
+
+Fixed:
+
+- **An exclusive lock on a local btrfs destination no longer always reports
+  the lock busy.** On a btrfs target on a kernel 6.6 or newer, every exclusive
+  lock a local backup takes -- the one that serializes a receive, and the one
+  prune takes -- failed with `remote lock ... is busy`, so a receive or a
+  prune into a local btrfs location could not run. The cause: a directory
+  descriptor on btrfs lists only the entries that existed when it was opened
+  until it is rewound, and the lock store listed its own freshly written
+  record through such a descriptor and so never saw it. The store now rewinds
+  the descriptor before it lists. Shared snapshot pins, which never list a
+  directory, were unaffected, and the 0.9.17 `O_NOFOLLOW` protections are
+  intact.
+
 ## [0.9.17] - 2026-10-22
 
 A security release. The lock store created its directories and wrote its
