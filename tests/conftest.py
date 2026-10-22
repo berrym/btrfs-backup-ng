@@ -465,6 +465,20 @@ def heartbeats_end_with_the_test(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def the_umask_the_product_creates_under():
+    """The lock store refuses a directory its group or everyone can write
+    (``sshutil.lock.STORE_FUNCTIONS``). The product makes its own
+    directories 0755 whatever the umask, but a test that stands a store up
+    with a bare ``mkdir`` gets the umask's mode: 0775 under the 002 a Fedora
+    user's login shell sets, which that test would then be refused for while
+    passing under 022. The suite runs under the umask the product's own
+    directories end up with, so its verdicts do not depend on who runs it."""
+    old = os.umask(0o022)
+    yield
+    os.umask(old)
+
+
+@pytest.fixture(autouse=True)
 def exit_cleanups_end_with_the_test():
     """Run, when a test ends, every exit cleanup it registered.
 
