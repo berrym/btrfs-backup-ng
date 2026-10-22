@@ -39,7 +39,7 @@ Categories:
                output location.
     BELOW      creation strictly below a verified base: the primitive, or
                mkdtemp, or a remote ``mkdir`` inside an ``[ -d target ]`` guard.
-    PRIMITIVE  the two helpers in ``__util__`` that everything else uses.
+    PRIMITIVE  the helpers in ``__util__`` that everything else uses.
     MESSAGE    a string that mentions mkdir and is never run: error text.
 """
 
@@ -80,6 +80,9 @@ STATE, OUTPUT, BELOW, PRIMITIVE, MESSAGE = (
 REGISTRY: dict[str, tuple[str, ...]] = {
     # -- the primitives ------------------------------------------------------
     "__util__.py::create_below": (PRIMITIVE, PRIMITIVE),
+    # One component, made with mkdirat against a descriptor on its parent and
+    # never through a link: the lock store's primitive (``sshutil.lock``).
+    "__util__.py::open_directory_nofollow": (PRIMITIVE,),
     "__util__.py::privileged_mkdir": (PRIMITIVE, PRIMITIVE, PRIMITIVE),
     # -- below a verified base ------------------------------------------------
     "_legacy_main.py::prepare_source_endpoint": (BELOW, BELOW),
@@ -94,8 +97,11 @@ REGISTRY: dict[str, tuple[str, ...]] = {
     "core/operations.py::_snapper_prepare_slot": (BELOW,),
     "endpoint/common.py::Endpoint.snapshot": (BELOW,),
     "endpoint/local.py::LocalEndpoint._prepare": (BELOW,),
+    # The one ``mkdir`` every lock script makes a directory with
+    # (``STORE_FUNCTIONS``): a single component, called only inside an
+    # ``[ -d target ]`` guard, refusing a link where the component should be.
+    "sshutil/lock.py::<module>": (BELOW,),
     "sshutil/lock.py::RemoteLockManager._acquire_script": (BELOW,),
-    "sshutil/lock.py::RemoteLockManager._shared_record_script": (BELOW,),
     # The read-only probe makes one directory directly below a location that
     # `[ -d ]` has just confirmed, and removes it at once; a location that is
     # not there exits before it.
@@ -125,6 +131,10 @@ REGISTRY: dict[str, tuple[str, ...]] = {
     "core/state.py::OperationRecord.save": (STATE,),
     "core/state.py::OperationManager._ensure_state_dir": (STATE, STATE, STATE),
     "endpoint/common.py::_secure_lock_dir": (STATE,),
+    # The lock directory a local acquire takes: one component, mkdirat against
+    # a descriptor on a store that is already open, so no ancestor can be
+    # built; this program's own lock state, beside the backups it protects.
+    "sshutil/lock.py::LocalLockManager._mkdir": (STATE,),
     "sshutil/diagnose.py::test_btrfs_receive": (STATE,),
     "sshutil/master.py::ensure_operator_known_hosts": (STATE,),
     "sshutil/master.py::SSHMasterManager.__init__": (STATE,),

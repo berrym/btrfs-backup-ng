@@ -40,18 +40,34 @@ These commands run under sudo on a machine we are only visiting. Files are
 removed by name and the directory is then ``rmdir``ed, which fails harmlessly if
 anything unexpected is inside. A mis-constructed path can therefore delete
 nothing but the lock it created.
+
+Nothing is written through a link
+---------------------------------
+The store sits at a predictable path beside the backups, and the account
+writing it is often root. A symbolic link planted at that path, at a lock
+directory under it, or at a holder's record once made ``mkdir -p`` build the
+lock tree wherever the link pointed and ``>`` truncate whatever file it
+pointed at. Every creating operation now refuses a link at every component
+and refuses a store its group or everyone can write: from Python with
+descriptors on this machine (``LocalLockManager``), where the kernel does the
+refusing and no window exists, and in the shell on a remote
+(``STORE_FUNCTIONS``), where the refusal is a check followed by a use and the
+swap between the two is what remains.
 """
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import logging
 import os
 import shlex
+import stat
 import threading
+import time
 import uuid
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from pathlib import PurePosixPath
 from typing import Any, Callable, Iterator, Optional
 
@@ -381,6 +397,87 @@ MTIME_FUNCTIONS = (
     'if [ -n "$bbng_a" ] && [ -n "$bbng_n" ]; then echo $(( bbng_n - bbng_a )); fi; }; '
 )
 
+#: Shell defining the functions every lock script creates directories and
+#: records with. The scripts that write run under ``set -C`` as well.
+#:
+#: The records live beside the backups they protect, on a target this tool
+#: may be writing as root, in a directory another account may be able to
+#: write. A symbolic link planted at a predictable lock path -- the store, a
+#: lock directory under it, a holder's record -- turned ``mkdir -p`` into a
+#: tree built wherever the link pointed and ``>`` into a truncation of
+#: whatever file it pointed at. POSIX sh has no ``O_NOFOLLOW``, so the
+#: scripts refuse what they can detect and let the shell refuse the rest:
+#:
+#: ``bbng_mkdir DIR`` creates ONE path component with a plain ``mkdir``,
+#: which never creates through a link at DIR: 0 when it was made or a real
+#: directory already stood there, 2 when a symlink stands there, 1 when it
+#: could not be made. ``bbng_tree DIR...`` walks the components below the
+#: target in order, each checked by ``bbng_safe_dir`` before the next is
+#: made beneath it, and ends the script at the first symlink (``UNSAFE
+#: SYMLINK``). ``bbng_safe_dir DIR`` also refuses a directory its group or
+#: everyone may write (``UNSAFE WRITABLE``): any account able to write it
+#: could plant a link there. The permission bits are read from ``ls -ld``,
+#: whose first ten characters are the same under GNU, BSD and busybox, where
+#: ``stat`` would need a flavour probe of its own. ``bbng_safe_leaf FILE``
+#: refuses a record path at which a symlink (``UNSAFE SYMLINK``) or anything
+#: but a regular file (``UNSAFE NOTFILE``) stands. ``set -C`` (noclobber)
+#: then makes every ``>`` fail on a name that exists, a symlink included --
+#: verified under bash, dash and busybox ash -- so a link planted between the
+#: check and the write is refused by the shell rather than followed.
+#:
+#: What this cannot close: a link swapped in at a path COMPONENT after
+#: ``bbng_mkdir`` accepted it and before the next command used it. The shell
+#: resolves every path afresh at every command, and only ``openat`` and
+#: ``mkdirat`` against a held descriptor would pin the component. The local
+#: transport (``LocalLockManager``) does exactly that from Python and closes
+#: the shape fully; on a remote it is narrowed to that race. A symlink to a
+#: FIFO or a device, which noclobber opens, is likewise narrowed to the
+#: window after ``bbng_safe_leaf``. ``UNSAFE`` is never answered by
+#: elevating: a refusal that elevated would do as root the very write that
+#: was refused.
+STORE_FUNCTIONS = (
+    'bbng_mkdir() { if mkdir -m 755 "$1" 2>/dev/null; then return 0; fi; '
+    'if [ -L "$1" ]; then return 2; fi; if [ -d "$1" ]; then return 0; fi; return 1; }; '
+    'bbng_unsafe() { printf "UNSAFE %s %s" "$1" "$2" | tr -d "\\n"; echo; exit 0; }; '
+    'bbng_safe_dir() { if [ -L "$1" ]; then bbng_unsafe SYMLINK "$1"; fi; '
+    'bbng_p=$(ls -ld "$1" 2>/dev/null) || return 0; '
+    'case $bbng_p in ?????w*|????????w*) bbng_unsafe WRITABLE "$1";; esac; return 0; }; '
+    'bbng_tree() { for bbng_d in "$@"; do bbng_mkdir "$bbng_d"; '
+    'case $? in 0) bbng_safe_dir "$bbng_d";; 2) bbng_unsafe SYMLINK "$bbng_d";; '
+    "*) return 1;; esac; done; return 0; }; "
+    'bbng_safe_leaf() { if [ -L "$1" ]; then bbng_unsafe SYMLINK "$1"; fi; '
+    'if [ -e "$1" ] && [ ! -f "$1" ]; then bbng_unsafe NOTFILE "$1"; fi; return 0; }; '
+)
+
+
+def unsafe_store_message(verdict: str) -> str:
+    """What the operator is told when a lock script, or the local store,
+    answered ``UNSAFE KIND PATH`` (see ``STORE_FUNCTIONS``)."""
+    _, _, rest = verdict.partition(" ")
+    kind, _, path = rest.partition(" ")
+    path = path.strip() or "the lock store"
+    if kind == "SYMLINK":
+        return (
+            f"the lock store will not be used: {path!r} is a symbolic link. A "
+            f"link planted at a lock path sends the lock, and every file written "
+            f"for it, wherever the link points. Remove the link; whoever could "
+            f"place it should not be able to write there"
+        )
+    if kind == "WRITABLE":
+        return (
+            f"the lock store will not be used: {path!r} can be written by its "
+            f"group or by everyone. Any account that can write a lock directory "
+            f"can plant a link that redirects a lock, so the directory must be "
+            f"writable by its owner alone (chmod go-w {shlex.quote(path)})"
+        )
+    if kind == "NOTFILE":
+        return (
+            f"the lock store will not be used: {path!r} is not a regular file. "
+            f"A FIFO, device or socket standing where a lock record belongs is "
+            f"refused rather than written to"
+        )
+    return f"the lock store will not be used: {verdict.strip()}"
+
 
 def csh_unsafe(script: str) -> list[str]:
     """The fragments of ``script`` a csh or tcsh login shell would misread.
@@ -451,6 +548,7 @@ class RemoteLockManager:
         pins the file lists (``holders_beside``)."""
         self._run = run_remote
         self._target = str(target_path).rstrip("/") or "/"
+        self._dir_name = dir_name
         self._root = f"{self._target}/{dir_name}"
         self._heartbeat_interval = heartbeat_interval
         self._stale_after = stale_after
@@ -505,8 +603,8 @@ class RemoteLockManager:
             f"elif [ -f {hb} ]; then bbng_key={hb}; AGE=$(bbng_age {hb}); "
             f"else AGE=$(bbng_age {lock}); fi; return 0; }}; "
             f"bbng_show() {{ for bbng_f in {lock}/{OWNER_PREFIX}*; do "
-            '[ -f "$bbng_f" ] && cat "$bbng_f" 2>/dev/null && echo; done; '
-            f"[ -f {info} ] && cat {info} 2>/dev/null; return 0; }}; "
+            '[ ! -L "$bbng_f" ] && [ -f "$bbng_f" ] && cat "$bbng_f" 2>/dev/null && echo; done; '
+            f"[ ! -L {info} ] && [ -f {info} ] && cat {info} 2>/dev/null; return 0; }}; "
         )
 
     def _acquire_script(self, name: str, payload: str, token: str) -> str:
@@ -553,6 +651,14 @@ class RemoteLockManager:
         What remains is the lease assumption every such lock rests on: a
         holder that stops refreshing for longer than the stale threshold has
         lost the lock, even if it wakes later still believing it holds it.
+
+        Nothing here is created through a symbolic link (``STORE_FUNCTIONS``):
+        the store is made one component at a time and refused where a link
+        or a group- or world-writable directory stands, a link at the lock
+        path -- which ``mkdir`` refuses to create through, so the failed
+        ``mkdir`` is where it is seen -- is refused rather than judged, and
+        the record is written under ``set -C``. Still one script: the
+        checks are added inside it, not as round trips before it.
         """
         lock = shlex.quote(self._lock_dir(name))
         root = shlex.quote(self._root)
@@ -562,8 +668,16 @@ class RemoteLockManager:
         target = shlex.quote(self._target)
         body = shlex.quote(csh_safe_text(payload))
         return (
-            self._exclusive_functions(name) + "bbng_take() { "
-            f"if printf '%s' {body} > {owner} 2>/dev/null; then "
+            "set -C; "
+            + self._exclusive_functions(name)
+            + STORE_FUNCTIONS
+            + "bbng_take() { "
+            # A link inside the directory this holder has just created can
+            # only have been planted by an account able to write the store;
+            # a record written through it would land wherever it points.
+            f"if [ -L {owner} ] || [ -L {hb} ]; then rmdir {lock} 2>/dev/null; "
+            f"bbng_unsafe SYMLINK {lock}; fi; "
+            f"if printf '%s' {body} 2>/dev/null > {owner}; then "
             "bbng_c=0; "
             f'for bbng_f in {lock}/{OWNER_PREFIX}*; do [ -f "$bbng_f" ] && bbng_c=$((bbng_c + 1)); done; '
             f'if [ "$bbng_c" -eq 1 ]; then touch {hb} 2>/dev/null; echo "$1"; return 0; fi; '
@@ -577,9 +691,15 @@ class RemoteLockManager:
             # unmounted destination rebuilt on the root filesystem by a lock
             # acquisition). A missing target therefore falls through to the
             # NOLOCKDIR verdict below, which callers report distinctly.
-            f"if [ -d {target} ]; then mkdir -p {root} 2>/dev/null; fi; "
+            # The walk refuses the store before judging it writable: a store
+            # that is unsafe must never be answered by elevating into it.
+            f"if [ -d {target} ]; then bbng_tree {root}; fi; "
             f"if [ ! -d {root} ] || [ ! -w {root} ]; then echo NOLOCKDIR; exit 0; fi; "
             f"if mkdir {lock} 2>/dev/null; then bbng_take ACQUIRED; exit 0; fi; "
+            # ``mkdir`` refused to create through a link at the lock path;
+            # judging what it points at would read, and could break, some
+            # other lock.
+            f"if [ -L {lock} ]; then bbng_unsafe SYMLINK {lock}; fi; "
             # The mkdir failed with no lock there: the holder released in
             # between (take it now), or the directory cannot be made at all
             # (a full or read-only filesystem, a quota) -- which is not
@@ -630,18 +750,10 @@ class RemoteLockManager:
     def _holder_file(self, name: str, lock_id: str) -> str:
         return f"{self._holders_dir(name)}/{encode_name(str(lock_id))}"
 
-    def _shared_record_script(self, name: str, lock_id: str, operation: str) -> str:
-        """The script that writes this holder's record of its pin on ``name``.
-
-        Run by ``acquire_shared`` to take the pin and by the pin's heartbeat
-        to keep it: the beat writes the record again, whole, so a record
-        removed from under a live holder (``restore --unlock`` run during a
-        restore, a sweep after a long stall) returns with its identity and
-        inside its directories, rather than as an empty file ``touch`` left
-        where the file was, or as nothing at all once the directories had
-        been tidied away with the last record.
-        """
-        payload = json.dumps(
+    def _shared_payload(self, name: str, lock_id: str, operation: str) -> str:
+        """This holder's record of its pin on ``name``: what every writer of
+        a shared record, shell or local, puts in the file."""
+        return json.dumps(
             {
                 # The lock's REAL name, because the directory holding it carries
                 # an encoded one. Identity lives here; the filename is only a
@@ -654,29 +766,122 @@ class RemoteLockManager:
                 "shared": True,
             }
         )
+
+    def _shared_record_script(self, name: str, lock_id: str, operation: str) -> str:
+        """The script that writes this holder's record of its pin on ``name``.
+
+        Run by ``acquire_shared`` to take the pin and by the pin's heartbeat
+        to keep it: the beat writes the record again, whole, so a record
+        removed from under a live holder (``restore --unlock`` run during a
+        restore, a sweep after a long stall) returns with its identity and
+        inside its directories, rather than as an empty file ``touch`` left
+        where the file was, or as nothing at all once the directories had
+        been tidied away with the last record.
+
+        The directories are made one component at a time and the record is
+        written under ``set -C`` (``STORE_FUNCTIONS``). The first acquire
+        creates a record that does not exist; the ``>`` fails on one that
+        does, a link included. Every later beat only refreshes the mtime of
+        the record already there, in place with ``touch -c``, so the record
+        is never removed and a listing by a prune can never fall in a window
+        where a live holder has no record. A record removed from under a
+        live holder (``restore --unlock`` during a restore, a sweep after a
+        long stall) is written again whole on the next beat, so the pin
+        comes back with its identity and inside its directories.
+        ``bbng_safe_leaf`` refuses a link or a non-regular file at the name
+        before either path, so neither ``touch`` nor ``>`` follows one; the
+        residual the function block describes is a link swapped in between
+        that check and the write that points at a FIFO or a device.
+        """
+        body = shlex.quote(
+            csh_safe_text(self._shared_payload(name, lock_id, operation))
+        )
         root = shlex.quote(self._root)
         target = shlex.quote(self._target)
+        lock = shlex.quote(self._lock_dir(name))
         holders = shlex.quote(self._holders_dir(name))
         holder = shlex.quote(self._holder_file(name, lock_id))
         return (
+            "set -C; "
+            + STORE_FUNCTIONS
             # Same rule as acquisition: create only below an existing target,
-            # never the target itself (mkdir -p would build every component).
-            f"if [ -d {target} ]; then mkdir -p {holders} 2>/dev/null; fi; "
+            # never the target itself: one component at a time, none through
+            # a link, and each refused -- as a link, or as a directory others
+            # can write -- before the next is made under it and before any
+            # NOLOCKDIR verdict could elevate into it.
+            + f"if [ -d {target} ]; then bbng_tree {root} {lock} {holders}; fi; "
             # Reported distinctly from contention: a bare mkdir failure looks
             # exactly like losing a race, and sends an operator hunting for a
             # competing process that does not exist.
             f"if [ ! -d {root} ] || [ ! -d {holders} ] || [ ! -w {holders} ]; then "
             f"  echo NOLOCKDIR; exit 0; fi; "
-            f"printf '%s' {shlex.quote(csh_safe_text(payload))} > {holder} 2>/dev/null "
-            f"&& echo ACQUIRED || echo FAILED"
+            f"bbng_safe_leaf {holder}; "
+            # stderr is silenced before ``>`` is opened: a refusal of the
+            # write is a verdict, not a message for the caller's stderr.
+            # The record exists on every beat after the first. Refresh its
+            # mtime in place with ``touch -c`` -- never removing it -- so a
+            # listing by a prune can never fall in a window where a live
+            # holder has no record. ``bbng_safe_leaf`` has already refused a
+            # link or a non-regular file at this name, so ``[ -f ]`` is
+            # absent-or-regular; absent (the first acquire, or a record swept
+            # from under a live holder) it is written whole under noclobber,
+            # which is how a removed pin comes back.
+            f"if [ -f {holder} ]; then touch -c {holder} 2>/dev/null "
+            f"&& echo ACQUIRED || echo FAILED; "
+            f"else printf '%s' {body} 2>/dev/null > {holder} "
+            f"&& echo ACQUIRED || echo FAILED; fi"
+        )
+
+    # -------------------------------------------------- the creating writes
+    #
+    # The three operations that CREATE on the target -- the exclusive
+    # acquire, the shared record (the acquire and every beat) and the
+    # exclusive beat -- go through these, so a manager over a location on
+    # this machine can do them with descriptors (``LocalLockManager``) while
+    # everything else, and the elevated retry, runs the scripts. Each returns
+    # ``(returncode, stdout, stderr)`` with the script's own verdict words.
+
+    def _record_exclusive(
+        self, name: str, payload: str, token: str
+    ) -> tuple[int, str, str]:
+        return self._run(self._acquire_script(name, payload, token))
+
+    def _record_shared(
+        self, name: str, lock_id: str, operation: str
+    ) -> tuple[int, str, str]:
+        return self._run(self._shared_record_script(name, lock_id, operation))
+
+    def _refresh_exclusive(self, name: str) -> tuple[int, str, str]:
+        return self._run(self._refresh_script(name))
+
+    def _refresh_script(self, name: str) -> str:
+        """The exclusive beat: ``touch -c`` of the holder's ``owner.<token>``
+        file and the ``heartbeat`` beside it. ``touch`` refreshes whatever a
+        link points at, so a link at either name is refused first."""
+        with self._state_lock:
+            token = self._tokens.get(name, "")
+        files = [f"{self._lock_dir(name)}/{HEARTBEAT_NAME}"]
+        if token:
+            files.insert(0, self._owner_file(name, token))
+        quoted = [shlex.quote(f) for f in files]
+        return (
+            STORE_FUNCTIONS
+            + "".join(f"bbng_safe_leaf {q}; " for q in quoted)
+            + f"touch -c {' '.join(quoted)} 2>/dev/null "
+            f"&& echo REFRESHED || echo UNWRITABLE; exit 0"
         )
 
     def acquire_shared(self, name: str, lock_id: str, operation: str = "") -> str:
         """Add this holder's pin to ``name``. Never blocks on another holder."""
-        script = self._shared_record_script(name, lock_id, operation)
-        rc, out, err = self._run(script)
+        rc, out, err = self._record_shared(name, lock_id, operation)
+        if _verdict(out).startswith("UNSAFE"):
+            raise RemoteLockUnavailable(unsafe_store_message(_verdict(out)))
         if "NOLOCKDIR" in out and self._run_elevated is not None:
-            rc, out, err = self._run_elevated(script)
+            rc, out, err = self._run_elevated(
+                self._shared_record_script(name, lock_id, operation)
+            )
+        if _verdict(out).startswith("UNSAFE"):
+            raise RemoteLockUnavailable(unsafe_store_message(_verdict(out)))
         if "NOLOCKDIR" in out:
             raise RemoteLockUnavailable(
                 f"the lock directory {self._root!r} on the target could not be "
@@ -727,8 +932,7 @@ class RemoteLockManager:
         """Pin ``name`` and keep the pin alive until ``release_shared``."""
         mode = self.acquire_shared(name, lock_id, operation)
         self._start_heartbeat(
-            self._held_key(name, lock_id),
-            self._shared_record_script(name, lock_id, operation),
+            self._held_key(name, lock_id), shared=(name, lock_id, operation)
         )
         return mode
 
@@ -769,13 +973,17 @@ class RemoteLockManager:
                 "token": token,
             }
         )
-        script = self._acquire_script(name, payload, token)
-        rc, out, err = self._run(script)
+        rc, out, err = self._record_exclusive(name, payload, token)
         if _verdict(out) == "NOLOCKDIR" and self._run_elevated is not None:
             # Backup destinations are usually root-owned, so the unprivileged
             # attempt failing is the ordinary case rather than an error.
-            rc, out, err = self._run_elevated(script)
+            rc, out, err = self._run_elevated(
+                self._acquire_script(name, payload, token)
+            )
         verdict = _verdict(out)
+        if verdict.startswith("UNSAFE"):
+            # Never elevated: the refusal is about the store, not the account.
+            raise RemoteLockUnavailable(unsafe_store_message(verdict))
         if verdict == "NOLOCKDIR":
             raise RemoteLockUnavailable(
                 f"the lock directory {self._root!r} on the target could not be "
@@ -1006,18 +1214,18 @@ class RemoteLockManager:
             f'    if [ ! -r "$d/{holders_dir}" ] || [ ! -x "$d/{holders_dir}" ]; then '
             f'      printf "U %s\\n" "$n"; continue; fi; '
             f'    for h in "$d"/{holders_dir}/*; do '
-            f'      [ -f "$h" ] || continue; '
+            f'      if [ -L "$h" ] || [ ! -f "$h" ]; then continue; fi; '
             f'      m=$(bbng_mtime "$h"); '
             f'      printf "H %s %s %s " "$n" "${{m:-?}}" "$(basename "$h")"; '
             f'      cat "$h" 2>/dev/null; printf "\\n"; '
             f"    done; "
             f"  else "
-            f'    k=; for f in "$d"/{OWNER_PREFIX}*; do [ -f "$f" ] && k=$f; done; '
+            f'    k=; for f in "$d"/{OWNER_PREFIX}*; do [ -f "$f" ] && [ ! -L "$f" ] && k=$f; done; '
             f'    if [ -n "$k" ]; then m=$(bbng_mtime "$k"); '
             f'    else k="$d/{LEGACY_INFO_NAME}"; m=$(bbng_mtime "$d/{HEARTBEAT_NAME}"); '
             f'      [ -n "$m" ] || m=$(bbng_mtime "$d"); fi; '
             f'    printf "X %s %s - " "$n" "${{m:-?}}"; '
-            f'    cat "$k" 2>/dev/null; printf "\\n"; '
+            f'    [ ! -L "$k" ] && cat "$k" 2>/dev/null; printf "\\n"; '
             f"  fi; "
             f"done 2>/dev/null; exit 0"
         )
@@ -1181,17 +1389,20 @@ class RemoteLockManager:
 
     # ------------------------------------------------------------- heartbeat
 
-    def _start_heartbeat(self, key: str, record: Optional[str] = None) -> None:
+    def _start_heartbeat(
+        self, key: str, shared: Optional[tuple[str, str, str]] = None
+    ) -> None:
         """Refresh the holder's record until stopped. ``key`` identifies it.
 
-        For a shared pin ``record`` is the script that writes this holder's
-        own record (``_shared_record_script``), run again at every beat, so
-        holders of the same snapshot keep their pins alive independently and
-        a record removed from under a live holder comes back whole. For an
-        exclusive lock (no ``record``) the beat is a ``touch -c`` of the
-        holder's ``owner.<token>`` file and the ``heartbeat`` beside it: a
-        holder whose lock was broken while it was stalled must not recreate
-        its record inside the next holder's lock.
+        For a shared pin ``shared`` is ``(name, lock id, operation)``, and
+        every beat writes this holder's own record again
+        (``_record_shared``), so holders of the same snapshot keep their pins
+        alive independently and a record removed from under a live holder
+        comes back whole. For an exclusive lock (no ``shared``) the beat is a
+        ``touch -c`` of the holder's ``owner.<token>`` file and the
+        ``heartbeat`` beside it (``_refresh_exclusive``): a holder whose lock
+        was broken while it was stalled must not recreate its record inside
+        the next holder's lock.
 
         A beat elevates as the acquire did. The acquire runs unprivileged
         first and elevates when the lock directory cannot be created or
@@ -1200,26 +1411,30 @@ class RemoteLockManager:
         not refresh it, so the pin went stale after ``stale_after`` seconds
         while its holder was still at work, and an exclusive lock could be
         broken under a running operation. A beat whose verdict says it
-        could not write is run again elevated, with the same runner.
+        could not write is run again elevated, with the same runner. A beat
+        the store refused as unsafe is never elevated (``STORE_FUNCTIONS``):
+        it is logged, and the record goes unrefreshed, which is the truth
+        about a store that cannot safely be written.
         """
         stop = threading.Event()
-        if record is not None:
-            command = record
-        else:
-            with self._state_lock:
-                token = self._tokens.get(key, "")
-            files = [f"{self._lock_dir(key)}/{HEARTBEAT_NAME}"]
-            if token:
-                files.insert(0, self._owner_file(key, token))
-            command = (
-                f"touch -c {' '.join(shlex.quote(f) for f in files)} 2>/dev/null "
-                f"&& echo REFRESHED || echo UNWRITABLE; exit 0"
-            )
 
         def beat_once() -> None:
-            _rc, out, _err = self._run(command)
+            if shared is not None:
+                _rc, out, _err = self._record_shared(*shared)
+                command = self._shared_record_script(*shared)
+            else:
+                _rc, out, _err = self._refresh_exclusive(key)
+                command = self._refresh_script(key)
+            verdict = _verdict(out)
+            if verdict.startswith("UNSAFE"):
+                logger.warning(
+                    "The lock record for %r was not refreshed: %s",
+                    key,
+                    unsafe_store_message(verdict),
+                )
+                return
             if (
-                _verdict(out) not in ("ACQUIRED", "REFRESHED")
+                verdict not in ("ACQUIRED", "REFRESHED")
                 and self._run_elevated is not None
             ):
                 self._run_elevated(command)
@@ -1395,16 +1610,444 @@ def release_persisted_locks(
     manager.sweep_dead_holders()
 
 
+class _StoreVerdict(Exception):
+    """A verdict line reached before the operation could finish: ``NOLOCKDIR``
+    (with the errno that said so), or ``UNSAFE KIND PATH``."""
+
+    def __init__(self, line: str, error: Optional[int] = None) -> None:
+        super().__init__(line)
+        self.line = line
+        self.errno = error
+
+
+def _unsafe(kind: str, path: str) -> _StoreVerdict:
+    return _StoreVerdict(f"UNSAFE {kind} {path}".replace("\n", ""))
+
+
+@contextmanager
+def _closing(fd: int) -> Iterator[int]:
+    try:
+        yield fd
+    finally:
+        os.close(fd)
+
+
+def _writable(dir_fd: int) -> bool:
+    """``[ -w DIR ]`` for the directory ``dir_fd`` is open on."""
+    return os.access(
+        ".",
+        os.W_OK,
+        dir_fd=dir_fd,
+        effective_ids=os.access in os.supports_effective_ids,
+    )
+
+
+class LocalLockManager(RemoteLockManager):
+    """A lock manager over a location on THIS machine.
+
+    The protocol is the remote one, and most of it runs here exactly as it
+    runs on a remote -- through ``sh`` -- so the pin a local run takes is the
+    pin an ssh:// prune reads, and the other way round (``local_manager``).
+    The three operations that CREATE on the target -- the exclusive acquire,
+    the shared record and the exclusive beat -- are done from Python with
+    descriptors instead: ``sh`` cannot refuse to follow a symbolic link, and
+    a link planted in a store this tool may be writing as root turned a lock
+    into a tree built, or a file truncated, wherever the link pointed
+    (``STORE_FUNCTIONS`` says what the shell can and cannot refuse). Each
+    component below the target is created or opened relative to the
+    descriptor of the one above with ``O_NOFOLLOW``, and each record with
+    ``O_NOFOLLOW`` -- ``O_EXCL`` where the record is new -- so there is no
+    window between the check and the use: what is used is the descriptor,
+    and a link at any component fails the open in the kernel. A store its
+    group or everyone can write is refused outright.
+
+    The verdicts are the scripts' own words, so the callers that read them,
+    and the elevated retry -- the hardened script through ``sudo -n sh -c``
+    when a root-owned store refuses the unprivileged attempt -- are the same
+    code for both transports. ``UNSAFE`` is never retried elevated.
+    """
+
+    # ----------------------------------------------------------- the store
+
+    def _open_store(self, *, create: bool) -> int:
+        """A descriptor on this manager's store directory, made below the
+        target when ``create``, each component refused where a link stands.
+
+        ``NOLOCKDIR`` when the target is missing or the store cannot be made
+        or entered -- the errno travels, so a beat can tell a store that is
+        not there from one it may not enter -- and ``UNSAFE`` when a
+        component is a link or the store is writable by its group or by
+        everyone. The target itself is opened as the operator named it; the
+        components below it are what another account could plant.
+        """
+        try:
+            fd = os.open(self._target, os.O_RDONLY | os.O_DIRECTORY)
+        except OSError as e:
+            raise _StoreVerdict("NOLOCKDIR", e.errno) from None
+        path = self._target
+        for component in (c for c in self._dir_name.split("/") if c):
+            path = f"{path}/{component}"
+            fd = self._open_below(fd, component, path, create=create)
+        return fd
+
+    @classmethod
+    def _open_below(cls, parent_fd: int, name: str, path: str, *, create: bool) -> int:
+        """A descriptor on ``name`` under ``parent_fd``, which is closed:
+        refused where a link stands, and refused -- once opened -- where its
+        group or everyone could write it, before anything is made or
+        written beneath it."""
+        from .. import __util__
+
+        try:
+            fd = __util__.open_directory_nofollow(name, dir_fd=parent_fd, create=create)
+        except OSError as e:
+            if e.errno == errno.ELOOP:
+                raise _unsafe("SYMLINK", path) from None
+            raise _StoreVerdict("NOLOCKDIR", e.errno) from None
+        finally:
+            os.close(parent_fd)
+        try:
+            cls._refuse_writable(fd, path)
+        except BaseException:
+            os.close(fd)
+            raise
+        return fd
+
+    @staticmethod
+    def _refuse_writable(dir_fd: int, path: str) -> None:
+        if os.fstat(dir_fd).st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+            raise _unsafe("WRITABLE", path)
+
+    # ------------------------------------------------- the exclusive acquire
+
+    def _record_exclusive(
+        self, name: str, payload: str, token: str
+    ) -> tuple[int, str, str]:
+        try:
+            lines = self._acquire_here(name, payload, token)
+        except _StoreVerdict as v:
+            lines = [v.line]
+        return 0, "\n".join(lines) + "\n", ""
+
+    def _acquire_here(self, name: str, payload: str, token: str) -> list[str]:
+        """``_acquire_script``, step for step, against descriptors. The lock
+        directory is still taken by ``mkdir`` -- ``mkdirat`` here -- and the
+        break still removes the one entry that identifies the instance judged
+        stale, so the one-winner argument in that docstring is unchanged."""
+        from .. import __util__
+
+        lock_name = f"{encode_name(name)}.lock"
+        lock_path = self._lock_dir(name)
+        with _closing(self._open_store(create=True)) as root_fd:
+            if not _writable(root_fd):
+                return ["NOLOCKDIR"]
+            if self._mkdir(root_fd, lock_name, lock_path):
+                return self._take(
+                    root_fd, lock_name, lock_path, token, payload, "ACQUIRED"
+                )
+            try:
+                lock_fd = __util__.open_directory_nofollow(lock_name, dir_fd=root_fd)
+            except FileNotFoundError:
+                # The holder released between the mkdir and this: take it.
+                if self._mkdir(root_fd, lock_name, lock_path):
+                    return self._take(
+                        root_fd, lock_name, lock_path, token, payload, "ACQUIRED"
+                    )
+                try:
+                    lock_fd = __util__.open_directory_nofollow(
+                        lock_name, dir_fd=root_fd
+                    )
+                except OSError as e:
+                    return [f"NOLOCK {lock_path}: {e.strerror}"]
+            except OSError as e:
+                if e.errno == errno.ELOOP:
+                    # ``mkdir`` refused to create through a link at the lock
+                    # path; judging what it points at would read, and could
+                    # break, some other lock.
+                    raise _unsafe("SYMLINK", lock_path) from None
+                return [f"NOLOCK {lock_path}: {e.strerror}"]
+            with _closing(lock_fd):
+                key, age = self._judge(lock_fd)
+                if age is None:
+                    # No readable age: a lock that cannot be judged is never
+                    # broken, unless it is gone.
+                    if self._entry_exists(root_fd, lock_name):
+                        return ["BUSY", *self._show(lock_fd)]
+                    if self._mkdir(root_fd, lock_name, lock_path, busy_on_failure=True):
+                        return self._take(
+                            root_fd, lock_name, lock_path, token, payload, "ACQUIRED"
+                        )
+                    return ["BUSY"]
+                if age <= self._stale_after:
+                    return ["BUSY", *self._show(lock_fd)]
+                # Stale. Remove the entry identifying the instance that was
+                # judged (see ``_acquire_script``); only one contender can.
+                if key is not None:
+                    try:
+                        os.unlink(key, dir_fd=lock_fd)
+                    except OSError:
+                        return ["BUSY"]
+                    for extra in (HEARTBEAT_NAME, LEGACY_INFO_NAME):
+                        with suppress(OSError):
+                            os.unlink(extra, dir_fd=lock_fd)
+            try:
+                os.rmdir(lock_name, dir_fd=root_fd)
+            except OSError:
+                return ["BUSY"]
+            if self._mkdir(root_fd, lock_name, lock_path, busy_on_failure=True):
+                return self._take(
+                    root_fd, lock_name, lock_path, token, payload, "ACQUIRED_STALE"
+                )
+            return ["BUSY"]
+
+    @staticmethod
+    def _mkdir(
+        root_fd: int, lock_name: str, lock_path: str, *, busy_on_failure: bool = False
+    ) -> bool:
+        """``mkdir`` of the lock directory: True when this call made it,
+        False when something already stands there. Any other refusal is not
+        contention: ``NOLOCK`` with the reason, or -- in the break, where the
+        script says BUSY -- False."""
+        try:
+            os.mkdir(lock_name, 0o755, dir_fd=root_fd)
+        except FileExistsError:
+            return False
+        except OSError as e:
+            if busy_on_failure:
+                return False
+            raise _StoreVerdict(f"NOLOCK {lock_path}: {e.strerror}") from None
+        return True
+
+    @staticmethod
+    def _entry_exists(dir_fd: int, name: str) -> bool:
+        try:
+            os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+        except OSError:
+            return False
+        return True
+
+    @staticmethod
+    def _is_regular(dir_fd: int, name: str) -> bool:
+        try:
+            st = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+        except OSError:
+            return False
+        return stat.S_ISREG(st.st_mode)
+
+    def _judge(self, lock_fd: int) -> tuple[Optional[str], Optional[int]]:
+        """``bbng_judge``: the entry identifying this instance of the lock,
+        and its age by this machine's clock -- which IS the target's clock
+        here -- or None where no age can be read."""
+        now = int(time.time())
+
+        def age_of(name: str) -> Optional[int]:
+            try:
+                st = (
+                    os.fstat(lock_fd)
+                    if name == "."
+                    else os.stat(name, dir_fd=lock_fd, follow_symlinks=False)
+                )
+            except OSError:
+                return None
+            return now - int(st.st_mtime)
+
+        try:
+            entries = sorted(os.listdir(lock_fd))
+        except OSError:
+            entries = []
+        owners = [
+            n
+            for n in entries
+            if n.startswith(OWNER_PREFIX) and self._is_regular(lock_fd, n)
+        ]
+        if owners:
+            return owners[-1], age_of(owners[-1])
+        if self._is_regular(lock_fd, LEGACY_INFO_NAME):
+            age = age_of(HEARTBEAT_NAME)
+            return LEGACY_INFO_NAME, age if age is not None else age_of(".")
+        if self._is_regular(lock_fd, HEARTBEAT_NAME):
+            return HEARTBEAT_NAME, age_of(HEARTBEAT_NAME)
+        return None, age_of(".")
+
+    def _show(self, lock_fd: int) -> list[str]:
+        """``bbng_show``: the holder's recorded details, one record a line."""
+        lines = []
+        try:
+            entries = sorted(os.listdir(lock_fd))
+        except OSError:
+            entries = []
+        names = [n for n in entries if n.startswith(OWNER_PREFIX)] + [LEGACY_INFO_NAME]
+        for name in names:
+            if not self._is_regular(lock_fd, name):
+                continue
+            try:
+                fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=lock_fd)
+            except OSError:
+                continue
+            with os.fdopen(fd, "rb") as f:
+                lines.append(f.read().decode("utf-8", errors="replace").strip())
+        return lines
+
+    def _take(
+        self,
+        root_fd: int,
+        lock_name: str,
+        lock_path: str,
+        token: str,
+        payload: str,
+        verdict: str,
+    ) -> list[str]:
+        """``bbng_take``: write this holder's record into the directory it
+        has just made, and report the lock taken only if that record is the
+        only one there."""
+        from .. import __util__
+
+        try:
+            lock_fd = __util__.open_directory_nofollow(lock_name, dir_fd=root_fd)
+        except OSError as e:
+            if e.errno == errno.ELOOP:
+                raise _unsafe("SYMLINK", lock_path) from None
+            return ["BUSY"]
+        with _closing(lock_fd):
+            owner = f"{OWNER_PREFIX}{token}"
+            try:
+                fd = __util__.open_regular_nofollow(
+                    owner, dir_fd=lock_fd, exclusive=True
+                )
+            except OSError:
+                return ["BUSY"]
+            with os.fdopen(fd, "wb") as f:
+                f.write(payload.encode("utf-8"))
+            try:
+                entries = os.listdir(lock_fd)
+            except OSError:
+                entries = []
+            records = [
+                n
+                for n in entries
+                if n.startswith(OWNER_PREFIX) and self._is_regular(lock_fd, n)
+            ]
+            if len(records) == 1:
+                with suppress(OSError):
+                    hb = __util__.open_regular_nofollow(HEARTBEAT_NAME, dir_fd=lock_fd)
+                    try:
+                        os.utime(hb)
+                    finally:
+                        os.close(hb)
+                return [verdict]
+            with suppress(OSError):
+                os.unlink(owner, dir_fd=lock_fd)
+        with suppress(OSError):
+            os.rmdir(lock_name, dir_fd=root_fd)
+        return ["BUSY"]
+
+    # ---------------------------------------------------- the shared record
+
+    def _record_shared(
+        self, name: str, lock_id: str, operation: str
+    ) -> tuple[int, str, str]:
+        try:
+            line = self._record_shared_here(name, lock_id, operation)
+        except _StoreVerdict as v:
+            line = v.line
+        return 0, line + "\n", ""
+
+    def _record_shared_here(self, name: str, lock_id: str, operation: str) -> str:
+        """``_shared_record_script`` against descriptors. The record is
+        opened ``O_NOFOLLOW`` and truncated in place -- it exists already at
+        every beat -- so unlike the shell's remove-and-recreate it is never
+        absent, and a planted link or FIFO fails the open in the kernel."""
+        from .. import __util__
+
+        payload = self._shared_payload(name, lock_id, operation)
+        holders_path = self._holders_dir(name)
+        holder_path = self._holder_file(name, lock_id)
+        fd = self._open_store(create=True)
+        fd = self._open_below(
+            fd, f"{encode_name(name)}.lock", self._lock_dir(name), create=True
+        )
+        fd = self._open_below(fd, HOLDERS_DIR_NAME, holders_path, create=True)
+        with _closing(fd) as holders_fd:
+            if not _writable(holders_fd):
+                return "NOLOCKDIR"
+            try:
+                record = __util__.open_regular_nofollow(
+                    encode_name(str(lock_id)), dir_fd=holders_fd
+                )
+            except OSError as e:
+                if e.errno == errno.ELOOP:
+                    raise _unsafe("SYMLINK", holder_path) from None
+                if e.errno in (errno.EEXIST, errno.ENXIO):
+                    raise _unsafe("NOTFILE", holder_path) from None
+                return "FAILED"
+            with os.fdopen(record, "wb") as f:
+                f.truncate(0)
+                f.write(payload.encode("utf-8"))
+            return "ACQUIRED"
+
+    # --------------------------------------------------- the exclusive beat
+
+    def _refresh_exclusive(self, name: str) -> tuple[int, str, str]:
+        try:
+            line = self._refresh_here(name)
+        except _StoreVerdict as v:
+            if v.line.startswith("UNSAFE"):
+                line = v.line
+            elif v.errno == errno.ENOENT:
+                # ``touch -c`` of a file that is not there: nothing to do.
+                line = "REFRESHED"
+            else:
+                line = "UNWRITABLE"
+        return 0, line + "\n", ""
+
+    def _refresh_here(self, name: str) -> str:
+        """``_refresh_script`` against descriptors: the mtime of this
+        holder's record and of the heartbeat beside it, refreshed through a
+        descriptor opened ``O_NOFOLLOW`` on each, never created."""
+        with self._state_lock:
+            token = self._tokens.get(name, "")
+        names = [HEARTBEAT_NAME]
+        if token:
+            names.insert(0, f"{OWNER_PREFIX}{token}")
+        fd = self._open_store(create=False)
+        fd = self._open_below(
+            fd, f"{encode_name(name)}.lock", self._lock_dir(name), create=False
+        )
+        with _closing(fd) as lock_fd:
+            for entry in names:
+                try:
+                    rfd = os.open(
+                        entry,
+                        os.O_WRONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+                        dir_fd=lock_fd,
+                    )
+                except FileNotFoundError:
+                    continue
+                except OSError as e:
+                    if e.errno == errno.ELOOP:
+                        raise _unsafe(
+                            "SYMLINK", f"{self._lock_dir(name)}/{entry}"
+                        ) from None
+                    return "UNWRITABLE"
+                with _closing(rfd):
+                    if not stat.S_ISREG(os.fstat(rfd).st_mode):
+                        raise _unsafe("NOTFILE", f"{self._lock_dir(name)}/{entry}")
+                    os.utime(rfd)
+        return "REFRESHED"
+
+
 def local_manager(
     target_path: str | os.PathLike, *, dir_name: str = LOCK_DIR_NAME
 ) -> "RemoteLockManager":
     """A lock manager over a location on this machine, running the same
-    scripts an ssh endpoint runs on its remote, through ``sh``.
+    scripts an ssh endpoint runs on its remote, through ``sh`` -- except
+    the writes that create, which it does with descriptors
+    (``LocalLockManager``).
 
     Elevation mirrors the ssh endpoint's: the unprivileged attempt first,
     ``sudo -n sh -c`` only when a directory or record could not be created
     or written -- a mirror received under ``--ssh-sudo`` is root-owned, and
-    its lock directory with it.
+    its lock directory with it. What runs elevated is the hardened script.
     """
     import shlex
     import socket as _socket
@@ -1427,7 +2070,7 @@ def local_manager(
             return 127, "", str(e)
         return run(f"{sudo} sh -c {shlex.quote(script)}".lstrip())
 
-    return RemoteLockManager(
+    return LocalLockManager(
         run,
         str(target_path),
         hostname=_socket.gethostname(),

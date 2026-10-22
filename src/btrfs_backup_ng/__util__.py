@@ -1514,6 +1514,89 @@ def create_below(
     return current
 
 
+def open_directory_nofollow(
+    name: str, *, dir_fd: int | None = None, create: bool = False, mode: int = 0o755
+) -> int:
+    """A descriptor on the directory ``name``, looked up relative to ``dir_fd``
+    without following a symbolic link at ``name``.
+
+    The descriptor-relative counterpart of ``create_below`` for a directory
+    whose parent another account may be able to write: a lock store, and the
+    lock and holder directories under it. A path-based ``mkdir`` or
+    ``is_dir`` on such a directory follows a symlink planted at any component
+    and builds or writes the tree wherever the link points -- a lock
+    silently defeated, root-owned files created at a path the planter chose.
+    Resolving each component against the descriptor of the one above with
+    ``O_NOFOLLOW|O_DIRECTORY`` moves the check into the kernel's own lookup:
+    a symlink fails the open with ``ELOOP`` and nothing is created through
+    it, and there is no window between deciding a component is a real
+    directory and using it, because what is used is the descriptor, not the
+    name.
+
+    With ``create`` the directory is made first when absent (``mkdirat``,
+    which is atomic and never follows a link at ``name``); one that already
+    exists is opened as it is. ``mode`` is capped at ``0o755`` whatever the
+    caller passes: a directory writable by its group or by everyone is what
+    the lock store refuses to use (see ``sshutil.lock``), so none is ever
+    created that way here.
+
+    Raises ``OSError``: ``ELOOP`` for a symlink at ``name`` -- Linux reports
+    a link met under ``O_DIRECTORY|O_NOFOLLOW`` as ``ENOTDIR``, so that
+    answer is told apart from a plain file by an ``lstat`` of the name,
+    which is safe after the open has already refused -- ``ENOTDIR`` for a
+    file there, and whatever the kernel says otherwise.
+    """
+    if create:
+        with contextlib.suppress(FileExistsError):
+            os.mkdir(name, mode & 0o755, dir_fd=dir_fd)
+    try:
+        return os.open(
+            name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=dir_fd
+        )
+    except NotADirectoryError as e:
+        is_link = False
+        with contextlib.suppress(OSError):
+            is_link = stat_module.S_ISLNK(
+                os.stat(name, dir_fd=dir_fd, follow_symlinks=False).st_mode
+            )
+        if is_link:
+            raise OSError(errno.ELOOP, os.strerror(errno.ELOOP), name) from None
+        raise e
+
+
+def open_regular_nofollow(
+    name: str, *, dir_fd: int | None = None, exclusive: bool = False, mode: int = 0o600
+) -> int:
+    """A write descriptor on the regular file ``name``, relative to ``dir_fd``,
+    created at ``mode`` when absent, refusing anything planted in its place.
+
+    ``O_NOFOLLOW`` refuses a symlink (``ELOOP``), so a link planted at the
+    name cannot turn the write into a truncation of whatever it points at.
+    ``O_NONBLOCK`` makes a FIFO with no reader fail at once (``ENXIO``)
+    instead of blocking the open forever, and what did open is then checked
+    to be a regular file, because a FIFO that happened to have a reader, a
+    device or a socket must not be written as if it were a record; such a
+    file is refused with ``EEXIST``, the same answer ``O_EXCL`` gives for
+    anything in the way. With ``exclusive`` the file must not exist at all
+    (``O_EXCL``), which is how a record named by a fresh random token is
+    created; without it an existing regular file is opened for rewriting and
+    the caller truncates it -- the shape of a record its holder refreshes in
+    place. The descriptor is returned in blocking mode.
+    """
+    flags = os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK
+    if exclusive:
+        flags |= os.O_EXCL
+    fd = os.open(name, flags, mode, dir_fd=dir_fd)
+    try:
+        if not stat_module.S_ISREG(os.fstat(fd).st_mode):
+            raise OSError(errno.EEXIST, "not a regular file", name)
+        os.set_blocking(fd, True)
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
 def privileged_mkdir(
     path: str | Path,
     *,

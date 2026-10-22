@@ -5,6 +5,40 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.17] - UNRELEASED
+
+A security release. The lock store created its directories and wrote its
+holder records with shell operations that follow a symbolic link, and read
+those records the same way. On a backup location whose lock-store directory
+is writable by an account other than the one running the backup, a symlink
+planted in it could redirect those writes and reads. Run as root, the common
+case for a scheduled backup, this let a less-privileged local account steer a
+root write or read. See the security advisory for the full account.
+
+Security:
+
+- **The lock store no longer follows a symbolic link when it creates a
+  directory, writes a holder record, or reads one.** On this machine the
+  three operations that create under the store run against file descriptors
+  opened `O_NOFOLLOW`, so a link at any component fails in the kernel with no
+  window between the check and the use. On a remote target, where only POSIX
+  shell is available, each component is made with a plain `mkdir` and refused
+  where a link stands, records are written under `set -C`, and a record that
+  is a link or not a regular file is refused rather than followed or read.
+
+Breaking:
+
+- **A lock-store directory writable by its group or by everyone is now
+  refused.** Such a directory is the precondition for the attack above, so a
+  backup that would use it stops with an error naming the directory and the
+  remedy (`chmod go-w <path>`); pass `--skip-remote-lock` to proceed without
+  the pin at your own risk. New lock-store directories are created `0755`
+  regardless of the process umask. A store created by an earlier version
+  under a permissive umask (notably an interactive session on a distribution
+  that sets umask `002`) is mode `0775` and will be refused until its
+  permissions are tightened; a store created by a root-run timer or over ssh
+  is `0755` and is unaffected.
+
 ## [0.9.16] - 2026-10-20
 
 This release closes the lock rework begun in 0.9.15. Five defects in how
