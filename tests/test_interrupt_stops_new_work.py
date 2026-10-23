@@ -949,7 +949,7 @@ def _defaults() -> None:
 # watched the way the ssh endpoint watches its pipeline (a poll every 0.2s).
 # Only the endpoints, the planner and the verdict are stand-ins.
 _RUN = """
-import os, subprocess, sys, time
+import os, subprocess, sys, threading, time
 from btrfs_backup_ng import __util__, endpoint, lifecycle
 from btrfs_backup_ng.cli import run as run_cli
 from btrfs_backup_ng.core import operations, planning
@@ -957,6 +957,14 @@ from btrfs_backup_ng.endpoint.raw_metadata import StructureVerdict
 
 SLEEP = sys.argv[1]
 events = open("events", "a", buffering=1)
+
+# parallel_targets = 2, so two workers transfer s1 at once. On a loaded builder
+# the second worker can start seconds after the first; with a plain per-transfer
+# timer the first sleep could then end before the test's interrupt arrived, so
+# the signal caught only one live transfer (seen on a Koji x86 builder). The two
+# first-wave transfers rendezvous here, so both begin -- and the test sees both
+# "start" lines -- together, whatever the builder's scheduling.
+START_TOGETHER = threading.Barrier(2)
 
 class Snap:
     def __init__(self, name):
@@ -1001,6 +1009,11 @@ def choose_endpoint(path, kwargs, source=False):
     return Source() if source else Destination(os.path.basename(str(path)))
 
 def send(snapshot, destination, parent=None, options=None):
+    if snapshot.name == "s1":
+        try:
+            START_TOGETHER.wait(timeout=30)
+        except threading.BrokenBarrierError:
+            pass
     events.write(f"start {destination.label} {snapshot.name}\\n")
     with lifecycle.process_scope():
         child = lifecycle.track(subprocess.Popen(["sleep", SLEEP]))
