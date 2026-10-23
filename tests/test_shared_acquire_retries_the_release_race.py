@@ -85,19 +85,41 @@ def test_an_unsafe_verdict_is_raised_at_once_never_retried():
     assert calls["n"] == 1
 
 
-def test_real_churn_has_no_spurious_failures(tmp_path):
-    """Three holders churning acquire/release of one snapshot on a real store:
-    with the retry, the release-vs-acquire race no longer aborts an acquire."""
+def test_real_churn_stays_well_under_the_retry_bound(tmp_path):
+    """Three holders churning acquire/release of one snapshot on a real store.
+
+    Two assertions. The first -- no acquire failed -- is the behaviour, but it
+    goes flaky on a slow shared builder: a too-small bound (the 0.9.19 ppc64le
+    regression) can still pass it on a fast host and only fail under load. The
+    second does not depend on builder speed: it counts the attempts each acquire
+    actually needed and requires the bound to sit a wide margin above the worst
+    one. A bound near real contention fails it HERE, on an idle dev host, not
+    only on Koji.
+    """
     failures = []
+    worst = {"attempts": 0}
+    worst_lock = threading.Lock()
 
     def churn(lock_id):
         m = RemoteLockManager(_sh_run, str(tmp_path), hostname="h")
+        attempts = {"n": 0}
+        inner = m._record_shared
+
+        def counting(*a, **k):
+            attempts["n"] += 1
+            return inner(*a, **k)
+
+        m._record_shared = counting  # count attempts per acquire
         for _ in range(300):
+            attempts["n"] = 0
             try:
                 m.acquire_shared("snap-s", lock_id, "restore")
             except RemoteLockUnavailable as e:
                 failures.append((lock_id, str(e)))
                 continue
+            finally:
+                with worst_lock:
+                    worst["attempts"] = max(worst["attempts"], attempts["n"])
             m.release_shared("snap-s", lock_id)
 
     ts = [threading.Thread(target=churn, args=(f"restore:{k}",)) for k in range(3)]
@@ -107,3 +129,11 @@ def test_real_churn_has_no_spurious_failures(tmp_path):
         t.join()
 
     assert failures == [], f"spurious shared-acquire failures: {failures[:3]}"
+    # Host-independent guard: the worst acquire must stay a wide margin below the
+    # bound. With the margin at 10, bound 3 or 5 fails even on an idle host
+    # (churn routinely needs 2 attempts), while a loaded builder that needs a few
+    # more than this host still passes against a bound of 20.
+    assert worst["attempts"] <= SHARED_ACQUIRE_ATTEMPTS - 10, (
+        f"worst acquire needed {worst['attempts']} of {SHARED_ACQUIRE_ATTEMPTS} "
+        f"attempts; the bound is too close to real contention"
+    )
