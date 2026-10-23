@@ -62,6 +62,7 @@ import hashlib
 import json
 import logging
 import os
+import random
 import shlex
 import stat
 import threading
@@ -127,9 +128,20 @@ DEAD_HOLDER_MULTIPLE = 2
 #: holders directories between this script creating them and writing the record
 #: into them, so a single NOLOCKDIR/FAILED verdict can be a lost race rather than
 #: an unwritable store; the exclusive acquire already recovers from the same race
-#: by re-``mkdir``-ing within its own script. A couple of extra attempts cover it;
-#: a genuinely unwritable store still fails, just after this many cheap retries.
-SHARED_ACQUIRE_ATTEMPTS = 3
+#: by re-``mkdir``-ing within its own script.
+#:
+#: The bound sits well above what contention needs. Measured on x86_64 over
+#: 3 threads x 300 acquire/release rounds (900 acquires): idle, almost every
+#: acquire wins on the first attempt and none needs more than 2; with three test
+#: suites running at once, 3-8 acquires per 900 need a 4th attempt and the worst
+#: observed was 4. A slow builder -- the ppc64le Koji VMs where ``btrfs-backup-ng``
+#: 0.9.19 failed this with the bound at 3 -- widens the release-vs-acquire window
+#: per ``sh`` invocation, so the margin has to be generous. 20 is that margin (it
+#: is also the value Fedora carries as a 0.9.19 downstream patch). Each retry is
+#: one cheap shell script, and ``acquire_shared`` backs off a few milliseconds
+#: between attempts so starved contenders stop thrashing in lockstep; a genuinely
+#: unwritable store still fails, just after this many attempts rather than 3.
+SHARED_ACQUIRE_ATTEMPTS = 20
 
 
 # --------------------------------------------------------------- cleanup
@@ -893,7 +905,7 @@ class RemoteLockManager:
         UNSAFE verdict is a safety refusal, never a race, and is raised at once.
         """
         rc, out, err = 0, "", ""
-        for _ in range(SHARED_ACQUIRE_ATTEMPTS):
+        for attempt in range(SHARED_ACQUIRE_ATTEMPTS):
             rc, out, err = self._record_shared(name, lock_id, operation)
             if _verdict(out).startswith("UNSAFE"):
                 raise RemoteLockUnavailable(unsafe_store_message(_verdict(out)))
@@ -908,16 +920,29 @@ class RemoteLockManager:
                 return "acquired"
             # NOLOCKDIR / FAILED: a concurrent release may have removed the lock
             # directories mid-write. Loop; the next run recreates and retries.
-        if "NOLOCKDIR" in out:
-            raise RemoteLockUnavailable(
-                f"the lock directory {self._root!r} on the target could not be "
-                f"created or written to. Locks live beside the backups they "
-                f"protect, so this path must be writable by the account running "
-                f"the backup, or that account must be able to elevate for it."
-            )
+            # Back off a few milliseconds first, with jitter, so several starved
+            # contenders (a slow build VM running the churn under load) stop
+            # losing the race to one another in lockstep. Only between attempts:
+            # the first try pays nothing, and there is no sleep after the last.
+            if attempt + 1 < SHARED_ACQUIRE_ATTEMPTS:
+                time.sleep(min(0.005 * (attempt + 1), 0.03) + random.uniform(0, 0.005))
+        # Every attempt lost. On a writable store this is extreme contention on
+        # the release-vs-acquire race, not a broken store, so the message names
+        # that first and does not assert the path is unwritable -- 0.9.19 did,
+        # which sent operators of a perfectly writable store hunting a phantom
+        # permissions problem. Only the elevation hint stays tied to NOLOCKDIR,
+        # the one verdict an unwritable store actually produces.
+        detail = (
+            f"the lock directory {self._root!r} could not be created or written to"
+            if "NOLOCKDIR" in out
+            else (err.strip() or out.strip() or f"exit {rc}")
+        )
         raise RemoteLockUnavailable(
-            f"could not record a shared lock on {name!r}: "
-            f"{err.strip() or out.strip() or f'exit {rc}'}"
+            f"could not record a shared lock on {name!r} after "
+            f"{SHARED_ACQUIRE_ATTEMPTS} attempts ({detail}). On a writable store "
+            f"this means extreme contention on the lock directory; otherwise the "
+            f"path is not writable by the account running the backup, which must "
+            f"be able to write there (or to elevate for it)."
         )
 
     def release_shared(self, name: str, lock_id: str) -> None:

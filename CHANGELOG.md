@@ -5,6 +5,26 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.20] - 2026-10-22
+
+A follow-up to 0.9.19 fixing a regression in the shared lock store's retry
+bound that surfaced on slow package-build machines. There are no configuration
+or on-disk format changes, and no change to the lock store's failure policy.
+
+Fixed:
+
+- **A shared snapshot pin no longer fails spuriously under heavy contention on
+  a slow machine.** 0.9.19 made a shared acquire retry a lost
+  release-vs-acquire race but bounded it at three attempts -- enough on a fast
+  host, too few on a slow build VM, where three contenders churning one snapshot
+  could lose the race more than three times in a row and abort with "could not
+  lock ... refusing to continue" on a perfectly writable store. The bound is
+  raised well above what real contention needs, and the acquire now backs off a
+  few milliseconds, with jitter, between attempts so starved contenders stop
+  losing the race to one another in lockstep. When the retries are genuinely
+  exhausted, the message no longer asserts the store is unwritable: on a
+  writable store an exhaustion is contention, not a permissions problem.
+
 ## [0.9.19] - 2026-10-22
 
 A bugfix release hardening retention and the shared lock store against three
