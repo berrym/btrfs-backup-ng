@@ -122,6 +122,15 @@ LEGACY_INFO_NAME = "info.json"
 #: within one threshold. Only then is it safe to delete someone else's file.
 DEAD_HOLDER_MULTIPLE = 2
 
+#: How many times a SHARED acquire re-runs its record script before reporting the
+#: store unavailable. A concurrent ``release_shared`` can ``rmdir`` the lock and
+#: holders directories between this script creating them and writing the record
+#: into them, so a single NOLOCKDIR/FAILED verdict can be a lost race rather than
+#: an unwritable store; the exclusive acquire already recovers from the same race
+#: by re-``mkdir``-ing within its own script. A couple of extra attempts cover it;
+#: a genuinely unwritable store still fails, just after this many cheap retries.
+SHARED_ACQUIRE_ATTEMPTS = 3
+
 
 # --------------------------------------------------------------- cleanup
 #
@@ -872,16 +881,33 @@ class RemoteLockManager:
         )
 
     def acquire_shared(self, name: str, lock_id: str, operation: str = "") -> str:
-        """Add this holder's pin to ``name``. Never blocks on another holder."""
-        rc, out, err = self._record_shared(name, lock_id, operation)
-        if _verdict(out).startswith("UNSAFE"):
-            raise RemoteLockUnavailable(unsafe_store_message(_verdict(out)))
-        if "NOLOCKDIR" in out and self._run_elevated is not None:
-            rc, out, err = self._run_elevated(
-                self._shared_record_script(name, lock_id, operation)
-            )
-        if _verdict(out).startswith("UNSAFE"):
-            raise RemoteLockUnavailable(unsafe_store_message(_verdict(out)))
+        """Add this holder's pin to ``name``. Never blocks on another holder.
+
+        A concurrent ``release_shared`` can ``rmdir`` the lock and holders
+        directories between this script creating them and writing the record
+        into them, so a NOLOCKDIR or FAILED verdict can be a lost race rather
+        than an unwritable store. Re-run the record script a bounded number of
+        times (``SHARED_ACQUIRE_ATTEMPTS``) -- it recreates the directories each
+        time -- before reporting the store unavailable, which is how the
+        exclusive acquire recovers from the same race within its own script. An
+        UNSAFE verdict is a safety refusal, never a race, and is raised at once.
+        """
+        rc, out, err = 0, "", ""
+        for _ in range(SHARED_ACQUIRE_ATTEMPTS):
+            rc, out, err = self._record_shared(name, lock_id, operation)
+            if _verdict(out).startswith("UNSAFE"):
+                raise RemoteLockUnavailable(unsafe_store_message(_verdict(out)))
+            if "NOLOCKDIR" in out and self._run_elevated is not None:
+                rc, out, err = self._run_elevated(
+                    self._shared_record_script(name, lock_id, operation)
+                )
+                if _verdict(out).startswith("UNSAFE"):
+                    raise RemoteLockUnavailable(unsafe_store_message(_verdict(out)))
+            if _verdict(out) == "ACQUIRED":
+                _register_for_cleanup(self, self._held_key(name, lock_id))
+                return "acquired"
+            # NOLOCKDIR / FAILED: a concurrent release may have removed the lock
+            # directories mid-write. Loop; the next run recreates and retries.
         if "NOLOCKDIR" in out:
             raise RemoteLockUnavailable(
                 f"the lock directory {self._root!r} on the target could not be "
@@ -889,13 +915,10 @@ class RemoteLockManager:
                 f"protect, so this path must be writable by the account running "
                 f"the backup, or that account must be able to elevate for it."
             )
-        if _verdict(out) != "ACQUIRED":
-            raise RemoteLockUnavailable(
-                f"could not record a shared lock on {name!r}: "
-                f"{err.strip() or out.strip() or f'exit {rc}'}"
-            )
-        _register_for_cleanup(self, self._held_key(name, lock_id))
-        return "acquired"
+        raise RemoteLockUnavailable(
+            f"could not record a shared lock on {name!r}: "
+            f"{err.strip() or out.strip() or f'exit {rc}'}"
+        )
 
     def release_shared(self, name: str, lock_id: str) -> None:
         """Drop THIS holder's pin. Others keep theirs.
@@ -956,7 +979,8 @@ class RemoteLockManager:
 
     def holds_shared(self, name: str, lock_id: str) -> bool:
         """Whether THIS manager already holds that pin."""
-        return self._held_key(name, lock_id) in self._held
+        with self._state_lock:
+            return self._held_key(name, lock_id) in self._held
 
     # ---------------------------------------------------- exclusive (target)
 
@@ -1339,16 +1363,45 @@ class RemoteLockManager:
         _live, dead = self._scan_holders()
         if not dead:
             return 0
-        paths = [
+        threshold = self._stale_after * DEAD_HOLDER_MULTIPLE
+        paths = " ".join(
             shlex.quote(f"{self._root}/{dir_name}.lock/{HOLDERS_DIR_NAME}/{file_name}")
             for dir_name, file_name in dead
-        ]
-        script = f"rm -f {' '.join(paths)} 2>/dev/null && echo SWEPT || echo UNWRITABLE; exit 0"
+        )
+        # Re-check each record's age in the SAME script that removes it, rather
+        # than removing by path what a separate listing judged dead: a holder
+        # whose heartbeat refreshed its record between _scan_holders' listing
+        # and this removal has a young mtime NOW and must be kept. A blind rm
+        # removed a live holder's fresh record (the list-then-remove TOCTOU).
+        # ``bbng_age`` is the same measure the listing used, so the judgement is
+        # consistent. Reports how many it actually removed.
+        script = (
+            MTIME_FUNCTIONS + "bbng_swept=0; bbng_unwr=0; "
+            f"for bbng_p in {paths}; do "
+            'bbng_a=$(bbng_age "$bbng_p"); '
+            f'if [ -n "$bbng_a" ] && [ "$bbng_a" -gt {threshold} ]; then '
+            'if rm -f "$bbng_p" 2>/dev/null; then bbng_swept=$((bbng_swept + 1)); '
+            'elif [ -e "$bbng_p" ]; then bbng_unwr=1; fi; '
+            "fi; done; "
+            'if [ "$bbng_unwr" -eq 1 ]; then echo "UNWRITABLE $bbng_swept"; '
+            'else echo "SWEPT $bbng_swept"; fi; exit 0'
+        )
+
+        def _count(out: str) -> int:
+            parts = _verdict(out).split()
+            return int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 0
+
         _rc, out, _err = self._run(script)
-        if _verdict(out) == "UNWRITABLE" and self._run_elevated is not None:
-            self._run_elevated(script)
-        logger.debug("Swept %d abandoned holder record(s) on the target", len(dead))
-        return len(dead)
+        swept = _count(out)
+        if _verdict(out).startswith("UNWRITABLE") and self._run_elevated is not None:
+            # A root-owned record the unprivileged rm could not remove: the
+            # elevated pass re-checks age too, so it will not remove a record
+            # refreshed since, nor double-count one already removed (its age
+            # reads empty).
+            _rc, out, _err = self._run_elevated(script)
+            swept += _count(out)
+        logger.debug("Swept %d abandoned holder record(s) on the target", swept)
+        return swept
 
     def release_holder(self, holder: Holder) -> None:
         """Drop a holder by the record it was found in.
@@ -1450,16 +1503,29 @@ class RemoteLockManager:
                     logger.debug("Heartbeat for %r failed: %s", key, exc)
 
         thread = threading.Thread(target=beat, name="lock-hb", daemon=True)
-        self._held[key] = stop
-        self._threads[key] = thread
+        # _held/_threads are shared: one source endpoint per volume is used by
+        # every target thread, and record_pin's holds_shared()/this start is a
+        # check-then-act. Without this guard two threads pinning the same key
+        # both reached here and the second overwrote _held[key]/_threads[key],
+        # orphaning the first thread -- which kept rewriting the record after
+        # release, resurrecting a dropped pin. Register and start the thread only
+        # if no heartbeat is already running for this key; the record the caller
+        # wrote (acquire) is idempotent, so an existing beat already keeps it
+        # alive and a duplicate start is dropped.
+        with self._state_lock:
+            if key in self._held:
+                return
+            self._held[key] = stop
+            self._threads[key] = thread
         _register_for_cleanup(self, key)
         thread.start()
 
     def _stop_heartbeat(self, key: str) -> None:
         """Stop refreshing. The exit-cleanup entry stays until the release
         itself has run, so a release that does not complete is retried."""
-        stop = self._held.pop(key, None)
-        thread = self._threads.pop(key, None)
+        with self._state_lock:
+            stop = self._held.pop(key, None)
+            thread = self._threads.pop(key, None)
         if stop is not None:
             stop.set()
         if thread is not None and thread is not threading.current_thread():
@@ -1480,7 +1546,8 @@ class RemoteLockManager:
 
     def holds(self, name: str) -> bool:
         """Whether THIS manager is the one holding ``name``."""
-        return name in self._held
+        with self._state_lock:
+            return name in self._held
 
     @contextmanager
     def hold(self, name: str, operation: str) -> Iterator[str]:

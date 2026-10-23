@@ -5,6 +5,44 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.19] - 2026-10-22
+
+A bugfix release hardening retention and the shared lock store against three
+concurrency and accounting defects. Each was found by an adversarial review of
+the 0.9.16 release and reproduced before being fixed. There are no configuration
+or on-disk format changes, and no change to the lock store's failure policy.
+
+Fixed:
+
+- **A pruned raw stream is no longer counted as both deleted and failed.** When
+  a raw stream file was removed but its `.meta` sidecar could not be (an
+  immutable or read-only sidecar, say), the delete counted the snapshot as
+  deleted and then -- because the sidecar unlink shared the stream unlink's
+  error handler -- also as failed, so one stream appeared in both totals and
+  the in-process listing kept showing a stream whose file was already gone. The
+  sidecar is now removed on its own: the stream file is the backup, so once it
+  is gone the snapshot is deleted, and a sidecar that cannot be removed is a
+  warning rather than a second verdict.
+
+- **A shared snapshot pin no longer fails spuriously when another holder
+  releases at the same instant.** Taking a shared pin -- what a restore or a
+  backup holds while it reads or writes a snapshot -- recreates the lock's
+  directories and writes a record into them; a release running at the same
+  instant could remove those directories between the two steps, and the acquire
+  then aborted the operation with "could not lock ... refusing to continue."
+  The shared acquire now retries a bounded number of times, recreating the
+  directories, exactly as the exclusive acquire already did.
+
+- **A released shared pin can no longer come back from the dead, and a sweep no
+  longer removes a record its holder has just refreshed.** Two threads pinning
+  one snapshot both started a keep-alive heartbeat and the second orphaned the
+  first, which went on rewriting the record after the pin was released. And the
+  sweep of long-abandoned holder records removed them by a path from an earlier
+  listing without re-checking their age, so a stalled holder whose heartbeat
+  landed between the listing and the removal lost a fresh record. The pin
+  bookkeeping is now serialized and a duplicate keep-alive is dropped, and the
+  sweep re-checks each record's age at the moment it removes it.
+
 ## [0.9.18] - 2026-10-22
 
 A bugfix release for a regression introduced in 0.9.17. **Do not use 0.9.17
