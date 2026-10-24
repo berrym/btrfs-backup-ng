@@ -28,7 +28,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional, TypedDict
 
-from btrfs_backup_ng import __util__, lifecycle
+from btrfs_backup_ng import __util__
 from btrfs_backup_ng.__logger__ import logger
 from btrfs_backup_ng.lifecycle import scoped as in_process_scope
 from btrfs_backup_ng.lifecycle import track as track_child
@@ -1848,36 +1848,23 @@ class RawEndpoint(Endpoint):
             run, path, hostname=socket.gethostname(), run_elevated=run_elevated
         )
 
-    @contextlib.contextmanager
-    def receiving_lock(
-        self, destination: str, *, timeout: float | None = None
-    ) -> Iterator[None]:
-        """Hold the right to write the stream ``destination`` at this location
-        for the span of its receive and commit.
+    def _receive_lock_root(self) -> str | None:
+        """A stream's receiving lock lives in the store the location's pins
+        already live in, which for the raw+ssh subclass is on the remote --
+        that subclass inherits this as it is.
 
         One stream, not the whole target: ``target_lock`` still serialises the
         commit's rename and sidecar write against ``raw backfill-metadata`` and
-        ``raw encrypt``, which rewrite many sidecars at once; this lock is the
-        receive-to-commit span of a single stream, so a second transfer of the
-        same stream is refused before it sends anything, and a prune of that
-        stream cannot run while it is being written. Lives in the store the
-        location's pins already live in (``_lock_manager``), which for the
-        raw+ssh subclass is on the remote -- that subclass inherits this as
-        it is. The body is ``sshutil.lock.hold_receiving_lock``, shared with
-        every other transport.
+        ``raw encrypt``, which rewrite many sidecars at once; the receiving
+        lock is a single stream's, held for its receive-to-commit span and
+        taken by a prune before it removes the stream, so neither a second
+        transfer of that stream nor its deletion runs while it is being
+        written. The lock itself is the base endpoint's.
         """
-        if self._lock_target_path() is None:
-            yield
-            return
-        from ..sshutil.lock import hold_receiving_lock
+        return self._lock_target_path()
 
-        with hold_receiving_lock(
-            self._lock_manager,
-            destination,
-            skip_remote_lock=bool(self.config.get("skip_remote_lock")),
-        ):
-            with lifecycle.process_scope():
-                yield
+    def _receive_lock_manager(self) -> Any:
+        return self._lock_manager()
 
     def protect_incremental_parents(
         self, to_keep: list, to_delete: list
@@ -2035,58 +2022,69 @@ class RawEndpoint(Endpoint):
                     snapshot, "needed as the incremental parent of a kept stream"
                 )
                 continue
-            # The stream file IS the backup; removing it is the deletion. Only a
-            # failure HERE is a delete failure.
-            try:
-                if snapshot.stream_path.exists():
-                    snapshot.stream_path.unlink()
-                    logger.info("Deleted stream file: %s", snapshot.stream_path)
-                    result.deleted.append(snapshot)
-                else:
-                    # Previously silent: a batch whose every stream was already
-                    # gone produced no log line at all and was reported as a
-                    # completed prune of that many snapshots.
-                    logger.warning(
-                        "Stream file already absent, nothing to delete: %s",
-                        snapshot.stream_path,
-                    )
-                    result.skip(snapshot, "stream file already absent")
-            except OSError as e:
-                logger.error("Failed to delete snapshot %s: %s", snapshot.name, e)
-                result.fail(snapshot, e)
-                # The stream is still there; leave its cache entry and sidecar
-                # alone and do NOT count it deleted.
+            # The stream's own receiving lock, which a transfer holds from the
+            # first byte of its ``.part`` through the commit that renames it
+            # into place: a stream being written is skipped, not deleted.
+            held = self._lock_for_deletion(
+                snapshot, self._receive_destination(snapshot.get_name()), result
+            )
+            if held is None:
                 continue
-
-            # The .meta sidecar is bookkeeping beside the stream, not the backup.
-            # Its removal is attempted in its OWN try/except: once the stream is
-            # gone the snapshot is deleted, so a sidecar that cannot be unlinked
-            # is a leftover to WARN about, never a second verdict. Folding it into
-            # the delete's try counted the SAME snapshot both deleted (stream
-            # unlinked) and failed (sidecar OSError), and skipped the cache drop.
-            if snapshot.metadata_path.exists():
+            with held:
+                # The stream file IS the backup; removing it is the deletion. Only a
+                # failure HERE is a delete failure.
                 try:
-                    snapshot.metadata_path.unlink()
-                    logger.debug("Deleted metadata file: %s", snapshot.metadata_path)
+                    if snapshot.stream_path.exists():
+                        snapshot.stream_path.unlink()
+                        logger.info("Deleted stream file: %s", snapshot.stream_path)
+                        result.deleted.append(snapshot)
+                    else:
+                        # Previously silent: a batch whose every stream was already
+                        # gone produced no log line at all and was reported as a
+                        # completed prune of that many snapshots.
+                        logger.warning(
+                            "Stream file already absent, nothing to delete: %s",
+                            snapshot.stream_path,
+                        )
+                        result.skip(snapshot, "stream file already absent")
                 except OSError as e:
-                    logger.warning(
-                        "Removed the stream %s but could not remove its .meta "
-                        "sidecar %s: %s. The backup is gone; the orphaned sidecar "
-                        "is harmless -- a later listing refuses a sidecar whose "
-                        "stream is missing -- and can be removed by hand.",
-                        snapshot.name,
-                        snapshot.metadata_path,
-                        e,
-                    )
+                    logger.error("Failed to delete snapshot %s: %s", snapshot.name, e)
+                    result.fail(snapshot, e)
+                    # The stream is still there; leave its cache entry and sidecar
+                    # alone and do NOT count it deleted.
+                    continue
 
-            # The stream is gone (deleted here or already absent), so drop it from
-            # the cache regardless of how the sidecar fared -- otherwise every
-            # later list_snapshots() in this process reports a stream that is not
-            # there.
-            if self._cached_snapshots is not None:
-                self._cached_snapshots = [
-                    s for s in self._cached_snapshots if s.name != snapshot.name
-                ]
+                # The .meta sidecar is bookkeeping beside the stream, not the backup.
+                # Its removal is attempted in its OWN try/except: once the stream is
+                # gone the snapshot is deleted, so a sidecar that cannot be unlinked
+                # is a leftover to WARN about, never a second verdict. Folding it into
+                # the delete's try counted the SAME snapshot both deleted (stream
+                # unlinked) and failed (sidecar OSError), and skipped the cache drop.
+                if snapshot.metadata_path.exists():
+                    try:
+                        snapshot.metadata_path.unlink()
+                        logger.debug(
+                            "Deleted metadata file: %s", snapshot.metadata_path
+                        )
+                    except OSError as e:
+                        logger.warning(
+                            "Removed the stream %s but could not remove its .meta "
+                            "sidecar %s: %s. The backup is gone; the orphaned sidecar "
+                            "is harmless -- a later listing refuses a sidecar whose "
+                            "stream is missing -- and can be removed by hand.",
+                            snapshot.name,
+                            snapshot.metadata_path,
+                            e,
+                        )
+
+                # The stream is gone (deleted here or already absent), so drop it from
+                # the cache regardless of how the sidecar fared -- otherwise every
+                # later list_snapshots() in this process reports a stream that is not
+                # there.
+                if self._cached_snapshots is not None:
+                    self._cached_snapshots = [
+                        s for s in self._cached_snapshots if s.name != snapshot.name
+                    ]
         return result
 
     def delete_snapshot(self, snapshot: RawSnapshot, **kwargs: Any) -> DeletionResult:
@@ -2209,13 +2207,6 @@ class SSHRawEndpoint(RawEndpoint):
         # An explicit ssh-agent socket (e.g. `--ssh-auth-sock`), useful under sudo where
         # SSH_AUTH_SOCK is not inherited. None -> rely on ssh's own agent discovery.
         self.ssh_auth_sock = config.get("ssh_auth_sock")
-
-        # set_lock consults self.config for this, but only SSHEndpoint whitelisted
-        # it, so a raw+ssh target could never relax the lock abort -- the abort's
-        # own message says "pass --skip-remote-lock to proceed unprotected on
-        # purpose", advice that did nothing on this transport.
-        if config.get("skip_remote_lock") is not None:
-            self.config["skip_remote_lock"] = config["skip_remote_lock"]
 
         self._is_remote = True
 
@@ -3562,45 +3553,53 @@ class SSHRawEndpoint(RawEndpoint):
             if snapshot_lock_name(snapshot) in remote_locked:
                 result.skip(snapshot, "locked by another process on this target")
                 continue
-            try:
-                # Build rm command for stream and metadata
-                rm_cmd = (
-                    f"rm -f {shlex.quote(str(snapshot.stream_path))} "
-                    f"{shlex.quote(str(snapshot.metadata_path))}"
-                )
-                rm_cmd = self._elevate(rm_cmd)
+            # The stream's own receiving lock, on the remote store: a stream a
+            # transfer is writing right now is skipped, not removed under it.
+            held = self._lock_for_deletion(
+                snapshot, self._receive_destination(snapshot.get_name()), result
+            )
+            if held is None:
+                continue
+            with held:
+                try:
+                    # Build rm command for stream and metadata
+                    rm_cmd = (
+                        f"rm -f {shlex.quote(str(snapshot.stream_path))} "
+                        f"{shlex.quote(str(snapshot.metadata_path))}"
+                    )
+                    rm_cmd = self._elevate(rm_cmd)
 
-                full_cmd = ssh_cmd + [rm_cmd]
-                subprocess.run(full_cmd, check=True, capture_output=True)
-                logger.info("Deleted remote snapshot: %s", snapshot.name)
-                result.deleted.append(snapshot)
+                    full_cmd = ssh_cmd + [rm_cmd]
+                    subprocess.run(full_cmd, check=True, capture_output=True)
+                    logger.info("Deleted remote snapshot: %s", snapshot.name)
+                    result.deleted.append(snapshot)
 
-                # Update cache
-                if self._cached_snapshots is not None:
-                    self._cached_snapshots = [
-                        s for s in self._cached_snapshots if s.name != snapshot.name
-                    ]
-            except subprocess.CalledProcessError as e:
-                stderr = (e.stderr or b"").decode(errors="replace").strip()
-                logger.error(
-                    "Failed to delete remote snapshot %s: %s",
-                    snapshot.name,
-                    stderr or e,
-                )
-                if _is_sudo_denial(stderr):
-                    # Every delete in this run will fail for the same reason, and
-                    # prune would otherwise finish "successfully" having removed
-                    # nothing -- so the retention policy silently stops applying
-                    # while the operator is told it ran.
-                    raise __util__.AbortError(
-                        f"Cannot delete backups on {self.hostname}: {stderr}. "
-                        "Retention did NOT run. A raw+ssh target stores plain "
-                        "files, so with ssh_sudo the remote user needs "
-                        "passwordless sudo for rm (and find/cat/stat), not for "
-                        "btrfs; alternatively give the user ownership of the "
-                        "backup directory and turn ssh_sudo off."
-                    ) from e
-                # Not a denial, so the rest of the batch may still succeed --
-                # but this one did not, and the caller has to be told which.
-                result.fail(snapshot, stderr or e)
+                    # Update cache
+                    if self._cached_snapshots is not None:
+                        self._cached_snapshots = [
+                            s for s in self._cached_snapshots if s.name != snapshot.name
+                        ]
+                except subprocess.CalledProcessError as e:
+                    stderr = (e.stderr or b"").decode(errors="replace").strip()
+                    logger.error(
+                        "Failed to delete remote snapshot %s: %s",
+                        snapshot.name,
+                        stderr or e,
+                    )
+                    if _is_sudo_denial(stderr):
+                        # Every delete in this run will fail for the same reason, and
+                        # prune would otherwise finish "successfully" having removed
+                        # nothing -- so the retention policy silently stops applying
+                        # while the operator is told it ran.
+                        raise __util__.AbortError(
+                            f"Cannot delete backups on {self.hostname}: {stderr}. "
+                            "Retention did NOT run. A raw+ssh target stores plain "
+                            "files, so with ssh_sudo the remote user needs "
+                            "passwordless sudo for rm (and find/cat/stat), not for "
+                            "btrfs; alternatively give the user ownership of the "
+                            "backup directory and turn ssh_sudo off."
+                        ) from e
+                    # Not a denial, so the rest of the batch may still succeed --
+                    # but this one did not, and the caller has to be told which.
+                    result.fail(snapshot, stderr or e)
         return result

@@ -2510,8 +2510,8 @@ def hold_receiving_lock(
     *,
     skip_remote_lock: bool = False,
 ) -> Iterator[str]:
-    """Hold the right to create ``destination`` on a target: the one body
-    behind every endpoint's ``receiving_lock``.
+    """Hold the right to create -- or to remove -- ``destination`` on a target:
+    the one body behind every endpoint's ``_hold_receiving_lock``.
 
     ``manager`` is a ``RemoteLockManager`` or a zero-argument callable that
     builds one (an endpoint's bound ``_lock_manager``), as ``record_pin``
@@ -2532,6 +2532,12 @@ def hold_receiving_lock(
     A lock that cannot be recorded stops the operation, unless the operator
     said ``skip_remote_lock`` -- then it proceeds with a warning, unprotected
     on purpose.
+
+    A deletion takes the same lock before removing the artifact
+    (``Endpoint._lock_for_deletion``), so a prune and a receive of one
+    artifact exclude each other instead of racing; the deletion skips what is
+    being received, and ``ReceivingLockBusy`` carries the holder's name for
+    it to say so.
 
     Yields how the block came to run: ``acquired`` (this call took the lock
     and will release it), ``reentrant`` (held further up this call stack) or
@@ -2564,28 +2570,31 @@ def hold_receiving_lock(
                 f"{info.get('hostname', 'an unknown host')} "
                 f"(pid {info.get('pid', '?')})"
             )
-        raise __util__.AbortError(
+        raise __util__.ReceivingLockBusy(
+            destination,
+            holder,
             f"Already being received by {holder}: {destination}\n"
             f"Refusing to start a second transfer to the same path -- both "
             f"would create the same copy, and the loser only finds out "
-            f"after transferring everything."
+            f"after transferring everything.",
         ) from exc
     except RemoteLockUnavailable as exc:
         if skip_remote_lock:
             logger.warning(
-                "Could not lock %s before receiving (%s), and "
+                "Could not take the receiving lock on %s (%s), and "
                 "--skip-remote-lock was given, so this continues WITHOUT "
-                "protection against a concurrent transfer to the same path.",
+                "protection against a concurrent transfer or deletion of the "
+                "same path.",
                 destination,
                 exc,
             )
             yield "unprotected"
             return
         raise __util__.AbortError(
-            f"Could not lock {destination!r} before receiving: {exc}. "
-            f"Refusing to continue unprotected: a second transfer to the "
-            f"same path would collide. Pass --skip-remote-lock to proceed "
-            f"anyway."
+            f"Could not take the receiving lock on {destination!r}: {exc}. "
+            f"Refusing to continue unprotected: a transfer and a deletion of "
+            f"the same path, or two transfers, would collide. Pass "
+            f"--skip-remote-lock to proceed anyway."
         ) from exc
     manager._start_heartbeat(name)
     try:

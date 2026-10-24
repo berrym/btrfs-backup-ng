@@ -408,9 +408,11 @@ class SnapperLayout:
         created" instead of the actual condition. The check is the engine's
         own, with the same diagnosis on every transport; nothing is created
         by it. The receive and the publish are two halves of ONE transaction
-        on the slot, and the lock is named for exactly what the transfer
-        beneath will lock, so that call finds it already held rather than
-        taking a second one.
+        on the slot, so the lock is held from here through the publish; it is
+        named for the slot itself -- ``.snapshots/<n>``, what the publish
+        renames into place and what a prune deletes -- so a prune of that
+        slot finds it held and keeps the slot. The transfer beneath takes no
+        lock of its own (``_SlotReceiver.receiving_lock``).
         """
         if self._open is not None:
             raise RuntimeError(
@@ -421,7 +423,7 @@ class SnapperLayout:
         slot = _OpenSlot(number, self.endpoint.config["path"])
         try:
             slot.locks.enter_context(
-                _ops._receiving_lock(self.endpoint, f"{incoming}/snapshot", self.base)
+                _ops._receiving_lock(self.endpoint, self.slot_dir(number), self.base)
             )
             # A leftover temp from a prior crashed run goes first; then the
             # slot is made, below the target and only there.

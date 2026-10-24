@@ -57,6 +57,21 @@ class SnapshotTransferError(AbortError):
     """Error when transferring a snapshot."""
 
 
+class ReceivingLockBusy(AbortError):
+    """Another process holds the receiving lock on a destination artifact.
+
+    Raised by ``sshutil.lock.hold_receiving_lock`` for a transfer, which it
+    stops, and for a deletion, which skips the artifact instead; the message
+    is the transfer's, so the holder and the artifact travel as attributes
+    for the deletion to word its own.
+    """
+
+    def __init__(self, destination: str, holder: str, message: str) -> None:
+        super().__init__(message)
+        self.destination = destination
+        self.holder = holder
+
+
 class InsufficientSpaceError(AbortError):
     """Destination has insufficient space for the transfer.
 

@@ -210,11 +210,12 @@ class TestTheDestinationIsTheReceivedSubvolume:
         )
 
     def test_two_snapper_slots_do_not_collide(self, tmp_path):
-        """Both are named "snapshot"; the SLOT is what separates them, so the
-        lock has to be keyed on the incoming slot rather than the basename."""
+        """Both receive a subvolume named "snapshot"; the SLOT is what
+        separates them, so the slot lock is keyed on the slot directory
+        (``SnapperLayout.open_slot``) rather than on the basename."""
         first, second = _endpoint(tmp_path), _endpoint(tmp_path)
-        with first.receiving_lock(f"{tmp_path}/.snapshots/41.incoming/snapshot"):
-            with second.receiving_lock(f"{tmp_path}/.snapshots/42.incoming/snapshot"):
+        with first.receiving_lock(f"{tmp_path}/.snapshots/41"):
+            with second.receiving_lock(f"{tmp_path}/.snapshots/42"):
                 pass
 
 
@@ -320,13 +321,26 @@ class TestARawStoreTakesARealLockPerStream:
 
 class TestOneBodyServesEveryTransport:
     """Three copies of the receive lock had grown apart only in which store
-    they opened. Each endpoint now supplies its store to one shared body."""
+    they opened. The lock is now ``Endpoint._hold_receiving_lock`` and nothing
+    overrides it: an endpoint names only its store (``_receive_lock_root``,
+    ``_receive_lock_manager``). A transfer and a deletion both take it."""
 
-    @pytest.mark.parametrize("cls", [Endpoint, RawEndpoint, SSHEndpoint])
-    def test_the_endpoint_delegates_to_the_shared_body(self, cls):
+    def test_the_lock_body_is_inherited_by_every_endpoint(self):
+        assert RawEndpoint._hold_receiving_lock is Endpoint._hold_receiving_lock
+        assert SSHEndpoint._hold_receiving_lock is Endpoint._hold_receiving_lock
+        # The raw endpoint adds nothing to the receive either; ssh adds the
+        # cleanup of its own partial on top of the lock, and only that.
+        assert RawEndpoint.receiving_lock is Endpoint.receiving_lock
+        assert SSHEndpoint.receiving_lock is not Endpoint.receiving_lock
+
+    def test_the_body_is_the_shared_one(self):
         import inspect
+        import re
 
-        assert "hold_receiving_lock" in inspect.getsource(cls.receiving_lock)
+        source = inspect.getsource(Endpoint._hold_receiving_lock)
+        assert re.search(r"(?<![\w.])hold_receiving_lock\(", source), source
+        source = inspect.getsource(Endpoint._lock_for_deletion)
+        assert "_hold_receiving_lock(" in source, source
 
 
 class TestTheOperatorCanOptOut:

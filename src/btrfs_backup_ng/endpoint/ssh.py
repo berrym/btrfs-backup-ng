@@ -510,7 +510,6 @@ class SSHEndpoint(Endpoint):
             "ssh_auth_sock",
             "ssh_password_fallback",
             "ssh_host_key_policy",
-            "skip_remote_lock",
             "lock_root",
             "transfer_stall_timeout",
         ):
@@ -886,93 +885,107 @@ class SSHEndpoint(Endpoint):
             # Ensure the path is properly normalized for remote execution
             remote_path = self._normalize_path(remote_path)
 
-            # Verify the subvolume exists before attempting deletion. Asked as a
-            # btrfs subcommand, not `test -d`: the remote sudoers policy grants
-            # btrfs only, so an elevated `test` fails for lack of privilege and
-            # is indistinguishable from a missing path -- which skipped every
-            # snapshot and made remote pruning silently delete nothing. It is
-            # also the stricter precondition for the `btrfs subvolume delete`
-            # below, since it fails on a plain directory rather than passing it.
-            test_cmd = ["btrfs", "subvolume", "show", remote_path]
-            try:
-                test_result = self._exec_remote_command(
-                    test_cmd,
-                    check=False,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                )
-                if test_result.returncode != 0:
-                    logger.warning(
-                        f"Not an existing btrfs subvolume, skipping deletion: {remote_path}"
-                    )
-                    result.skip(snapshot, "not an existing btrfs subvolume")
-                    continue
-            except Exception as e:
-                logger.warning(f"Could not verify snapshot path {remote_path}: {e}")
-                # Could not even establish whether there is anything to delete.
-                # Not a skip: the deletion was asked for and did not happen, and
-                # the cause (a dead connection, an unmounted remote filesystem)
-                # applies to every snapshot in the batch.
-                result.fail(snapshot, f"could not verify the path: {e}")
+            # The subvolume's own receiving lock, the one a transfer to this
+            # destination holds from before its authorship probe through its
+            # commit: a subvolume being received is skipped, never deleted
+            # under the receive. Taken before the existence check below --
+            # during a receive the path exists, as the partial -- and keyed as
+            # the receive keys it.
+            held = self._lock_for_deletion(
+                snapshot, self._receive_destination(remote_path), result
+            )
+            if held is None:
                 continue
-
-            # Build deletion command with proper sudo handling
-            cmd = ["btrfs", "subvolume", "delete", remote_path]
-            logger.debug("Executing remote deletion command: %s", cmd)
-
-            try:
-                # Use retry mechanism for commands that may require authentication
-                use_sudo = self.config.get("ssh_sudo", False)
-                if use_sudo:
-                    proc = self._exec_remote_command_with_retry(
-                        cmd,
-                        max_retries=2,
+            with held:
+                # Verify the subvolume exists before attempting deletion. Asked as a
+                # btrfs subcommand, not `test -d`: the remote sudoers policy grants
+                # btrfs only, so an elevated `test` fails for lack of privilege and
+                # is indistinguishable from a missing path -- which skipped every
+                # snapshot and made remote pruning silently delete nothing. It is
+                # also the stricter precondition for the `btrfs subvolume delete`
+                # below, since it fails on a plain directory rather than passing it.
+                test_cmd = ["btrfs", "subvolume", "show", remote_path]
+                try:
+                    test_result = self._exec_remote_command(
+                        test_cmd,
                         check=False,
                         stdout=subprocess.PIPE,
                         stderr=subprocess.PIPE,
                     )
-                else:
-                    proc = self._exec_remote_command(
-                        cmd,
-                        check=False,
-                        stdout=subprocess.PIPE,
-                        stderr=subprocess.PIPE,
-                    )
-                if proc.returncode == 0:
-                    logger.info("Deleted remote snapshot subvolume: %s", remote_path)
-                    result.deleted.append(snapshot)
-                else:
-                    stderr = (
-                        proc.stderr.decode(errors="replace").strip()
-                        if hasattr(proc, "stderr") and proc.stderr
-                        else "Unknown error"
-                    )
-                    # Check for common btrfs deletion errors
-                    if "No such file or directory" in stderr:
+                    if test_result.returncode != 0:
                         logger.warning(
-                            f"Snapshot already deleted or path not found: {remote_path}"
+                            f"Not an existing btrfs subvolume, skipping deletion: {remote_path}"
                         )
-                        result.skip(snapshot, "already absent on the destination")
-                    elif "statfs" in stderr.lower():
-                        logger.error(
-                            f"Filesystem access error when deleting {remote_path}: {stderr}"
+                        result.skip(snapshot, "not an existing btrfs subvolume")
+                        continue
+                except Exception as e:
+                    logger.warning(f"Could not verify snapshot path {remote_path}: {e}")
+                    # Could not even establish whether there is anything to delete.
+                    # Not a skip: the deletion was asked for and did not happen, and
+                    # the cause (a dead connection, an unmounted remote filesystem)
+                    # applies to every snapshot in the batch.
+                    result.fail(snapshot, f"could not verify the path: {e}")
+                    continue
+
+                # Build deletion command with proper sudo handling
+                cmd = ["btrfs", "subvolume", "delete", remote_path]
+                logger.debug("Executing remote deletion command: %s", cmd)
+
+                try:
+                    # Use retry mechanism for commands that may require authentication
+                    use_sudo = self.config.get("ssh_sudo", False)
+                    if use_sudo:
+                        proc = self._exec_remote_command_with_retry(
+                            cmd,
+                            max_retries=2,
+                            check=False,
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE,
                         )
-                        logger.error(
-                            "This may indicate the remote path is not accessible or the filesystem is unmounted"
-                        )
-                        result.fail(snapshot, f"filesystem access error: {stderr}")
                     else:
-                        logger.error(
-                            f"Failed to delete remote snapshot {remote_path}: {stderr}"
+                        proc = self._exec_remote_command(
+                            cmd,
+                            check=False,
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE,
                         )
-                        result.fail(snapshot, stderr)
-            except Exception as e:
-                logger.error(
-                    f"Exception while deleting remote snapshot {remote_path}: {e}"
-                )
-                # Log additional diagnostic information
-                logger.debug(f"Deletion exception details: {e}", exc_info=True)
-                result.fail(snapshot, e)
+                    if proc.returncode == 0:
+                        logger.info(
+                            "Deleted remote snapshot subvolume: %s", remote_path
+                        )
+                        result.deleted.append(snapshot)
+                    else:
+                        stderr = (
+                            proc.stderr.decode(errors="replace").strip()
+                            if hasattr(proc, "stderr") and proc.stderr
+                            else "Unknown error"
+                        )
+                        # Check for common btrfs deletion errors
+                        if "No such file or directory" in stderr:
+                            logger.warning(
+                                f"Snapshot already deleted or path not found: {remote_path}"
+                            )
+                            result.skip(snapshot, "already absent on the destination")
+                        elif "statfs" in stderr.lower():
+                            logger.error(
+                                f"Filesystem access error when deleting {remote_path}: {stderr}"
+                            )
+                            logger.error(
+                                "This may indicate the remote path is not accessible or the filesystem is unmounted"
+                            )
+                            result.fail(snapshot, f"filesystem access error: {stderr}")
+                        else:
+                            logger.error(
+                                f"Failed to delete remote snapshot {remote_path}: {stderr}"
+                            )
+                            result.fail(snapshot, stderr)
+                except Exception as e:
+                    logger.error(
+                        f"Exception while deleting remote snapshot {remote_path}: {e}"
+                    )
+                    # Log additional diagnostic information
+                    logger.debug(f"Deletion exception details: {e}", exc_info=True)
+                    result.fail(snapshot, e)
         return result
 
     def delete_old_snapshots(self, keep: int) -> DeletionResult:
@@ -1084,6 +1097,13 @@ class SSHEndpoint(Endpoint):
             run_elevated=run_elevated,
         )
 
+    def _receive_lock_root(self) -> Optional[str]:
+        """The receiving lock lives in the remote store the pins live in."""
+        return self._lock_target_path()
+
+    def _receive_lock_manager(self) -> Any:
+        return self._lock_manager()
+
     @contextlib.contextmanager
     def receiving_lock(
         self, destination: str, *, timeout: float | None = None
@@ -1109,19 +1129,10 @@ class SSHEndpoint(Endpoint):
         ``<n>`` -- two halves of one transaction on the same slot -- and the
         transfer beneath must not contend with its own caller.
         """
-        from ..sshutil.lock import hold_receiving_lock
-
-        if self._lock_target_path() is None:
-            yield
-            return
-
-        # The body is the one every transport shares; what is this endpoint's
-        # own is the remote store (``_lock_manager``) and the cleanup below.
-        with hold_receiving_lock(
-            self._lock_manager,
-            destination,
-            skip_remote_lock=bool(self.config.get("skip_remote_lock")),
-        ) as mode:
+        # The lock is the one every transport shares, over this endpoint's
+        # remote store (``_hold_receiving_lock``, ``_receive_lock_manager``);
+        # what is this method's own is the cleanup below.
+        with self._hold_receiving_lock(destination) as mode:
             if mode != "acquired":
                 # Held further up this call stack, or the operator opted out:
                 # the frame that took the lock owns the cleanup, and an
@@ -4494,7 +4505,7 @@ print(json.dumps(result))
         the transfer and verification paths already use, so the lock names the
         thing that actually collides.
         """
-        dest = str(self._normalize_path(self.config["path"])).rstrip("/")
+        dest = str(self._normalize_path(self.config.get("path", ""))).rstrip("/")
         return f"{dest}/{Path(str(source_path)).name}"
 
     def _require_remote_destination(self, dest_path) -> bool:

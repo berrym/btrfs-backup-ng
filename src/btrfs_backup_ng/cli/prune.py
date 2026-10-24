@@ -305,6 +305,7 @@ def delete_snapper_backups(
     if not backups:
         return 0, []
 
+    from ..core import operations as _ops
     from ..core.target import TargetKind, parse_target
     from ..endpoint import choose_endpoint
 
@@ -394,9 +395,22 @@ def delete_snapper_backups(
             )
             continue
         slot_dir = f"{base}/.snapshots/{number}"
+        # The slot's receiving lock: a run holds it from the moment it opens
+        # the slot until the publish has renamed it into place, so a slot a
+        # run is filling right now is kept rather than deleted out from under
+        # it -- both sides used to report success, and the destination held
+        # neither backup. Keyed on the slot directory, as the run keys it.
         try:
-            _delete_snapper_slot_btrfs(endpoint_obj, slot_dir, remote)
+            with _ops._receiving_lock(endpoint_obj, slot_dir, base):
+                _delete_snapper_slot_btrfs(endpoint_obj, slot_dir, remote)
             deleted += 1
+        except __util__.ReceivingLockBusy as e:
+            logger.info(
+                "  Kept slot %s at %s: being received by %s",
+                number,
+                backup_path,
+                e.holder,
+            )
         except Exception as e:  # noqa: BLE001 - record and continue
             errors.append(f"Delete slot {number}: {e}")
     return deleted, errors
