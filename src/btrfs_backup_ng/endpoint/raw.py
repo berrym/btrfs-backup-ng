@@ -56,11 +56,50 @@ class PendingMetadata(TypedDict):
     stream_path: Path
     part_path: Path
     parent_name: str | None
+    # The identity the parent stream carried when this receive began, as
+    # ``_identity_token`` reads it, or None for a parent that records none. The
+    # commit asks the parent for the same token before it publishes.
+    parent_identity: tuple[str, str] | None
     source_uuid: str
     compress: str | None
     encrypt: str | None
     gpg_recipient: str | None
     openssl_cipher: str | None
+
+
+def _identity_tokens(snapshot: RawSnapshot) -> tuple[tuple[str, str], ...]:
+    """What tells one stored stream from another stored under the same name,
+    strongest first, each as ``(kind, value)`` with an empty value for a token
+    the record lacks.
+
+    A stream's sidecar records the uuid the stream carries (``source_uuid``:
+    what a ``btrfs receive`` of it records, and what an increment built on it
+    names as its parent), and the sha256 its commit sealed. The uuid is the
+    identity; the checksum stands in for a sidecar written before the uuid
+    was recorded.
+    """
+    return (
+        ("source uuid", snapshot.source_uuid or ""),
+        ("sha256", snapshot.checksum_value or ""),
+    )
+
+
+def _identity_token(snapshot: RawSnapshot) -> tuple[str, str] | None:
+    """The strongest identity token ``snapshot`` records, or None for a stream
+    that records none -- a legacy or filename-inferred record has no identity
+    to compare, and None says so."""
+    for token in _identity_tokens(snapshot):
+        if token[1]:
+            return token
+    return None
+
+
+def _identity_value(snapshot: RawSnapshot, kind: str) -> str:
+    """The value ``snapshot`` records for the token ``kind``, or an empty
+    string. The commit asks the live record for the token the receive
+    captured, so a parent that lost its sidecar reads as changed, not as
+    unknowable."""
+    return dict(_identity_tokens(snapshot)).get(kind, "")
 
 
 # Environment variable for OpenSSL passphrase (compatible with btrbk)
@@ -577,6 +616,7 @@ class RawEndpoint(Endpoint):
             "stream_path": Path(),
             "part_path": Path(),
             "parent_name": None,
+            "parent_identity": None,
             "source_uuid": "",
             "compress": None,
             "encrypt": None,
@@ -621,7 +661,7 @@ class RawEndpoint(Endpoint):
         so a stream written earlier in this run is found.
         """
         try:
-            return any(s.get_name() == name for s in self.list_snapshots())
+            return self._stored_by_name(name) is not None
         except Exception as e:  # noqa: BLE001 - the engine's own answer under doubt
             # The engine's probe answers True when it cannot tell: for a
             # cleanup that means "not ours to remove", for a parent pin it
@@ -630,6 +670,24 @@ class RawEndpoint(Endpoint):
                 "Could not list %s to look for %s: %s", self.config.get("path"), name, e
             )
             return True
+
+    def _stored_by_name(
+        self, name: str, *, live: bool = False
+    ) -> Optional[RawSnapshot]:
+        """The stream this location stores under ``name``, or None.
+
+        The one by-name lookup over this store's own listing, which is how a
+        raw location answers every question of identity: correspondence, the
+        parent an increment needs, whether a copy pre-exists, and whether the
+        parent a commit is about to publish against is still there. ``live``
+        drops the cached listing first, for the question whose answer has to
+        be this moment's. Raises what the listing raises; each caller has its
+        own posture under doubt.
+        """
+        for candidate in self.list_snapshots(flush_cache=live):
+            if candidate.get_name() == name:
+                return candidate
+        return None
 
     def correspondent_of(self, snapshot: Any) -> Optional[Any]:
         """Raw override of :meth:`Endpoint.correspondent_of` -- NAME semantics.
@@ -644,11 +702,7 @@ class RawEndpoint(Endpoint):
         if not callable(get_name):
             return None
         try:
-            name = get_name()
-            candidates = self.list_snapshots()
-            for candidate in candidates:
-                if candidate.get_name() == name:
-                    return candidate
+            return self._stored_by_name(get_name())
         except Exception as e:  # noqa: BLE001 - contract: never raise; None is safe
             logger.debug("correspondent_of: could not resolve correspondent (%s)", e)
         return None
@@ -713,13 +767,12 @@ class RawEndpoint(Endpoint):
         if not parent_name:
             return None
         try:
-            listed = list(self.list_snapshots())
+            parent = self._stored_by_name(parent_name)
         except Exception as e:  # noqa: BLE001 - reported below as unmet
             logger.debug("required_parent_of: could not list snapshots (%s)", e)
-            listed = []
-        for candidate in listed:
-            if candidate.get_name() == parent_name:
-                return candidate
+            parent = None
+        if parent is not None:
+            return parent
         raise __util__.AbortError(
             f"{snapshot.get_name()} is an incremental stream whose parent "
             f"{parent_name} is not at this location, so it cannot be received "
@@ -900,6 +953,7 @@ class RawEndpoint(Endpoint):
             "stream_path": output_path,
             "part_path": part_path,
             "parent_name": parent_name,
+            "parent_identity": self._parent_identity_at_receive(parent_name),
             "source_uuid": source_uuid,
             "compress": self.compress,
             "encrypt": self.encrypt,
@@ -916,6 +970,83 @@ class RawEndpoint(Endpoint):
         proc = self._execute_pipeline(pipeline, stdin)
 
         return proc
+
+    def _parent_identity_at_receive(
+        self, parent_name: str | None
+    ) -> tuple[str, str] | None:
+        """The identity token of the parent stream as this receive begins.
+
+        Read from the store's listing (the one the engine just asked the
+        parent's presence of), kept in the pending record and compared with
+        the live record at commit by ``_require_parent_at_commit``. None for a
+        full stream, for a parent whose record carries no identity, and when
+        the listing cannot be read: the commit then asks presence alone, which
+        is all that can be asked of such a parent.
+        """
+        if not parent_name:
+            return None
+        try:
+            parent = self._stored_by_name(parent_name)
+        except Exception as e:  # noqa: BLE001 - presence alone is asked at commit
+            logger.debug(
+                "Could not read the identity of parent %s at %s: %s",
+                parent_name,
+                self.config.get("path"),
+                e,
+            )
+            return None
+        return _identity_token(parent) if parent is not None else None
+
+    def _require_parent_at_commit(self) -> None:
+        """Refuse to publish an increment whose parent is not the one it was
+        received against, or is no longer here.
+
+        Asked inside the target lock, before the rename, from a listing taken
+        at that moment: the same lock a prune of this location holds while it
+        deletes, so nothing this tool does can take the parent between the
+        answer and the publish. The parent's pin covers the receive (the
+        engine pins the destination's copy of the parent for the span of the
+        send); this covers what a pin cannot: a parent removed by hand, by a
+        tool that reads no pins, or after a pin was judged stale.
+
+        An increment stored here applies only onto its parent, and nothing at
+        this location can regenerate a full stream in its place, so a stream
+        published against a parent that is gone is a backup that cannot be
+        restored, reported as a success. A parent replaced under its name by a
+        different stream (a second config sharing the prefix, a re-sent copy
+        of another snapshot) is the same loss one step later: the increment
+        would be restored onto the wrong base. The two are told apart in the
+        message. A parent whose record carries no identity can only be asked
+        to be present. A listing that cannot be read refuses the commit too:
+        the stream stays an uncommitted ``.part``, removed by the transfer's
+        own cleanup, and the next run sends it again.
+        """
+        pending = self._pending_metadata
+        parent_name = pending.get("parent_name")
+        if not parent_name:
+            return
+        child = pending["name"]
+        where = self.config.get("path")
+        parent = self._stored_by_name(parent_name, live=True)
+        if parent is None:
+            raise RuntimeError(
+                f"{child} was received against {parent_name}, which is no longer "
+                f"at {where}: refusing to publish an increment whose parent is "
+                f"gone, since a stored increment applies only onto its parent "
+                f"and nothing here can send a full stream in its place"
+            )
+        expected = pending.get("parent_identity")
+        if expected is None:
+            return
+        kind, value = expected
+        found = _identity_value(parent, kind)
+        if found != value:
+            raise RuntimeError(
+                f"{child} was received against {parent_name}, but the stream "
+                f"stored under that name is not the one the receive began against "
+                f"({kind} {value} then, {found or 'none'} now): refusing to publish "
+                f"an increment onto a parent that changed identity"
+            )
 
     def _build_receive_pipeline(self, output_path: Path) -> list[list[str]]:
         """Build the compression/encryption pipeline for receiving.
@@ -1067,6 +1198,10 @@ class RawEndpoint(Endpoint):
         ``discover_raw_snapshots`` ignores -- so a partial transfer can never be
         mistaken for a complete backup.
 
+        An increment is published only if its parent is still here and is the
+        stream the receive began against (``_require_parent_at_commit``), asked
+        under the target lock just before the rename.
+
         Raises on failure so the engine treats an un-published stream as a
         failed transfer rather than reporting a success that is not on disk.
         """
@@ -1107,6 +1242,7 @@ class RawEndpoint(Endpoint):
         # before the sidecar is written (and mislabel it). This section is sub-second
         # (a metadata rename + a directory fsync + a small sidecar write).
         with self.target_lock():
+            self._require_parent_at_commit()
             os.replace(part_path, final_path)
             # Persist the rename itself.
             self._fsync_dir(final_path.parent)
@@ -2825,8 +2961,11 @@ class SSHRawEndpoint(RawEndpoint):
         The receive pipeline writes to a remote ``.part`` file; once the engine
         confirms success we ``sync`` the remote filesystem and ``mv -f`` the
         ``.part`` file to its final name. A crash leaves only the ``.part`` file,
-        which discovery ignores. Raises on failure so an un-published stream is
-        treated as a failed transfer.
+        which discovery ignores. An increment is published only if its parent
+        is still on the remote and is the stream the receive began against
+        (``_require_parent_at_commit``, inherited: the listing it asks is this
+        endpoint's remote one), under the target lock. Raises on failure so an
+        un-published stream is treated as a failed transfer.
         """
         pending = getattr(self, "_pending_metadata", None)
         # No receive() has run on this endpoint (dummy init) -> nothing to publish.
@@ -2861,6 +3000,7 @@ class SSHRawEndpoint(RawEndpoint):
         # not a rename -- and its peers can be on other machines, where a flock would
         # not have helped anyway. This section is now metadata-only and sub-second.
         with self.target_lock():
+            self._require_parent_at_commit()
             result = self._exec_remote_command(["sh", "-c", mv_script], check=False)
             if result.returncode != 0:
                 stderr = result.stderr
