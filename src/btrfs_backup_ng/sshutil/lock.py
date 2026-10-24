@@ -102,6 +102,16 @@ SNAPSHOT_LOCK_PREFIX = "snap-"
 #: would cost throughput to prevent a clash that cannot happen.
 RECEIVING_LOCK_PREFIX = "receiving-"
 
+#: The directory under a LOCAL btrfs target that its receive locks live in.
+#: Deliberately not ``LOCK_DIR_NAME``: a local endpoint recognises that
+#: directory as the location's PIN store and, finding it, reads its pins from
+#: there instead of from the lock file -- so creating it for a receive lock
+#: would hide every pin an earlier run recorded in the file. The receive
+#: locks get a store of their own and the pin store is left exactly as it
+#: was. ssh:// and raw locations have no lock-file mode to protect, so their
+#: receive locks share the one store their pins already live in.
+RECEIVING_DIR_NAME = ".btrfs-backup-ng.receiving"
+
 #: Holder files for a SHARED lock live here, one per holder.
 HOLDERS_DIR_NAME = "holders"
 
@@ -2491,3 +2501,94 @@ def blocked_by_remote_lock(manager: Any, snapshots: list) -> set[str]:
         if f"{SNAPSHOT_LOCK_PREFIX}{n}" in live
         or encode_name(f"{SNAPSHOT_LOCK_PREFIX}{n}") in directories
     }
+
+
+@contextmanager
+def hold_receiving_lock(
+    manager: Any,
+    destination: str,
+    *,
+    skip_remote_lock: bool = False,
+) -> Iterator[str]:
+    """Hold the right to create ``destination`` on a target: the one body
+    behind every endpoint's ``receiving_lock``.
+
+    ``manager`` is a ``RemoteLockManager`` or a zero-argument callable that
+    builds one (an endpoint's bound ``_lock_manager``), as ``record_pin``
+    takes it. Each endpoint supplies only the manager -- the store its locks
+    live in -- and the protocol is this one for every transport: an ssh://
+    target, a raw store on this machine or a remote one, a local btrfs target.
+    Three copies of it had grown apart only in which store they opened.
+
+    Scoped to ONE destination artifact, not the whole target: two receives
+    into one directory under different names run in parallel; two under the
+    same name are what collide, and the loser is refused BEFORE its stream
+    starts, by a message naming the holder. Re-entrant within a process: the
+    snapper flow holds this across a receive and the publish that follows it,
+    and the transfer beneath must not contend with its own caller.
+
+    Non-blocking. A holder is refused at once, not waited for: a second
+    receive of the same artifact is a mistake to report, not a queue to join.
+    A lock that cannot be recorded stops the operation, unless the operator
+    said ``skip_remote_lock`` -- then it proceeds with a warning, unprotected
+    on purpose.
+
+    Yields how the block came to run: ``acquired`` (this call took the lock
+    and will release it), ``reentrant`` (held further up this call stack) or
+    ``unprotected`` (the opt-out). The caller stops the processes it starts
+    before this returns (``btrfs_backup_ng.lifecycle.process_scope``), so
+    nothing can take the lock while a stream is still arriving; a caller that
+    cleans up a failed receive does so inside the block too, and only when
+    the mode is ``acquired`` -- a re-entrant holder's cleanup belongs to the
+    frame that took the lock.
+    """
+    from .. import __util__
+
+    name = f"{RECEIVING_LOCK_PREFIX}{destination}"
+    if callable(manager):
+        manager = manager()
+    if manager.holds(name):
+        yield "reentrant"
+        return
+    try:
+        manager.acquire_once(name, f"receive:{destination}")
+    except RemoteLockBusy as exc:
+        # Built from the holder's details rather than by interpolating the
+        # exception, whose text repeats the destination and the lock name.
+        # An operator reading a wrapped three-line sentence to find a
+        # hostname is being made to work for it.
+        info = exc.info or {}
+        holder = "another process"
+        if info:
+            holder = (
+                f"{info.get('hostname', 'an unknown host')} "
+                f"(pid {info.get('pid', '?')})"
+            )
+        raise __util__.AbortError(
+            f"Already being received by {holder}: {destination}\n"
+            f"Refusing to start a second transfer to the same path -- both "
+            f"would create the same copy, and the loser only finds out "
+            f"after transferring everything."
+        ) from exc
+    except RemoteLockUnavailable as exc:
+        if skip_remote_lock:
+            logger.warning(
+                "Could not lock %s before receiving (%s), and "
+                "--skip-remote-lock was given, so this continues WITHOUT "
+                "protection against a concurrent transfer to the same path.",
+                destination,
+                exc,
+            )
+            yield "unprotected"
+            return
+        raise __util__.AbortError(
+            f"Could not lock {destination!r} before receiving: {exc}. "
+            f"Refusing to continue unprotected: a second transfer to the "
+            f"same path would collide. Pass --skip-remote-lock to proceed "
+            f"anyway."
+        ) from exc
+    manager._start_heartbeat(name)
+    try:
+        yield "acquired"
+    finally:
+        manager.release(name)

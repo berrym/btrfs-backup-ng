@@ -2074,19 +2074,58 @@ def _execute_transfers(
                 result.failed.append((best_snapshot, err))
                 continue
 
-        # Asked BEFORE the transfer, because afterwards there is no way to tell a
-        # partial this run wrote from a backup that was already sitting there.
-        preexisting = destination_artifact_exists(
-            destination_endpoint, best_snapshot.get_name()
-        )
-
-        # Set locks
-        source_endpoint.set_lock(best_snapshot, destination_id, True)
-        if parent:
-            source_endpoint.set_lock(parent, destination_id, True, parent=True)
-
-        invalid_artifact = False
+        # The destination's right to create this copy, held from before the
+        # authorship probe below through the commit and the cleanup of a failed
+        # transfer, and released in the ``finally``. Two transfers of one
+        # snapshot into one destination both read "absent, so ours" while the
+        # probe ran outside any lock; the loser then failed with "File exists"
+        # and its cleanup deleted the winner's committed copy. The second is
+        # now refused before its stream starts, as this snapshot's failure
+        # rather than the run's. Asked for AFTER the destination is known to
+        # exist, as the snapper layout does: against a missing target the lock
+        # would fail first and report a store that "could not be created"
+        # instead of the actual condition.
+        held = contextlib.ExitStack()
         try:
+            _ensure_destination_exists(destination_endpoint)
+            held.enter_context(
+                _receiving_lock(
+                    destination_endpoint,
+                    _received_artifact_of(destination_endpoint, best_snapshot),
+                )
+            )
+        except (__util__.SnapshotTransferError, __util__.AbortError) as e:
+            held.close()
+            logger.error("Not transferring %s: %s", best_snapshot, e)
+            failure = (
+                e
+                if isinstance(e, __util__.SnapshotTransferError)
+                else __util__.SnapshotTransferError(str(e))
+            )
+            result.failed.append((best_snapshot, failure))
+            continue
+
+        # Until the probe below has answered, under the lock, the copy is not
+        # this run's: the safe answer under uncertainty, and the one the probe
+        # itself gives when it cannot tell.
+        preexisting = True
+        invalid_artifact = False
+        # How the block ended, for the lock's own context managers (below).
+        caught: Optional[BaseException] = None
+        try:
+            # Asked BEFORE the transfer, because afterwards there is no way to
+            # tell a partial this run wrote from a backup that was already
+            # sitting there -- and under the lock, so the answer cannot change
+            # beneath this run.
+            preexisting = destination_artifact_exists(
+                destination_endpoint, best_snapshot.get_name()
+            )
+
+            # Set locks
+            source_endpoint.set_lock(best_snapshot, destination_id, True)
+            if parent:
+                source_endpoint.set_lock(parent, destination_id, True, parent=True)
+
             logger.info("Starting transfer of %s", best_snapshot)
             # A transfer that ends any way but a transfer error (handled
             # below) -- Ctrl-C, SIGTERM or SIGHUP, an unexpected exception --
@@ -2146,6 +2185,7 @@ def _execute_transfers(
             transferred_names.add(best_snapshot.get_name())
 
         except __util__.SnapshotTransferError as e:
+            caught = e
             logger.error("Snapshot transfer failed for %s: %s", best_snapshot, e)
             if release_on_failure:
                 logger.info("Releasing the pin on %s after the failure.", best_snapshot)
@@ -2174,7 +2214,8 @@ def _execute_transfers(
                     best_snapshot.get_name(),
                     created_by_this_run=not preexisting,
                 )
-        except BaseException:
+        except BaseException as fatal:
+            caught = fatal
             # Anything else that ends the transfer -- Ctrl-C, a signal turned
             # into SystemExit, an error no handler above names -- propagates,
             # but not with the pins still on the source. A restore's pin on a
@@ -2198,6 +2239,21 @@ def _execute_transfers(
                         release_error,
                     )
             raise
+        finally:
+            # The destination lock goes last, after the cleanup a failure ran
+            # above: nothing else may start creating this copy until what this
+            # run left of it is gone. Released as a ``with`` statement around
+            # this block would release it -- told how the block ended -- because
+            # the lock's own context managers act on that: an ssh destination
+            # removes the partial it received inside its lock
+            # (``undo_on_failure``), and the processes a receive started are
+            # stopped before the lock goes (``process_scope``). ``close()``
+            # would tell them the block succeeded, and the handled failure
+            # above is no longer in flight here for ``sys.exc_info`` to carry.
+            if caught is None:
+                held.close()
+            else:
+                held.__exit__(type(caught), caught, caught.__traceback__)
 
     # Report honestly: a "complete!" banner must not print when a transfer failed.
     if result.failed:
@@ -2588,16 +2644,20 @@ def _enumerate_snapper_btrfs_backups(destination_endpoint) -> list:
 
 
 def _receiving_lock(destination_endpoint, destination: str, lock_root: str = ""):
-    """The destination lock for ``destination``, or a no-op for a local target.
+    """The destination's lock on ``destination``: the right to create that copy.
 
-    Taken HERE rather than inside the endpoint's transfer methods. Those methods
-    are the quoting and stream-contract surface, exercised by unit tests that
-    have no remote to talk to; making each of them open a network lock would
-    have meant every such test acquiring one. The lock belongs with the
-    transaction, and the transaction is here.
+    Taken by the engine rather than inside the endpoint's transfer methods.
+    Those methods are the quoting and stream-contract surface, exercised by
+    unit tests that have no remote to talk to; making each of them open a
+    lock would have meant every such test acquiring one. The lock belongs with
+    the transaction, and the transaction is here.
 
-    Only remote endpoints record locks; a local one has no cross-machine
-    contention to guard against and no ``receiving_lock`` to call.
+    Every endpoint provides ``receiving_lock`` (one shared body, the endpoint's
+    own store); the engine takes it at the three places a receive can begin:
+    the transfer loop (``_execute_transfers``), a snapper slot opening
+    (``SnapperLayout.open_slot``) and a snapper backup into a raw store
+    (``_send_snapper_snapshot_to_raw_store``). An object with no
+    ``receiving_lock`` at all -- a test's stand-in -- is passed through.
 
     ``lock_root``, when given, pins where the lock is written. The snapper flow
     needs it: it repoints the endpoint at ``.snapshots/<n>.incoming`` for the
@@ -2669,6 +2729,23 @@ def _destination_subvolume(destination_endpoint, source_path) -> str:
         return str(own(source_path))
     dest = str(destination_endpoint.config.get("path", "")).rstrip("/")
     return f"{dest}/{_Path(str(source_path)).name}"
+
+
+def _received_artifact_of(destination_endpoint, snapshot) -> str:
+    """The destination artifact ``snapshot`` will be received as -- what its
+    receive lock is named for.
+
+    Through ``_destination_subvolume`` from the snapshot's path where it has
+    one, since the receive names the copy after the source basename and the
+    endpoint may normalise; by the snapshot's name otherwise, which for a
+    native snapshot is that basename. Identification never fails: a snapshot
+    that could not be named for its lock would stop the loop before any lock
+    was taken, and the shapes this loop is driven with vary (see
+    ``sshutil.lock.snapshot_lock_name`` for the same posture).
+    """
+    getter = getattr(snapshot, "get_path", None)
+    source_path = getter() if callable(getter) else snapshot.get_name()
+    return _destination_subvolume(destination_endpoint, source_path)
 
 
 def _snapper_prepare_slot(destination_endpoint, snapshot_num) -> None:
@@ -2913,6 +2990,41 @@ def _local_snapper_writer_lock(destination_endpoint, subject: str):
     return SnapperLayout(destination_endpoint).writer_lock(subject)
 
 
+def _send_snapper_snapshot_to_raw_store(
+    source_wrapper,
+    destination_endpoint,
+    parent_wrapper,
+    options: dict,
+    base_path: str,
+) -> None:
+    """A snapper backup into a raw store: one stream file, named by the backup
+    name, written under the stream's receive lock.
+
+    The raw counterpart of the slot lifecycle ``SnapperLayout`` runs for a
+    btrfs target. Raw has no slot to open, and this flow does not pass through
+    the transfer loop, so this is the one place its receive lock is taken --
+    under the name the stream is stored and pruned by. The destination is
+    checked first for the reason the layout checks it before its slot lock:
+    against a missing target the lock would fail first and report a store
+    that could not be created instead of the actual condition. Compression
+    and encryption are intrinsic to the raw endpoint, so the pipeline's own
+    compression is switched off here rather than applied twice.
+    """
+    _ensure_destination_exists(destination_endpoint)
+    raw_options = dict(options)
+    raw_options["compress"] = "none"
+    with _receiving_lock(
+        destination_endpoint,
+        f"{base_path.rstrip('/')}/{source_wrapper.get_name()}",
+    ):
+        send_snapshot(
+            source_wrapper,
+            destination_endpoint,
+            parent=parent_wrapper,
+            options=raw_options,
+        )
+
+
 def send_snapper_snapshot(
     snapper_snapshot,
     destination_endpoint,
@@ -3005,16 +3117,11 @@ def send_snapper_snapshot(
 
     try:
         if is_raw:
-            # Raw targets have no subvolumes: write one stream file named by the
-            # backup name. Compression/encryption are intrinsic to the raw
-            # endpoint, so avoid double-compressing in the pipeline.
-            raw_options = dict(options)
-            raw_options["compress"] = "none"
-            send_snapshot(
-                source_wrapper,
-                destination_endpoint,
-                parent=parent_wrapper,
-                options=raw_options,
+            # Raw targets have no subvolumes: one stream file named by the
+            # backup name, written under its receive lock by the raw
+            # counterpart of the layout below.
+            _send_snapper_snapshot_to_raw_store(
+                source_wrapper, destination_endpoint, parent_wrapper, options, base_path
             )
         else:
             # btrfs targets: a TRANSACTIONAL receive through the snapper layout,

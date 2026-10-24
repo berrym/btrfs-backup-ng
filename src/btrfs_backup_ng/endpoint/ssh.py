@@ -1109,73 +1109,37 @@ class SSHEndpoint(Endpoint):
         ``<n>`` -- two halves of one transaction on the same slot -- and the
         transfer beneath must not contend with its own caller.
         """
-        from ..sshutil.lock import (
-            RECEIVING_LOCK_PREFIX,
-            RemoteLockBusy,
-            RemoteLockUnavailable,
-        )
+        from ..sshutil.lock import hold_receiving_lock
 
         if self._lock_target_path() is None:
             yield
             return
 
-        name = f"{RECEIVING_LOCK_PREFIX}{destination}"
-        manager = self._lock_manager()
-        if manager.holds(name):
-            yield  # already held further up this call stack
-            return
-
-        try:
-            manager.acquire_once(name, f"receive:{destination}")
-        except RemoteLockBusy as exc:
-            # Built from the holder's details rather than by interpolating the
-            # exception, whose text repeats the destination and the lock name.
-            # An operator reading a wrapped three-line sentence to find a
-            # hostname is being made to work for it.
-            info = exc.info or {}
-            holder = "another process"
-            if info:
-                holder = (
-                    f"{info.get('hostname', 'an unknown host')} "
-                    f"(pid {info.get('pid', '?')})"
-                )
-            raise __util__.AbortError(
-                f"Already being received by {holder}: {destination}\n"
-                f"Refusing to start a second transfer to the same path -- both "
-                f"would create the same subvolume, and the loser only finds out "
-                f"after transferring everything."
-            ) from exc
-        except RemoteLockUnavailable as exc:
-            if self.config.get("skip_remote_lock"):
-                logger.warning(
-                    "Could not lock %s before receiving (%s), and "
-                    "--skip-remote-lock was given, so this continues WITHOUT "
-                    "protection against a concurrent transfer to the same path.",
-                    destination,
-                    exc,
-                )
+        # The body is the one every transport shares; what is this endpoint's
+        # own is the remote store (``_lock_manager``) and the cleanup below.
+        with hold_receiving_lock(
+            self._lock_manager,
+            destination,
+            skip_remote_lock=bool(self.config.get("skip_remote_lock")),
+        ) as mode:
+            if mode != "acquired":
+                # Held further up this call stack, or the operator opted out:
+                # the frame that took the lock owns the cleanup, and an
+                # unprotected receive has no lock to clean up under.
                 yield
                 return
-            raise __util__.AbortError(
-                f"Could not lock {destination!r} before receiving: {exc}. "
-                f"Refusing to continue unprotected: a second transfer to the "
-                f"same path would collide. Pass --skip-remote-lock to proceed "
-                f"anyway."
-            ) from exc
 
-        # Recorded while the lock is held and before anything is received: what
-        # is at the path now is not this run's work, and must survive this
-        # run's failure.
-        dest_dir, _, received = str(destination).rstrip("/").rpartition("/")
-        preexisted = self.artifact_exists(dest_dir or "/", received)
+            # Recorded while the lock is held and before anything is received:
+            # what is at the path now is not this run's work, and must survive
+            # this run's failure.
+            dest_dir, _, received = str(destination).rstrip("/").rpartition("/")
+            preexisted = self.artifact_exists(dest_dir or "/", received)
 
-        def remove_partial() -> None:
-            self._cleanup_partial_subvolume(
-                dest_dir or "/", received, created_by_this_run=not preexisted
-            )
+            def remove_partial() -> None:
+                self._cleanup_partial_subvolume(
+                    dest_dir or "/", received, created_by_this_run=not preexisted
+                )
 
-        manager._start_heartbeat(name)
-        try:
             # The order an interrupted or failed receive is unwound in (see
             # btrfs_backup_ng.lifecycle): the receive's processes are stopped
             # and waited for; then the partial subvolume THIS run created at
@@ -1184,8 +1148,6 @@ class SSHEndpoint(Endpoint):
             with lifecycle.undo_on_failure(remove_partial):
                 with lifecycle.process_scope():
                     yield
-        finally:
-            manager.release(name)
 
     def _read_locks(self) -> dict:
         """The locks recorded ON THIS TARGET, in the lock-file shape.

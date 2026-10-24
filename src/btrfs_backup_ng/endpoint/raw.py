@@ -28,7 +28,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional, TypedDict
 
-from btrfs_backup_ng import __util__
+from btrfs_backup_ng import __util__, lifecycle
 from btrfs_backup_ng.__logger__ import logger
 from btrfs_backup_ng.lifecycle import scoped as in_process_scope
 from btrfs_backup_ng.lifecycle import track as track_child
@@ -1847,6 +1847,37 @@ class RawEndpoint(Endpoint):
         return RemoteLockManager(
             run, path, hostname=socket.gethostname(), run_elevated=run_elevated
         )
+
+    @contextlib.contextmanager
+    def receiving_lock(
+        self, destination: str, *, timeout: float | None = None
+    ) -> Iterator[None]:
+        """Hold the right to write the stream ``destination`` at this location
+        for the span of its receive and commit.
+
+        One stream, not the whole target: ``target_lock`` still serialises the
+        commit's rename and sidecar write against ``raw backfill-metadata`` and
+        ``raw encrypt``, which rewrite many sidecars at once; this lock is the
+        receive-to-commit span of a single stream, so a second transfer of the
+        same stream is refused before it sends anything, and a prune of that
+        stream cannot run while it is being written. Lives in the store the
+        location's pins already live in (``_lock_manager``), which for the
+        raw+ssh subclass is on the remote -- that subclass inherits this as
+        it is. The body is ``sshutil.lock.hold_receiving_lock``, shared with
+        every other transport.
+        """
+        if self._lock_target_path() is None:
+            yield
+            return
+        from ..sshutil.lock import hold_receiving_lock
+
+        with hold_receiving_lock(
+            self._lock_manager,
+            destination,
+            skip_remote_lock=bool(self.config.get("skip_remote_lock")),
+        ):
+            with lifecycle.process_scope():
+                yield
 
     def protect_incremental_parents(
         self, to_keep: list, to_delete: list

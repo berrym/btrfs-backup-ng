@@ -316,8 +316,9 @@ class SnapperLayout:
 
     The slot lifecycle is the one thing here, and both directions run it:
 
-    - ``open_slot(n)``: the target must exist; the slot lock the destination
-      offers (ssh:// targets have one, a local one none) is taken for slot n;
+    - ``open_slot(n)``: the target must exist; the destination's slot lock
+      (every transport has one; the local target's lives in its own store
+      under the target) is taken for slot n;
       a ``.incoming`` left by a crashed run is removed; ``.snapshots/<n>.incoming``
       is created below the target; the endpoint is pointed at it, so a
       ``btrfs receive`` through the endpoint lands ``<n>.incoming/snapshot``.
@@ -558,10 +559,10 @@ class SnapperLayout:
         """One writer at a time below this ``.snapshots`` tree: a restore
         into a config, or a snapper backup into a local target.
 
-        A local target has no receive lock (``_receiving_lock`` is a no-op),
-        and the next free number counts only numeric entries, so two writers
-        would both pick n and the second's open_slot would remove the first's
-        in-flight ``<n>.incoming`` as "a temp a crashed run left". An
+        The receive lock is per SLOT and is taken as a slot opens; the next
+        free number is chosen before that, counting only numeric entries, so
+        two writers would both pick n -- and the loser would learn it slot by
+        slot. This lock refuses the second writer up front instead. An
         exclusive flock on ``.snapshots/WRITER_LOCK_NAME``
         (``__util__.exclusive_lock``, timeout 0) is held for the whole run: a
         second writer is refused at once with words, and the kernel drops the
@@ -757,6 +758,17 @@ class _SlotReceiver:
         every source, so it gives it.
         """
         return f"{str(self._endpoint.config['path']).rstrip('/')}/snapshot"
+
+    def receiving_lock(self, destination: str, *, timeout: float | None = None) -> Any:
+        """The executor takes the destination's receive lock before it asks
+        whether a copy pre-exists. Through this receiver that lock is the
+        SLOT's, and the slot is chosen as the receive starts (``open_slot``,
+        from ``next_number``) -- so before ``receive()`` there is no slot to
+        name, and ``_receive_destination`` would answer with the config's own
+        ``<base>/snapshot``, one key shared by every copy. The layout takes
+        the real lock in ``open_slot`` and holds it through the publish; the
+        executor's call is answered with nothing to hold."""
+        return contextlib.nullcontext()
 
     def list_snapshots(self, flush_cache: bool = False) -> list:
         return []

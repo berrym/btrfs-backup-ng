@@ -14,7 +14,7 @@ from typing import Any, Callable, Dict, Iterator, List, Optional, Set, Tuple
 
 from filelock import FileLock
 
-from btrfs_backup_ng import __util__
+from btrfs_backup_ng import __util__, lifecycle
 from btrfs_backup_ng.__logger__ import logger
 from btrfs_backup_ng.core.estimate import SizeEstimate
 from btrfs_backup_ng.core.space import SpaceInfo
@@ -618,18 +618,72 @@ class Endpoint:
     def receiving_lock(
         self, destination: str, *, timeout: float | None = None
     ) -> Iterator[None]:
-        """The destination-side receive-lock seam: the right to write
-        ``destination`` on this target for the span of a receive and its commit.
+        """Hold the right to create ``destination`` on this target for the
+        span of a receive and its commit.
 
         The transfer engine takes this through ``core.operations._receiving_lock``
-        around every receive. The base is a no-op: a plain local btrfs target has no
-        cross-machine contention today, and the raw endpoints guard a stream with a
-        unique ``O_EXCL`` ``.part`` name. ``SSHEndpoint`` overrides it with a
-        heartbeated per-subvolume lease. Declaring it here turns a duck-typed hook
-        into an explicit contract: the single destination-locking seam the
-        per-artifact locking work unifies and extends to every transport.
+        before it asks whether the copy pre-exists, and holds it through the
+        commit and the cleanup of a failed transfer. Two transfers of one
+        snapshot into one local destination used to both read "absent, so
+        ours" from a probe made outside any lock; the loser then failed with
+        "File exists" and its cleanup deleted the winner's committed copy.
+
+        One body serves every transport (``sshutil.lock.hold_receiving_lock``);
+        this endpoint supplies the store: a lock manager over the location --
+        ``lock_root`` where the snapper flow has set it, else ``path`` -- in a
+        directory of its own (``RECEIVING_DIR_NAME``), so that creating it can
+        never turn the location's lock FILE into a directory store and hide the
+        pins recorded there. Per artifact, heartbeated, re-entrant within a
+        process, non-blocking: a second receive of the same copy is refused at
+        once with the holder named. ``timeout`` is accepted for signature
+        parity with the ssh endpoint's override and is not a wait. The ssh
+        endpoint overrides this to use its remote store and to clean up its
+        own partial inside the lock; the raw endpoint to use the store its
+        pins live in.
         """
-        yield
+        if self._receive_lock_root() is None:
+            yield
+            return
+        from ..sshutil.lock import hold_receiving_lock
+
+        with hold_receiving_lock(
+            self._receive_lock_manager,
+            destination,
+            skip_remote_lock=bool(self.config.get("skip_remote_lock")),
+        ):
+            # Processes this receive starts are stopped and waited for before
+            # the lock is released, so no other transfer can begin creating
+            # the path while a stream is still arriving.
+            with lifecycle.process_scope():
+                yield
+
+    def _receive_lock_root(self) -> Optional[str]:
+        """The directory this endpoint's receive locks live under, or None.
+
+        ``lock_root`` wins where it is set: the snapper flow points ``path``
+        at ``.snapshots/<n>.incoming`` for the duration of a receive, and a
+        lock root that followed it would be written inside the slot being
+        published and renamed into place along with it.
+        """
+        path = self.config.get("lock_root") or self.config.get("path")
+        if path in (None, ""):
+            return None
+        return str(path)
+
+    def _receive_lock_manager(self) -> Any:
+        """The one lock manager for this location's receive locks, built over
+        ``RECEIVING_DIR_NAME`` and shared per root path (``cached_manager``:
+        ``holds()`` and the heartbeat belong to one instance)."""
+        from ..sshutil.lock import RECEIVING_DIR_NAME, cached_manager, local_manager
+
+        root = self._receive_lock_root()
+        if root is None:
+            raise ValueError("this location has no path; cannot lock a receive")
+        return cached_manager(
+            self,
+            f"{root}#receiving",
+            lambda: local_manager(root, dir_name=RECEIVING_DIR_NAME),
+        )
 
     def list_snapshots(self, flush_cache: bool = False) -> List[Any]:
         """
