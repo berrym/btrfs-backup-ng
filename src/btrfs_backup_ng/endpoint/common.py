@@ -1036,7 +1036,8 @@ class Endpoint:
         never raises.
 
         This base implementation is the btrfs (uuid) semantics used by Local and SSH
-        endpoints; raw endpoints override it with name semantics.
+        endpoints; raw endpoints override it with their own rule, the name and the
+        source the stored stream was sent from.
         """
         stream_uuid = getattr(snapshot, "stream_uuid", "")
         if not stream_uuid:

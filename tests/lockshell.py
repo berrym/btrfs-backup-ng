@@ -26,7 +26,9 @@ _real_popen = subprocess.Popen
 
 
 class _Result:
-    def __init__(self, returncode: int, stdout: bytes, stderr: bytes) -> None:
+    def __init__(
+        self, returncode: int, stdout: bytes | str, stderr: bytes | str
+    ) -> None:
         self.returncode = returncode
         self.stdout = stdout
         self.stderr = stderr
@@ -111,7 +113,16 @@ def local_remote(sandbox: Path, remote_root: str = "/backup"):
 
     def run(cmd, *args, **kwargs):
         script = str(cmd[-1]).replace(remote_root, str(sandbox))
-        return _exec(script, kwargs.get("input"))
+        result = _exec(script, kwargs.get("input"))
+        if kwargs.get("text") or kwargs.get("universal_newlines"):
+            # As subprocess.run does: text mode hands back str, and the remote
+            # listing reads its find and cat output that way.
+            return _Result(
+                result.returncode,
+                result.stdout.decode(errors="replace"),
+                result.stderr.decode(errors="replace"),
+            )
+        return result
 
     return run
 

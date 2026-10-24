@@ -90,9 +90,12 @@ destination's id, as a parent pin.
 same snapshot as one on the source, rather than merely one with the same name.
 
 **Technical.** For btrfs destinations, the destination copy's `received_uuid`
-must equal the source snapshot's stream uuid; for raw destinations the name is
-the identity. Presence on a destination is decided by this rule and nothing
-else, so a re-created snapshot with an old name is correctly absent. The planner
+must equal the source snapshot's stream uuid; for raw destinations the stream
+is found by its name and must have been sent from the same source, as far as
+its sidecar and the source snapshot record it (a stream whose record names no
+source is matched by name alone). Presence on a destination is decided by this
+rule and nothing else, so a re-created snapshot with an old name is correctly
+absent, and so is another volume's stream under a shared prefix. The planner
 and the reconcile share one presence authority so they cannot disagree.
 
 **Code.** `btrfs_backup_ng.endpoint.common:Endpoint.correspondent_of`,
@@ -102,8 +105,9 @@ From `src/btrfs_backup_ng/core/planning.py`:
 
 ```python
     Presence is decided purely by correspondence -- ``received_uuid == stream_uuid`` for
-    btrfs, name for raw -- via the polymorphic ``correspondent_of`` (which never raises; a listing
-    failure yields None -> absent). This is the shared presence authority used by both the
+    btrfs, the name and the source the stream was sent from for raw -- via the polymorphic
+    ``correspondent_of`` (which never raises; a listing failure yields None -> absent). This
+    is the shared presence authority used by both the
 ```
 
 ### Plan

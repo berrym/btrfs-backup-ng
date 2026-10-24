@@ -102,6 +102,41 @@ def _identity_value(snapshot: RawSnapshot, kind: str) -> str:
     return dict(_identity_tokens(snapshot)).get(kind, "")
 
 
+def _stream_uuid_of(snapshot: Any) -> str:
+    """The uuid the stream of ``snapshot`` carries, or an empty string when it
+    is not known: a source whose identity was never read, a record written
+    before the uuid was recorded, a stream listed from its filename alone."""
+    return getattr(snapshot, "stream_uuid", "") or ""
+
+
+def _from_the_same_source(snapshot: Any, stored: Any) -> bool:
+    """Whether ``stored``, a stream this location holds, can be the backup of
+    ``snapshot``: the uuid each carries is the same, or is unknown on either
+    side. Two volumes sharing a snapshot prefix name their streams alike, and
+    a name alone cannot tell one volume's backup from the other's; the uuid
+    can, when both sides recorded one."""
+    ours, theirs = _stream_uuid_of(snapshot), _stream_uuid_of(stored)
+    return not ours or not theirs or ours == theirs
+
+
+def _named(listing: Any, name: str) -> list[RawSnapshot]:
+    """Every stream in ``listing`` stored under ``name``. A location holds
+    one stream per name; two is a store that was written by something other
+    than this tool, and each caller decides what that means."""
+    return [stored for stored in listing if stored.get_name() == name]
+
+
+def _corresponding(snapshot: Any, listing: Any) -> Optional[RawSnapshot]:
+    """The stream in ``listing`` that is the backup of ``snapshot``: stored
+    under its name, and sent from the same source as far as either side knows.
+    This is raw correspondence, the one rule for presence at and parent
+    selection against a raw location."""
+    for stored in _named(listing, snapshot.get_name()):
+        if _from_the_same_source(snapshot, stored):
+            return stored
+    return None
+
+
 # Environment variable for OpenSSL passphrase (compatible with btrbk)
 OPENSSL_PASSPHRASE_ENV = "BTRFS_BACKUP_PASSPHRASE"
 BTRBK_PASSPHRASE_ENV = "BTRBK_PASSPHRASE"
@@ -676,43 +711,48 @@ class RawEndpoint(Endpoint):
     ) -> Optional[RawSnapshot]:
         """The stream this location stores under ``name``, or None.
 
-        The one by-name lookup over this store's own listing, which is how a
-        raw location answers every question of identity: correspondence, the
-        parent an increment needs, whether a copy pre-exists, and whether the
-        parent a commit is about to publish against is still there. ``live``
-        drops the cached listing first, for the question whose answer has to
-        be this moment's. Raises what the listing raises; each caller has its
-        own posture under doubt.
+        The one by-name lookup over this store's own listing, for the
+        questions a name answers: the parent an increment's sidecar names,
+        whether a copy pre-exists, and whether the parent a commit is about
+        to publish against is still there. Whether a stream is the backup of a
+        given snapshot is a different question (``correspondent_of``: the name
+        and the source). ``live`` drops the cached listing first, for the
+        question whose answer has to be this moment's. Raises what the listing
+        raises; each caller has its own posture under doubt.
         """
-        for candidate in self.list_snapshots(flush_cache=live):
-            if candidate.get_name() == name:
-                return candidate
-        return None
+        return next(iter(_named(self.list_snapshots(flush_cache=live), name)), None)
 
     def correspondent_of(self, snapshot: Any) -> Optional[Any]:
-        """Raw override of :meth:`Endpoint.correspondent_of` -- NAME semantics.
+        """Raw override of :meth:`Endpoint.correspondent_of`: the stream stored
+        under the snapshot's name, sent from the same source.
 
-        A raw backup is a self-contained ``btrfs send`` stream written to a file; there is
-        no ``btrfs receive`` on the destination and therefore no ``received_uuid`` to match.
-        Correspondence for raw targets is by snapshot name (the sidecar also records the
-        parent by name), which is correct because a raw stream is replayed by name/order at
-        restore time. Returns the raw backup with the same name, or ``None`` (never raises).
+        A raw backup is a self-contained ``btrfs send`` stream written to a
+        file; nothing receives it at the destination, so there is no
+        ``received_uuid`` to match, and the stream is found by its name, which
+        is also how its sidecar names its parent and how a restore replays the
+        chain. The name alone cannot tell two volumes apart when they share a
+        snapshot prefix into one location: the second volume's planner found
+        the first volume's stream under its own name, called the second volume
+        backed up, and never sent it (#138). So the stream's record is asked
+        which source it was sent from (``source_uuid``, the uuid the stream
+        carries) and a stream from a different source is not this snapshot's
+        backup. A record or a source whose identity is unknown is matched by
+        name alone, which is all that can be asked of it. Returns the backup,
+        or ``None`` (never raises).
         """
         get_name = getattr(snapshot, "get_name", None)
         if not callable(get_name):
             return None
         try:
-            return self._stored_by_name(get_name())
+            return _corresponding(snapshot, self.list_snapshots())
         except Exception as e:  # noqa: BLE001 - contract: never raise; None is safe
             logger.debug("correspondent_of: could not resolve correspondent (%s)", e)
         return None
 
     def correspondents_of(self, snapshots: list[Any]) -> dict[str, Any]:
-        """Raw override of :meth:`Endpoint.correspondents_of` -- NAME semantics.
-
-        Same rule as the singular raw form (a raw backup has no ``received_uuid``
-        to match, so correspondence is by name), over a listing taken once rather
-        than once per snapshot. Never raises.
+        """Raw override of :meth:`Endpoint.correspondents_of`: the singular
+        form's rule (the name, and the source the stream was sent from), over
+        a listing taken once rather than once per snapshot. Never raises.
         """
         try:
             candidates = self.list_snapshots()
@@ -720,7 +760,7 @@ class RawEndpoint(Endpoint):
             logger.debug("correspondents_of: could not list snapshots (%s)", e)
             return {}
 
-        by_name: dict[str, Any] = {}
+        by_name: dict[str, list[Any]] = {}
         for candidate in candidates:
             # A listing entry without a name is skipped, not fatal: this method
             # promises never to raise, and three callers rely on that.
@@ -728,7 +768,7 @@ class RawEndpoint(Endpoint):
             if not callable(candidate_name):
                 continue
             try:
-                by_name.setdefault(candidate_name(), candidate)
+                by_name.setdefault(candidate_name(), []).append(candidate)
             except Exception as exc:  # noqa: BLE001 - contract: never raise
                 logger.debug("correspondents_of: unusable listing entry (%s)", exc)
 
@@ -742,9 +782,10 @@ class RawEndpoint(Endpoint):
             except Exception as exc:  # noqa: BLE001 - contract: never raise
                 logger.debug("correspondents_of: unusable source entry (%s)", exc)
                 continue
-            match = by_name.get(name)
-            if match is not None:
-                found[name] = match
+            for match in by_name.get(name, ()):
+                if _from_the_same_source(snapshot, match):
+                    found[name] = match
+                    break
         return found
 
     def required_parent_of(self, snapshot: Any) -> Optional[Any]:
@@ -997,17 +1038,68 @@ class RawEndpoint(Endpoint):
             return None
         return _identity_token(parent) if parent is not None else None
 
-    def _require_parent_at_commit(self) -> None:
+    def _require_publishable_at_commit(self) -> None:
+        """The questions a commit asks of the store before it renames the
+        stream into place, from one listing taken inside the target lock.
+
+        The lock is the one a prune of this location holds while it deletes
+        and a peer's commit holds while it publishes, so an answer read under
+        it cannot be overtaken before the rename. A listing that cannot be
+        read refuses the commit: the stream stays an uncommitted ``.part``,
+        removed by the transfer's own cleanup, and the next run sends it again.
+        """
+        stored = self.list_snapshots(flush_cache=True)
+        self._refuse_another_sources_name(stored)
+        self._require_parent_at_commit(stored)
+
+    def _refuse_another_sources_name(self, stored: list[RawSnapshot]) -> None:
+        """Refuse to publish over a stream this source cannot be shown to own.
+
+        The commit is a replacing rename. Two volumes sharing a snapshot prefix
+        into one location name their streams alike, so the second volume's
+        commit renamed its stream over the first volume's and reported a
+        success, leaving one backup for two volumes (#138). A stream already
+        under this name is asked which source it was sent from: the same
+        source is refreshing its own backup and may; a different source may
+        not; a stream that records no source (a sidecar written before the
+        uuid was recorded, a stream listed from its filename alone) cannot be
+        told from another volume's and is refused too, since overwriting an
+        unconfirmable backup is the loss being removed.
+        """
+        pending = self._pending_metadata
+        name = pending["name"]
+        ours = pending.get("source_uuid") or ""
+        where = self.config.get("path")
+        for existing in _named(stored, name):
+            theirs = _stream_uuid_of(existing)
+            if not theirs:
+                raise RuntimeError(
+                    f"a stream is already at {where} under the name {name}, and "
+                    f"nothing records which source it was sent from, so it cannot "
+                    f"be confirmed to be this one's: refusing to overwrite a backup "
+                    f"that cannot be told from another volume's; move or remove it, "
+                    f"or give this volume a snapshot prefix of its own"
+                )
+            if theirs != ours:
+                raise RuntimeError(
+                    f"a stream is already at {where} under the name {name}, sent "
+                    f"from {theirs}; this one was sent from "
+                    f"{ours or 'a source whose identity is unknown'}: refusing to "
+                    f"overwrite another source's backup; give each volume sharing "
+                    f"this location a snapshot prefix of its own"
+                )
+
+    def _require_parent_at_commit(self, stored: list[RawSnapshot]) -> None:
         """Refuse to publish an increment whose parent is not the one it was
         received against, or is no longer here.
 
-        Asked inside the target lock, before the rename, from a listing taken
-        at that moment: the same lock a prune of this location holds while it
-        deletes, so nothing this tool does can take the parent between the
-        answer and the publish. The parent's pin covers the receive (the
-        engine pins the destination's copy of the parent for the span of the
-        send); this covers what a pin cannot: a parent removed by hand, by a
-        tool that reads no pins, or after a pin was judged stale.
+        Asked inside the target lock, before the rename, from ``stored``, the
+        listing taken at that moment: the same lock a prune of this location
+        holds while it deletes, so nothing this tool does can take the parent
+        between the answer and the publish. The parent's pin covers the
+        receive (the engine pins the destination's copy of the parent for the
+        span of the send); this covers what a pin cannot: a parent removed by
+        hand, by a tool that reads no pins, or after a pin was judged stale.
 
         An increment stored here applies only onto its parent, and nothing at
         this location can regenerate a full stream in its place, so a stream
@@ -1017,9 +1109,7 @@ class RawEndpoint(Endpoint):
         of another snapshot) is the same loss one step later: the increment
         would be restored onto the wrong base. The two are told apart in the
         message. A parent whose record carries no identity can only be asked
-        to be present. A listing that cannot be read refuses the commit too:
-        the stream stays an uncommitted ``.part``, removed by the transfer's
-        own cleanup, and the next run sends it again.
+        to be present.
         """
         pending = self._pending_metadata
         parent_name = pending.get("parent_name")
@@ -1027,7 +1117,7 @@ class RawEndpoint(Endpoint):
             return
         child = pending["name"]
         where = self.config.get("path")
-        parent = self._stored_by_name(parent_name, live=True)
+        parent = next(iter(_named(stored, parent_name)), None)
         if parent is None:
             raise RuntimeError(
                 f"{child} was received against {parent_name}, which is no longer "
@@ -1198,9 +1288,10 @@ class RawEndpoint(Endpoint):
         ``discover_raw_snapshots`` ignores -- so a partial transfer can never be
         mistaken for a complete backup.
 
-        An increment is published only if its parent is still here and is the
-        stream the receive began against (``_require_parent_at_commit``), asked
-        under the target lock just before the rename.
+        The stream is published only if nothing another source wrote is under
+        its name and, for an increment, its parent is still here and is the
+        stream the receive began against (``_require_publishable_at_commit``),
+        asked under the target lock just before the rename.
 
         Raises on failure so the engine treats an un-published stream as a
         failed transfer rather than reporting a success that is not on disk.
@@ -1242,7 +1333,7 @@ class RawEndpoint(Endpoint):
         # before the sidecar is written (and mislabel it). This section is sub-second
         # (a metadata rename + a directory fsync + a small sidecar write).
         with self.target_lock():
-            self._require_parent_at_commit()
+            self._require_publishable_at_commit()
             os.replace(part_path, final_path)
             # Persist the rename itself.
             self._fsync_dir(final_path.parent)
@@ -2961,11 +3052,13 @@ class SSHRawEndpoint(RawEndpoint):
         The receive pipeline writes to a remote ``.part`` file; once the engine
         confirms success we ``sync`` the remote filesystem and ``mv -f`` the
         ``.part`` file to its final name. A crash leaves only the ``.part`` file,
-        which discovery ignores. An increment is published only if its parent
-        is still on the remote and is the stream the receive began against
-        (``_require_parent_at_commit``, inherited: the listing it asks is this
-        endpoint's remote one), under the target lock. Raises on failure so an
-        un-published stream is treated as a failed transfer.
+        which discovery ignores. The stream is published only if nothing
+        another source wrote is under its name on the remote and, for an
+        increment, its parent is still there and is the stream the receive
+        began against (``_require_publishable_at_commit``, inherited: the
+        listing it asks is this endpoint's remote one), under the target lock.
+        Raises on failure so an un-published stream is treated as a failed
+        transfer.
         """
         pending = getattr(self, "_pending_metadata", None)
         # No receive() has run on this endpoint (dummy init) -> nothing to publish.
@@ -3000,7 +3093,7 @@ class SSHRawEndpoint(RawEndpoint):
         # not a rename -- and its peers can be on other machines, where a flock would
         # not have helped anyway. This section is now metadata-only and sub-second.
         with self.target_lock():
-            self._require_parent_at_commit()
+            self._require_publishable_at_commit()
             result = self._exec_remote_command(["sh", "-c", mv_script], check=False)
             if result.returncode != 0:
                 stderr = result.stderr

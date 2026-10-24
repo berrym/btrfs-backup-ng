@@ -75,7 +75,7 @@ See the [LICENSE](LICENSE) file for full copyright attribution.
   backup with `--backup-name` or `--date` (`--snapshot N` restores the newest and warns)
 - **Pre/Post Pairs**: Supports single, pre, and post snapshot types
 - **Incremental Transfers**: Efficient delta-based transfers between snapshots, with the parent
-  matched by btrfs UUID correspondence (name for raw targets) — so a re-created snapshot with the
+  matched by btrfs UUID correspondence (name and source for raw targets) — so a re-created snapshot with the
   same name but new content is correctly treated as new, never reused as an incorrect parent
 - **Generate Config**: Auto-generate TOML config from existing Snapper setup
 

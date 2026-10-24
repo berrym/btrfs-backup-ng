@@ -4,9 +4,10 @@ This is the single authority for the transfer plan, in both directions: a backup
 run plans with it, and so does a restore (a transfer with the roles swapped).
 Presence on the destination and incremental-parent validity are decided STRICTLY
 by ``destination_endpoint.correspondent_of`` -- the btrfs
-``received_uuid``/``stream_uuid`` correspondence (or name, for raw targets, where
-the override makes name the native identity), NEVER the on-disk name, which can
-collide (a re-created snapshot reuses the name but has a new uuid). There is
+``received_uuid``/``stream_uuid`` correspondence (or, for raw targets, the name
+together with the source the stored stream was sent from, as the override
+defines it), NEVER the on-disk name alone, which can collide (a re-created
+snapshot reuses the name but has a new uuid). There is
 deliberately no name-based fallback for btrfs: identity comes from uuids that
 enumeration sudo-escalates to read (see ``Endpoint._load_subvolume_ids_into``),
 so a missing uuid is an enrichment problem to fix at the source, not a reason to
@@ -36,8 +37,9 @@ def snapshots_present_on(source_snapshots, destination_endpoint):
     """Return the set of source-snapshot *names* already present on the destination.
 
     Presence is decided purely by correspondence -- ``received_uuid == stream_uuid`` for
-    btrfs, name for raw -- via the polymorphic ``correspondent_of`` (which never raises; a listing
-    failure yields None -> absent). This is the shared presence authority used by both the
+    btrfs, the name and the source the stream was sent from for raw -- via the polymorphic
+    ``correspondent_of`` (which never raises; a listing failure yields None -> absent). This
+    is the shared presence authority used by both the
     transfer planner and the persistent-lock reconcile, so the two can never disagree. A
     re-created snapshot (same name, new uuid) is correctly absent, never a name coincidence.
     """
@@ -46,9 +48,9 @@ def snapshots_present_on(source_snapshots, destination_endpoint):
     # about three seconds each, so a 44-snapshot source spent over two minutes
     # here before transferring anything (issue #106). Semantics are unchanged:
     # correspondents_of applies the same per-endpoint rule (received_uuid for
-    # btrfs, name for raw) and never raises.
+    # btrfs, name and source for raw) and never raises.
     # Called directly rather than probed for. Every endpoint inherits
-    # correspondents_of from Endpoint (raw overrides it with name semantics), so
+    # correspondents_of from Endpoint (raw overrides it with its own rule), so
     # a getattr/callable probe would only ever be accommodating a test double --
     # and it silently mis-fires on one: a bare MagicMock auto-creates the
     # attribute, so the probe took the batch path and called a Mock.
@@ -207,7 +209,7 @@ def plan_transfer_sequence(
     each snapshot to transfer, the parent is the newest source snapshot ordered BEFORE it --
     by creation time, then source-enumeration position to break same-second ties (see
     ``_order_key``) -- that is (or, within this run, will be) present on the destination by
-    correspondence (uuid for btrfs, name for raw), so ``btrfs receive`` can resolve the
+    correspondence (uuid for btrfs, name and source for raw), so ``btrfs receive`` can resolve the
     ``send -p``; if none qualifies the snapshot is sent in full. Correspondence is the only
     presence/parent authority -- a snapshot the destination cannot verifiably resolve is never
     used as a parent.
@@ -312,7 +314,7 @@ def plan_transfer_sequence(
             )
             for candidate in older_newest_first:
                 # A valid incremental parent must have a verified correspondent on the
-                # destination (uuid for btrfs, name for raw) -- never a bare name match --
+                # destination (uuid for btrfs, name and source for raw) -- never a bare name match --
                 # counting in-run transfers already planned before this one.
                 if candidate.get_name() in projected_present:
                     parent = candidate
