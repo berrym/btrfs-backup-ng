@@ -72,6 +72,17 @@ class ReceivingLockBusy(AbortError):
         self.holder = holder
 
 
+class ReceiveLeaseLost(SnapshotTransferError):
+    """This run's receiving lock on a slot no longer stands in the store.
+
+    A holder stalled past the stale threshold has had its lock broken and
+    taken by another run; what is in the slot now is that run's work. Raised
+    where this run was about to publish or remove the slot, which it refuses
+    to do (``core.operations._require_slot_lease``). A transfer failure like
+    any other: the run exits non-zero and nothing chained on it is started.
+    """
+
+
 class InsufficientSpaceError(AbortError):
     """Destination has insufficient space for the transfer.
 

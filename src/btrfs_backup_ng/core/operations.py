@@ -2841,6 +2841,138 @@ def _received_artifact_of(destination_endpoint, snapshot) -> str:
     return _destination_subvolume(destination_endpoint, source_path)
 
 
+def _lock_store_of(destination_endpoint):
+    """The manager over the store ``destination_endpoint``'s receiving locks
+    live in, or None where it has none to offer: an endpoint without a lock
+    store, or a stand-in."""
+    manager_of = getattr(destination_endpoint, "_receive_lock_manager", None)
+    if not callable(manager_of):
+        return None
+    try:
+        return manager_of()
+    except Exception as e:  # noqa: BLE001 - no store is an answer, reported by the caller
+        logger.debug("No lock store for %s: %s", destination_endpoint, e)
+        return None
+
+
+def _slot_lease(destination_endpoint, destination: str):
+    """The lease this process holds on ``destination``'s receiving lock -- the
+    manager it was taken through and the lock's name -- or None where no lock
+    of this process's covers it: an endpoint with no lock store, a stand-in,
+    or the operator's opt-out. Taken as the slot opens and asked again before
+    every action on the slot (``_require_slot_lease``)."""
+    from ..sshutil.lock import RECEIVING_LOCK_PREFIX
+
+    manager = _lock_store_of(destination_endpoint)
+    if manager is None:
+        return None
+    name = f"{RECEIVING_LOCK_PREFIX}{destination}"
+    holds = getattr(manager, "holds", None)
+    if not callable(holds) or holds(name) is not True:
+        return None
+    return manager, name
+
+
+def _slot_lease_lost(lease, snapshot_num, slot_dir: str) -> Optional[str]:
+    """Why this run may no longer act on slot ``snapshot_num``, or None while
+    its lease stands -- or where there is no lease to ask.
+
+    The receive lock on a slot is a lease: a holder whose beat lapses past
+    the stale threshold (suspended, swapped out, a long ``sudo -n``) is
+    broken by the next run, which then receives into the same slot. Until
+    now the lease was enforced only at the door. The stale-broken holder,
+    waking, removed the slot as its own failed receive or published what was
+    in it as its own copy -- the successor's partial, a read-write subvolume
+    with no received_uuid (#143). So the store is asked whether the lease
+    still stands immediately before each such action; a holder that lost it
+    owns nothing in the slot and touches nothing. A store that cannot be
+    asked is a lease that cannot be confirmed, refused the same way.
+    """
+    if lease is None:
+        return None
+    manager, name = lease
+    standing = manager.is_owner(name)
+    if standing is True:
+        return None
+    if standing is False:
+        return (
+            f"lost the receive lease on slot {snapshot_num} ({slot_dir}): another "
+            f"run broke it as stale while this one was stalled, and holds the "
+            f"slot now"
+        )
+    return (
+        f"the receive lease on slot {snapshot_num} ({slot_dir}) could not be "
+        f"confirmed: the lock store could not be read"
+    )
+
+
+def _require_slot_lease(lease, snapshot_num, slot_dir: str, action: str) -> None:
+    """Refuse ``action`` on the slot unless this run's lease on it stands."""
+    lost = _slot_lease_lost(lease, snapshot_num, slot_dir)
+    if lost is not None:
+        raise __util__.ReceiveLeaseLost(f"{lost}; refusing to {action} it")
+
+
+def _clear_leftover_slot(destination_endpoint, snapshot_num) -> None:
+    """Remove a ``.snapshots/{num}.incoming`` left by a run that is gone, and
+    refuse one that may belong to a receive still in progress.
+
+    The slot lock has just been taken, so whatever is in the slot was left by
+    a holder that is no longer holding it: a run that crashed, or one whose
+    lease was broken as stale. The two look alike by path; they differ by
+    when the slot was last written. A receive that is still arriving keeps
+    writing into ``.incoming/snapshot``. So the slot's last write is judged
+    by the same clock a lease is judged by -- the store's own, read from a
+    probe (``RemoteLockManager.age_of``) -- against the same threshold: a
+    slot written within ``stale_after`` seconds may be a live receive and is
+    refused, not removed, and this run does not receive into it either; an
+    older one is a leftover and is removed; one whose age cannot be read
+    cannot be told from live and is refused too.
+    """
+    base = f"{str(destination_endpoint.config['path']).rstrip('/')}/.snapshots"
+    q = shlex.quote
+    incoming_dir = f"{base}/{snapshot_num}.incoming"
+    incoming_sub = f"{incoming_dir}/snapshot"
+    script = (
+        f"if [ -e {q(incoming_sub)} ]; then echo SUBVOL; "
+        f"elif [ -e {q(incoming_dir)} ]; then echo DIR; else echo ABSENT; fi"
+    )
+    rc, out = _snapper_run_shell(destination_endpoint, script)
+    lines = [line.strip() for line in (out or "").splitlines() if line.strip()]
+    found = lines[-1] if lines else ""
+    if rc != 0 or found not in ("SUBVOL", "DIR", "ABSENT"):
+        raise __util__.SnapshotTransferError(
+            f"could not look at {incoming_dir} before opening slot {snapshot_num}: "
+            f"the destination's shell did not answer (exit {rc})"
+        )
+    if found == "ABSENT":
+        return
+    written = incoming_sub if found == "SUBVOL" else incoming_dir
+    store = _lock_store_of(destination_endpoint)
+    age = store.age_of(written) if store is not None else None
+    if age is None:
+        raise __util__.SnapshotTransferError(
+            f"{incoming_dir} is there, and when it was last written could not be "
+            f"read against the target's clock, so it cannot be told from a receive "
+            f"still in progress; refusing to remove it or to receive into it. If no "
+            f"other run is receiving into slot {snapshot_num}, remove {incoming_dir} "
+            f"by hand and run again."
+        )
+    if age <= store.stale_after:
+        raise __util__.SnapshotTransferError(
+            f"{incoming_dir} was written {age}s ago, by a receive that may still be "
+            f"in progress; refusing to remove it or to receive into it. A run that "
+            f"is gone leaves it to age past {store.stale_after}s, after which the "
+            f"next run removes it."
+        )
+    logger.info(
+        "Removing %s, left by a run that is gone (last written %ds ago).",
+        incoming_dir,
+        age,
+    )
+    _cleanup_snapper_backup(destination_endpoint, snapshot_num, False)
+
+
 def _snapper_prepare_slot(destination_endpoint, snapshot_num) -> None:
     """Create the ``.snapshots/{num}.incoming`` receive slot BELOW an existing target.
 

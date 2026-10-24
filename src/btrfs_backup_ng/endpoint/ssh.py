@@ -1148,6 +1148,26 @@ class SSHEndpoint(Endpoint):
             preexisted = self.artifact_exists(dest_dir or "/", received)
 
             def remove_partial() -> None:
+                # The lock is a lease. A holder stalled past the stale
+                # threshold has had it broken and taken by another run, and
+                # the partial at the path is that run's receive, not this
+                # one's: asked of the store first, and left alone unless the
+                # lease is confirmed to stand.
+                from ..sshutil.lock import RECEIVING_LOCK_PREFIX
+
+                standing = self._receive_lock_manager().is_owner(
+                    f"{RECEIVING_LOCK_PREFIX}{destination}"
+                )
+                if standing is not True:
+                    logger.warning(
+                        "Leaving the partial at %s as it is: this run's receiving "
+                        "lock on it %s, and another run may be receiving there now.",
+                        destination,
+                        "was broken while this run was stalled"
+                        if standing is False
+                        else "could not be confirmed",
+                    )
+                    return
                 self._cleanup_partial_subvolume(
                     dest_dir or "/", received, created_by_this_run=not preexisted
                 )

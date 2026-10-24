@@ -1168,6 +1168,92 @@ class RemoteLockManager:
                     err.strip() or out.strip() or f"exit {rc}",
                 )
 
+    # ------------------------------------------------ the lease, re-checked
+
+    @property
+    def stale_after(self) -> int:
+        """Seconds without a beat after which a holder's lease may be broken:
+        the one threshold, for a lock's staleness and for what a leftover is
+        judged against (``age_of``)."""
+        return self._stale_after
+
+    def is_owner(self, name: str) -> Optional[bool]:
+        """Whether this manager's lease on ``name`` still stands in the store.
+
+        The acquire wrote ``owner.<token>``, the beat refreshes it, and a
+        contender that finds it older than ``stale_after`` removes it and
+        takes the lock with a record of its own. A holder stalled past that
+        point -- suspended, swapped out, waiting on a slow sudo -- wakes
+        still believing it holds the lock, and every action it then takes on
+        what the lock guards is taken on the other holder's work. So before
+        such an action the holder asks the store. True: its own record is
+        there and is the only owner record. False: the record is gone or
+        another's stands beside it, or this manager holds no lease on
+        ``name`` at all. None: the store could not be asked, which a caller
+        acting on the lock's guard treats as not confirmed.
+
+        A read, never a write, so never elevated: the lock directory is made
+        readable, and a record that cannot be read is a lease that cannot be
+        confirmed.
+        """
+        with self._state_lock:
+            token = self._tokens.get(name)
+        if token is None:
+            return False
+        rc, out, err = self._check_owner(name, token)
+        verdict = _verdict(out)
+        if rc != 0 or verdict not in ("OWNER", "NOTOWNER"):
+            logger.debug(
+                "Could not confirm the lease on %r: %s",
+                name,
+                err.strip() or out.strip() or f"exit {rc}",
+            )
+            return None
+        return verdict == "OWNER"
+
+    def _check_owner(self, name: str, token: str) -> tuple[int, str, str]:
+        return self._run(self._owner_script(name, token))
+
+    def _owner_script(self, name: str, token: str) -> str:
+        """``OWNER`` when ``owner.<token>`` is a regular file and the only
+        owner record in the lock directory, else ``NOTOWNER``. A link at
+        either name is not a record."""
+        lock = shlex.quote(self._lock_dir(name))
+        owner = shlex.quote(self._owner_file(name, token))
+        return (
+            f"if [ -L {owner} ] || [ ! -f {owner} ]; then echo NOTOWNER; exit 0; fi; "
+            f"bbng_c=0; for bbng_f in {lock}/{OWNER_PREFIX}*; do "
+            '[ ! -L "$bbng_f" ] && [ -f "$bbng_f" ] && bbng_c=$((bbng_c + 1)); done; '
+            'if [ "$bbng_c" -eq 1 ]; then echo OWNER; else echo NOTOWNER; fi; exit 0'
+        )
+
+    def age_of(self, path: str) -> Optional[int]:
+        """Seconds since ``path`` on the target was last written, by the
+        clock the store's records are judged by -- ``bbng_now``, the mtime of
+        a probe written into the store root -- or None when the path or the
+        clock cannot be read. What a lease's staleness is measured against is
+        what a leftover's freshness is measured against (the snapper layout
+        asks this of a slot it finds occupied as it opens it)."""
+        rc, out, _err = self._read_age(path)
+        verdict = _verdict(out)
+        if rc != 0 or not verdict.startswith("AGE "):
+            return None
+        try:
+            return int(verdict[len("AGE ") :].strip())
+        except ValueError:
+            return None
+
+    def _read_age(self, path: str) -> tuple[int, str, str]:
+        return self._run(self._age_script(path))
+
+    def _age_script(self, path: str) -> str:
+        root = shlex.quote(self._root)
+        return (
+            MTIME_FUNCTIONS + f"BBNG_NOW=$(bbng_now {root}); "
+            f"bbng_a=$(bbng_age {shlex.quote(path)}); "
+            'if [ -n "$bbng_a" ]; then echo "AGE $bbng_a"; else echo UNKNOWN; fi; exit 0'
+        )
+
     def is_locked(self, name: str) -> Optional[dict]:
         """The holder's details if a live lock exists, else None.
 
@@ -2128,6 +2214,56 @@ class LocalLockManager(RemoteLockManager):
         with suppress(OSError):
             os.rmdir(lock_name, dir_fd=root_fd)
         return ["BUSY"]
+
+    # ------------------------------------------------ the lease, re-checked
+
+    def _check_owner(self, name: str, token: str) -> tuple[int, str, str]:
+        try:
+            line = self._check_owner_here(name, token)
+        except _StoreVerdict as v:
+            # A store or lock directory that is not there is a lease that is
+            # gone; anything else is a store that could not be asked.
+            line = "NOTOWNER" if v.errno == errno.ENOENT else v.line
+        return 0, line + "\n", ""
+
+    def _check_owner_here(self, name: str, token: str) -> str:
+        """``_owner_script`` against descriptors: the record opened by name
+        below the lock directory, never through a link."""
+        from .. import __util__
+
+        fd = self._open_store(create=False)
+        fd = self._open_below(
+            fd, f"{encode_name(name)}.lock", self._lock_dir(name), create=False
+        )
+        with _closing(fd) as lock_fd:
+            if not self._is_regular(lock_fd, f"{OWNER_PREFIX}{token}"):
+                return "NOTOWNER"
+            try:
+                entries = __util__.listdir_current(lock_fd)
+            except OSError:
+                return "UNREADABLE"
+            records = [
+                n
+                for n in entries
+                if n.startswith(OWNER_PREFIX) and self._is_regular(lock_fd, n)
+            ]
+            return "OWNER" if len(records) == 1 else "NOTOWNER"
+
+    def _read_age(self, path: str) -> tuple[int, str, str]:
+        """``_age_script`` against descriptors: the store's clock from
+        ``_probe_now``, the path's mtime without following a link."""
+        try:
+            with _closing(self._open_store(create=False)) as root_fd:
+                now = self._probe_now(root_fd)
+        except _StoreVerdict:
+            now = None
+        if now is None:
+            return 0, "UNKNOWN\n", ""
+        try:
+            st = os.stat(path, follow_symlinks=False)
+        except OSError:
+            return 0, "UNKNOWN\n", ""
+        return 0, f"AGE {now - int(st.st_mtime)}\n", ""
 
     # ---------------------------------------------------- the shared record
 

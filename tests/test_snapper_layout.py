@@ -77,6 +77,14 @@ class TestOpeningASlot:
         stale = tmp_path / "target" / ".snapshots" / "7.incoming" / "snapshot"
         stale.mkdir(parents=True)
         (stale / "half").write_text("of a receive")
+        # Last written long before the stale threshold: the run that wrote
+        # it is gone. A slot written recently is a receive that may still be
+        # arriving, and is refused (test_a_stale_broken_holder_leaves_the_slot_alone).
+        import os
+        import time
+
+        long_ago = time.time() - 3600
+        os.utime(stale, (long_ago, long_ago))
         layout = SnapperLayout(_endpoint(tmp_path / "target"))
         layout.open_slot(7)
         assert (tmp_path / "target" / ".snapshots" / "7.incoming").is_dir()
