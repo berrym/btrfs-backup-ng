@@ -357,15 +357,21 @@ def delete_snapper_backups(
 
     base = str(endpoint_obj.config["path"]).rstrip("/")
     remote = scheme.kind is TargetKind.SSH
-    # A snapper restore pins the backup it reads on its location, under the
-    # slot's name (``snapshot-<n>``), in the location's lock store. This
-    # deletion is not the endpoint's guarded one -- it removes slot
-    # directories, not prefix-named snapshots -- so it asks the store itself,
-    # at delete time, and skips what is pinned. A store that cannot be read
-    # deletes nothing: "no pins" is the one answer that must not be invented.
+    # A snapper restore pins the backup it reads, and a snapper backup pins the
+    # parent slot its incremental receive chains against -- both on this
+    # location, under the slot's name (``snapshot-<n>``), in the location's
+    # lock store. This deletion is not the endpoint's guarded one -- it removes
+    # slot directories, not prefix-named snapshots -- so it asks the store
+    # itself, at delete time, and skips what is pinned, naming the holders. A
+    # store that cannot be read deletes nothing: "no pins" is the one answer
+    # that must not be invented.
     try:
         pinned = {
-            name
+            name: sorted(
+                str(holder)
+                for holder in list(entry.get("locks") or [])
+                + list(entry.get("parent_locks") or [])
+            )
             for name, entry in endpoint_obj._read_locks().items()
             if entry.get("locks") or entry.get("parent_locks")
         }
@@ -389,9 +395,10 @@ def delete_snapper_backups(
         slot_name = f"snapshot-{number}"
         if slot_name in pinned:
             logger.info(
-                "  Kept slot %s at %s: pinned by a restore in progress",
+                "  Kept slot %s at %s: pinned by %s",
                 number,
                 backup_path,
+                ", ".join(pinned[slot_name]),
             )
             continue
         slot_dir = f"{base}/.snapshots/{number}"

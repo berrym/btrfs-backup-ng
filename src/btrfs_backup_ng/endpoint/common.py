@@ -2295,7 +2295,7 @@ class Endpoint:
         """The DIRECTORY lock store at this location, or None.
 
         A location has one set of pins however it is reached. An ssh:// endpoint
-        records its persistent locks -- the pins a restore holds, the locks a
+        records its persistent locks -- the pins a restore or a receive holds, the locks a
         receive holds (``sshutil/lock.py``) -- in a directory named
         ``LOCK_DIR_NAME`` under the target; a local endpoint keeps a JSON file
         of the same name. A local endpoint over an ssh:// mirror (a transfer

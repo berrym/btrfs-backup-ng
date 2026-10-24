@@ -2014,9 +2014,11 @@ def _execute_transfers(
 
     ``plan`` is a list of ``(snapshot, parent_or_None)`` pairs from
     ``planning.plan_transfer_sequence``; ALL ordering and parent decisions were made there.
-    This function only moves bytes and manages the lock lifecycle: it locks the snapshot
-    (and its parent), sends, records the artifact verdict on what arrived, and on a
-    verified success releases the locks and registers the snapshot at the destination;
+    This function only moves bytes and manages the lock lifecycle: it pins the snapshot
+    (and its parent) on the source and the parent's copy on the destination, takes the
+    destination's lock on the copy it is about to create, sends, records the artifact
+    verdict on what arrived, and on a verified success releases the pins and registers
+    the snapshot at the destination;
     a failed snapshot is recorded in ``result.failed`` (never silently dropped), and any
     partial or invalid artifact is cleaned under the authorship rule.
 
@@ -2133,22 +2135,27 @@ def _execute_transfers(
             # Left there, a local partial sits at the snapshot's own name and
             # every later run refuses to remove what was there before it
             # started. An ssh:// destination does this inside its receive
-            # lock (SSHEndpoint.receiving_lock).
-            with lifecycle.undo_on_failure(
-                functools.partial(
-                    _cleanup_this_runs_partial,
-                    destination_endpoint,
-                    best_snapshot.get_name(),
-                    created_by_this_run=not preexisting,
-                ),
-                unless=(__util__.SnapshotTransferError,),
+            # lock (SSHEndpoint.receiving_lock). The destination's copy of the
+            # parent is pinned for the span of the send, outermost, so a failed
+            # receive's partial is removed before the parent is let go.
+            with _destination_parent_pinned(
+                destination_endpoint, parent, best_snapshot.get_name()
             ):
-                send_snapshot(
-                    best_snapshot,
-                    destination_endpoint,
-                    parent=parent,
-                    options=options or {},
-                )
+                with lifecycle.undo_on_failure(
+                    functools.partial(
+                        _cleanup_this_runs_partial,
+                        destination_endpoint,
+                        best_snapshot.get_name(),
+                        created_by_this_run=not preexisting,
+                    ),
+                    unless=(__util__.SnapshotTransferError,),
+                ):
+                    send_snapshot(
+                        best_snapshot,
+                        destination_endpoint,
+                        parent=parent,
+                        options=options or {},
+                    )
             # The receive exited 0 and the commit held. What did it leave?
             # Recorded for every transfer; only ``invalid`` fails one. A check
             # that cannot even run is ``unverifiable``: the data has landed,
@@ -2695,6 +2702,92 @@ def _receiving_lock(destination_endpoint, destination: str, lock_root: str = "")
     return _pinned()
 
 
+class _ParentPin:
+    """A destination copy known by name, in the shape ``set_lock`` reads: the
+    name the pin is keyed under and the two lock sets it maintains."""
+
+    def __init__(self, name: str) -> None:
+        self.name = name
+        self.locks: set = set()
+        self.parent_locks: set = set()
+
+    def get_name(self) -> str:
+        return self.name
+
+    def __repr__(self) -> str:
+        return self.name
+
+
+@contextlib.contextmanager
+def _destination_parent_pinned(
+    destination_endpoint,
+    parent,
+    child_name: str,
+    *,
+    pin_name: Optional[str] = None,
+    artifact: Optional[str] = None,
+):
+    """Pin, on the destination, the parent this receive chains against.
+
+    An incremental receive applies against the destination's copy of the
+    parent. Between the plan that chose it and the end of the stream, a prune
+    of the destination -- another config, another process, another machine --
+    was free to delete that copy: the receive then failed after sending
+    everything, or a raw store committed a stream whose parent was gone. The
+    destination's own pin machinery (``set_lock(..., parent=True)``) now
+    records a reader pin on its copy for the span of the receive; every
+    delete path re-reads the destination's pins at delete time and skips a
+    pinned parent, as a source prune skips the parent a transfer reads.
+
+    By NAME, on both counts. The pin is keyed by the copy's name (that is how
+    every pin is keyed, ``sshutil.lock.snapshot_lock_name``), so a stand-in
+    carrying the name records the pin a listed object would. The copy's
+    presence is asked by name too (``destination_artifact_exists``, the probe
+    the loop already asks about the copy it is creating), and a parent that is
+    not there fails this transfer before a byte is sent. Not by uuid
+    correspondence: a parent transferred earlier in this run is in the
+    destination's cache as the object the transfer registered, which carries
+    no ``received_uuid``, so correspondence cannot find the copy that was just
+    made and would refuse the second snapshot of every chain -- while the
+    planner counts an in-run parent present by name. Whether the copy at that
+    name is the right one is the commit's own identity check.
+
+    ``pin_name`` and ``artifact`` are for a copy whose pin key and path are not
+    the parent's name: a snapper slot is pinned as ``snapshot-<n>`` -- the key
+    prune and restore pin a slot by -- and probed at ``.snapshots/<n>/snapshot``.
+    ``parent`` None is a full transfer, with nothing to pin; a destination whose
+    type has no ``set_lock`` is passed through -- the snapper layout's receiver,
+    whose config is snapper's own to keep or clean and whose restored parent
+    sits in a freshly numbered slot, never at the parent's name; or a test's
+    stand-in.
+
+    Released on every exit, success or failure: the pin protects the receive
+    and nothing after it.
+    """
+    # Looked up on the TYPE, as ``destination_artifact_exists`` looks up its
+    # hook: the snapper layout's receiver forwards every other attribute to
+    # the endpoint beneath it, and a double built from MagicMock answers any
+    # name with a callable; neither is a destination that pins.
+    if parent is None or not callable(
+        getattr(type(destination_endpoint), "set_lock", None)
+    ):
+        yield
+        return
+    name = pin_name or parent.get_name()
+    if not destination_artifact_exists(destination_endpoint, artifact or name):
+        raise __util__.SnapshotTransferError(
+            f"incremental parent {name} is not on the destination; refusing to "
+            f"send {child_name} against a missing parent"
+        )
+    lock_id = f"receiving:{child_name}"
+    pin = _ParentPin(name)
+    destination_endpoint.set_lock(pin, lock_id, True, parent=True)
+    try:
+        yield
+    finally:
+        destination_endpoint.set_lock(pin, lock_id, False, parent=True)
+
+
 def received_name_of(snapshot) -> str:
     """The name ``btrfs receive`` gives the copy of ``snapshot``.
 
@@ -3017,12 +3110,17 @@ def _send_snapper_snapshot_to_raw_store(
         destination_endpoint,
         f"{base_path.rstrip('/')}/{source_wrapper.get_name()}",
     ):
-        send_snapshot(
-            source_wrapper,
-            destination_endpoint,
-            parent=parent_wrapper,
-            options=raw_options,
-        )
+        # The parent stream is a raw backup named as the parent snapshot is,
+        # so the store resolves it by name, as its own correspondence rule does.
+        with _destination_parent_pinned(
+            destination_endpoint, parent_wrapper, source_wrapper.get_name()
+        ):
+            send_snapshot(
+                source_wrapper,
+                destination_endpoint,
+                parent=parent_wrapper,
+                options=raw_options,
+            )
 
 
 def send_snapper_snapshot(
@@ -3135,18 +3233,30 @@ def send_snapper_snapshot(
             from .layout import SnapperLayout
 
             layout = SnapperLayout(destination_endpoint)
-            layout.open_slot(snapshot_num)
-            try:
-                send_snapshot(
-                    source_wrapper,
-                    destination_endpoint,
-                    parent=parent_wrapper,
-                    options=options,
-                )
-                layout.publish(info_xml=_snapper_info_xml_bytes(snapper_snapshot))
-            except BaseException:
-                layout.abandon()
-                raise
+            # The parent slot is pinned under the name prune and restore pin a
+            # slot by, ``snapshot-<n>``, and probed where its subvolume lives.
+            # Pinned BEFORE the slot is opened, because the endpoint writes
+            # its pins at ``path``, which the open slot points at ``.incoming``
+            # until the publish or abandon that precedes the release.
+            with _destination_parent_pinned(
+                destination_endpoint,
+                parent_wrapper,
+                source_wrapper.get_name(),
+                pin_name=f"snapshot-{parent_num}",
+                artifact=f".snapshots/{parent_num}/snapshot",
+            ):
+                layout.open_slot(snapshot_num)
+                try:
+                    send_snapshot(
+                        source_wrapper,
+                        destination_endpoint,
+                        parent=parent_wrapper,
+                        options=options,
+                    )
+                    layout.publish(info_xml=_snapper_info_xml_bytes(snapper_snapshot))
+                except BaseException:
+                    layout.abandon()
+                    raise
 
         # Metadata sidecar (endpoint-aware; carries original_xml for restore).
         _write_snapper_metadata(

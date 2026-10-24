@@ -2485,7 +2485,7 @@ def blocked_by_remote_lock(manager: Any, snapshots: list) -> set[str]:
     except Exception as exc:  # noqa: BLE001 - see docstring: the caller decides
         raise RemoteLockUnavailable(
             f"the lock state on this target could not be read ({exc}), so it is "
-            f"not known whether a restore is holding any of these snapshots"
+            f"not known whether a restore or a receive is holding any of these snapshots"
         ) from exc
     # Matched on the real name AND on the encoded directory each lock actually
     # lives in. A lock whose payload cannot be parsed has no real name to offer,

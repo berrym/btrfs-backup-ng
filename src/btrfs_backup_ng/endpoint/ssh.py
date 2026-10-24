@@ -823,7 +823,8 @@ class SSHEndpoint(Endpoint):
         Consults the locks recorded ON THE TARGET as well as the in-memory ones.
         A prune running in another process (or on another machine) lists this
         destination fresh, so every snapshot it sees has an empty in-memory lock
-        set -- including one a restore is reading at that moment. The guard
+        set -- including one a restore is reading at that moment, or one an
+        incremental receive is chaining against. The guard
         existed; it simply could not see the other process.
 
         Returns a :class:`DeletionResult`. This method has six distinct outcomes

@@ -700,7 +700,7 @@ class TestPinsProtectEverywhere:
             count, errors = prune_cli.delete_snapper_backups("/backups", backups, {})
         assert (count, errors) == (1, [])
         assert deleted == ["/backups/.snapshots/4"]
-        assert "pinned by a restore in progress" in caplog.text
+        assert "Kept slot 3" in caplog.text and "pinned by restore:s1" in caplog.text
 
     def test_an_unreadable_lock_store_deletes_no_slot(self, monkeypatch):
         deleted = self._slot_deleter(monkeypatch, __util__.AbortError("corrupt"))

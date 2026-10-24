@@ -610,6 +610,27 @@ class RawEndpoint(Endpoint):
         path = self._normalize_path(self.config["path"])
         return f"raw://{path}"
 
+    def _artifact_preexists(self, name: str) -> bool:
+        """Whether a stream named ``name`` is at this location.
+
+        The engine asks a destination this by name
+        (``core.operations.destination_artifact_exists``), and its default
+        looks for ``<path>/<name>``; a raw backup is the file ``<name>.btrfs``
+        beside its sidecar, so the location answers from its own listing, on
+        whichever transport it lives. The listing is dropped by every commit,
+        so a stream written earlier in this run is found.
+        """
+        try:
+            return any(s.get_name() == name for s in self.list_snapshots())
+        except Exception as e:  # noqa: BLE001 - the engine's own answer under doubt
+            # The engine's probe answers True when it cannot tell: for a
+            # cleanup that means "not ours to remove", for a parent pin it
+            # means "pin it by name and let the receive be the judge".
+            logger.debug(
+                "Could not list %s to look for %s: %s", self.config.get("path"), name, e
+            )
+            return True
+
     def correspondent_of(self, snapshot: Any) -> Optional[Any]:
         """Raw override of :meth:`Endpoint.correspondent_of` -- NAME semantics.
 
@@ -1875,10 +1896,11 @@ class RawEndpoint(Endpoint):
         without its parent stream, so deleting a parent silently makes its children unrestorable.
         Walk the ``parent_name`` chain from every kept stream back to its root and rescue any
         ancestor currently marked for deletion (transitive -- walking the full chain also covers a
-        rescued parent's own parents). A kept stream whose parent is not present on this target has
-        a chain already broken upstream (pre-existing, not caused by this prune): warn, never
-        fabricate. Legacy streams with no recorded ``parent_name`` cannot be chain-resolved and are
-        left as the time-based decision placed them.
+        rescued parent's own parents). A kept stream whose parent is not on this target has a chain
+        that was already broken when this pass listed the target -- by an earlier prune, another
+        process or a deletion by hand -- so it is warned about, never repaired by fabrication.
+        Legacy streams with no recorded ``parent_name`` cannot be chain-resolved and are left as
+        the time-based decision placed them.
         """
         by_name = {s.get_name(): s for s in list(to_keep) + list(to_delete)}
         delete_names = {s.get_name() for s in to_delete}
@@ -1894,9 +1916,11 @@ class RawEndpoint(Endpoint):
                 parent = by_name.get(parent_name)
                 if parent is None:
                     logger.warning(
-                        "Retention: retained raw stream %r references parent %r which is not "
-                        "present on this target -- its incremental chain is already broken "
-                        "upstream (not caused by this prune)",
+                        "Retention: retained raw stream %r references parent %r, which is not "
+                        "on this target: its incremental chain was already broken when this "
+                        "pass listed the target -- the parent was removed earlier, by a "
+                        "previous prune, another process or by hand -- and nothing in this "
+                        "pass can repair it",
                         leaf.get_name(),
                         parent_name,
                     )
@@ -1994,7 +2018,8 @@ class RawEndpoint(Endpoint):
             result.fail_all(snapshots, f"the lock store is unusable: {exc}")
             return result
         for snapshot in snapshots:
-            # A retention lock is what a restore holds while it reads a stream.
+            # A retention lock is what a restore holds while it reads a stream,
+            # and what a receive holds on the parent stream it chains against.
             # The base Endpoint.delete_snapshots checks it; this override
             # replaces that method wholesale and never did, so `set_lock` on a
             # raw target pinned nothing: a prune deleted the stream a restore was
@@ -3500,7 +3525,8 @@ class SSHRawEndpoint(RawEndpoint):
         chain guard as the local primitive applies (never orphan a child stream)."""
         # Locks recorded ON THE TARGET, not just this process's in-memory set: a
         # prune in another process lists the target fresh, so every snapshot it
-        # sees looks unlocked -- including one a restore is reading right now.
+        # sees looks unlocked -- including one a restore is reading right now,
+        # or one an incremental receive is chaining against.
         from ..sshutil.lock import (
             RemoteLockUnavailable,
             blocked_by_remote_lock,
