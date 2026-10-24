@@ -614,6 +614,23 @@ class Endpoint:
         """
         return
 
+    @contextlib.contextmanager
+    def receiving_lock(
+        self, destination: str, *, timeout: float | None = None
+    ) -> Iterator[None]:
+        """The destination-side receive-lock seam: the right to write
+        ``destination`` on this target for the span of a receive and its commit.
+
+        The transfer engine takes this through ``core.operations._receiving_lock``
+        around every receive. The base is a no-op: a plain local btrfs target has no
+        cross-machine contention today, and the raw endpoints guard a stream with a
+        unique ``O_EXCL`` ``.part`` name. ``SSHEndpoint`` overrides it with a
+        heartbeated per-subvolume lease. Declaring it here turns a duck-typed hook
+        into an explicit contract: the single destination-locking seam the
+        per-artifact locking work unifies and extends to every transport.
+        """
+        yield
+
     def list_snapshots(self, flush_cache: bool = False) -> List[Any]:
         """
         Return a list of all snapshots found directly in self.config['path'] using $snap_prefix.

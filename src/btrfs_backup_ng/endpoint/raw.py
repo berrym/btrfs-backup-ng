@@ -731,9 +731,10 @@ class RawEndpoint(Endpoint):
         hostile or mis-created lock file degrades to the same bounded fail/skip as
         contention instead of crashing (or hanging) every backup. The lock lives
         inside the target directory, so that directory MUST NOT be writable by
-        untrusted users. The raw+ssh subclass overrides this as a no-op (remote
-        locking is a separate concern -- there is no persistent connection to hold an
-        flock)."""
+        untrusted users. The raw+ssh subclass overrides this to take a REAL remote
+        exclusive lock via ``sshutil.lock`` (``manager.hold("target")``), not a
+        no-op: it gives raw+ssh the same mutual exclusion local raw targets have,
+        across processes AND across machines, which the local flock cannot offer."""
         if timeout is None:
             timeout = float(self.config.get("lock_timeout", 30.0))
         path = Path(self.config["path"])
@@ -3472,7 +3473,8 @@ class SSHRawEndpoint(RawEndpoint):
         so both entry points that wrap it in ``target_lock`` -- ``delete_snapshots``
         (per batch) and ``delete_old_snapshots`` (whole prune pass) -- dispatch to the
         remote deletion for a raw+ssh target. Inheriting the base ``delete_snapshots``
-        keeps the (no-op) lock discipline uniform across local and remote. The same
+        keeps the ``target_lock`` discipline uniform across local and remote -- for
+        raw+ssh that lock is a real remote exclusive hold, not a no-op. The same
         chain guard as the local primitive applies (never orphan a child stream)."""
         # Locks recorded ON THE TARGET, not just this process's in-memory set: a
         # prune in another process lists the target fresh, so every snapshot it
