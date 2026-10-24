@@ -27,6 +27,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from btrfs_backup_ng.sshutil import lock as lock_module
 from btrfs_backup_ng.sshutil.lock import (
     HOLDERS_DIR_NAME,
     LOCK_DIR_NAME,
@@ -35,6 +36,7 @@ from btrfs_backup_ng.sshutil.lock import (
     RemoteLockUnavailable,
     blocked_by_remote_lock,
     encode_name,
+    local_manager,
     read_persisted_locks,
     snapshot_lock_name,
     write_persisted_locks,
@@ -609,14 +611,68 @@ class TestStaleness:
     def test_staleness_is_judged_on_the_target_not_the_client(self, tmp_path):
         """No client clock is ever compared, so client skew cannot break a lock.
 
-        The age expression must be computed from the target's own `date` and the
-        target's own `stat`; if either came from this side, two hosts four
-        seconds apart (which is what the development pair measured) would each
-        reach a different verdict about the same lock.
+        The age is the difference of two readings of ONE clock, the filesystem
+        holding the store: the record's mtime, and the mtime of a probe file the
+        script creates in the store root at the moment it judges. ``date`` --
+        the clock of whichever host runs the script, which on a networked store
+        is NOT the host that stamped the record -- is never consulted. Two hosts
+        four seconds apart (what the development pair measured), or an NFS
+        server minutes behind its client, reach the same verdict.
         """
         script = _manager(tmp_path)._acquire_script("target", "{}", "tok")
-        assert "date +%s" in script, "the target must supply the current time"
+        assert "date +%s" not in script, "no host clock may enter the age"
+        assert "$(date" not in script and " date " not in script, script
+        assert "BBNG_NOW=$(bbng_now " in script, "now must be read from the store"
+        probe_dir = script.split("BBNG_NOW=$(bbng_now ", 1)[1].split(")", 1)[0]
+        assert LOCK_DIR_NAME in probe_dir, probe_dir
         assert "stat -c %Y" in script or "stat -f %m" in script
+
+    def test_a_fresh_lock_survives_a_client_clock_ahead_of_the_filesystem(
+        self, tmp_path, monkeypatch
+    ):
+        """The mutation this kills: reading "now" from ``date``. A live lock
+        whose record the filesystem stamped a moment ago, judged by a ``date``
+        10 000 seconds ahead -- an NFS client ahead of its server, any host
+        clock that is not the store's -- read as 10 000 seconds stale and was
+        broken while its holder was heartbeating. The probe reads the clock that
+        stamped the record, so the lock stays live, the pin stays held and
+        nothing is swept, whatever ``date`` says."""
+        shims = tmp_path / "date-shim"
+        shims.mkdir()
+        (shims / "date").write_text("#!/bin/sh\necho 9999999999\n")
+        (shims / "date").chmod(0o755)
+        monkeypatch.setenv("PATH", f"{shims}:{os.environ['PATH']}")
+        sandbox = tmp_path / "target"
+        sandbox.mkdir()
+        holder = _manager(sandbox, stale_after=60)
+        holder.acquire_once("target", "prune")
+        holder.acquire_shared("snap-a", "restore:1")
+        with pytest.raises(RemoteLockBusy):
+            _manager(sandbox, stale_after=60).acquire_once("target", "restore")
+        assert (holder.is_locked("target") or {}).get("operation") == "prune"
+        assert "snap-a" in holder.live_locks()
+        assert holder.sweep_dead_holders() == 0
+        assert blocked_by_remote_lock(holder, ["a"]) == {"a"}
+
+    def test_a_local_store_judges_by_the_filesystem_clock_not_the_process_clock(
+        self, tmp_path, monkeypatch
+    ):
+        """The same guard for the descriptor-based local manager, whose acquire
+        judges in Python. The mutation this kills: ``now = int(time.time())``.
+        With the process clock 10 000 seconds ahead of the filesystem that
+        stamped the record -- a local store on an NFS mount whose server lags --
+        a live lock read as long dead and was broken. The probe's mtime is read
+        from the store's own filesystem, so the lock stays live whatever
+        ``time.time`` says."""
+        real_now = time.time()
+        monkeypatch.setattr(lock_module.time, "time", lambda: real_now + 10_000)
+        store = tmp_path / "target"
+        store.mkdir()
+        holder = local_manager(store)
+        holder.acquire_once("target", "prune")
+        with pytest.raises(RemoteLockBusy):
+            local_manager(store).acquire_once("target", "restore")
+        assert (holder.is_locked("target") or {}).get("operation") == "prune"
 
 
 class TestBreakingADeadLockHasOneWinner:
@@ -690,8 +746,12 @@ class TestBreakingADeadLockHasOneWinner:
     @pytest.mark.parametrize(
         "shape,command,pattern",
         [
-            # after reading the dead lock's age, before the clock
-            *[(shape, "date", "*") for shape in ("current", "older-version", "empty")],
+            # before the clock is read: the probe that reads the store's own
+            # time begins with an rm of its own name (date is never run)
+            *[
+                (shape, "rm", "*now-probe*")
+                for shape in ("current", "older-version", "empty")
+            ],
             # just before the removal (an empty lock has none: its rmdir is it)
             *[
                 (shape, "rm", "*owner.*|*info.json|*heartbeat")
@@ -1295,32 +1355,33 @@ class TestTheAgeIsAlwaysAnInteger:
         assert manager.sweep_dead_holders() == 0
         assert blocked_by_remote_lock(manager, ["a"]) == {"a"}
 
-    def test_a_date_without_epoch_seconds_is_never_arithmetic(
-        self, tmp_path, monkeypatch
-    ):
-        """The current time is checked to be digits too. A ``date`` without
-        ``%s`` prints the format back; that must not reach ``$(( ))``, and a
-        lock that cannot be aged is never broken -- even one whose heartbeat
-        is long dead stays BUSY."""
+    def test_a_now_that_cannot_be_read_never_ages_a_lock(self, tmp_path, monkeypatch):
+        """The current time is checked to be digits too. "Now" is the mtime of
+        a probe the script creates in the store root; a ``stat`` that prints
+        something other than digits for it must not reach ``$(( ))``, and a
+        lock that cannot be aged is never broken -- even one whose heartbeat is
+        long dead stays BUSY."""
         sandbox = tmp_path / "target"
         sandbox.mkdir()
         manager = _manager(sandbox, stale_after=1)
         lock_dir = self._held_lock(manager, "target")
         old = time.time() - 10_000
         os.utime(lock_dir / "heartbeat", (old, old))
-        self._fake_date(tmp_path, monkeypatch)
+        self._unreadable_now(tmp_path, monkeypatch)
         rc, out, err = manager._run(manager._acquire_script("target", "{}", "tok"))
         assert rc == 0, err
         assert err == "", err
         assert "BUSY" in out and "ACQUIRED" not in out, out
 
-    @staticmethod
-    def _fake_date(tmp_path, monkeypatch) -> None:
-        shims = tmp_path / "date-shim"
-        shims.mkdir()
-        (shims / "date").write_text("#!/bin/sh\necho '%s'\n")
-        (shims / "date").chmod(0o755)
-        monkeypatch.setenv("PATH", f"{shims}:{os.environ['PATH']}")
+    def _unreadable_now(self, tmp_path, monkeypatch) -> None:
+        """Make "now" unreadable: the ``stat`` of the probe file -- and ONLY
+        that one; every record's own mtime still reads -- prints a format
+        string instead of digits, as a ``date`` without ``%s`` once did."""
+        self._shim(
+            tmp_path,
+            monkeypatch,
+            'case "$*" in *now-probe*) echo "%s"; exit 0;; esac',
+        )
 
     def test_a_lock_taken_microseconds_ago_is_listed_as_live(self, tmp_path):
         """The listing ages a lock whose record is not written yet from its
@@ -1382,14 +1443,15 @@ class TestTheAgeIsAlwaysAnInteger:
     def test_a_target_clock_that_cannot_be_read_holds_every_pin(
         self, tmp_path, monkeypatch
     ):
-        """With no readable ``date``, no age can be judged: every holder is
-        held, none is swept, and the guard blocks the deletion."""
+        """With no readable store clock -- the probe's mtime cannot be read --
+        no age can be judged: every holder is held, none is swept, and the
+        guard blocks the deletion."""
         manager = _manager(tmp_path, stale_after=1)
         manager.acquire_shared("snap-a", "restore:1")
         holder = next(tmp_path.rglob("holders/*"))
         old = time.time() - 10_000
         os.utime(holder, (old, old))
-        self._fake_date(tmp_path, monkeypatch)
+        self._unreadable_now(tmp_path, monkeypatch)
         assert "snap-a" in manager.live_locks()
         assert manager.sweep_dead_holders() == 0
         assert holder.exists()

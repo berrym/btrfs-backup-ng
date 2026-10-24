@@ -396,12 +396,21 @@ def read_only_notice(name: str, where: str, location: str) -> None:
 #: arithmetic syntax error under contention. Whatever ``stat`` prints is then
 #: checked to be digits before it is printed at all.
 #:
-#: ``bbng_now`` prints the target's clock as a bare integer, or nothing.
+#: ``bbng_now DIR`` prints the clock of the filesystem holding DIR as a bare
+#: integer, read from the mtime of a probe file created in DIR -- the SAME
+#: clock that stamps every lock record. ``date`` is not consulted: a store on a
+#: networked mount whose server clock differs from this client's ``date`` can no
+#: longer make a freshly-heartbeated lock read stale. Nothing when DIR is a
+#: symbolic link or not a directory (a probe is a WRITE, and the listing paths
+#: reach here with no safety walk of the store, so a link planted at the store
+#: is refused rather than written through), when the probe cannot be created in
+#: DIR, or when its mtime is not digits.
 #:
-#: ``bbng_age FILE [FALLBACK]`` prints the age in seconds of FILE by the
-#: target's own clock, of FALLBACK when FILE has no readable mtime, or nothing
-#: when neither can be read or the clock cannot. Callers treat nothing as
-#: "cannot judge", never as an age of zero or of forever.
+#: ``bbng_age FILE [FALLBACK]`` prints the age in seconds of FILE against
+#: ``$BBNG_NOW`` (which each judge site sets once from ``bbng_now <store root>``),
+#: of FALLBACK when FILE has no readable mtime, or nothing when the mtime or
+#: ``$BBNG_NOW`` cannot be read. Callers treat nothing as "cannot judge", never
+#: as an age of zero or of forever.
 MTIME_FUNCTIONS = (
     "if stat -c %Y / >/dev/null 2>&1; then bbng_st='-c %Y'; else bbng_st='-f %m'; fi; "
     'bbng_digits() { bbng_t=$1; [ -n "$bbng_t" ] || return 1; '
@@ -410,12 +419,15 @@ MTIME_FUNCTIONS = (
     'bbng_mtime() { bbng_m=$(stat $bbng_st "$1" 2>/dev/null) || bbng_m=; '
     'bbng_digits "$bbng_m" || bbng_m=; '
     'printf "%s" "$bbng_m"; }; '
-    "bbng_now() { bbng_c=$(date +%s 2>/dev/null) || bbng_c=; "
-    'bbng_digits "$bbng_c" || bbng_c=; printf "%s" "$bbng_c"; }; '
+    'bbng_now() { bbng_nd=$1; [ -n "$bbng_nd" ] || return 0; '
+    'if [ -L "$bbng_nd" ] || [ ! -d "$bbng_nd" ]; then return 0; fi; '
+    'bbng_np=$bbng_nd/.bbng-now-probe.$$; rm -f "$bbng_np" 2>/dev/null; '
+    'if ( set -C; : > "$bbng_np" ) 2>/dev/null; then '
+    'bbng_nm=$(bbng_mtime "$bbng_np"); rm -f "$bbng_np" 2>/dev/null; '
+    'printf "%s" "$bbng_nm"; fi; }; '
     'bbng_age() { bbng_a=$(bbng_mtime "$1"); '
     'if [ -z "$bbng_a" ] && [ -n "$2" ]; then bbng_a=$(bbng_mtime "$2"); fi; '
-    "bbng_n=$(bbng_now); "
-    'if [ -n "$bbng_a" ] && [ -n "$bbng_n" ]; then echo $(( bbng_n - bbng_a )); fi; }; '
+    'if [ -n "$bbng_a" ] && [ -n "$BBNG_NOW" ]; then echo $(( BBNG_NOW - bbng_a )); fi; }; '
 )
 
 #: Shell defining the functions every lock script creates directories and
@@ -532,6 +544,16 @@ def _verdict(out: str) -> str:
         if line.strip():
             return line.strip()
     return ""
+
+
+def _clock_readable(out: str) -> bool:
+    """Whether a listing's ``NOW`` line carries the store's clock. The clock
+    is read by writing a probe into the store, so an account that may list the
+    store but not write it prints ``NOW`` with nothing after it."""
+    for line in out.splitlines():
+        if line.startswith("NOW"):
+            return line[3:].strip().isdigit()
+    return False
 
 
 class RemoteLockManager:
@@ -729,7 +751,7 @@ class RemoteLockManager:
             f"  if bbng_e=$(mkdir {lock} 2>&1); then bbng_take ACQUIRED; exit 0; fi; "
             f'  if [ ! -d {lock} ]; then printf "NOLOCK %s" "$bbng_e" | tr -d "\\n"; echo; exit 0; fi; '
             "fi; "
-            "bbng_judge; "
+            f"BBNG_NOW=$(bbng_now {root}); bbng_judge; "
             # No readable age: a lock that cannot be judged is never broken.
             f'if [ -z "$AGE" ]; then '
             f"  if [ -d {lock} ]; then echo BUSY; bbng_show; exit 0; fi; "
@@ -1148,9 +1170,11 @@ class RemoteLockManager:
         hand.
         """
         lock = shlex.quote(self._lock_dir(name))
+        root = shlex.quote(self._root)
         script = (
             self._exclusive_functions(name) + f"if [ -d {lock} ]; then "
-            'bbng_judge; printf "AGE %s\\n" "${AGE:-?}"; bbng_show; '
+            f"BBNG_NOW=$(bbng_now {root}); bbng_judge; "
+            'printf "AGE %s\\n" "${AGE:-?}"; bbng_show; '
             f"elif [ -e {lock} ]; then echo UNKNOWN; else echo ABSENT; fi"
         )
         rc, out, err = self._run(script)
@@ -1250,7 +1274,7 @@ class RemoteLockManager:
         root = shlex.quote(self._root)
         holders_dir = HOLDERS_DIR_NAME
         script = (
-            MTIME_FUNCTIONS + 'printf "NOW %s\\n" "$(bbng_now)"; '
+            MTIME_FUNCTIONS + f'printf "NOW %s\\n" "$(bbng_now {root})"; '
             # A lock root that exists but cannot be listed is not an empty one:
             # the glob below would simply not expand, and "no pins" would be
             # reported for a target this account cannot see into.
@@ -1279,9 +1303,11 @@ class RemoteLockManager:
             f"done 2>/dev/null; exit 0"
         )
         rc, out, err = self._run(script)
+        elevated = False
         if rc == 0 and "UNLISTABLE" in out.splitlines():
             if self._run_elevated is not None:
                 rc, out, err = self._run_elevated(script)
+                elevated = True
             if rc == 0 and "UNLISTABLE" in out.splitlines():
                 raise RemoteLockUnavailable(
                     f"the lock directory {self._root!r} on the target exists but "
@@ -1298,6 +1324,17 @@ class RemoteLockManager:
             raise RemoteLockUnavailable(
                 f"could not list locks on the target: {err.strip() or f'exit {rc}'}"
             )
+        # The clock is read by writing a probe into the store, so an account
+        # that may list the store but not write it -- the usual case for a
+        # scheduled backup's root-owned store -- cannot read it, and would
+        # report every record held and the sweep nothing dead. That is what
+        # ``run_elevated`` exists for: ask again as root, which can probe. If
+        # root cannot probe either, every record stays held, as on a store that
+        # is read-only for everyone.
+        if not elevated and self._run_elevated is not None and not _clock_readable(out):
+            e_rc, e_out, e_err = self._run_elevated(script)
+            if e_rc == 0:
+                rc, out, err = e_rc, e_out, e_err
 
         now: Optional[int] = None
         clock_read = False
@@ -1389,6 +1426,7 @@ class RemoteLockManager:
         if not dead:
             return 0
         threshold = self._stale_after * DEAD_HOLDER_MULTIPLE
+        root = shlex.quote(self._root)
         paths = " ".join(
             shlex.quote(f"{self._root}/{dir_name}.lock/{HOLDERS_DIR_NAME}/{file_name}")
             for dir_name, file_name in dead
@@ -1401,7 +1439,13 @@ class RemoteLockManager:
         # ``bbng_age`` is the same measure the listing used, so the judgement is
         # consistent. Reports how many it actually removed.
         script = (
-            MTIME_FUNCTIONS + "bbng_swept=0; bbng_unwr=0; "
+            MTIME_FUNCTIONS + f"BBNG_NOW=$(bbng_now {root}); "
+            # A probe that cannot be written is the store refusing this
+            # account, not a verdict on any record: report the unwritable
+            # store it is, so the elevated pass -- which can probe -- runs,
+            # and remove nothing meanwhile.
+            'if [ -z "$BBNG_NOW" ]; then echo "UNWRITABLE 0"; exit 0; fi; '
+            "bbng_swept=0; bbng_unwr=0; "
             f"for bbng_p in {paths}; do "
             'bbng_a=$(bbng_age "$bbng_p"); '
             f'if [ -n "$bbng_a" ] && [ "$bbng_a" -gt {threshold} ]; then '
@@ -1859,7 +1903,7 @@ class LocalLockManager(RemoteLockManager):
                     raise _unsafe("SYMLINK", lock_path) from None
                 return [f"NOLOCK {lock_path}: {e.strerror}"]
             with _closing(lock_fd):
-                key, age = self._judge(lock_fd)
+                key, age = self._judge(lock_fd, self._probe_now(root_fd))
                 if age is None:
                     # No readable age: a lock that cannot be judged is never
                     # broken, unless it is gone.
@@ -1926,15 +1970,53 @@ class LocalLockManager(RemoteLockManager):
             return False
         return stat.S_ISREG(st.st_mode)
 
-    def _judge(self, lock_fd: int) -> tuple[Optional[str], Optional[int]]:
-        """``bbng_judge``: the entry identifying this instance of the lock,
-        and its age by this machine's clock -- which IS the target's clock
-        here -- or None where no age can be read."""
+    def _probe_now(self, root_fd: int) -> Optional[int]:
+        """The store filesystem's clock, read as the mtime of a probe file
+        created in the store root under ``root_fd``.
+
+        The same clock that stamps every lock record, so a store on a networked
+        mount whose server stamps mtimes cannot be aged against this machine's
+        ``time.time()`` -- comparing a client wall clock to a server-stamped
+        mtime is exactly the skew this replaces. None when the probe cannot be
+        created or its mtime read: "cannot judge", which ``_acquire_here`` treats
+        as "do not break". The probe is created in the store ROOT (never inside a
+        lock or holders directory, so no lock's mtime is disturbed), O_EXCL and
+        O_NOFOLLOW like every other record this manager writes, and unlinked at
+        once.
+        """
+        probe = f".bbng-now-probe.{os.getpid()}.{uuid.uuid4().hex}"
+        try:
+            fd = os.open(
+                probe,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                0o600,
+                dir_fd=root_fd,
+            )
+        except OSError:
+            return None
+        try:
+            return int(os.fstat(fd).st_mtime)
+        except OSError:
+            return None
+        finally:
+            os.close(fd)
+            with suppress(OSError):
+                os.unlink(probe, dir_fd=root_fd)
+
+    def _judge(
+        self, lock_fd: int, now: Optional[int]
+    ) -> tuple[Optional[str], Optional[int]]:
+        """``bbng_judge``: the entry identifying this instance of the lock, and
+        its age against ``now`` -- the store filesystem's clock read by
+        ``_probe_now`` -- or None where no age can be read. ``time.time()`` is
+        not used: on a networked store the records are stamped by the server, and
+        aging them against this machine's wall clock is the skew the probe
+        removes."""
         from .. import __util__
 
-        now = int(time.time())
-
         def age_of(name: str) -> Optional[int]:
+            if now is None:
+                return None
             try:
                 st = (
                     os.fstat(lock_fd)
