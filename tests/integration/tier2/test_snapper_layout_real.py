@@ -507,7 +507,10 @@ class TestTheEdgesHoldOnRealBtrfs:
     def test_a_slot_pinned_by_a_restore_survives_the_prune(self, btrfs_three_volumes):
         from types import SimpleNamespace
 
-        from btrfs_backup_ng.cli.prune import delete_snapper_backups
+        from btrfs_backup_ng.cli.prune import (
+            delete_snapper_backups,
+            with_slot_identities,
+        )
 
         first, second, _third = btrfs_three_volumes
         _data, snapshots, _delta = _snapper_source(first)
@@ -524,8 +527,13 @@ class TestTheEdgesHoldOnRealBtrfs:
             "restore:s1",
             True,
         )
-        backups = list_snapper_backups(str(backup))
+        # As the plan records them: each slot with the received_uuid of the
+        # copy it holds, read from the real subvolumes.
+        backups = with_slot_identities(
+            str(backup), list_snapper_backups(str(backup)), {}
+        )
         assert [b["number"] for b in backups] == [1, 2]
+        assert all(b.get("received_uuid") for b in backups), backups
         deleted, errors = delete_snapper_backups(str(backup), backups, {})
         assert (deleted, errors) == (1, [])
         assert not (backup / ".snapshots" / "1").exists()

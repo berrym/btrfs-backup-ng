@@ -317,9 +317,17 @@ class TestTheDeletePrimitive:
     `sudo rm` is refused because rm is not btrfs."""
 
     def _endpoint(self, path="/backups"):
-        # A location whose lock store holds no pins: the deletion asks it
-        # before removing any slot.
-        return SimpleNamespace(config={"path": path}, _read_locks=lambda: {})
+        # A location whose lock store holds no pins, and whose slots still hold
+        # the copies the plan chose: the deletion asks both before removing a
+        # slot.
+        return SimpleNamespace(
+            config={"path": path},
+            _read_locks=lambda: {},
+            subvolume_identity=lambda p: {
+                "uuid": "",
+                "received_uuid": "copy-" + p.split("/")[-2],
+            },
+        )
 
     def test_the_subvolume_is_deleted_before_the_slot_directory(self):
         """If the subvolume delete fails there is still data in the slot;
@@ -449,7 +457,8 @@ class TestTheDeletePrimitive:
                 side_effect=[RuntimeError("boom"), None, None],
             ):
                 deleted, errors = prune.delete_snapper_backups(
-                    "/backups", [{"number": n} for n in (1, 2, 3)]
+                    "/backups",
+                    [{"number": n, "received_uuid": f"copy-{n}"} for n in (1, 2, 3)],
                 )
         assert deleted == 2
         assert len(errors) == 1 and "slot 1" in errors[0]

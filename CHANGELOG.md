@@ -81,7 +81,12 @@ Changes an upgrade can notice:
   slot with a new backup, prune deleted the new backup believing it had
   removed the old occupant its plan had chosen. Every deletion, on every
   transport, now takes the artifact's receive lock before touching it, and
-  a held lock is a skip, never a race. `--skip-remote-lock` also now
+  a held lock is a skip, never a race. A snapper plan also records the
+  `received_uuid` of the copy each slot held when it was chosen, and the
+  delete, under the slot's lock, asks the slot again: one whose occupant
+  changed since the plan, or whose identity cannot be read, is kept and the
+  reason is logged. A slot number alone never named a backup, because
+  snapper reuses numbers. `--skip-remote-lock` also now
   reaches a local btrfs target and a local raw target, where the option was
   read from a key that was never stored.
   ([#137](https://github.com/berrym/btrfs-backup-ng/issues/137))

@@ -683,6 +683,10 @@ class TestPinsProtectEverywhere:
                     raise locks
                 return locks
 
+            def subvolume_identity(self, path):
+                # Every slot still holds the copy the plan chose.
+                return {"uuid": "", "received_uuid": "copy-" + path.split("/")[-2]}
+
         monkeypatch.setattr(
             prune_cli, "choose_endpoint", lambda p, c: Endpoint(), raising=False
         )
@@ -695,7 +699,10 @@ class TestPinsProtectEverywhere:
         deleted = self._slot_deleter(
             monkeypatch, {"snapshot-3": {"locks": ["restore:s1"]}}
         )
-        backups = [{"number": 3}, {"number": 4}]
+        backups = [
+            {"number": 3, "received_uuid": "copy-3"},
+            {"number": 4, "received_uuid": "copy-4"},
+        ]
         with caplog.at_level(logging.INFO):
             count, errors = prune_cli.delete_snapper_backups("/backups", backups, {})
         assert (count, errors) == (1, [])

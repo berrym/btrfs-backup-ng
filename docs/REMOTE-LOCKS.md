@@ -443,7 +443,10 @@ the artifact's own receive lock before it touches the artifact, and before any
 look at its path, since during a receive the path exists and is the partial. A
 held lock is a skip, "being received by <holder>"; a lock that cannot be taken
 fails that deletion rather than guessing, unless the operator passed
-`--skip-remote-lock`.
+`--skip-remote-lock`. A snapper slot is asked one more question under that
+lock: whether it still holds the copy the plan chose, by the `received_uuid`
+the plan recorded for it. snapper reuses numbers, so a slot a run republished
+between the plan and the delete is kept, and the pass says what changed.
 
 Three outcomes, kept distinct because they demand different responses:
 

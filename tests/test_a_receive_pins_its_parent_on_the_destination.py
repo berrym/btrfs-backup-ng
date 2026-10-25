@@ -298,8 +298,18 @@ class TestASnapperBackupIntoABtrfsTargetPinsTheParentSlot:
         monkeypatch.setattr(
             "btrfs_backup_ng.endpoint.choose_endpoint", lambda p, c: _endpoint(base)
         )
+        # The slot holds the copy the plan chose; the pin is what this test is
+        # about, not the occupant.
+        monkeypatch.setattr(
+            LocalEndpoint,
+            "subvolume_identity",
+            lambda self, path: {
+                "uuid": "",
+                "received_uuid": "copy-" + path.split("/")[-2],
+            },
+        )
         return deleted, prune_cli.delete_snapper_backups(
-            str(base), [{"number": number}], {}
+            str(base), [{"number": number, "received_uuid": f"copy-{number}"}], {}
         )
 
     def test_a_prune_during_the_receive_keeps_the_parent_slot(

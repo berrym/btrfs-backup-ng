@@ -111,7 +111,19 @@ class TestASnapperSlotBeingReceivedIsNotPruned:
         monkeypatch.setattr(
             "btrfs_backup_ng.endpoint.choose_endpoint", lambda p, c: _endpoint(base)
         )
-        outcome = prune_cli.delete_snapper_backups(str(base), [{"number": number}], {})
+        # The slot holds the copy the plan chose; the lock is what this test is
+        # about, not the occupant.
+        monkeypatch.setattr(
+            LocalEndpoint,
+            "subvolume_identity",
+            lambda self, path: {
+                "uuid": "",
+                "received_uuid": "copy-" + path.split("/")[-2],
+            },
+        )
+        outcome = prune_cli.delete_snapper_backups(
+            str(base), [{"number": number, "received_uuid": f"copy-{number}"}], {}
+        )
         return deleted, outcome
 
     def test_the_slot_a_run_is_filling_is_kept_and_deleted_once_published(
