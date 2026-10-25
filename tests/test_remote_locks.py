@@ -787,28 +787,46 @@ class TestBreakingADeadLockHasOneWinner:
         for attempt in range(15):
             sandbox = tmp_path / f"t{attempt}"
             sandbox.mkdir()
-            self._dead(sandbox, "current" if attempt % 2 else "older-version")
+            shape = "current" if attempt % 2 else "older-version"
+            lock_dir = self._dead(sandbox, shape)
             wins: list[str] = []
             errors: list[str] = []
+            # Every contender's answer, so a failure says what the twelve
+            # scripts replied rather than only who won.
+            verdicts: list[str] = []
             barrier = threading.Barrier(12)
 
-            def contend(i: int, _sandbox=sandbox, _wins=wins, _errors=errors) -> None:
+            def contend(
+                i: int, _sandbox=sandbox, _wins=wins, _errors=errors, _v=verdicts
+            ) -> None:
                 barrier.wait()
                 try:
-                    _manager(_sandbox).acquire_once("target", f"op-{i}")
+                    mode = _manager(_sandbox).acquire_once("target", f"op-{i}")
                     _wins.append(f"op-{i}")
-                except RemoteLockBusy:
-                    pass
+                    _v.append(f"op-{i}: {mode}")
+                except RemoteLockBusy as exc:
+                    _v.append(f"op-{i}: busy (holder {exc.info})")
                 except Exception as exc:  # noqa: BLE001 - asserted on below
                     _errors.append(repr(exc))
+                    _v.append(f"op-{i}: {exc!r}")
 
             threads = [threading.Thread(target=contend, args=(i,)) for i in range(12)]
             for t in threads:
                 t.start()
             for t in threads:
                 t.join()
-            assert not errors, errors
-            assert len(wins) == 1, f"run {attempt}: winners {wins}"
+            left = (
+                sorted(p.name for p in lock_dir.iterdir())
+                if lock_dir.is_dir()
+                else "no lock directory"
+            )
+            report = (
+                f"run {attempt} ({shape}): winners {wins}; contenders: "
+                + "; ".join(sorted(verdicts))
+                + f"; lock directory holds: {left}"
+            )
+            assert not errors, report
+            assert len(wins) == 1, report
 
     def test_a_claimant_that_finds_another_record_withdraws(
         self, tmp_path, monkeypatch
