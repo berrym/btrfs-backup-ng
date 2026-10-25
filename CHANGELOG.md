@@ -5,6 +5,150 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.10.0] - 2026-10-24
+
+This release is about the destination: what a run may delete there, what it
+may publish there, and how it tells its own work from another run's. Each
+fix closes a way a backup could be lost while every run involved reported
+success: a prune deleting the parent an increment was being received
+against; two transfers of one snapshot into one local target, the loser
+deleting the winner's copy; a prune deleting a snapper backup republished
+into a recycled slot number; two volumes sharing a snapshot prefix and a
+destination, one of them never sent; a stale-broken snapper run publishing
+over its successor's slot; and a live lock broken because the client's clock
+and the target's disagreed. Each was confirmed against the released code
+before it was fixed, and each fix is verified by tests that fail when the fix
+is removed. There are no configuration keys added or removed.
+
+Changes an upgrade can notice:
+
+- **A config whose volumes share a snapshot prefix and a destination no
+  longer loads.** Two distinct volumes with one effective `snapshot_prefix`
+  sending to one destination are refused at load, by `run`, `config
+  validate`, `doctor` and every other command that reads the file, with a
+  message naming the two volumes, the prefix, the destination and the
+  remedy. Such a config only ever worked by losing one of the two backups.
+  Give each volume its own prefix, or send them to different destinations.
+- **A local btrfs target gains a lock directory,
+  `<target>/.btrfs-backup-ng.receiving`,** created below the target the
+  first time a snapshot is received into it. It holds the receive locks;
+  the target's pins stay in its lock file. `ssh://` and raw targets keep
+  their receive locks in the lock directory they already have.
+- **A raw target refuses to overwrite a stream it cannot show to be this
+  source's own.** A stream under the same name sent from another source, or
+  one whose record names no source (written before 0.9.10), fails the
+  transfer with the reason instead of being replaced. Move or remove the
+  older stream, or give the volume a prefix of its own.
+- **A snapper receive refuses a slot that was written to recently.** An
+  `.snapshots/<n>.incoming` left behind is removed only once it is older
+  than the stale threshold (180 seconds); a younger one may be a receive
+  still arriving, and the transfer fails rather than removing it. A run
+  that is gone leaves it to age, and the next run clears it.
+- **`prune` reports "being received by <holder>"** for a snapshot, raw
+  stream or snapper slot a transfer is creating at that moment, and keeps
+  it. A lock it cannot take fails that deletion rather than guessing,
+  unless `--skip-remote-lock` was passed.
+
+### Fixed
+
+- **A prune can no longer delete the parent an increment is being received
+  against.** The source pinned the parent so the source could not prune it
+  mid-send, but the destination pinned nothing, so a prune of the
+  destination, from a second config, another process or another machine,
+  could delete its copy while the child's stream was in flight. The
+  receive then failed after sending everything, or a raw target committed
+  a stream whose recorded parent was gone, an increment nothing can
+  restore. The destination's copy of the parent is now pinned for the span
+  of the receive, every delete path re-reads the destination's pins at
+  delete time, and a raw commit publishes an increment only if its parent
+  is still there and still carries the identity the receive began against.
+  ([#135](https://github.com/berrym/btrfs-backup-ng/issues/135))
+
+- **Two transfers of one snapshot into one local btrfs destination no
+  longer leave it empty.** Both decided, before either receive ran, that
+  they were the one creating it; one committed a verified copy and the
+  other, failing with "File exists" and believing the copy its own partial,
+  deleted it. An `ssh://` destination took a receive lock before that probe;
+  a local target took none. Every transport now holds the destination's
+  receive lock from before the probe through the commit and the cleanup of
+  a failed transfer, and a second transfer is refused before its stream
+  starts, as that snapshot's failure rather than the run's.
+  ([#136](https://github.com/berrym/btrfs-backup-ng/issues/136))
+
+- **A prune can no longer delete a snapper backup republished into a
+  recycled slot number.** `prune` deleted a slot by its number under no
+  lock; when snapper recycled a number and a concurrent run republished the
+  slot with a new backup, prune deleted the new backup believing it had
+  removed the old occupant its plan had chosen. Every deletion, on every
+  transport, now takes the artifact's receive lock before touching it, and
+  a held lock is a skip, never a race. `--skip-remote-lock` also now
+  reaches a local btrfs target and a local raw target, where the option was
+  read from a key that was never stored.
+  ([#137](https://github.com/berrym/btrfs-backup-ng/issues/137))
+
+- **Two volumes sharing a snapshot prefix and a raw destination no longer
+  lose one backup silently.** Two volumes configured with one prefix into
+  one raw target named their streams alike, in one run in the same second;
+  the first volume published, the second volume's planner found the name
+  present, called the second volume already backed up and never sent it,
+  and both reported success. A second apart, the second volume's increment
+  chained onto the first volume's stream by name, a chain nothing can
+  restore. The config is now refused at load. Should a collision reach a
+  raw target anyway, through two spellings of one remote directory or
+  streams written by an earlier version, the raw store now tells streams
+  apart by the source that wrote them: a stream from another source is
+  neither this snapshot's backup nor a parent for it, so the shadowed
+  snapshot is sent, and the commit refuses to overwrite another source's
+  stream, failing that transfer loudly.
+  ([#138](https://github.com/berrym/btrfs-backup-ng/issues/138))
+
+- **A live lock is no longer broken because the client's clock and the
+  target's disagree.** A lock's age was the client's `date` minus the
+  record's mtime on the target, so a freshly heartbeated lock on a
+  networked filesystem whose server clock ran behind the client's read as
+  stale and was broken, on every transport. Staleness is now judged by the
+  store's own clock, read from the mtime of a probe file written in the
+  store, the same clock that stamps every record; neither `date` nor the
+  client's wall clock takes part. A clock that cannot be read keeps every
+  lock and pin held.
+  ([#142](https://github.com/berrym/btrfs-backup-ng/issues/142))
+
+- **A snapper run whose slot lock was broken while it was stalled no longer
+  publishes over, or removes, its successor's slot.** The lock was enforced
+  only at the door; every action after it acted on the slot by path. A run
+  suspended past the stale threshold was stale-broken by the next run,
+  which cleared the first run's in-flight receive as a leftover and received
+  into the slot; the first run, waking, removed the second's receive in
+  turn, or published it as its own, a read-write subvolume with no
+  `received_uuid` that listing cannot see and the next run sent again whole.
+  A holder now asks the lock store whether its lease still stands
+  immediately before it publishes, before it abandons, and before the ssh
+  receive removes the partial a failed receive left; a holder whose lease
+  is gone owns nothing in the slot, touches nothing and fails its own
+  transfer with the reason. A lease the store cannot confirm is refused the
+  same way.
+  ([#143](https://github.com/berrym/btrfs-backup-ng/issues/143))
+
+### Changed
+
+- **One receive lock serves every transport.** The lock body is shared;
+  each endpoint supplies only the store its locks live in. The transfer
+  loop takes it where the transaction is, and a structural test keeps every
+  receive funnel classified as locked.
+
+- **The lock store answers whether a holder's lease still stands**, and how
+  long ago a path under it was written, by its own clock. Both are reads,
+  never elevated.
+
+- **The raw store's by-name lookup is one method**, used by correspondence,
+  by the parent an increment needs, by the pre-existence probe and by the
+  commit, so the four cannot disagree about what is stored under a name.
+
+- **`prune`'s kept-slot line names the holders of a pin**, since a backup
+  can now hold one as well as a restore, and the retention warning for a
+  kept raw stream whose parent is missing no longer claims the break was not
+  caused by a prune.
+
 ## [0.9.20] - 2026-10-22
 
 A follow-up to 0.9.19 fixing a regression in the shared lock store's retry

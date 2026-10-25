@@ -26,11 +26,12 @@ produces today. The entries use three layers:
 · [elevation](#elevation) · [evidence](#holder-record) · [guard](#guard) ·
 [heartbeat](#heartbeat) · [holder](#holder) · [holder record](#holder-record) ·
 [holders directory](#holder-record) · [incremental](#incremental-and-parent) ·
-[ledger](#lock-file) · [lifecycle](#lifecycle-and-the-exit-drain) · [live](#stale-and-dead)
-· [lock](#lock) · [lock file](#lock-file) · [lock id](#lock-id-and-destination-id)
-· [marker](#run-marker) · [own pin](#own-pin-parent-pin-restore-pin) ·
-[parent](#incremental-and-parent) · [parent pin](#own-pin-parent-pin-restore-pin)
-· [pin](#pin) · [plan](#plan) · [policy](#retention-policy) · [prune](#prune) ·
+[lease](#lease) · [ledger](#lock-file) · [lifecycle](#lifecycle-and-the-exit-drain)
+· [live](#stale-and-dead) · [lock](#lock) · [lock file](#lock-file) ·
+[lock id](#lock-id-and-destination-id) · [marker](#run-marker) ·
+[own pin](#own-pin-parent-pin-restore-pin) · [parent](#incremental-and-parent) ·
+[parent pin](#own-pin-parent-pin-restore-pin) · [pin](#pin) · [plan](#plan) ·
+[policy](#retention-policy) · [prune](#prune) · [receiving lock](#lock) ·
 [reconcile](#reconcile) · [restore pin](#own-pin-parent-pin-restore-pin) ·
 [retention](#retention-policy) · [run lock](#run-lock) · [session](#restore-session)
 · [sidecar](#sidecar) · [snapshot](#snapshot) · [source](#source-and-destination)
@@ -190,7 +191,29 @@ is not a pin, and the word is not used for pins outside the on-disk key names
 
 **Code.** `btrfs_backup_ng.sshutil.lock:RemoteLockManager.acquire_once`,
 `btrfs_backup_ng.sshutil.lock:RemoteLockManager.release`,
-`btrfs_backup_ng.sshutil.lock:RemoteLockBusy`.
+`btrfs_backup_ng.sshutil.lock:RemoteLockBusy`,
+`btrfs_backup_ng.sshutil.lock:hold_receiving_lock`.
+
+### Lease
+
+**Plain.** A lock whose right lasts only while the holder keeps proving it is
+alive. Stop proving it for long enough and the right is gone, whatever the
+holder believes.
+
+**Technical.** Every exclusive lock is a lease: the holder's record stands
+while its heartbeat refreshes it, and once the record is older than the stale
+threshold the next contender may break the lock and take it. A holder that was
+stalled past the threshold therefore owns nothing under the lock once its
+record is gone. A receive lock is asked of the store, not assumed, before the
+actions it protects: a snapper slot is published or abandoned, and an ssh
+partial removed, only after the store confirms that this holder's record is
+there and is the only owner record. A holder whose lease is lost fails its own
+transfer with the reason and touches nothing in the slot; a lease the store
+cannot confirm is refused the same way.
+
+**Code.** `btrfs_backup_ng.sshutil.lock:RemoteLockManager.is_owner`,
+`btrfs_backup_ng.core.operations:_require_slot_lease`,
+`btrfs_backup_ng.__util__:ReceiveLeaseLost`.
 
 ### Pin
 
@@ -443,9 +466,13 @@ is a directory whose `owner.<token>` file names its holder; a pin is a
 directory `snap-<name>-<hash>.lock/holders/` with one record per holder.
 Everything is read and written by short POSIX shell scripts that run the same
 way under bash, dash and busybox, locally through `sh` or on the remote over
-ssh, and the age of every record is judged by the target's own clock. A local
-endpoint that finds the directory where its lock file would be uses the store
-instead, so an ssh mirror and a local prune of it see the same pins.
+ssh, and the age of every record is judged by the target's own clock, read
+from the mtime of a probe file written in the store. A local endpoint that
+finds the directory where its lock file would be uses the store instead, so an
+ssh mirror and a local prune of it see the same pins. For the same reason a
+local btrfs target's receive locks live in a store of their own,
+`.btrfs-backup-ng.receiving/`, with the same layout: creating the pin store's
+directory for them would hide the pins in the lock file.
 
 **Code.** `btrfs_backup_ng.sshutil.lock:RemoteLockManager`,
 `btrfs_backup_ng.sshutil.lock:local_manager`,
