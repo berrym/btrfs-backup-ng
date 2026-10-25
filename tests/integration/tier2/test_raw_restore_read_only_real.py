@@ -102,7 +102,10 @@ class TestARawStoreOnAReadOnlyMedium:
             assert _listing(medium) == before, (
                 "the restore wrote to the read-only medium"
             )
-            assert not (store / ".btrfs-backup-ng.locks").exists()
+            # The lock store is the backup's: the receive lock on the stream
+            # left it, and the listing above shows the restore added nothing
+            # to it.
+            assert (store / ".btrfs-backup-ng.locks").is_dir()
             copies = [p for p in restore_to.iterdir() if p.name.startswith("vol-")]
             assert len(copies) == 1, list(restore_to.iterdir())
             landed = (copies[0] / "payload.bin").read_bytes()
