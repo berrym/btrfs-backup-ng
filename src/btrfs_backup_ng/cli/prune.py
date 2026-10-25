@@ -160,7 +160,91 @@ def plan_snapper_retention(
     backups = list_snapper_backups(backup_path, endpoint_options)
     if not backups:
         return [], []
+    backups = with_slot_identities(backup_path, backups, endpoint_options)
     return plan_snapper_retention_of(backups, retention, now=now)
+
+
+def _snapper_endpoint(backup_path: str, endpoint_options: dict | None) -> Any:
+    """The endpoint a snapper destination is planned and pruned through: one
+    construction, so the identity read for the plan and the one read at the
+    delete come from the same place, with the same privilege."""
+    from ..endpoint import choose_endpoint
+
+    config: dict[str, Any] = {"path": backup_path, "snap_prefix": ""}
+    if endpoint_options:
+        config.update(endpoint_options)
+    return choose_endpoint(backup_path, config)
+
+
+def with_slot_identities(
+    backup_path: str, backups: list, endpoint_options: dict | None = None
+) -> list:
+    """The backups with each btrfs slot's ``received_uuid`` recorded: the
+    identity of the copy the slot holds as the plan is made.
+
+    A snapper slot is named by its number, and snapper reuses numbers. A plan
+    that names a slot therefore does not name a backup: between the plan and
+    the delete a run can republish the slot with a new copy, and a delete by
+    number would remove the new copy believing it the old one. So the plan
+    records what the slot held when it chose it, and the delete asks again
+    (``delete_snapper_backups``). The identity is the ``received_uuid`` the
+    copy carries, read in one pass over the slots, the pass the backup
+    direction uses to match slots to source snapshots. A slot the pass could
+    not read records no identity, and the delete keeps it, saying so. A pass
+    that failed raises, so the plan fails and nothing is pruned, rather than
+    planning deletions it could not confirm.
+
+    Raw targets are returned as they are: a raw snapper backup is deleted by
+    its stream name, which carries the date and no recycled number can reuse.
+    """
+    from ..core import operations as _ops
+    from ..core.target import parse_target
+
+    if not backups or parse_target(backup_path).is_raw:
+        return backups
+    identities = {
+        slot.number: slot.received_uuid
+        for slot in _ops._enumerate_snapper_btrfs_backups(
+            _snapper_endpoint(backup_path, endpoint_options)
+        )
+    }
+    identified = []
+    for backup in backups:
+        received = identities.get(int(str(backup.get("number"))), "")
+        identified.append({**backup, "received_uuid": received} if received else backup)
+    return identified
+
+
+def _occupant_differs(endpoint_obj: Any, slot_dir: str, backup: dict) -> str:
+    """Why a slot must be kept, or ``""`` when it still holds the copy the plan
+    chose. Asked under the slot's receiving lock, immediately before the
+    delete, so nothing can republish the slot between the answer and the act.
+
+    The plan recorded the copy's ``received_uuid`` (``with_slot_identities``);
+    the slot's subvolume is asked for its own through the endpoint's one
+    identity probe. A plan that recorded none, or a slot that cannot answer
+    now, is kept: "the same backup" is the one answer that must not be
+    invented."""
+    planned = str(backup.get("received_uuid") or "")
+    if not planned:
+        return (
+            "the identity of its occupant was not read when the plan was made, "
+            "so it cannot be told from a backup published into the slot since"
+        )
+    identity = endpoint_obj.subvolume_identity(f"{slot_dir}/snapshot")
+    if identity is None:
+        return (
+            "the identity of its occupant cannot be read now, so it cannot be "
+            f"confirmed as the backup the plan chose (received_uuid {planned})"
+        )
+    current = str(identity.get("received_uuid") or "")
+    if current != planned:
+        return (
+            "its occupant changed since the plan was made: the plan chose "
+            f"received_uuid {planned}, the slot now holds "
+            f"{current or 'a subvolume with no received_uuid'}"
+        )
+    return ""
 
 
 def _snapper_item_name(item: Any) -> str:
@@ -305,14 +389,11 @@ def delete_snapper_backups(
     if not backups:
         return 0, []
 
+    from ..core import operations as _ops
     from ..core.target import TargetKind, parse_target
-    from ..endpoint import choose_endpoint
 
     scheme = parse_target(backup_path)
-    config: dict[str, Any] = {"path": backup_path, "snap_prefix": ""}
-    if endpoint_options:
-        config.update(endpoint_options)
-    endpoint_obj = choose_endpoint(backup_path, config)
+    endpoint_obj = _snapper_endpoint(backup_path, endpoint_options)
 
     deleted = 0
     errors: list[str] = []
@@ -356,15 +437,21 @@ def delete_snapper_backups(
 
     base = str(endpoint_obj.config["path"]).rstrip("/")
     remote = scheme.kind is TargetKind.SSH
-    # A snapper restore pins the backup it reads on its location, under the
-    # slot's name (``snapshot-<n>``), in the location's lock store. This
-    # deletion is not the endpoint's guarded one -- it removes slot
-    # directories, not prefix-named snapshots -- so it asks the store itself,
-    # at delete time, and skips what is pinned. A store that cannot be read
-    # deletes nothing: "no pins" is the one answer that must not be invented.
+    # A snapper restore pins the backup it reads, and a snapper backup pins the
+    # parent slot its incremental receive chains against -- both on this
+    # location, under the slot's name (``snapshot-<n>``), in the location's
+    # lock store. This deletion is not the endpoint's guarded one -- it removes
+    # slot directories, not prefix-named snapshots -- so it asks the store
+    # itself, at delete time, and skips what is pinned, naming the holders. A
+    # store that cannot be read deletes nothing: "no pins" is the one answer
+    # that must not be invented.
     try:
         pinned = {
-            name
+            name: sorted(
+                str(holder)
+                for holder in list(entry.get("locks") or [])
+                + list(entry.get("parent_locks") or [])
+            )
             for name, entry in endpoint_obj._read_locks().items()
             if entry.get("locks") or entry.get("parent_locks")
         }
@@ -388,15 +475,38 @@ def delete_snapper_backups(
         slot_name = f"snapshot-{number}"
         if slot_name in pinned:
             logger.info(
-                "  Kept slot %s at %s: pinned by a restore in progress",
+                "  Kept slot %s at %s: pinned by %s",
                 number,
                 backup_path,
+                ", ".join(pinned[slot_name]),
             )
             continue
         slot_dir = f"{base}/.snapshots/{number}"
+        # The slot's receiving lock: a run holds it from the moment it opens
+        # the slot until the publish has renamed it into place, so a slot a
+        # run is filling right now is kept rather than deleted out from under
+        # it -- both sides used to report success, and the destination held
+        # neither backup. Keyed on the slot directory, as the run keys it.
+        # Under that lock the slot is asked whether it still holds the copy
+        # the plan chose: snapper reuses numbers, and a run that finished
+        # between the plan and this delete may have republished the slot.
         try:
-            _delete_snapper_slot_btrfs(endpoint_obj, slot_dir, remote)
+            with _ops._receiving_lock(endpoint_obj, slot_dir, base):
+                kept_because = _occupant_differs(endpoint_obj, slot_dir, backup)
+                if kept_because:
+                    logger.info(
+                        "  Kept slot %s at %s: %s", number, backup_path, kept_because
+                    )
+                    continue
+                _delete_snapper_slot_btrfs(endpoint_obj, slot_dir, remote)
             deleted += 1
+        except __util__.ReceivingLockBusy as e:
+            logger.info(
+                "  Kept slot %s at %s: being received by %s",
+                number,
+                backup_path,
+                e.holder,
+            )
         except Exception as e:  # noqa: BLE001 - record and continue
             errors.append(f"Delete slot {number}: {e}")
     return deleted, errors

@@ -92,12 +92,15 @@ class TestCleanupPartialLocalSubvolume:
 
 
 class TestExecuteTransfersCleansPartialOnFailure:
-    def test_failure_triggers_local_cleanup(self, monkeypatch):
+    def test_failure_triggers_local_cleanup(self, monkeypatch, tmp_path):
         snap = _fake_snap("s1")
         src = MagicMock()
         dst = MagicMock()
         dst.get_id.return_value = "d"
         dst._is_remote = False
+        # A real directory: the loop refuses a missing destination before a
+        # transfer begins, and what it does after a failure is the point here.
+        dst.config = {"path": str(tmp_path)}
 
         monkeypatch.setattr(
             ops,
@@ -113,12 +116,15 @@ class TestExecuteTransfersCleansPartialOnFailure:
         # cleanup targets the exact received name of the snapshot that failed
         assert spy.call_args[0][1] == "s1"
 
-    def test_success_does_not_trigger_cleanup(self, monkeypatch):
+    def test_success_does_not_trigger_cleanup(self, monkeypatch, tmp_path):
         snap = _fake_snap("s1")
         src = MagicMock()
         dst = MagicMock()
         dst.get_id.return_value = "d"
         dst._is_remote = False
+        # A real directory, or the transfer is refused before it begins and
+        # "no cleanup" would hold for the wrong reason.
+        dst.config = {"path": str(tmp_path)}
 
         monkeypatch.setattr(ops, "send_snapshot", MagicMock(return_value=None))
         # A local double has no subvolume at the received path; the verdict on

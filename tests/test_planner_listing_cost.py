@@ -57,6 +57,8 @@ class _CountingEndpoint:
 class _CountingRawEndpoint(_CountingEndpoint):
     correspondent_of = RawEndpoint.correspondent_of
     correspondents_of = RawEndpoint.correspondents_of
+    # The singular form resolves through the store's one by-name lookup.
+    _stored_by_name = RawEndpoint._stored_by_name
 
 
 class TestPresenceDetectionCostsOneListing:

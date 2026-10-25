@@ -510,7 +510,6 @@ class SSHEndpoint(Endpoint):
             "ssh_auth_sock",
             "ssh_password_fallback",
             "ssh_host_key_policy",
-            "skip_remote_lock",
             "lock_root",
             "transfer_stall_timeout",
         ):
@@ -824,7 +823,8 @@ class SSHEndpoint(Endpoint):
         Consults the locks recorded ON THE TARGET as well as the in-memory ones.
         A prune running in another process (or on another machine) lists this
         destination fresh, so every snapshot it sees has an empty in-memory lock
-        set -- including one a restore is reading at that moment. The guard
+        set -- including one a restore is reading at that moment, or one an
+        incremental receive is chaining against. The guard
         existed; it simply could not see the other process.
 
         Returns a :class:`DeletionResult`. This method has six distinct outcomes
@@ -886,93 +886,107 @@ class SSHEndpoint(Endpoint):
             # Ensure the path is properly normalized for remote execution
             remote_path = self._normalize_path(remote_path)
 
-            # Verify the subvolume exists before attempting deletion. Asked as a
-            # btrfs subcommand, not `test -d`: the remote sudoers policy grants
-            # btrfs only, so an elevated `test` fails for lack of privilege and
-            # is indistinguishable from a missing path -- which skipped every
-            # snapshot and made remote pruning silently delete nothing. It is
-            # also the stricter precondition for the `btrfs subvolume delete`
-            # below, since it fails on a plain directory rather than passing it.
-            test_cmd = ["btrfs", "subvolume", "show", remote_path]
-            try:
-                test_result = self._exec_remote_command(
-                    test_cmd,
-                    check=False,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                )
-                if test_result.returncode != 0:
-                    logger.warning(
-                        f"Not an existing btrfs subvolume, skipping deletion: {remote_path}"
-                    )
-                    result.skip(snapshot, "not an existing btrfs subvolume")
-                    continue
-            except Exception as e:
-                logger.warning(f"Could not verify snapshot path {remote_path}: {e}")
-                # Could not even establish whether there is anything to delete.
-                # Not a skip: the deletion was asked for and did not happen, and
-                # the cause (a dead connection, an unmounted remote filesystem)
-                # applies to every snapshot in the batch.
-                result.fail(snapshot, f"could not verify the path: {e}")
+            # The subvolume's own receiving lock, the one a transfer to this
+            # destination holds from before its authorship probe through its
+            # commit: a subvolume being received is skipped, never deleted
+            # under the receive. Taken before the existence check below --
+            # during a receive the path exists, as the partial -- and keyed as
+            # the receive keys it.
+            held = self._lock_for_deletion(
+                snapshot, self._receive_destination(remote_path), result
+            )
+            if held is None:
                 continue
-
-            # Build deletion command with proper sudo handling
-            cmd = ["btrfs", "subvolume", "delete", remote_path]
-            logger.debug("Executing remote deletion command: %s", cmd)
-
-            try:
-                # Use retry mechanism for commands that may require authentication
-                use_sudo = self.config.get("ssh_sudo", False)
-                if use_sudo:
-                    proc = self._exec_remote_command_with_retry(
-                        cmd,
-                        max_retries=2,
+            with held:
+                # Verify the subvolume exists before attempting deletion. Asked as a
+                # btrfs subcommand, not `test -d`: the remote sudoers policy grants
+                # btrfs only, so an elevated `test` fails for lack of privilege and
+                # is indistinguishable from a missing path -- which skipped every
+                # snapshot and made remote pruning silently delete nothing. It is
+                # also the stricter precondition for the `btrfs subvolume delete`
+                # below, since it fails on a plain directory rather than passing it.
+                test_cmd = ["btrfs", "subvolume", "show", remote_path]
+                try:
+                    test_result = self._exec_remote_command(
+                        test_cmd,
                         check=False,
                         stdout=subprocess.PIPE,
                         stderr=subprocess.PIPE,
                     )
-                else:
-                    proc = self._exec_remote_command(
-                        cmd,
-                        check=False,
-                        stdout=subprocess.PIPE,
-                        stderr=subprocess.PIPE,
-                    )
-                if proc.returncode == 0:
-                    logger.info("Deleted remote snapshot subvolume: %s", remote_path)
-                    result.deleted.append(snapshot)
-                else:
-                    stderr = (
-                        proc.stderr.decode(errors="replace").strip()
-                        if hasattr(proc, "stderr") and proc.stderr
-                        else "Unknown error"
-                    )
-                    # Check for common btrfs deletion errors
-                    if "No such file or directory" in stderr:
+                    if test_result.returncode != 0:
                         logger.warning(
-                            f"Snapshot already deleted or path not found: {remote_path}"
+                            f"Not an existing btrfs subvolume, skipping deletion: {remote_path}"
                         )
-                        result.skip(snapshot, "already absent on the destination")
-                    elif "statfs" in stderr.lower():
-                        logger.error(
-                            f"Filesystem access error when deleting {remote_path}: {stderr}"
+                        result.skip(snapshot, "not an existing btrfs subvolume")
+                        continue
+                except Exception as e:
+                    logger.warning(f"Could not verify snapshot path {remote_path}: {e}")
+                    # Could not even establish whether there is anything to delete.
+                    # Not a skip: the deletion was asked for and did not happen, and
+                    # the cause (a dead connection, an unmounted remote filesystem)
+                    # applies to every snapshot in the batch.
+                    result.fail(snapshot, f"could not verify the path: {e}")
+                    continue
+
+                # Build deletion command with proper sudo handling
+                cmd = ["btrfs", "subvolume", "delete", remote_path]
+                logger.debug("Executing remote deletion command: %s", cmd)
+
+                try:
+                    # Use retry mechanism for commands that may require authentication
+                    use_sudo = self.config.get("ssh_sudo", False)
+                    if use_sudo:
+                        proc = self._exec_remote_command_with_retry(
+                            cmd,
+                            max_retries=2,
+                            check=False,
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE,
                         )
-                        logger.error(
-                            "This may indicate the remote path is not accessible or the filesystem is unmounted"
-                        )
-                        result.fail(snapshot, f"filesystem access error: {stderr}")
                     else:
-                        logger.error(
-                            f"Failed to delete remote snapshot {remote_path}: {stderr}"
+                        proc = self._exec_remote_command(
+                            cmd,
+                            check=False,
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE,
                         )
-                        result.fail(snapshot, stderr)
-            except Exception as e:
-                logger.error(
-                    f"Exception while deleting remote snapshot {remote_path}: {e}"
-                )
-                # Log additional diagnostic information
-                logger.debug(f"Deletion exception details: {e}", exc_info=True)
-                result.fail(snapshot, e)
+                    if proc.returncode == 0:
+                        logger.info(
+                            "Deleted remote snapshot subvolume: %s", remote_path
+                        )
+                        result.deleted.append(snapshot)
+                    else:
+                        stderr = (
+                            proc.stderr.decode(errors="replace").strip()
+                            if hasattr(proc, "stderr") and proc.stderr
+                            else "Unknown error"
+                        )
+                        # Check for common btrfs deletion errors
+                        if "No such file or directory" in stderr:
+                            logger.warning(
+                                f"Snapshot already deleted or path not found: {remote_path}"
+                            )
+                            result.skip(snapshot, "already absent on the destination")
+                        elif "statfs" in stderr.lower():
+                            logger.error(
+                                f"Filesystem access error when deleting {remote_path}: {stderr}"
+                            )
+                            logger.error(
+                                "This may indicate the remote path is not accessible or the filesystem is unmounted"
+                            )
+                            result.fail(snapshot, f"filesystem access error: {stderr}")
+                        else:
+                            logger.error(
+                                f"Failed to delete remote snapshot {remote_path}: {stderr}"
+                            )
+                            result.fail(snapshot, stderr)
+                except Exception as e:
+                    logger.error(
+                        f"Exception while deleting remote snapshot {remote_path}: {e}"
+                    )
+                    # Log additional diagnostic information
+                    logger.debug(f"Deletion exception details: {e}", exc_info=True)
+                    result.fail(snapshot, e)
         return result
 
     def delete_old_snapshots(self, keep: int) -> DeletionResult:
@@ -1084,6 +1098,13 @@ class SSHEndpoint(Endpoint):
             run_elevated=run_elevated,
         )
 
+    def _receive_lock_root(self) -> Optional[str]:
+        """The receiving lock lives in the remote store the pins live in."""
+        return self._lock_target_path()
+
+    def _receive_lock_manager(self) -> Any:
+        return self._lock_manager()
+
     @contextlib.contextmanager
     def receiving_lock(
         self, destination: str, *, timeout: float | None = None
@@ -1109,73 +1130,48 @@ class SSHEndpoint(Endpoint):
         ``<n>`` -- two halves of one transaction on the same slot -- and the
         transfer beneath must not contend with its own caller.
         """
-        from ..sshutil.lock import (
-            RECEIVING_LOCK_PREFIX,
-            RemoteLockBusy,
-            RemoteLockUnavailable,
-        )
-
-        if self._lock_target_path() is None:
-            yield
-            return
-
-        name = f"{RECEIVING_LOCK_PREFIX}{destination}"
-        manager = self._lock_manager()
-        if manager.holds(name):
-            yield  # already held further up this call stack
-            return
-
-        try:
-            manager.acquire_once(name, f"receive:{destination}")
-        except RemoteLockBusy as exc:
-            # Built from the holder's details rather than by interpolating the
-            # exception, whose text repeats the destination and the lock name.
-            # An operator reading a wrapped three-line sentence to find a
-            # hostname is being made to work for it.
-            info = exc.info or {}
-            holder = "another process"
-            if info:
-                holder = (
-                    f"{info.get('hostname', 'an unknown host')} "
-                    f"(pid {info.get('pid', '?')})"
-                )
-            raise __util__.AbortError(
-                f"Already being received by {holder}: {destination}\n"
-                f"Refusing to start a second transfer to the same path -- both "
-                f"would create the same subvolume, and the loser only finds out "
-                f"after transferring everything."
-            ) from exc
-        except RemoteLockUnavailable as exc:
-            if self.config.get("skip_remote_lock"):
-                logger.warning(
-                    "Could not lock %s before receiving (%s), and "
-                    "--skip-remote-lock was given, so this continues WITHOUT "
-                    "protection against a concurrent transfer to the same path.",
-                    destination,
-                    exc,
-                )
+        # The lock is the one every transport shares, over this endpoint's
+        # remote store (``_hold_receiving_lock``, ``_receive_lock_manager``);
+        # what is this method's own is the cleanup below.
+        with self._hold_receiving_lock(destination) as mode:
+            if mode != "acquired":
+                # Held further up this call stack, or the operator opted out:
+                # the frame that took the lock owns the cleanup, and an
+                # unprotected receive has no lock to clean up under.
                 yield
                 return
-            raise __util__.AbortError(
-                f"Could not lock {destination!r} before receiving: {exc}. "
-                f"Refusing to continue unprotected: a second transfer to the "
-                f"same path would collide. Pass --skip-remote-lock to proceed "
-                f"anyway."
-            ) from exc
 
-        # Recorded while the lock is held and before anything is received: what
-        # is at the path now is not this run's work, and must survive this
-        # run's failure.
-        dest_dir, _, received = str(destination).rstrip("/").rpartition("/")
-        preexisted = self.artifact_exists(dest_dir or "/", received)
+            # Recorded while the lock is held and before anything is received:
+            # what is at the path now is not this run's work, and must survive
+            # this run's failure.
+            dest_dir, _, received = str(destination).rstrip("/").rpartition("/")
+            preexisted = self.artifact_exists(dest_dir or "/", received)
 
-        def remove_partial() -> None:
-            self._cleanup_partial_subvolume(
-                dest_dir or "/", received, created_by_this_run=not preexisted
-            )
+            def remove_partial() -> None:
+                # The lock is a lease. A holder stalled past the stale
+                # threshold has had it broken and taken by another run, and
+                # the partial at the path is that run's receive, not this
+                # one's: asked of the store first, and left alone unless the
+                # lease is confirmed to stand.
+                from ..sshutil.lock import RECEIVING_LOCK_PREFIX
 
-        manager._start_heartbeat(name)
-        try:
+                standing = self._receive_lock_manager().is_owner(
+                    f"{RECEIVING_LOCK_PREFIX}{destination}"
+                )
+                if standing is not True:
+                    logger.warning(
+                        "Leaving the partial at %s as it is: this run's receiving "
+                        "lock on it %s, and another run may be receiving there now.",
+                        destination,
+                        "was broken while this run was stalled"
+                        if standing is False
+                        else "could not be confirmed",
+                    )
+                    return
+                self._cleanup_partial_subvolume(
+                    dest_dir or "/", received, created_by_this_run=not preexisted
+                )
+
             # The order an interrupted or failed receive is unwound in (see
             # btrfs_backup_ng.lifecycle): the receive's processes are stopped
             # and waited for; then the partial subvolume THIS run created at
@@ -1184,8 +1180,6 @@ class SSHEndpoint(Endpoint):
             with lifecycle.undo_on_failure(remove_partial):
                 with lifecycle.process_scope():
                     yield
-        finally:
-            manager.release(name)
 
     def _read_locks(self) -> dict:
         """The locks recorded ON THIS TARGET, in the lock-file shape.
@@ -4532,7 +4526,7 @@ print(json.dumps(result))
         the transfer and verification paths already use, so the lock names the
         thing that actually collides.
         """
-        dest = str(self._normalize_path(self.config["path"])).rstrip("/")
+        dest = str(self._normalize_path(self.config.get("path", ""))).rstrip("/")
         return f"{dest}/{Path(str(source_path)).name}"
 
     def _require_remote_destination(self, dest_path) -> bool:

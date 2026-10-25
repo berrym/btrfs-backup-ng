@@ -477,12 +477,17 @@ class TestDeletionsStopBetweenSnapshots:
         endpoint_obj = MagicMock()
         endpoint_obj.config = {"path": "/dest"}
         endpoint_obj._read_locks.return_value = {}
+        # Every slot still holds the copy the plan chose.
+        endpoint_obj.subvolume_identity.side_effect = lambda path: {
+            "uuid": "",
+            "received_uuid": "copy-" + path.split("/")[-2],
+        }
         monkeypatch.setattr(
             "btrfs_backup_ng.endpoint.choose_endpoint", lambda *a, **k: endpoint_obj
         )
         monkeypatch.setattr(prune_cli, "_delete_snapper_slot_btrfs", remove)
         deleted, errors = prune_cli.delete_snapper_backups(
-            "/dest", [{"number": 1}, {"number": 2}, {"number": 3}]
+            "/dest", [{"number": n, "received_uuid": f"copy-{n}"} for n in (1, 2, 3)]
         )
         assert removed == ["/dest/.snapshots/1"]
         assert deleted == 1

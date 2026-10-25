@@ -56,11 +56,85 @@ class PendingMetadata(TypedDict):
     stream_path: Path
     part_path: Path
     parent_name: str | None
+    # The identity the parent stream carried when this receive began, as
+    # ``_identity_token`` reads it, or None for a parent that records none. The
+    # commit asks the parent for the same token before it publishes.
+    parent_identity: tuple[str, str] | None
     source_uuid: str
     compress: str | None
     encrypt: str | None
     gpg_recipient: str | None
     openssl_cipher: str | None
+
+
+def _identity_tokens(snapshot: RawSnapshot) -> tuple[tuple[str, str], ...]:
+    """What tells one stored stream from another stored under the same name,
+    strongest first, each as ``(kind, value)`` with an empty value for a token
+    the record lacks.
+
+    A stream's sidecar records the uuid the stream carries (``source_uuid``:
+    what a ``btrfs receive`` of it records, and what an increment built on it
+    names as its parent), and the sha256 its commit sealed. The uuid is the
+    identity; the checksum stands in for a sidecar written before the uuid
+    was recorded.
+    """
+    return (
+        ("source uuid", snapshot.source_uuid or ""),
+        ("sha256", snapshot.checksum_value or ""),
+    )
+
+
+def _identity_token(snapshot: RawSnapshot) -> tuple[str, str] | None:
+    """The strongest identity token ``snapshot`` records, or None for a stream
+    that records none -- a legacy or filename-inferred record has no identity
+    to compare, and None says so."""
+    for token in _identity_tokens(snapshot):
+        if token[1]:
+            return token
+    return None
+
+
+def _identity_value(snapshot: RawSnapshot, kind: str) -> str:
+    """The value ``snapshot`` records for the token ``kind``, or an empty
+    string. The commit asks the live record for the token the receive
+    captured, so a parent that lost its sidecar reads as changed, not as
+    unknowable."""
+    return dict(_identity_tokens(snapshot)).get(kind, "")
+
+
+def _stream_uuid_of(snapshot: Any) -> str:
+    """The uuid the stream of ``snapshot`` carries, or an empty string when it
+    is not known: a source whose identity was never read, a record written
+    before the uuid was recorded, a stream listed from its filename alone."""
+    return getattr(snapshot, "stream_uuid", "") or ""
+
+
+def _from_the_same_source(snapshot: Any, stored: Any) -> bool:
+    """Whether ``stored``, a stream this location holds, can be the backup of
+    ``snapshot``: the uuid each carries is the same, or is unknown on either
+    side. Two volumes sharing a snapshot prefix name their streams alike, and
+    a name alone cannot tell one volume's backup from the other's; the uuid
+    can, when both sides recorded one."""
+    ours, theirs = _stream_uuid_of(snapshot), _stream_uuid_of(stored)
+    return not ours or not theirs or ours == theirs
+
+
+def _named(listing: Any, name: str) -> list[RawSnapshot]:
+    """Every stream in ``listing`` stored under ``name``. A location holds
+    one stream per name; two is a store that was written by something other
+    than this tool, and each caller decides what that means."""
+    return [stored for stored in listing if stored.get_name() == name]
+
+
+def _corresponding(snapshot: Any, listing: Any) -> Optional[RawSnapshot]:
+    """The stream in ``listing`` that is the backup of ``snapshot``: stored
+    under its name, and sent from the same source as far as either side knows.
+    This is raw correspondence, the one rule for presence at and parent
+    selection against a raw location."""
+    for stored in _named(listing, snapshot.get_name()):
+        if _from_the_same_source(snapshot, stored):
+            return stored
+    return None
 
 
 # Environment variable for OpenSSL passphrase (compatible with btrbk)
@@ -577,6 +651,7 @@ class RawEndpoint(Endpoint):
             "stream_path": Path(),
             "part_path": Path(),
             "parent_name": None,
+            "parent_identity": None,
             "source_uuid": "",
             "compress": None,
             "encrypt": None,
@@ -610,34 +685,74 @@ class RawEndpoint(Endpoint):
         path = self._normalize_path(self.config["path"])
         return f"raw://{path}"
 
-    def correspondent_of(self, snapshot: Any) -> Optional[Any]:
-        """Raw override of :meth:`Endpoint.correspondent_of` -- NAME semantics.
+    def _artifact_preexists(self, name: str) -> bool:
+        """Whether a stream named ``name`` is at this location.
 
-        A raw backup is a self-contained ``btrfs send`` stream written to a file; there is
-        no ``btrfs receive`` on the destination and therefore no ``received_uuid`` to match.
-        Correspondence for raw targets is by snapshot name (the sidecar also records the
-        parent by name), which is correct because a raw stream is replayed by name/order at
-        restore time. Returns the raw backup with the same name, or ``None`` (never raises).
+        The engine asks a destination this by name
+        (``core.operations.destination_artifact_exists``), and its default
+        looks for ``<path>/<name>``; a raw backup is the file ``<name>.btrfs``
+        beside its sidecar, so the location answers from its own listing, on
+        whichever transport it lives. The listing is dropped by every commit,
+        so a stream written earlier in this run is found.
+        """
+        try:
+            return self._stored_by_name(name) is not None
+        except Exception as e:  # noqa: BLE001 - the engine's own answer under doubt
+            # The engine's probe answers True when it cannot tell: for a
+            # cleanup that means "not ours to remove", for a parent pin it
+            # means "pin it by name and let the receive be the judge".
+            logger.debug(
+                "Could not list %s to look for %s: %s", self.config.get("path"), name, e
+            )
+            return True
+
+    def _stored_by_name(
+        self, name: str, *, live: bool = False
+    ) -> Optional[RawSnapshot]:
+        """The stream this location stores under ``name``, or None.
+
+        The one by-name lookup over this store's own listing, for the
+        questions a name answers: the parent an increment's sidecar names,
+        whether a copy pre-exists, and whether the parent a commit is about
+        to publish against is still there. Whether a stream is the backup of a
+        given snapshot is a different question (``correspondent_of``: the name
+        and the source). ``live`` drops the cached listing first, for the
+        question whose answer has to be this moment's. Raises what the listing
+        raises; each caller has its own posture under doubt.
+        """
+        return next(iter(_named(self.list_snapshots(flush_cache=live), name)), None)
+
+    def correspondent_of(self, snapshot: Any) -> Optional[Any]:
+        """Raw override of :meth:`Endpoint.correspondent_of`: the stream stored
+        under the snapshot's name, sent from the same source.
+
+        A raw backup is a self-contained ``btrfs send`` stream written to a
+        file; nothing receives it at the destination, so there is no
+        ``received_uuid`` to match, and the stream is found by its name, which
+        is also how its sidecar names its parent and how a restore replays the
+        chain. The name alone cannot tell two volumes apart when they share a
+        snapshot prefix into one location: the second volume's planner found
+        the first volume's stream under its own name, called the second volume
+        backed up, and never sent it (#138). So the stream's record is asked
+        which source it was sent from (``source_uuid``, the uuid the stream
+        carries) and a stream from a different source is not this snapshot's
+        backup. A record or a source whose identity is unknown is matched by
+        name alone, which is all that can be asked of it. Returns the backup,
+        or ``None`` (never raises).
         """
         get_name = getattr(snapshot, "get_name", None)
         if not callable(get_name):
             return None
         try:
-            name = get_name()
-            candidates = self.list_snapshots()
-            for candidate in candidates:
-                if candidate.get_name() == name:
-                    return candidate
+            return _corresponding(snapshot, self.list_snapshots())
         except Exception as e:  # noqa: BLE001 - contract: never raise; None is safe
             logger.debug("correspondent_of: could not resolve correspondent (%s)", e)
         return None
 
     def correspondents_of(self, snapshots: list[Any]) -> dict[str, Any]:
-        """Raw override of :meth:`Endpoint.correspondents_of` -- NAME semantics.
-
-        Same rule as the singular raw form (a raw backup has no ``received_uuid``
-        to match, so correspondence is by name), over a listing taken once rather
-        than once per snapshot. Never raises.
+        """Raw override of :meth:`Endpoint.correspondents_of`: the singular
+        form's rule (the name, and the source the stream was sent from), over
+        a listing taken once rather than once per snapshot. Never raises.
         """
         try:
             candidates = self.list_snapshots()
@@ -645,7 +760,7 @@ class RawEndpoint(Endpoint):
             logger.debug("correspondents_of: could not list snapshots (%s)", e)
             return {}
 
-        by_name: dict[str, Any] = {}
+        by_name: dict[str, list[Any]] = {}
         for candidate in candidates:
             # A listing entry without a name is skipped, not fatal: this method
             # promises never to raise, and three callers rely on that.
@@ -653,7 +768,7 @@ class RawEndpoint(Endpoint):
             if not callable(candidate_name):
                 continue
             try:
-                by_name.setdefault(candidate_name(), candidate)
+                by_name.setdefault(candidate_name(), []).append(candidate)
             except Exception as exc:  # noqa: BLE001 - contract: never raise
                 logger.debug("correspondents_of: unusable listing entry (%s)", exc)
 
@@ -667,9 +782,10 @@ class RawEndpoint(Endpoint):
             except Exception as exc:  # noqa: BLE001 - contract: never raise
                 logger.debug("correspondents_of: unusable source entry (%s)", exc)
                 continue
-            match = by_name.get(name)
-            if match is not None:
-                found[name] = match
+            for match in by_name.get(name, ()):
+                if _from_the_same_source(snapshot, match):
+                    found[name] = match
+                    break
         return found
 
     def required_parent_of(self, snapshot: Any) -> Optional[Any]:
@@ -692,13 +808,12 @@ class RawEndpoint(Endpoint):
         if not parent_name:
             return None
         try:
-            listed = list(self.list_snapshots())
+            parent = self._stored_by_name(parent_name)
         except Exception as e:  # noqa: BLE001 - reported below as unmet
             logger.debug("required_parent_of: could not list snapshots (%s)", e)
-            listed = []
-        for candidate in listed:
-            if candidate.get_name() == parent_name:
-                return candidate
+            parent = None
+        if parent is not None:
+            return parent
         raise __util__.AbortError(
             f"{snapshot.get_name()} is an incremental stream whose parent "
             f"{parent_name} is not at this location, so it cannot be received "
@@ -731,9 +846,10 @@ class RawEndpoint(Endpoint):
         hostile or mis-created lock file degrades to the same bounded fail/skip as
         contention instead of crashing (or hanging) every backup. The lock lives
         inside the target directory, so that directory MUST NOT be writable by
-        untrusted users. The raw+ssh subclass overrides this as a no-op (remote
-        locking is a separate concern -- there is no persistent connection to hold an
-        flock)."""
+        untrusted users. The raw+ssh subclass overrides this to take a REAL remote
+        exclusive lock via ``sshutil.lock`` (``manager.hold("target")``), not a
+        no-op: it gives raw+ssh the same mutual exclusion local raw targets have,
+        across processes AND across machines, which the local flock cannot offer."""
         if timeout is None:
             timeout = float(self.config.get("lock_timeout", 30.0))
         path = Path(self.config["path"])
@@ -878,6 +994,7 @@ class RawEndpoint(Endpoint):
             "stream_path": output_path,
             "part_path": part_path,
             "parent_name": parent_name,
+            "parent_identity": self._parent_identity_at_receive(parent_name),
             "source_uuid": source_uuid,
             "compress": self.compress,
             "encrypt": self.encrypt,
@@ -894,6 +1011,132 @@ class RawEndpoint(Endpoint):
         proc = self._execute_pipeline(pipeline, stdin)
 
         return proc
+
+    def _parent_identity_at_receive(
+        self, parent_name: str | None
+    ) -> tuple[str, str] | None:
+        """The identity token of the parent stream as this receive begins.
+
+        Read from the store's listing (the one the engine just asked the
+        parent's presence of), kept in the pending record and compared with
+        the live record at commit by ``_require_parent_at_commit``. None for a
+        full stream, for a parent whose record carries no identity, and when
+        the listing cannot be read: the commit then asks presence alone, which
+        is all that can be asked of such a parent.
+        """
+        if not parent_name:
+            return None
+        try:
+            parent = self._stored_by_name(parent_name)
+        except Exception as e:  # noqa: BLE001 - presence alone is asked at commit
+            logger.debug(
+                "Could not read the identity of parent %s at %s: %s",
+                parent_name,
+                self.config.get("path"),
+                e,
+            )
+            return None
+        return _identity_token(parent) if parent is not None else None
+
+    def _require_publishable_at_commit(self) -> None:
+        """The questions a commit asks of the store before it renames the
+        stream into place, from one listing taken inside the target lock.
+
+        The lock is the one a prune of this location holds while it deletes
+        and a peer's commit holds while it publishes, so an answer read under
+        it cannot be overtaken before the rename. A listing that cannot be
+        read refuses the commit: the stream stays an uncommitted ``.part``,
+        removed by the transfer's own cleanup, and the next run sends it again.
+        """
+        stored = self.list_snapshots(flush_cache=True)
+        self._refuse_another_sources_name(stored)
+        self._require_parent_at_commit(stored)
+
+    def _refuse_another_sources_name(self, stored: list[RawSnapshot]) -> None:
+        """Refuse to publish over a stream this source cannot be shown to own.
+
+        The commit is a replacing rename. Two volumes sharing a snapshot prefix
+        into one location name their streams alike, so the second volume's
+        commit renamed its stream over the first volume's and reported a
+        success, leaving one backup for two volumes (#138). A stream already
+        under this name is asked which source it was sent from: the same
+        source is refreshing its own backup and may; a different source may
+        not; a stream that records no source (a sidecar written before the
+        uuid was recorded, a stream listed from its filename alone) cannot be
+        told from another volume's and is refused too, since overwriting an
+        unconfirmable backup is the loss being removed.
+        """
+        pending = self._pending_metadata
+        name = pending["name"]
+        ours = pending.get("source_uuid") or ""
+        where = self.config.get("path")
+        for existing in _named(stored, name):
+            theirs = _stream_uuid_of(existing)
+            if not theirs:
+                raise RuntimeError(
+                    f"a stream is already at {where} under the name {name}, and "
+                    f"nothing records which source it was sent from, so it cannot "
+                    f"be confirmed to be this one's: refusing to overwrite a backup "
+                    f"that cannot be told from another volume's; move or remove it, "
+                    f"or give this volume a snapshot prefix of its own"
+                )
+            if theirs != ours:
+                raise RuntimeError(
+                    f"a stream is already at {where} under the name {name}, sent "
+                    f"from {theirs}; this one was sent from "
+                    f"{ours or 'a source whose identity is unknown'}: refusing to "
+                    f"overwrite another source's backup; give each volume sharing "
+                    f"this location a snapshot prefix of its own"
+                )
+
+    def _require_parent_at_commit(self, stored: list[RawSnapshot]) -> None:
+        """Refuse to publish an increment whose parent is not the one it was
+        received against, or is no longer here.
+
+        Asked inside the target lock, before the rename, from ``stored``, the
+        listing taken at that moment: the same lock a prune of this location
+        holds while it deletes, so nothing this tool does can take the parent
+        between the answer and the publish. The parent's pin covers the
+        receive (the engine pins the destination's copy of the parent for the
+        span of the send); this covers what a pin cannot: a parent removed by
+        hand, by a tool that reads no pins, or after a pin was judged stale.
+
+        An increment stored here applies only onto its parent, and nothing at
+        this location can regenerate a full stream in its place, so a stream
+        published against a parent that is gone is a backup that cannot be
+        restored, reported as a success. A parent replaced under its name by a
+        different stream (a second config sharing the prefix, a re-sent copy
+        of another snapshot) is the same loss one step later: the increment
+        would be restored onto the wrong base. The two are told apart in the
+        message. A parent whose record carries no identity can only be asked
+        to be present.
+        """
+        pending = self._pending_metadata
+        parent_name = pending.get("parent_name")
+        if not parent_name:
+            return
+        child = pending["name"]
+        where = self.config.get("path")
+        parent = next(iter(_named(stored, parent_name)), None)
+        if parent is None:
+            raise RuntimeError(
+                f"{child} was received against {parent_name}, which is no longer "
+                f"at {where}: refusing to publish an increment whose parent is "
+                f"gone, since a stored increment applies only onto its parent "
+                f"and nothing here can send a full stream in its place"
+            )
+        expected = pending.get("parent_identity")
+        if expected is None:
+            return
+        kind, value = expected
+        found = _identity_value(parent, kind)
+        if found != value:
+            raise RuntimeError(
+                f"{child} was received against {parent_name}, but the stream "
+                f"stored under that name is not the one the receive began against "
+                f"({kind} {value} then, {found or 'none'} now): refusing to publish "
+                f"an increment onto a parent that changed identity"
+            )
 
     def _build_receive_pipeline(self, output_path: Path) -> list[list[str]]:
         """Build the compression/encryption pipeline for receiving.
@@ -1045,6 +1288,11 @@ class RawEndpoint(Endpoint):
         ``discover_raw_snapshots`` ignores -- so a partial transfer can never be
         mistaken for a complete backup.
 
+        The stream is published only if nothing another source wrote is under
+        its name and, for an increment, its parent is still here and is the
+        stream the receive began against (``_require_publishable_at_commit``),
+        asked under the target lock just before the rename.
+
         Raises on failure so the engine treats an un-published stream as a
         failed transfer rather than reporting a success that is not on disk.
         """
@@ -1085,6 +1333,7 @@ class RawEndpoint(Endpoint):
         # before the sidecar is written (and mislabel it). This section is sub-second
         # (a metadata rename + a directory fsync + a small sidecar write).
         with self.target_lock():
+            self._require_publishable_at_commit()
             os.replace(part_path, final_path)
             # Persist the rename itself.
             self._fsync_dir(final_path.parent)
@@ -1847,6 +2096,24 @@ class RawEndpoint(Endpoint):
             run, path, hostname=socket.gethostname(), run_elevated=run_elevated
         )
 
+    def _receive_lock_root(self) -> str | None:
+        """A stream's receiving lock lives in the store the location's pins
+        already live in, which for the raw+ssh subclass is on the remote --
+        that subclass inherits this as it is.
+
+        One stream, not the whole target: ``target_lock`` still serialises the
+        commit's rename and sidecar write against ``raw backfill-metadata`` and
+        ``raw encrypt``, which rewrite many sidecars at once; the receiving
+        lock is a single stream's, held for its receive-to-commit span and
+        taken by a prune before it removes the stream, so neither a second
+        transfer of that stream nor its deletion runs while it is being
+        written. The lock itself is the base endpoint's.
+        """
+        return self._lock_target_path()
+
+    def _receive_lock_manager(self) -> Any:
+        return self._lock_manager()
+
     def protect_incremental_parents(
         self, to_keep: list, to_delete: list
     ) -> tuple[list, list]:
@@ -1856,10 +2123,11 @@ class RawEndpoint(Endpoint):
         without its parent stream, so deleting a parent silently makes its children unrestorable.
         Walk the ``parent_name`` chain from every kept stream back to its root and rescue any
         ancestor currently marked for deletion (transitive -- walking the full chain also covers a
-        rescued parent's own parents). A kept stream whose parent is not present on this target has
-        a chain already broken upstream (pre-existing, not caused by this prune): warn, never
-        fabricate. Legacy streams with no recorded ``parent_name`` cannot be chain-resolved and are
-        left as the time-based decision placed them.
+        rescued parent's own parents). A kept stream whose parent is not on this target has a chain
+        that was already broken when this pass listed the target -- by an earlier prune, another
+        process or a deletion by hand -- so it is warned about, never repaired by fabrication.
+        Legacy streams with no recorded ``parent_name`` cannot be chain-resolved and are left as
+        the time-based decision placed them.
         """
         by_name = {s.get_name(): s for s in list(to_keep) + list(to_delete)}
         delete_names = {s.get_name() for s in to_delete}
@@ -1875,9 +2143,11 @@ class RawEndpoint(Endpoint):
                 parent = by_name.get(parent_name)
                 if parent is None:
                     logger.warning(
-                        "Retention: retained raw stream %r references parent %r which is not "
-                        "present on this target -- its incremental chain is already broken "
-                        "upstream (not caused by this prune)",
+                        "Retention: retained raw stream %r references parent %r, which is not "
+                        "on this target: its incremental chain was already broken when this "
+                        "pass listed the target -- the parent was removed earlier, by a "
+                        "previous prune, another process or by hand -- and nothing in this "
+                        "pass can repair it",
                         leaf.get_name(),
                         parent_name,
                     )
@@ -1975,7 +2245,8 @@ class RawEndpoint(Endpoint):
             result.fail_all(snapshots, f"the lock store is unusable: {exc}")
             return result
         for snapshot in snapshots:
-            # A retention lock is what a restore holds while it reads a stream.
+            # A retention lock is what a restore holds while it reads a stream,
+            # and what a receive holds on the parent stream it chains against.
             # The base Endpoint.delete_snapshots checks it; this override
             # replaces that method wholesale and never did, so `set_lock` on a
             # raw target pinned nothing: a prune deleted the stream a restore was
@@ -2003,58 +2274,69 @@ class RawEndpoint(Endpoint):
                     snapshot, "needed as the incremental parent of a kept stream"
                 )
                 continue
-            # The stream file IS the backup; removing it is the deletion. Only a
-            # failure HERE is a delete failure.
-            try:
-                if snapshot.stream_path.exists():
-                    snapshot.stream_path.unlink()
-                    logger.info("Deleted stream file: %s", snapshot.stream_path)
-                    result.deleted.append(snapshot)
-                else:
-                    # Previously silent: a batch whose every stream was already
-                    # gone produced no log line at all and was reported as a
-                    # completed prune of that many snapshots.
-                    logger.warning(
-                        "Stream file already absent, nothing to delete: %s",
-                        snapshot.stream_path,
-                    )
-                    result.skip(snapshot, "stream file already absent")
-            except OSError as e:
-                logger.error("Failed to delete snapshot %s: %s", snapshot.name, e)
-                result.fail(snapshot, e)
-                # The stream is still there; leave its cache entry and sidecar
-                # alone and do NOT count it deleted.
+            # The stream's own receiving lock, which a transfer holds from the
+            # first byte of its ``.part`` through the commit that renames it
+            # into place: a stream being written is skipped, not deleted.
+            held = self._lock_for_deletion(
+                snapshot, self._receive_destination(snapshot.get_name()), result
+            )
+            if held is None:
                 continue
-
-            # The .meta sidecar is bookkeeping beside the stream, not the backup.
-            # Its removal is attempted in its OWN try/except: once the stream is
-            # gone the snapshot is deleted, so a sidecar that cannot be unlinked
-            # is a leftover to WARN about, never a second verdict. Folding it into
-            # the delete's try counted the SAME snapshot both deleted (stream
-            # unlinked) and failed (sidecar OSError), and skipped the cache drop.
-            if snapshot.metadata_path.exists():
+            with held:
+                # The stream file IS the backup; removing it is the deletion. Only a
+                # failure HERE is a delete failure.
                 try:
-                    snapshot.metadata_path.unlink()
-                    logger.debug("Deleted metadata file: %s", snapshot.metadata_path)
+                    if snapshot.stream_path.exists():
+                        snapshot.stream_path.unlink()
+                        logger.info("Deleted stream file: %s", snapshot.stream_path)
+                        result.deleted.append(snapshot)
+                    else:
+                        # Previously silent: a batch whose every stream was already
+                        # gone produced no log line at all and was reported as a
+                        # completed prune of that many snapshots.
+                        logger.warning(
+                            "Stream file already absent, nothing to delete: %s",
+                            snapshot.stream_path,
+                        )
+                        result.skip(snapshot, "stream file already absent")
                 except OSError as e:
-                    logger.warning(
-                        "Removed the stream %s but could not remove its .meta "
-                        "sidecar %s: %s. The backup is gone; the orphaned sidecar "
-                        "is harmless -- a later listing refuses a sidecar whose "
-                        "stream is missing -- and can be removed by hand.",
-                        snapshot.name,
-                        snapshot.metadata_path,
-                        e,
-                    )
+                    logger.error("Failed to delete snapshot %s: %s", snapshot.name, e)
+                    result.fail(snapshot, e)
+                    # The stream is still there; leave its cache entry and sidecar
+                    # alone and do NOT count it deleted.
+                    continue
 
-            # The stream is gone (deleted here or already absent), so drop it from
-            # the cache regardless of how the sidecar fared -- otherwise every
-            # later list_snapshots() in this process reports a stream that is not
-            # there.
-            if self._cached_snapshots is not None:
-                self._cached_snapshots = [
-                    s for s in self._cached_snapshots if s.name != snapshot.name
-                ]
+                # The .meta sidecar is bookkeeping beside the stream, not the backup.
+                # Its removal is attempted in its OWN try/except: once the stream is
+                # gone the snapshot is deleted, so a sidecar that cannot be unlinked
+                # is a leftover to WARN about, never a second verdict. Folding it into
+                # the delete's try counted the SAME snapshot both deleted (stream
+                # unlinked) and failed (sidecar OSError), and skipped the cache drop.
+                if snapshot.metadata_path.exists():
+                    try:
+                        snapshot.metadata_path.unlink()
+                        logger.debug(
+                            "Deleted metadata file: %s", snapshot.metadata_path
+                        )
+                    except OSError as e:
+                        logger.warning(
+                            "Removed the stream %s but could not remove its .meta "
+                            "sidecar %s: %s. The backup is gone; the orphaned sidecar "
+                            "is harmless -- a later listing refuses a sidecar whose "
+                            "stream is missing -- and can be removed by hand.",
+                            snapshot.name,
+                            snapshot.metadata_path,
+                            e,
+                        )
+
+                # The stream is gone (deleted here or already absent), so drop it from
+                # the cache regardless of how the sidecar fared -- otherwise every
+                # later list_snapshots() in this process reports a stream that is not
+                # there.
+                if self._cached_snapshots is not None:
+                    self._cached_snapshots = [
+                        s for s in self._cached_snapshots if s.name != snapshot.name
+                    ]
         return result
 
     def delete_snapshot(self, snapshot: RawSnapshot, **kwargs: Any) -> DeletionResult:
@@ -2177,13 +2459,6 @@ class SSHRawEndpoint(RawEndpoint):
         # An explicit ssh-agent socket (e.g. `--ssh-auth-sock`), useful under sudo where
         # SSH_AUTH_SOCK is not inherited. None -> rely on ssh's own agent discovery.
         self.ssh_auth_sock = config.get("ssh_auth_sock")
-
-        # set_lock consults self.config for this, but only SSHEndpoint whitelisted
-        # it, so a raw+ssh target could never relax the lock abort -- the abort's
-        # own message says "pass --skip-remote-lock to proceed unprotected on
-        # purpose", advice that did nothing on this transport.
-        if config.get("skip_remote_lock") is not None:
-            self.config["skip_remote_lock"] = config["skip_remote_lock"]
 
         self._is_remote = True
 
@@ -2777,8 +3052,13 @@ class SSHRawEndpoint(RawEndpoint):
         The receive pipeline writes to a remote ``.part`` file; once the engine
         confirms success we ``sync`` the remote filesystem and ``mv -f`` the
         ``.part`` file to its final name. A crash leaves only the ``.part`` file,
-        which discovery ignores. Raises on failure so an un-published stream is
-        treated as a failed transfer.
+        which discovery ignores. The stream is published only if nothing
+        another source wrote is under its name on the remote and, for an
+        increment, its parent is still there and is the stream the receive
+        began against (``_require_publishable_at_commit``, inherited: the
+        listing it asks is this endpoint's remote one), under the target lock.
+        Raises on failure so an un-published stream is treated as a failed
+        transfer.
         """
         pending = getattr(self, "_pending_metadata", None)
         # No receive() has run on this endpoint (dummy init) -> nothing to publish.
@@ -2813,6 +3093,7 @@ class SSHRawEndpoint(RawEndpoint):
         # not a rename -- and its peers can be on other machines, where a flock would
         # not have helped anyway. This section is now metadata-only and sub-second.
         with self.target_lock():
+            self._require_publishable_at_commit()
             result = self._exec_remote_command(["sh", "-c", mv_script], check=False)
             if result.returncode != 0:
                 stderr = result.stderr
@@ -3472,11 +3753,13 @@ class SSHRawEndpoint(RawEndpoint):
         so both entry points that wrap it in ``target_lock`` -- ``delete_snapshots``
         (per batch) and ``delete_old_snapshots`` (whole prune pass) -- dispatch to the
         remote deletion for a raw+ssh target. Inheriting the base ``delete_snapshots``
-        keeps the (no-op) lock discipline uniform across local and remote. The same
+        keeps the ``target_lock`` discipline uniform across local and remote -- for
+        raw+ssh that lock is a real remote exclusive hold, not a no-op. The same
         chain guard as the local primitive applies (never orphan a child stream)."""
         # Locks recorded ON THE TARGET, not just this process's in-memory set: a
         # prune in another process lists the target fresh, so every snapshot it
-        # sees looks unlocked -- including one a restore is reading right now.
+        # sees looks unlocked -- including one a restore is reading right now,
+        # or one an incremental receive is chaining against.
         from ..sshutil.lock import (
             RemoteLockUnavailable,
             blocked_by_remote_lock,
@@ -3529,45 +3812,53 @@ class SSHRawEndpoint(RawEndpoint):
             if snapshot_lock_name(snapshot) in remote_locked:
                 result.skip(snapshot, "locked by another process on this target")
                 continue
-            try:
-                # Build rm command for stream and metadata
-                rm_cmd = (
-                    f"rm -f {shlex.quote(str(snapshot.stream_path))} "
-                    f"{shlex.quote(str(snapshot.metadata_path))}"
-                )
-                rm_cmd = self._elevate(rm_cmd)
+            # The stream's own receiving lock, on the remote store: a stream a
+            # transfer is writing right now is skipped, not removed under it.
+            held = self._lock_for_deletion(
+                snapshot, self._receive_destination(snapshot.get_name()), result
+            )
+            if held is None:
+                continue
+            with held:
+                try:
+                    # Build rm command for stream and metadata
+                    rm_cmd = (
+                        f"rm -f {shlex.quote(str(snapshot.stream_path))} "
+                        f"{shlex.quote(str(snapshot.metadata_path))}"
+                    )
+                    rm_cmd = self._elevate(rm_cmd)
 
-                full_cmd = ssh_cmd + [rm_cmd]
-                subprocess.run(full_cmd, check=True, capture_output=True)
-                logger.info("Deleted remote snapshot: %s", snapshot.name)
-                result.deleted.append(snapshot)
+                    full_cmd = ssh_cmd + [rm_cmd]
+                    subprocess.run(full_cmd, check=True, capture_output=True)
+                    logger.info("Deleted remote snapshot: %s", snapshot.name)
+                    result.deleted.append(snapshot)
 
-                # Update cache
-                if self._cached_snapshots is not None:
-                    self._cached_snapshots = [
-                        s for s in self._cached_snapshots if s.name != snapshot.name
-                    ]
-            except subprocess.CalledProcessError as e:
-                stderr = (e.stderr or b"").decode(errors="replace").strip()
-                logger.error(
-                    "Failed to delete remote snapshot %s: %s",
-                    snapshot.name,
-                    stderr or e,
-                )
-                if _is_sudo_denial(stderr):
-                    # Every delete in this run will fail for the same reason, and
-                    # prune would otherwise finish "successfully" having removed
-                    # nothing -- so the retention policy silently stops applying
-                    # while the operator is told it ran.
-                    raise __util__.AbortError(
-                        f"Cannot delete backups on {self.hostname}: {stderr}. "
-                        "Retention did NOT run. A raw+ssh target stores plain "
-                        "files, so with ssh_sudo the remote user needs "
-                        "passwordless sudo for rm (and find/cat/stat), not for "
-                        "btrfs; alternatively give the user ownership of the "
-                        "backup directory and turn ssh_sudo off."
-                    ) from e
-                # Not a denial, so the rest of the batch may still succeed --
-                # but this one did not, and the caller has to be told which.
-                result.fail(snapshot, stderr or e)
+                    # Update cache
+                    if self._cached_snapshots is not None:
+                        self._cached_snapshots = [
+                            s for s in self._cached_snapshots if s.name != snapshot.name
+                        ]
+                except subprocess.CalledProcessError as e:
+                    stderr = (e.stderr or b"").decode(errors="replace").strip()
+                    logger.error(
+                        "Failed to delete remote snapshot %s: %s",
+                        snapshot.name,
+                        stderr or e,
+                    )
+                    if _is_sudo_denial(stderr):
+                        # Every delete in this run will fail for the same reason, and
+                        # prune would otherwise finish "successfully" having removed
+                        # nothing -- so the retention policy silently stops applying
+                        # while the operator is told it ran.
+                        raise __util__.AbortError(
+                            f"Cannot delete backups on {self.hostname}: {stderr}. "
+                            "Retention did NOT run. A raw+ssh target stores plain "
+                            "files, so with ssh_sudo the remote user needs "
+                            "passwordless sudo for rm (and find/cat/stat), not for "
+                            "btrfs; alternatively give the user ownership of the "
+                            "backup directory and turn ssh_sudo off."
+                        ) from e
+                    # Not a denial, so the rest of the batch may still succeed --
+                    # but this one did not, and the caller has to be told which.
+                    result.fail(snapshot, stderr or e)
         return result

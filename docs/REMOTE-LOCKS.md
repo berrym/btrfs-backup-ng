@@ -85,6 +85,20 @@ The `snap-` prefix is what separates a pin on a snapshot from a lock on the
 whole target. One constant drives it, so the writer, the delete guards and
 `restore --status` cannot drift apart.
 
+A local btrfs target keeps its pins in a lock file, not in this directory, and
+a local endpoint that finds the directory where its lock file would be reads
+its pins from the directory instead. Creating the directory for a receive lock
+would therefore hide every pin an earlier run recorded in the file. A local
+btrfs target's receive locks live in a store of their own:
+
+```
+<target>/.btrfs-backup-ng.receiving/
+    receiving-<dest>.lock/        the same layout; the pins stay in the lock file
+```
+
+`ssh://` and raw targets have no lock-file mode to protect, so their receive
+locks share the directory their pins already live in.
+
 ### Names on disk are encoded, identity is not
 
 A lock's directory is named `<sanitised>-<digest>`, where the digest is of the
@@ -172,6 +186,19 @@ held it. Now it finds its own record gone, leaves the lock alone and says so.
 Its heartbeat refreshes with `touch -c`, so it cannot recreate its record
 inside the successor's lock either.
 
+The same holds for what the lock protected. A receive lock is a lease: the
+right it grants lasts only while the holder's record stands, and a holder that
+was stalled past the threshold owns nothing under it once the record is gone,
+whatever it believes. A snapper receive therefore asks the store whether its
+lease still stands, its own record there and the only owner record,
+immediately before it publishes the slot, before it abandons it, and before an
+`ssh://` receive removes the partial a failed receive left. A holder whose
+lease is gone publishes nothing, removes nothing and fails its own transfer
+with the reason; what is in the slot is the successor's work. A lease the
+store cannot confirm is refused the same way. Before 0.10.0 the lock was
+enforced only at the door, and a stale-broken holder cleared or published its
+successor's slot by path.
+
 Shared pins need none of this. There is nothing to win, so acquiring one is a
 single write with no contention to resolve.
 
@@ -223,8 +250,15 @@ left behind are not locks and are ignored.
 ### Staleness is judged from the target's clock
 
 The holder refreshes its file every 30 seconds. Age is `remote_now -
-remote_mtime`, both read **from the target** — its own `date`, its own `stat`.
-No client clock is ever compared to a remote one.
+remote_mtime`, both read **from the target**: the mtime of each record, and
+for `now` the mtime of a probe file written into the store and removed again,
+the same clock that stamped the records. No client clock is ever compared to a
+remote one, and neither is the target's `date`: a store on a networked
+filesystem is stamped by the file server's clock, not the host's, and before
+0.10.0 a server clock running behind the host's `date` made a freshly
+heartbeated lock read as stale and let the next contender break it. A probe
+that cannot be written, because the store is read-only or its root is a
+symbolic link, means the clock cannot be read, and every record is then held.
 
 Listing emits those raw facts and does the arithmetic in Python. Conditional
 logic in a script that must behave identically under bash, dash and busybox ash
@@ -322,7 +356,29 @@ same subvolume, and the loser only finds out after transferring everything.
 
 The lock is taken where the transaction is, in `core/operations.py`, not inside
 the endpoint's transfer methods — those are the quoting and stream-contract
-surface, exercised by unit tests that have no remote to talk to.
+surface, exercised by unit tests that have no remote to talk to. One lock body
+serves every transport, and each endpoint supplies only the store its locks
+live in: a local btrfs target was the one destination with no receive lock at
+all until 0.10.0, and two transfers of one snapshot into it both read "absent,
+so ours", one committed a verified copy and the other's cleanup deleted it as
+its own partial. The lock is held from before the probe that records
+authorship through the commit and the cleanup of a failed transfer.
+
+Two more things are held for the span of a receive. The destination's copy of
+the parent an increment chains against is pinned on the destination, so a
+prune there, from another process or another machine, cannot delete it
+mid-send; the pin is released when the receive ends. And every deletion takes
+the artifact's receive lock before touching it, so a prune that meets a
+snapshot, a raw stream or a snapper slot being received reports it as `being
+received by <holder>` and keeps it, never as a leftover it may remove.
+
+A snapper receive clears an `.snapshots/<n>.incoming` left behind by an earlier
+run before it opens the slot, and judges it by when it was last written,
+against the store's clock and the stale threshold. One written within the
+threshold may be a receive still arriving: the slot is refused, not cleared,
+and the transfer fails with the reason; a run that is gone leaves it to age
+past the threshold, and the next run removes it. An age that cannot be read
+keeps the slot.
 
 For snapper the same lock spans **both** halves of the transaction: the receive
 into `.snapshots/<n>.incoming` and the rename that publishes it as
@@ -382,7 +438,15 @@ heartbeat stops, the lock goes stale, and the next contender breaks it.
 
 Every remote delete path asks the target which snapshots are locked before
 deleting anything, and skips those. The answer covers locks taken by any
-process, which is the point.
+process, which is the point. Every delete path, on every transport, also takes
+the artifact's own receive lock before it touches the artifact, and before any
+look at its path, since during a receive the path exists and is the partial. A
+held lock is a skip, "being received by <holder>"; a lock that cannot be taken
+fails that deletion rather than guessing, unless the operator passed
+`--skip-remote-lock`. A snapper slot is asked one more question under that
+lock: whether it still holds the copy the plan chose, by the `received_uuid`
+the plan recorded for it. snapper reuses numbers, so a slot a run republished
+between the plan and the delete is kept, and the pass says what changed.
 
 Three outcomes, kept distinct because they demand different responses:
 
@@ -468,7 +532,9 @@ beside each pin.
 | local `raw://` | yes | lock directory beside the streams |
 
 `persists_locks` states this per endpoint, and a test asserts the flag cannot
-drift from what `set_lock` actually does.
+drift from what `set_lock` actually does. Receive locks persist on every
+target: in the lock directory for `ssh://` and raw targets, and in
+`.btrfs-backup-ng.receiving` beside the lock file for a local one.
 
 ## Permissions
 

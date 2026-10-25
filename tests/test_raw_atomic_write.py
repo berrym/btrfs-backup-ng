@@ -116,6 +116,11 @@ def _ssh_commit_endpoint(**config):
         "stream_path": "/backup/snap.btrfs",
         "part_path": "/backup/snap.btrfs.part",
     }
+    # The remote store the commit lists under the target lock before it
+    # publishes, to see that nothing another source wrote is under the name:
+    # empty, as for a first transfer. The real listing is its own ssh session,
+    # which the mocked remote command below would not answer.
+    ep.list_snapshots = lambda flush_cache=False: []
     return ep
 
 

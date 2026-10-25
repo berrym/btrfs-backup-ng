@@ -24,8 +24,15 @@ import pytest
 
 from btrfs_backup_ng import __util__
 from btrfs_backup_ng.core import operations
+from btrfs_backup_ng.endpoint.common import Endpoint
+from btrfs_backup_ng.endpoint.raw import RawEndpoint
 from btrfs_backup_ng.endpoint.ssh import SSHEndpoint
-from btrfs_backup_ng.sshutil.lock import RECEIVING_LOCK_PREFIX, RemoteLockManager
+from btrfs_backup_ng.sshutil.lock import (
+    LOCK_DIR_NAME,
+    RECEIVING_DIR_NAME,
+    RECEIVING_LOCK_PREFIX,
+    RemoteLockManager,
+)
 
 
 def _manager(sandbox: Path, **kw) -> RemoteLockManager:
@@ -203,24 +210,137 @@ class TestTheDestinationIsTheReceivedSubvolume:
         )
 
     def test_two_snapper_slots_do_not_collide(self, tmp_path):
-        """Both are named "snapshot"; the SLOT is what separates them, so the
-        lock has to be keyed on the incoming slot rather than the basename."""
+        """Both receive a subvolume named "snapshot"; the SLOT is what
+        separates them, so the slot lock is keyed on the slot directory
+        (``SnapperLayout.open_slot``) rather than on the basename."""
         first, second = _endpoint(tmp_path), _endpoint(tmp_path)
-        with first.receiving_lock(f"{tmp_path}/.snapshots/41.incoming/snapshot"):
-            with second.receiving_lock(f"{tmp_path}/.snapshots/42.incoming/snapshot"):
+        with first.receiving_lock(f"{tmp_path}/.snapshots/41"):
+            with second.receiving_lock(f"{tmp_path}/.snapshots/42"):
                 pass
 
 
-class TestALocalTargetIsUnaffected:
-    def test_a_local_endpoint_is_a_no_op(self, tmp_path):
-        """Only remote endpoints record locks; a local one has no
-        cross-machine contention and no receiving_lock to call."""
+def _local(sandbox: Path, **config) -> Endpoint:
+    """A base endpoint over ``sandbox``, as a local btrfs target is."""
+    endpoint = Endpoint.__new__(Endpoint)
+    endpoint.config = {"path": str(sandbox), **config}
+    return endpoint
 
-        class Local:
+
+class TestALocalTargetTakesARealLock:
+    """A local btrfs target had no receive lock at all: two transfers of one
+    snapshot into it both read "absent, so ours" and the loser's cleanup
+    deleted the winner's copy. It now has the same per-copy lock as every
+    other transport, in a store of its own under the target."""
+
+    def test_a_second_receive_of_one_copy_is_refused(self, tmp_path):
+        first, second = _local(tmp_path), _local(tmp_path)
+        destination = f"{tmp_path}/home.20240101T120000"
+        with first.receiving_lock(destination):
+            with pytest.raises(__util__.AbortError, match="Already being received"):
+                with second.receiving_lock(destination):
+                    pass
+
+    def test_different_copies_are_not_serialised(self, tmp_path):
+        first, second = _local(tmp_path), _local(tmp_path)
+        with first.receiving_lock(f"{tmp_path}/home.20240101T120000"):
+            with second.receiving_lock(f"{tmp_path}/var.20240101T120000"):
+                pass  # must not block or raise
+
+    def test_it_is_reentrant_within_one_endpoint(self, tmp_path):
+        """The snapper flow holds the slot's lock across the receive and the
+        publish; the transfer beneath must not contend with its caller."""
+        endpoint = _local(tmp_path)
+        destination = f"{tmp_path}/.snapshots/42.incoming/snapshot"
+        with endpoint.receiving_lock(destination):
+            with endpoint.receiving_lock(destination):
+                pass
+            with pytest.raises(__util__.AbortError):
+                with _local(tmp_path).receiving_lock(destination):
+                    pass
+
+    def test_the_lock_lives_in_its_own_store_and_leaves_the_pin_store_alone(
+        self, tmp_path
+    ):
+        """Creating ``.btrfs-backup-ng.locks`` would make the endpoint read
+        its pins from there instead of from the lock file, hiding every pin
+        an earlier run recorded. The receive lock must not have that side
+        effect."""
+        endpoint = _local(tmp_path, lock_file_name=LOCK_DIR_NAME)
+        with endpoint.receiving_lock(f"{tmp_path}/home.20240101T120000"):
+            assert (tmp_path / RECEIVING_DIR_NAME).is_dir()
+            assert not (tmp_path / LOCK_DIR_NAME).exists(), (
+                "the receive lock was written into the PIN store"
+            )
+            assert endpoint._lock_store_manager() is None, (
+                "the location now reads its pins from a directory store"
+            )
+
+    def test_the_lock_root_wins_over_the_path(self, tmp_path):
+        """The snapper flow repoints ``path`` at the slot; the lock must stay
+        under the target, or it is published and renamed with the slot."""
+        endpoint = _local(tmp_path, lock_root=str(tmp_path))
+        incoming = tmp_path / ".snapshots" / "42.incoming"
+        incoming.mkdir(parents=True)
+        endpoint.config["path"] = str(incoming)
+        with endpoint.receiving_lock(f"{incoming}/snapshot"):
+            assert not (incoming / RECEIVING_DIR_NAME).exists()
+            assert (tmp_path / RECEIVING_DIR_NAME).is_dir()
+
+    def test_an_object_with_no_receiving_lock_is_passed_through(self):
+        """A test's stand-in that is not an endpoint at all: the engine's
+        dispatcher has nothing to call and does not invent a lock."""
+
+        class StandIn:
             config: dict = {"path": "/backup"}
 
-        with operations._receiving_lock(Local(), "/backup/x"):
+        with operations._receiving_lock(StandIn(), "/backup/x"):
             pass
+
+
+class TestARawStoreTakesARealLockPerStream:
+    def test_a_second_receive_of_one_stream_is_refused(self, tmp_path):
+        first = RawEndpoint(config={"path": str(tmp_path)})
+        second = RawEndpoint(config={"path": str(tmp_path)})
+        with first.receiving_lock(f"{tmp_path}/home.20240101T120000"):
+            with pytest.raises(__util__.AbortError, match="Already being received"):
+                with second.receiving_lock(f"{tmp_path}/home.20240101T120000"):
+                    pass
+
+    def test_different_streams_are_not_serialised(self, tmp_path):
+        first = RawEndpoint(config={"path": str(tmp_path)})
+        second = RawEndpoint(config={"path": str(tmp_path)})
+        with first.receiving_lock(f"{tmp_path}/home.20240101T120000"):
+            with second.receiving_lock(f"{tmp_path}/var.20240101T120000"):
+                pass
+
+    def test_the_remote_raw_store_inherits_it(self):
+        from btrfs_backup_ng.endpoint.raw import SSHRawEndpoint
+
+        assert SSHRawEndpoint.receiving_lock is RawEndpoint.receiving_lock
+
+
+class TestOneBodyServesEveryTransport:
+    """Three copies of the receive lock had grown apart only in which store
+    they opened. The lock is now ``Endpoint._hold_receiving_lock`` and nothing
+    overrides it: an endpoint names only its store (``_receive_lock_root``,
+    ``_receive_lock_manager``). A transfer and a deletion both take it."""
+
+    def test_the_lock_body_is_inherited_by_every_endpoint(self):
+        assert RawEndpoint._hold_receiving_lock is Endpoint._hold_receiving_lock
+        assert SSHEndpoint._hold_receiving_lock is Endpoint._hold_receiving_lock
+        # The raw endpoint adds nothing to the receive either; ssh adds the
+        # cleanup of its own partial on top of the lock, and only that.
+        assert RawEndpoint.receiving_lock is Endpoint.receiving_lock
+        assert SSHEndpoint.receiving_lock is not Endpoint.receiving_lock
+
+    def test_the_body_is_the_shared_one(self):
+        import inspect
+        import re
+
+        source = inspect.getsource(Endpoint._hold_receiving_lock)
+        assert re.search(r"(?<![\w.])hold_receiving_lock\(", source), source
+        source = inspect.getsource(Endpoint._lock_for_deletion)
+        assert "_hold_receiving_lock(" in source, source
 
 
 class TestTheOperatorCanOptOut:
@@ -303,6 +423,30 @@ class TestTheReceiveStopsBeforeItsLockGoes:
         seen = self._watch_release(manager, child)
         with pytest.raises(KeyboardInterrupt):
             with manager.hold("target", "mutating operation"):
+                child.append(lifecycle.track(subprocess.Popen(["sleep", "30"])))
+                raise KeyboardInterrupt
+        assert seen == {"writer_alive": False}
+
+    def test_the_local_receive_lock(self, tmp_path):
+        from btrfs_backup_ng import lifecycle
+
+        endpoint = _local(tmp_path)
+        child: list = []
+        seen = self._watch_release(endpoint._receive_lock_manager(), child)
+        with pytest.raises(KeyboardInterrupt):
+            with endpoint.receiving_lock(f"{tmp_path}/home.20240101T120000"):
+                child.append(lifecycle.track(subprocess.Popen(["sleep", "30"])))
+                raise KeyboardInterrupt
+        assert seen == {"writer_alive": False}
+
+    def test_the_raw_receive_lock(self, tmp_path):
+        from btrfs_backup_ng import lifecycle
+
+        endpoint = RawEndpoint(config={"path": str(tmp_path)})
+        child: list = []
+        seen = self._watch_release(endpoint._lock_manager(), child)
+        with pytest.raises(KeyboardInterrupt):
+            with endpoint.receiving_lock(f"{tmp_path}/home.20240101T120000"):
                 child.append(lifecycle.track(subprocess.Popen(["sleep", "30"])))
                 raise KeyboardInterrupt
         assert seen == {"writer_alive": False}

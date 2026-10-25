@@ -4,10 +4,11 @@ Handles config file discovery, parsing, and validation with helpful error messag
 """
 
 import os
+import posixpath
 import pwd
 import tomllib
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 from .schema import (
     Config,
@@ -947,6 +948,87 @@ def _validate_config(config: Config) -> list[str]:
     return warnings
 
 
+def _destination_identity(target: TargetConfig) -> Optional[tuple[Any, ...]]:
+    """What one destination is, for telling two targets apart without reaching it.
+
+    Two targets with the same identity are one directory holding one set of
+    snapshot names. The comparison is lexical: a local path is resolved on this
+    machine; a remote one is the store it holds (btrfs or raw), the host as ssh
+    sees it (lowercased), the port that will be used (the URL's, else the
+    target's ``ssh_port``) and the path normalised as written. The user is not
+    part of it: two accounts writing one directory still share it. Nothing here
+    touches the network. Two spellings that alias one remote directory through
+    a symlink are not told apart here; that residue is caught at commit, where
+    the raw store refuses to overwrite a stream another source wrote.
+
+    None for a target that holds no snapshots by name (a shell command) or
+    that cannot be classified at all, which is refused elsewhere.
+    """
+    from ..core.target import TargetKind, parse_target
+
+    scheme = parse_target(target.path)
+    store = "raw" if scheme.is_raw else "btrfs"
+    if scheme.kind in (TargetKind.LOCAL, TargetKind.RAW):
+        return (store, None, None, os.path.realpath(scheme.path))
+    if scheme.is_remote:
+        host = (scheme.host or "").lower()
+        port = scheme.port or target.ssh_port or 22
+        return (store, host, port, posixpath.normpath(scheme.path or "/"))
+    return None
+
+
+def _same_source(a: VolumeConfig, b: VolumeConfig) -> bool:
+    """Whether two volume entries name one subvolume on this machine."""
+    return os.path.realpath(a.path) == os.path.realpath(b.path)
+
+
+def _refuse_a_shared_destination(config: Config) -> None:
+    """Refuse two volumes whose snapshots nothing on the destination could tell apart.
+
+    On every destination but a snapper layout a snapshot is filed under its
+    name, the volume's snapshot_prefix and a timestamp, and the destination
+    holds one snapshot per name. Two distinct volumes with one prefix writing
+    to one destination produce the same names in the same run. Whichever lands
+    second is refused as another source's, or, where the destination's record
+    of the first cannot say whose it is, taken for the second and never sent.
+    Both volumes reported success while one of them was not backed up at all.
+    This is a configuration that cannot work, so it does not load. A volume
+    listed twice is not two volumes; the duplicate-volume warning names that.
+    Snapper volumes are not compared: their destination is keyed by snapshot
+    number, not by name.
+    """
+    seen: dict[tuple[Any, ...], tuple[VolumeConfig, TargetConfig]] = {}
+    for volume in config.volumes:
+        if volume.is_snapper_source():
+            continue
+        for target in volume.targets:
+            identity = _destination_identity(target)
+            if identity is None:
+                continue
+            key = (volume.snapshot_prefix, identity)
+            first = seen.get(key)
+            if first is None:
+                seen[key] = (volume, target)
+                continue
+            first_volume, first_target = first
+            if _same_source(first_volume, volume):
+                continue
+            where = f"'{first_target.path}'"
+            if target.path != first_target.path:
+                where += f" (also written '{target.path}')"
+            raise ConfigError(
+                f"Volumes '{first_volume.path}' and '{volume.path}' would both "
+                f"write snapshots named '{volume.snapshot_prefix}<timestamp>' to "
+                f"the same destination, {where}. A destination holds one snapshot "
+                "per name, so two volumes cannot share a prefix there: whichever "
+                "arrives second is refused as another source's, or, where the "
+                "destination cannot say whose the first is, taken for it and "
+                "never sent. Either way one of the two is not backed up. Give "
+                "each volume its own snapshot_prefix, or send them to different "
+                "destinations."
+            )
+
+
 def load_config(path: Path | str) -> tuple[Config, list[str]]:
     """Load and validate configuration from TOML file.
 
@@ -990,6 +1072,10 @@ def load_config(path: Path | str) -> tuple[Config, list[str]]:
         volumes.append(_parse_volume(vol_data, global_config))
 
     config = Config(global_config=global_config, volumes=volumes)
+
+    # A config that would file two volumes' snapshots under one set of names
+    # does not load; nothing below it would make it safe to run.
+    _refuse_a_shared_destination(config)
 
     # Validate and collect warnings. Unknown-key warnings first: a typo'd or
     # misplaced key is a structural mistake worth seeing before the semantic

@@ -2,8 +2,9 @@
 
 Correspondence is the single authority for "does THIS endpoint hold the subvolume that
 corresponds to that snapshot". For btrfs it is ``received_uuid == snapshot.uuid`` (what
-incremental send/receive actually resolves on the destination); for raw it is name (a
-self-contained stream, no received_uuid). Adding it was strictly NON-behavioral: the
+incremental send/receive actually resolves on the destination); for raw it is the name
+and the source the stored stream was sent from (a self-contained stream has no
+received_uuid; its sidecar records the uuid it carries). Adding it was strictly NON-behavioral: the
 method exists and is proven on its own; the planner and restore were wired onto it later.
 """
 
@@ -136,9 +137,12 @@ def test_correspondent_restore_direction_finds_backup_by_received_uuid(
 
 
 # --------------------------------------------------------------------------- #
-# raw correspondence: by name, uuid ignored
+# raw correspondence: by name, and by the source the stream was sent from
 # --------------------------------------------------------------------------- #
-def test_raw_correspondent_matches_by_name_ignoring_uuid(tmp_path):
+def test_raw_correspondent_matches_by_name_when_the_record_names_no_source(tmp_path):
+    """A raw record written before the stream's uuid was recorded has only its
+    name to answer with, and answers with it. The ``uuid`` field is the source
+    subvolume's own uuid, not the stream identity, and is not consulted."""
     from btrfs_backup_ng.endpoint.raw import RawEndpoint
     from btrfs_backup_ng.endpoint.raw_metadata import RawSnapshot
 
@@ -150,13 +154,41 @@ def test_raw_correspondent_matches_by_name_ignoring_uuid(tmp_path):
     )
     raw.list_snapshots = lambda flush_cache=False: [backup]  # type: ignore[method-assign]
 
-    # A source with a totally different uuid still corresponds by NAME on a raw target.
     source = _snap(raw, tmp_path, "20240101-000000", uuid="DIFFERENT-UUID")
     assert raw.correspondent_of(source) is backup
 
     # A different name -> no correspondence.
     other = _snap(raw, tmp_path, "20240202-000000", uuid="DIFFERENT-UUID")
     assert raw.correspondent_of(other) is None
+
+
+def test_raw_correspondent_is_not_another_sources_stream_under_the_name(tmp_path):
+    """Two volumes sharing a snapshot prefix name their streams alike. The
+    stream's record says which source it was sent from, and a stream from a
+    different source is not this snapshot's backup (#138)."""
+    from btrfs_backup_ng.endpoint.raw import RawEndpoint
+    from btrfs_backup_ng.endpoint.raw_metadata import RawSnapshot
+
+    raw = RawEndpoint(config={"path": str(tmp_path)})
+    backup = RawSnapshot(
+        name="home-20240101-000000",
+        stream_path=Path(tmp_path) / "home-20240101-000000.btrfs",
+        source_uuid="VOLUME-A",
+    )
+    raw.list_snapshots = lambda flush_cache=False: [backup]  # type: ignore[method-assign]
+
+    assert (
+        raw.correspondent_of(_snap(raw, tmp_path, "20240101-000000", uuid="VOLUME-A"))
+        is backup
+    )
+    assert (
+        raw.correspondent_of(_snap(raw, tmp_path, "20240101-000000", uuid="VOLUME-B"))
+        is None
+    )
+    # A source whose own identity could not be read has only its name to ask with.
+    assert (
+        raw.correspondent_of(_snap(raw, tmp_path, "20240101-000000", uuid="")) is backup
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -231,7 +263,7 @@ def test_polymorphism_btrfs_uses_base_raw_overrides():
     # btrfs endpoints inherit the base (received_uuid) semantics.
     assert SSHEndpoint.correspondent_of is Endpoint.correspondent_of
     assert LocalEndpoint.correspondent_of is Endpoint.correspondent_of
-    # raw endpoints override with name semantics; ssh-raw inherits the raw override.
+    # raw endpoints override with their own rule; ssh-raw inherits the raw override.
     assert RawEndpoint.correspondent_of is not Endpoint.correspondent_of
     assert SSHRawEndpoint.correspondent_of is RawEndpoint.correspondent_of
 

@@ -262,6 +262,10 @@ def _run_two_targets(tmp_path, monkeypatch, iterations, leftover, fail):
     finals = []
     for i in range(iterations):
         root = tmp_path / f"run{i}"
+        # Real destination directories: the transfer loop refuses a missing
+        # destination before a transfer begins, and the pins are the point.
+        for ident in ("d1", "d2"):
+            (root / ident).mkdir(parents=True)
         source = _location(root / "snaps", leftover)
         source.list_snapshots(flush_cache=True)
         targets = [_Destination(ident, {S0}, root / ident) for ident in ("d1", "d2")]

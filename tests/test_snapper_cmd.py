@@ -1532,7 +1532,9 @@ class TestSnapperEndpointRouting:
                 operations, "_create_snapper_snapshot_wrapper", return_value=MagicMock()
             ),
             patch.object(operations, "send_snapshot", side_effect=fake_send_snapshot),
-            patch.object(operations, "_snapper_run_shell", return_value=(0, "")),
+            # A shell that answers: the slot is looked at before it is opened,
+            # and a look that gets no answer refuses the slot.
+            patch.object(operations, "_snapper_run_shell", return_value=(0, "ABSENT")),
             patch.object(operations, "_snapper_publish_slot") as pub,
             patch.object(operations, "_write_info_xml"),
             patch.object(operations, "_write_snapper_metadata"),

@@ -301,12 +301,17 @@ class _MarkedReceiver:
 
 class _OpenSlot:
     """The slot a receive is landing in: its number, the endpoint path to put
-    back, and the slot lock held for the receive and the publish."""
+    back, the slot lock held for the receive and the publish, and the lease
+    that lock is -- asked again before anything is done to the slot."""
 
     def __init__(self, number: int, saved_path: Any) -> None:
         self.number = number
         self.saved_path = saved_path
         self.locks = contextlib.ExitStack()
+        #: ``(manager, lock name)`` while this process holds the slot's
+        #: receiving lock (``_ops._slot_lease``); None where no lock of this
+        #: process's covers the slot.
+        self.lease: Optional[tuple[Any, str]] = None
 
 
 class SnapperLayout:
@@ -316,11 +321,14 @@ class SnapperLayout:
 
     The slot lifecycle is the one thing here, and both directions run it:
 
-    - ``open_slot(n)``: the target must exist; the slot lock the destination
-      offers (ssh:// targets have one, a local one none) is taken for slot n;
-      a ``.incoming`` left by a crashed run is removed; ``.snapshots/<n>.incoming``
-      is created below the target; the endpoint is pointed at it, so a
-      ``btrfs receive`` through the endpoint lands ``<n>.incoming/snapshot``.
+    - ``open_slot(n)``: the target must exist; the destination's slot lock
+      (every transport has one; the local target's lives in its own store
+      under the target) is taken for slot n; a ``.incoming`` left by a run
+      that is gone is removed, and one written recently enough to be a
+      receive still in progress is refused (``_clear_leftover_slot``);
+      ``.snapshots/<n>.incoming`` is created below the target; the endpoint
+      is pointed at it, so a ``btrfs receive`` through the endpoint lands
+      ``<n>.incoming/snapshot``.
     - ``publish(info_xml)``: the endpoint is pointed back at ``BASE``; the
       slot's ``info.xml`` is written INTO ``.incoming``; the directory is
       renamed to ``<n>`` (a received subvolume is read-only and cannot be
@@ -328,6 +336,13 @@ class SnapperLayout:
       received_uuid). A slot appears complete or not at all.
     - ``abandon()``: the endpoint is pointed back; ``.incoming`` and the
       subvolume in it are removed; the published slots are never touched.
+
+    The slot lock is a lease, and a holder whose beat lapsed past the stale
+    threshold has lost it to the next run, which receives into the same
+    slot. So the lease is asked again, of the store, immediately before the
+    publish and before the abandon: a holder that lost it publishes nothing
+    and removes nothing, since what is in the slot is the other run's
+    (``_ops._require_slot_lease``).
 
     A snapper backup (``core.operations.send_snapper_snapshot``) calls those
     three around the engine's transfer with the source's own number and
@@ -407,9 +422,11 @@ class SnapperLayout:
         created" instead of the actual condition. The check is the engine's
         own, with the same diagnosis on every transport; nothing is created
         by it. The receive and the publish are two halves of ONE transaction
-        on the slot, and the lock is named for exactly what the transfer
-        beneath will lock, so that call finds it already held rather than
-        taking a second one.
+        on the slot, so the lock is held from here through the publish; it is
+        named for the slot itself -- ``.snapshots/<n>``, what the publish
+        renames into place and what a prune deletes -- so a prune of that
+        slot finds it held and keeps the slot. The transfer beneath takes no
+        lock of its own (``_SlotReceiver.receiving_lock``).
         """
         if self._open is not None:
             raise RuntimeError(
@@ -420,11 +437,13 @@ class SnapperLayout:
         slot = _OpenSlot(number, self.endpoint.config["path"])
         try:
             slot.locks.enter_context(
-                _ops._receiving_lock(self.endpoint, f"{incoming}/snapshot", self.base)
+                _ops._receiving_lock(self.endpoint, self.slot_dir(number), self.base)
             )
-            # A leftover temp from a prior crashed run goes first; then the
+            slot.lease = _ops._slot_lease(self.endpoint, self.slot_dir(number))
+            # A leftover temp from a run that is gone goes first -- a slot a
+            # receive may still be arriving in is refused instead; then the
             # slot is made, below the target and only there.
-            _ops._cleanup_snapper_backup(self.endpoint, number, False)
+            _ops._clear_leftover_slot(self.endpoint, number)
             _ops._snapper_prepare_slot(self.endpoint, number)
         except BaseException:
             slot.locks.close()
@@ -440,11 +459,16 @@ class SnapperLayout:
         published slot carries its metadata from the instant it exists. A
         publish that fails abandons the slot (the ``.incoming`` temp is
         removed, a pre-existing published backup is never touched) and
-        raises the executor's transfer error.
+        raises the executor's transfer error. Neither happens unless this
+        run's lease on the slot still stands: a holder whose lock was broken
+        while it was stalled would be publishing the next run's partial.
         """
         slot = self._require_open()
         self.endpoint.config["path"] = slot.saved_path
         try:
+            _ops._require_slot_lease(
+                slot.lease, slot.number, self.slot_dir(slot.number), "publish"
+            )
             if info_xml is not None and not _ops._write_info_xml(
                 self.endpoint, self.incoming_dir(slot.number), info_xml
             ):
@@ -558,10 +582,10 @@ class SnapperLayout:
         """One writer at a time below this ``.snapshots`` tree: a restore
         into a config, or a snapper backup into a local target.
 
-        A local target has no receive lock (``_receiving_lock`` is a no-op),
-        and the next free number counts only numeric entries, so two writers
-        would both pick n and the second's open_slot would remove the first's
-        in-flight ``<n>.incoming`` as "a temp a crashed run left". An
+        The receive lock is per SLOT and is taken as a slot opens; the next
+        free number is chosen before that, counting only numeric entries, so
+        two writers would both pick n -- and the loser would learn it slot by
+        slot. This lock refuses the second writer up front instead. An
         exclusive flock on ``.snapshots/WRITER_LOCK_NAME``
         (``__util__.exclusive_lock``, timeout 0) is held for the whole run: a
         second writer is refused at once with words, and the kernel drops the
@@ -618,13 +642,23 @@ class SnapperLayout:
 
     def abandon(self) -> None:
         """Remove the open slot's ``.incoming`` -- and only that -- and point
-        the endpoint back at the target. A no-op when no slot is open."""
+        the endpoint back at the target. A no-op when no slot is open. A run
+        whose lease on the slot no longer stands removes nothing: what is in
+        the slot is the run that holds the lease now."""
         slot = self._open
         if slot is None:
             return
         self._open = None
         self.endpoint.config["path"] = slot.saved_path
         try:
+            lost = _ops._slot_lease_lost(
+                slot.lease, slot.number, self.slot_dir(slot.number)
+            )
+            if lost is not None:
+                logger.warning(
+                    "Leaving %s as it is: %s.", self.incoming_dir(slot.number), lost
+                )
+                return
             logger.info(
                 "Abandoning snapper slot %s: the receive into it did not complete.",
                 self.incoming_dir(slot.number),
@@ -757,6 +791,17 @@ class _SlotReceiver:
         every source, so it gives it.
         """
         return f"{str(self._endpoint.config['path']).rstrip('/')}/snapshot"
+
+    def receiving_lock(self, destination: str, *, timeout: float | None = None) -> Any:
+        """The executor takes the destination's receive lock before it asks
+        whether a copy pre-exists. Through this receiver that lock is the
+        SLOT's, and the slot is chosen as the receive starts (``open_slot``,
+        from ``next_number``) -- so before ``receive()`` there is no slot to
+        name, and ``_receive_destination`` would answer with the config's own
+        ``<base>/snapshot``, one key shared by every copy. The layout takes
+        the real lock in ``open_slot`` and holds it through the publish; the
+        executor's call is answered with nothing to hold."""
+        return contextlib.nullcontext()
 
     def list_snapshots(self, flush_cache: bool = False) -> list:
         return []

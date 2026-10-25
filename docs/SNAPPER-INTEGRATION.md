@@ -397,7 +397,9 @@ config's `.snapshots/` is the destination.
    `.incoming`; a copy that is not the backup's is not published. One restore
    runs into a config at a time: a second one started while the first runs is
    refused with the reason and restores nothing; a temp left by a restore that
-   was killed is removed by the next restore into that config.
+   was killed is removed by the next restore into that config once it is older
+   than the lock store's stale threshold, while a younger one is taken for a
+   receive still arriving and that restore is refused rather than removing it.
 5. **Pin the backup on its location** for the duration (`restore:<session>`,
    released if a transfer fails or the run is interrupted), so a prune on that
    location cannot delete what is being read: the pin is recorded on the

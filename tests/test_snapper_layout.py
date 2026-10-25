@@ -77,6 +77,14 @@ class TestOpeningASlot:
         stale = tmp_path / "target" / ".snapshots" / "7.incoming" / "snapshot"
         stale.mkdir(parents=True)
         (stale / "half").write_text("of a receive")
+        # Last written long before the stale threshold: the run that wrote
+        # it is gone. A slot written recently is a receive that may still be
+        # arriving, and is refused (test_a_stale_broken_holder_leaves_the_slot_alone).
+        import os
+        import time
+
+        long_ago = time.time() - 3600
+        os.utime(stale, (long_ago, long_ago))
         layout = SnapperLayout(_endpoint(tmp_path / "target"))
         layout.open_slot(7)
         assert (tmp_path / "target" / ".snapshots" / "7.incoming").is_dir()
@@ -106,11 +114,12 @@ class TestOpeningASlot:
         assert not (tmp_path / "unmounted").exists()
         assert layout.open_number is None
 
-    def test_the_slot_lock_names_the_slots_snapshot_under_the_target(
+    def test_the_slot_lock_names_the_slot_a_prune_would_delete(
         self, tmp_path, real_shell, monkeypatch
     ):
-        """The lock is named for exactly what the transfer beneath will lock,
-        and it is held from the open through the publish."""
+        """The lock is named for the slot itself -- what the publish renames
+        into place and what a prune deletes -- and it is held from the open
+        through the publish."""
         base = tmp_path / "target"
         events: list = []
 
@@ -123,7 +132,8 @@ class TestOpeningASlot:
         monkeypatch.setattr(ops, "_receiving_lock", fake_lock)
         layout = SnapperLayout(_endpoint(base))
         layout.open_slot(7)
-        expected = f"{base}/.snapshots/7.incoming/snapshot"
+        expected = f"{base}/.snapshots/7"
+        assert expected == layout.slot_dir(7)
         assert events == [("enter", expected, str(base))]
         _received(layout, 7)
         layout.publish()

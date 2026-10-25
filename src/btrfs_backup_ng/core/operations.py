@@ -2014,9 +2014,11 @@ def _execute_transfers(
 
     ``plan`` is a list of ``(snapshot, parent_or_None)`` pairs from
     ``planning.plan_transfer_sequence``; ALL ordering and parent decisions were made there.
-    This function only moves bytes and manages the lock lifecycle: it locks the snapshot
-    (and its parent), sends, records the artifact verdict on what arrived, and on a
-    verified success releases the locks and registers the snapshot at the destination;
+    This function only moves bytes and manages the lock lifecycle: it pins the snapshot
+    (and its parent) on the source and the parent's copy on the destination, takes the
+    destination's lock on the copy it is about to create, sends, records the artifact
+    verdict on what arrived, and on a verified success releases the pins and registers
+    the snapshot at the destination;
     a failed snapshot is recorded in ``result.failed`` (never silently dropped), and any
     partial or invalid artifact is cleaned under the authorship rule.
 
@@ -2074,19 +2076,58 @@ def _execute_transfers(
                 result.failed.append((best_snapshot, err))
                 continue
 
-        # Asked BEFORE the transfer, because afterwards there is no way to tell a
-        # partial this run wrote from a backup that was already sitting there.
-        preexisting = destination_artifact_exists(
-            destination_endpoint, best_snapshot.get_name()
-        )
-
-        # Set locks
-        source_endpoint.set_lock(best_snapshot, destination_id, True)
-        if parent:
-            source_endpoint.set_lock(parent, destination_id, True, parent=True)
-
-        invalid_artifact = False
+        # The destination's right to create this copy, held from before the
+        # authorship probe below through the commit and the cleanup of a failed
+        # transfer, and released in the ``finally``. Two transfers of one
+        # snapshot into one destination both read "absent, so ours" while the
+        # probe ran outside any lock; the loser then failed with "File exists"
+        # and its cleanup deleted the winner's committed copy. The second is
+        # now refused before its stream starts, as this snapshot's failure
+        # rather than the run's. Asked for AFTER the destination is known to
+        # exist, as the snapper layout does: against a missing target the lock
+        # would fail first and report a store that "could not be created"
+        # instead of the actual condition.
+        held = contextlib.ExitStack()
         try:
+            _ensure_destination_exists(destination_endpoint)
+            held.enter_context(
+                _receiving_lock(
+                    destination_endpoint,
+                    _received_artifact_of(destination_endpoint, best_snapshot),
+                )
+            )
+        except (__util__.SnapshotTransferError, __util__.AbortError) as e:
+            held.close()
+            logger.error("Not transferring %s: %s", best_snapshot, e)
+            failure = (
+                e
+                if isinstance(e, __util__.SnapshotTransferError)
+                else __util__.SnapshotTransferError(str(e))
+            )
+            result.failed.append((best_snapshot, failure))
+            continue
+
+        # Until the probe below has answered, under the lock, the copy is not
+        # this run's: the safe answer under uncertainty, and the one the probe
+        # itself gives when it cannot tell.
+        preexisting = True
+        invalid_artifact = False
+        # How the block ended, for the lock's own context managers (below).
+        caught: Optional[BaseException] = None
+        try:
+            # Asked BEFORE the transfer, because afterwards there is no way to
+            # tell a partial this run wrote from a backup that was already
+            # sitting there -- and under the lock, so the answer cannot change
+            # beneath this run.
+            preexisting = destination_artifact_exists(
+                destination_endpoint, best_snapshot.get_name()
+            )
+
+            # Set locks
+            source_endpoint.set_lock(best_snapshot, destination_id, True)
+            if parent:
+                source_endpoint.set_lock(parent, destination_id, True, parent=True)
+
             logger.info("Starting transfer of %s", best_snapshot)
             # A transfer that ends any way but a transfer error (handled
             # below) -- Ctrl-C, SIGTERM or SIGHUP, an unexpected exception --
@@ -2094,22 +2135,27 @@ def _execute_transfers(
             # Left there, a local partial sits at the snapshot's own name and
             # every later run refuses to remove what was there before it
             # started. An ssh:// destination does this inside its receive
-            # lock (SSHEndpoint.receiving_lock).
-            with lifecycle.undo_on_failure(
-                functools.partial(
-                    _cleanup_this_runs_partial,
-                    destination_endpoint,
-                    best_snapshot.get_name(),
-                    created_by_this_run=not preexisting,
-                ),
-                unless=(__util__.SnapshotTransferError,),
+            # lock (SSHEndpoint.receiving_lock). The destination's copy of the
+            # parent is pinned for the span of the send, outermost, so a failed
+            # receive's partial is removed before the parent is let go.
+            with _destination_parent_pinned(
+                destination_endpoint, parent, best_snapshot.get_name()
             ):
-                send_snapshot(
-                    best_snapshot,
-                    destination_endpoint,
-                    parent=parent,
-                    options=options or {},
-                )
+                with lifecycle.undo_on_failure(
+                    functools.partial(
+                        _cleanup_this_runs_partial,
+                        destination_endpoint,
+                        best_snapshot.get_name(),
+                        created_by_this_run=not preexisting,
+                    ),
+                    unless=(__util__.SnapshotTransferError,),
+                ):
+                    send_snapshot(
+                        best_snapshot,
+                        destination_endpoint,
+                        parent=parent,
+                        options=options or {},
+                    )
             # The receive exited 0 and the commit held. What did it leave?
             # Recorded for every transfer; only ``invalid`` fails one. A check
             # that cannot even run is ``unverifiable``: the data has landed,
@@ -2146,6 +2192,7 @@ def _execute_transfers(
             transferred_names.add(best_snapshot.get_name())
 
         except __util__.SnapshotTransferError as e:
+            caught = e
             logger.error("Snapshot transfer failed for %s: %s", best_snapshot, e)
             if release_on_failure:
                 logger.info("Releasing the pin on %s after the failure.", best_snapshot)
@@ -2174,7 +2221,8 @@ def _execute_transfers(
                     best_snapshot.get_name(),
                     created_by_this_run=not preexisting,
                 )
-        except BaseException:
+        except BaseException as fatal:
+            caught = fatal
             # Anything else that ends the transfer -- Ctrl-C, a signal turned
             # into SystemExit, an error no handler above names -- propagates,
             # but not with the pins still on the source. A restore's pin on a
@@ -2198,6 +2246,21 @@ def _execute_transfers(
                         release_error,
                     )
             raise
+        finally:
+            # The destination lock goes last, after the cleanup a failure ran
+            # above: nothing else may start creating this copy until what this
+            # run left of it is gone. Released as a ``with`` statement around
+            # this block would release it -- told how the block ended -- because
+            # the lock's own context managers act on that: an ssh destination
+            # removes the partial it received inside its lock
+            # (``undo_on_failure``), and the processes a receive started are
+            # stopped before the lock goes (``process_scope``). ``close()``
+            # would tell them the block succeeded, and the handled failure
+            # above is no longer in flight here for ``sys.exc_info`` to carry.
+            if caught is None:
+                held.close()
+            else:
+                held.__exit__(type(caught), caught, caught.__traceback__)
 
     # Report honestly: a "complete!" banner must not print when a transfer failed.
     if result.failed:
@@ -2588,16 +2651,20 @@ def _enumerate_snapper_btrfs_backups(destination_endpoint) -> list:
 
 
 def _receiving_lock(destination_endpoint, destination: str, lock_root: str = ""):
-    """The destination lock for ``destination``, or a no-op for a local target.
+    """The destination's lock on ``destination``: the right to create that copy.
 
-    Taken HERE rather than inside the endpoint's transfer methods. Those methods
-    are the quoting and stream-contract surface, exercised by unit tests that
-    have no remote to talk to; making each of them open a network lock would
-    have meant every such test acquiring one. The lock belongs with the
-    transaction, and the transaction is here.
+    Taken by the engine rather than inside the endpoint's transfer methods.
+    Those methods are the quoting and stream-contract surface, exercised by
+    unit tests that have no remote to talk to; making each of them open a
+    lock would have meant every such test acquiring one. The lock belongs with
+    the transaction, and the transaction is here.
 
-    Only remote endpoints record locks; a local one has no cross-machine
-    contention to guard against and no ``receiving_lock`` to call.
+    Every endpoint provides ``receiving_lock`` (one shared body, the endpoint's
+    own store); the engine takes it at the three places a receive can begin:
+    the transfer loop (``_execute_transfers``), a snapper slot opening
+    (``SnapperLayout.open_slot``) and a snapper backup into a raw store
+    (``_send_snapper_snapshot_to_raw_store``). An object with no
+    ``receiving_lock`` at all -- a test's stand-in -- is passed through.
 
     ``lock_root``, when given, pins where the lock is written. The snapper flow
     needs it: it repoints the endpoint at ``.snapshots/<n>.incoming`` for the
@@ -2635,6 +2702,92 @@ def _receiving_lock(destination_endpoint, destination: str, lock_root: str = "")
     return _pinned()
 
 
+class _ParentPin:
+    """A destination copy known by name, in the shape ``set_lock`` reads: the
+    name the pin is keyed under and the two lock sets it maintains."""
+
+    def __init__(self, name: str) -> None:
+        self.name = name
+        self.locks: set = set()
+        self.parent_locks: set = set()
+
+    def get_name(self) -> str:
+        return self.name
+
+    def __repr__(self) -> str:
+        return self.name
+
+
+@contextlib.contextmanager
+def _destination_parent_pinned(
+    destination_endpoint,
+    parent,
+    child_name: str,
+    *,
+    pin_name: Optional[str] = None,
+    artifact: Optional[str] = None,
+):
+    """Pin, on the destination, the parent this receive chains against.
+
+    An incremental receive applies against the destination's copy of the
+    parent. Between the plan that chose it and the end of the stream, a prune
+    of the destination -- another config, another process, another machine --
+    was free to delete that copy: the receive then failed after sending
+    everything, or a raw store committed a stream whose parent was gone. The
+    destination's own pin machinery (``set_lock(..., parent=True)``) now
+    records a reader pin on its copy for the span of the receive; every
+    delete path re-reads the destination's pins at delete time and skips a
+    pinned parent, as a source prune skips the parent a transfer reads.
+
+    By NAME, on both counts. The pin is keyed by the copy's name (that is how
+    every pin is keyed, ``sshutil.lock.snapshot_lock_name``), so a stand-in
+    carrying the name records the pin a listed object would. The copy's
+    presence is asked by name too (``destination_artifact_exists``, the probe
+    the loop already asks about the copy it is creating), and a parent that is
+    not there fails this transfer before a byte is sent. Not by uuid
+    correspondence: a parent transferred earlier in this run is in the
+    destination's cache as the object the transfer registered, which carries
+    no ``received_uuid``, so correspondence cannot find the copy that was just
+    made and would refuse the second snapshot of every chain -- while the
+    planner counts an in-run parent present by name. Whether the copy at that
+    name is the right one is the commit's own identity check.
+
+    ``pin_name`` and ``artifact`` are for a copy whose pin key and path are not
+    the parent's name: a snapper slot is pinned as ``snapshot-<n>`` -- the key
+    prune and restore pin a slot by -- and probed at ``.snapshots/<n>/snapshot``.
+    ``parent`` None is a full transfer, with nothing to pin; a destination whose
+    type has no ``set_lock`` is passed through -- the snapper layout's receiver,
+    whose config is snapper's own to keep or clean and whose restored parent
+    sits in a freshly numbered slot, never at the parent's name; or a test's
+    stand-in.
+
+    Released on every exit, success or failure: the pin protects the receive
+    and nothing after it.
+    """
+    # Looked up on the TYPE, as ``destination_artifact_exists`` looks up its
+    # hook: the snapper layout's receiver forwards every other attribute to
+    # the endpoint beneath it, and a double built from MagicMock answers any
+    # name with a callable; neither is a destination that pins.
+    if parent is None or not callable(
+        getattr(type(destination_endpoint), "set_lock", None)
+    ):
+        yield
+        return
+    name = pin_name or parent.get_name()
+    if not destination_artifact_exists(destination_endpoint, artifact or name):
+        raise __util__.SnapshotTransferError(
+            f"incremental parent {name} is not on the destination; refusing to "
+            f"send {child_name} against a missing parent"
+        )
+    lock_id = f"receiving:{child_name}"
+    pin = _ParentPin(name)
+    destination_endpoint.set_lock(pin, lock_id, True, parent=True)
+    try:
+        yield
+    finally:
+        destination_endpoint.set_lock(pin, lock_id, False, parent=True)
+
+
 def received_name_of(snapshot) -> str:
     """The name ``btrfs receive`` gives the copy of ``snapshot``.
 
@@ -2669,6 +2822,155 @@ def _destination_subvolume(destination_endpoint, source_path) -> str:
         return str(own(source_path))
     dest = str(destination_endpoint.config.get("path", "")).rstrip("/")
     return f"{dest}/{_Path(str(source_path)).name}"
+
+
+def _received_artifact_of(destination_endpoint, snapshot) -> str:
+    """The destination artifact ``snapshot`` will be received as -- what its
+    receive lock is named for.
+
+    Through ``_destination_subvolume`` from the snapshot's path where it has
+    one, since the receive names the copy after the source basename and the
+    endpoint may normalise; by the snapshot's name otherwise, which for a
+    native snapshot is that basename. Identification never fails: a snapshot
+    that could not be named for its lock would stop the loop before any lock
+    was taken, and the shapes this loop is driven with vary (see
+    ``sshutil.lock.snapshot_lock_name`` for the same posture).
+    """
+    getter = getattr(snapshot, "get_path", None)
+    source_path = getter() if callable(getter) else snapshot.get_name()
+    return _destination_subvolume(destination_endpoint, source_path)
+
+
+def _lock_store_of(destination_endpoint):
+    """The manager over the store ``destination_endpoint``'s receiving locks
+    live in, or None where it has none to offer: an endpoint without a lock
+    store, or a stand-in."""
+    manager_of = getattr(destination_endpoint, "_receive_lock_manager", None)
+    if not callable(manager_of):
+        return None
+    try:
+        return manager_of()
+    except Exception as e:  # noqa: BLE001 - no store is an answer, reported by the caller
+        logger.debug("No lock store for %s: %s", destination_endpoint, e)
+        return None
+
+
+def _slot_lease(destination_endpoint, destination: str):
+    """The lease this process holds on ``destination``'s receiving lock -- the
+    manager it was taken through and the lock's name -- or None where no lock
+    of this process's covers it: an endpoint with no lock store, a stand-in,
+    or the operator's opt-out. Taken as the slot opens and asked again before
+    every action on the slot (``_require_slot_lease``)."""
+    from ..sshutil.lock import RECEIVING_LOCK_PREFIX
+
+    manager = _lock_store_of(destination_endpoint)
+    if manager is None:
+        return None
+    name = f"{RECEIVING_LOCK_PREFIX}{destination}"
+    holds = getattr(manager, "holds", None)
+    if not callable(holds) or holds(name) is not True:
+        return None
+    return manager, name
+
+
+def _slot_lease_lost(lease, snapshot_num, slot_dir: str) -> Optional[str]:
+    """Why this run may no longer act on slot ``snapshot_num``, or None while
+    its lease stands -- or where there is no lease to ask.
+
+    The receive lock on a slot is a lease: a holder whose beat lapses past
+    the stale threshold (suspended, swapped out, a long ``sudo -n``) is
+    broken by the next run, which then receives into the same slot. Until
+    now the lease was enforced only at the door. The stale-broken holder,
+    waking, removed the slot as its own failed receive or published what was
+    in it as its own copy -- the successor's partial, a read-write subvolume
+    with no received_uuid (#143). So the store is asked whether the lease
+    still stands immediately before each such action; a holder that lost it
+    owns nothing in the slot and touches nothing. A store that cannot be
+    asked is a lease that cannot be confirmed, refused the same way.
+    """
+    if lease is None:
+        return None
+    manager, name = lease
+    standing = manager.is_owner(name)
+    if standing is True:
+        return None
+    if standing is False:
+        return (
+            f"lost the receive lease on slot {snapshot_num} ({slot_dir}): another "
+            f"run broke it as stale while this one was stalled, and holds the "
+            f"slot now"
+        )
+    return (
+        f"the receive lease on slot {snapshot_num} ({slot_dir}) could not be "
+        f"confirmed: the lock store could not be read"
+    )
+
+
+def _require_slot_lease(lease, snapshot_num, slot_dir: str, action: str) -> None:
+    """Refuse ``action`` on the slot unless this run's lease on it stands."""
+    lost = _slot_lease_lost(lease, snapshot_num, slot_dir)
+    if lost is not None:
+        raise __util__.ReceiveLeaseLost(f"{lost}; refusing to {action} it")
+
+
+def _clear_leftover_slot(destination_endpoint, snapshot_num) -> None:
+    """Remove a ``.snapshots/{num}.incoming`` left by a run that is gone, and
+    refuse one that may belong to a receive still in progress.
+
+    The slot lock has just been taken, so whatever is in the slot was left by
+    a holder that is no longer holding it: a run that crashed, or one whose
+    lease was broken as stale. The two look alike by path; they differ by
+    when the slot was last written. A receive that is still arriving keeps
+    writing into ``.incoming/snapshot``. So the slot's last write is judged
+    by the same clock a lease is judged by -- the store's own, read from a
+    probe (``RemoteLockManager.age_of``) -- against the same threshold: a
+    slot written within ``stale_after`` seconds may be a live receive and is
+    refused, not removed, and this run does not receive into it either; an
+    older one is a leftover and is removed; one whose age cannot be read
+    cannot be told from live and is refused too.
+    """
+    base = f"{str(destination_endpoint.config['path']).rstrip('/')}/.snapshots"
+    q = shlex.quote
+    incoming_dir = f"{base}/{snapshot_num}.incoming"
+    incoming_sub = f"{incoming_dir}/snapshot"
+    script = (
+        f"if [ -e {q(incoming_sub)} ]; then echo SUBVOL; "
+        f"elif [ -e {q(incoming_dir)} ]; then echo DIR; else echo ABSENT; fi"
+    )
+    rc, out = _snapper_run_shell(destination_endpoint, script)
+    lines = [line.strip() for line in (out or "").splitlines() if line.strip()]
+    found = lines[-1] if lines else ""
+    if rc != 0 or found not in ("SUBVOL", "DIR", "ABSENT"):
+        raise __util__.SnapshotTransferError(
+            f"could not look at {incoming_dir} before opening slot {snapshot_num}: "
+            f"the destination's shell did not answer (exit {rc})"
+        )
+    if found == "ABSENT":
+        return
+    written = incoming_sub if found == "SUBVOL" else incoming_dir
+    store = _lock_store_of(destination_endpoint)
+    age = store.age_of(written) if store is not None else None
+    if age is None:
+        raise __util__.SnapshotTransferError(
+            f"{incoming_dir} is there, and when it was last written could not be "
+            f"read against the target's clock, so it cannot be told from a receive "
+            f"still in progress; refusing to remove it or to receive into it. If no "
+            f"other run is receiving into slot {snapshot_num}, remove {incoming_dir} "
+            f"by hand and run again."
+        )
+    if age <= store.stale_after:
+        raise __util__.SnapshotTransferError(
+            f"{incoming_dir} was written {age}s ago, by a receive that may still be "
+            f"in progress; refusing to remove it or to receive into it. A run that "
+            f"is gone leaves it to age past {store.stale_after}s, after which the "
+            f"next run removes it."
+        )
+    logger.info(
+        "Removing %s, left by a run that is gone (last written %ds ago).",
+        incoming_dir,
+        age,
+    )
+    _cleanup_snapper_backup(destination_endpoint, snapshot_num, False)
 
 
 def _snapper_prepare_slot(destination_endpoint, snapshot_num) -> None:
@@ -2913,6 +3215,46 @@ def _local_snapper_writer_lock(destination_endpoint, subject: str):
     return SnapperLayout(destination_endpoint).writer_lock(subject)
 
 
+def _send_snapper_snapshot_to_raw_store(
+    source_wrapper,
+    destination_endpoint,
+    parent_wrapper,
+    options: dict,
+    base_path: str,
+) -> None:
+    """A snapper backup into a raw store: one stream file, named by the backup
+    name, written under the stream's receive lock.
+
+    The raw counterpart of the slot lifecycle ``SnapperLayout`` runs for a
+    btrfs target. Raw has no slot to open, and this flow does not pass through
+    the transfer loop, so this is the one place its receive lock is taken --
+    under the name the stream is stored and pruned by. The destination is
+    checked first for the reason the layout checks it before its slot lock:
+    against a missing target the lock would fail first and report a store
+    that could not be created instead of the actual condition. Compression
+    and encryption are intrinsic to the raw endpoint, so the pipeline's own
+    compression is switched off here rather than applied twice.
+    """
+    _ensure_destination_exists(destination_endpoint)
+    raw_options = dict(options)
+    raw_options["compress"] = "none"
+    with _receiving_lock(
+        destination_endpoint,
+        f"{base_path.rstrip('/')}/{source_wrapper.get_name()}",
+    ):
+        # The parent stream is a raw backup named as the parent snapshot is,
+        # so the store resolves it by name, as its own correspondence rule does.
+        with _destination_parent_pinned(
+            destination_endpoint, parent_wrapper, source_wrapper.get_name()
+        ):
+            send_snapshot(
+                source_wrapper,
+                destination_endpoint,
+                parent=parent_wrapper,
+                options=raw_options,
+            )
+
+
 def send_snapper_snapshot(
     snapper_snapshot,
     destination_endpoint,
@@ -3005,16 +3347,11 @@ def send_snapper_snapshot(
 
     try:
         if is_raw:
-            # Raw targets have no subvolumes: write one stream file named by the
-            # backup name. Compression/encryption are intrinsic to the raw
-            # endpoint, so avoid double-compressing in the pipeline.
-            raw_options = dict(options)
-            raw_options["compress"] = "none"
-            send_snapshot(
-                source_wrapper,
-                destination_endpoint,
-                parent=parent_wrapper,
-                options=raw_options,
+            # Raw targets have no subvolumes: one stream file named by the
+            # backup name, written under its receive lock by the raw
+            # counterpart of the layout below.
+            _send_snapper_snapshot_to_raw_store(
+                source_wrapper, destination_endpoint, parent_wrapper, options, base_path
             )
         else:
             # btrfs targets: a TRANSACTIONAL receive through the snapper layout,
@@ -3028,18 +3365,30 @@ def send_snapper_snapshot(
             from .layout import SnapperLayout
 
             layout = SnapperLayout(destination_endpoint)
-            layout.open_slot(snapshot_num)
-            try:
-                send_snapshot(
-                    source_wrapper,
-                    destination_endpoint,
-                    parent=parent_wrapper,
-                    options=options,
-                )
-                layout.publish(info_xml=_snapper_info_xml_bytes(snapper_snapshot))
-            except BaseException:
-                layout.abandon()
-                raise
+            # The parent slot is pinned under the name prune and restore pin a
+            # slot by, ``snapshot-<n>``, and probed where its subvolume lives.
+            # Pinned BEFORE the slot is opened, because the endpoint writes
+            # its pins at ``path``, which the open slot points at ``.incoming``
+            # until the publish or abandon that precedes the release.
+            with _destination_parent_pinned(
+                destination_endpoint,
+                parent_wrapper,
+                source_wrapper.get_name(),
+                pin_name=f"snapshot-{parent_num}",
+                artifact=f".snapshots/{parent_num}/snapshot",
+            ):
+                layout.open_slot(snapshot_num)
+                try:
+                    send_snapshot(
+                        source_wrapper,
+                        destination_endpoint,
+                        parent=parent_wrapper,
+                        options=options,
+                    )
+                    layout.publish(info_xml=_snapper_info_xml_bytes(snapper_snapshot))
+                except BaseException:
+                    layout.abandon()
+                    raise
 
         # Metadata sidecar (endpoint-aware; carries original_xml for restore).
         _write_snapper_metadata(

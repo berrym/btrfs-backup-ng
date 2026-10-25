@@ -576,7 +576,7 @@ class TestAFileNamedLikeASlot:
 # f. a pin never outlives the transfer
 # --------------------------------------------------------------------------- #
 class TestAPinNeverOutlivesTheTransfer:
-    def _run(self, monkeypatch, release_on_failure, exc):
+    def _run(self, monkeypatch, tmp_path, release_on_failure, exc):
         calls: list[tuple[str, bool]] = []
 
         class Source:
@@ -584,7 +584,9 @@ class TestAPinNeverOutlivesTheTransfer:
                 calls.append((snapshot.get_name(), state))
 
         class Dest:
-            config = {"path": "/dest"}
+            # A real directory: the loop refuses a missing destination before
+            # a transfer begins, and the pin it takes once it has is the point.
+            config = {"path": str(tmp_path)}
 
             def get_id(self):
                 return "dest"
@@ -609,16 +611,18 @@ class TestAPinNeverOutlivesTheTransfer:
             )
         return calls
 
-    def test_ctrl_c_releases_a_restores_pin(self, monkeypatch):
-        calls = self._run(monkeypatch, True, KeyboardInterrupt())
+    def test_ctrl_c_releases_a_restores_pin(self, monkeypatch, tmp_path):
+        calls = self._run(monkeypatch, tmp_path, True, KeyboardInterrupt())
         assert calls == [("home-1", True), ("home-1", False)]
 
-    def test_any_unexpected_exception_releases_it_too(self, monkeypatch):
-        calls = self._run(monkeypatch, True, RuntimeError("the pipe vanished"))
+    def test_any_unexpected_exception_releases_it_too(self, monkeypatch, tmp_path):
+        calls = self._run(
+            monkeypatch, tmp_path, True, RuntimeError("the pipe vanished")
+        )
         assert calls == [("home-1", True), ("home-1", False)]
 
-    def test_a_backup_keeps_its_pin_as_before(self, monkeypatch):
-        calls = self._run(monkeypatch, False, KeyboardInterrupt())
+    def test_a_backup_keeps_its_pin_as_before(self, monkeypatch, tmp_path):
+        calls = self._run(monkeypatch, tmp_path, False, KeyboardInterrupt())
         assert calls == [("home-1", True)]
 
 
@@ -679,6 +683,10 @@ class TestPinsProtectEverywhere:
                     raise locks
                 return locks
 
+            def subvolume_identity(self, path):
+                # Every slot still holds the copy the plan chose.
+                return {"uuid": "", "received_uuid": "copy-" + path.split("/")[-2]}
+
         monkeypatch.setattr(
             prune_cli, "choose_endpoint", lambda p, c: Endpoint(), raising=False
         )
@@ -691,12 +699,15 @@ class TestPinsProtectEverywhere:
         deleted = self._slot_deleter(
             monkeypatch, {"snapshot-3": {"locks": ["restore:s1"]}}
         )
-        backups = [{"number": 3}, {"number": 4}]
+        backups = [
+            {"number": 3, "received_uuid": "copy-3"},
+            {"number": 4, "received_uuid": "copy-4"},
+        ]
         with caplog.at_level(logging.INFO):
             count, errors = prune_cli.delete_snapper_backups("/backups", backups, {})
         assert (count, errors) == (1, [])
         assert deleted == ["/backups/.snapshots/4"]
-        assert "pinned by a restore in progress" in caplog.text
+        assert "Kept slot 3" in caplog.text and "pinned by restore:s1" in caplog.text
 
     def test_an_unreadable_lock_store_deletes_no_slot(self, monkeypatch):
         deleted = self._slot_deleter(monkeypatch, __util__.AbortError("corrupt"))

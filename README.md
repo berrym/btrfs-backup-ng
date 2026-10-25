@@ -26,7 +26,11 @@ return the wrong volume while reporting success, and a class of bugs that only a
 the remote's `/bin/sh` is `dash` or `busybox ash` — which is most Debian, Ubuntu, Alpine and
 NAS targets. 0.9.5 makes concurrency safe: locks on a remote target are now recorded on the
 target itself, so a prune running in another process — or on another machine — can no longer
-delete the snapshot a restore is reading. As with any backup tool, test your restores.
+delete the snapshot a restore is reading. 0.10.0 does the same for the destination: a receive
+holds a lock on what it creates and a pin on the parent it chains against, a prune honours
+both, a raw target tells streams apart by the source that wrote them, and a config whose
+volumes would file their snapshots under one set of names is refused before it runs. As with
+any backup tool, test your restores.
 
 ## Heritage
 
@@ -75,7 +79,7 @@ See the [LICENSE](LICENSE) file for full copyright attribution.
   backup with `--backup-name` or `--date` (`--snapshot N` restores the newest and warns)
 - **Pre/Post Pairs**: Supports single, pre, and post snapshot types
 - **Incremental Transfers**: Efficient delta-based transfers between snapshots, with the parent
-  matched by btrfs UUID correspondence (name for raw targets) — so a re-created snapshot with the
+  matched by btrfs UUID correspondence (name and source for raw targets) — so a re-created snapshot with the
   same name but new content is correctly treated as new, never reused as an incorrect parent
 - **Generate Config**: Auto-generate TOML config from existing Snapper setup
 
@@ -596,7 +600,9 @@ path = "/home"                    # Path to BTRFS subvolume
 # snapshot_prefix: prefix for snapshot names. Omit to auto-derive from the path
 # (/home -> "home-"). Set to "" for bare-timestamp names -- if you do, pair it
 # with a strict timestamp_format and a dedicated snapshot_dir so unrelated
-# subvolumes are not mistaken for snapshots.
+# subvolumes are not mistaken for snapshots. Two volumes sending to one
+# destination must not share a prefix: a destination holds one snapshot per
+# name, so the config is refused at load and names the remedy.
 snapshot_prefix = "home-"
 snapshot_dir = ".snapshots"       # Override global snapshot_dir
 enabled = true                    # Enable/disable this volume
@@ -839,7 +845,8 @@ BELOW a location that exists, one level at a time, never the location itself:
   <volume>/<snapshot_dir>                  a RELATIVE snapshot_dir (".snapshots")
   <snapshot_dir>/<volume name>             under an ABSOLUTE snapshot_dir
   <target>/.snapshots/<n>                  a snapper backup's slots
-  <target>/.btrfs-backup-ng.locks          locks on a remote target
+  <target>/.btrfs-backup-ng.locks          locks and pins on a remote or raw target
+  <target>/.btrfs-backup-ng.receiving      receive locks on a local btrfs target
 ```
 
 Why the rule is strict: a target on a removable or network filesystem that is not mounted used to have its mount point rebuilt on the root filesystem and the backup written there -- invisible once the real disk came back, and charged against the wrong filesystem's free space. An absolute `snapshot_dir` was worse: the snapshots *succeeded* on the root filesystem, because a btrfs snapshot only needs to share a filesystem with its source. Refusing also catches a typo, which is the same argument from the other side. When a run is refused for a missing location, the message names the path and the remedy; mount the filesystem, fix the typo, or create the directory once by hand:

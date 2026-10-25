@@ -14,7 +14,7 @@ from typing import Any, Callable, Dict, Iterator, List, Optional, Set, Tuple
 
 from filelock import FileLock
 
-from btrfs_backup_ng import __util__
+from btrfs_backup_ng import __util__, lifecycle
 from btrfs_backup_ng.__logger__ import logger
 from btrfs_backup_ng.core.estimate import SizeEstimate
 from btrfs_backup_ng.core.space import SpaceInfo
@@ -214,6 +214,14 @@ class Endpoint:
         # Snapshot timestamp format (from [global] timestamp_format). None means the
         # built-in default is used when naming/parsing snapshots for this endpoint.
         self.config["timestamp_format"] = config.get("timestamp_format")
+        # The operator's opt-out from a lock that cannot be recorded -- the
+        # receiving lock, a pin in the directory store, the delete guard.
+        # Every transport reads it, so it is kept here for every transport:
+        # the ssh endpoint whitelisted it, then the raw+ssh one did, while a
+        # local btrfs target and a local raw store read a key their
+        # constructor never kept, and "pass --skip-remote-lock to proceed
+        # anyway" did nothing for them.
+        self.config["skip_remote_lock"] = bool(config.get("skip_remote_lock", False))
 
         self.__cached_snapshots: List[Any] | None = None
         # Set True when the lock file could not be read (corrupt/permission); retention
@@ -614,6 +622,139 @@ class Endpoint:
         """
         return
 
+    @contextlib.contextmanager
+    def receiving_lock(
+        self, destination: str, *, timeout: float | None = None
+    ) -> Iterator[None]:
+        """Hold the right to create ``destination`` on this target for the
+        span of a receive and its commit.
+
+        The transfer engine takes this through ``core.operations._receiving_lock``
+        before it asks whether the copy pre-exists, and holds it through the
+        commit and the cleanup of a failed transfer. Two transfers of one
+        snapshot into one local destination used to both read "absent, so
+        ours" from a probe made outside any lock; the loser then failed with
+        "File exists" and its cleanup deleted the winner's committed copy.
+
+        One body serves every transport (``sshutil.lock.hold_receiving_lock``);
+        this endpoint supplies the store: a lock manager over the location --
+        ``lock_root`` where the snapper flow has set it, else ``path`` -- in a
+        directory of its own (``RECEIVING_DIR_NAME``), so that creating it can
+        never turn the location's lock FILE into a directory store and hide the
+        pins recorded there. Per artifact, heartbeated, re-entrant within a
+        process, non-blocking: a second receive of the same copy is refused at
+        once with the holder named. ``timeout`` is accepted for signature
+        parity with the ssh endpoint's override and is not a wait. The lock
+        itself is ``_hold_receiving_lock``; the ssh endpoint overrides this
+        method to clean up its own partial inside it, and the ssh and raw
+        endpoints name their own stores through ``_receive_lock_root`` and
+        ``_receive_lock_manager``.
+        """
+        with self._hold_receiving_lock(destination) as mode:
+            if mode == "unlocked":
+                yield
+                return
+            # Processes this receive starts are stopped and waited for before
+            # the lock is released, so no other transfer can begin creating
+            # the path while a stream is still arriving.
+            with lifecycle.process_scope():
+                yield
+
+    @contextlib.contextmanager
+    def _hold_receiving_lock(self, destination: str) -> Iterator[str]:
+        """``sshutil.lock.hold_receiving_lock`` bound to this location: its
+        store and its guard, and nothing of the receive itself.
+
+        What a transfer and a deletion of ``destination`` share is this lock;
+        what each does under it is its own (``receiving_lock``,
+        ``_lock_for_deletion``). Yields the mode the shared body yields, or
+        ``unlocked`` for a location with no path to keep a store under.
+        """
+        if self._receive_lock_root() is None:
+            yield "unlocked"
+            return
+        from ..sshutil.lock import hold_receiving_lock
+
+        with hold_receiving_lock(
+            self._receive_lock_manager,
+            destination,
+            skip_remote_lock=bool(self.config.get("skip_remote_lock")),
+        ) as mode:
+            yield mode
+
+    def _receive_lock_root(self) -> Optional[str]:
+        """The directory this endpoint's receive locks live under, or None.
+
+        ``lock_root`` wins where it is set: the snapper flow points ``path``
+        at ``.snapshots/<n>.incoming`` for the duration of a receive, and a
+        lock root that followed it would be written inside the slot being
+        published and renamed into place along with it.
+        """
+        path = self.config.get("lock_root") or self.config.get("path")
+        if path in (None, ""):
+            return None
+        return str(path)
+
+    def _receive_lock_manager(self) -> Any:
+        """The one lock manager for this location's receive locks, built over
+        ``RECEIVING_DIR_NAME`` and shared per root path (``cached_manager``:
+        ``holds()`` and the heartbeat belong to one instance)."""
+        from ..sshutil.lock import RECEIVING_DIR_NAME, cached_manager, local_manager
+
+        root = self._receive_lock_root()
+        if root is None:
+            raise ValueError("this location has no path; cannot lock a receive")
+        return cached_manager(
+            self,
+            f"{root}#receiving",
+            lambda: local_manager(root, dir_name=RECEIVING_DIR_NAME),
+        )
+
+    def _receive_destination(self, source_path: Any) -> str:
+        """The artifact a receive of ``source_path`` creates at this location --
+        what its receiving lock is named for, on the way in and on the way out.
+
+        ``btrfs receive`` names the copy after the SOURCE basename, not the
+        snapshot's name (for snapper that is always ``snapshot``); a raw store
+        names its stream after the snapshot. Either way the artifact is that
+        basename under this location's path, so a deletion asking with the
+        artifact's own name gets the answer the receive got, and the two take
+        the same lock. The transfer engine asks through
+        ``core.operations._destination_subvolume``; the ssh endpoint overrides
+        this to apply its path normalisation.
+        """
+        dest = str(self.config.get("path", "")).rstrip("/")
+        return f"{dest}/{Path(str(source_path)).name}"
+
+    def _lock_for_deletion(
+        self, snapshot: Any, artifact: str, result: DeletionResult
+    ) -> Optional[contextlib.ExitStack]:
+        """Take ``artifact``'s receiving lock before deleting it, or record
+        why the deletion is not happening.
+
+        Returns the held lock for the deletion to run under (``with held:``),
+        or None once the snapshot's fate is in ``result``: skipped while
+        another process is receiving the artifact -- a prune deleted the slot
+        a run was publishing into, both reported success, and the destination
+        held neither backup -- or failed when the lock could not be taken at
+        all, since a deletion that cannot know whether a receive is under way
+        does not guess. ``skip_remote_lock`` lifts that refusal as it does for
+        a transfer, unprotected on purpose. Taken BEFORE any look at the
+        artifact's path: during a receive the path exists, as the partial.
+        """
+        held = contextlib.ExitStack()
+        try:
+            held.enter_context(self._hold_receiving_lock(artifact))
+        except __util__.ReceivingLockBusy as exc:
+            logger.info("Skipping %s: being received by %s", artifact, exc.holder)
+            result.skip(snapshot, f"being received by {exc.holder}")
+            return None
+        except __util__.AbortError as exc:
+            logger.error("Not deleting %s: %s", artifact, exc)
+            result.fail(snapshot, f"its receiving lock could not be taken: {exc}")
+            return None
+        return held
+
     def list_snapshots(self, flush_cache: bool = False) -> List[Any]:
         """
         Return a list of all snapshots found directly in self.config['path'] using $snap_prefix.
@@ -895,7 +1036,8 @@ class Endpoint:
         never raises.
 
         This base implementation is the btrfs (uuid) semantics used by Local and SSH
-        endpoints; raw endpoints override it with name semantics.
+        endpoints; raw endpoints override it with their own rule, the name and the
+        source the stored stream was sent from.
         """
         stream_uuid = getattr(snapshot, "stream_uuid", "")
         if not stream_uuid:
@@ -1390,6 +1532,12 @@ class Endpoint:
         success from the absence of an exception was counting every one of those
         as a deletion.
         """
+        from ..sshutil.lock import (
+            RemoteLockUnavailable,
+            blocked_by_remote_lock,
+            snapshot_lock_name,
+        )
+
         result = DeletionResult()
         store = self._lock_store_manager()
         listing_unreadable = bool(getattr(self, "_locks_read_failed", False))
@@ -1430,12 +1578,6 @@ class Endpoint:
         # store is on this machine. An unanswerable query deletes nothing.
         store_locked: set = set()
         if store is not None:
-            from ..sshutil.lock import (
-                RemoteLockUnavailable,
-                blocked_by_remote_lock,
-                snapshot_lock_name,
-            )
-
             try:
                 store_locked = blocked_by_remote_lock(store, list(snapshots))
             except RemoteLockUnavailable as exc:
@@ -1461,40 +1603,55 @@ class Endpoint:
             if store_locked and snapshot_lock_name(snapshot) in store_locked:
                 result.skip(snapshot, "locked by another process at this location")
                 continue
-            # Built by _build_deletion_commands rather than hand-rolled here, so
-            # `convert_rw` gets its `btrfs property set -ts ... ro false` ahead of
-            # the delete. Both are legacy CLI flags -- `-w/--convert-rw` and
-            # `-s/--sync` -- that reach this endpoint's config and were then
-            # dropped, because this method assembled its own single command and
-            # consulted neither. Their help text promised behaviour that never
-            # happened. `subvolume_sync` is deliberately excluded per snapshot:
-            # it is one trailing command for the whole batch, issued below.
-            commands = self._build_deletion_commands([snapshot], subvolume_sync=False)
-            logger.debug("Executing deletion command(s): %s", commands)
-            for cmd in commands:
-                try:
-                    logger.debug("Deleting snapshot with path: %s", snapshot.get_path())
-                    self._exec_command({"command": cmd})
-                except Exception as e:
-                    logger.error(
-                        "Failed to delete snapshot %s: %s", snapshot.get_path(), e
-                    )
-                    logger.error("Deletion command was: %s", cmd)
-                    result.fail(snapshot, e)
-                    break
-            else:
-                logger.info("Deleted snapshot subvolume: %s", snapshot.get_path())
-                result.deleted.append(snapshot)
-                if store is None:
-                    self._forget_lock_entry(snapshot.get_name())
-                # Evicted only on success, inside this branch. It used to sit at
-                # the loop's own indent, so a snapshot whose deletion FAILED was
-                # dropped from the cache anyway and every later list_snapshots()
-                # in the process reported it gone -- the listing agreeing with a
-                # deletion that did not happen.
-                if self.__cached_snapshots is not None:
-                    with contextlib.suppress(ValueError):
-                        self.__cached_snapshots.remove(snapshot)
+            # The artifact's own receiving lock -- the one a transfer holds from
+            # before its authorship probe through its commit -- so a deletion
+            # of what is being received is skipped, never raced. Taken before
+            # any look at the path: during a receive the path exists, as the
+            # partial.
+            held = self._lock_for_deletion(
+                snapshot, self._receive_destination(snapshot.get_name()), result
+            )
+            if held is None:
+                continue
+            with held:
+                # Built by _build_deletion_commands rather than hand-rolled here, so
+                # `convert_rw` gets its `btrfs property set -ts ... ro false` ahead of
+                # the delete. Both are legacy CLI flags -- `-w/--convert-rw` and
+                # `-s/--sync` -- that reach this endpoint's config and were then
+                # dropped, because this method assembled its own single command and
+                # consulted neither. Their help text promised behaviour that never
+                # happened. `subvolume_sync` is deliberately excluded per snapshot:
+                # it is one trailing command for the whole batch, issued below.
+                commands = self._build_deletion_commands(
+                    [snapshot], subvolume_sync=False
+                )
+                logger.debug("Executing deletion command(s): %s", commands)
+                for cmd in commands:
+                    try:
+                        logger.debug(
+                            "Deleting snapshot with path: %s", snapshot.get_path()
+                        )
+                        self._exec_command({"command": cmd})
+                    except Exception as e:
+                        logger.error(
+                            "Failed to delete snapshot %s: %s", snapshot.get_path(), e
+                        )
+                        logger.error("Deletion command was: %s", cmd)
+                        result.fail(snapshot, e)
+                        break
+                else:
+                    logger.info("Deleted snapshot subvolume: %s", snapshot.get_path())
+                    result.deleted.append(snapshot)
+                    if store is None:
+                        self._forget_lock_entry(snapshot.get_name())
+                    # Evicted only on success, inside this branch. It used to sit at
+                    # the loop's own indent, so a snapshot whose deletion FAILED was
+                    # dropped from the cache anyway and every later list_snapshots()
+                    # in the process reported it gone -- the listing agreeing with a
+                    # deletion that did not happen.
+                    if self.__cached_snapshots is not None:
+                        with contextlib.suppress(ValueError):
+                            self.__cached_snapshots.remove(snapshot)
         # `btrfs subvolume sync` waits for the deletions to finish being cleaned
         # up, so it belongs after the batch and only if the batch deleted
         # something. It is not a per-snapshot verdict: the subvolumes are already
@@ -2139,7 +2296,7 @@ class Endpoint:
         """The DIRECTORY lock store at this location, or None.
 
         A location has one set of pins however it is reached. An ssh:// endpoint
-        records its persistent locks -- the pins a restore holds, the locks a
+        records its persistent locks -- the pins a restore or a receive holds, the locks a
         receive holds (``sshutil/lock.py``) -- in a directory named
         ``LOCK_DIR_NAME`` under the target; a local endpoint keeps a JSON file
         of the same name. A local endpoint over an ssh:// mirror (a transfer

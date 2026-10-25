@@ -102,6 +102,16 @@ SNAPSHOT_LOCK_PREFIX = "snap-"
 #: would cost throughput to prevent a clash that cannot happen.
 RECEIVING_LOCK_PREFIX = "receiving-"
 
+#: The directory under a LOCAL btrfs target that its receive locks live in.
+#: Deliberately not ``LOCK_DIR_NAME``: a local endpoint recognises that
+#: directory as the location's PIN store and, finding it, reads its pins from
+#: there instead of from the lock file -- so creating it for a receive lock
+#: would hide every pin an earlier run recorded in the file. The receive
+#: locks get a store of their own and the pin store is left exactly as it
+#: was. ssh:// and raw locations have no lock-file mode to protect, so their
+#: receive locks share the one store their pins already live in.
+RECEIVING_DIR_NAME = ".btrfs-backup-ng.receiving"
+
 #: Holder files for a SHARED lock live here, one per holder.
 HOLDERS_DIR_NAME = "holders"
 
@@ -396,12 +406,21 @@ def read_only_notice(name: str, where: str, location: str) -> None:
 #: arithmetic syntax error under contention. Whatever ``stat`` prints is then
 #: checked to be digits before it is printed at all.
 #:
-#: ``bbng_now`` prints the target's clock as a bare integer, or nothing.
+#: ``bbng_now DIR`` prints the clock of the filesystem holding DIR as a bare
+#: integer, read from the mtime of a probe file created in DIR -- the SAME
+#: clock that stamps every lock record. ``date`` is not consulted: a store on a
+#: networked mount whose server clock differs from this client's ``date`` can no
+#: longer make a freshly-heartbeated lock read stale. Nothing when DIR is a
+#: symbolic link or not a directory (a probe is a WRITE, and the listing paths
+#: reach here with no safety walk of the store, so a link planted at the store
+#: is refused rather than written through), when the probe cannot be created in
+#: DIR, or when its mtime is not digits.
 #:
-#: ``bbng_age FILE [FALLBACK]`` prints the age in seconds of FILE by the
-#: target's own clock, of FALLBACK when FILE has no readable mtime, or nothing
-#: when neither can be read or the clock cannot. Callers treat nothing as
-#: "cannot judge", never as an age of zero or of forever.
+#: ``bbng_age FILE [FALLBACK]`` prints the age in seconds of FILE against
+#: ``$BBNG_NOW`` (which each judge site sets once from ``bbng_now <store root>``),
+#: of FALLBACK when FILE has no readable mtime, or nothing when the mtime or
+#: ``$BBNG_NOW`` cannot be read. Callers treat nothing as "cannot judge", never
+#: as an age of zero or of forever.
 MTIME_FUNCTIONS = (
     "if stat -c %Y / >/dev/null 2>&1; then bbng_st='-c %Y'; else bbng_st='-f %m'; fi; "
     'bbng_digits() { bbng_t=$1; [ -n "$bbng_t" ] || return 1; '
@@ -410,12 +429,15 @@ MTIME_FUNCTIONS = (
     'bbng_mtime() { bbng_m=$(stat $bbng_st "$1" 2>/dev/null) || bbng_m=; '
     'bbng_digits "$bbng_m" || bbng_m=; '
     'printf "%s" "$bbng_m"; }; '
-    "bbng_now() { bbng_c=$(date +%s 2>/dev/null) || bbng_c=; "
-    'bbng_digits "$bbng_c" || bbng_c=; printf "%s" "$bbng_c"; }; '
+    'bbng_now() { bbng_nd=$1; [ -n "$bbng_nd" ] || return 0; '
+    'if [ -L "$bbng_nd" ] || [ ! -d "$bbng_nd" ]; then return 0; fi; '
+    'bbng_np=$bbng_nd/.bbng-now-probe.$$; rm -f "$bbng_np" 2>/dev/null; '
+    'if ( set -C; : > "$bbng_np" ) 2>/dev/null; then '
+    'bbng_nm=$(bbng_mtime "$bbng_np"); rm -f "$bbng_np" 2>/dev/null; '
+    'printf "%s" "$bbng_nm"; fi; }; '
     'bbng_age() { bbng_a=$(bbng_mtime "$1"); '
     'if [ -z "$bbng_a" ] && [ -n "$2" ]; then bbng_a=$(bbng_mtime "$2"); fi; '
-    "bbng_n=$(bbng_now); "
-    'if [ -n "$bbng_a" ] && [ -n "$bbng_n" ]; then echo $(( bbng_n - bbng_a )); fi; }; '
+    'if [ -n "$bbng_a" ] && [ -n "$BBNG_NOW" ]; then echo $(( BBNG_NOW - bbng_a )); fi; }; '
 )
 
 #: Shell defining the functions every lock script creates directories and
@@ -532,6 +554,16 @@ def _verdict(out: str) -> str:
         if line.strip():
             return line.strip()
     return ""
+
+
+def _clock_readable(out: str) -> bool:
+    """Whether a listing's ``NOW`` line carries the store's clock. The clock
+    is read by writing a probe into the store, so an account that may list the
+    store but not write it prints ``NOW`` with nothing after it."""
+    for line in out.splitlines():
+        if line.startswith("NOW"):
+            return line[3:].strip().isdigit()
+    return False
 
 
 class RemoteLockManager:
@@ -729,7 +761,7 @@ class RemoteLockManager:
             f"  if bbng_e=$(mkdir {lock} 2>&1); then bbng_take ACQUIRED; exit 0; fi; "
             f'  if [ ! -d {lock} ]; then printf "NOLOCK %s" "$bbng_e" | tr -d "\\n"; echo; exit 0; fi; '
             "fi; "
-            "bbng_judge; "
+            f"BBNG_NOW=$(bbng_now {root}); bbng_judge; "
             # No readable age: a lock that cannot be judged is never broken.
             f'if [ -z "$AGE" ]; then '
             f"  if [ -d {lock} ]; then echo BUSY; bbng_show; exit 0; fi; "
@@ -1136,6 +1168,92 @@ class RemoteLockManager:
                     err.strip() or out.strip() or f"exit {rc}",
                 )
 
+    # ------------------------------------------------ the lease, re-checked
+
+    @property
+    def stale_after(self) -> int:
+        """Seconds without a beat after which a holder's lease may be broken:
+        the one threshold, for a lock's staleness and for what a leftover is
+        judged against (``age_of``)."""
+        return self._stale_after
+
+    def is_owner(self, name: str) -> Optional[bool]:
+        """Whether this manager's lease on ``name`` still stands in the store.
+
+        The acquire wrote ``owner.<token>``, the beat refreshes it, and a
+        contender that finds it older than ``stale_after`` removes it and
+        takes the lock with a record of its own. A holder stalled past that
+        point -- suspended, swapped out, waiting on a slow sudo -- wakes
+        still believing it holds the lock, and every action it then takes on
+        what the lock guards is taken on the other holder's work. So before
+        such an action the holder asks the store. True: its own record is
+        there and is the only owner record. False: the record is gone or
+        another's stands beside it, or this manager holds no lease on
+        ``name`` at all. None: the store could not be asked, which a caller
+        acting on the lock's guard treats as not confirmed.
+
+        A read, never a write, so never elevated: the lock directory is made
+        readable, and a record that cannot be read is a lease that cannot be
+        confirmed.
+        """
+        with self._state_lock:
+            token = self._tokens.get(name)
+        if token is None:
+            return False
+        rc, out, err = self._check_owner(name, token)
+        verdict = _verdict(out)
+        if rc != 0 or verdict not in ("OWNER", "NOTOWNER"):
+            logger.debug(
+                "Could not confirm the lease on %r: %s",
+                name,
+                err.strip() or out.strip() or f"exit {rc}",
+            )
+            return None
+        return verdict == "OWNER"
+
+    def _check_owner(self, name: str, token: str) -> tuple[int, str, str]:
+        return self._run(self._owner_script(name, token))
+
+    def _owner_script(self, name: str, token: str) -> str:
+        """``OWNER`` when ``owner.<token>`` is a regular file and the only
+        owner record in the lock directory, else ``NOTOWNER``. A link at
+        either name is not a record."""
+        lock = shlex.quote(self._lock_dir(name))
+        owner = shlex.quote(self._owner_file(name, token))
+        return (
+            f"if [ -L {owner} ] || [ ! -f {owner} ]; then echo NOTOWNER; exit 0; fi; "
+            f"bbng_c=0; for bbng_f in {lock}/{OWNER_PREFIX}*; do "
+            '[ ! -L "$bbng_f" ] && [ -f "$bbng_f" ] && bbng_c=$((bbng_c + 1)); done; '
+            'if [ "$bbng_c" -eq 1 ]; then echo OWNER; else echo NOTOWNER; fi; exit 0'
+        )
+
+    def age_of(self, path: str) -> Optional[int]:
+        """Seconds since ``path`` on the target was last written, by the
+        clock the store's records are judged by -- ``bbng_now``, the mtime of
+        a probe written into the store root -- or None when the path or the
+        clock cannot be read. What a lease's staleness is measured against is
+        what a leftover's freshness is measured against (the snapper layout
+        asks this of a slot it finds occupied as it opens it)."""
+        rc, out, _err = self._read_age(path)
+        verdict = _verdict(out)
+        if rc != 0 or not verdict.startswith("AGE "):
+            return None
+        try:
+            return int(verdict[len("AGE ") :].strip())
+        except ValueError:
+            return None
+
+    def _read_age(self, path: str) -> tuple[int, str, str]:
+        return self._run(self._age_script(path))
+
+    def _age_script(self, path: str) -> str:
+        root = shlex.quote(self._root)
+        return (
+            MTIME_FUNCTIONS + f"BBNG_NOW=$(bbng_now {root}); "
+            f"bbng_a=$(bbng_age {shlex.quote(path)}); "
+            'if [ -n "$bbng_a" ]; then echo "AGE $bbng_a"; else echo UNKNOWN; fi; exit 0'
+        )
+
     def is_locked(self, name: str) -> Optional[dict]:
         """The holder's details if a live lock exists, else None.
 
@@ -1148,9 +1266,11 @@ class RemoteLockManager:
         hand.
         """
         lock = shlex.quote(self._lock_dir(name))
+        root = shlex.quote(self._root)
         script = (
             self._exclusive_functions(name) + f"if [ -d {lock} ]; then "
-            'bbng_judge; printf "AGE %s\\n" "${AGE:-?}"; bbng_show; '
+            f"BBNG_NOW=$(bbng_now {root}); bbng_judge; "
+            'printf "AGE %s\\n" "${AGE:-?}"; bbng_show; '
             f"elif [ -e {lock} ]; then echo UNKNOWN; else echo ABSENT; fi"
         )
         rc, out, err = self._run(script)
@@ -1250,7 +1370,7 @@ class RemoteLockManager:
         root = shlex.quote(self._root)
         holders_dir = HOLDERS_DIR_NAME
         script = (
-            MTIME_FUNCTIONS + 'printf "NOW %s\\n" "$(bbng_now)"; '
+            MTIME_FUNCTIONS + f'printf "NOW %s\\n" "$(bbng_now {root})"; '
             # A lock root that exists but cannot be listed is not an empty one:
             # the glob below would simply not expand, and "no pins" would be
             # reported for a target this account cannot see into.
@@ -1279,9 +1399,11 @@ class RemoteLockManager:
             f"done 2>/dev/null; exit 0"
         )
         rc, out, err = self._run(script)
+        elevated = False
         if rc == 0 and "UNLISTABLE" in out.splitlines():
             if self._run_elevated is not None:
                 rc, out, err = self._run_elevated(script)
+                elevated = True
             if rc == 0 and "UNLISTABLE" in out.splitlines():
                 raise RemoteLockUnavailable(
                     f"the lock directory {self._root!r} on the target exists but "
@@ -1298,6 +1420,17 @@ class RemoteLockManager:
             raise RemoteLockUnavailable(
                 f"could not list locks on the target: {err.strip() or f'exit {rc}'}"
             )
+        # The clock is read by writing a probe into the store, so an account
+        # that may list the store but not write it -- the usual case for a
+        # scheduled backup's root-owned store -- cannot read it, and would
+        # report every record held and the sweep nothing dead. That is what
+        # ``run_elevated`` exists for: ask again as root, which can probe. If
+        # root cannot probe either, every record stays held, as on a store that
+        # is read-only for everyone.
+        if not elevated and self._run_elevated is not None and not _clock_readable(out):
+            e_rc, e_out, e_err = self._run_elevated(script)
+            if e_rc == 0:
+                rc, out, err = e_rc, e_out, e_err
 
         now: Optional[int] = None
         clock_read = False
@@ -1389,6 +1522,7 @@ class RemoteLockManager:
         if not dead:
             return 0
         threshold = self._stale_after * DEAD_HOLDER_MULTIPLE
+        root = shlex.quote(self._root)
         paths = " ".join(
             shlex.quote(f"{self._root}/{dir_name}.lock/{HOLDERS_DIR_NAME}/{file_name}")
             for dir_name, file_name in dead
@@ -1401,7 +1535,13 @@ class RemoteLockManager:
         # ``bbng_age`` is the same measure the listing used, so the judgement is
         # consistent. Reports how many it actually removed.
         script = (
-            MTIME_FUNCTIONS + "bbng_swept=0; bbng_unwr=0; "
+            MTIME_FUNCTIONS + f"BBNG_NOW=$(bbng_now {root}); "
+            # A probe that cannot be written is the store refusing this
+            # account, not a verdict on any record: report the unwritable
+            # store it is, so the elevated pass -- which can probe -- runs,
+            # and remove nothing meanwhile.
+            'if [ -z "$BBNG_NOW" ]; then echo "UNWRITABLE 0"; exit 0; fi; '
+            "bbng_swept=0; bbng_unwr=0; "
             f"for bbng_p in {paths}; do "
             'bbng_a=$(bbng_age "$bbng_p"); '
             f'if [ -n "$bbng_a" ] && [ "$bbng_a" -gt {threshold} ]; then '
@@ -1859,7 +1999,7 @@ class LocalLockManager(RemoteLockManager):
                     raise _unsafe("SYMLINK", lock_path) from None
                 return [f"NOLOCK {lock_path}: {e.strerror}"]
             with _closing(lock_fd):
-                key, age = self._judge(lock_fd)
+                key, age = self._judge(lock_fd, self._probe_now(root_fd))
                 if age is None:
                     # No readable age: a lock that cannot be judged is never
                     # broken, unless it is gone.
@@ -1926,15 +2066,53 @@ class LocalLockManager(RemoteLockManager):
             return False
         return stat.S_ISREG(st.st_mode)
 
-    def _judge(self, lock_fd: int) -> tuple[Optional[str], Optional[int]]:
-        """``bbng_judge``: the entry identifying this instance of the lock,
-        and its age by this machine's clock -- which IS the target's clock
-        here -- or None where no age can be read."""
+    def _probe_now(self, root_fd: int) -> Optional[int]:
+        """The store filesystem's clock, read as the mtime of a probe file
+        created in the store root under ``root_fd``.
+
+        The same clock that stamps every lock record, so a store on a networked
+        mount whose server stamps mtimes cannot be aged against this machine's
+        ``time.time()`` -- comparing a client wall clock to a server-stamped
+        mtime is exactly the skew this replaces. None when the probe cannot be
+        created or its mtime read: "cannot judge", which ``_acquire_here`` treats
+        as "do not break". The probe is created in the store ROOT (never inside a
+        lock or holders directory, so no lock's mtime is disturbed), O_EXCL and
+        O_NOFOLLOW like every other record this manager writes, and unlinked at
+        once.
+        """
+        probe = f".bbng-now-probe.{os.getpid()}.{uuid.uuid4().hex}"
+        try:
+            fd = os.open(
+                probe,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                0o600,
+                dir_fd=root_fd,
+            )
+        except OSError:
+            return None
+        try:
+            return int(os.fstat(fd).st_mtime)
+        except OSError:
+            return None
+        finally:
+            os.close(fd)
+            with suppress(OSError):
+                os.unlink(probe, dir_fd=root_fd)
+
+    def _judge(
+        self, lock_fd: int, now: Optional[int]
+    ) -> tuple[Optional[str], Optional[int]]:
+        """``bbng_judge``: the entry identifying this instance of the lock, and
+        its age against ``now`` -- the store filesystem's clock read by
+        ``_probe_now`` -- or None where no age can be read. ``time.time()`` is
+        not used: on a networked store the records are stamped by the server, and
+        aging them against this machine's wall clock is the skew the probe
+        removes."""
         from .. import __util__
 
-        now = int(time.time())
-
         def age_of(name: str) -> Optional[int]:
+            if now is None:
+                return None
             try:
                 st = (
                     os.fstat(lock_fd)
@@ -2036,6 +2214,56 @@ class LocalLockManager(RemoteLockManager):
         with suppress(OSError):
             os.rmdir(lock_name, dir_fd=root_fd)
         return ["BUSY"]
+
+    # ------------------------------------------------ the lease, re-checked
+
+    def _check_owner(self, name: str, token: str) -> tuple[int, str, str]:
+        try:
+            line = self._check_owner_here(name, token)
+        except _StoreVerdict as v:
+            # A store or lock directory that is not there is a lease that is
+            # gone; anything else is a store that could not be asked.
+            line = "NOTOWNER" if v.errno == errno.ENOENT else v.line
+        return 0, line + "\n", ""
+
+    def _check_owner_here(self, name: str, token: str) -> str:
+        """``_owner_script`` against descriptors: the record opened by name
+        below the lock directory, never through a link."""
+        from .. import __util__
+
+        fd = self._open_store(create=False)
+        fd = self._open_below(
+            fd, f"{encode_name(name)}.lock", self._lock_dir(name), create=False
+        )
+        with _closing(fd) as lock_fd:
+            if not self._is_regular(lock_fd, f"{OWNER_PREFIX}{token}"):
+                return "NOTOWNER"
+            try:
+                entries = __util__.listdir_current(lock_fd)
+            except OSError:
+                return "UNREADABLE"
+            records = [
+                n
+                for n in entries
+                if n.startswith(OWNER_PREFIX) and self._is_regular(lock_fd, n)
+            ]
+            return "OWNER" if len(records) == 1 else "NOTOWNER"
+
+    def _read_age(self, path: str) -> tuple[int, str, str]:
+        """``_age_script`` against descriptors: the store's clock from
+        ``_probe_now``, the path's mtime without following a link."""
+        try:
+            with _closing(self._open_store(create=False)) as root_fd:
+                now = self._probe_now(root_fd)
+        except _StoreVerdict:
+            now = None
+        if now is None:
+            return 0, "UNKNOWN\n", ""
+        try:
+            st = os.stat(path, follow_symlinks=False)
+        except OSError:
+            return 0, "UNKNOWN\n", ""
+        return 0, f"AGE {now - int(st.st_mtime)}\n", ""
 
     # ---------------------------------------------------- the shared record
 
@@ -2393,7 +2621,7 @@ def blocked_by_remote_lock(manager: Any, snapshots: list) -> set[str]:
     except Exception as exc:  # noqa: BLE001 - see docstring: the caller decides
         raise RemoteLockUnavailable(
             f"the lock state on this target could not be read ({exc}), so it is "
-            f"not known whether a restore is holding any of these snapshots"
+            f"not known whether a restore or a receive is holding any of these snapshots"
         ) from exc
     # Matched on the real name AND on the encoded directory each lock actually
     # lives in. A lock whose payload cannot be parsed has no real name to offer,
@@ -2409,3 +2637,103 @@ def blocked_by_remote_lock(manager: Any, snapshots: list) -> set[str]:
         if f"{SNAPSHOT_LOCK_PREFIX}{n}" in live
         or encode_name(f"{SNAPSHOT_LOCK_PREFIX}{n}") in directories
     }
+
+
+@contextmanager
+def hold_receiving_lock(
+    manager: Any,
+    destination: str,
+    *,
+    skip_remote_lock: bool = False,
+) -> Iterator[str]:
+    """Hold the right to create -- or to remove -- ``destination`` on a target:
+    the one body behind every endpoint's ``_hold_receiving_lock``.
+
+    ``manager`` is a ``RemoteLockManager`` or a zero-argument callable that
+    builds one (an endpoint's bound ``_lock_manager``), as ``record_pin``
+    takes it. Each endpoint supplies only the manager -- the store its locks
+    live in -- and the protocol is this one for every transport: an ssh://
+    target, a raw store on this machine or a remote one, a local btrfs target.
+    Three copies of it had grown apart only in which store they opened.
+
+    Scoped to ONE destination artifact, not the whole target: two receives
+    into one directory under different names run in parallel; two under the
+    same name are what collide, and the loser is refused BEFORE its stream
+    starts, by a message naming the holder. Re-entrant within a process: the
+    snapper flow holds this across a receive and the publish that follows it,
+    and the transfer beneath must not contend with its own caller.
+
+    Non-blocking. A holder is refused at once, not waited for: a second
+    receive of the same artifact is a mistake to report, not a queue to join.
+    A lock that cannot be recorded stops the operation, unless the operator
+    said ``skip_remote_lock`` -- then it proceeds with a warning, unprotected
+    on purpose.
+
+    A deletion takes the same lock before removing the artifact
+    (``Endpoint._lock_for_deletion``), so a prune and a receive of one
+    artifact exclude each other instead of racing; the deletion skips what is
+    being received, and ``ReceivingLockBusy`` carries the holder's name for
+    it to say so.
+
+    Yields how the block came to run: ``acquired`` (this call took the lock
+    and will release it), ``reentrant`` (held further up this call stack) or
+    ``unprotected`` (the opt-out). The caller stops the processes it starts
+    before this returns (``btrfs_backup_ng.lifecycle.process_scope``), so
+    nothing can take the lock while a stream is still arriving; a caller that
+    cleans up a failed receive does so inside the block too, and only when
+    the mode is ``acquired`` -- a re-entrant holder's cleanup belongs to the
+    frame that took the lock.
+    """
+    from .. import __util__
+
+    name = f"{RECEIVING_LOCK_PREFIX}{destination}"
+    if callable(manager):
+        manager = manager()
+    if manager.holds(name):
+        yield "reentrant"
+        return
+    try:
+        manager.acquire_once(name, f"receive:{destination}")
+    except RemoteLockBusy as exc:
+        # Built from the holder's details rather than by interpolating the
+        # exception, whose text repeats the destination and the lock name.
+        # An operator reading a wrapped three-line sentence to find a
+        # hostname is being made to work for it.
+        info = exc.info or {}
+        holder = "another process"
+        if info:
+            holder = (
+                f"{info.get('hostname', 'an unknown host')} "
+                f"(pid {info.get('pid', '?')})"
+            )
+        raise __util__.ReceivingLockBusy(
+            destination,
+            holder,
+            f"Already being received by {holder}: {destination}\n"
+            f"Refusing to start a second transfer to the same path -- both "
+            f"would create the same copy, and the loser only finds out "
+            f"after transferring everything.",
+        ) from exc
+    except RemoteLockUnavailable as exc:
+        if skip_remote_lock:
+            logger.warning(
+                "Could not take the receiving lock on %s (%s), and "
+                "--skip-remote-lock was given, so this continues WITHOUT "
+                "protection against a concurrent transfer or deletion of the "
+                "same path.",
+                destination,
+                exc,
+            )
+            yield "unprotected"
+            return
+        raise __util__.AbortError(
+            f"Could not take the receiving lock on {destination!r}: {exc}. "
+            f"Refusing to continue unprotected: a transfer and a deletion of "
+            f"the same path, or two transfers, would collide. Pass "
+            f"--skip-remote-lock to proceed anyway."
+        ) from exc
+    manager._start_heartbeat(name)
+    try:
+        yield "acquired"
+    finally:
+        manager.release(name)

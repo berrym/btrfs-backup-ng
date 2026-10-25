@@ -25,6 +25,9 @@ def _receive_and_commit(ep, tmp_path, name="snap1", parent_name=None):
 
 def test_commit_writes_authoritative_v2_sidecar(tmp_path):
     ep = RawEndpoint(config={"path": str(tmp_path), "compress": "gzip"})
+    # The parent is in the store first: an increment is published only onto
+    # the parent it was received against.
+    _receive_and_commit(ep, tmp_path, name="snap0")
     _receive_and_commit(ep, tmp_path, name="snap1", parent_name="snap0")
 
     stream = tmp_path / "snap1.btrfs.gz"
@@ -62,13 +65,13 @@ def test_committed_sidecar_is_discovered_with_authoritative_metadata(tmp_path):
     """After commit, a fresh endpoint lists the snapshot from the SIDECAR (not
     filename inference), so restore/prune get authoritative metadata."""
     ep = RawEndpoint(config={"path": str(tmp_path), "compress": "gzip"})
+    _receive_and_commit(ep, tmp_path, name="snap0")
     _receive_and_commit(ep, tmp_path, name="snap1", parent_name="snap0")
 
     lister = RawEndpoint(config={"path": str(tmp_path)})
     snaps = lister.list_snapshots()
-    assert len(snaps) == 1
-    s = snaps[0]
-    assert s.name == "snap1"
+    assert sorted(s.name for s in snaps) == ["snap0", "snap1"]
+    s = next(s for s in snaps if s.name == "snap1")
     assert s.compress == "gzip"
     assert s.parent_name == "snap0"  # only the sidecar carries this; filenames don't
     assert s.provenance_origin == "native-write"
