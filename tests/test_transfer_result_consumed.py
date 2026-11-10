@@ -105,8 +105,9 @@ class TestTheRunSummaryCountsSnapshotsNotTargets:
         separate snapshot count is what makes the summary line true.
 
         Checked by AST at EVERY augmented assignment, not by searching the source
-        for one occurrence: there are two scoring sites, parallel and sequential,
-        and a substring check is satisfied by whichever one was left alone.
+        for one occurrence: there are three scoring sites, parallel, sequential
+        and snapper, and a substring check is satisfied by whichever one was
+        left alone.
         """
         import ast
         import inspect
@@ -125,8 +126,8 @@ class TestTheRunSummaryCountsSnapshotsNotTargets:
                 continue
             sites.append((node.lineno, ast.dump(node.value)))
 
-        assert len(sites) >= 3, (
-            f"expected the two scoring sites plus the roll-up, found {len(sites)}"
+        assert len(sites) >= 5, (
+            f"expected three scoring sites plus two roll-ups, found {len(sites)}"
         )
         wrong = [
             line

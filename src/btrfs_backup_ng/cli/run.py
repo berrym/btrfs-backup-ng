@@ -983,7 +983,7 @@ def _backup_snapper_volume(
 
             # Sync snapper snapshots to this target
             logger.info("Syncing snapper config '%s' to %s", config_name, target.path)
-            transferred = sync_snapper_snapshots(
+            transferred_count = sync_snapper_snapshots(
                 scanner,
                 config_name,
                 destination_endpoint,
@@ -998,8 +998,15 @@ def _backup_snapper_volume(
                 ),
             )
 
-            stats["completed"] += transferred
-            logger.info("Transferred %d snapshot(s) to %s", transferred, target.path)
+            # The target once, the snapshots by count, as the native pipeline
+            # scores a target: adding the snapshot count to "completed" made the
+            # notification report two transfers for one target, and left the
+            # summary's snapshot count at zero.
+            stats["completed"] += 1
+            stats["snapshots_transferred"] += transferred_count
+            logger.info(
+                "Transferred %d snapshot(s) to %s", transferred_count, target.path
+            )
             # Only a target whose transfer SUCCEEDED is eligible for retention,
             # matching the native pipeline's fate-sharing rule.
             succeeded_targets.append((target, snapper_endpoint_config))
