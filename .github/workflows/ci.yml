@@ -38,6 +38,15 @@ jobs:
           sudo apt-get install -y tcsh
           command -v dash && command -v tcsh && command -v csh
 
+      # Which mkdir the lock scripts run under here. The uutils one exits 0
+      # on "File exists" when a directory stands there, which the lock
+      # protocol withstands by one retry (#158); a change of runner image
+      # should be visible in the log, not inferred from a flaky test.
+      - name: Name the runner's mkdir
+        run: |
+          readlink -f "$(command -v mkdir)"
+          mkdir --version | head -1
+
       - name: Set up uv
         uses: astral-sh/setup-uv@v10.2.0
 
@@ -87,6 +96,15 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y tcsh
           command -v dash && command -v tcsh && command -v csh
+
+      # Which mkdir the lock scripts run under here. The uutils one exits 0
+      # on "File exists" when a directory stands there, which the lock
+      # protocol withstands by one retry (#158); a change of runner image
+      # should be visible in the log, not inferred from a flaky test.
+      - name: Name the runner's mkdir
+        run: |
+          readlink -f "$(command -v mkdir)"
+          mkdir --version | head -1
 
       - name: Set up uv
         uses: astral-sh/setup-uv@v10.2.0

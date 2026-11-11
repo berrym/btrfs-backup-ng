@@ -160,10 +160,32 @@ The break now removes the one entry that identifies the instance judged dead:
 its `owner.<token>` file. That name exists only in that instance, and removing
 it succeeds for exactly one caller, so every other contender that judged the
 same dead lock is told BUSY -- and one that judged an older instance cannot
-touch a newer one's record. Only the winner goes on to `rmdir` the directory
-and `mkdir` it afresh. A lock left by an older version (no owner file) is
-broken the same way through its `info.json`, which this version never writes;
-an empty directory, through `rmdir`, which succeeds only while it is empty.
+touch a newer one's record. Only the winner goes on to remove the heartbeat,
+`rmdir` the directory and `mkdir` it afresh. A lock left by an older version
+(no owner file) is broken the same way through its `info.json`, which this
+version never writes; an empty directory, through `rmdir`, which succeeds
+only while it is empty.
+
+For that to be one contender, one entry must identify the instance for every
+lister. The winner removes the record first and the heartbeat after, so a
+contender listing in between finds a directory holding only a heartbeat.
+That shape is aged by the directory's mtime, which the record's removal has
+just refreshed, and is reported BUSY. No live holder leaves that shape; a
+release that died between its two removals does, with a directory mtime as
+old as the death, and that one is broken through its heartbeat once it is
+past the threshold. Through 0.10.0 the shape was aged by the heartbeat's own
+mtime, so a contender in the breaker's gap took the same dead instance for a
+second one and broke it too; the second `rmdir` could remove a claimant's
+fresh, still-empty directory, a later claimant made the path again, the first
+wrote its record into the second's directory, and the record count below
+decided the round: one winner and a contender told the lock could not be
+created, or none when both saw two records.
+
+What remains of that class needs a crash first: an empty directory left by a
+breaker or a release killed between its two last steps, judged dead by two
+contenders in the same instant once it is past the threshold, with a
+claimant's `mkdir` landing between their two `rmdir`s. The record count below
+then gives one winner, or a round with none, never two.
 
 A new holder then checks that its record is the only one in the directory
 before it reports the lock as taken. The one interleaving the removal cannot
@@ -171,6 +193,22 @@ exclude -- an empty dead directory removed by a slow contender just after
 another had re-created it and before it wrote its record -- ends with the
 second record written into a directory someone else created, or not written at
 all, and the later claimant withdraws.
+
+A claimant that withdraws tries once more from the first `mkdir`, and reports
+BUSY only if that try withdraws too. With a `mkdir` that tells the truth the
+second try never runs: a withdrawal needs two records in one directory, which
+needs the crash above. One `mkdir` does not tell the truth. The uutils
+coreutils `mkdir`, Ubuntu's default from 25.10, exits 0 when a directory stands
+at the path by the time its own call has failed with "File exists", so two
+contenders racing for the path a break has just freed are both told they made
+it; both write a record, both count two, both withdraw, and the round had no
+winner at all, never two. Twelve contenders at one dead lock did that in one
+job in five on the GitHub runners (#158). On the second try the path is free and
+the first `mkdir` takes it, or another claimant holds it and the try says BUSY
+with that claimant's record. The two can race again and be lied to again, so a
+round can still end with no winner; the retry makes that rare rather than
+certain. A breaker that withdraws and wins on its second try still reports the
+lock as broken: the break happened on the first.
 
 What remains is the assumption every lease rests on: a holder that stops
 refreshing for longer than the threshold has lost its lock, even if it wakes
