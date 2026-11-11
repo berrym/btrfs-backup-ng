@@ -173,6 +173,65 @@ def assert_target_mounted(target_path: str, require_mount: bool | str = True) ->
     logger.debug("Mount check passed for %s", target_path)
 
 
+def report_transfer_outcome(
+    log: logging.Logger, target_path: str, transferred_count: int, indent: str = ""
+) -> None:
+    """Say what a target's successful transfer did, in one voice for every
+    command and both pipelines.
+
+    An empty plan is a destination that already holds every snapshot, not a
+    delivery of nothing: the two are told apart here so that no caller says
+    "Transferred 0 snapshot(s)" where another says "already up to date".
+    """
+    if transferred_count == 0:
+        log.info("%s%s is already up to date", indent, target_path)
+    else:
+        log.info(
+            "%sTransferred %d snapshot(s) to %s", indent, transferred_count, target_path
+        )
+
+
+def report_transfer_failure(
+    log: logging.Logger, target_path: str, exc: BaseException, indent: str = ""
+) -> None:
+    """Say how a target's transfer failed, reading the outcome the transfer
+    attached to its exception (``operations._raise_transfer_failures``) so a
+    run that delivered three of five snapshots is reported as one, and a run
+    that delivered nothing is not.
+    """
+    if isinstance(exc, __util__.AbortError):
+        partial = getattr(exc, "result", None)
+        if partial is not None and getattr(partial, "transferred", None):
+            log.error(
+                "%sTransfer to %s aborted after %d of %d snapshot(s): %s",
+                indent,
+                target_path,
+                partial.transferred_count,
+                partial.attempted,
+                exc,
+            )
+        else:
+            log.error("%sTransfer to %s aborted: %s", indent, target_path, exc)
+    else:
+        log.error("%sTransfer to %s failed: %s", indent, target_path, exc)
+
+
+def report_optional_target_skipped(
+    log: logging.Logger, target_path: str, exc: BaseException, indent: str = ""
+) -> None:
+    """A target declared ``optional`` could not be prepared: reported, and
+    counted by no caller, which is what the option promises."""
+    log.warning("%sSkipping optional target %s: %s", indent, target_path, exc)
+
+
+def report_prepare_failure(
+    log: logging.Logger, target_path: str, exc: BaseException, indent: str = ""
+) -> None:
+    """A target that is not optional could not be prepared: a failure, said
+    before anything was sent."""
+    log.error("%sFailed to prepare destination %s: %s", indent, target_path, exc)
+
+
 def space_options_from_args(args: argparse.Namespace) -> dict[str, Any]:
     """Space-check transfer options derived from the parsed CLI flags.
 

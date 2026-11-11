@@ -160,7 +160,7 @@ class TestASnapperVolumeIsScoredLikeANativeOne:
         monkeypatch.setattr(
             run_cli.endpoint,
             "choose_endpoint",
-            lambda path, cfg: SimpleNamespace(path=path),
+            lambda path, cfg: SimpleNamespace(path=path, prepare=lambda: None),
         )
 
         def sync(scanner, config_name, destination_endpoint, **kwargs):

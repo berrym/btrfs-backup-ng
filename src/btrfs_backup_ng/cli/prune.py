@@ -34,6 +34,7 @@ from .common import (
     assert_target_mounted,
     get_log_level,
     get_timestamp_format,
+    report_optional_target_skipped,
     snapper_destination_options,
     thread_ssh_target_config,
 )
@@ -927,7 +928,7 @@ def execute_prune(args: argparse.Namespace) -> int:
                     # Declared as allowed to be absent; an unreachable optional
                     # target is not a prune failure. Its backups are simply not
                     # pruned this time, which is the safe direction.
-                    logger.warning("  Skipping optional target %s: %s", target.path, e)
+                    report_optional_target_skipped(logger, target.path, e, indent="  ")
                     continue
                 logger.error("  Error pruning target %s: %s", target.path, e)
                 error_messages.append(f"Target {target.path}: {e}")
@@ -1043,7 +1044,7 @@ def _plan_snapper_volume(
                 )
         except Exception as e:  # noqa: BLE001 - one target must not abort the rest
             if getattr(target, "optional", False):
-                logger.warning("  Skipping optional target %s: %s", target.path, e)
+                report_optional_target_skipped(logger, target.path, e, indent="  ")
                 continue
             # An enumeration that failed is not an empty destination: nothing
             # is planned there, and the command fails rather than reporting a
