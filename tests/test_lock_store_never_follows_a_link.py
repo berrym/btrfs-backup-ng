@@ -267,8 +267,16 @@ class TestAWritableStoreIsRefusedLocally:
         manager.acquire_shared_persistent(SNAPSHOT, PIN)
         record = _holder(store)
         assert record.is_file()
-        record.unlink()
-        record.symlink_to(victim)
+        # The link goes in place in one step. A shared beat writes the record
+        # again in full, by design, so a record removed from under a live holder
+        # comes back whole; an unlink followed by symlink_to left a window in
+        # which a beat recreated the record and the symlink step found a file
+        # where it expected none (#154). rename(2) over the record cannot find
+        # the path taken.
+        planted = record.with_name(record.name + ".planted")
+        planted.symlink_to(victim)
+        os.replace(planted, record)
+        assert record.is_symlink()
         before = _sha256(victim)
 
         deadline = time.monotonic() + 5
