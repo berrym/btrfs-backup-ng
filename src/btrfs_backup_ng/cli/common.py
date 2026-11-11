@@ -224,6 +224,17 @@ def report_optional_target_skipped(
     log.warning("%sSkipping optional target %s: %s", indent, target_path, exc)
 
 
+def report_no_transfers_ran(
+    log: logging.Logger, skipped: int, indent: str = ""
+) -> None:
+    """Say that a run reached no target because every one was declared
+    optional and every one was away: a success that moved nothing, told apart
+    from a run whose targets were all up to date."""
+    log.warning(
+        "%sNo transfers ran: all %d target(s) were skipped as optional", indent, skipped
+    )
+
+
 def report_prepare_failure(
     log: logging.Logger, target_path: str, exc: BaseException, indent: str = ""
 ) -> None:

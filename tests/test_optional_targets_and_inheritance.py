@@ -179,6 +179,102 @@ class TestOptionalTargets:
         ok, stats, errors = run_cli._backup_volume(config.volumes[0], config, 1)
         assert stats["failed"] == 0, f"an optional target was counted: {stats}"
         assert not errors, errors
+        # Asserted since #153: this test let `ok` and `pruned` go unread, and
+        # the volume was in fact failed by the "no destination endpoints" check
+        # after the loop, with retention never asked.
+        assert ok is True, "an all-optional-away volume is a success"
+        assert pruned == [True], "source retention proceeds, nothing is owed"
+
+    def test_an_all_optional_away_volume_says_no_transfers_ran(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        import logging
+
+        from btrfs_backup_ng.cli import run as run_cli
+
+        src = tmp_path / "src"
+        (src / ".snapshots").mkdir(parents=True)
+        config = _load(
+            tmp_path,
+            f'[[volumes]]\npath = "{src}"\nsnapshot_prefix = "home-"\n\n'
+            f'[[volumes.targets]]\npath = "{tmp_path}/absent"\n'
+            f"require_mount = true\noptional = true\n\n"
+            f'[[volumes.targets]]\npath = "{tmp_path}/absent-too"\n'
+            f"require_mount = true\noptional = true\n",
+        )
+        monkeypatch.setattr(run_cli, "_prune_after_transfer", lambda *a, **kw: True)
+
+        class _Src:
+            def snapshot(self, **_kw):
+                return object()
+
+            def prepare(self):
+                return None
+
+            def __getattr__(self, _n):
+                return lambda *a, **k: None
+
+        monkeypatch.setattr(
+            run_cli.endpoint, "choose_endpoint", lambda *a, **kw: _Src()
+        )
+        with caplog.at_level(logging.WARNING, logger="btrfs_backup_ng.cli.run"):
+            ok, stats, errors = run_cli._backup_volume(config.volumes[0], config, 1)
+        assert ok is True and not errors
+        assert stats["failed"] == 0 and stats["completed"] == 0
+        messages = [r.message for r in caplog.records]
+        assert "No transfers ran: all 2 target(s) were skipped as optional" in messages
+        assert not any("No destination endpoints" in m for m in messages)
+
+    def test_an_optional_away_target_beside_a_failed_one_is_still_a_failure(
+        self, tmp_path, monkeypatch
+    ):
+        """Mutation guard for the distinction: nothing prepared AND a failure
+        counted is the failure it always was, with its reason recorded."""
+        from btrfs_backup_ng import __util__
+        from btrfs_backup_ng.cli import run as run_cli
+
+        src = tmp_path / "src"
+        (src / ".snapshots").mkdir(parents=True)
+        config = _load(
+            tmp_path,
+            f'[[volumes]]\npath = "{src}"\nsnapshot_prefix = "home-"\n\n'
+            f'[[volumes.targets]]\npath = "{tmp_path}/absent"\n'
+            f"require_mount = true\noptional = true\n\n"
+            f'[[volumes.targets]]\npath = "{tmp_path}/broken"\n',
+        )
+        pruned = []
+        monkeypatch.setattr(
+            run_cli,
+            "_prune_after_transfer",
+            lambda *a, **kw: pruned.append(kw.get("prune_source")) or True,
+        )
+
+        class _Src:
+            def snapshot(self, **_kw):
+                return object()
+
+            def prepare(self):
+                return None
+
+            def __getattr__(self, _n):
+                return lambda *a, **k: None
+
+        class _Broken(_Src):
+            def prepare(self):
+                raise __util__.AbortError("Destination does not exist")
+
+        monkeypatch.setattr(
+            run_cli.endpoint,
+            "choose_endpoint",
+            lambda path, *a, **kw: _Broken() if path.endswith("/broken") else _Src(),
+        )
+        ok, stats, errors = run_cli._backup_volume(config.volumes[0], config, 1)
+        assert ok is False
+        assert stats["failed"] == 1
+        assert errors == [
+            f"Destination endpoint {tmp_path}/broken: Destination does not exist"
+        ]
+        assert pruned == [], "nothing is pruned when nothing could be prepared"
 
     def test_a_required_absent_target_still_fails_the_run(self, tmp_path, monkeypatch):
         """Mutation guard: treating every target as optional would pass the test
