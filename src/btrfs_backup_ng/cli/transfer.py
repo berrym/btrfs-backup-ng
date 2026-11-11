@@ -10,6 +10,9 @@ from ..__logger__ import add_file_handler, create_logger
 from ..config import ConfigError, find_config_file, load_config
 from ..core.operations import sync_snapshots
 from .common import (
+    report_optional_target_skipped,
+    report_transfer_failure,
+    report_transfer_outcome,
     apply_config_verbosity,
     btrfs_debug_enabled,
     resolve_snapshot_dir,
@@ -218,19 +221,20 @@ def execute_transfer(args: argparse.Namespace) -> int:
                     )
                     success_count += 1
                     moved_count += result.transferred_count
-                    if result.transferred_count == 0:
-                        logger.info("  %s is already up to date", target.path)
+                    report_transfer_outcome(
+                        logger, target.path, result.transferred_count, indent="  "
+                    )
 
                 except Exception as e:
                     if getattr(target, "optional", False):
                         # Declared as allowed to be absent, so its unavailability
                         # is not a transfer failure. Reported either way.
-                        logger.warning(
-                            "  Skipping optional target %s: %s", target.path, e
+                        report_optional_target_skipped(
+                            logger, target.path, e, indent="  "
                         )
                         skipped_count += 1
                         continue
-                    logger.error("  Transfer to %s failed: %s", target.path, e)
+                    report_transfer_failure(logger, target.path, e, indent="  ")
                     fail_count += 1
 
         except Exception as e:

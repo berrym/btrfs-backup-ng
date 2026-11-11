@@ -39,6 +39,10 @@ from ..transaction import set_transaction_log
 from .common import (
     apply_config_verbosity,
     assert_target_mounted,
+    report_optional_target_skipped,
+    report_prepare_failure,
+    report_transfer_failure,
+    report_transfer_outcome,
     get_log_level,
     get_timestamp_format,
     should_show_progress,
@@ -630,9 +634,9 @@ def _backup_volume(
                 # not fail the run and does not hold back source retention, which
                 # is the whole point of marking a monthly drive optional rather
                 # than choosing between a permanently red run and an unguarded one.
-                logger.warning("Skipping optional target %s: %s", target.path, e)
+                report_optional_target_skipped(logger, target.path, e)
                 continue
-            logger.error("Failed to prepare destination %s: %s", target.path, e)
+            report_prepare_failure(logger, target.path, e)
             errors.append(f"Destination endpoint {target.path}: {e}")
             # Count it. This block used to log, record the error, and stop --
             # `all_success` was declared BELOW the loop and never saw it, and
@@ -698,7 +702,7 @@ def _backup_volume(
                         stats["failed"] += 1
                         all_success = False
                 except Exception as e:
-                    logger.error("Transfer to %s failed: %s", dest, e)
+                    report_transfer_failure(logger, target_cfg.path, e)
                     stats["failed"] += 1
                     errors.append(f"Transfer to {target_cfg.path}: {e}")
                     all_success = False
@@ -728,7 +732,7 @@ def _backup_volume(
                     stats["failed"] += 1
                     all_success = False
             except Exception as e:
-                logger.error("Transfer to %s failed: %s", dest_endpoint, e)
+                report_transfer_failure(logger, target_config.path, e)
                 stats["failed"] += 1
                 errors.append(f"Transfer to {target_config.path}: {e}")
                 all_success = False
@@ -928,13 +932,24 @@ def _backup_snapper_volume(
         return True, stats, errors
 
     all_success = True
+    skipped = 0
     succeeded_targets: list[tuple[Any, dict[str, Any]]] = []
     for target in volume.targets:
         if lifecycle.stopped_before(f"the transfer to {target.path}"):
-            errors.append(f"Target {target.path}: {lifecycle.NOT_STARTED}")
+            errors.append(
+                f"Destination endpoint {target.path}: {lifecycle.NOT_STARTED}"
+            )
             all_success = False
             stats["failed"] += 1
             continue
+        # Preparation, apart from the transfer, as the native path has it: a
+        # target declared optional that cannot be prepared -- its drive away,
+        # its host down -- is reported and skipped, counted by neither counter,
+        # and does not fail the run. One try around both steps made every
+        # absence a failure, so a snapper volume with a monthly drive marked
+        # optional was a red run whenever the drive was not there, which is
+        # the outcome the option exists to prevent. A transfer that fails
+        # after preparation is a failure on both paths, optional or not.
         try:
             # Same shared check as above. This copy also carried a shorter
             # message that omitted how to turn the check off.
@@ -980,7 +995,24 @@ def _backup_snapper_volume(
             endpoint.assert_compression_applied(
                 snapper_endpoint_config["compress"], destination_endpoint
             )
+            # Prepared here, as the native path, `transfer` and `prune` prepare
+            # a destination: a configured path that is not there is refused
+            # (never created), and an ssh host opens its connection. Both are
+            # met at preparation, where an optional target may be skipped,
+            # rather than inside the transfer, where they were failures.
+            destination_endpoint.prepare()
+        except Exception as e:
+            if getattr(target, "optional", False):
+                report_optional_target_skipped(logger, target.path, e)
+                skipped += 1
+                continue
+            report_prepare_failure(logger, target.path, e)
+            errors.append(f"Destination endpoint {target.path}: {e}")
+            all_success = False
+            stats["failed"] += 1
+            continue
 
+        try:
             # Sync snapper snapshots to this target
             logger.info("Syncing snapper config '%s' to %s", config_name, target.path)
             transferred_count = sync_snapper_snapshots(
@@ -1004,23 +1036,24 @@ def _backup_snapper_volume(
             # summary's snapshot count at zero.
             stats["completed"] += 1
             stats["snapshots_transferred"] += transferred_count
-            logger.info(
-                "Transferred %d snapshot(s) to %s", transferred_count, target.path
-            )
+            report_transfer_outcome(logger, target.path, transferred_count)
             # Only a target whose transfer SUCCEEDED is eligible for retention,
             # matching the native pipeline's fate-sharing rule.
             succeeded_targets.append((target, snapper_endpoint_config))
 
-        except __util__.AbortError as e:
-            logger.error("Backup to %s aborted: %s", target.path, e)
-            errors.append(f"Target {target.path}: {e}")
-            all_success = False
-            stats["failed"] += 1
         except Exception as e:
-            logger.error("Backup to %s failed: %s", target.path, e)
-            errors.append(f"Target {target.path}: {e}")
+            report_transfer_failure(logger, target.path, e)
+            errors.append(f"Transfer to {target.path}: {e}")
             all_success = False
             stats["failed"] += 1
+
+    if skipped and skipped == len(volume.targets):
+        # Every target was declared optional and every one was away. Said so,
+        # as `transfer` says it, rather than "completed successfully" for a run
+        # that reached nothing at all.
+        logger.warning(
+            "No transfers ran: all %d target(s) were skipped as optional", skipped
+        )
 
     prune_ok = _prune_snapper_after_transfer(volume, config, succeeded_targets, errors)
     return (all_success and prune_ok), stats, errors
@@ -1367,32 +1400,19 @@ def _transfer_to_target(
             # What the target's own prune would keep (see _catch_up_selector).
             select=None if newest_only else select,
         )
-    except __util__.AbortError as e:
+    except Exception as e:
         # sync_snapshots attaches the outcome to the exception precisely so a
         # partial run can be reported as one (operations._raise_transfer_failures).
-        # Nothing read it, so "3 of 5 delivered, 2 failed" and "nothing moved at
-        # all" were the same line in the log.
-        partial = getattr(e, "result", None)
-        if partial is not None and partial.transferred:
-            logger.error(
-                "Transfer to %s aborted after %d of %d snapshot(s): %s",
-                destination_endpoint,
-                partial.transferred_count,
-                partial.attempted,
-                e,
-            )
-        else:
-            logger.error("Transfer to %s aborted: %s", destination_endpoint, e)
-        return None
-    except Exception as e:
-        logger.error("Transfer to %s failed: %s", destination_endpoint, e)
+        # Nothing read it once, so "3 of 5 delivered, 2 failed" and "nothing
+        # moved at all" were the same line in the log. The reporter reads it,
+        # for this path and the snapper path alike.
+        report_transfer_failure(logger, target_config.path, e)
         return None
 
     # An empty plan means the destination already holds every source snapshot.
     # That is a legitimate no-op, and it is not a delivery: saying so is the
     # whole point of returning the result instead of True.
-    if result.transferred_count == 0:
-        logger.info("%s is already up to date", destination_endpoint)
+    report_transfer_outcome(logger, target_config.path, result.transferred_count)
     return result
 
 
