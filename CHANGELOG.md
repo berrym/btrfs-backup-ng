@@ -5,6 +5,111 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.10.1] - 2026-11-11
+
+A follow-up to 0.10.0 about what a run says and what a lock does under
+contention. A snapper volume's run summary and completion notification
+counted the wrong things; an optional target that was away failed a snapper
+run, and failed a native run whose other targets were all optional too; the
+lock a run takes on its target could, in two separate ways, end a round of
+contention with no holder at all; and a pin on a snapshot could be refused on
+a loaded machine. Nothing here changes what is backed up or what is kept.
+There are no configuration keys added or removed, and no change to the lock
+store's on-disk shape: a 0.10.1 client and a 0.10.0 client can contend for
+one lock, and the heartbeat file every lock already carried now also says
+who owns the directory.
+
+Changes an upgrade can notice:
+
+- **A snapper target that was already up to date counts as a completed
+  transfer**, as a native one always has, so a run whose only snapper volume
+  had one up-to-date target and one failed target is reported "partial"
+  rather than "failure".
+- **A volume whose every target is optional and away succeeds** and says
+  "No transfers ran: all N target(s) were skipped as optional", and its
+  source retention runs. Before, the native path failed such a volume with
+  "No destination endpoints could be prepared" and kept every snapshot for
+  as long as the drive was away; the snapper path failed it outright.
+- **A target's outcome is said in one voice** by `run`, `transfer` and
+  `prune`: "is already up to date", "Transferred N snapshot(s) to <target>",
+  "aborted after N of M snapshot(s)", with the target named as configured.
+  `transfer` says "aborted", with how far it got, where it said "failed".
+
+### Fixed
+
+- **A snapper volume's run summary no longer says "0 snapshot(s)
+  transferred" under a line that says otherwise**, and its completion
+  notification no longer counts snapshots as transfers. The snapper path
+  added the snapshot count to the target count and never filled the snapshot
+  count, since snapper support arrived in 0.8.2 and the summary switched to
+  that counter in 0.9.7. It now scores a target as the native path does.
+  (#149)
+- **An optional snapper target that is away no longer fails the run.** The
+  snapper path met a drive that was not connected or a host that did not
+  answer inside the transfer, where every exception was a failure, so a
+  monthly drive marked optional made a red run on every timer firing while it
+  was away. The snapper loop now prepares a target apart from transferring to
+  it, as the native path does, and skips an optional one that cannot be
+  prepared with a warning. A transfer that fails after preparation is a
+  failure on both paths, whatever the target was declared. (#151, #152)
+- **A native volume whose every target is optional and away no longer
+  fails, and prunes its source.** The check after the destination loop,
+  written for targets whose preparation failed, took "nothing prepared" for
+  a failure when every target had been skipped as optional, returned exit 1
+  with no error recorded, and returned before retention. It now tells the two
+  apart. (#153)
+- **Breaking a dead lock has one breaker.** A break removes the record that
+  identifies the dead instance and then its heartbeat; a contender listing in
+  between found a directory holding only a heartbeat, aged it by the
+  heartbeat's old mtime and broke the same dead lock a second time. Two
+  breakers meant two `rmdir`s, and the second could remove a claimant's
+  fresh, still-empty directory, so a round of twelve contenders could end
+  with one holder and a second contender told "File exists ... not another
+  process holding it", or with no holder at all. A directory holding only a
+  heartbeat is now aged by the directory's mtime, which the removal that made
+  it has just refreshed. Two failures in 178 traced runs before; none in 600
+  on each of three Pythons after. (#158)
+- **Who owns a lock directory is decided by the exclusive create of its
+  heartbeat, not by `mkdir`'s exit status.** The uutils coreutils `mkdir`,
+  Ubuntu's default from 25.10 and the one on GitHub's Ubuntu runners, exits 0
+  when its own call has failed with "File exists" but a directory stands at
+  the path by then; GNU `mkdir` exits 1. Two contenders racing for the path a
+  break had just freed were both told they made it, both wrote a record, both
+  counted two, both withdrew, and the round had no holder, in one CI job in
+  five. The record count is what kept it from being two holders, and it
+  stays. A claimant now creates the heartbeat first, under the `set -C` the
+  lock script already runs with, an exclusive create done by the shell itself
+  that succeeds for exactly one claimant per directory; the one refused writes
+  nothing, removes nothing and is BUSY. A claimant that still finds another
+  record withdraws, taking its heartbeat with its record, and tries once more.
+  A target whose shell has that `mkdir` could before refuse one of two
+  contending runs for no reason; the next run took the lock, and no backup was
+  at risk. Found by tracing every contender's shell on the runners; the bare
+  `mkdir(2)` race never misfired there in 1.2 million rounds, the same race
+  through the exec'd binary misfired in more than half of 5,000. Reported
+  upstream as uutils/coreutils#16344. (#158)
+- **A shared pin's acquire retries the release race for ten seconds rather
+  than twenty attempts.** A contender descheduled for tens of milliseconds on
+  a loaded two-CPU machine lost the race as many times in a row as the machine
+  was slow, reached the count, and refused a restore or a transfer with "could
+  not record a shared lock" on a perfectly writable store. What the bound
+  protects against, a store that cannot be written, fails on the first attempt
+  and gains nothing from a count; it is now told apart from the race and
+  reported at once, so a restore from a read-only mirror learns so in one
+  attempt per pin. The back-off between attempts grows to a few tens of
+  milliseconds with jitter, and the message says how many attempts were made
+  over how long. (#160)
+
+### Changed
+
+- **The CI workflow names the runner's `mkdir`** so the next change of image
+  is read in the log rather than inferred from a flaky test.
+- **One test planted a symbolic link over a held record in two steps**, an
+  unlink and then a symlink, with the holder's heartbeat running every 0.05
+  seconds; a beat between the two recreated the record and the test failed
+  once in CI. The link is now created under a temporary name and renamed
+  onto the record in one step. The behaviour under test is unchanged. (#154)
+
 ## [0.10.0] - 2026-10-25
 
 This release is about the destination: what a run may delete there, what it
