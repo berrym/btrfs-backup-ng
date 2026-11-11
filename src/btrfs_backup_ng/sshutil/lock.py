@@ -644,9 +644,10 @@ class RemoteLockManager:
         instance of the lock -- the one a breaker must remove -- and ``AGE`` to
         the lock's age, or leaves ``AGE`` empty when it cannot be read. A
         directory holding only a ``heartbeat`` is aged by the directory, not
-        the file: no live holder leaves that shape, a breaker or a release
-        leaves it for an instant between two removals, and the removal that
-        made it refreshed the directory's mtime (``_acquire_script``).
+        the file: no live holder leaves that shape; a breaker or a release
+        leaves it for an instant between two removals, and a claimant for an
+        instant between its heartbeat and its record, and the step that made
+        it refreshed the directory's mtime (``_acquire_script``).
         ``bbng_show`` prints the holder's recorded details.
         """
         lock = shlex.quote(self._lock_dir(name))
@@ -672,9 +673,10 @@ class RemoteLockManager:
 
         The lock is a directory; ``mkdir`` decides who creates it. Inside it,
         the holder's record is a file named by the holder's own random token,
-        ``owner.<token>``, whose mtime the holder's heartbeat refreshes. (A
-        ``heartbeat`` file is refreshed beside it, for older versions that
-        judge a lock by that name.)
+        ``owner.<token>``, whose mtime the holder's heartbeat refreshes. A
+        ``heartbeat`` file beside it is created first and exclusively, which
+        decides who owns the directory (below), and is refreshed beside the
+        record for older versions that judge a lock by that name.
 
         Breaking a stale lock is where two winners used to come from. The old
         break renamed the lock directory away, but the directory it renamed
@@ -712,32 +714,43 @@ class RemoteLockManager:
         told the lock could not be created, or none when both saw two
         records (#158).
 
-        A new holder then checks that its owner file is the only one in the
-        directory before it reports the lock as taken. The one interleaving
-        the removal cannot exclude -- an empty directory, judged dead, removed
-        by a slow contender just after another had created a new one and
-        before it wrote its record -- ends with the second record written into
-        a directory someone else created, or not written at all; either way
-        the check sees it, and the later claimant withdraws. Two holders
-        would each have to see only their own file, and whichever wrote
-        second cannot.
-
-        A claimant that withdraws tries once more, from the first ``mkdir``,
-        and reports BUSY only if that try withdraws too. With a ``mkdir``
-        that tells the truth the second try never runs: a withdrawal needs
-        two records in one directory, which needs the crash above. One
-        ``mkdir`` does not tell the truth. The uutils coreutils ``mkdir``,
+        Who owns the directory ``mkdir`` reported made is decided inside it,
+        not by ``mkdir``'s answer. The claimant creates the ``heartbeat``
+        first, under ``set -C``: an exclusive create done by the shell
+        itself, which succeeds for exactly one caller per directory
+        instance. A claimant refused there was told it made a directory it
+        did not, writes nothing, removes nothing, and says BUSY. The answer
+        of ``mkdir`` is not to be trusted: the uutils coreutils ``mkdir``,
         Ubuntu's default from 25.10, exits 0 when a directory stands at the
         path by the time its own call has failed with "File exists", so two
         contenders racing for the path a break has just freed are both told
-        they made it; both write a record, both count two, both withdraw,
-        and the round had no winner at all -- never two -- in one job in
-        five on the GitHub runners (#158). On the second try the path is
-        free and the first ``mkdir`` takes it, or another claimant holds it
-        and the try says BUSY with that claimant's record. The two can race
-        again and be lied to again, so a round can still end with no
-        winner; the retry makes that rare rather than certain. A breaker
-        that withdraws and wins on its second try still reports the lock as
+        they made it. Decided by their records alone, both wrote one, both
+        counted two, both withdrew, and the round had no winner at all --
+        never two -- in one job in five on the GitHub runners (#158).
+        Decided by the heartbeat, one of them holds it and the other is
+        BUSY. The same step closes most of what the crash below leaves: a
+        directory holding a heartbeat is not empty, so a late ``rmdir``
+        cannot remove it; only the one builtin step between ``mkdir`` and
+        the create is still open.
+
+        The owner then writes its record and checks that it is the only one
+        in the directory before it reports the lock as taken. The one
+        interleaving the removal cannot exclude -- an empty directory, judged
+        dead, removed by a slow contender in that step, just after another
+        had created a new one -- ends with a record written into a directory
+        someone else created, or not written at all; either way the check
+        sees it, and the later claimant withdraws, taking its heartbeat with
+        its record so nothing of its stays. Two holders would each have to
+        see only their own file, and whichever wrote second cannot. A
+        claimant that withdraws tries once more, from the first ``mkdir``,
+        and reports BUSY only if that try withdraws too. Among clients that
+        decide ownership by the heartbeat, only the one that created it
+        writes a record, so two records in one directory, and the second
+        try, need a 0.10.0 client in the round, which writes its record
+        without the heartbeat first; a claimant whose empty directory was
+        removed in that open step and not re-made is refused at the create
+        and loses the round while no one holds the lock. A breaker that
+        withdraws and wins on its second try still reports the lock as
         broken: the break happened on the first.
 
         What remains is the lease assumption every such lock rests on: a
@@ -772,11 +785,22 @@ class RemoteLockManager:
             f"if printf '%s' {body} 2>/dev/null > {owner}; then "
             "bbng_c=0; "
             f'for bbng_f in {lock}/{OWNER_PREFIX}*; do [ -f "$bbng_f" ] && bbng_c=$((bbng_c + 1)); done; '
-            f'if [ "$bbng_c" -eq 1 ]; then touch {hb} 2>/dev/null; echo "$1"; return 0; fi; '
+            # Ownership of this directory instance is decided here, by the
+            # shell's own exclusive create of the heartbeat under set -C, not
+            # by mkdir's exit status (see the docstring): one claimant per
+            # instance. The one refused was told it made a directory it did
+            # not; it writes nothing, removes nothing, and is BUSY, showing
+            # the holder. A FIFO or a device planted at the name would block
+            # the shell's open, so anything but a regular file is refused
+            # first (noclobber refuses only regular files by failing).
+            f"bbng_safe_leaf {hb}; "
+            f"if ( : > {hb} ) 2>/dev/null; then :; else echo BUSY; bbng_show; return 0; fi; "
+            f'if [ "$bbng_c" -eq 1 ]; then echo "$1"; return 0; fi; '
             # Withdrawn: no verdict yet. The caller tries once more (see the
-            # docstring) and says BUSY only if that try withdraws too.
-            f"rm -f {owner} 2>/dev/null; rmdir {lock} 2>/dev/null; return 3; "
-            "fi; echo BUSY; return 0; }; "
+            # docstring) and says BUSY only if that try withdraws too. The
+            # heartbeat goes with the record: nothing of this claimant's stays.
+            f"rm -f {owner} {hb} 2>/dev/null; rmdir {lock} 2>/dev/null; return 3; "
+            f"fi; rm -f {hb} 2>/dev/null; rmdir {lock} 2>/dev/null; echo BUSY; return 0; }}; "
             "bbng_acquire() { "
             # A lock directory that cannot be created is NOT contention. Reported
             # as BUSY -- which is what a bare mkdir failure looks like -- it sends
@@ -2246,9 +2270,10 @@ class LocalLockManager(RemoteLockManager):
         payload: str,
         verdict: str,
     ) -> list[str]:
-        """``bbng_take``: write this holder's record into the directory it
-        has just made, and report the lock taken only if that record is the
-        only one there."""
+        """``bbng_take``: create the heartbeat exclusively, which decides who
+        owns the directory ``mkdir`` reported made, write this holder's record
+        into it, and report the lock taken only if that record is the only
+        one there."""
         from .. import __util__
 
         try:
@@ -2277,15 +2302,12 @@ class LocalLockManager(RemoteLockManager):
                 if n.startswith(OWNER_PREFIX) and self._is_regular(lock_fd, n)
             ]
             if len(records) == 1:
-                with suppress(OSError):
-                    hb = __util__.open_regular_nofollow(HEARTBEAT_NAME, dir_fd=lock_fd)
-                    try:
-                        os.utime(hb)
-                    finally:
-                        os.close(hb)
                 return [verdict]
-            with suppress(OSError):
-                os.unlink(owner, dir_fd=lock_fd)
+            # Withdrawn: the heartbeat goes with the record, so nothing of
+            # this claimant's stays.
+            for mine in (owner, HEARTBEAT_NAME):
+                with suppress(OSError):
+                    os.unlink(mine, dir_fd=lock_fd)
         with suppress(OSError):
             os.rmdir(lock_name, dir_fd=root_fd)
         return [_WITHDREW]
@@ -2303,12 +2325,30 @@ class LocalLockManager(RemoteLockManager):
 
     def _check_owner_here(self, name: str, token: str) -> str:
         """``_owner_script`` against descriptors: the record opened by name
+            # Ownership of this directory instance is decided here, by the
+            # exclusive create of the heartbeat, not by mkdir's answer (see
+            # ``_acquire_script``): one claimant per instance. The one refused
+            # was told it made a directory it did not; it writes nothing,
+            # removes nothing, and is BUSY.
+            try:
+                hb = __util__.open_regular_nofollow(
+                    HEARTBEAT_NAME, dir_fd=lock_fd, exclusive=True
+                )
+            except OSError as e:
+                if e.errno == errno.ELOOP:
+                    raise _unsafe("SYMLINK", f"{lock_path}/{HEARTBEAT_NAME}") from None
+                return ["BUSY", *self._show(lock_fd)]
+            os.close(hb)
         below the lock directory, never through a link."""
         from .. import __util__
 
         fd = self._open_store(create=False)
         fd = self._open_below(
             fd, f"{encode_name(name)}.lock", self._lock_dir(name), create=False
+                with suppress(OSError):
+                    os.unlink(HEARTBEAT_NAME, dir_fd=lock_fd)
+                with suppress(OSError):
+                    os.rmdir(lock_name, dir_fd=root_fd)
         )
         with _closing(fd) as lock_fd:
             if not self._is_regular(lock_fd, f"{OWNER_PREFIX}{token}"):
