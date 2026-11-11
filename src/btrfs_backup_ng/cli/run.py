@@ -39,6 +39,7 @@ from ..transaction import set_transaction_log
 from .common import (
     apply_config_verbosity,
     assert_target_mounted,
+    report_no_transfers_ran,
     report_optional_target_skipped,
     report_prepare_failure,
     report_transfer_failure,
@@ -585,6 +586,7 @@ def _backup_volume(
 
     destination_endpoints = []
     prepare_failures = 0
+    skipped = 0
     for index, target in enumerate(volume.targets):
         # Preparing a target is new work: an ssh master, remote diagnostics
         # with a write test, perhaps a password prompt. None of it begins after
@@ -635,6 +637,7 @@ def _backup_volume(
                 # is the whole point of marking a monthly drive optional rather
                 # than choosing between a permanently red run and an unguarded one.
                 report_optional_target_skipped(logger, target.path, e)
+                skipped += 1
                 continue
             report_prepare_failure(logger, target.path, e)
             errors.append(f"Destination endpoint {target.path}: {e}")
@@ -656,6 +659,20 @@ def _backup_volume(
             stats["failed"] += 1
 
     if not destination_endpoints:
+        if skipped and not prepare_failures:
+            # Every target was declared optional and every one was away. The
+            # option says the run does not wait for such a target, so this is
+            # a success that moved nothing, said so, and source retention
+            # proceeds as it would have: nothing is owed to a target the
+            # operator declared may be absent. This check returned False for
+            # the case, with nothing counted and no error recorded, so a volume
+            # with one optional drive was red for as long as the drive was
+            # away, and its source kept every snapshot meanwhile.
+            report_no_transfers_ran(logger, skipped)
+            prune_ok = _prune_after_transfer(
+                volume, config, source_endpoint, [], errors, prune_source=True
+            )
+            return prune_ok, stats, errors
         logger.error("No destination endpoints could be prepared")
         return False, stats, errors
 
@@ -745,7 +762,8 @@ def _backup_volume(
     # (non-zero exit) rather than being silently skipped.
     #
     # Fate-sharing, both ways: only targets whose transfer SUCCEEDED are pruned,
-    # and the source is pruned only if EVERY target succeeded. The lock reconcile
+    # and the source is pruned only if every REQUIRED target succeeded; a target
+    # declared optional and skipped is owed nothing. The lock reconcile
     # protects a snapshot whose transfer failed part-way, but a target that never
     # got as far as a transfer -- refused by require_mount, or failing to prepare
     # for any other reason -- takes no lock at all, so the snapshots it still owes
@@ -1048,12 +1066,7 @@ def _backup_snapper_volume(
             stats["failed"] += 1
 
     if skipped and skipped == len(volume.targets):
-        # Every target was declared optional and every one was away. Said so,
-        # as `transfer` says it, rather than "completed successfully" for a run
-        # that reached nothing at all.
-        logger.warning(
-            "No transfers ran: all %d target(s) were skipped as optional", skipped
-        )
+        report_no_transfers_ran(logger, skipped)
 
     prune_ok = _prune_snapper_after_transfer(volume, config, succeeded_targets, errors)
     return (all_success and prune_ok), stats, errors

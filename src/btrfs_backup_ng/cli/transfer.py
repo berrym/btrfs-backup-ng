@@ -10,6 +10,7 @@ from ..__logger__ import add_file_handler, create_logger
 from ..config import ConfigError, find_config_file, load_config
 from ..core.operations import sync_snapshots
 from .common import (
+    report_no_transfers_ran,
     report_optional_target_skipped,
     report_transfer_failure,
     report_transfer_outcome,
@@ -253,10 +254,7 @@ def execute_transfer(args: argparse.Namespace) -> int:
         # `continue` for an optional target bypasses both counters, so this used
         # to print "All transfers completed successfully" and exit 0 for a run
         # that reached nothing at all.
-        logger.warning(
-            "No transfers ran: all %d target(s) were skipped as optional",
-            skipped_count,
-        )
+        report_no_transfers_ran(logger, skipped_count)
         return 0
     # The snapshot count, not the target count. "All transfers completed
     # successfully" was printed for a run that moved nothing, because the

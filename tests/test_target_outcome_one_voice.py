@@ -156,6 +156,7 @@ class TestThereIsOnePlaceThatSaysIt:
         "Transfer to %s failed",
         "Skipping optional target %s",
         "Failed to prepare destination %s",
+        "No transfers ran: all %d target",
         r"Transferred %d snapshot\(s\)",
     )
 
