@@ -642,7 +642,11 @@ class RemoteLockManager:
 
         ``bbng_judge`` sets ``bbng_key`` to the entry that identifies THIS
         instance of the lock -- the one a breaker must remove -- and ``AGE`` to
-        the lock's age, or leaves ``AGE`` empty when it cannot be read.
+        the lock's age, or leaves ``AGE`` empty when it cannot be read. A
+        directory holding only a ``heartbeat`` is aged by the directory, not
+        the file: no live holder leaves that shape, a breaker or a release
+        leaves it for an instant between two removals, and the removal that
+        made it refreshed the directory's mtime (``_acquire_script``).
         ``bbng_show`` prints the holder's recorded details.
         """
         lock = shlex.quote(self._lock_dir(name))
@@ -653,7 +657,7 @@ class RemoteLockManager:
             f'for bbng_f in {lock}/{OWNER_PREFIX}*; do [ -f "$bbng_f" ] && bbng_key=$bbng_f; done; '
             'if [ -n "$bbng_key" ]; then AGE=$(bbng_age "$bbng_key"); '
             f"elif [ -f {info} ]; then bbng_key={info}; AGE=$(bbng_age {hb} {lock}); "
-            f"elif [ -f {hb} ]; then bbng_key={hb}; AGE=$(bbng_age {hb}); "
+            f"elif [ -f {hb} ]; then bbng_key={hb}; AGE=$(bbng_age {lock}); "
             f"else AGE=$(bbng_age {lock}); fi; return 0; }}; "
             f"bbng_show() {{ for bbng_f in {lock}/{OWNER_PREFIX}*; do "
             '[ ! -L "$bbng_f" ] && [ -f "$bbng_f" ] && cat "$bbng_f" 2>/dev/null && echo; done; '
@@ -687,9 +691,26 @@ class RemoteLockManager:
 
         Locks without an owner file are judged by what they hold: an older
         version's lock by its ``info.json`` (removed the same way; this
-        version never writes one), a directory left mid-release by its
-        ``heartbeat``, an empty directory by its own mtime and ``rmdir``,
-        which succeeds only while it is empty.
+        version never writes one), an empty directory by its own mtime and
+        ``rmdir``, which succeeds only while it is empty, and a directory
+        holding only a ``heartbeat`` by the DIRECTORY's mtime, through the
+        heartbeat.
+
+        That last shape is the one the break itself makes: the winner removes
+        the record first and the heartbeat after, and a contender listing in
+        between finds the heartbeat alone. Its directory was touched by the
+        record's unlink an instant ago, so aged by the directory it is fresh
+        and the contender says BUSY; one breaker per instance. A release that
+        died between its two removals leaves the same shape with a directory
+        mtime as old as the death, and that one is still broken once it is
+        past the threshold. Aged by the heartbeat's own mtime, as before, the
+        shape in the breaker's gap was a dead lock a second time: the
+        contender removed the heartbeat, its ``rmdir`` could remove a
+        claimant's fresh, still-empty directory, a later claimant made the
+        path again, the first wrote its record into the second's directory,
+        and the check below decided the round -- one winner and a contender
+        told the lock could not be created, or none when both saw two
+        records (#158).
 
         A new holder then checks that its owner file is the only one in the
         directory before it reports the lock as taken. The one interleaving
@@ -2138,7 +2159,9 @@ class LocalLockManager(RemoteLockManager):
             age = age_of(HEARTBEAT_NAME)
             return LEGACY_INFO_NAME, age if age is not None else age_of(".")
         if self._is_regular(lock_fd, HEARTBEAT_NAME):
-            return HEARTBEAT_NAME, age_of(HEARTBEAT_NAME)
+            # The shape a breaker or a release leaves between its two removals:
+            # aged by the directory the removal just refreshed (bbng_judge).
+            return HEARTBEAT_NAME, age_of(".")
         return None, age_of(".")
 
     def _show(self, lock_fd: int) -> list[str]:

@@ -757,6 +757,10 @@ class TestBreakingADeadLockHasOneWinner:
                 (shape, "rm", "*owner.*|*info.json|*heartbeat")
                 for shape in ("current", "older-version")
             ],
+            # between the key's removal and the heartbeat's: the faster
+            # contender finds a directory holding only a heartbeat and must
+            # age it by the directory, not break it a second time (#158)
+            *[(shape, "rm", "-f*heartbeat*") for shape in ("current", "older-version")],
             # after the removal, before the rmdir
             *[(shape, "rmdir", "*") for shape in ("current", "older-version", "empty")],
         ],
