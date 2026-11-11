@@ -74,7 +74,9 @@ winner.
     target.lock/                  EXCLUSIVE: a whole-target lock
         owner.<token>             holder: operation, hostname, pid, token;
                                   its mtime is the holder's heartbeat
-        heartbeat                 refreshed beside it, for older versions
+        heartbeat                 created first, exclusively: who made it
+                                  owns the directory; refreshed beside the
+                                  record for older versions
     snap-<name>.lock/             SHARED: a pin on one snapshot
         holders/
             restore_abc           one file per holder; its mtime is that
@@ -187,28 +189,41 @@ contenders in the same instant once it is past the threshold, with a
 claimant's `mkdir` landing between their two `rmdir`s. The record count below
 then gives one winner, or a round with none, never two.
 
-A new holder then checks that its record is the only one in the directory
-before it reports the lock as taken. The one interleaving the removal cannot
-exclude -- an empty dead directory removed by a slow contender just after
-another had re-created it and before it wrote its record -- ends with the
-second record written into a directory someone else created, or not written at
-all, and the later claimant withdraws.
+Who owns the directory `mkdir` reported made is decided inside it, not by
+`mkdir`'s answer. The claimant creates the `heartbeat` first, under `set -C`:
+an exclusive create done by the shell itself, which succeeds for exactly one
+caller per directory instance. A claimant refused there was told it made a
+directory it did not; it writes nothing, removes nothing, and says BUSY. The
+answer of `mkdir` is not to be trusted: the uutils coreutils `mkdir`, Ubuntu's
+default from 25.10, exits 0 when a directory stands at the path by the time its
+own call has failed with "File exists", so two contenders racing for the path a
+break has just freed are both told they made it. Decided by their records
+alone, both wrote one, both counted two, both withdrew, and the round had no
+winner at all, never two; twelve contenders at one dead lock did that in one
+job in five on the GitHub runners (#158). Decided by the heartbeat, one of them
+holds it and the other is BUSY. The same step closes most of what the crash
+above leaves: a directory holding a heartbeat is not empty, so a late `rmdir`
+cannot remove it; only the one builtin step between `mkdir` and the create is
+still open.
 
-A claimant that withdraws tries once more from the first `mkdir`, and reports
-BUSY only if that try withdraws too. With a `mkdir` that tells the truth the
-second try never runs: a withdrawal needs two records in one directory, which
-needs the crash above. One `mkdir` does not tell the truth. The uutils
-coreutils `mkdir`, Ubuntu's default from 25.10, exits 0 when a directory stands
-at the path by the time its own call has failed with "File exists", so two
-contenders racing for the path a break has just freed are both told they made
-it; both write a record, both count two, both withdraw, and the round had no
-winner at all, never two. Twelve contenders at one dead lock did that in one
-job in five on the GitHub runners (#158). On the second try the path is free and
-the first `mkdir` takes it, or another claimant holds it and the try says BUSY
-with that claimant's record. The two can race again and be lied to again, so a
-round can still end with no winner; the retry makes that rare rather than
-certain. A breaker that withdraws and wins on its second try still reports the
-lock as broken: the break happened on the first.
+The owner then writes its record and checks that it is the only one in the
+directory before it reports the lock as taken. The one interleaving the removal
+cannot exclude -- an empty directory, judged dead, removed by a slow contender
+in that step, just after another had re-created it -- ends with a record
+written into a directory someone else created, or not written at all, and the
+later claimant withdraws, taking its heartbeat with its record so nothing of
+its stays. A claimant that withdraws tries once more from the first `mkdir`,
+and reports BUSY only if that try withdraws too. Among clients that decide
+ownership by the heartbeat, only the one that created it writes a record, so
+two records in one directory, and the second try, need a 0.10.0 client in the
+round, which writes its record without the heartbeat first; a claimant whose
+empty directory was removed in that open step and not re-made is refused at the
+create and loses the round while no one holds the lock. A breaker that
+withdraws and wins on its second try still reports the lock as broken: the
+break happened on the first. In a round with a 0.10.0 client, a withdrawing
+claimant can take away the heartbeat that client then holds its lock without;
+clients since 0.9.11 judge a lock by its record and are unaffected, and the
+exposure of older ones is the one described below.
 
 What remains is the assumption every lease rests on: a holder that stops
 refreshing for longer than the threshold has lost its lock, even if it wakes
@@ -242,8 +257,9 @@ single write with no contention to resolve.
 
 ### One window that had to be closed
 
-Between the `mkdir` that wins an exclusive lock and the `touch` that writes its
-first heartbeat, the heartbeat does not exist. Ageing a missing file from epoch
+Through 0.10.0, between the `mkdir` that won an exclusive lock and the `touch`
+that wrote its first heartbeat, the heartbeat did not exist (it is now the first
+thing a claimant creates). Ageing a missing file from epoch
 zero makes that brand-new lock look infinitely old, so a contender arriving
 inside the window judged it dead, broke it, and took a lock somebody already
 held -- two winners. It surfaced as an intermittent failure of the one-winner

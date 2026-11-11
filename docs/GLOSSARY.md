@@ -484,7 +484,8 @@ On disk:
 <location>/.btrfs-backup-ng.locks/
     target-<hash>.lock/                 exclusive: the whole-target lock a prune holds
         owner.<token>                   the holder; its mtime is the heartbeat
-        heartbeat                       refreshed beside it, for older versions
+        heartbeat                       created first, exclusively: who made it owns the
+                                        directory; refreshed beside the record for older versions
     receiving-<dest>-<hash>.lock/       exclusive: the right to create one subvolume
         owner.<token>
     snap-<name>-<hash>.lock/            shared: a pin on one snapshot
