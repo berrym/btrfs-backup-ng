@@ -722,6 +722,24 @@ class RemoteLockManager:
         would each have to see only their own file, and whichever wrote
         second cannot.
 
+        A claimant that withdraws tries once more, from the first ``mkdir``,
+        and reports BUSY only if that try withdraws too. With a ``mkdir``
+        that tells the truth the second try never runs: a withdrawal needs
+        two records in one directory, which needs the crash above. One
+        ``mkdir`` does not tell the truth. The uutils coreutils ``mkdir``,
+        Ubuntu's default from 25.10, exits 0 when a directory stands at the
+        path by the time its own call has failed with "File exists", so two
+        contenders racing for the path a break has just freed are both told
+        they made it; both write a record, both count two, both withdraw,
+        and the round had no winner at all -- never two -- in one job in
+        five on the GitHub runners (#158). On the second try the path is
+        free and the first ``mkdir`` takes it, or another claimant holds it
+        and the try says BUSY with that claimant's record. The two can race
+        again and be lied to again, so a round can still end with no
+        winner; the retry makes that rare rather than certain. A breaker
+        that withdraws and wins on its second try still reports the lock as
+        broken: the break happened on the first.
+
         What remains is the lease assumption every such lock rests on: a
         holder that stops refreshing for longer than the stale threshold has
         lost the lock, even if it wakes later still believing it holds it.
@@ -755,8 +773,11 @@ class RemoteLockManager:
             "bbng_c=0; "
             f'for bbng_f in {lock}/{OWNER_PREFIX}*; do [ -f "$bbng_f" ] && bbng_c=$((bbng_c + 1)); done; '
             f'if [ "$bbng_c" -eq 1 ]; then touch {hb} 2>/dev/null; echo "$1"; return 0; fi; '
-            f"rm -f {owner} 2>/dev/null; rmdir {lock} 2>/dev/null; "
+            # Withdrawn: no verdict yet. The caller tries once more (see the
+            # docstring) and says BUSY only if that try withdraws too.
+            f"rm -f {owner} 2>/dev/null; rmdir {lock} 2>/dev/null; return 3; "
             "fi; echo BUSY; return 0; }; "
+            "bbng_acquire() { "
             # A lock directory that cannot be created is NOT contention. Reported
             # as BUSY -- which is what a bare mkdir failure looks like -- it sends
             # an operator hunting for a competing process that does not exist.
@@ -768,8 +789,8 @@ class RemoteLockManager:
             # The walk refuses the store before judging it writable: a store
             # that is unsafe must never be answered by elevating into it.
             f"if [ -d {target} ]; then bbng_tree {root}; fi; "
-            f"if [ ! -d {root} ] || [ ! -w {root} ]; then echo NOLOCKDIR; exit 0; fi; "
-            f"if mkdir {lock} 2>/dev/null; then bbng_take ACQUIRED; exit 0; fi; "
+            f"if [ ! -d {root} ] || [ ! -w {root} ]; then echo NOLOCKDIR; return 0; fi; "
+            f"if mkdir {lock} 2>/dev/null; then bbng_take $BBNG_MODE; return $?; fi; "
             # ``mkdir`` refused to create through a link at the lock path;
             # judging what it points at would read, and could break, some
             # other lock.
@@ -779,26 +800,32 @@ class RemoteLockManager:
             # (a full or read-only filesystem, a quota) -- which is not
             # contention and is reported with the reason.
             f"if [ ! -d {lock} ]; then "
-            f"  if bbng_e=$(mkdir {lock} 2>&1); then bbng_take ACQUIRED; exit 0; fi; "
-            f'  if [ ! -d {lock} ]; then printf "NOLOCK %s" "$bbng_e" | tr -d "\\n"; echo; exit 0; fi; '
+            f"  if bbng_e=$(mkdir {lock} 2>&1); then bbng_take $BBNG_MODE; return $?; fi; "
+            f'  if [ ! -d {lock} ]; then printf "NOLOCK %s" "$bbng_e" | tr -d "\\n"; echo; return 0; fi; '
             "fi; "
             f"BBNG_NOW=$(bbng_now {root}); bbng_judge; "
             # No readable age: a lock that cannot be judged is never broken.
             f'if [ -z "$AGE" ]; then '
-            f"  if [ -d {lock} ]; then echo BUSY; bbng_show; exit 0; fi; "
-            f"  if mkdir {lock} 2>/dev/null; then bbng_take ACQUIRED; exit 0; fi; "
-            "  echo BUSY; exit 0; "
+            f"  if [ -d {lock} ]; then echo BUSY; bbng_show; return 0; fi; "
+            f"  if mkdir {lock} 2>/dev/null; then bbng_take $BBNG_MODE; return $?; fi; "
+            "  echo BUSY; return 0; "
             "fi; "
-            f'if [ "$AGE" -le {self._stale_after} ]; then echo BUSY; bbng_show; exit 0; fi; '
+            f'if [ "$AGE" -le {self._stale_after} ]; then echo BUSY; bbng_show; return 0; fi; '
             # Stale. Remove the entry identifying the instance that was judged
             # (see the docstring); only one contender can.
             'if [ -n "$bbng_key" ]; then '
-            '  if rm "$bbng_key" </dev/null 2>/dev/null; then :; else echo BUSY; exit 0; fi; '
+            '  if rm "$bbng_key" </dev/null 2>/dev/null; then :; else echo BUSY; return 0; fi; '
             f"  rm -f {hb} {info} 2>/dev/null; "
             "fi; "
-            f"if rmdir {lock} 2>/dev/null; then :; else echo BUSY; exit 0; fi; "
-            f"if mkdir {lock} 2>/dev/null; then bbng_take ACQUIRED_STALE; exit 0; fi; "
-            "echo BUSY"
+            # The break is done: whichever try takes the lock now reports it
+            # as broken, so a breaker that withdraws and wins on its second
+            # try is still logged as having broken a dead lock.
+            f"if rmdir {lock} 2>/dev/null; then BBNG_MODE=ACQUIRED_STALE; else echo BUSY; return 0; fi; "
+            f"if mkdir {lock} 2>/dev/null; then bbng_take $BBNG_MODE; return $?; fi; "
+            "echo BUSY; return 0; }; "
+            # One more try after a withdrawal, then BUSY (see the docstring).
+            "BBNG_MODE=ACQUIRED; bbng_acquire; if [ $? -eq 3 ]; then bbng_acquire; "
+            "if [ $? -eq 3 ]; then echo BUSY; fi; fi"
         )
 
     # ------------------------------------------------------------------- API
@@ -1863,6 +1890,11 @@ def release_persisted_locks(
     manager.sweep_dead_holders()
 
 
+#: ``_take``'s answer when the claimant withdrew (``bbng_take`` returns 3):
+#: not a verdict, and never printed; ``_acquire_here`` tries once more.
+_WITHDREW = "WITHDREW"
+
+
 class _StoreVerdict(Exception):
     """A verdict line reached before the operation could finish: ``NOLOCKDIR``
     (with the errno that said so), or ``UNSAFE KIND PATH``."""
@@ -1986,72 +2018,92 @@ class LocalLockManager(RemoteLockManager):
         """``_acquire_script``, step for step, against descriptors. The lock
         directory is still taken by ``mkdir`` -- ``mkdirat`` here -- and the
         break still removes the one entry that identifies the instance judged
-        stale, so the one-winner argument in that docstring is unchanged."""
-        from .. import __util__
-
+        stale, so the one-winner argument in that docstring is unchanged. A
+        claimant that withdraws tries once more, as the script does."""
         lock_name = f"{encode_name(name)}.lock"
         lock_path = self._lock_dir(name)
         with _closing(self._open_store(create=True)) as root_fd:
             if not _writable(root_fd):
                 return ["NOLOCKDIR"]
+            # The mode outlives a withdrawal: a breaker that wins on its
+            # second try still reports the lock as broken.
+            mode = ["ACQUIRED"]
+            for _attempt in range(2):
+                out = self._acquire_attempt(
+                    root_fd, lock_name, lock_path, token, payload, mode
+                )
+                if out != [_WITHDREW]:
+                    return out
+            return ["BUSY"]
+
+    def _acquire_attempt(
+        self,
+        root_fd: int,
+        lock_name: str,
+        lock_path: str,
+        token: str,
+        payload: str,
+        mode: list[str],
+    ) -> list[str]:
+        """One pass of ``_acquire_here``: the verdict lines, or ``_WITHDREW``
+        when this claimant made the directory and found another record in it.
+        ``mode`` is the verdict a take reports, ``ACQUIRED_STALE`` once this
+        claimant has broken a dead lock."""
+        from .. import __util__
+
+        if self._mkdir(root_fd, lock_name, lock_path):
+            return self._take(root_fd, lock_name, lock_path, token, payload, mode[0])
+        try:
+            lock_fd = __util__.open_directory_nofollow(lock_name, dir_fd=root_fd)
+        except FileNotFoundError:
+            # The holder released between the mkdir and this: take it.
             if self._mkdir(root_fd, lock_name, lock_path):
                 return self._take(
-                    root_fd, lock_name, lock_path, token, payload, "ACQUIRED"
+                    root_fd, lock_name, lock_path, token, payload, mode[0]
                 )
             try:
                 lock_fd = __util__.open_directory_nofollow(lock_name, dir_fd=root_fd)
-            except FileNotFoundError:
-                # The holder released between the mkdir and this: take it.
-                if self._mkdir(root_fd, lock_name, lock_path):
-                    return self._take(
-                        root_fd, lock_name, lock_path, token, payload, "ACQUIRED"
-                    )
-                try:
-                    lock_fd = __util__.open_directory_nofollow(
-                        lock_name, dir_fd=root_fd
-                    )
-                except OSError as e:
-                    return [f"NOLOCK {lock_path}: {e.strerror}"]
             except OSError as e:
-                if e.errno == errno.ELOOP:
-                    # ``mkdir`` refused to create through a link at the lock
-                    # path; judging what it points at would read, and could
-                    # break, some other lock.
-                    raise _unsafe("SYMLINK", lock_path) from None
                 return [f"NOLOCK {lock_path}: {e.strerror}"]
-            with _closing(lock_fd):
-                key, age = self._judge(lock_fd, self._probe_now(root_fd))
-                if age is None:
-                    # No readable age: a lock that cannot be judged is never
-                    # broken, unless it is gone.
-                    if self._entry_exists(root_fd, lock_name):
-                        return ["BUSY", *self._show(lock_fd)]
-                    if self._mkdir(root_fd, lock_name, lock_path, busy_on_failure=True):
-                        return self._take(
-                            root_fd, lock_name, lock_path, token, payload, "ACQUIRED"
-                        )
-                    return ["BUSY"]
-                if age <= self._stale_after:
+        except OSError as e:
+            if e.errno == errno.ELOOP:
+                # ``mkdir`` refused to create through a link at the lock
+                # path; judging what it points at would read, and could
+                # break, some other lock.
+                raise _unsafe("SYMLINK", lock_path) from None
+            return [f"NOLOCK {lock_path}: {e.strerror}"]
+        with _closing(lock_fd):
+            key, age = self._judge(lock_fd, self._probe_now(root_fd))
+            if age is None:
+                # No readable age: a lock that cannot be judged is never
+                # broken, unless it is gone.
+                if self._entry_exists(root_fd, lock_name):
                     return ["BUSY", *self._show(lock_fd)]
-                # Stale. Remove the entry identifying the instance that was
-                # judged (see ``_acquire_script``); only one contender can.
-                if key is not None:
-                    try:
-                        os.unlink(key, dir_fd=lock_fd)
-                    except OSError:
-                        return ["BUSY"]
-                    for extra in (HEARTBEAT_NAME, LEGACY_INFO_NAME):
-                        with suppress(OSError):
-                            os.unlink(extra, dir_fd=lock_fd)
-            try:
-                os.rmdir(lock_name, dir_fd=root_fd)
-            except OSError:
+                if self._mkdir(root_fd, lock_name, lock_path, busy_on_failure=True):
+                    return self._take(
+                        root_fd, lock_name, lock_path, token, payload, mode[0]
+                    )
                 return ["BUSY"]
-            if self._mkdir(root_fd, lock_name, lock_path, busy_on_failure=True):
-                return self._take(
-                    root_fd, lock_name, lock_path, token, payload, "ACQUIRED_STALE"
-                )
+            if age <= self._stale_after:
+                return ["BUSY", *self._show(lock_fd)]
+            # Stale. Remove the entry identifying the instance that was
+            # judged (see ``_acquire_script``); only one contender can.
+            if key is not None:
+                try:
+                    os.unlink(key, dir_fd=lock_fd)
+                except OSError:
+                    return ["BUSY"]
+                for extra in (HEARTBEAT_NAME, LEGACY_INFO_NAME):
+                    with suppress(OSError):
+                        os.unlink(extra, dir_fd=lock_fd)
+        try:
+            os.rmdir(lock_name, dir_fd=root_fd)
+        except OSError:
             return ["BUSY"]
+        mode[0] = "ACQUIRED_STALE"
+        if self._mkdir(root_fd, lock_name, lock_path, busy_on_failure=True):
+            return self._take(root_fd, lock_name, lock_path, token, payload, mode[0])
+        return ["BUSY"]
 
     @staticmethod
     def _mkdir(
@@ -2236,7 +2288,7 @@ class LocalLockManager(RemoteLockManager):
                 os.unlink(owner, dir_fd=lock_fd)
         with suppress(OSError):
             os.rmdir(lock_name, dir_fd=root_fd)
-        return ["BUSY"]
+        return [_WITHDREW]
 
     # ------------------------------------------------ the lease, re-checked
 

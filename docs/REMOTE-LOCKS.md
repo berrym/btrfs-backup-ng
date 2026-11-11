@@ -194,6 +194,22 @@ another had re-created it and before it wrote its record -- ends with the
 second record written into a directory someone else created, or not written at
 all, and the later claimant withdraws.
 
+A claimant that withdraws tries once more from the first `mkdir`, and reports
+BUSY only if that try withdraws too. With a `mkdir` that tells the truth the
+second try never runs: a withdrawal needs two records in one directory, which
+needs the crash above. One `mkdir` does not tell the truth. The uutils
+coreutils `mkdir`, Ubuntu's default from 25.10, exits 0 when a directory stands
+at the path by the time its own call has failed with "File exists", so two
+contenders racing for the path a break has just freed are both told they made
+it; both write a record, both count two, both withdraw, and the round had no
+winner at all, never two. Twelve contenders at one dead lock did that in one
+job in five on the GitHub runners (#158). On the second try the path is free and
+the first `mkdir` takes it, or another claimant holds it and the try says BUSY
+with that claimant's record. The two can race again and be lied to again, so a
+round can still end with no winner; the retry makes that rare rather than
+certain. A breaker that withdraws and wins on its second try still reports the
+lock as broken: the break happened on the first.
+
 What remains is the assumption every lease rests on: a holder that stops
 refreshing for longer than the threshold has lost its lock, even if it wakes
 later still believing it holds it.
