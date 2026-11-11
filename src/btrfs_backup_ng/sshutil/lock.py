@@ -133,25 +133,28 @@ LEGACY_INFO_NAME = "info.json"
 #: within one threshold. Only then is it safe to delete someone else's file.
 DEAD_HOLDER_MULTIPLE = 2
 
-#: How many times a SHARED acquire re-runs its record script before reporting the
-#: store unavailable. A concurrent ``release_shared`` can ``rmdir`` the lock and
-#: holders directories between this script creating them and writing the record
-#: into them, so a single NOLOCKDIR/FAILED verdict can be a lost race rather than
-#: an unwritable store; the exclusive acquire already recovers from the same race
-#: by re-``mkdir``-ing within its own script.
+#: How long, in seconds, a SHARED acquire keeps re-running its record script
+#: before reporting the store unavailable. A concurrent ``release_shared`` can
+#: ``rmdir`` the lock and holders directories between this script creating them
+#: and writing the record into them, so a single NOLOCKDIR/FAILED verdict can be
+#: a lost race rather than an unwritable store; the exclusive acquire already
+#: recovers from the same race by re-``mkdir``-ing within its own script.
 #:
-#: The bound sits well above what contention needs. Measured on x86_64 over
-#: 3 threads x 300 acquire/release rounds (900 acquires): idle, almost every
-#: acquire wins on the first attempt and none needs more than 2; with three test
-#: suites running at once, 3-8 acquires per 900 need a 4th attempt and the worst
-#: observed was 4. A slow builder -- the ppc64le Koji VMs where ``btrfs-backup-ng``
-#: 0.9.19 failed this with the bound at 3 -- widens the release-vs-acquire window
-#: per ``sh`` invocation, so the margin has to be generous. 20 is that margin (it
-#: is also the value Fedora carries as a 0.9.19 downstream patch). Each retry is
-#: one cheap shell script, and ``acquire_shared`` backs off a few milliseconds
-#: between attempts so starved contenders stop thrashing in lockstep; a genuinely
-#: unwritable store still fails, just after this many attempts rather than 3.
-SHARED_ACQUIRE_ATTEMPTS = 20
+#: A budget of time, not a count of attempts. The count was 3 in 0.9.19 and
+#: failed on the ppc64le Koji builders; 20 from 0.9.20, set from a measurement
+#: whose worst case under load was 4 attempts; and 20 was reached on a two-CPU
+#: machine under CPU starvation (#160), where a contender descheduled for tens
+#: of milliseconds loses the race as many times in a row as the machine is
+#: slow, and an acquire that reaches the bound refuses a restore or a transfer
+#: on a perfectly writable store. What the bound protects against -- a store
+#: that cannot be written -- fails on the first attempt and gains nothing from
+#: a count, so the retry is bounded by the time an operator would accept
+#: waiting for a pin, and ``acquire_shared`` backs off between attempts, with
+#: jitter growing to a few tens of milliseconds, so starved contenders stop
+#: losing the race to one another in lockstep. Under that starvation the
+#: slowest acquire of 900 measured here took 3.2 seconds; the budget sits a
+#: wide margin above it, and the guard test holds it there.
+SHARED_ACQUIRE_BUDGET = 10.0
 
 
 # --------------------------------------------------------------- cleanup
@@ -782,9 +785,6 @@ class RemoteLockManager:
             # a record written through it would land wherever it points.
             f"if [ -L {owner} ] || [ -L {hb} ]; then rmdir {lock} 2>/dev/null; "
             f"bbng_unsafe SYMLINK {lock}; fi; "
-            f"if printf '%s' {body} 2>/dev/null > {owner}; then "
-            "bbng_c=0; "
-            f'for bbng_f in {lock}/{OWNER_PREFIX}*; do [ -f "$bbng_f" ] && bbng_c=$((bbng_c + 1)); done; '
             # Ownership of this directory instance is decided here, by the
             # shell's own exclusive create of the heartbeat under set -C, not
             # by mkdir's exit status (see the docstring): one claimant per
@@ -795,6 +795,9 @@ class RemoteLockManager:
             # first (noclobber refuses only regular files by failing).
             f"bbng_safe_leaf {hb}; "
             f"if ( : > {hb} ) 2>/dev/null; then :; else echo BUSY; bbng_show; return 0; fi; "
+            f"if printf '%s' {body} 2>/dev/null > {owner}; then "
+            "bbng_c=0; "
+            f'for bbng_f in {lock}/{OWNER_PREFIX}*; do [ -f "$bbng_f" ] && bbng_c=$((bbng_c + 1)); done; '
             f'if [ "$bbng_c" -eq 1 ]; then echo "$1"; return 0; fi; '
             # Withdrawn: no verdict yet. The caller tries once more (see the
             # docstring) and says BUSY only if that try withdraws too. The
@@ -937,9 +940,26 @@ class RemoteLockManager:
             + f"if [ -d {target} ]; then bbng_tree {root} {lock} {holders}; fi; "
             # Reported distinctly from contention: a bare mkdir failure looks
             # exactly like losing a race, and sends an operator hunting for a
-            # competing process that does not exist.
-            f"if [ ! -d {root} ] || [ ! -d {holders} ] || [ ! -w {holders} ]; then "
-            f"  echo NOLOCKDIR; exit 0; fi; "
+            # competing process that does not exist. NOLOCKDIR is a store this
+            # account cannot write: the target gone, the store or a directory
+            # under it unwritable. A lock or holders directory that is simply
+            # not there, under a writable store, was removed by a concurrent
+            # release after the walk made it: the race, FAILED, which
+            # acquire_shared retries. The two must not be confused, or an
+            # unwritable store costs the whole retry budget per pin and the
+            # race is given up at once.
+            # The writability test is not atomic with the existence test, and
+            # a release can remove the directory between the two: a failed -w
+            # is asked again whether the directory is still there and still
+            # unwritable, and one that is gone is the race.
+            f"if [ ! -d {root} ] || [ ! -w {root} ]; then echo NOLOCKDIR; exit 0; fi; "
+            f"for bbng_d in {lock} {holders}; do "
+            'if [ ! -w "$bbng_d" ]; then '
+            # one that is there and still unwritable is the store; one that is
+            # gone, or that a peer's walk has re-made writable meanwhile, is
+            # the race
+            'if [ -d "$bbng_d" ] && [ ! -w "$bbng_d" ]; then echo NOLOCKDIR; else echo FAILED; fi; '
+            "exit 0; fi; done; "
             f"bbng_safe_leaf {holder}; "
             # stderr is silenced before ``>`` is opened: a refusal of the
             # write is a verdict, not a message for the caller's stderr.
@@ -1001,15 +1021,26 @@ class RemoteLockManager:
 
         A concurrent ``release_shared`` can ``rmdir`` the lock and holders
         directories between this script creating them and writing the record
-        into them, so a NOLOCKDIR or FAILED verdict can be a lost race rather
-        than an unwritable store. Re-run the record script a bounded number of
-        times (``SHARED_ACQUIRE_ATTEMPTS``) -- it recreates the directories each
-        time -- before reporting the store unavailable, which is how the
-        exclusive acquire recovers from the same race within its own script. An
-        UNSAFE verdict is a safety refusal, never a race, and is raised at once.
+        into them; the script reports that as FAILED, a lost race rather than
+        an unwritable store, and it is re-run for as long as the budget allows
+        (``SHARED_ACQUIRE_BUDGET``) -- it recreates the directories each time
+        -- which is how the exclusive acquire recovers from the same race
+        within its own script. NOLOCKDIR is a store this account cannot
+        write; a release never removes the store, so it is not the race, and
+        two rounds in a row answering so (the elevated attempt's answer where
+        one ran) are raised at once rather than retried for the budget: a
+        restore from a read-only mirror learns so in two attempts per pin,
+        not ten seconds. One alone is retried, since the script's tests of a
+        directory are not atomic and a release can remove it between them.
+        An UNSAFE verdict is a safety refusal, never a race, and is raised at
+        once.
         """
         rc, out, err = 0, "", ""
-        for attempt in range(SHARED_ACQUIRE_ATTEMPTS):
+        deadline = time.monotonic() + SHARED_ACQUIRE_BUDGET
+        attempt = 0
+        unwritable = 0
+        while True:
+            attempt += 1
             rc, out, err = self._record_shared(name, lock_id, operation)
             if _verdict(out).startswith("UNSAFE"):
                 raise RemoteLockUnavailable(unsafe_store_message(_verdict(out)))
@@ -1022,31 +1053,45 @@ class RemoteLockManager:
             if _verdict(out) == "ACQUIRED":
                 _register_for_cleanup(self, self._held_key(name, lock_id))
                 return "acquired"
-            # NOLOCKDIR / FAILED: a concurrent release may have removed the lock
-            # directories mid-write. Loop; the next run recreates and retries.
-            # Back off a few milliseconds first, with jitter, so several starved
-            # contenders (a slow build VM running the churn under load) stop
-            # losing the race to one another in lockstep. Only between attempts:
-            # the first try pays nothing, and there is no sleep after the last.
-            if attempt + 1 < SHARED_ACQUIRE_ATTEMPTS:
-                time.sleep(min(0.005 * (attempt + 1), 0.03) + random.uniform(0, 0.005))
-        # Every attempt lost. On a writable store this is extreme contention on
-        # the release-vs-acquire race, not a broken store, so the message names
-        # that first and does not assert the path is unwritable -- 0.9.19 did,
-        # which sent operators of a perfectly writable store hunting a phantom
-        # permissions problem. Only the elevation hint stays tied to NOLOCKDIR,
-        # the one verdict an unwritable store actually produces.
-        detail = (
-            f"the lock directory {self._root!r} could not be created or written to"
-            if "NOLOCKDIR" in out
-            else (err.strip() or out.strip() or f"exit {rc}")
-        )
+            # Twice in a row is the store; once can still be the race caught
+            # between two tests of one directory, so one more attempt. The
+            # round's answer is the elevated attempt's where one ran (a
+            # root-owned lock directory says NOLOCKDIR to the plain attempt
+            # every round, legitimately), and a round that is not NOLOCKDIR
+            # starts the count again.
+            unwritable = unwritable + 1 if "NOLOCKDIR" in out else 0
+            if "NOLOCKDIR" in out:
+                if unwritable >= 2:
+                    raise RemoteLockUnavailable(
+                        f"could not record a shared lock on {name!r}: the lock "
+                        f"directory {self._root!r} could not be created or "
+                        f"written to. The path must be writable by the account "
+                        f"running the backup, which must be able to write there "
+                        f"(or to elevate for it)."
+                    )
+            # FAILED (or a first NOLOCKDIR): a concurrent release removed the
+            # lock directories mid-write. Loop; the next run recreates and
+            # retries, for as long as the budget allows. Back off a few milliseconds
+            # first, growing with the attempts and with jitter, so several
+            # starved contenders (a slow or loaded machine running the churn)
+            # stop losing the race to one another in lockstep. Only between
+            # attempts: the first try pays nothing, and the last sleep ends at
+            # the deadline.
+            left = deadline - time.monotonic()
+            if left <= 0:
+                break
+            time.sleep(min(min(0.005 * attempt, 0.05) + random.uniform(0, 0.01), left))
+        # The budget is spent on the race alone (an unwritable store was
+        # reported above): extreme contention on the release-vs-acquire race,
+        # not a broken store, so the message says so and does not assert the
+        # path is unwritable -- 0.9.19 did, which sent operators of a perfectly
+        # writable store hunting a phantom permissions problem.
+        detail = err.strip() or out.strip() or f"exit {rc}"
         raise RemoteLockUnavailable(
-            f"could not record a shared lock on {name!r} after "
-            f"{SHARED_ACQUIRE_ATTEMPTS} attempts ({detail}). On a writable store "
-            f"this means extreme contention on the lock directory; otherwise the "
-            f"path is not writable by the account running the backup, which must "
-            f"be able to write there (or to elevate for it)."
+            f"could not record a shared lock on {name!r} after {attempt} attempts "
+            f"over {SHARED_ACQUIRE_BUDGET:g} seconds ({detail}): extreme "
+            f"contention on the lock directory, every attempt losing the race "
+            f"with a concurrent release."
         )
 
     def release_shared(self, name: str, lock_id: str) -> None:
@@ -2283,12 +2328,30 @@ class LocalLockManager(RemoteLockManager):
                 raise _unsafe("SYMLINK", lock_path) from None
             return ["BUSY"]
         with _closing(lock_fd):
+            # Ownership of this directory instance is decided here, by the
+            # exclusive create of the heartbeat, not by mkdir's answer (see
+            # ``_acquire_script``): one claimant per instance. The one refused
+            # was told it made a directory it did not; it writes nothing,
+            # removes nothing, and is BUSY.
+            try:
+                hb = __util__.open_regular_nofollow(
+                    HEARTBEAT_NAME, dir_fd=lock_fd, exclusive=True
+                )
+            except OSError as e:
+                if e.errno == errno.ELOOP:
+                    raise _unsafe("SYMLINK", f"{lock_path}/{HEARTBEAT_NAME}") from None
+                return ["BUSY", *self._show(lock_fd)]
+            os.close(hb)
             owner = f"{OWNER_PREFIX}{token}"
             try:
                 fd = __util__.open_regular_nofollow(
                     owner, dir_fd=lock_fd, exclusive=True
                 )
             except OSError:
+                with suppress(OSError):
+                    os.unlink(HEARTBEAT_NAME, dir_fd=lock_fd)
+                with suppress(OSError):
+                    os.rmdir(lock_name, dir_fd=root_fd)
                 return ["BUSY"]
             with os.fdopen(fd, "wb") as f:
                 f.write(payload.encode("utf-8"))
@@ -2325,30 +2388,12 @@ class LocalLockManager(RemoteLockManager):
 
     def _check_owner_here(self, name: str, token: str) -> str:
         """``_owner_script`` against descriptors: the record opened by name
-            # Ownership of this directory instance is decided here, by the
-            # exclusive create of the heartbeat, not by mkdir's answer (see
-            # ``_acquire_script``): one claimant per instance. The one refused
-            # was told it made a directory it did not; it writes nothing,
-            # removes nothing, and is BUSY.
-            try:
-                hb = __util__.open_regular_nofollow(
-                    HEARTBEAT_NAME, dir_fd=lock_fd, exclusive=True
-                )
-            except OSError as e:
-                if e.errno == errno.ELOOP:
-                    raise _unsafe("SYMLINK", f"{lock_path}/{HEARTBEAT_NAME}") from None
-                return ["BUSY", *self._show(lock_fd)]
-            os.close(hb)
         below the lock directory, never through a link."""
         from .. import __util__
 
         fd = self._open_store(create=False)
         fd = self._open_below(
             fd, f"{encode_name(name)}.lock", self._lock_dir(name), create=False
-                with suppress(OSError):
-                    os.unlink(HEARTBEAT_NAME, dir_fd=lock_fd)
-                with suppress(OSError):
-                    os.rmdir(lock_name, dir_fd=root_fd)
         )
         with _closing(fd) as lock_fd:
             if not self._is_regular(lock_fd, f"{OWNER_PREFIX}{token}"):
@@ -2402,10 +2447,19 @@ class LocalLockManager(RemoteLockManager):
         holders_path = self._holders_dir(name)
         holder_path = self._holder_file(name, lock_id)
         fd = self._open_store(create=True)
-        fd = self._open_below(
-            fd, f"{encode_name(name)}.lock", self._lock_dir(name), create=True
-        )
-        fd = self._open_below(fd, HOLDERS_DIR_NAME, holders_path, create=True)
+        try:
+            fd = self._open_below(
+                fd, f"{encode_name(name)}.lock", self._lock_dir(name), create=True
+            )
+            fd = self._open_below(fd, HOLDERS_DIR_NAME, holders_path, create=True)
+        except _StoreVerdict as v:
+            # The store is there and writable; a directory under it that is
+            # not there to make the next one in was removed by a concurrent
+            # release after the walk made it: the race, not an unwritable
+            # store (the shell script says the same).
+            if v.line == "NOLOCKDIR" and v.errno == errno.ENOENT:
+                return "FAILED"
+            raise
         with _closing(fd) as holders_fd:
             if not _writable(holders_fd):
                 return "NOLOCKDIR"
