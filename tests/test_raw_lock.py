@@ -7,6 +7,7 @@ file must never be mistaken for a backup stream.
 
 import argparse
 import os
+import sys
 import signal
 import time
 from contextlib import contextmanager
@@ -107,9 +108,16 @@ def test_lock_fstat_failure_maps_to_runtime_error(tmp_path, monkeypatch):
     degrade to a bounded RuntimeError -- NOT escape as an uncaught OSError (the prune
     path catches only RuntimeError, and the CLI would misreport an OSError on stdout)."""
     ep = RawEndpoint(config={"path": str(tmp_path)})
+    real_fstat = raw_mod.os.fstat
 
-    def boom(_fd):
-        raise OSError(5, "simulated fstat failure")
+    def boom(fd):
+        # Only the lock's own fstat fails. ``os`` is one module, so a patch of
+        # ``os.fstat`` is seen by everything, including the test runner's
+        # output capture (pytest 9.2 calls it there); the failure is simulated
+        # for the frame under test alone.
+        if sys._getframe(1).f_code.co_name == "exclusive_lock":
+            raise OSError(5, "simulated fstat failure")
+        return real_fstat(fd)
 
     monkeypatch.setattr(raw_mod.os, "fstat", boom)
     with pytest.raises(RuntimeError, match="cannot stat"):
